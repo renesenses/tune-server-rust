@@ -10,8 +10,8 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use tune_core::http::streamer::{
-    ICY_METAINT, SharedSessions, StreamInfo, StreamSession, build_icy_metadata, build_wav_header,
-    extract_stream_id,
+    ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
+    build_wav_header, extract_stream_id,
 };
 
 pub async fn handle_head(
@@ -132,7 +132,7 @@ pub async fn handle_stream(
     // Proxy mode
     let proxy_url = session.proxy_url.lock().await.clone();
     if let Some(ref url) = proxy_url {
-        return proxy_stream(url, &session.info, session.is_radio, &req_headers).await;
+        return proxy_stream(url, &session.info, session.is_radio, &req_headers, &session).await;
     }
 
     // Chunked streaming mode
@@ -467,6 +467,80 @@ fn parse_range_start(range: &str) -> Option<u64> {
 /// body error before we give up and end the response.
 const PROXY_MAX_RESUMES: u32 = 5;
 
+/// Max number of URL re-resolutions when a signed CDN URL has expired.
+/// Bounded so a genuinely-dead track can't loop forever.
+const PROXY_MAX_RERESOLVES: u32 = 3;
+
+/// True when an upstream HTTP status indicates an expired/invalid signed URL
+/// (Qobuz/Tidal signatures return 403 Forbidden or 410 Gone once `etsp`
+/// passes). These are re-resolvable — a fresh signed URL for the same file
+/// will succeed; a plain 404/5xx is not, so we don't re-resolve those.
+fn is_expired_url_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::GONE
+}
+
+/// Send a GET for `url` (optionally with `Range: bytes={start}-`) and, if the
+/// request fails to send OR the CDN answers with an expiry status (403/410),
+/// re-resolve a fresh signed URL via `reresolve` and retry — bounded by
+/// `PROXY_MAX_RERESOLVES`. Returns the successful response together with the
+/// URL that produced it (which the caller stores back on the session so later
+/// resumes use the fresh URL). Byte-exactness is preserved: the retry re-uses
+/// the SAME absolute `start` offset against the same file.
+async fn send_with_reresolve(
+    client: &'static reqwest::Client,
+    url: String,
+    start: Option<u64>,
+    reresolve: &Option<ReresolveFn>,
+) -> Result<(reqwest::Response, String), ()> {
+    let mut url = url;
+    let mut attempts: u32 = 0;
+    loop {
+        let mut req = client.get(&url).header("Accept-Encoding", "identity");
+        if let Some(s) = start {
+            req = req.header("Range", format!("bytes={s}-"));
+        }
+        let outcome = req.send().await;
+
+        // Decide whether this attempt needs a fresh URL.
+        let needs_reresolve = match &outcome {
+            Err(e) => {
+                warn!(error = %e, url = %url, "proxy_upstream_error");
+                true
+            }
+            Ok(r) if is_expired_url_status(r.status()) => {
+                warn!(status = %r.status(), url = %url, "proxy_upstream_expired_status");
+                true
+            }
+            Ok(_) => false,
+        };
+
+        if !needs_reresolve {
+            // Safe: matched Ok(_) above.
+            return Ok((outcome.unwrap(), url));
+        }
+
+        let Some(reresolve) = reresolve else {
+            // No re-resolver (local/non-expiring source) — nothing more to do.
+            return Err(());
+        };
+        if attempts >= PROXY_MAX_RERESOLVES {
+            warn!(url = %url, "proxy_reresolve_giveup");
+            return Err(());
+        }
+        attempts += 1;
+        match reresolve().await {
+            Ok(fresh) => {
+                info!(attempts, start = ?start, "proxy_url_reresolved");
+                url = fresh;
+            }
+            Err(e) => {
+                warn!(error = %e, attempts, "proxy_reresolve_failed");
+                return Err(());
+            }
+        }
+    }
+}
+
 /// Build a body that streams `initial` chunks to the client and, on a
 /// mid-stream body error (reqwest "error decoding response body" — a dropped
 /// Akamai keep-alive connection, NOT a content-decode issue since the client
@@ -482,10 +556,13 @@ fn resumable_proxy_body(
     upstream_url: String,
     initial: reqwest::Response,
     abs_offset: u64,
+    reresolve: Option<ReresolveFn>,
 ) -> Body {
     Body::from_stream(async_stream::stream! {
         use futures_util::StreamExt;
         let mut resp = initial;
+        // Current (possibly re-resolved) CDN URL we reconnect against.
+        let mut url = upstream_url;
         // Absolute file offset of the next byte we expect to yield.
         let mut pos = abs_offset;
         let mut resumes: u32 = 0;
@@ -519,21 +596,24 @@ fn resumable_proxy_body(
                 200u64 * u64::from(resumes),
             ))
             .await;
-            let req = client
-                .get(&upstream_url)
-                .header("Accept-Encoding", "identity")
-                .header("Range", format!("bytes={pos}-"));
-            match req.send().await {
-                Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+            // Reconnect at the exact byte offset reached. If the connection
+            // fails to send or the signed URL has expired (403/410), this
+            // re-resolves a fresh signed URL and retries the SAME offset —
+            // byte-exact — so a mid-track URL expiry no longer stops playback.
+            match send_with_reresolve(client, url.clone(), Some(pos), &reresolve).await {
+                Ok((r, fresh_url)) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    if fresh_url != url {
+                        url = fresh_url;
+                    }
                     info!(pos, resumes, "proxy_resume_reconnect_206");
                     resp = r;
                 }
-                Ok(r) => {
+                Ok((r, _)) => {
                     warn!(status = %r.status(), pos, "proxy_resume_bad_status");
                     break;
                 }
-                Err(e) => {
-                    warn!(error = %e, pos, "proxy_upstream_error");
+                Err(()) => {
+                    warn!(pos, "proxy_resume_upstream_failed");
                     break;
                 }
             }
@@ -546,7 +626,11 @@ async fn proxy_stream(
     info: &StreamInfo,
     is_radio: bool,
     req_headers: &HeaderMap,
+    session: &StreamSession,
 ) -> Response {
+    // Re-resolver for expiring signed CDN URLs (Qobuz/Tidal). Present only for
+    // streaming proxy sessions; None for radio and non-expiring sources.
+    let reresolve = session.reresolve.lock().await.clone();
     let client = if is_radio {
         // Radio streams are infinite — use a client with no total timeout
         // so the connection stays alive until the user stops playback.
@@ -581,23 +665,31 @@ async fn proxy_stream(
         .and_then(parse_range_start)
         .filter(|&n| n >= RESUME_RANGE_THRESHOLD);
 
-    // Ask the CDN for the raw bytes — `identity` disables any upstream
-    // content-coding so we proxy the FLAC verbatim (byte-exact audio).
-    let mut upstream_req = client
-        .get(upstream_url)
-        .header("Accept-Encoding", "identity");
     if let Some(start) = resume_start {
-        upstream_req = upstream_req.header("Range", format!("bytes={start}-"));
         info!(url = upstream_url, start, "proxy_forward_resume_range");
     }
 
-    let upstream_resp = match upstream_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, url = upstream_url, "proxy_upstream_error");
-            return StatusCode::BAD_GATEWAY.into_response();
+    // Ask the CDN for the raw bytes — `identity` disables any upstream
+    // content-coding so we proxy the FLAC verbatim (byte-exact audio).
+    // send_with_reresolve retries against a FRESH signed URL when the request
+    // fails to send or the CDN returns an expiry status (403/410) — this is the
+    // path the client Range-resume hits when the Qobuz `etsp` signature has
+    // expired mid-track (#1136), which the old single-shot send could not
+    // recover from.
+    let (upstream_resp, upstream_url) =
+        match send_with_reresolve(client, upstream_url.to_string(), resume_start, &reresolve).await
+        {
+            Ok(pair) => pair,
+            Err(()) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+    // Persist a re-resolved URL so later resumes start from the fresh signature.
+    {
+        let mut pu = session.proxy_url.lock().await;
+        if pu.as_deref() != Some(upstream_url.as_str()) {
+            *pu = Some(upstream_url.clone());
         }
-    };
+    }
+    let upstream_url = upstream_url.as_str();
     // Only treat it as a real resume if the CDN honoured the Range (206).
     let resume_start = if upstream_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         resume_start
@@ -661,7 +753,13 @@ async fn proxy_stream(
         }
         info!(url = upstream_url, start, "proxy_resume_206_from_cdn");
 
-        let body = resumable_proxy_body(client, upstream_url.to_string(), upstream_resp, start);
+        let body = resumable_proxy_body(
+            client,
+            upstream_url.to_string(),
+            upstream_resp,
+            start,
+            reresolve.clone(),
+        );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -701,7 +799,13 @@ async fn proxy_stream(
             HeaderValue::from_str(&format!("bytes 0-{}/{}", cl - 1, cl)).unwrap(),
         );
 
-        let body = resumable_proxy_body(client, upstream_url.to_string(), upstream_resp, 0);
+        let body = resumable_proxy_body(
+            client,
+            upstream_url.to_string(),
+            upstream_resp,
+            0,
+            reresolve.clone(),
+        );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -709,7 +813,13 @@ async fn proxy_stream(
         headers.insert("Content-Length", HeaderValue::from(cl));
     }
 
-    let body = resumable_proxy_body(client, upstream_url.to_string(), upstream_resp, 0);
+    let body = resumable_proxy_body(
+        client,
+        upstream_url.to_string(),
+        upstream_resp,
+        0,
+        reresolve.clone(),
+    );
     (StatusCode::OK, headers, body).into_response()
 }
 

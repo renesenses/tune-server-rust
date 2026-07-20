@@ -2996,10 +2996,55 @@ impl PlaybackOrchestrator {
                         }
                     }
                 } else {
-                    // Renderer supports FLAC — proxy directly as before
+                    // Renderer supports FLAC — proxy directly as before.
+                    //
+                    // Qobuz/Tidal signed CDN URLs carry a short TTL (Qobuz
+                    // `etsp=<unix-expiry>`, ~60 min). On a long Hi-Res track the
+                    // URL expires mid-playback and a client Range-resume against
+                    // the stored URL fails at the connection/auth level. Attach a
+                    // re-resolver so the proxy layer can fetch a FRESH signed URL
+                    // for the same track+quality and resume byte-exact (#1136).
+                    // Only for real https CDN URLs (not file:// DASH assemblies).
+                    let reresolve: Option<crate::http::streamer::ReresolveFn> = if is_https {
+                        let services = self.services.clone();
+                        let service_name = service_name.to_string();
+                        let source_id = source_id.to_string();
+                        Some(std::sync::Arc::new(move || {
+                            let services = services.clone();
+                            let service_name = service_name.clone();
+                            let source_id = source_id.clone();
+                            Box::pin(async move {
+                                let registry = services.lock().await;
+                                let svc = registry
+                                    .get(&service_name)
+                                    .ok_or_else(|| format!("unknown service: {service_name}"))?;
+                                let mut svc = svc.lock().await;
+                                // Best-effort token refresh, then re-resolve with
+                                // the same default quality the initial play used.
+                                let _ = svc.refresh_if_needed().await;
+                                match svc.get_track_url(&source_id, None).await {
+                                    Ok(data) => Ok(data.url),
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            })
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn std::future::Future<Output = Result<String, String>>
+                                            + Send,
+                                    >,
+                                >
+                        }))
+                    } else {
+                        None
+                    };
                     let session_id = self
                         .streamer
-                        .create_proxy_session(info, stream_data.url.clone(), false)
+                        .create_proxy_session_with_reresolve(
+                            info,
+                            stream_data.url.clone(),
+                            false,
+                            reresolve,
+                        )
                         .await;
                     let server_ip = self.server_ip();
                     let url = self
