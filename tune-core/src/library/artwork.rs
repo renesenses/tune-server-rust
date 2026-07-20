@@ -724,12 +724,40 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    let resp = client.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
+    // Single choke point for every artwork/artist-image download: log *why* a
+    // fetch produced nothing so an enrichment run that "finds nothing" can be
+    // diagnosed (rate-limit vs genuinely absent vs network), instead of every
+    // failure being an indistinguishable `None` (#1096). Behaviour is unchanged
+    // — all four failure cases still return `None`.
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(url, error = %e, "artwork_download_network_error");
+            return None;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() == 429 || status.as_u16() == 503 {
+            warn!(
+                url,
+                status = status.as_u16(),
+                "artwork_download_rate_limited"
+            );
+        } else {
+            debug!(url, status = status.as_u16(), "artwork_download_http_error");
+        }
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(url, error = %e, "artwork_download_read_error");
+            return None;
+        }
+    };
     if bytes.len() < 1000 {
+        debug!(url, len = bytes.len(), "artwork_download_too_small");
         return None;
     }
     Some(bytes.to_vec())
