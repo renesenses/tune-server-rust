@@ -1,6 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::{debug, info, warn};
+
+/// Best-effort diagnostic counter of artwork downloads rejected with a
+/// rate-limit status (429/503), incremented in [`download_image`]. An
+/// enrichment batch reads the delta over its own run and reports it, so a run
+/// that "found nothing" can tell retryable throttling apart from genuinely
+/// absent artwork (Jean Valjean #1096). It counts download-level hits (a single
+/// artist may hit several sources) and is process-global — fine because
+/// enrichment runs are serialised; `Relaxed` is enough for a diagnostic count.
+/// Per-artist precision will come with the fetch-layer refactor (typed
+/// `FetchOutcome` propagated up the source cascade).
+static ARTWORK_RATE_LIMIT_HITS: AtomicU32 = AtomicU32::new(0);
 
 /// Candidate filenames for folder-level cover art.
 ///
@@ -739,6 +751,7 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
     let status = resp.status();
     if !status.is_success() {
         if status.as_u16() == 429 || status.as_u16() == 503 {
+            ARTWORK_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
             warn!(
                 url,
                 status = status.as_u16(),
@@ -815,6 +828,10 @@ async fn batch_enrich_artist_artwork_inner(
     force: bool,
 ) {
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
+    // Snapshot the global rate-limit counter so the result can report how many
+    // downloads THIS run had throttled (429/503) — a "found nothing" run with a
+    // high count is retryable, not genuinely empty (#1096).
+    let rl_start = ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed);
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
     let mut community_applied = 0u32;
@@ -1062,6 +1079,8 @@ async fn batch_enrich_artist_artwork_inner(
                         "enriched": enriched,
                         "failed": failed,
                         "community_applied": community_applied,
+                        "rate_limit_hits":
+                            ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
                     })
                     .to_string(),
                 )
@@ -1170,6 +1189,11 @@ async fn batch_enrich_artist_artwork_inner(
                 "phase3_lastfm": lastfm_enriched,
                 "failed": failed,
                 "community_applied": community_applied,
+                // How many downloads were rate-limited during this run: lets the
+                // UI say "N restants dont X à réessayer" instead of implying the
+                // artists are simply absent (#1096).
+                "rate_limit_hits":
+                    ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
             })
             .to_string(),
         )
