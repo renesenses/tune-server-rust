@@ -99,6 +99,18 @@ pub mod sql {
         )
     }
 
+    /// Make room for a mid-queue insert: shift every existing row at
+    /// `position >= start` up by `count`, so the inserted rows land on
+    /// now-free positions instead of colliding. `{1}=count, {2}=zone, {3}=start`.
+    pub fn shift_positions_up<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE play_queue SET position = position + {} WHERE zone_id = {} AND position >= {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
     pub fn delete_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
             "DELETE FROM streaming_queue WHERE zone_id = {}",
@@ -263,6 +275,7 @@ impl PlayQueueRepo {
             sql::insert_queue_row_no_current,
             sql::insert_queue_row_no_current,
         );
+        let shift_sql = self.dialect_sql(sql::shift_positions_up, sql::shift_positions_up);
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             let max_pos: i64 = tx
@@ -271,6 +284,18 @@ impl PlayQueueRepo {
                 .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
                 .unwrap_or(-1);
             let start = position.unwrap_or(max_pos + 1);
+            // Mid-queue insert (explicit position, e.g. "Play next"): shift the
+            // existing rows up first so the new rows don't collide on `position`.
+            // Without this, inserting at an occupied position left two rows with
+            // the same position — a corrupted queue where "play from here" and
+            // gapless advance resolved to the wrong track (Bertrand: a "Play next"
+            // on an album produced a duplicate entry + duplicate position). Append
+            // (position = None → start = max+1) matches nothing, so this is a no-op.
+            let count = track_ids.len() as i64;
+            if position.is_some() && count > 0 {
+                let sp: [&dyn ToSqlValue; 3] = [&count, &zone_id, &start];
+                tx.execute(&shift_sql, &sp)?;
+            }
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = start + i as i64;
                 let p: [&dyn ToSqlValue; 3] = [&zone_id, tid, &pos];
@@ -619,6 +644,46 @@ mod tests {
         repo.add_tracks(1, &[tid2], Some(0)).unwrap();
 
         assert_eq!(repo.count(1).unwrap(), 2);
+    }
+
+    #[test]
+    fn queue_insert_at_occupied_position_shifts_no_duplicates() {
+        // Bertrand: a "Play next" (insert at the position right after current)
+        // on an album produced a queue with TWO entries at the same position and
+        // a duplicated track, which broke "play from here" / gapless advance.
+        // Inserting at an occupied position must shift the existing rows up so
+        // positions stay unique and contiguous.
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+
+        let mut ids = Vec::new();
+        for name in ["A", "B", "C"] {
+            let mut t = Track::new(name.into());
+            t.file_path = Some(format!("/{name}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+        repo.set_queue(1, &ids).unwrap(); // A@0, B@1, C@2
+
+        let mut x = Track::new("X".into());
+        x.file_path = Some("/x.flac".into());
+        let xid = track_repo.create(&x).unwrap();
+
+        // "Play next" while A (position 0) is current → insert at position 1.
+        repo.add_tracks(1, &[xid], Some(1)).unwrap();
+
+        let queue = repo.get_queue(1).unwrap();
+        // Expected order: A, X, B, C with contiguous unique positions 0..3.
+        let order: Vec<i64> = queue.iter().map(|q| q.track_id).collect();
+        assert_eq!(order, vec![ids[0], xid, ids[1], ids[2]]);
+        let positions: Vec<i64> = queue.iter().map(|q| q.position).collect();
+        assert_eq!(positions, vec![0, 1, 2, 3]);
+        // No duplicate positions.
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            positions.iter().all(|p| seen.insert(*p)),
+            "duplicate position in queue: {positions:?}"
+        );
     }
 
     #[test]
