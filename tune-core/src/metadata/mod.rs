@@ -1424,10 +1424,24 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
         return None;
     }
-    let data = std::fs::read(path).ok()?;
+    // The Vorbis comment block lives in the file header (FLAC metadata blocks
+    // precede the audio; the OGG/Opus comment header is in the first pages), so
+    // a bounded prefix read finds the field — never slurp a multi-GB hi-res FLAC
+    // into RAM (twice: the old code also built a full from_utf8_lossy copy that
+    // was never read) just to recover one tag. On the rare file whose comment
+    // block sits past the window this returns None, exactly as before when lofty
+    // already missed the field.
+    const HEADER_BYTES: u64 = 1024 * 1024;
+    let mut data = Vec::new();
+    {
+        use std::io::Read;
+        std::fs::File::open(path)
+            .ok()?
+            .take(HEADER_BYTES)
+            .read_to_end(&mut data)
+            .ok()?;
+    }
     let needle = format!("{}=", field_name);
-    let needle_upper = format!("{}=", field_name.to_uppercase());
-    let content = String::from_utf8_lossy(&data);
     for line_bytes in data.windows(needle.len()) {
         let chunk = std::str::from_utf8(line_bytes).unwrap_or("");
         if chunk.eq_ignore_ascii_case(&needle) {
@@ -1445,7 +1459,6 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
             }
         }
     }
-    let _ = (content, needle_upper);
     None
 }
 
