@@ -137,23 +137,60 @@ jobs:
         if: "!matrix.cross && runner.os == 'macOS'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres
 
+      # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
+      # tune-server so AirPlay 2 works on native installs, not just Docker
+      # (#700 / Bilou #1135). Built from a pinned rev of our fork.
+      #
+      # Best-effort PER TARGET: build the real binary or ship NOTHING — never a
+      # placeholder. An empty stub would make daemon_available() return true and
+      # route AirPlay to a broken daemon instead of falling back to AirPlay 1.
+      # If the build fails (e.g. the vendored C on a given toolchain) the artifact
+      # still ships, just without AirPlay 2. Cross targets (arm64 Linux) skipped.
+      - name: Build airplay-daemon
+        if: "!matrix.cross"
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get install -y --no-install-recommends cmake clang
+          fi
+          if cargo install --git https://github.com/renesenses/airplay2-rs \
+               --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
+               airplay-daemon --target ${{ matrix.target }} \
+               --root "$RUNNER_TEMP/apd" --locked; then
+            echo "airplay-daemon built for ${{ matrix.target }}"
+          else
+            echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
+          fi
+
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p package/web
           cp target/${{ matrix.target }}/release/tune-server package/
           cp -r web/* package/web/
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server web/
+          # Bundle airplay-daemon next to tune-server if it built for this target.
+          DAEMON=""
+          if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
+            cp "$RUNNER_TEMP/apd/bin/airplay-daemon" package/
+            DAEMON="airplay-daemon"
+          fi
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON web/
           cd ..
 
       - name: Package (windows zip)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           mkdir package\web
           copy target\${{ matrix.target }}\release\tune-server.exe package\
+          # Bundle airplay-daemon.exe next to tune-server.exe if it built.
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" package\
+          }
           xcopy web\* package\web\ /E /I /Q
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
+          if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           cd ..
 
       - name: Install NSIS
@@ -165,6 +202,14 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
+          # Include the AirPlay 2 daemon in the installer only if it built for this
+          # target; otherwise the File directive is omitted entirely (no broken or
+          # empty binary that would defeat the AirPlay 1 fallback).
+          $daemonFile = ""
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" "target\${{ matrix.target }}\release\airplay-daemon.exe"
+            $daemonFile = 'File "target\${{ matrix.target }}\release\airplay-daemon.exe"'
+          }
           @"
           !include "MUI2.nsh"
           Name "Tune Server"
@@ -190,6 +235,7 @@ jobs:
             SetOverwrite on
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
+            $daemonFile
             SetOutPath "`$INSTDIR\web"
             File /r "web\*.*"
 
