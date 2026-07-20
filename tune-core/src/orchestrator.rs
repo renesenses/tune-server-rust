@@ -587,6 +587,48 @@ impl PlaybackOrchestrator {
             "orchestrator_play"
         );
 
+        // Fail fast when the initial output send itself errored.
+        //
+        // play() already flipped the zone to Playing and bumped
+        // track_generation (so the poller armed its 45s track-load grace).
+        // That grace exists for a real renderer that accepts the stream but
+        // takes a few seconds to start pulling bytes — NOT for a renderer that
+        // outright rejected the stream (e.g. AirPlay ANNOUNCE → 403). Without
+        // this short-circuit the zone sits "loading" for ~45s of grace + ~30
+        // stopped ticks (~100s total) before the poller finally gives up with
+        // bytes_sent=0 (Bilou, forum #1135).
+        //
+        // We only trip here on an explicit send error (output_error.is_some()
+        // with a requested output device). The success path (play_media → Ok,
+        // output_sent=true) is untouched, so a slow-but-valid renderer keeps
+        // its full grace period. The superseded and "no output device" cases
+        // returned earlier / set output_error=None and are likewise unaffected.
+        if !output_sent && output_error.is_some() && req.output_device_id.is_some() {
+            warn!(
+                zone_id = req.zone_id,
+                device_id = req.output_device_id.as_deref().unwrap_or(""),
+                error = output_error.as_deref().unwrap_or(""),
+                "output_send_failed_stopping_zone_immediately"
+            );
+            // Drop the stream we just created — nothing is consuming it.
+            if let Some(ref sid) = resolved.stream_id {
+                self.streamer.remove_session(sid).await;
+            }
+            // Surface the failure now: flip the zone to Stopped so the poller's
+            // load-grace path never runs and the UI reflects the error within a
+            // poll tick instead of ~100s later.
+            self.playback.stop(req.zone_id).await;
+            crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .save_play_state(req.zone_id, "stopped")
+                .ok();
+            return Ok(PlayResult {
+                stream_url: Some(resolved.url),
+                output_sent: false,
+                source: resolved.source,
+                error: output_error,
+            });
+        }
+
         // Trigger prefetch of the next track in the background.
         // This runs concurrently with the current playback so the next
         // streaming track is already decoded in memory when needed.
@@ -5043,5 +5085,111 @@ mod tests {
             "podcast should not create proxy session"
         );
         assert_eq!(resolved.url, "https://cdn.podcast.com/episode.mp3");
+    }
+
+    /// An output that rejects `play_media` — mirrors an AirPlay renderer whose
+    /// ANNOUNCE returns 403 (Bilou, forum #1135).
+    struct RejectingOutput {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outputs::traits::OutputTarget for RejectingOutput {
+        fn name(&self) -> &str {
+            "Rejecting"
+        }
+        fn device_id(&self) -> &str {
+            &self.id
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        async fn play_media(
+            &self,
+            _media: &crate::outputs::traits::PlayMedia<'_>,
+        ) -> Result<(), String> {
+            Err("ANNOUNCE failed: 403".into())
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_status(&self) -> Result<crate::outputs::traits::OutputStatus, String> {
+            Ok(crate::outputs::traits::OutputStatus::default())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// When the initial output send errors (e.g. AirPlay 403), the zone must
+    /// fail fast: `send_to_output` reports the error and the fail-fast branch
+    /// flips the zone to Stopped instead of leaving it "Playing" for ~100s
+    /// while the poller runs its load-grace clock (Bilou, forum #1135).
+    #[tokio::test]
+    async fn output_send_error_fails_fast_to_stopped() {
+        let orch = test_orchestrator();
+        let zone_id = 7;
+        let device_id = "airplay-192.168.1.18-7000";
+
+        {
+            let mut outputs = orch.outputs.lock().await;
+            outputs.register(Box::new(RejectingOutput {
+                id: device_id.to_string(),
+            }));
+        }
+
+        // Prime the zone exactly as play() does before send_to_output.
+        let np = NowPlaying {
+            title: "So Long".into(),
+            duration_ms: 230_050,
+            source: "local".into(),
+            ..Default::default()
+        };
+        orch.playback.play(zone_id, np).await;
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Playing,
+            "zone must be Playing after play() primes it"
+        );
+
+        // The rejecting output must report a send failure (not a false success).
+        let media = crate::outputs::traits::PlayMedia {
+            url: "http://server/stream",
+            mime_type: "audio/wav",
+            ..Default::default()
+        };
+        let (output_sent, output_error) = orch.send_to_output(device_id, &media, None).await;
+        assert!(
+            !output_sent,
+            "rejecting output must report output_sent=false"
+        );
+        assert!(
+            output_error.is_some(),
+            "rejecting output must surface an error string"
+        );
+
+        // Fail-fast reaction (same as play()'s new short-circuit): stop the zone
+        // immediately rather than handing it to the poller in a loading state.
+        orch.playback.stop(zone_id).await;
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "output send error must leave the zone Stopped, not Playing"
+        );
     }
 }
