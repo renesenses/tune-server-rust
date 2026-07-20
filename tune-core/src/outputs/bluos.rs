@@ -62,6 +62,17 @@ impl OutputTarget for BluosOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        // Clear the Node's internal play queue before starting a new track.
+        // BluOS keeps its own queue: set_next_media (/Add?prepend=1) stages the
+        // gapless track into it, and /Play?url= does NOT purge leftover entries.
+        // Without this, tracks from a previous album stayed queued and the Node
+        // auto-advanced onto them at every track transition (Scordia: a new CD
+        // plays track 1, then jumps to the previous CD's tracks — "in memory"
+        // yet absent from Tune's own queue/history, because they live on the
+        // Node). Fire-and-forget: a failed Clear must not block playback. Gapless
+        // within the album still works — set_next_media rebuilds a fresh queue.
+        let _ = self.api_get("Clear", &[]).await;
+
         // BluOS expects the url parameter without re-encoding — .query()
         // would double-encode http:// in the stream URL, causing silent failure.
         let mut play_url = format!("{}/Play?url={}", self.base_url(), media.url);
