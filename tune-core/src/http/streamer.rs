@@ -9,6 +9,28 @@ use crate::audio::wav::build_wav_header_with_duration;
 
 pub const ICY_METAINT: usize = 16384;
 
+/// A boxed, cloneable async closure that re-resolves a fresh signed CDN URL
+/// for the track backing a proxy session.
+///
+/// Streaming services (Qobuz, Tidal, …) hand out short-TTL signed CDN URLs
+/// (Qobuz embeds `etsp=<unix-expiry>` + `hmac=`; the TTL is ~60 min). On a
+/// long Hi-Res track — or after a long pause — the URL expires mid-playback,
+/// so a client-triggered `Range: bytes=N-` resume against the stored URL fails
+/// at the connection/auth level (reqwest "error sending request", or 403/410).
+/// Re-fetching the SAME expired URL can never succeed; the proxy layer instead
+/// calls this to obtain a FRESH signed URL for the same file and resumes the
+/// Range request byte-exact.
+///
+/// The future resolves to a fresh `https://…` CDN URL for the same track and
+/// quality, or an error string. It is `Send` and captures only cheap
+/// clones (an `Arc` registry handle + the service name / track id / quality),
+/// so it can be invoked any number of times over the life of the session.
+pub type ReresolveFn = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamInfo {
     pub format: String,
@@ -51,6 +73,12 @@ pub struct StreamSession {
     /// DLNA renderer gets the metadata up front without seeking to the file end.
     pub faststart: std::sync::Mutex<Option<crate::audio::faststart::FaststartMap>>,
     pub proxy_url: Mutex<Option<String>>,
+    /// Re-resolver for the proxied CDN URL. Set for streaming proxy sessions
+    /// whose signed URL can expire (Qobuz/Tidal). When a proxied upstream
+    /// request fails to send or returns 403/410 (expired signature), the proxy
+    /// layer calls this to fetch a fresh signed URL and resumes byte-exact.
+    /// `None` for local files, radio, and non-expiring sources.
+    pub reresolve: Mutex<Option<ReresolveFn>>,
     pub track_title: Option<String>,
     pub track_artist: Option<String>,
     pub track_album: Option<String>,
@@ -77,6 +105,7 @@ impl StreamSession {
             file_path: Mutex::new(None),
             faststart: std::sync::Mutex::new(None),
             proxy_url: Mutex::new(None),
+            reresolve: Mutex::new(None),
             track_title: None,
             track_artist: None,
             track_album: None,
@@ -227,10 +256,25 @@ impl AudioStreamer {
         upstream_url: String,
         is_radio: bool,
     ) -> String {
+        self.create_proxy_session_with_reresolve(info, upstream_url, is_radio, None)
+            .await
+    }
+
+    /// Like `create_proxy_session` but also stores a re-resolver so the proxy
+    /// layer can obtain a fresh signed CDN URL when the stored one expires
+    /// mid-track (Qobuz/Tidal short-TTL signatures — #1136).
+    pub async fn create_proxy_session_with_reresolve(
+        &self,
+        info: StreamInfo,
+        upstream_url: String,
+        is_radio: bool,
+        reresolve: Option<ReresolveFn>,
+    ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut session = StreamSession::new(id.clone(), info, false, 128);
         session.is_radio = is_radio;
         *session.proxy_url.lock().await = Some(upstream_url);
+        *session.reresolve.lock().await = reresolve;
         self.sessions
             .lock()
             .await
