@@ -25,6 +25,12 @@ const MB_RATE_LIMIT_MS: u64 = 1100;
 /// Updates DB with ALL enriched fields using COALESCE to never
 /// overwrite existing data.
 pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse {
+    // Full-library MusicBrainz enrichment is the same class of operation as the
+    // premium-gated /system/enrich-metadata, so gate it the same way (premium
+    // unlimited, free daily quota) instead of leaving it a free bypass (#6).
+    if let Err(resp) = crate::routes::system::gate_enrichment(&state).await {
+        return resp;
+    }
     let task_id = uuid::Uuid::new_v4().to_string();
     let backend = state.backend.clone();
     let http_client = state.http_client.clone();

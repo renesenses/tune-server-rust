@@ -6,6 +6,9 @@ mod convert;
 mod database;
 mod diagnostics;
 mod enrich;
+// Shared enrichment quota/premium gate, reused by /library/enrich-all so the
+// full-library MusicBrainz path isn't a free bypass of the same operation.
+pub(crate) use enrich::gate_enrichment;
 mod import;
 mod playlist_hub;
 mod plugins;
