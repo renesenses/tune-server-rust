@@ -211,7 +211,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .collect();
 
         let track_repo = TrackRepo::with_backend(db.clone());
-        let artist_repo = ArtistRepo::with_backend(db.clone());
+        // Artist/album resolution during the batch loop is owned by the shared
+        // `TrackImporter` below; `album_repo` is still used post-scan for album
+        // stats and orphan cleanup.
         let album_repo = AlbumRepo::with_backend(db.clone());
 
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
@@ -279,8 +281,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .flatten()
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let mut albums_with_cover: std::collections::HashSet<i64> =
-            std::collections::HashSet::new();
+        // Shared artist/album resolver + Track builder, identical to the manual
+        // scan. Using it here fixes the drift where the auto/startup scan used a
+        // simpler resolver and could split a compilation (or an album with
+        // per-track soloists) into one album+cover per artist.
+        let mut importer =
+            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
         let mut inserted = 0u64;
         let mut updated = 0u64;
         let mut skipped = pre_skipped as u64;
@@ -305,6 +311,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     db.execute("BEGIN IMMEDIATE", &[]).ok();
                 }
 
+                importer.begin_batch(&batch);
+
                 for sf in &batch {
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
@@ -326,25 +334,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         }
                     }
 
-                    let Some((mut track, album_id)) = build_track_from_metadata_opts(
-                        sf,
-                        &artist_repo,
-                        &album_repo,
-                        quality_split,
-                    ) else {
+                    let Some((mut track, _album_id)) = importer.import(sf) else {
                         continue;
                     };
-
-                    if let Some(aid) = album_id
-                        && !albums_with_cover.contains(&aid)
-                        && let Some(hash) = tune_core::library::artwork::get_or_extract(
-                            std::path::Path::new(&sf.path),
-                            &cache_dir,
-                        )
-                    {
-                        album_repo.update_cover_path(aid, &hash).ok();
-                        albums_with_cover.insert(aid);
-                    }
 
                     // File already exists and has changed — collect for batch update
                     if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
@@ -441,6 +433,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             },
         );
 
+        // Album covers extracted during the scan (owned by the importer).
+        let artwork_extracted = importer.artwork_extracted();
+
         // Prune tracks whose files no longer exist on disk. The startup
         // auto-scan never removed stale rows, so files/folders deleted while
         // the server was stopped kept track_count>0 and their album was never
@@ -497,7 +492,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             inserted,
             updated,
             skipped,
-            artwork = albums_with_cover.len(),
+            artwork = artwork_extracted,
             orphan_albums,
             "auto_scan_complete"
         );
@@ -511,7 +506,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
-            "artwork_extracted": albums_with_cover.len(),
+            "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
         });
 
