@@ -11,6 +11,17 @@ use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Cooperative cancellation flag for the running library scan.
+///
+/// Set to `true` by `scan_cancel` (POST /system/scan/cancel) and polled by the
+/// batch loop before each batch, so "Arrêter le scan / Stop scan" actually
+/// stops the scan instead of being a no-op that only flipped `scan_status` to
+/// "idle" while the batch loop kept inserting for minutes (bug #1129). Reset to
+/// `false` at the start of every scan.
+static SCAN_CANCEL: AtomicBool = AtomicBool::new(false);
+
 /// True when an `album_artist` value denotes a various-artists compilation.
 fn is_various_artists(s: &str) -> bool {
     let l = s.trim().to_lowercase();
@@ -75,6 +86,8 @@ pub(super) async fn trigger_scan(
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
+    // Clear any leftover cancel request from a previous scan before starting.
+    SCAN_CANCEL.store(false, Ordering::SeqCst);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "scanning") {
         tracing::warn!(error = %e, "scan_status_set_failed");
@@ -190,6 +203,25 @@ pub(super) async fn trigger_scan(
             }),
         );
 
+        // Emit an immediate progress event so the panel shows "0 / total" and a
+        // determinate bar right away, instead of sitting at "0 fichiers, 0
+        // ajoutés" until the first batch commits — which on a large/slow NAS is
+        // many seconds and reads as "stuck / doing nothing" (bug #1129). The
+        // per-batch emit below only fires once `processed > 0`, so without this
+        // the very start of a scan has no counter at all.
+        event_bus.emit(
+            "library.scan.progress",
+            json!({
+                "phase": "files",
+                "scanned": pre_skipped,
+                "added": 0i64,
+                "total": total_discovered as i64,
+                "inserted": 0i64,
+                "updated": 0i64,
+                "skipped": pre_skipped,
+            }),
+        );
+
         // --- Batched scan + import ---
         // Parse metadata in parallel (rayon) in chunks of SCAN_BATCH_SIZE,
         // then batch-insert/update each chunk in its own transaction.
@@ -234,6 +266,15 @@ pub(super) async fn trigger_scan(
             true,
             batch_size,
             |batch, batch_idx, _total_files| {
+                // Cooperative cancellation: once "Stop scan" was pressed, skip
+                // all remaining batches so the loop drains quickly and the scan
+                // stops (bug #1129 — the old cancel only flipped scan_status but
+                // the batch loop kept inserting). Files for the remaining
+                // batches were already read by the walker, but no DB work is
+                // done for them.
+                if SCAN_CANCEL.load(Ordering::SeqCst) {
+                    return;
+                }
                 // Collect tracks to batch-insert and batch-update
                 let mut to_insert: Vec<tune_core::db::models::Track> =
                     Vec::with_capacity(batch.len());
@@ -1139,6 +1180,13 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoResponse {
+    // Signal the running batch loop to stop processing further batches. The scan
+    // task then drains its remaining (no-op) batches and runs its normal
+    // completion path, which resets scan_status to "idle" and emits
+    // library.scan.completed. Without this flag the endpoint only flipped the
+    // status string while the scan kept inserting for minutes (bug #1129).
+    SCAN_CANCEL.store(true, Ordering::SeqCst);
+    tracing::info!("scan_cancel_requested");
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "idle") {
         tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
