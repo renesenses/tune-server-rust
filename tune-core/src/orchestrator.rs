@@ -1385,10 +1385,28 @@ impl PlaybackOrchestrator {
                 32
             } else if src_fmt == AudioFormat::Dsd {
                 24
-            } else if oaat_needs_wav || dlna_needs_wav {
-                // OAAT endpoints and DLNA renderers that need WAV fallback:
-                // cap at 24-bit (LPCM max for most DLNA renderers).
+            } else if oaat_needs_wav {
+                // OAAT endpoints (Tune's own RPi renderers) parse the WAV fmt
+                // chunk and handle true 24-bit PCM: cap at 24-bit.
                 bit_depth.max(16).min(24)
+            } else if dlna_needs_wav {
+                // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
+                // 16-bit.
+                //
+                // The WAV we serve is advertised in DIDL with
+                // `DLNA.ORG_PN=LPCM` and Content-Type `audio/wav`.  The DLNA
+                // LPCM profile is standardised for 16-bit only (`audio/L16`);
+                // there is no standard PN for 24-bit LPCM.  Many hi-fi
+                // renderers (Ruark R3, LHC-62 — Yves, forum #1137) map that
+                // advertised profile to 16-bit and, fed genuine 24-bit PCM
+                // (3 bytes/sample), read misaligned samples and play SILENCE.
+                // 16-bit tracks worked because 16-bit WAV *is* valid LPCM.
+                //
+                // Renderers that can preserve hi-res advertise `audio/flac`
+                // and take the FLAC branch above (dlna_needs_wav = false), so
+                // this cap only ever applies to the LPCM fallback where
+                // guaranteed-audible 16-bit is the correct trade-off.
+                16
             } else if src_fmt == AudioFormat::Alac {
                 // ALAC: transcode to FLAC for DLNA (universally supported).
                 // FLAC max is 24-bit; cap at min(source_bd, 24) but at least 16.
@@ -1501,6 +1519,12 @@ impl PlaybackOrchestrator {
                 let tmp_path_clone = tmp_path.clone();
                 let target_fmt_str = target_format_str.clone();
                 let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
+                // Target bit depth chosen above (out_bd). For the generic DLNA
+                // WAV/LPCM fallback this is 16 (LPCM is a 16-bit-only profile);
+                // the decoded PCM must actually be reduced to 16-bit here, not
+                // merely relabelled — otherwise 24-bit samples are served under
+                // a 16-bit WAV header and the renderer plays silence (#1137).
+                let target_bd = out_bd;
                 let transcode_result =
                     tokio::time::timeout(std::time::Duration::from_secs(120), async move {
                         // 1. Decode source to PCM (blocking I/O)
@@ -1518,7 +1542,17 @@ impl PlaybackOrchestrator {
                         .map_err(|e| format!("decode task panic: {e}"))??;
 
                         let mut pcm_bytes = decoded.pcm_bytes();
-                        let actual_bd = decoded.bit_depth;
+                        let mut actual_bd = decoded.bit_depth;
+
+                        // 1a. Reduce bit depth to the negotiated target when the
+                        // source is deeper (e.g. 24-bit ALAC/FLAC → 16-bit LPCM
+                        // for a DLNA renderer that only supports 16-bit LPCM).
+                        if target_bd < actual_bd {
+                            pcm_bytes = crate::audio::decode::convert_pcm_bytes(
+                                &pcm_bytes, actual_bd, target_bd,
+                            );
+                            actual_bd = target_bd;
+                        }
 
                         // 1b. Apply EQ if enabled for this zone
                         if let Some(mut eq) = eq_profile {
@@ -2403,6 +2437,12 @@ impl PlaybackOrchestrator {
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
             let eq_profile_pretranscode = self.load_eq_processor(req.zone_id, sr, 2);
+            // When falling back to WAV/LPCM (renderer has no audio/flac sink),
+            // the served WAV is advertised with `DLNA.ORG_PN=LPCM`, a 16-bit-only
+            // DLNA profile. A 24-bit Hi-Res stream (Tidal/Qobuz) served under it
+            // plays SILENCE on renderers like the Ruark R3 / LHC-62 (Yves,
+            // #1137). Cap the LPCM fallback at 16-bit; FLAC keeps full hi-res.
+            let dash_is_wav = dash_enc_format == "wav";
             let transcode_result = tokio::task::spawn_blocking(move || {
                 let decoded = crate::audio::decode::decode_to_pcm(
                     &unique_path_clone,
@@ -2413,7 +2453,12 @@ impl PlaybackOrchestrator {
                 )?;
 
                 let mut pcm_bytes = decoded.pcm_bytes();
-                let actual_bd = decoded.bit_depth;
+                let mut actual_bd = decoded.bit_depth;
+
+                if dash_is_wav && actual_bd > 16 {
+                    pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                    actual_bd = 16;
+                }
 
                 if let Some(mut eq) = eq_profile_pretranscode {
                     eq.process_pcm(&mut pcm_bytes, actual_bd);
@@ -2461,7 +2506,10 @@ impl PlaybackOrchestrator {
                         format: dash_enc_format.into(),
                         mime_type: dash_mime.into(),
                         sample_rate: sr,
-                        bit_depth: bd,
+                        // Use the *encoded* depth (`actual_bd`), which the WAV
+                        // fallback caps at 16-bit — otherwise DIDL/WAV would
+                        // advertise 24-bit LPCM and the renderer plays silence.
+                        bit_depth: actual_bd,
                         channels: 2,
                         file_size: Some(file_size),
                         duration_ms: None,
@@ -2571,8 +2619,18 @@ impl PlaybackOrchestrator {
                         0.0,
                         0.0,
                     )?;
-                    let pcm_bytes = decoded.pcm_bytes();
-                    let actual_bd = decoded.bit_depth;
+                    let mut pcm_bytes = decoded.pcm_bytes();
+                    let mut actual_bd = decoded.bit_depth;
+
+                    // WAV/LPCM fallback is a 16-bit-only DLNA profile
+                    // (DLNA.ORG_PN=LPCM); a >16-bit source served under it plays
+                    // silence on strict renderers (#1137). Cap to 16-bit for
+                    // WAV; FLAC keeps full depth.
+                    if aac_enc_format == "wav" && actual_bd > 16 {
+                        pcm_bytes =
+                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                        actual_bd = 16;
+                    }
 
                     // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
                     //    FLAC-rejecting renderer (Revox/Denon/Marantz).
@@ -2621,7 +2679,8 @@ impl PlaybackOrchestrator {
                             format: aac_enc_format.into(),
                             mime_type: aac_mime.into(),
                             sample_rate: sr,
-                            bit_depth: bd,
+                            // Encoded depth: WAV fallback is capped to 16-bit.
+                            bit_depth: actual_bd,
                             channels: 2,
                             file_size: Some(file_size),
                             duration_ms: None,
@@ -2733,10 +2792,22 @@ impl PlaybackOrchestrator {
                             0.0,
                             0.0,
                         )?;
-                        let pcm_bytes = decoded.pcm_bytes();
-                        let actual_bd = decoded.bit_depth;
+                        let mut pcm_bytes = decoded.pcm_bytes();
+                        let mut actual_bd = decoded.bit_depth;
                         let actual_sr = decoded.sample_rate;
                         let actual_ch = decoded.channels;
+
+                        // The renderer rejected FLAC, so we serve WAV/LPCM
+                        // (DLNA.ORG_PN=LPCM), a 16-bit-only DLNA profile. A
+                        // 24-bit Hi-Res FLAC (Qobuz/Tidal) served under it plays
+                        // SILENCE on strict renderers like the Ruark R3 / LHC-62
+                        // (Yves, #1137). Cap to 16-bit so the WAV matches the
+                        // advertised LPCM profile and is audible.
+                        if actual_bd > 16 {
+                            pcm_bytes =
+                                crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                            actual_bd = 16;
+                        }
 
                         // 3. Encode to WAV
                         let rt = tokio::runtime::Handle::try_current()
