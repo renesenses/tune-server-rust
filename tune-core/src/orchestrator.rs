@@ -4364,10 +4364,13 @@ impl PlaybackOrchestrator {
             }
         };
 
-        let result = self.play(req).await?;
+        // Set the queue index BEFORE play() emits "started" so the event
+        // carries the correct queue_position and the client updates its
+        // highlight without refetching the whole queue (#1096).
         self.playback
             .update_queue_info(zone_id, position, total)
             .await;
+        let result = self.play(req).await?;
         Ok(result)
     }
 
@@ -4431,6 +4434,12 @@ impl PlaybackOrchestrator {
             }
         };
 
+        // Set the queue index BEFORE update_now_playing emits "track_changed"
+        // so the event carries the new queue_position — the client updates its
+        // highlight/badge without refetching the whole queue (#1096).
+        self.playback
+            .update_queue_info(zone_id, position, total)
+            .await;
         // Use update_now_playing (not play) to avoid bumping track_generation —
         // the poller must keep its gapless_cooldown intact so it doesn't falsely
         // detect track-end on renderers that briefly report Stopped during
@@ -4438,9 +4447,6 @@ impl PlaybackOrchestrator {
         self.playback.update_now_playing(zone_id, np).await;
         self.playback.update_position(zone_id, 0).await;
         self.playback.emit_position(zone_id, 0);
-        self.playback
-            .update_queue_info(zone_id, position, total)
-            .await;
         Ok(())
     }
 
