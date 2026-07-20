@@ -400,6 +400,18 @@ fn daemon_exe_name() -> String {
     format!("{DAEMON_BINARY}{}", std::env::consts::EXE_SUFFIX)
 }
 
+/// A daemon candidate counts only if it is a real, non-empty file. The arm64
+/// Docker image ships a **0-byte placeholder** (`touch dist/arm64/airplay-daemon`)
+/// so AirPlay 2 is meant to fall back to legacy AirPlay 1 there. An existence-only
+/// check would pick that empty file, then fail to exec it at playback time —
+/// breaking AirPlay with NO fallback (worse than legacy). Requiring a non-zero
+/// size makes `daemon_available()` correctly report "no daemon" on arm64. (#700)
+fn is_usable_daemon(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
 /// Resolve the daemon binary given the directory of the running executable.
 /// Pure (no PATH lookup) so it can be unit-tested. Checks, in order:
 ///   1. next to the tune-server executable — how the release archives bundle it,
@@ -410,7 +422,7 @@ fn daemon_exe_name() -> String {
 fn resolve_daemon_path(exe_dir: Option<&std::path::Path>, exe_name: &str) -> Option<String> {
     if let Some(dir) = exe_dir {
         let candidate = dir.join(exe_name);
-        if candidate.exists() {
+        if is_usable_daemon(&candidate) {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }
@@ -418,11 +430,11 @@ fn resolve_daemon_path(exe_dir: Option<&std::path::Path>, exe_name: &str) -> Opt
         format!("/usr/local/bin/{exe_name}"),
         format!("/opt/tune-server/{exe_name}"),
     ] {
-        if std::path::Path::new(&abs).exists() {
+        if is_usable_daemon(std::path::Path::new(&abs)) {
             return Some(abs);
         }
     }
-    if std::path::Path::new(exe_name).exists() {
+    if is_usable_daemon(std::path::Path::new(exe_name)) {
         return Some(exe_name.to_string());
     }
     None
@@ -484,6 +496,24 @@ mod daemon_path_tests {
         // No exe dir + not in CWD/system dirs → None (caller falls back to PATH).
         std::fs::remove_file(&bin).unwrap();
         assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_placeholder_is_not_resolved() {
+        // arm64 Docker ships a 0-byte placeholder so AirPlay 2 falls back to
+        // legacy. An existence-only check would pick it and fail to exec (#700):
+        // a zero-length candidate must be treated as "no daemon".
+        let dir =
+            std::env::temp_dir().join(format!("tune_daemon_empty_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_name = daemon_exe_name();
+        let bin = dir.join(&exe_name);
+        std::fs::write(&bin, b"").unwrap(); // 0 bytes, like `touch`
+
+        assert!(!is_usable_daemon(&bin));
+        assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
