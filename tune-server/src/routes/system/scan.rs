@@ -621,83 +621,32 @@ pub(super) async fn trigger_scan(
                         }
                     }
 
-                    let title = meta.title.clone().unwrap_or_else(|| {
-                        std::path::Path::new(&sf.path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    });
-
                     // File already exists and has changed — collect for batch update
-                    // (unchanged files were already skipped by the early-exit above)
+                    // (unchanged files were already skipped by the early-exit above).
+                    // Field mapping is shared with the auto/watcher scans via
+                    // `scan_import::build_track_row`.
                     if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
-                        let mut track = tune_core::db::models::Track::new(title);
+                        let mut track = crate::scan_import::build_track_row(
+                            meta,
+                            sf,
+                            album_id,
+                            artist_id,
+                            track_artist_name,
+                        );
                         track.id = Some(existing_id);
-                        track.album_id = album_id;
-                        track.artist_id = artist_id;
-                        track.artist_name = Some(track_artist_name.to_string());
-                        track.album_artist = meta.album_artist.clone();
-                        track.album_title = meta.album.clone();
-                        track.disc_number = meta.disc_number.unwrap_or(1) as i32;
-                        track.disc_subtitle = meta.disc_subtitle.clone();
-                        track.track_number = meta.track_number.unwrap_or(0) as i32;
-                        track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
-                        track.file_path = Some(sf.path.clone());
-                        track.format = meta.format.clone();
-                        track.sample_rate = meta.sample_rate.map(|s| s as i32);
-                        track.bit_depth = meta.bit_depth.map(|b| b as i32);
-                        track.channels = meta.channels.unwrap_or(2) as i32;
-                        track.file_size = Some(sf.file_size as i64);
-                        track.file_mtime = Some(sf.mtime as f64);
-                        track.audio_hash = sf.audio_hash.clone();
-                        track.genre = meta.genre.clone();
-                        track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
-                        track.composer = meta
-                            .credits
-                            .iter()
-                            .find(|c| c.role == "composer")
-                            .map(|c| c.name.clone());
-                        track.year = meta.year.map(|y| y as i32);
-                        track.bpm = meta.bpm;
-                        track.label = meta.label.clone();
-                        track.isrc = meta.isrc.clone();
-                        track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
-                        track.comments = meta.comment.clone();
                         to_update.push(track);
                         continue;
                     }
 
-                    // New file -- collect for batch insert
-                    let mut track = tune_core::db::models::Track::new(title);
-                    track.album_id = album_id;
-                    track.artist_id = artist_id;
-                    track.artist_name = Some(track_artist_name.to_string());
-                    track.album_artist = meta.album_artist.clone();
-                    track.album_title = meta.album.clone();
-                    track.disc_number = meta.disc_number.unwrap_or(1) as i32;
-                    track.track_number = meta.track_number.unwrap_or(0) as i32;
-                    track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
-                    track.file_path = Some(sf.path.clone());
-                    track.format = meta.format.clone();
-                    track.sample_rate = meta.sample_rate.map(|s| s as i32);
-                    track.bit_depth = meta.bit_depth.map(|b| b as i32);
-                    track.channels = meta.channels.unwrap_or(2) as i32;
-                    track.file_size = Some(sf.file_size as i64);
-                    track.file_mtime = Some(sf.mtime as f64);
-                    track.audio_hash = sf.audio_hash.clone();
-                    track.genre = meta.genre.clone();
-                    track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
-                    track.composer = meta
-                        .credits
-                        .iter()
-                        .find(|c| c.role == "composer")
-                        .map(|c| c.name.clone());
-                    track.year = meta.year.map(|y| y as i32);
-                    track.bpm = meta.bpm;
-                    track.label = meta.label.clone();
-                    track.isrc = meta.isrc.clone();
-                    track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
-                    track.comments = meta.comment.clone();
+                    // New file -- collect for batch insert (now also carries
+                    // disc_subtitle, previously dropped by this inline mapping).
+                    let track = crate::scan_import::build_track_row(
+                        meta,
+                        sf,
+                        album_id,
+                        artist_id,
+                        track_artist_name,
+                    );
                     to_insert.push(track);
                 }
 
@@ -1260,26 +1209,6 @@ fn chrono_now() -> String {
 /// If the structured `genres` vec is non-empty, serialize it as JSON.
 /// Otherwise, fall back to the primary `genre` string and wrap it as a
 /// single-element array so the column is never NULL when genre data exists.
-fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
-    if !genres.is_empty() {
-        Some(serde_json::to_string(genres).unwrap_or_default())
-    } else if let Some(g) = genre {
-        if g.is_empty() {
-            None
-        } else {
-            // Split in case genre contains separators (legacy data)
-            let split = tune_core::metadata::split_genre_tag(g);
-            if split.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&split).unwrap_or_default())
-            }
-        }
-    } else {
-        None
-    }
-}
-
 pub(super) async fn scan_report() -> impl IntoResponse {
     let report_path = std::env::var("TUNE_DB_PATH")
         .unwrap_or_else(|_| "tune.db".into())

@@ -157,38 +157,10 @@ pub fn build_track_from_metadata_opts(
             .ok();
     }
 
-    let title = meta.title.clone().unwrap_or_else(|| {
-        std::path::Path::new(&sf.path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default()
-    });
-
-    let mut track = Track::new(title);
-    track.album_id = album_id;
-    track.artist_id = artist_id;
-    track.artist_name = Some(track_artist_name.to_string());
-    track.album_artist = meta.album_artist.clone();
-    track.album_title = meta.album.clone();
-    track.disc_number = meta.disc_number.unwrap_or(1) as i32;
-    track.disc_subtitle = meta.disc_subtitle.clone();
-    track.track_number = meta.track_number.unwrap_or(0) as i32;
-    track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
-    track.file_path = Some(sf.path.clone());
-    track.format = meta.format.clone();
-    track.sample_rate = meta.sample_rate.map(|s| s as i32);
-    track.bit_depth = meta.bit_depth.map(|b| b as i32);
-    track.channels = meta.channels.unwrap_or(2) as i32;
-    track.file_size = Some(sf.file_size as i64);
-    track.file_mtime = Some(sf.mtime as f64);
-    track.audio_hash = sf.audio_hash.clone();
-    track.genre = meta.genre.clone();
-    track.year = meta.year.map(|y| y as i32);
-    track.label = meta.label.clone();
-    track.isrc = meta.isrc.clone();
-    track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
-    track.comments = meta.comment.clone();
-
+    // Field mapping is shared with the manual scan via `scan_import` — this
+    // path now also populates `genres` and `composer`, which the old inline
+    // mapping here dropped.
+    let track = crate::scan_import::build_track_row(meta, sf, album_id, artist_id, track_artist_name);
     Some((track, album_id))
 }
 
