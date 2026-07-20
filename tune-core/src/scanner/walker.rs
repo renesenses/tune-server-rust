@@ -47,6 +47,22 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
 
+/// The dedicated I/O thread pool for tag reads, built once for the whole
+/// process. Returns `None` (→ caller falls back to the default rayon pool) if
+/// the pool couldn't be built. Reusing it avoids spawning and tearing down
+/// SCAN_IO_CONCURRENCY OS threads on every scan pass.
+fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(SCAN_IO_CONCURRENCY)
+            .thread_name(|i| format!("scan-io-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
     "alac", "ape", "iso",
@@ -477,13 +493,10 @@ pub fn scan_files_batched(
     aggregate.total_files = total;
 
     // Dedicated high-concurrency pool for the I/O-bound tag reads (see
-    // SCAN_IO_CONCURRENCY). Built once and reused across batches. If the pool
-    // fails to build, fall back to the default rayon pool.
-    let io_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(SCAN_IO_CONCURRENCY)
-        .thread_name(|i| format!("scan-io-{i}"))
-        .build()
-        .ok();
+    // SCAN_IO_CONCURRENCY). Built once per process and reused by every scan
+    // instead of spawning/tearing down 32 OS threads on each scan pass. Falls
+    // back to the default rayon pool if it couldn't be built.
+    let io_pool = scan_io_pool();
 
     for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
         // Parse metadata in parallel within this chunk
@@ -540,7 +553,7 @@ pub fn scan_files_batched(
         // Run the I/O-bound reads on the dedicated high-concurrency pool so many
         // per-file latencies overlap; fall back to the default pool if the
         // dedicated one couldn't be built.
-        let batch: Vec<ScannedFile> = match &io_pool {
+        let batch: Vec<ScannedFile> = match io_pool {
             Some(pool) => pool.install(read_batch),
             None => read_batch(),
         };
