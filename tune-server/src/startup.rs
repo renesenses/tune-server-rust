@@ -280,24 +280,16 @@ async fn restore_playback_positions(state: &AppState) {
             }
             let np = if let Some(track_id) = zone.last_track_id {
                 if let Ok(Some(track)) = track_repo.get(track_id) {
+                    // Restore the source/source_id from the *zone* row (the
+                    // saved playback origin), not the library row — a track may
+                    // have been played from a streaming source.
                     tune_core::playback::NowPlaying {
-                        track_id: Some(track_id),
-                        title: track.title.clone(),
-                        artist_name: track.artist_name.clone(),
-                        album_title: track.album_title.clone(),
-                        cover_path: track.cover_path.clone(),
-                        duration_ms: track.duration_ms,
                         source: zone
                             .last_track_source
                             .clone()
                             .unwrap_or_else(|| "local".into()),
                         source_id: zone.last_track_source_id.clone(),
-                        stream_id: None,
-                        format: track.format.clone(),
-                        sample_rate: track.sample_rate.map(|v| v as u32),
-                        bit_depth: track.bit_depth.map(|v| v as u32),
-                        genre: track.genre.clone(),
-                        year: track.year,
+                        ..tune_core::playback::NowPlaying::from_track(&track)
                     }
                 } else {
                     continue;
