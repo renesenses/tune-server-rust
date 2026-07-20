@@ -313,11 +313,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut updated = 0u64;
         let mut skipped = pre_skipped as u64;
 
+        // Progress telemetry for the auto/startup scan (parity with the manual
+        // scan) so the UI shows a live bar during it too.
+        let scan_total = files_to_scan.len() as i64;
+        let scan_timer_start = std::time::Instant::now();
+        let mut last_progress_emit = scan_timer_start;
+
         let stats = tune_core::scanner::walker::scan_files_batched(
             &files_to_scan,
             true,
             tune_core::scanner::walker::SCAN_BATCH_SIZE,
-            |batch, _batch_idx, _total_files| {
+            |batch, batch_idx, _total_files| {
                 let mut to_insert: Vec<Track> = Vec::with_capacity(batch.len());
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
 
@@ -426,6 +432,39 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 if db.engine() == tune_core::db::engine::Engine::Sqlite {
                     db.execute("COMMIT", &[]).ok();
+                }
+
+                // Emit scan progress after each batch (throttled every other
+                // batch or 2s), mirroring the manual scan's payload/phase.
+                let processed = (inserted + updated + skipped) as i64;
+                if processed > 0
+                    && (batch_idx % 2 == 0
+                        || last_progress_emit.elapsed() >= std::time::Duration::from_secs(2))
+                {
+                    last_progress_emit = std::time::Instant::now();
+                    let elapsed_secs = scan_timer_start.elapsed().as_secs_f64().max(0.001);
+                    let tracks_per_second = processed as f64 / elapsed_secs;
+                    let remaining = (scan_total - processed).max(0);
+                    let eta_seconds = if tracks_per_second > 0.0 {
+                        (remaining as f64 / tracks_per_second) as u64
+                    } else {
+                        0
+                    };
+                    event_bus.emit(
+                        "library.scan.progress",
+                        serde_json::json!({
+                            "phase": "files",
+                            "scanned": processed,
+                            "added": inserted,
+                            "total": scan_total,
+                            "batch": batch_idx,
+                            "inserted": inserted,
+                            "updated": updated,
+                            "skipped": skipped,
+                            "tracks_per_second": (tracks_per_second * 10.0).round() / 10.0,
+                            "eta_seconds": eta_seconds,
+                        }),
+                    );
                 }
             },
         );

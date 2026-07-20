@@ -760,6 +760,7 @@ pub(super) async fn trigger_scan(
                     event_bus.emit(
                         "library.scan.progress",
                         json!({
+                            "phase": "files",
                             "scanned": processed,
                             "added": inserted,
                             "total": total,
@@ -804,7 +805,7 @@ pub(super) async fn trigger_scan(
                 tracing::info!(pruned, "post_scan_stale_tracks_removed");
                 event_bus.emit(
                     "library.scan.progress",
-                    json!({ "pruned": pruned }),
+                    json!({ "phase": "prune", "pruned": pruned }),
                 );
             }
         }
@@ -962,7 +963,7 @@ pub(super) async fn trigger_scan(
             tracing::info!(covers_backfilled, "post_scan_embedded_covers_backfilled");
             event_bus.emit(
                 "library.scan.progress",
-                json!({ "artwork_backfilled": covers_backfilled }),
+                json!({ "phase": "artwork", "artwork_backfilled": covers_backfilled }),
             );
         }
 
