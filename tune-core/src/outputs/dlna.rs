@@ -992,4 +992,47 @@ mod tests {
         assert!(didl_1.contains("Track 1"));
         assert!(didl_2.contains("Track 2"));
     }
+
+    #[test]
+    fn native_flac_next_track_didl_is_complete() {
+        // #1132 (native FLAC): the gapless SetNextAVTransportURI DIDL must carry
+        // the SAME full metadata as the initial SetAVTransportURI item — title,
+        // artist, album, protocolInfo (format), duration AND a size that matches
+        // the bytes the renderer will actually receive. A queued item missing
+        // any of these makes the Marantz ND 8006 lose the format/duration/
+        // progress display when it transitions to the next track. Both the
+        // current-track and next-track paths build via `didl_metadata`, so a
+        // single assertion covers the queued item too.
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/track2.flac",
+                mime_type: "audio/flac",
+                title: Some("So What"),
+                artist: Some("Miles Davis"),
+                album: Some("Kind of Blue"),
+                duration_ms: Some(562_000),
+                file_size: Some(50_000_000),
+                sample_rate: Some(96_000),
+                bit_depth: Some(24),
+                channels: Some(2),
+                ..Default::default()
+            },
+            "2",
+        );
+        assert!(didl.contains("So What"), "title present");
+        assert!(didl.contains("Miles Davis"), "artist present");
+        assert!(didl.contains("Kind of Blue"), "album present");
+        assert!(didl.contains("audio/flac"), "format/protocolInfo present");
+        assert!(didl.contains("DLNA.ORG_OP=01"), "DLNA flags present");
+        assert!(
+            didl.contains("duration=\"0:09:22.000\""),
+            "duration present on the queued FLAC item"
+        );
+        assert!(
+            didl.contains("size=\"50000000\""),
+            "size present on the queued FLAC item"
+        );
+        assert!(didl.contains("sampleFrequency=\"96000\""));
+        assert!(didl.contains("bitsPerSample=\"24\""));
+    }
 }
