@@ -1475,6 +1475,21 @@ impl PlaybackOrchestrator {
                 let fp = file_path.clone();
                 let ev_bus = self.event_bus.clone();
                 let zone_id = req.zone_id;
+                // EQ alters the encoded bytes and is not part of the cache key,
+                // so a zone with an active EQ never uses the cache (always fresh).
+                let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
+                let cache_path_opt = if eq_profile.is_some() {
+                    None
+                } else {
+                    crate::transcode_cache::cache_path(
+                        &file_path, &out_ext, out_sr, out_bd, channels,
+                    )
+                };
+                // The transcode always writes to a fresh `tune-transcode-*` file
+                // (subject to the normal cleanup); on success it is atomically
+                // renamed into the cache. A crash mid-transcode therefore can
+                // never leave a partial file under a cache name that a later hit
+                // would serve.
                 let tmp_path = std::env::temp_dir()
                     .join(format!(
                         "tune-transcode-{}.{}",
@@ -1508,185 +1523,232 @@ impl PlaybackOrchestrator {
                     return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
                 }
 
-                info!(
-                    file = %fp,
-                    tmp = %tmp_path,
-                    target = %target_format_str,
-                    sample_rate = out_sr,
-                    bit_depth = out_bd,
-                    "transcode_to_temp_file_start"
-                );
+                // Cache hit: an identical rendition already exists on disk —
+                // serve it and skip the entire decode/encode (Yves: ~30s → instant
+                // on replay / superseded burst).
+                if let Some(cp) = cache_path_opt
+                    .as_ref()
+                    .filter(|cp| crate::transcode_cache::is_hit(cp))
+                {
+                    crate::transcode_cache::touch(cp);
+                    let file_size = std::fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
+                    info!(file = %file_path, cache = %cp, file_size, "transcode_cache_hit");
+                    let file_info = StreamInfo {
+                        format: out_ext.clone(),
+                        mime_type: out_mime.clone(),
+                        sample_rate: out_sr,
+                        bit_depth: out_bd,
+                        channels,
+                        file_size: Some(file_size),
+                        duration_ms: Some(track.duration_ms as u64),
+                        ..Default::default()
+                    };
+                    let session_id = self
+                        .streamer
+                        .create_file_session(file_info, cp.clone(), false)
+                        .await;
+                    (
+                        session_id,
+                        out_mime,
+                        out_ext,
+                        Some(file_size),
+                        Some(out_sr),
+                        Some(out_bd as u32),
+                        Some(channels as u32),
+                    )
+                } else {
+                    info!(
+                        file = %fp,
+                        tmp = %tmp_path,
+                        target = %target_format_str,
+                        sample_rate = out_sr,
+                        bit_depth = out_bd,
+                        "transcode_to_temp_file_start"
+                    );
 
-                let tmp_path_clone = tmp_path.clone();
-                let target_fmt_str = target_format_str.clone();
-                let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
-                // Target bit depth chosen above (out_bd). For the generic DLNA
-                // WAV/LPCM fallback this is 16 (LPCM is a 16-bit-only profile);
-                // the decoded PCM must actually be reduced to 16-bit here, not
-                // merely relabelled — otherwise 24-bit samples are served under
-                // a 16-bit WAV header and the renderer plays silence (#1137).
-                let target_bd = out_bd;
-                let transcode_result =
-                    tokio::time::timeout(std::time::Duration::from_secs(120), async move {
-                        // 1. Decode source to PCM (blocking I/O)
-                        let fp_clone = fp.clone();
-                        let decoded = tokio::task::spawn_blocking(move || {
-                            crate::audio::decode::decode_to_pcm(
-                                &fp_clone,
-                                Some(out_sr),
-                                Some(channels as u32),
-                                0.0,
-                                0.0,
-                            )
-                        })
-                        .await
-                        .map_err(|e| format!("decode task panic: {e}"))??;
+                    let tmp_path_clone = tmp_path.clone();
+                    let target_fmt_str = target_format_str.clone();
+                    // Target bit depth chosen above (out_bd). For the generic DLNA
+                    // WAV/LPCM fallback this is 16 (LPCM is a 16-bit-only profile);
+                    // the decoded PCM must actually be reduced to 16-bit here, not
+                    // merely relabelled — otherwise 24-bit samples are served under
+                    // a 16-bit WAV header and the renderer plays silence (#1137).
+                    let target_bd = out_bd;
+                    let transcode_result =
+                        tokio::time::timeout(std::time::Duration::from_secs(120), async move {
+                            // 1. Decode source to PCM (blocking I/O)
+                            let fp_clone = fp.clone();
+                            let decoded = tokio::task::spawn_blocking(move || {
+                                crate::audio::decode::decode_to_pcm(
+                                    &fp_clone,
+                                    Some(out_sr),
+                                    Some(channels as u32),
+                                    0.0,
+                                    0.0,
+                                )
+                            })
+                            .await
+                            .map_err(|e| format!("decode task panic: {e}"))??;
 
-                        let mut pcm_bytes = decoded.pcm_bytes();
-                        let mut actual_bd = decoded.bit_depth;
+                            let mut pcm_bytes = decoded.pcm_bytes();
+                            let mut actual_bd = decoded.bit_depth;
 
-                        // 1a. Reduce bit depth to the negotiated target when the
-                        // source is deeper (e.g. 24-bit ALAC/FLAC → 16-bit LPCM
-                        // for a DLNA renderer that only supports 16-bit LPCM).
-                        if target_bd < actual_bd {
-                            pcm_bytes = crate::audio::decode::convert_pcm_bytes(
-                                &pcm_bytes, actual_bd, target_bd,
+                            // 1a. Reduce bit depth to the negotiated target when the
+                            // source is deeper (e.g. 24-bit ALAC/FLAC → 16-bit LPCM
+                            // for a DLNA renderer that only supports 16-bit LPCM).
+                            if target_bd < actual_bd {
+                                pcm_bytes = crate::audio::decode::convert_pcm_bytes(
+                                    &pcm_bytes, actual_bd, target_bd,
+                                );
+                                actual_bd = target_bd;
+                            }
+
+                            // 1b. Apply EQ if enabled for this zone
+                            if let Some(mut eq) = eq_profile {
+                                eq.process_pcm(&mut pcm_bytes, actual_bd);
+                            }
+
+                            // 2. Encode to target format (async — no block_on needed)
+                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                                &target_fmt_str,
+                                decoded.sample_rate,
+                                actual_bd as u32,
+                                decoded.channels,
                             );
-                            actual_bd = target_bd;
-                        }
+                            encoder.start().await?;
+                            encoder.write(&pcm_bytes).await?;
+                            let encoded_data = encoder.finish().await?;
 
-                        // 1b. Apply EQ if enabled for this zone
-                        if let Some(mut eq) = eq_profile {
-                            eq.process_pcm(&mut pcm_bytes, actual_bd);
-                        }
+                            // 3. Write to temp file (blocking I/O)
+                            let tmp_write = tmp_path_clone.clone();
+                            let encoded_clone = encoded_data.clone();
+                            tokio::task::spawn_blocking(move || {
+                                std::fs::write(&tmp_write, &encoded_clone)
+                                    .map_err(|e| format!("write temp file: {e}"))
+                            })
+                            .await
+                            .map_err(|e| format!("write task panic: {e}"))??;
 
-                        // 2. Encode to target format (async — no block_on needed)
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            &target_fmt_str,
-                            decoded.sample_rate,
-                            actual_bd as u32,
-                            decoded.channels,
-                        );
-                        encoder.start().await?;
-                        encoder.write(&pcm_bytes).await?;
-                        let encoded_data = encoder.finish().await?;
-
-                        // 3. Write to temp file (blocking I/O)
-                        let tmp_write = tmp_path_clone.clone();
-                        let encoded_clone = encoded_data.clone();
-                        tokio::task::spawn_blocking(move || {
-                            std::fs::write(&tmp_write, &encoded_clone)
-                                .map_err(|e| format!("write temp file: {e}"))
+                            let file_size = encoded_data.len() as u64;
+                            Ok::<(u64, Vec<u8>, u16), String>((file_size, pcm_bytes, actual_bd))
                         })
-                        .await
-                        .map_err(|e| format!("write task panic: {e}"))??;
+                        .await;
 
-                        let file_size = encoded_data.len() as u64;
-                        Ok::<(u64, Vec<u8>, u16), String>((file_size, pcm_bytes, actual_bd))
-                    })
-                    .await;
-
-                match transcode_result {
-                    Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
-                        if file_size < 1024 {
-                            warn!(
+                    match transcode_result {
+                        Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
+                            if file_size < 1024 {
+                                warn!(
+                                    file = %file_path,
+                                    file_size,
+                                    "transcode_produced_empty_file — source may be corrupted or encrypted"
+                                );
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(
+                                    "transcode produced empty file (corrupted source?)".into()
+                                );
+                            }
+                            // Promote the completed file into the cache (atomic rename
+                            // within the temp dir) so the next identical request is a
+                            // hit. If we're not caching, or the rename fails, serve the
+                            // freshly-written file as before.
+                            let serve_path = match cache_path_opt.as_ref() {
+                                Some(cp) if std::fs::rename(&tmp_path, cp).is_ok() => {
+                                    tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                                    cp.clone()
+                                }
+                                _ => tmp_path.clone(),
+                            };
+                            info!(
                                 file = %file_path,
+                                tmp = %serve_path,
                                 file_size,
-                                "transcode_produced_empty_file — source may be corrupted or encrypted"
+                                "transcode_to_temp_file_complete"
                             );
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err("transcode produced empty file (corrupted source?)".into());
-                        }
-                        info!(
-                            file = %file_path,
-                            tmp = %tmp_path,
-                            file_size,
-                            "transcode_to_temp_file_complete"
-                        );
 
-                        // Emit audio levels in the background
-                        if let Some(ref bus) = ev_bus {
-                            let bus = bus.clone();
-                            let actual_ch = channels;
-                            let sr = out_sr;
-                            tokio::spawn(async move {
-                                let (levels_tx, mut levels_rx) =
-                                    tokio::sync::mpsc::unbounded_channel::<
-                                        crate::audio::levels::AudioLevels,
-                                    >();
-                                let bus_clone = bus.clone();
+                            // Emit audio levels in the background
+                            if let Some(ref bus) = ev_bus {
+                                let bus = bus.clone();
+                                let actual_ch = channels;
+                                let sr = out_sr;
                                 tokio::spawn(async move {
-                                    while let Some(lvl) = levels_rx.recv().await {
-                                        bus_clone.emit(
-                                            "playback.audio_levels",
-                                            serde_json::json!({
-                                                "zone_id": zone_id,
-                                                "rms_left_db": lvl.rms_left_db(),
-                                                "rms_right_db": lvl.rms_right_db(),
-                                                "peak_left_db": lvl.peak_left_db(),
-                                                "peak_right_db": lvl.peak_right_db(),
-                                                "rms_left": lvl.rms_left,
-                                                "rms_right": lvl.rms_right,
-                                                "spectrum": lvl.spectrum,
-                                            }),
-                                        );
-                                    }
-                                });
-                                tokio::task::spawn_blocking(move || {
-                                    for chunk in pcm_bytes.chunks(32768) {
-                                        if levels_tx
-                                            .send(crate::audio::levels::compute_levels(
-                                                chunk, actual_bd, actual_ch, sr,
-                                            ))
-                                            .is_err()
-                                        {
-                                            break;
+                                    let (levels_tx, mut levels_rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<
+                                            crate::audio::levels::AudioLevels,
+                                        >();
+                                    let bus_clone = bus.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(lvl) = levels_rx.recv().await {
+                                            bus_clone.emit(
+                                                "playback.audio_levels",
+                                                serde_json::json!({
+                                                    "zone_id": zone_id,
+                                                    "rms_left_db": lvl.rms_left_db(),
+                                                    "rms_right_db": lvl.rms_right_db(),
+                                                    "peak_left_db": lvl.peak_left_db(),
+                                                    "peak_right_db": lvl.peak_right_db(),
+                                                    "rms_left": lvl.rms_left,
+                                                    "rms_right": lvl.rms_right,
+                                                    "spectrum": lvl.spectrum,
+                                                }),
+                                            );
                                         }
-                                    }
-                                })
-                                .await
-                                .ok();
-                            });
+                                    });
+                                    tokio::task::spawn_blocking(move || {
+                                        for chunk in pcm_bytes.chunks(32768) {
+                                            if levels_tx
+                                                .send(crate::audio::levels::compute_levels(
+                                                    chunk, actual_bd, actual_ch, sr,
+                                                ))
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    })
+                                    .await
+                                    .ok();
+                                });
+                            }
+
+                            // Create a file session — HTTP handler serves with
+                            // Content-Length and Range support.
+                            let file_info = StreamInfo {
+                                format: out_ext.clone(),
+                                mime_type: out_mime.clone(),
+                                sample_rate: out_sr,
+                                bit_depth: out_bd,
+                                channels,
+                                file_size: Some(file_size),
+                                duration_ms: Some(track.duration_ms as u64),
+                                ..Default::default()
+                            };
+                            let session_id = self
+                                .streamer
+                                .create_file_session(file_info, serve_path, false)
+                                .await;
+
+                            (
+                                session_id,
+                                out_mime,
+                                out_ext,
+                                Some(file_size),
+                                Some(out_sr),
+                                Some(out_bd as u32),
+                                Some(channels as u32),
+                            )
                         }
-
-                        // Create a file session — HTTP handler serves with
-                        // Content-Length and Range support.
-                        let file_info = StreamInfo {
-                            format: out_ext.clone(),
-                            mime_type: out_mime.clone(),
-                            sample_rate: out_sr,
-                            bit_depth: out_bd,
-                            channels,
-                            file_size: Some(file_size),
-                            duration_ms: Some(track.duration_ms as u64),
-                            ..Default::default()
-                        };
-                        let session_id = self
-                            .streamer
-                            .create_file_session(file_info, tmp_path, false)
-                            .await;
-
-                        (
-                            session_id,
-                            out_mime,
-                            out_ext,
-                            Some(file_size),
-                            Some(out_sr),
-                            Some(out_bd as u32),
-                            Some(channels as u32),
-                        )
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, file = %file_path, "transcode_to_temp_file_failed");
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(format!("transcode failed: {e}"));
-                    }
-                    Err(_) => {
-                        warn!(file = %file_path, "transcode_timeout_120s");
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(
-                            "transcode timeout (120s) — file too large or I/O stalled".into()
-                        );
+                        Ok(Err(e)) => {
+                            warn!(error = %e, file = %file_path, "transcode_to_temp_file_failed");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(format!("transcode failed: {e}"));
+                        }
+                        Err(_) => {
+                            warn!(file = %file_path, "transcode_timeout_120s");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(
+                                "transcode timeout (120s) — file too large or I/O stalled".into()
+                            );
+                        }
                     }
                 }
             } else {
