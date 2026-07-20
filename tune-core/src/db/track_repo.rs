@@ -243,6 +243,40 @@ pub mod sql {
     }
 }
 
+/// Collapse content-duplicate tracks for DISPLAY, preserving order.
+///
+/// When a user keeps real duplicate files on disk (e.g. a track copied from a
+/// NAS to a local folder, or a folder duplicated), the same recording gets one
+/// row per `file_path` — so an album lists a track two or three times. This
+/// hides those extra copies in list views WITHOUT touching the files or the
+/// shared query methods (which internal callers — playlist matching, tag
+/// writing, conversion — still need to see every row).
+///
+/// Two rows are duplicates when they share the same `album_id` AND either the
+/// same non-empty `audio_hash` (identical audio bytes), or — when no hash is
+/// available — the same disc number, track number and (case-insensitive) title.
+/// The first occurrence in the input order is kept (callers order by
+/// disc/track, so the retained row is the natural one).
+pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
+    let mut seen: HashSet<(Option<i64>, String)> = HashSet::new();
+    let mut out = Vec::with_capacity(tracks.len());
+    for t in tracks {
+        let key = match t.audio_hash.as_deref().map(str::trim) {
+            Some(h) if !h.is_empty() => format!("h:{h}"),
+            _ => format!(
+                "m:{}/{}/{}",
+                t.disc_number,
+                t.track_number,
+                t.title.trim().to_lowercase()
+            ),
+        };
+        if seen.insert((t.album_id, key)) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -1118,6 +1152,63 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    #[test]
+    fn dedup_display_collapses_content_duplicates() {
+        // Same album, same hash → the copy is hidden, first kept.
+        let mut a = Track::new("Time".into());
+        a.album_id = Some(1);
+        a.disc_number = 1;
+        a.track_number = 4;
+        a.audio_hash = Some("HASH_TIME".into());
+        a.file_path = Some("/nas/time.flac".into());
+        let mut a_copy = a.clone();
+        a_copy.file_path = Some("/local/time.flac".into()); // real duplicate file
+        let mut a_copy2 = a.clone();
+        a_copy2.file_path = Some("/local2/time.flac".into()); // triplicate
+
+        // Same album, hash-less: dedup falls back to disc/track/title.
+        let mut b = Track::new("Money".into());
+        b.album_id = Some(1);
+        b.disc_number = 1;
+        b.track_number = 6;
+        let mut b_copy = b.clone();
+        b_copy.title = "MONEY".into(); // case-insensitive match
+
+        // Genuinely different track in the same album is kept.
+        let mut c = Track::new("Us and Them".into());
+        c.album_id = Some(1);
+        c.disc_number = 1;
+        c.track_number = 7;
+
+        // Same recording on a DIFFERENT album (compilation) must NOT collapse.
+        let mut a_other_album = a.clone();
+        a_other_album.album_id = Some(2);
+
+        let out = dedup_display_tracks(vec![
+            a.clone(),
+            a_copy,
+            a_copy2,
+            b.clone(),
+            b_copy,
+            c.clone(),
+            a_other_album,
+        ]);
+
+        let titles: Vec<(&str, Option<i64>)> =
+            out.iter().map(|t| (t.title.as_str(), t.album_id)).collect();
+        assert_eq!(
+            titles,
+            vec![
+                ("Time", Some(1)),        // first copy kept
+                ("Money", Some(1)),       // first kept, "MONEY" dropped
+                ("Us and Them", Some(1)), // distinct track survives
+                ("Time", Some(2)),        // same song, other album: kept
+            ]
+        );
+        // The retained "Time" is the first-seen path (album 1), not a copy.
+        assert_eq!(out[0].file_path.as_deref(), Some("/nas/time.flac"));
     }
 
     #[test]
