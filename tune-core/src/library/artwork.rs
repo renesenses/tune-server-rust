@@ -188,6 +188,7 @@ pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     // this release.
     for size in ["front-1200", "front-500"] {
         let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
+        crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
         let Ok(resp) = client.get(&url).send().await else {
             continue;
         };
@@ -222,6 +223,7 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -254,6 +256,7 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -316,9 +319,9 @@ pub async fn batch_enrich_artwork(
         let mbid_to_use = if let Some(id) = resolved_mbid {
             Some(id)
         } else {
-            // Search MusicBrainz for the release
+            // Search MusicBrainz for the release (the shared MB rate limiter
+            // inside `search_musicbrainz_release` enforces the ~1 req/s spacing).
             searched += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
             let found = search_musicbrainz_release(artist, title).await;
             if let Some(ref id) = found {
                 // Store the discovered MBID on the album for future use
@@ -337,10 +340,8 @@ pub async fn batch_enrich_artwork(
             continue;
         };
 
-        // Step 2: Fetch cover from Cover Art Archive
-        // Rate limit: wait 1.1s between CAA requests
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
+        // Step 2: Fetch cover from Cover Art Archive (the shared MB rate limiter
+        // inside `fetch_cover_art` enforces the ~1 req/s spacing).
         match fetch_cover_art(mbid_val).await {
             Some(data) => {
                 let hash = artwork_hash(mbid_val);
@@ -576,6 +577,7 @@ async fn fetch_artist_image_musicbrainz_full(
     mbid: &str,
 ) -> Option<Vec<u8>> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -736,44 +738,24 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    // Single choke point for every artwork/artist-image download: log *why* a
-    // fetch produced nothing so an enrichment run that "finds nothing" can be
-    // diagnosed (rate-limit vs genuinely absent vs network), instead of every
-    // failure being an indistinguishable `None` (#1096). Behaviour is unchanged
-    // — all four failure cases still return `None`.
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(url, error = %e, "artwork_download_network_error");
-            return None;
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        if status.as_u16() == 429 || status.as_u16() == 503 {
+    // Single choke point for every artwork/artist-image download: classify the
+    // failure via the shared `FetchOutcome` so an enrichment run that "finds
+    // nothing" can be diagnosed — rate-limit vs genuinely absent vs network —
+    // instead of every failure being an indistinguishable `None` (#1096).
+    // Behaviour is unchanged: all failure cases still return `None`.
+    match crate::http::fetch::fetch_bytes(client, url, 1000).await {
+        crate::http::fetch::FetchOutcome::Success(bytes) => Some(bytes),
+        crate::http::fetch::FetchOutcome::RateLimited => {
+            // Counter read per-run by the enrichment batch to report throttling.
             ARTWORK_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                url,
-                status = status.as_u16(),
-                "artwork_download_rate_limited"
-            );
-        } else {
-            debug!(url, status = status.as_u16(), "artwork_download_http_error");
+            warn!(url, "artwork_download_rate_limited");
+            None
         }
-        return None;
-    }
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(url, error = %e, "artwork_download_read_error");
-            return None;
+        other => {
+            debug!(url, reason = other.reason(), "artwork_download_failed");
+            None
         }
-    };
-    if bytes.len() < 1000 {
-        debug!(url, len = bytes.len(), "artwork_download_too_small");
-        return None;
     }
-    Some(bytes.to_vec())
 }
 
 /// Run batch artist image enrichment for all artists with an MBID but no image.
