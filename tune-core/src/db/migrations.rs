@@ -1068,6 +1068,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Skips the slow native FLAC encoder for hi-res AND avoids renderers whose
     // ALAC decoder pops at start (Yves, LHC-56). Overrides alac_passthrough.
     add_column_if_missing(db, "zones", "dlna_lpcm", "INTEGER DEFAULT 0");
+    // Opt-in: cap this DLNA renderer's output to 16-bit. Some renderers advertise
+    // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode 16-bit
+    // internally — 24-bit direct plays SILENCE (Ruark R3, Yves forum #1137). This
+    // forces a 16-bit downconvert (kept as FLAC) instead of direct passthrough,
+    // without regressing renderers that genuinely play 24-bit.
+    add_column_if_missing(db, "zones", "dlna_cap_16bit", "INTEGER DEFAULT 0");
     // Physical host (IP) of the renderer, used to dedup DLNA zones across
     // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
     // N12 after a restart) must reconnect to its existing zone instead of

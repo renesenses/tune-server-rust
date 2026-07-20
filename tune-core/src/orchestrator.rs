@@ -1248,9 +1248,19 @@ impl PlaybackOrchestrator {
         // takes precedence over ALAC passthrough.
         let dlna_lpcm =
             is_network_output && ZoneRepo::with_backend(self.db.clone()).get_dlna_lpcm(req.zone_id);
+        // Opt-in per zone: cap output to 16-bit. Some renderers advertise
+        // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode
+        // 16-bit internally — 24-bit direct plays SILENCE (Ruark R3, Yves #1137).
+        // Forces a 16-bit downconvert (kept as FLAC) instead of direct
+        // passthrough, without regressing renderers that genuinely play 24-bit.
+        // Only meaningful when the source is deeper than 16-bit.
+        let dlna_cap_16bit = is_network_output
+            && bit_depth > 16
+            && ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id);
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
             && !dlna_lpcm
+            && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
 
         let needs_transcode_for_output = is_network_output
@@ -1312,7 +1322,12 @@ impl PlaybackOrchestrator {
             || oaat_needs_wav
             || local_needs_wav
             || needs_downsample
-            || dlna_needs_wav;
+            || dlna_needs_wav
+            // 16-bit cap on a FLAC-direct renderer: force a transcode so the
+            // hi-res FLAC is re-encoded at 16-bit instead of served direct
+            // (silent on the Ruark R3, #1137). ALAC already transcodes because
+            // the cap disables alac_passthrough above.
+            || (dlna_cap_16bit && will_be_flac);
 
         let (
             session_id,
@@ -1387,6 +1402,11 @@ impl PlaybackOrchestrator {
                 // and take the FLAC branch above (dlna_needs_wav = false), so
                 // this cap only ever applies to the LPCM fallback where
                 // guaranteed-audible 16-bit is the correct trade-off.
+                16
+            } else if dlna_cap_16bit {
+                // Zone opt-in cap: renderer advertises `audio/flac` but only
+                // decodes 16-bit (Ruark R3, #1137). Downconvert to 16-bit FLAC
+                // instead of sending silent hi-res direct.
                 16
             } else if src_fmt == AudioFormat::Alac {
                 // ALAC: transcode to FLAC for DLNA (universally supported).
