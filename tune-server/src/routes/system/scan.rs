@@ -853,6 +853,27 @@ pub(super) async fn trigger_scan(
             ) {
                 tracing::warn!(error = %e, "post_scan_album_quality_update_failed");
             }
+
+            // Full scan only: realign each album's derived genre with its tracks.
+            // The COALESCE above is fill-only (it never overwrites a value once
+            // set), so an album whose genre was set once and then went stale —
+            // e.g. stuck on "Folk" while its tracks are now "Folk-Punk" (Yves
+            // Scordia) — never self-corrected. A forced full scan is an explicit
+            // "rebuild from the files" action, so overwrite genre/genres from the
+            // tracks; incremental scans keep the fill-only behaviour so values
+            // persist between full scans. The EXISTS guard avoids nulling an
+            // album genre when no track carries one.
+            if force {
+                if let Err(e) = db.execute(
+                    "UPDATE albums SET \
+                     genre = (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1), \
+                     genres = (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL LIMIT 1) \
+                     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL)",
+                    &[],
+                ) {
+                    tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");
+                }
+            }
             // Merge duplicate local albums (same title, case-insensitive).
             // After a rescan, tag changes can create a second album entry for
             // tracks that already belonged to an existing album (e.g. when
