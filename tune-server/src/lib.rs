@@ -11,6 +11,7 @@ pub mod error;
 pub mod i18n;
 pub mod premium_guard;
 pub mod routes;
+pub mod scan_import;
 pub mod startup;
 pub mod state;
 pub mod windows_migrate;

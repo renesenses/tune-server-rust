@@ -22,45 +22,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// `false` at the start of every scan.
 static SCAN_CANCEL: AtomicBool = AtomicBool::new(false);
 
-/// True when an `album_artist` value denotes a various-artists compilation.
-fn is_various_artists(s: &str) -> bool {
-    let l = s.trim().to_lowercase();
-    l == "various artists" || l == "various" || l == "va" || l == "compilations"
-}
-
-/// Decide, per `(folder, album title)`, whether that album is a various-artists
-/// compilation, from the metadata of a set of scanned tracks.
-///
-/// A genuine single-artist album has one consistent `album_artist`. An album is
-/// treated as a compilation when any of its tracks carries the compilation flag
-/// or a "Various Artists" album_artist, OR when the `album_artist` value varies
-/// across the tracks of the same `(folder, album)` — the tell-tale of a
-/// compilation whose tracks were each tagged with their own artist as the
-/// album_artist, which otherwise splits into one album (and cover) per artist.
-///
-/// Keys are `(folder, album_title.to_lowercase())`.
-fn decide_compilation_albums<'a>(
-    items: impl Iterator<Item = (String, &'a str, Option<&'a str>, bool)>,
-) -> std::collections::HashMap<(String, String), bool> {
-    let mut acc: std::collections::HashMap<
-        (String, String),
-        (bool, std::collections::HashSet<String>),
-    > = std::collections::HashMap::new();
-    for (dir, album, album_artist, comp_flag) in items {
-        let entry = acc.entry((dir, album.to_lowercase())).or_default();
-        let aa = album_artist.map(|s| s.trim()).filter(|s| !s.is_empty());
-        if comp_flag || aa.map(is_various_artists).unwrap_or(false) {
-            entry.0 = true;
-        }
-        if let Some(aa) = aa {
-            entry.1.insert(aa.to_lowercase());
-        }
-    }
-    acc.into_iter()
-        .map(|(k, (flag, artists))| (k, flag || artists.len() >= 2))
-        .collect()
-}
-
 #[derive(Deserialize)]
 pub(super) struct ScanQuery {
     /// When true, re-process ALL discovered files (bypass the unchanged-file
@@ -139,8 +100,6 @@ pub(super) async fn trigger_scan(
             .collect();
 
         let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(db.clone());
-        let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(db.clone());
-        let album_repo = tune_core::db::album_repo::AlbumRepo::with_backend(db.clone());
 
         // "Separate albums by quality" — when on (default), a quality suffix is
         // appended to the album title so CD and Hi-Res versions become distinct
@@ -229,34 +188,20 @@ pub(super) async fn trigger_scan(
         // each batch commits, not only when the entire scan finishes.
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
-        let mut albums_with_cover: std::collections::HashSet<i64> =
-            std::collections::HashSet::new();
         let mut inserted = 0i64;
         let mut updated = 0i64;
         let mut skipped = pre_skipped;
-        let mut artwork_extracted = 0i64;
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
         let scan_timer_start = std::time::Instant::now();
 
-        // In-memory caches to avoid repeated DB lookups (persist across batches)
-        let mut artist_cache: std::collections::HashMap<
-            String,
-            std::sync::Arc<tune_core::db::models::Artist>,
-        > = std::collections::HashMap::new();
-        let mut album_cache: std::collections::HashMap<
-            (String, i64, Option<i32>),
-            std::sync::Arc<tune_core::db::models::Album>,
-        > = std::collections::HashMap::new();
-
-        // When a track has no album_artist tag, the album artist is pinned to
-        // the first track artist seen in that folder (see below). Without this,
-        // an album whose tracks have differing per-track artists (classical
-        // soloists, features) split into one album row per artist (Alain,
-        // Pierre: "same album appears 2-3 times"). Keyed by parent directory.
-        let mut dir_album_artist: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        // Shared artist/album resolver + Track builder, identical to the auto/
+        // startup + watcher scans. Owns the cross-batch caches (artist, album,
+        // covers, per-folder album-artist pinning), the per-batch compilation
+        // decision, and the artwork-extracted counter.
+        let mut importer =
+            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
@@ -298,32 +243,18 @@ pub(super) async fn trigger_scan(
                     }
                 }
 
-                // Decide compilation status per (folder, album title) for this
-                // batch so every track of an album agrees on the album artist,
-                // regardless of inconsistent per-track album_artist tags. A real
-                // single-artist album has one consistent album_artist; if it
-                // varies within the same (folder, album) — or any track carries
-                // the compilation flag or a "Various Artists" album_artist — the
-                // whole album is treated as a compilation. Without this, a
-                // compilation whose tracks each carry their own artist as
-                // album_artist split into one album (and cover) per artist
-                // (Bilou: pochettes multipliées). Files are walked in directory
-                // order so an album's tracks are contiguous and land in the same
-                // batch (SCAN_BATCH_SIZE = 500).
-                let comp_decision = decide_compilation_albums(batch.iter().filter_map(|sf| {
-                    let meta = sf.metadata.as_ref()?;
-                    let album = meta.album.as_deref()?;
-                    let dir = std::path::Path::new(&sf.path)
-                        .parent()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    Some((dir, album, meta.album_artist.as_deref(), meta.compilation))
-                }));
+                // Resolve artists/albums and build the track rows for this batch
+                // via the shared importer — the same logic (compilation
+                // flattening, classical-soloist album-artist pinning, mbid album
+                // resolution, embedded-cover preference, artist images) as the
+                // auto/startup + watcher scans. The importer owns the cross-batch
+                // caches and the per-(folder,album) compilation decision.
+                importer.begin_batch(&batch);
 
                 for sf in &batch {
-                    let Some(ref meta) = sf.metadata else {
+                    if sf.metadata.is_none() {
                         continue;
-                    };
+                    }
 
                     // Early-exit: skip unchanged files BEFORE resolving artist/album.
                     // Without this, get_or_create_with_mbid can create a ghost album
@@ -344,361 +275,19 @@ pub(super) async fn trigger_scan(
                         }
                     }
 
-                    // Compilation status: prefer the per-(folder,album) batch
-                    // decision so every track of the album agrees; fall back to
-                    // this track's own signal if the album was not seen whole in
-                    // this batch (rare: album straddles a batch boundary, or an
-                    // incremental scan touches a single track). The fallback
-                    // equals the old per-track behaviour, so incremental scans
-                    // are no worse.
-                    let album_dir = std::path::Path::new(&sf.path)
-                        .parent()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let is_compilation = meta
-                        .album
-                        .as_ref()
-                        .and_then(|a| {
-                            comp_decision
-                                .get(&(album_dir.clone(), a.to_lowercase()))
-                                .copied()
-                        })
-                        .unwrap_or_else(|| {
-                            meta.compilation
-                                || meta
-                                    .album_artist
-                                    .as_deref()
-                                    .map(is_various_artists)
-                                    .unwrap_or(false)
-                        });
-
-                    let album_artist_name = if is_compilation {
-                        "Various Artists"
-                    } else if let Some(aa) = meta.album_artist.as_deref() {
-                        aa
-                    } else {
-                        // No album_artist tag: pin the album artist to the first
-                        // track artist seen in this folder so all of the album's
-                        // tracks resolve to a single album row, instead of
-                        // splitting into one row per differing track artist
-                        // (classical soloists, features).
-                        let track_a = meta.artist.as_deref().unwrap_or("Unknown Artist");
-                        dir_album_artist
-                            .entry(album_dir.clone())
-                            .or_insert_with(|| track_a.to_string())
-                            .as_str()
-                    };
-
-                    let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
-
-                    let album_artist_mbid = if is_compilation {
-                        None
-                    } else {
-                        meta.musicbrainz_album_artist_id
-                            .as_deref()
-                            .or(meta.musicbrainz_artist_id.as_deref())
-                    };
-                    let album_artist_entry =
-                        if let Some(cached) = artist_cache.get(album_artist_name) {
-                            Some(std::sync::Arc::clone(cached))
-                        } else {
-                            let result = artist_repo
-                                .get_or_create(
-                                    album_artist_name,
-                                    album_artist_mbid,
-                                    meta.album_artist_sort.as_deref(),
-                                )
-                                .ok()
-                                .map(std::sync::Arc::new);
-                            if let Some(ref a) = result {
-                                artist_cache
-                                    .insert(album_artist_name.to_string(), std::sync::Arc::clone(a));
-                            }
-                            result
-                        };
-                    let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
-
-                    let track_artist = if is_compilation && track_artist_name != album_artist_name {
-                        if let Some(cached) = artist_cache.get(track_artist_name) {
-                            Some(std::sync::Arc::clone(cached))
-                        } else {
-                            let result = artist_repo
-                                .get_or_create(
-                                    track_artist_name,
-                                    meta.musicbrainz_artist_id.as_deref(),
-                                    None,
-                                )
-                                .ok()
-                                .map(std::sync::Arc::new);
-                            if let Some(ref a) = result {
-                                artist_cache
-                                    .insert(track_artist_name.to_string(), std::sync::Arc::clone(a));
-                            }
-                            result
-                        }
-                    } else {
-                        album_artist_entry.clone()
-                    };
-                    let artist_id = track_artist.as_ref().and_then(|a| a.id);
-
-                    if let Some(ref album_title) = meta.album {
-                        let t = album_title.to_lowercase();
-                        if t.contains("best") || t.contains("greatest") || t.contains("hits") {
-                            tracing::info!(
-                                album = %album_title,
-                                album_artist_tag = ?meta.album_artist,
-                                artist_tag = ?meta.artist,
-                                resolved_album_artist = album_artist_name,
-                                resolved_artist_id = ?album_artist_id,
-                                resolved_artist_name = ?album_artist_entry.as_ref().map(|a| &a.name),
-                                year = ?meta.year,
-                                file = %sf.path,
-                                "DIAG_generic_album_scan"
-                            );
-                        }
-                    }
-
-                    let album_key = meta.album.as_ref().map(|t| {
-                        let title = if quality_split {
-                            let suffix = tune_core::scanner::quality::quality_suffix(
-                                meta.sample_rate,
-                                meta.bit_depth,
-                            );
-                            if suffix.is_empty() {
-                                t.clone()
-                            } else {
-                                format!("{t} ({suffix})")
-                            }
-                        } else {
-                            t.clone()
-                        };
-                        (title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
-                    });
-
-                    let album = if let Some(ref key) = album_key {
-                        if let Some(cached) = album_cache.get(key) {
-                            let c = std::sync::Arc::clone(cached);
-                            if c.artist_id != Some(key.1) {
-                                tracing::warn!(
-                                    album = %key.0,
-                                    cache_key_artist_id = key.1,
-                                    cached_album_id = ?c.id,
-                                    cached_album_artist_id = ?c.artist_id,
-                                    file = %sf.path,
-                                    "BUG_album_cache_artist_mismatch"
-                                );
-                            }
-                            Some(c)
-                        } else {
-                            let result = album_repo
-                                .get_or_create_with_mbid(
-                                    &key.0,
-                                    key.1,
-                                    key.2,
-                                    meta.musicbrainz_release_id.as_deref(),
-                                );
-                            if let Err(ref e) = result {
-                                tracing::warn!(
-                                    album = %key.0,
-                                    artist_id = key.1,
-                                    year = ?key.2,
-                                    error = %e,
-                                    file = %sf.path,
-                                    "BUG_album_create_failed"
-                                );
-                            }
-                            let result = result.ok().map(std::sync::Arc::new);
-                            if let Some(ref a) = result {
-                                if a.artist_id != Some(key.1) {
-                                    tracing::warn!(
-                                        album = %key.0,
-                                        requested_artist_id = key.1,
-                                        returned_album_id = ?a.id,
-                                        returned_artist_id = ?a.artist_id,
-                                        mb_release_id = ?meta.musicbrainz_release_id,
-                                        file = %sf.path,
-                                        "BUG_album_artist_mismatch"
-                                    );
-                                }
-                                album_cache.insert(key.clone(), std::sync::Arc::clone(a));
-                            }
-                            result
-                        }
-                    } else {
-                        None
-                    };
-
-                    let album_id = album.as_ref().and_then(|a| a.id);
-
-                    // Propagate date metadata from track tags to the album
-                    if let Some(aid) = album_id {
-                        album_repo.update_dates(
-                            aid,
-                            meta.year.map(|y| y as i32),
-                            meta.original_year.map(|y| y as i32),
-                            meta.release_date.as_deref(),
-                            meta.original_date.as_deref(),
-                        ).ok();
-                    }
-
-                    if let Some(aid) = album_id
-                        && !albums_with_cover.contains(&aid)
-                    {
-                        // Prefer the embedded cover already read while parsing
-                        // the tags — re-opening the file to extract it failed
-                        // (os error 3, path not found) for some accented Windows
-                        // paths even though the first read had succeeded
-                        // (Thibaud). Fall back to a fresh extract (folder cover,
-                        // or files whose metadata came from a non-tag path).
-                        let cover_hash = match sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref())
-                        {
-                            Some(cover) => tune_core::library::artwork::save_embedded_cover(
-                                std::path::Path::new(&sf.path),
-                                &cache_dir,
-                                cover,
-                            ),
-                            None => tune_core::library::artwork::get_or_extract(
-                                std::path::Path::new(&sf.path),
-                                &cache_dir,
-                            ),
-                        };
-                        if let Some(hash) = cover_hash {
-                            if let Err(e) = album_repo.update_cover_path(aid, &hash) {
-                                tracing::warn!(album_id = aid, error = %e, "cover_path_update_failed");
-                            }
-                            albums_with_cover.insert(aid);
-                            artwork_extracted += 1;
-                        }
-                    }
-
-                    // Check for artist image if not already set
-                    if let Some(ref art) = track_artist {
-                        if art.image_path.is_none() {
-                            if let Some(parent) = std::path::Path::new(&sf.path).parent() {
-                                for name in
-                                    &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"]
-                                {
-                                    let candidate = parent.join(name);
-                                    if candidate.exists() {
-                                        let hash = tune_core::library::artwork::artwork_hash(
-                                            &candidate.to_string_lossy(),
-                                        );
-                                        let ext = candidate
-                                            .extension()
-                                            .and_then(|e| e.to_str())
-                                            .unwrap_or("jpg");
-                                        // Only record the image in the DB if the
-                                        // cache write actually succeeded. Setting
-                                        // image_path after a failed read/save left
-                                        // the DB claiming "has image" with nothing
-                                        // on disk → grey square + permanent skip
-                                        // (Sandro, fresh install where the cache
-                                        // dir wasn't writable).
-                                        let saved = std::fs::read(&candidate).ok().and_then(|data| {
-                                            tune_core::library::artwork::save_to_cache(
-                                                &data, &cache_dir, &hash, ext,
-                                            )
-                                        });
-                                        if saved.is_none() {
-                                            tracing::warn!(
-                                                artist = %art.name,
-                                                candidate = %candidate.display(),
-                                                "artist_image_cache_write_failed_not_recording"
-                                            );
-                                            continue;
-                                        }
-                                        let mut updated_artist =
-                                            tune_core::db::models::Artist::clone(art);
-                                        updated_artist.image_path = Some(hash);
-                                        updated_artist.image_source = Some("local".to_string());
-                                        if let Err(e) = artist_repo.update(&updated_artist) {
-                                            tracing::warn!(error = %e, "artist_image_update_failed");
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let title = meta.title.clone().unwrap_or_else(|| {
-                        std::path::Path::new(&sf.path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    });
-
-                    // File already exists and has changed — collect for batch update
-                    // (unchanged files were already skipped by the early-exit above)
-                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
-                        let mut track = tune_core::db::models::Track::new(title);
-                        track.id = Some(existing_id);
-                        track.album_id = album_id;
-                        track.artist_id = artist_id;
-                        track.artist_name = Some(track_artist_name.to_string());
-                        track.album_artist = meta.album_artist.clone();
-                        track.album_title = meta.album.clone();
-                        track.disc_number = meta.disc_number.unwrap_or(1) as i32;
-                        track.disc_subtitle = meta.disc_subtitle.clone();
-                        track.track_number = meta.track_number.unwrap_or(0) as i32;
-                        track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
-                        track.file_path = Some(sf.path.clone());
-                        track.format = meta.format.clone();
-                        track.sample_rate = meta.sample_rate.map(|s| s as i32);
-                        track.bit_depth = meta.bit_depth.map(|b| b as i32);
-                        track.channels = meta.channels.unwrap_or(2) as i32;
-                        track.file_size = Some(sf.file_size as i64);
-                        track.file_mtime = Some(sf.mtime as f64);
-                        track.audio_hash = sf.audio_hash.clone();
-                        track.genre = meta.genre.clone();
-                        track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
-                        track.composer = meta
-                            .credits
-                            .iter()
-                            .find(|c| c.role == "composer")
-                            .map(|c| c.name.clone());
-                        track.year = meta.year.map(|y| y as i32);
-                        track.bpm = meta.bpm;
-                        track.label = meta.label.clone();
-                        track.isrc = meta.isrc.clone();
-                        track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
-                        track.comments = meta.comment.clone();
-                        to_update.push(track);
+                    let Some((mut track, _album_id)) = importer.import(sf) else {
                         continue;
-                    }
+                    };
 
-                    // New file -- collect for batch insert
-                    let mut track = tune_core::db::models::Track::new(title);
-                    track.album_id = album_id;
-                    track.artist_id = artist_id;
-                    track.artist_name = Some(track_artist_name.to_string());
-                    track.album_artist = meta.album_artist.clone();
-                    track.album_title = meta.album.clone();
-                    track.disc_number = meta.disc_number.unwrap_or(1) as i32;
-                    track.track_number = meta.track_number.unwrap_or(0) as i32;
-                    track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
-                    track.file_path = Some(sf.path.clone());
-                    track.format = meta.format.clone();
-                    track.sample_rate = meta.sample_rate.map(|s| s as i32);
-                    track.bit_depth = meta.bit_depth.map(|b| b as i32);
-                    track.channels = meta.channels.unwrap_or(2) as i32;
-                    track.file_size = Some(sf.file_size as i64);
-                    track.file_mtime = Some(sf.mtime as f64);
-                    track.audio_hash = sf.audio_hash.clone();
-                    track.genre = meta.genre.clone();
-                    track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
-                    track.composer = meta
-                        .credits
-                        .iter()
-                        .find(|c| c.role == "composer")
-                        .map(|c| c.name.clone());
-                    track.year = meta.year.map(|y| y as i32);
-                    track.bpm = meta.bpm;
-                    track.label = meta.label.clone();
-                    track.isrc = meta.isrc.clone();
-                    track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
-                    track.comments = meta.comment.clone();
-                    to_insert.push(track);
+                    // File already exists and has changed → batch update;
+                    // otherwise a new file → batch insert. (Unchanged files were
+                    // already skipped by the early-exit above.)
+                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
+                        track.id = Some(existing_id);
+                        to_update.push(track);
+                    } else {
+                        to_insert.push(track);
+                    }
                 }
 
                 // Collect extended metadata for tracks in this batch
@@ -816,6 +405,9 @@ pub(super) async fn trigger_scan(
                 }
             },
         );
+
+        // Album covers extracted during the scan (owned by the importer).
+        let artwork_extracted = importer.artwork_extracted() as i64;
 
         // Prune tracks whose files no longer exist on disk.
         // SAFETY: skip tracks in missing directories — the volume/NAS may
@@ -1260,26 +852,6 @@ fn chrono_now() -> String {
 /// If the structured `genres` vec is non-empty, serialize it as JSON.
 /// Otherwise, fall back to the primary `genre` string and wrap it as a
 /// single-element array so the column is never NULL when genre data exists.
-fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
-    if !genres.is_empty() {
-        Some(serde_json::to_string(genres).unwrap_or_default())
-    } else if let Some(g) = genre {
-        if g.is_empty() {
-            None
-        } else {
-            // Split in case genre contains separators (legacy data)
-            let split = tune_core::metadata::split_genre_tag(g);
-            if split.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&split).unwrap_or_default())
-            }
-        }
-    } else {
-        None
-    }
-}
-
 pub(super) async fn scan_report() -> impl IntoResponse {
     let report_path = std::env::var("TUNE_DB_PATH")
         .unwrap_or_else(|_| "tune.db".into())
@@ -1352,7 +924,7 @@ pub(super) async fn artist_split_preview(State(state): State<AppState>) -> Json<
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_compilation_albums, is_various_artists};
+    use crate::scan_import::{decide_compilation_albums, is_various_artists};
 
     fn decide<'a>(
         tracks: &'a [(&'a str, &'a str, Option<&'a str>, bool)],
