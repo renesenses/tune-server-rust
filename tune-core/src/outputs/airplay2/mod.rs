@@ -29,6 +29,22 @@ pub struct Airplay2Output {
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
     process: Arc<Mutex<Option<DaemonProcess>>>,
+    pairing: Arc<Mutex<PairingPhase>>,
+}
+
+/// Pairing progress for an AirPlay 2 receiver, updated by the daemon stdout
+/// reader and awaited by the PIN-pairing methods. Most receivers accept the
+/// hard-coded transient PIN (`3939`), but AirPlay-2-only TVs (Samsung, LG…) and
+/// Apple TV require HomeKit PIN pairing: the receiver shows a 4-digit code the
+/// user must type back (Bilou's Samsung S95, #1135).
+#[derive(Clone, Debug, PartialEq)]
+enum PairingPhase {
+    Idle,
+    /// The receiver is displaying a PIN; waiting for the user to submit it.
+    PinRequested,
+    /// Connected/paired successfully.
+    Connected,
+    Failed(String),
 }
 
 struct DaemonProcess {
@@ -73,15 +89,13 @@ impl Airplay2Output {
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
             process: Arc::new(Mutex::new(None)),
+            pairing: Arc::new(Mutex::new(PairingPhase::Idle)),
         }
     }
 
-    async fn ensure_connected(&self) -> Result<(), String> {
-        let mut proc = self.process.lock().await;
-        if proc.is_some() {
-            return Ok(());
-        }
-
+    /// Spawn the daemon, wait for `ready`, and start the single background stdout
+    /// reader that updates playback state AND pairing progress. Does NOT connect.
+    async fn spawn_daemon(&self) -> Result<DaemonProcess, String> {
         let binary = find_daemon_binary();
         info!(binary = %binary, device = %self.name, "airplay2: starting daemon");
 
@@ -95,8 +109,6 @@ impl Airplay2Output {
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
 
-        let mut daemon = DaemonProcess { child, stdin };
-
         // Wait for "ready" event
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -108,20 +120,31 @@ impl Airplay2Output {
             return Err(format!("daemon did not send ready: {line}"));
         }
 
-        // Spawn stdout reader to update position
         let playing = self.playing.clone();
         let position_ms = self.position_ms.clone();
         let device_name = self.name.clone();
+        let pairing = self.pairing.clone();
         tokio::spawn(async move {
             let mut line = String::new();
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        *pairing.lock().await = PairingPhase::Failed("daemon exited".into());
+                        break;
+                    }
                     Ok(_) => {
                         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) {
                             let event = ev["event"].as_str().unwrap_or("");
                             match event {
+                                "pin_requested" => {
+                                    *pairing.lock().await = PairingPhase::PinRequested;
+                                    info!(device = %device_name, "airplay2: receiver is showing a pairing PIN");
+                                }
+                                "connected" | "paired" => {
+                                    *pairing.lock().await = PairingPhase::Connected;
+                                    debug!(device = %device_name, "airplay2: connected/paired");
+                                }
                                 "playing" => {
                                     playing.store(true, Ordering::SeqCst);
                                     debug!(device = %device_name, "airplay2: playing");
@@ -136,19 +159,47 @@ impl Airplay2Output {
                                     }
                                 }
                                 "error" => {
-                                    let msg = ev["message"].as_str().unwrap_or("unknown");
+                                    let msg =
+                                        ev["message"].as_str().unwrap_or("unknown").to_string();
+                                    *pairing.lock().await = PairingPhase::Failed(msg.clone());
                                     warn!(device = %device_name, error = %msg, "airplay2: daemon error");
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        *pairing.lock().await = PairingPhase::Failed("daemon read error".into());
+                        break;
+                    }
                 }
             }
         });
 
-        // Send connect command
+        Ok(DaemonProcess { child, stdin })
+    }
+
+    /// Current pairing progress as a short string for the API/client to poll:
+    /// `idle` | `pin_requested` | `connected` | `failed:<msg>`. Cheap (a quick
+    /// lock), so it never blocks on the 30s human-paced pairing flow.
+    pub async fn pairing_status(&self) -> String {
+        match self.pairing.lock().await.clone() {
+            PairingPhase::Idle => "idle".to_string(),
+            PairingPhase::PinRequested => "pin_requested".to_string(),
+            PairingPhase::Connected => "connected".to_string(),
+            PairingPhase::Failed(e) => format!("failed:{e}"),
+        }
+    }
+
+    async fn ensure_connected(&self) -> Result<(), String> {
+        let mut proc = self.process.lock().await;
+        if proc.is_some() {
+            return Ok(());
+        }
+        *self.pairing.lock().await = PairingPhase::Idle;
+        let mut daemon = self.spawn_daemon().await?;
+        // Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
+        // already-paired receivers. PIN-only receivers need start_pin_pairing().
         daemon
             .send_cmd(&serde_json::json!({
                 "cmd": "connect",
@@ -158,10 +209,50 @@ impl Airplay2Output {
                 "pin": "3939",
             }))
             .await?;
-
         *proc = Some(daemon);
         info!(device = %self.name, "airplay2: daemon connected");
         Ok(())
+    }
+
+    /// Begin HomeKit PIN pairing: spawn the daemon (if needed) and ask the
+    /// receiver to display its 4-digit code. Returns as soon as the command is
+    /// sent; the client polls `pairing_status()` until `pin_requested`, then
+    /// calls `submit_pin` with the code. (#1135)
+    pub async fn start_pin_pairing(&self) -> Result<(), String> {
+        let mut proc = self.process.lock().await;
+        *self.pairing.lock().await = PairingPhase::Idle;
+        if proc.is_none() {
+            *proc = Some(self.spawn_daemon().await?);
+        }
+        proc.as_mut()
+            .unwrap()
+            .send_cmd(&serde_json::json!({
+                "cmd": "pair_pin_start",
+                "ip": self.host,
+                "port": self.port,
+            }))
+            .await
+    }
+
+    /// Finish PIN pairing with the code the user read off the receiver, then
+    /// connect. Returns as soon as the command is sent; the client polls
+    /// `pairing_status()` until `connected` (or `failed:*`). On success the
+    /// daemon persists the pairing identity so later sessions skip the PIN. (#1135)
+    pub async fn submit_pin(&self, pin: &str) -> Result<(), String> {
+        let mut proc = self.process.lock().await;
+        let daemon = proc
+            .as_mut()
+            .ok_or("airplay2: no pairing in progress — call start_pin_pairing first")?;
+        *self.pairing.lock().await = PairingPhase::Idle;
+        daemon
+            .send_cmd(&serde_json::json!({
+                "cmd": "connect",
+                "ip": self.host,
+                "port": self.port,
+                "device_id": self.ap_device_id,
+                "pin": pin,
+            }))
+            .await
     }
 
     async fn send(&self, cmd: &serde_json::Value) -> Result<(), String> {
@@ -186,6 +277,10 @@ impl OutputTarget for Airplay2Output {
 
     fn output_type(&self) -> &str {
         "airplay2"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
