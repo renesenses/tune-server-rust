@@ -59,7 +59,18 @@ fn play_error_response(e: String) -> axum::response::Response {
     {
         StatusCode::BAD_GATEWAY
     } else if e.contains("offline") || e.contains("Output device") {
+        // A renderer that rejects our stream (e.g. a Samsung TV faulting on
+        // SetAVTransportURI / an unsupported protocolInfo) is surfaced by the
+        // orchestrator as "Output device error: …". That is a device-side
+        // rejection, not a bug in Tune → 503, so the client shows a clean
+        // "device refused" instead of a scary "Erreur 500" (Bilou, #1135).
         StatusCode::SERVICE_UNAVAILABLE
+    } else if e.contains("transcode") || e.contains("decode") || e.contains("corrupted source") {
+        // Media-processing failure (FLAC→WAV transcode for a renderer that
+        // doesn't advertise FLAC, a corrupt/unsupported source, a decode
+        // timeout). This is an upstream/content problem, not an internal Tune
+        // fault → 502 Bad Gateway rather than a blunt 500 (Bilou, #1135).
+        StatusCode::BAD_GATEWAY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
@@ -841,7 +852,7 @@ async fn play(
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => play_error_response(e),
             };
         }
         // No now_playing — try queue fallback (same as empty-body path)
@@ -936,7 +947,7 @@ async fn play(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -990,7 +1001,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => play_error_response(e),
             };
         }
     }
@@ -1049,7 +1060,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                    Err(e) => play_error_response(e),
                 };
             }
         }
@@ -1080,7 +1091,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                    Err(e) => play_error_response(e),
                 };
             }
         }
@@ -1414,7 +1425,7 @@ async fn queue_jump(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -2022,7 +2033,7 @@ async fn invoke_zone_pin(
         Ok(result) => {
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -2266,7 +2277,7 @@ pub async fn shuffle_all(
             }
             Json(resp).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
