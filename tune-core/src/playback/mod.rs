@@ -233,17 +233,26 @@ impl PlaybackManager {
             zone_id,
             ..Default::default()
         });
+        // A seek recreates the stream, which routes through play(). In that
+        // case the orchestrator has already set position_ms to the seek target
+        // (via playback.seek()) just before this call, so resetting to 0 here
+        // would make the progress bar snap back to the start of the track and
+        // stay there until the seek grace period ends. Detect a recent seek and
+        // preserve the seeked position; only a genuine track change (no recent
+        // seek) resets to 0.
+        let is_recent_seek = state
+            .last_seek_at
+            .map(|t| t.elapsed().as_secs() < 5)
+            .unwrap_or(false);
         state.state = PlayState::Playing;
-        state.position_ms = 0;
+        if !is_recent_seek {
+            state.position_ms = 0;
+        }
         state.now_playing = Some(np);
         state.track_generation = state.track_generation.wrapping_add(1);
         // Preserve last_seek_at if a seek just happened (< 5s ago) — the
         // orchestrator recreates the stream during seek, which calls play().
         // Clearing it here would remove the seek grace period from the poller.
-        let is_recent_seek = state
-            .last_seek_at
-            .map(|t| t.elapsed().as_secs() < 5)
-            .unwrap_or(false);
         if !is_recent_seek {
             state.last_seek_at = None;
         }
