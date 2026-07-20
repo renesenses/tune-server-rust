@@ -1814,18 +1814,46 @@ impl PlaybackOrchestrator {
                     .unwrap_or_else(|| "audio/flac".into())
             };
 
+            // For a native passthrough served to a *network* renderer (DLNA
+            // native FLAC, ALAC, DSD…), advertise the ACTUAL on-disk byte
+            // length as `res@size` / HEAD Content-Length instead of the
+            // scanned `track.file_size`.
+            //
+            // The GET handler (`serve_file`) always streams `disk_size` bytes,
+            // but the DIDL `res@size` and the HEAD Content-Length are taken from
+            // the DB `track.file_size`. When those disagree — the file was
+            // re-tagged / had cover art (re)embedded after the scan, or was
+            // scanned by an older/fallback code path — a renderer that models
+            // playback position from `bytes_received / (size/duration)` (Marantz
+            // ND 8006, native FLAC) reaches true EOF while its estimate still
+            // reads position < duration, so it restarts/loops the track near the
+            // end instead of advancing to the next queued item, and loses the
+            // format/duration/progress display on that queued track (#1132).
+            //
+            // For a *compressed* stream (FLAC) we cannot derive duration from
+            // size, but making `res@size` equal the exact bytes the renderer
+            // will actually receive keeps its position model consistent — the
+            // FLAC analogue of the WAV size/duration fix in 1046ae8e. Only the
+            // network passthrough path is touched; local/OAAT/WAV-transcode
+            // paths keep their existing sizing (they never reach this branch).
+            let passthrough_disk_size = if is_network_output {
+                tokio::fs::metadata(&file_path).await.ok().map(|m| m.len())
+            } else {
+                None
+            };
+            let passthrough_file_size =
+                passthrough_disk_size.or_else(|| track.file_size.map(|s| s as u64));
+
             let info = StreamInfo {
                 format: fmt.clone(),
                 mime_type: mime.clone(),
                 sample_rate,
                 bit_depth,
                 channels,
-                file_size: track.file_size.map(|s| s as u64),
+                file_size: passthrough_file_size,
                 duration_ms: Some(track.duration_ms as u64),
                 ..Default::default()
             };
-
-            let passthrough_file_size = track.file_size.map(|s| s as u64);
 
             let session_id = self
                 .streamer
