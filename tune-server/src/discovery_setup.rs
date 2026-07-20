@@ -12,6 +12,29 @@ use tune_core::event_types::EventType;
 use crate::config::TuneConfig;
 use crate::state::AppState;
 
+/// Resolve a UPnP service `controlURL` (from the device description) into an
+/// absolute URL usable by the SOAP client.
+///
+/// The controlURL may be **relative** (`/MediaRenderer/AVTransport/Control`, the
+/// common case) or already **absolute** (`http://host:port/...`). Frontier Silicon
+/// radios (Ruark R3, Stream 94i Plus) advertise an absolute controlURL; blindly
+/// prefixing `http://host:port` yielded `http://host:PORThttp://...` — the port
+/// token became `PORThttp`, the URL failed to parse, and every SOAP call died with
+/// `soap send: builder error` (Yves: no sound, UI stuck on "loading title"). This
+/// mirrors the MediaServer handling in `ssdp.rs`.
+fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
+    if control_url.starts_with("http://") || control_url.starts_with("https://") {
+        control_url.to_string()
+    } else {
+        let sep = if control_url.starts_with('/') {
+            ""
+        } else {
+            "/"
+        };
+        format!("http://{host}:{port}{sep}{control_url}")
+    }
+}
+
 /// Set a zone's online state and, if it actually changed, broadcast a
 /// `zone.updated` event so controllers see availability flip in real time.
 /// (`set_online_by_device` alone is silent — clients never learned of it.)
@@ -139,16 +162,20 @@ async fn handle_ssdp_discovered(
         reg.register(Box::new(oh));
         info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
     } else {
+        // Resolve each controlURL to an absolute URL (see `resolve_control_url`):
+        // relative paths are joined onto host:port, absolute URLs kept as-is —
+        // otherwise Frontier Silicon radios (Ruark, Stream 94i) fail with
+        // `soap send: builder error` and play nothing.
         let av_url = svc_urls
             .get("avtransport")
-            .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+            .map(|p| resolve_control_url(&dev.host, dev.port, p));
         let rc_url = svc_urls
             .get("renderingcontrol")
-            .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+            .map(|p| resolve_control_url(&dev.host, dev.port, p));
         let cm_url = svc_urls
             .get("connectionmanager")
             .or_else(|| svc_urls.get("ConnectionManager"))
-            .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+            .map(|p| resolve_control_url(&dev.host, dev.port, p));
         if let (Some(av), Some(rc)) = (av_url, rc_url) {
             let delay = config.play_delay_for(&dev.name);
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
@@ -699,5 +726,42 @@ async fn probe_airplay_for_bluos(
                 tracing::debug!(host = host, name = %z.name, "bluos_fallback_probe_no_response");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_control_url;
+
+    #[test]
+    fn relative_control_url_joins_host_port() {
+        // The common case: a leading-slash relative path (Denon DMP-A10, LHC).
+        assert_eq!(
+            resolve_control_url("192.168.68.50", 8080, "/MediaRenderer/AVTransport/Control"),
+            "http://192.168.68.50:8080/MediaRenderer/AVTransport/Control"
+        );
+    }
+
+    #[test]
+    fn relative_without_leading_slash_gets_one() {
+        assert_eq!(
+            resolve_control_url("10.0.0.2", 55000, "upnp/control/AVTransport"),
+            "http://10.0.0.2:55000/upnp/control/AVTransport"
+        );
+    }
+
+    #[test]
+    fn absolute_control_url_kept_as_is() {
+        // Frontier Silicon radios (Ruark R3, Stream 94i Plus) advertise an
+        // absolute controlURL. It must be used verbatim — prefixing host:port
+        // would yield `http://host:PORThttp://...` (invalid port) → the reqwest
+        // `soap send: builder error` that left Yves with no sound.
+        let abs = "http://192.168.68.55:8080/dev0/srv1/control";
+        assert_eq!(resolve_control_url("192.168.68.55", 8080, abs), abs);
+        let abs_https = "https://192.168.68.55:443/control";
+        assert_eq!(
+            resolve_control_url("192.168.68.55", 443, abs_https),
+            abs_https
+        );
     }
 }

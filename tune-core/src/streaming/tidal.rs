@@ -947,8 +947,13 @@ impl TidalService {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
             image_path: item["picture"].as_str().map(|p| {
+                // 640x640 (not 480x480): Tidal's image CDN does not serve a
+                // 480x480 rendition — that key 403s (AccessDenied), so the
+                // artwork proxy returned 502 and artist images were blank
+                // (Bertrand). 640x640 is a valid size and matches every other
+                // Tidal image URL built in this file.
                 format!(
-                    "https://resources.tidal.com/images/{}/480x480.jpg",
+                    "https://resources.tidal.com/images/{}/640x640.jpg",
                     p.replace('-', "/")
                 )
             }),
@@ -2520,7 +2525,11 @@ mod tests {
         assert_eq!(artist.name, "Miles Davis");
         assert!(artist.image_path.is_some());
         let img = artist.image_path.unwrap();
-        assert!(img.contains("480x480"));
+        // 640x640 is a valid Tidal rendition; 480x480 403s (blank artist images).
+        assert!(img.contains("640x640"));
+        assert!(!img.contains("480x480"));
+        // dashes in the picture id become path slashes
+        assert!(img.contains("aa/bb/cc/dd"));
     }
 
     #[test]

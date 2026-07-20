@@ -68,6 +68,10 @@ struct PatchZone {
     /// renderer — skips the slow FLAC encoder for hi-res and avoids renderers
     /// whose ALAC decoder pops at start (LHC-56). Overrides alac_passthrough.
     dlna_lpcm: Option<bool>,
+    /// When enabled, cap output to 16-bit for this DLNA renderer. For renderers
+    /// that advertise `audio/flac` but only decode 16-bit (Ruark R3, #1137):
+    /// downconverts hi-res to 16-bit FLAC instead of serving silent 24-bit direct.
+    dlna_cap_16bit: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -419,9 +423,16 @@ fn build_signal_path(
     let zone_id = zone.id.unwrap_or(0);
     let dlna_lpcm =
         is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
+    // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
+    // signal path shows a real 16-bit downconvert instead of a phantom
+    // bit-perfect passthrough when the source is hi-res.
+    let dlna_cap_16bit = is_network_output
+        && bit_depth > 16
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id);
     let alac_passthrough = source_format == Some(AudioFormat::Alac)
         && is_network_output
         && !dlna_lpcm
+        && !dlna_cap_16bit
         && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
     let needs_transcode_for_output = is_network_output
         && !alac_passthrough
@@ -437,8 +448,12 @@ fn build_signal_path(
 
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if needs_transcode_for_output {
-                let target = source_format.unwrap().dlna_transcode_target();
+            if needs_transcode_for_output || dlna_cap_16bit {
+                // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
+                // an otherwise-direct FLAC source (Ruark R3, #1137).
+                let target = source_format
+                    .map(|f| f.dlna_transcode_target())
+                    .unwrap_or(AudioFormat::Flac);
                 (false, "DLNA/UPnP", target.display_name())
             } else {
                 // FLAC, WAV, MP3, AAC → passthrough (bit-perfect for lossless)
@@ -685,6 +700,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 json!(zone_repo.get_alac_passthrough(zone_id)),
             );
             obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
+            obj.insert(
+                "dlna_cap_16bit".into(),
+                json!(zone_repo.get_dlna_cap_16bit(zone_id)),
+            );
             let online = match z.output_type.as_deref() {
                 Some("local") | Some("browser") => true,
                 _ => z
@@ -766,6 +785,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     json!(repo.get_alac_passthrough(id)),
                 );
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
+                obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
                 let online = match zone.output_type.as_deref() {
                     Some("local") | Some("browser") => true,
                     _ => zone
@@ -880,6 +900,11 @@ async fn patch_zone(
     }
     if let Some(lpcm) = body.dlna_lpcm {
         if let Err(e) = repo.update_dlna_lpcm(id, lpcm) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(cap) = body.dlna_cap_16bit {
+        if let Err(e) = repo.update_dlna_cap_16bit(id, cap) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
