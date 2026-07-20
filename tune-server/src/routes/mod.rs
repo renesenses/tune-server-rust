@@ -1,5 +1,6 @@
 pub mod active_profile;
 pub mod ai;
+pub mod airplay_pairing;
 pub mod archive;
 pub mod bandcamp;
 pub mod bridge;
@@ -308,6 +309,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/dac-calibration", dac_calibration::router())
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
+        .nest("/outputs", airplay_pairing::router())
         .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
