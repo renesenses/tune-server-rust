@@ -207,35 +207,6 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
     }
 }
 
-/// Detect ALAC vs AAC for M4A files by probing with symphonia.
-/// Returns "alac" if the codec is ALAC, "aac" otherwise.
-pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::formats::probe::Hint;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-
-    let file = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension("m4a");
-    let format_reader = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .ok()?;
-    let track = format_reader.default_track(symphonia::core::formats::TrackType::Audio)?;
-    let codec_name = format!("{:?}", track.codec_params);
-    if codec_name.contains("Alac") || codec_name.contains("alac") || codec_name.contains("ALAC") {
-        Some("alac".to_string())
-    } else {
-        Some("aac".to_string())
-    }
-}
-
 /// Probe an M4A/MP4 file for its real codec **and** bit depth.
 ///
 /// lofty reports neither for these files: it can't tell ALAC (lossless) from
