@@ -18,6 +18,67 @@ const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transcode__";
 static TRANSCODE_GATE: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Decode `source` to PCM, reduce its bit depth to `target_bd` when the source
+/// is deeper, apply the zone `eq` if any, encode to `target_fmt`, and write the
+/// result to `dest`. Returns `(encoded_size, pcm_bytes, actual_bit_depth)`.
+///
+/// Extracted from `play()` so the on-demand transcode and the background cache
+/// warm-up (`spawn_warm_next_local`) produce byte-identical output — a warm-up
+/// that diverged would populate a cache entry the real play never hits.
+async fn transcode_source_to_file(
+    source: String,
+    out_sr: u32,
+    channels: u16,
+    target_bd: u16,
+    target_fmt: String,
+    eq: Option<crate::audio::eq::EqProcessor>,
+    dest: String,
+) -> Result<(u64, Vec<u8>, u16), String> {
+    // 1. Decode source to PCM (blocking I/O).
+    let decoded = tokio::task::spawn_blocking(move || {
+        crate::audio::decode::decode_to_pcm(&source, Some(out_sr), Some(channels as u32), 0.0, 0.0)
+    })
+    .await
+    .map_err(|e| format!("decode task panic: {e}"))??;
+
+    let mut pcm_bytes = decoded.pcm_bytes();
+    let mut actual_bd = decoded.bit_depth;
+
+    // 1a. Reduce bit depth to the negotiated target when the source is deeper
+    // (e.g. 24-bit ALAC/FLAC → 16-bit LPCM for a 16-bit-only DLNA renderer).
+    if target_bd < actual_bd {
+        pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, target_bd);
+        actual_bd = target_bd;
+    }
+
+    // 1b. Apply EQ if enabled for this zone.
+    if let Some(mut eq) = eq {
+        eq.process_pcm(&mut pcm_bytes, actual_bd);
+    }
+
+    // 2. Encode to the target format.
+    let mut encoder = crate::audio::encoder::AudioEncoder::new(
+        &target_fmt,
+        decoded.sample_rate,
+        actual_bd as u32,
+        decoded.channels,
+    );
+    encoder.start().await?;
+    encoder.write(&pcm_bytes).await?;
+    let encoded_data = encoder.finish().await?;
+
+    // 3. Write to `dest` (blocking I/O).
+    let file_size = encoded_data.len() as u64;
+    let encoded_clone = encoded_data.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&dest, &encoded_clone).map_err(|e| format!("write temp file: {e}"))
+    })
+    .await
+    .map_err(|e| format!("write task panic: {e}"))??;
+
+    Ok((file_size, pcm_bytes, actual_bd))
+}
+
 use crate::audio::formats::AudioFormat;
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
 use crate::db::play_queue_repo::PlayQueueRepo;
@@ -1547,6 +1608,18 @@ impl PlaybackOrchestrator {
                         .streamer
                         .create_file_session(file_info, cp.clone(), false)
                         .await;
+                    // The current track was a cache hit → warm the next one too,
+                    // so an album keeps hitting the cache track after track.
+                    self.spawn_warm_next_local(
+                        req.zone_id,
+                        sample_rate,
+                        bit_depth,
+                        channels,
+                        out_ext.clone(),
+                        out_sr,
+                        out_bd,
+                        target_format_str.clone(),
+                    );
                     (
                         session_id,
                         out_mime,
@@ -1566,73 +1639,25 @@ impl PlaybackOrchestrator {
                         "transcode_to_temp_file_start"
                     );
 
-                    let tmp_path_clone = tmp_path.clone();
-                    let target_fmt_str = target_format_str.clone();
                     // Target bit depth chosen above (out_bd). For the generic DLNA
                     // WAV/LPCM fallback this is 16 (LPCM is a 16-bit-only profile);
                     // the decoded PCM must actually be reduced to 16-bit here, not
                     // merely relabelled — otherwise 24-bit samples are served under
                     // a 16-bit WAV header and the renderer plays silence (#1137).
                     let target_bd = out_bd;
-                    let transcode_result =
-                        tokio::time::timeout(std::time::Duration::from_secs(120), async move {
-                            // 1. Decode source to PCM (blocking I/O)
-                            let fp_clone = fp.clone();
-                            let decoded = tokio::task::spawn_blocking(move || {
-                                crate::audio::decode::decode_to_pcm(
-                                    &fp_clone,
-                                    Some(out_sr),
-                                    Some(channels as u32),
-                                    0.0,
-                                    0.0,
-                                )
-                            })
-                            .await
-                            .map_err(|e| format!("decode task panic: {e}"))??;
-
-                            let mut pcm_bytes = decoded.pcm_bytes();
-                            let mut actual_bd = decoded.bit_depth;
-
-                            // 1a. Reduce bit depth to the negotiated target when the
-                            // source is deeper (e.g. 24-bit ALAC/FLAC → 16-bit LPCM
-                            // for a DLNA renderer that only supports 16-bit LPCM).
-                            if target_bd < actual_bd {
-                                pcm_bytes = crate::audio::decode::convert_pcm_bytes(
-                                    &pcm_bytes, actual_bd, target_bd,
-                                );
-                                actual_bd = target_bd;
-                            }
-
-                            // 1b. Apply EQ if enabled for this zone
-                            if let Some(mut eq) = eq_profile {
-                                eq.process_pcm(&mut pcm_bytes, actual_bd);
-                            }
-
-                            // 2. Encode to target format (async — no block_on needed)
-                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                                &target_fmt_str,
-                                decoded.sample_rate,
-                                actual_bd as u32,
-                                decoded.channels,
-                            );
-                            encoder.start().await?;
-                            encoder.write(&pcm_bytes).await?;
-                            let encoded_data = encoder.finish().await?;
-
-                            // 3. Write to temp file (blocking I/O)
-                            let tmp_write = tmp_path_clone.clone();
-                            let encoded_clone = encoded_data.clone();
-                            tokio::task::spawn_blocking(move || {
-                                std::fs::write(&tmp_write, &encoded_clone)
-                                    .map_err(|e| format!("write temp file: {e}"))
-                            })
-                            .await
-                            .map_err(|e| format!("write task panic: {e}"))??;
-
-                            let file_size = encoded_data.len() as u64;
-                            Ok::<(u64, Vec<u8>, u16), String>((file_size, pcm_bytes, actual_bd))
-                        })
-                        .await;
+                    let transcode_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        transcode_source_to_file(
+                            fp.clone(),
+                            out_sr,
+                            channels,
+                            target_bd,
+                            target_format_str.clone(),
+                            eq_profile,
+                            tmp_path.clone(),
+                        ),
+                    )
+                    .await;
 
                     match transcode_result {
                         Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
@@ -1727,6 +1752,24 @@ impl PlaybackOrchestrator {
                                 .create_file_session(file_info, serve_path, false)
                                 .await;
 
+                            // Current track just transcoded into the cache → warm
+                            // the next one in the background while this one plays,
+                            // so the album transition is a cache hit (no 30s gap).
+                            // Only when the current was actually cached (Some means
+                            // no EQ) — warming an EQ zone would populate an entry
+                            // the real (EQ) play never hits.
+                            if cache_path_opt.is_some() {
+                                self.spawn_warm_next_local(
+                                    req.zone_id,
+                                    sample_rate,
+                                    bit_depth,
+                                    channels,
+                                    out_ext.clone(),
+                                    out_sr,
+                                    out_bd,
+                                    target_format_str.clone(),
+                                );
+                            }
                             (
                                 session_id,
                                 out_mime,
@@ -3477,6 +3520,106 @@ impl PlaybackOrchestrator {
                 )),
             )
         }
+    }
+
+    /// Pre-transcode the NEXT local queue track into the transcode cache while
+    /// the current one plays, so its play is a cache hit — this masks the ~30s
+    /// file-transcode latency across an album (the per-track transition gap
+    /// Yves hears on DLNA). Best-effort, background, and a no-op unless the next
+    /// track decodes to the SAME PCM params (sample rate / bit depth / channels,
+    /// non-DSD): only then is the negotiated output — and thus the cache key —
+    /// guaranteed identical to what the next track's real play would produce.
+    /// Callers fire this only when the current track was itself cached (no EQ).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_warm_next_local(
+        &self,
+        zone_id: i64,
+        cur_sr: u32,
+        cur_bd: u16,
+        cur_ch: u16,
+        out_ext: String,
+        out_sr: u32,
+        out_bd: u16,
+        target_fmt: String,
+    ) {
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            // Locate the current queue position and the item right after it.
+            let qrepo = PlayQueueRepo::with_backend(db.clone());
+            let queue = match qrepo.get_queue(zone_id) {
+                Ok(q) => q,
+                Err(_) => return,
+            };
+            let Some(cur_pos) = queue.iter().find(|q| q.is_current).map(|q| q.position) else {
+                return;
+            };
+            let Some(next) = queue.iter().find(|q| q.position == cur_pos + 1) else {
+                return;
+            };
+            let Some(next_file) = next.file_path.clone() else {
+                return;
+            };
+            // Same decoded params as the current track? A NULL prop or a DSD
+            // source means the negotiated output could differ — skip to avoid
+            // warming a cache key the real play won't hit.
+            let trepo = TrackRepo::with_backend(db.clone());
+            let Some(t) = trepo.get(next.track_id).ok().flatten() else {
+                return;
+            };
+            let is_dsd = t
+                .format
+                .as_deref()
+                .map(|f| matches!(f.to_ascii_lowercase().as_str(), "dsd" | "dsf" | "dff"))
+                .unwrap_or(false);
+            let (Some(n_sr), Some(n_bd)) = (t.sample_rate, t.bit_depth) else {
+                return;
+            };
+            if is_dsd
+                || n_sr as u32 != cur_sr
+                || n_bd as u16 != cur_bd
+                || t.channels as u16 != cur_ch
+            {
+                return;
+            }
+            // Already warmed / cached?
+            let Some(cp) =
+                crate::transcode_cache::cache_path(&next_file, &out_ext, out_sr, out_bd, cur_ch)
+            else {
+                return;
+            };
+            if crate::transcode_cache::is_hit(&cp) {
+                return;
+            }
+            // Transcode into a fresh temp file, then atomically rename it into the
+            // cache (crash-safe: a partial write never lands under a cache name).
+            let tmp = std::env::temp_dir()
+                .join(format!(
+                    "tune-transcode-{}.{}",
+                    uuid::Uuid::new_v4(),
+                    out_ext
+                ))
+                .to_string_lossy()
+                .to_string();
+            match transcode_source_to_file(
+                next_file,
+                out_sr,
+                cur_ch,
+                out_bd,
+                target_fmt,
+                None,
+                tmp.clone(),
+            )
+            .await
+            {
+                Ok((size, _, _)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
+                    tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                    info!(zone_id, cache = %cp, "transcode_cache_warmed_next");
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        });
     }
 
     fn load_eq_processor(
