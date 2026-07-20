@@ -235,7 +235,7 @@ impl PlaybackManager {
         });
         state.state = PlayState::Playing;
         state.position_ms = 0;
-        state.now_playing = Some(np.clone());
+        state.now_playing = Some(np);
         state.track_generation = state.track_generation.wrapping_add(1);
         // Preserve last_seek_at if a seek just happened (< 5s ago) — the
         // orchestrator recreates the stream during seek, which calls play().
@@ -248,25 +248,11 @@ impl PlaybackManager {
             state.last_seek_at = None;
         }
 
+        let data = now_playing_event_data(state);
         self.emit(PlaybackEvent {
             event: "started".into(),
             zone_id,
-            data: serde_json::json!({
-                "title": np.title,
-                "artist_name": np.artist_name,
-                "album_title": np.album_title,
-                "cover_path": np.cover_path,
-                "duration_ms": np.duration_ms,
-                "source": np.source,
-                "source_id": np.source_id,
-                // Carry the technical info so the client can show the quality /
-                // signal-path badge immediately on play, instead of only after a
-                // manual refresh (Benjithom: the signal button appeared only
-                // after Ctrl+R on each track change).
-                "format": np.format,
-                "sample_rate": np.sample_rate,
-                "bit_depth": np.bit_depth,
-            }),
+            data,
         });
     }
 
@@ -296,30 +282,19 @@ impl PlaybackManager {
 
     pub async fn stop(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
-        let np_data = if let Some(state) = zones.get_mut(&zone_id) {
+        let data = if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Stopped;
             state.last_seek_at = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
-            state.now_playing.as_ref().map(|np| {
-                serde_json::json!({
-                    "track_id": np.track_id,
-                    "title": np.title,
-                    "artist_name": np.artist_name,
-                    "album_title": np.album_title,
-                    "cover_path": np.cover_path,
-                    "duration_ms": np.duration_ms,
-                    "source": np.source,
-                    "source_id": np.source_id,
-                })
-            })
+            now_playing_event_data(state)
         } else {
-            None
+            serde_json::json!({})
         };
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
-            data: np_data.unwrap_or(serde_json::json!({})),
+            data,
         });
     }
 
@@ -479,20 +454,16 @@ impl PlaybackManager {
     pub async fn update_now_playing(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
-            state.now_playing = Some(np.clone());
+            state.now_playing = Some(np);
         }
+        let data = zones
+            .get(&zone_id)
+            .map(now_playing_event_data)
+            .unwrap_or_else(|| serde_json::json!({}));
         self.emit(PlaybackEvent {
             event: "track_changed".into(),
             zone_id,
-            data: serde_json::json!({
-                "title": np.title,
-                "artist_name": np.artist_name,
-                "album_title": np.album_title,
-                "cover_path": np.cover_path,
-                "duration_ms": np.duration_ms,
-                "source": np.source,
-                "source_id": np.source_id,
-            }),
+            data,
         });
     }
 
@@ -501,9 +472,82 @@ impl PlaybackManager {
     }
 }
 
+/// Build the JSON payload for a now-playing WS event (`started` /
+/// `track_changed` / `stopped`) from the full [`ZoneState`], so every one of
+/// those events carries the same complete set of fields: the entire
+/// [`NowPlaying`] (title, `track_id`, `format`, `sample_rate`, `bit_depth`, …)
+/// plus `queue_position` / `queue_length` / `track_generation`. Each event used
+/// to hand-write a different subset — `track_changed` (emitted on every gapless
+/// advance) carried neither `track_id`, nor the quality fields, nor the queue
+/// index — which forced the client to refetch the whole queue and delayed the
+/// quality badge until a manual refresh (#1096, Benjithom).
+fn now_playing_event_data(state: &ZoneState) -> serde_json::Value {
+    let mut v = state
+        .now_playing
+        .as_ref()
+        .and_then(|np| serde_json::to_value(np).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "queue_position".into(),
+            serde_json::json!(state.queue_position),
+        );
+        obj.insert("queue_length".into(), serde_json::json!(state.queue_length));
+        obj.insert(
+            "track_generation".into(),
+            serde_json::json!(state.track_generation),
+        );
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn now_playing_event_data_carries_full_payload() {
+        let mut state = ZoneState {
+            zone_id: 1,
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                track_id: Some(42),
+                title: "Song".into(),
+                bit_depth: Some(16),
+                sample_rate: Some(44100),
+                format: Some("flac".into()),
+                ..Default::default()
+            }),
+            position_ms: 0,
+            volume: 1.0,
+            muted: false,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            queue_position: 3,
+            queue_length: 100,
+            shuffle_order: vec![],
+            shuffle_index: -1,
+            track_generation: 7,
+            play_seq: 0,
+            last_seek_at: None,
+            last_volume_set_at: None,
+        };
+        let v = now_playing_event_data(&state);
+        // Full NowPlaying is serialised…
+        assert_eq!(v["track_id"], 42);
+        assert_eq!(v["bit_depth"], 16);
+        assert_eq!(v["format"], "flac");
+        // …plus the queue index/length and generation.
+        assert_eq!(v["queue_position"], 3);
+        assert_eq!(v["queue_length"], 100);
+        assert_eq!(v["track_generation"], 7);
+
+        // With no now_playing it still reports the queue fields, never panics.
+        state.now_playing = None;
+        let empty = now_playing_event_data(&state);
+        assert_eq!(empty["queue_position"], 3);
+        assert!(empty.get("track_id").is_none());
+    }
 
     #[tokio::test]
     async fn set_shuffle_emits_event() {

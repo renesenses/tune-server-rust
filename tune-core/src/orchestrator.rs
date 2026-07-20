@@ -4029,10 +4029,12 @@ impl PlaybackOrchestrator {
                 seek_ms: None,
                 temp_file_path: None,
             };
-            let result = self.play(req).await?;
+            // Set the queue index before play() emits "started" so the event
+            // carries the correct queue_position (#1096).
             self.playback
                 .update_queue_info(zone_id, position, queue.len() as i64)
                 .await;
+            let result = self.play(req).await?;
             return Ok(result);
         }
 
@@ -4137,6 +4139,12 @@ impl PlaybackOrchestrator {
                 genre: track.as_ref().and_then(|t| t.genre.clone()),
                 year: track.as_ref().and_then(|t| t.year),
             };
+            // Set the queue index BEFORE emitting track_changed so the event
+            // carries the new queue_position — the client then updates its
+            // highlight without refetching the whole queue (#1096).
+            self.playback
+                .update_queue_info(zone_id, position, queue.len() as i64)
+                .await;
             // Use update_now_playing (not play) to avoid bumping
             // track_generation — the poller must keep its gapless_cooldown
             // intact so it doesn't falsely detect track-end on renderers
@@ -4147,9 +4155,6 @@ impl PlaybackOrchestrator {
             // previous track until the next poller tick overwrites it.
             self.playback.update_position(zone_id, 0).await;
             self.playback.emit_position(zone_id, 0);
-            self.playback
-                .update_queue_info(zone_id, position, queue.len() as i64)
-                .await;
             return Ok(());
         }
 
@@ -4182,15 +4187,16 @@ impl PlaybackOrchestrator {
                 stream_id: None,
                 ..Default::default()
             };
+            // Set the queue index before emitting track_changed (see above).
+            self.playback
+                .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
+                .await;
             // Same rationale: gapless metadata-only advance must not
             // bump track_generation — but position MUST reset to 0
             // because the new track starts from the beginning.
             self.playback.update_now_playing(zone_id, np).await;
             self.playback.update_position(zone_id, 0).await;
             self.playback.emit_position(zone_id, 0);
-            self.playback
-                .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
-                .await;
             return Ok(());
         }
 
