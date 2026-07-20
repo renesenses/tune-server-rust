@@ -300,38 +300,102 @@ impl OutputTarget for Airplay2Output {
     }
 }
 
-fn find_daemon_binary() -> String {
-    // Check common locations
-    let candidates = [
-        "airplay-daemon",
-        "/usr/local/bin/airplay-daemon",
-        "/opt/tune-server/airplay-daemon",
-    ];
-    for path in &candidates {
-        if std::path::Path::new(path).exists() {
-            return path.to_string();
+/// Platform-correct daemon filename (`airplay-daemon` or `airplay-daemon.exe`).
+fn daemon_exe_name() -> String {
+    format!("{DAEMON_BINARY}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Resolve the daemon binary given the directory of the running executable.
+/// Pure (no PATH lookup) so it can be unit-tested. Checks, in order:
+///   1. next to the tune-server executable — how the release archives bundle it,
+///      wherever the user extracted the zip/tar;
+///   2. well-known absolute install locations (Docker image, manual installs);
+///   3. the current working directory (legacy behaviour).
+/// Returns None if not found on disk (caller then falls back to a PATH probe).
+fn resolve_daemon_path(exe_dir: Option<&std::path::Path>, exe_name: &str) -> Option<String> {
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join(exe_name);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    // Try `which`
-    if let Ok(output) = std::process::Command::new("which")
-        .arg(DAEMON_BINARY)
+    for abs in [
+        format!("/usr/local/bin/{exe_name}"),
+        format!("/opt/tune-server/{exe_name}"),
+    ] {
+        if std::path::Path::new(&abs).exists() {
+            return Some(abs);
+        }
+    }
+    if std::path::Path::new(exe_name).exists() {
+        return Some(exe_name.to_string());
+    }
+    None
+}
+
+/// PATH lookup using the platform locator (`where` on Windows, `which` elsewhere).
+fn which_daemon(exe_name: &str) -> Option<String> {
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(locator)
+        .arg(exe_name)
         .output()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return path;
-        }
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    DAEMON_BINARY.to_string()
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+fn find_daemon_binary() -> String {
+    let exe_name = daemon_exe_name();
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(|p| p.parent());
+    resolve_daemon_path(exe_dir, &exe_name)
+        .or_else(|| which_daemon(&exe_name))
+        .unwrap_or(exe_name)
 }
 
 /// Check if the airplay-daemon binary is available on this system.
 pub fn daemon_available() -> bool {
-    let binary = find_daemon_binary();
-    std::path::Path::new(&binary).exists()
-        || std::process::Command::new("which")
-            .arg(DAEMON_BINARY)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    let exe_name = daemon_exe_name();
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(|p| p.parent());
+    resolve_daemon_path(exe_dir, &exe_name).is_some() || which_daemon(&exe_name).is_some()
+}
+
+#[cfg(test)]
+mod daemon_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_daemon_bundled_next_to_executable() {
+        // The primary native-install path: the daemon sits in the same directory
+        // as the tune-server binary, wherever the archive was extracted.
+        let dir = std::env::temp_dir().join(format!("tune_daemon_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_name = daemon_exe_name();
+        let bin = dir.join(&exe_name);
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+
+        let found = resolve_daemon_path(Some(&dir), &exe_name);
+        assert_eq!(found.as_deref(), Some(bin.to_string_lossy().as_ref()));
+
+        // No exe dir + not in CWD/system dirs → None (caller falls back to PATH).
+        std::fs::remove_file(&bin).unwrap();
+        assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn daemon_name_has_platform_exe_suffix() {
+        let name = daemon_exe_name();
+        assert!(name.starts_with("airplay-daemon"));
+        assert!(name.ends_with(std::env::consts::EXE_SUFFIX));
+    }
 }
