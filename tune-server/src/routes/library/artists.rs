@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
 use super::{Pagination, api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
 
@@ -189,7 +189,7 @@ pub(super) async fn artist_tracks(
     Path(id): Path<i64>,
 ) -> Json<Value> {
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let items = repo.list_by_artist(id).unwrap_or_default();
+    let items = dedup_display_tracks(repo.list_by_artist(id).unwrap_or_default());
     Json(json!(items))
 }
 
