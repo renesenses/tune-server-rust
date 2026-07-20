@@ -54,6 +54,7 @@ pub enum Feature {
     MultiServer,
     DacCalibration,
     BatchConverter,
+    PlaylistsHub,
 }
 
 impl Feature {
@@ -84,6 +85,7 @@ impl Feature {
             Feature::MultiServer,
             Feature::DacCalibration,
             Feature::BatchConverter,
+            Feature::PlaylistsHub,
         ]
     }
 
@@ -113,6 +115,7 @@ impl Feature {
             Feature::MultiServer => "Multi-Server",
             Feature::DacCalibration => "DAC Calibration",
             Feature::BatchConverter => "Batch Audio Converter",
+            Feature::PlaylistsHub => "Playlists Hub",
         }
     }
 }
@@ -550,8 +553,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentytwo_features() {
-        assert_eq!(Feature::all_premium().len(), 22);
+    fn all_premium_has_twentythree_features() {
+        assert_eq!(Feature::all_premium().len(), 23);
     }
 
     #[test]
