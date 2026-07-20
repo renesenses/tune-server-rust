@@ -1842,13 +1842,44 @@ impl PlaybackOrchestrator {
             .streamer
             .get_stream_url(&session_id, &server_ip, &out_ext);
 
+        // For a transcoded WAV/LPCM stream served with an exact byte length
+        // (the file-transcode path pre-encodes the whole WAV, so file_size is
+        // the real body size), advertise a DIDL `res@duration` derived from
+        // that byte length instead of the scanned `track.duration_ms`. The two
+        // can disagree by a few seconds (the FLAC STREAMINFO/scan duration vs.
+        // the actual decoded sample count), and when the DIDL duration is
+        // LONGER than the bytes the renderer receives, some renderers (Marantz
+        // ND 8006) reach EOF, see position < advertised duration, and
+        // restart/loop the track near the end instead of advancing (#1132).
+        // Computing duration from size/byte_rate keeps duration and size
+        // mathematically consistent, so the progress bar tracks correctly and
+        // the track advances cleanly. Only applies when we know the exact size
+        // AND the audio params; otherwise fall back to the scanned duration.
+        let didl_duration_ms = if out_mime == "audio/wav" || out_mime == "audio/x-wav" {
+            match (resolved_file_size, resolved_sr, resolved_bd, resolved_ch) {
+                (Some(size), Some(sr), Some(bd), Some(ch))
+                    if size > 44 && sr > 0 && bd > 0 && ch > 0 =>
+                {
+                    let byte_rate = sr as u64 * ch as u64 * (bd as u64 / 8);
+                    if byte_rate > 0 {
+                        Some(((size - 44) * 1000 / byte_rate) as i64)
+                    } else {
+                        Some(track.duration_ms)
+                    }
+                }
+                _ => Some(track.duration_ms),
+            }
+        } else {
+            Some(track.duration_ms)
+        };
+
         Ok(ResolvedStream {
             url: stream_url,
             mime_type: out_mime,
             title: track.title,
             artist: track.artist_name,
             album: track.album_title,
-            duration_ms: Some(track.duration_ms),
+            duration_ms: didl_duration_ms,
             source: "local".into(),
             cover_url: track.cover_path,
             stream_id: Some(session_id),

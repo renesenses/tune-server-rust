@@ -440,7 +440,12 @@ fn import_zones(
                     &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                     &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
                     &z["fixed_volume"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    &z["autoplay_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
+                    // autoplay defaults OFF: the schema default is 0 and
+                    // migration 46 (autoplay_default_off) forces it off. A
+                    // backup that predates the autoplay field must NOT silently
+                    // re-enable endless auto-DJ, which appends random tracks
+                    // when a launched playlist ends (#1132).
+                    &z["autoplay_enabled"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &name.to_string() as &dyn ToSqlValue,
                 ],
             )?;
@@ -458,7 +463,8 @@ fn import_zones(
                     &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                     &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
                     &z["fixed_volume"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    &z["autoplay_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
+                    // autoplay defaults OFF (see UPDATE branch above, #1132).
+                    &z["autoplay_enabled"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                 ],
             )?;
         }
