@@ -1,6 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::{debug, info, warn};
+
+/// Best-effort diagnostic counter of artwork downloads rejected with a
+/// rate-limit status (429/503), incremented in [`download_image`]. An
+/// enrichment batch reads the delta over its own run and reports it, so a run
+/// that "found nothing" can tell retryable throttling apart from genuinely
+/// absent artwork (Jean Valjean #1096). It counts download-level hits (a single
+/// artist may hit several sources) and is process-global — fine because
+/// enrichment runs are serialised; `Relaxed` is enough for a diagnostic count.
+/// Per-artist precision will come with the fetch-layer refactor (typed
+/// `FetchOutcome` propagated up the source cascade).
+static ARTWORK_RATE_LIMIT_HITS: AtomicU32 = AtomicU32::new(0);
 
 /// Candidate filenames for folder-level cover art.
 ///
@@ -724,12 +736,41 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    let resp = client.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
+    // Single choke point for every artwork/artist-image download: log *why* a
+    // fetch produced nothing so an enrichment run that "finds nothing" can be
+    // diagnosed (rate-limit vs genuinely absent vs network), instead of every
+    // failure being an indistinguishable `None` (#1096). Behaviour is unchanged
+    // — all four failure cases still return `None`.
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(url, error = %e, "artwork_download_network_error");
+            return None;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() == 429 || status.as_u16() == 503 {
+            ARTWORK_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                url,
+                status = status.as_u16(),
+                "artwork_download_rate_limited"
+            );
+        } else {
+            debug!(url, status = status.as_u16(), "artwork_download_http_error");
+        }
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(url, error = %e, "artwork_download_read_error");
+            return None;
+        }
+    };
     if bytes.len() < 1000 {
+        debug!(url, len = bytes.len(), "artwork_download_too_small");
         return None;
     }
     Some(bytes.to_vec())
@@ -787,6 +828,10 @@ async fn batch_enrich_artist_artwork_inner(
     force: bool,
 ) {
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
+    // Snapshot the global rate-limit counter so the result can report how many
+    // downloads THIS run had throttled (429/503) — a "found nothing" run with a
+    // high count is retryable, not genuinely empty (#1096).
+    let rl_start = ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed);
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
     let mut community_applied = 0u32;
@@ -1034,6 +1079,8 @@ async fn batch_enrich_artist_artwork_inner(
                         "enriched": enriched,
                         "failed": failed,
                         "community_applied": community_applied,
+                        "rate_limit_hits":
+                            ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
                     })
                     .to_string(),
                 )
@@ -1142,6 +1189,11 @@ async fn batch_enrich_artist_artwork_inner(
                 "phase3_lastfm": lastfm_enriched,
                 "failed": failed,
                 "community_applied": community_applied,
+                // How many downloads were rate-limited during this run: lets the
+                // UI say "N restants dont X à réessayer" instead of implying the
+                // artists are simply absent (#1096).
+                "rate_limit_hits":
+                    ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
             })
             .to_string(),
         )
