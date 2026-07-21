@@ -315,27 +315,20 @@ pub fn decode_to_pcm(
     }
 
     if ext == "ape" {
-        // Wrap in catch_unwind: the native APE decoder may panic on malformed
-        // or unsupported APE files (e.g. very old versions, Insane compression).
-        // A panic must NOT crash the server.
-        let fp = file_path.to_string();
-        let result = catch_unwind(AssertUnwindSafe(move || {
-            super::ape::decode_ape_to_pcm(
-                &fp,
-                target_sample_rate,
-                target_channels,
-                seek_s,
-                max_duration_s,
-            )
-        }));
-        return match result {
-            Ok(inner) => inner,
-            Err(panic_info) => {
-                let msg = panic_payload_to_string(&panic_info);
-                error!(file = file_path, panic = %msg, "ape_decoder_panic");
-                Err(format!("APE decode panic: {msg}"))
-            }
-        };
+        // Monkey's Audio (.ape) is NOT actually decodable: the in-tree native
+        // decoder (audio/ape.rs) is an incomplete, uncorrected approximation
+        // (simplified range coder / entropy model / prediction filter, no
+        // decode-correctness tests) that produces silence or errors rather than
+        // valid PCM, so playback silently did nothing (Marco Polo, #1145).
+        // symphonia has no APE support, and there is no reliable pure-Rust APE
+        // decoder; the only real decoders are C (libMAC / FFmpeg apedec), which
+        // we deliberately don't ship (all-native, no FFmpeg). Until a correct
+        // decoder exists, surface a clear "not supported" error instead of the
+        // broken decoder's silent no-op. Files still scan (tags via lofty); the
+        // recommended workaround is a lossless .ape -> .flac conversion.
+        return Err("Monkey's Audio (.ape) is not supported for playback. \
+             Please convert the file to FLAC (lossless)."
+            .to_string());
     }
 
     if ext == "wma" || ext == "asf" {
