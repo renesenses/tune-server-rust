@@ -175,6 +175,28 @@ pub struct ResolvedQueueItem {
     pub file_size: Option<u64>,
 }
 
+/// DIDL `res@duration` (ms) for a native passthrough stream served raw to a
+/// network renderer (FLAC/ALAC/… sent as-is, not transcoded).
+///
+/// Prefer the file container's authoritative duration (`probed_secs`, read from
+/// the FLAC STREAMINFO / lofty properties — the true playable length of the
+/// bytes we serve) over the scanned `track.duration_ms`, which can be a few
+/// seconds too long (recovered by a slow/fallback NAS scan, or drifted vs. the
+/// real sample count). An over-long `res@duration` makes the gapless-queued
+/// (SetNextAVTransportURI) track cut near EOF and lose its progress display on
+/// the Marantz ND 8006 (#1132), because the renderer models the auto-advanced
+/// track purely from the DIDL instead of re-probing the stream.
+///
+/// Falls back to the scanned duration when the probe failed or is non-positive
+/// (e.g. a NAS read timeout), so we never blank the duration entirely.
+fn passthrough_didl_duration_ms(probed_secs: Option<f64>, scanned_ms: i64) -> i64 {
+    probed_secs
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(|s| (s * 1000.0).round() as i64)
+        .filter(|&ms| ms > 0)
+        .unwrap_or(scanned_ms)
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -2117,6 +2139,34 @@ impl PlaybackOrchestrator {
                 }
                 _ => Some(track.duration_ms),
             }
+        } else if !needs_transcode && is_network_output {
+            // Native passthrough (FLAC/ALAC/… served raw) to a network renderer.
+            //
+            // The gapless-queued (SetNextAVTransportURI) track is the one that
+            // regresses on the Marantz ND 8006 (Jean Valjean, #1132): odd tracks
+            // start via a fresh SetAVTransportURI + Play — the renderer fetches
+            // the URL itself, learns the true byte length, and ends the track at
+            // the real EOF, so an over-long DIDL duration is harmless. But on the
+            // gapless auto-transition to the *next* track the renderer does NOT
+            // re-probe the stream — it models playback purely from the DIDL
+            // `res@duration` we supplied via SetNext. When the scanned
+            // `track.duration_ms` (possibly recovered by a slow/fallback scan on
+            // a NAS, or drifted vs. the real sample count) is a few seconds LONGER
+            // than the file's true duration, the renderer holds at the real EOF
+            // with its estimate still reading position < duration, loses the
+            // format/duration/progress display and cuts near the end of the
+            // queued track. 1626ec21 only made `res@size` consistent; the
+            // duration was still the scanned value on this passthrough path.
+            //
+            // Prefer the file container's authoritative duration (FLAC STREAMINFO
+            // total_samples / sample_rate via lofty — metadata only, no decode)
+            // so the SetNext DIDL `res@duration` matches the bytes actually
+            // served. This corrects the current-track DIDL identically (it can
+            // only get MORE accurate, never worse — the initial Play already
+            // ends at real EOF). Fall back to the scanned duration if the probe
+            // fails, so a NAS timeout never blanks the duration entirely.
+            let probed_secs = crate::audio::analyzer::get_duration(&file_path).await.ok();
+            Some(passthrough_didl_duration_ms(probed_secs, track.duration_ms))
         } else {
             Some(track.duration_ms)
         };
@@ -5091,7 +5141,40 @@ mod tests {
     use crate::playback::{NowPlaying, PlayState, PlaybackManager};
     use crate::streaming::registry::ServiceRegistry;
 
-    use super::PlaybackOrchestrator;
+    use super::{PlaybackOrchestrator, passthrough_didl_duration_ms};
+
+    #[test]
+    fn passthrough_duration_prefers_probed_over_scanned() {
+        // #1132: the scanned duration (5:65 = 305_000 ms) is a few seconds too
+        // long vs. the file's real STREAMINFO duration (300_000 ms). The DIDL
+        // must advertise the real one so the gapless-queued track on the Marantz
+        // ND 8006 ends at the true EOF instead of cutting/looping near the end.
+        assert_eq!(
+            passthrough_didl_duration_ms(Some(300.0), 305_000),
+            300_000,
+            "probed STREAMINFO duration wins over the too-long scanned value"
+        );
+    }
+
+    #[test]
+    fn passthrough_duration_falls_back_when_probe_missing() {
+        // NAS read timeout / unreadable header → probe is None. We must keep the
+        // scanned duration rather than blank it (a 0 duration hides the progress
+        // bar on the renderer entirely).
+        assert_eq!(passthrough_didl_duration_ms(None, 240_000), 240_000);
+    }
+
+    #[test]
+    fn passthrough_duration_ignores_bogus_probe() {
+        // Zero / negative / non-finite probed values must not overwrite a valid
+        // scanned duration.
+        assert_eq!(passthrough_didl_duration_ms(Some(0.0), 180_000), 180_000);
+        assert_eq!(passthrough_didl_duration_ms(Some(-5.0), 180_000), 180_000);
+        assert_eq!(
+            passthrough_didl_duration_ms(Some(f64::NAN), 180_000),
+            180_000
+        );
+    }
 
     fn test_orchestrator() -> PlaybackOrchestrator {
         let db = SqliteDb::open_in_memory().unwrap();
