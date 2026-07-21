@@ -73,6 +73,22 @@ pub(super) async fn trigger_scan(
             if let Err(e) = SettingsRepo::with_backend(db).set("scan_status", "idle") {
                 tracing::warn!(error = %e, "scan_status_reset_failed");
             }
+            // Emit a completion event so the client clears the "scanning" banner.
+            // The web UI only drops the banner on `library.scan.completed`; the
+            // normal path emits it at the end, but this early return was silent —
+            // leaving the panel stuck at "0 scanned, 0 added" forever, with a
+            // Stop button that does nothing because the scan already ended
+            // (macOS user with no folder yet, #1129).
+            event_bus.emit(
+                "library.scan.completed",
+                json!({
+                    "total_files": 0,
+                    "inserted": 0,
+                    "updated": 0,
+                    "skipped": 0,
+                    "no_dirs": true,
+                }),
+            );
             return;
         }
 
@@ -783,6 +799,16 @@ pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoRespo
     if let Err(e) = settings.set("scan_status", "idle") {
         tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
     }
+    // Clear the client's "scanning" banner immediately. The batch loop's own
+    // completion event only fires if the scan is *in* that loop — but if it is
+    // stuck earlier (walker enumerating a slow/inaccessible NAS path, macOS
+    // folder-permission stall) or has already ended, SCAN_CANCEL is a no-op and
+    // no completion event is ever emitted, so "Stop scan" does nothing visible
+    // (#1129). Emitting here guarantees the banner drops on Stop. A duplicate
+    // event from the draining loop is harmless (the UI just clears twice).
+    state
+        .event_bus
+        .emit("library.scan.completed", json!({ "cancelled": true }));
     StatusCode::NO_CONTENT
 }
 
