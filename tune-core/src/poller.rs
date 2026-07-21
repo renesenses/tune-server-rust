@@ -432,20 +432,65 @@ impl PositionPoller {
                 let last_state =
                     ZoneRepo::with_backend(self.db.clone()).get_last_play_state(zone_id);
                 if last_state.as_deref() == Some("playing") {
-                    let np = crate::playback::NowPlaying {
-                        track_id: None,
-                        title: status.track_title.unwrap_or_else(|| "Recovering...".into()),
-                        artist_name: status.track_artist,
-                        album_title: None,
-                        cover_path: None,
-                        duration_ms: status.duration_ms as i64,
-                        source: "local".into(),
-                        source_id: None,
-                        stream_id: None,
-                        ..Default::default()
-                    };
-                    self.playback.play(zone_id, np).await;
-                    info!(zone_id, device = %device_id, "playback_recovered_from_device");
+                    // Re-resolve the zone's REAL last-played track from the
+                    // persisted state instead of a bogus "Recovering..."
+                    // placeholder with track_id = None. That placeholder (a) showed
+                    // as a phantom track "that corresponds to nothing" and (b) made
+                    // resume() replay a track it couldn't play, so pressing play
+                    // after a zone switch did nothing (#729).
+                    let zone = ZoneRepo::with_backend(self.db.clone())
+                        .get(zone_id)
+                        .ok()
+                        .flatten();
+                    let last_track_id = zone.as_ref().and_then(|z| z.last_track_id);
+                    let last_source = zone
+                        .as_ref()
+                        .and_then(|z| z.last_track_source.clone())
+                        .unwrap_or_else(|| "local".into());
+                    let last_source_id = zone.as_ref().and_then(|z| z.last_track_source_id.clone());
+                    // Prefer the persisted local track's real metadata; fall back
+                    // to what the device reports. Never invent a placeholder title.
+                    let db_track = last_track_id.and_then(|tid| {
+                        crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                            .get(tid)
+                            .ok()
+                            .flatten()
+                    });
+                    let title = db_track
+                        .as_ref()
+                        .map(|t| t.title.clone())
+                        .or_else(|| status.track_title.clone());
+
+                    // Only recover if we actually know what is playing — otherwise
+                    // skip so a titleless device blip never surfaces as a phantom.
+                    if let Some(title) = title {
+                        let np = crate::playback::NowPlaying {
+                            track_id: last_track_id,
+                            title,
+                            artist_name: db_track
+                                .as_ref()
+                                .and_then(|t| t.artist_name.clone())
+                                .or_else(|| status.track_artist.clone()),
+                            album_title: db_track.as_ref().and_then(|t| t.album_title.clone()),
+                            cover_path: db_track.as_ref().and_then(|t| t.cover_path.clone()),
+                            duration_ms: db_track
+                                .as_ref()
+                                .map(|t| t.duration_ms)
+                                .unwrap_or(status.duration_ms as i64),
+                            source: last_source,
+                            source_id: last_source_id,
+                            stream_id: None,
+                            ..Default::default()
+                        };
+                        self.playback.play(zone_id, np).await;
+                        info!(zone_id, device = %device_id, "playback_recovered_from_device");
+                    } else {
+                        debug!(
+                            zone_id,
+                            device = %device_id,
+                            "playback_recovery_skipped_unknown_track"
+                        );
+                    }
                 } else {
                     debug!(
                         zone_id,
