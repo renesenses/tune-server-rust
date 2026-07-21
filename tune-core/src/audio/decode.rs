@@ -315,20 +315,10 @@ pub fn decode_to_pcm(
     }
 
     if ext == "ape" {
-        // Monkey's Audio (.ape) is NOT actually decodable: the in-tree native
-        // decoder (audio/ape.rs) is an incomplete, uncorrected approximation
-        // (simplified range coder / entropy model / prediction filter, no
-        // decode-correctness tests) that produces silence or errors rather than
-        // valid PCM, so playback silently did nothing (Marco Polo, #1145).
-        // symphonia has no APE support, and there is no reliable pure-Rust APE
-        // decoder; the only real decoders are C (libMAC / FFmpeg apedec), which
-        // we deliberately don't ship (all-native, no FFmpeg). Until a correct
-        // decoder exists, surface a clear "not supported" error instead of the
-        // broken decoder's silent no-op. Files still scan (tags via lofty); the
-        // recommended workaround is a lossless .ape -> .flac conversion.
-        return Err("Monkey's Audio (.ape) is not supported for playback. \
-             Please convert the file to FLAC (lossless)."
-            .to_string());
+        // SPIKE (#1145): real Monkey's Audio playback via the pure-Rust
+        // `ape-decoder` crate (MIT/Apache-2.0), replacing the broken in-tree
+        // stub. This is a feasibility wiring — validate before shipping.
+        return decode_ape_to_pcm(file_path, seek_s, max_duration_s);
     }
 
     if ext == "wma" || ext == "asf" {
@@ -1027,6 +1017,144 @@ fn decode_via_ffmpeg(
         bit_depth: out_bd,
         sample_rate: source_rate,
         channels: source_channels,
+        duration_s,
+    })
+}
+
+/// SPIKE (#1145): decode a Monkey's Audio (.ape) file to PCM using the
+/// pure-Rust `ape-decoder` crate. Returns right-justified i32 samples in a
+/// `DecodedAudio`, matching the symphonia path's contract.
+///
+/// The crate decodes to interleaved little-endian PCM bytes at the file's
+/// native bit depth (16/24/32). We deinterleave into right-justified i32
+/// samples so `pcm_bytes()` / `convert_pcm_bit_depth()` behave exactly as for
+/// the symphonia decoders. `seek_s` uses the crate's sample-accurate
+/// `decode_from`; `max_duration_s` truncates the sample buffer afterward.
+///
+/// NOT production-hardened: no local staging tuning, decodes the whole file
+/// into memory (a large 24/96 .ape can be ~1 GB PCM — the streaming path in
+/// decode_to_pcm_streaming_inner already routes .ape through full decode + chunk).
+fn decode_ape_to_pcm(
+    file_path: &str,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    use std::io::BufReader;
+
+    let file = File::open(file_path).map_err(|e| format!("open ape: {e}"))?;
+    let mut decoder =
+        ape_decoder::ApeDecoder::new(BufReader::new(file)).map_err(|e| format!("ape open: {e}"))?;
+
+    // Copy out the fields we need BEFORE any &mut decode call: info() borrows
+    // the decoder immutably and decode_all/decode_from borrow it mutably.
+    let (sample_rate, channels, bit_depth, is_float, is_signed_8bit) = {
+        let info = decoder.info();
+        (
+            info.sample_rate,
+            info.channels as u32,
+            info.bits_per_sample,
+            info.is_floating_point,
+            info.is_signed_8bit,
+        )
+    };
+
+    if is_float {
+        return Err("Monkey's Audio (.ape) floating-point source not supported".into());
+    }
+    if !matches!(bit_depth, 8 | 16 | 24 | 32) {
+        return Err(format!("ape: unsupported bit depth {bit_depth}"));
+    }
+
+    // Sample-accurate seek: decode from the requested sample offset onward.
+    let start_sample = if seek_s > 0.0 {
+        (seek_s * sample_rate as f64) as u64
+    } else {
+        0
+    };
+
+    let pcm: Vec<u8> = if start_sample > 0 {
+        decoder
+            .decode_from(start_sample)
+            .map_err(|e| format!("ape decode_from: {e}"))?
+    } else {
+        decoder
+            .decode_all()
+            .map_err(|e| format!("ape decode_all: {e}"))?
+    };
+
+    // Deinterleave native-depth LE PCM bytes into right-justified i32 samples.
+    let bytes_per_sample = (bit_depth / 8) as usize;
+    if bytes_per_sample == 0 || pcm.len() % bytes_per_sample != 0 {
+        return Err("ape: PCM byte length not aligned to sample size".into());
+    }
+    let mut samples: Vec<i32> = Vec::with_capacity(pcm.len() / bytes_per_sample);
+    match bit_depth {
+        8 => {
+            // APE 8-bit is unsigned by default; is_signed_8bit overrides.
+            let signed = is_signed_8bit;
+            for b in &pcm {
+                let v = if signed {
+                    *b as i8 as i32
+                } else {
+                    *b as i32 - 128
+                };
+                samples.push(v);
+            }
+        }
+        16 => {
+            for b in pcm.chunks_exact(2) {
+                samples.push(i16::from_le_bytes([b[0], b[1]]) as i32);
+            }
+        }
+        24 => {
+            for b in pcm.chunks_exact(3) {
+                let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+                // sign-extend 24-bit -> i32
+                samples.push((v << 8) >> 8);
+            }
+        }
+        32 => {
+            for b in pcm.chunks_exact(4) {
+                samples.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    // Optional truncation to max_duration_s (whole frames).
+    if max_duration_s > 0.0 {
+        let max_samples = (max_duration_s * sample_rate as f64 * channels as f64) as usize;
+        if samples.len() > max_samples {
+            samples.truncate(max_samples);
+        }
+    }
+
+    // 8-bit is widened to 16-bit for the rest of the pipeline (WAV min depth).
+    let out_bd = if bit_depth == 8 { 16 } else { bit_depth };
+    if bit_depth == 8 {
+        for s in samples.iter_mut() {
+            *s <<= 8;
+        }
+    }
+
+    let total_frames = samples.len() as f64 / channels as f64;
+    let duration_s = total_frames / sample_rate as f64;
+
+    debug!(
+        file = file_path,
+        samples = samples.len(),
+        rate = sample_rate,
+        channels,
+        bit_depth = out_bd,
+        duration_s,
+        "decoded_ape (spike #1145)"
+    );
+
+    Ok(DecodedAudio {
+        samples_i32: samples,
+        bit_depth: out_bd,
+        sample_rate,
+        channels,
         duration_s,
     })
 }
@@ -1896,5 +2024,41 @@ mod decode_integration_tests {
         params.bits_per_sample = Some(16);
         params.extra_data = Some(cookie.into_boxed_slice());
         assert_eq!(resolve_bit_depth(&params), 16);
+    }
+
+    /// SPIKE (#1145): decode a REAL .ape fixture (Monkey's Audio, High/c3000
+    /// compression, 16-bit stereo) and verify the PCM byte-for-byte matches the
+    /// reference WAV that the C++ Monkey's Audio decoder produced. This is the
+    /// correctness proof: it fails loudly if `ape-decoder` regresses, exactly
+    /// what the old in-tree stub lacked.
+    #[test]
+    fn ape_decodes_real_fixture_matches_reference_wav() {
+        let ape = fixture_path("ape/sine_16s_c3000.ape");
+        let decoded = decode_ape_to_pcm(&ape, 0.0, 0.0).expect("ape decode");
+
+        // Basic sanity: 44.1kHz stereo 16-bit, ~non-trivial duration, non-silent.
+        assert_eq!(decoded.channels, 2, "stereo");
+        assert_eq!(decoded.bit_depth, 16);
+        assert!(decoded.sample_rate >= 8000, "plausible sample rate");
+        assert!(decoded.duration_s > 0.1, "non-trivial duration");
+        assert!(
+            decoded.samples_i32.iter().any(|s| *s != 0),
+            "decoded PCM must not be all-silence (the stub's failure mode)"
+        );
+
+        // Byte-for-byte compare against the C++ reference decoder output.
+        let ref_wav =
+            std::fs::read(fixture_path("ape/sine_16s_c3000.wav")).expect("read reference wav");
+        let ref_pcm = &ref_wav[44..]; // strip 44-byte canonical WAV header
+        let our_pcm = decoded.pcm_bytes();
+        assert_eq!(
+            our_pcm.len(),
+            ref_pcm.len(),
+            "PCM length must equal the reference decoder's output"
+        );
+        assert_eq!(
+            our_pcm, ref_pcm,
+            "decoded PCM must be byte-for-byte identical to the C++ reference decoder"
+        );
     }
 }
