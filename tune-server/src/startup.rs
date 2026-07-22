@@ -70,6 +70,37 @@ fn deduplicate_zones(state: &AppState) {
 }
 
 fn cleanup_orphan_queues(state: &AppState) {
+    // `streaming_queue` is NOT part of CORE_SCHEMA (init_schema); it is created
+    // by migration v53 and re-created belt-and-suspenders at the end of
+    // run_migrations. Both run before this cleanup — but if that CREATE ever
+    // fails silently (e.g. a WAL/file lock on a NAS like Synology, where the
+    // migration's `.ok()`/execute_batch swallows the error), the DELETE below
+    // hits "no such table: streaming_queue" and logs `orphan_queue_cleanup_failed`
+    // (tester Yacine, DS418j). Re-assert the table here immediately before the
+    // DELETE so the cleanup is self-healing and the warning can never fire on a
+    // correctly-migrated DB. IF NOT EXISTS = no-op when it already exists.
+    // Schema is IDENTICAL to migration v53 / play_queue_repo::CREATE_STREAMING_QUEUE.
+    // `play_queue` is in CORE_SCHEMA so it always exists; only SQLite needs this
+    // guard (PG creates streaming_queue in migration 006 before any cleanup).
+    if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
+        if let Err(e) = state.backend.execute_batch(
+            "CREATE TABLE IF NOT EXISTS streaming_queue (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                zone_id INTEGER NOT NULL,\
+                position INTEGER NOT NULL,\
+                source TEXT,\
+                source_id TEXT,\
+                title TEXT,\
+                artist TEXT,\
+                album TEXT,\
+                cover_url TEXT,\
+                duration_ms INTEGER DEFAULT 0\
+            );",
+        ) {
+            tracing::warn!(error = %e, "orphan_queue_ensure_streaming_queue_failed");
+        }
+    }
+
     let sqls = [
         "DELETE FROM play_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
         "DELETE FROM streaming_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
