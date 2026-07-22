@@ -1972,13 +1972,44 @@ impl PlaybackOrchestrator {
             let passthrough_file_size =
                 passthrough_disk_size.or_else(|| track.file_size.map(|s| s as u64));
 
+            // For M4A/ALAC passthrough, build the on-the-fly faststart map UP
+            // FRONT so the advertised size (DIDL `res@size` + HEAD Content-Length)
+            // matches the bytes actually served. The map serves the file as
+            // `ftyp + patched-moov + mdat` (moov relocated to the front) so the
+            // renderer reads its metadata immediately instead of seeking to the
+            // END of the file first — a slow start + Range storm, esp. over a NAS
+            // mount (Yves, LHC-56, 192/24 ALAC on SMB). It also strips embedded
+            // cover art (`covr`) from the moov, which triggers a start-of-track
+            // "ploc" on some renderers in ALAC passthrough (Yves, LHC-56). Pure
+            // relocation keeps `total == disk size`; a cover-strip makes `total`
+            // SMALLER, so the served Content-Length and the DIDL `res@size` MUST
+            // both come from `map.total` — otherwise the renderer waits for cover
+            // bytes that never arrive and restarts/loops near EOF (#1132 inverse).
+            // Reads only ftyp+moov (never mdat), so it adds no copy latency; falls
+            // back to the original file if not applicable.
+            let faststart_map = if source_format == Some(AudioFormat::Alac) {
+                let fp = file_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let advertised_file_size = faststart_map
+                .as_ref()
+                .map(|m| m.total)
+                .or(passthrough_file_size);
+
             let info = StreamInfo {
                 format: fmt.clone(),
                 mime_type: mime.clone(),
                 sample_rate,
                 bit_depth,
                 channels,
-                file_size: passthrough_file_size,
+                file_size: advertised_file_size,
                 duration_ms: Some(track.duration_ms as u64),
                 ..Default::default()
             };
@@ -1988,23 +2019,14 @@ impl PlaybackOrchestrator {
                 .create_file_session(info, file_path.clone(), false)
                 .await;
 
-            // For M4A/ALAC passthrough, attach an on-the-fly faststart map so the
-            // file is served as `ftyp + patched-moov + mdat` (moov relocated to
-            // the front). The renderer then reads its metadata up front and starts
-            // immediately instead of seeking to the END of the file first — a slow
-            // start + Range storm, esp. over a NAS mount (Yves, LHC-56, 192/24
-            // ALAC on SMB). This reads only ftyp+moov (never mdat), so it adds no
-            // copy latency, and falls back to the original file if not applicable.
-            if source_format == Some(AudioFormat::Alac) {
-                let fp = file_path.clone();
-                if let Ok(Some(map)) = tokio::task::spawn_blocking(move || {
-                    crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
-                })
-                .await
-                {
-                    info!(file = %file_path, "m4a_faststart_applied");
-                    self.streamer.set_faststart(&session_id, map).await;
-                }
+            if let Some(map) = faststart_map {
+                info!(
+                    file = %file_path,
+                    total = map.total,
+                    disk = ?passthrough_file_size,
+                    "m4a_faststart_applied"
+                );
+                self.streamer.set_faststart(&session_id, map).await;
             }
 
             // Parallel decode-for-levels: decode the audio in the background
@@ -2081,7 +2103,7 @@ impl PlaybackOrchestrator {
                 session_id,
                 mime,
                 fmt.clone(),
-                passthrough_file_size,
+                advertised_file_size,
                 Some(sample_rate),
                 Some(bit_depth as u32),
                 Some(channels as u32),
