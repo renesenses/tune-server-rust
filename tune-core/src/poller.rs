@@ -1677,10 +1677,43 @@ impl PositionPoller {
             queue_pos = zone_state.queue_position,
             "auto_next"
         );
-        if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
-            warn!(zone_id, error = %e, "auto_next_failed");
-            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+        // Auto-advance must not die on an unavailable track. A queued item whose
+        // local file was moved/deleted (NAS unmounted, library reorganised) makes
+        // play_from_queue return an error; stopping the zone here cut the WHOLE
+        // playlist at the first gap (Yves — /Volumes/Music unmounted, queued
+        // paths dangling). Instead, skip to the next queue item and retry,
+        // honouring repeat/shuffle, bounded by the queue length so a tail of
+        // all-unavailable tracks stops cleanly instead of looping forever.
+        let mut zs = zone_state.clone();
+        let mut pos = next_pos;
+        let max_attempts = zone_state.queue_length.max(1);
+        for attempt in 0..max_attempts {
+            match self.orchestrator.play_from_queue(zone_id, pos).await {
+                Ok(_) => return,
+                Err(e) => {
+                    warn!(
+                        zone_id,
+                        pos,
+                        attempt,
+                        error = %e,
+                        "auto_next_item_unavailable_skipping"
+                    );
+                }
+            }
+            // Advance past the item we just failed on, reusing the repeat/shuffle
+            // decision so shuffle order and repeat-all wrap are respected.
+            if zs.shuffle && !zs.shuffle_order.is_empty() {
+                zs.shuffle_index += 1;
+            } else {
+                zs.queue_position = pos;
+            }
+            match Self::next_position(&zs) {
+                Some(p) => pos = p,
+                None => break, // repeat-off reached the end of the queue
+            }
         }
+        warn!(zone_id, "auto_next_all_remaining_unavailable_stopping");
+        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
     }
 
     async fn prepare_gapless(
