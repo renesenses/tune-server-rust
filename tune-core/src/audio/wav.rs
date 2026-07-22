@@ -20,6 +20,24 @@ pub fn build_wav_header_with_duration(
     build_wav_header_with_data_size(channels, sample_rate, bit_depth, data_size)
 }
 
+/// Build a 44-byte WAV header for an INFINITE live stream (internet radio).
+///
+/// Uses the "indeterminate length" convention (`RIFF` and `data` chunk sizes
+/// both set to `0xFFFF_FFFF`) instead of a finite size. An FFmpeg/libavformat
+/// (`Lavf`) DLNA renderer treats `0xFFFF_FFFF` as an unbounded stream and keeps
+/// reading until the connection closes, whereas the previous finite
+/// `0x7FFF_FFFF` (~2 GiB) size makes it treat the transcoded radio as a bounded
+/// PCM file: it fills its ~64 MiB read-ahead cache and then stops/reconnects
+/// after ~6 minutes (FIP cutoff, .15 zone_id=10, `Lavf/58.45.100`).
+pub fn build_wav_header_streaming(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    // Both the RIFF and the data chunk sizes are set to 0xFFFF_FFFF (the
+    // canonical "unknown/streaming length" marker). build_wav_header_with_data_size
+    // would wrap the RIFF size to `data_size + 36`, so patch it to 0xFFFF_FFFF here.
+    let mut header = build_wav_header_with_data_size(channels, sample_rate, bit_depth, 0xFFFF_FFFF);
+    header[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    header
+}
+
 /// Build a 44-byte WAV header with an exact `data` chunk size, for complete
 /// (non-streaming) WAV files where the full PCM length is known upfront.
 pub fn build_wav_header_with_data_size(
@@ -131,6 +149,23 @@ mod tests {
         let h = build_wav_header_with_duration(2, 44100, 16, None);
         let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
         assert_eq!(data_size, 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn wav_header_streaming_uses_indeterminate_length() {
+        // Live radio: both RIFF and data chunk sizes must be 0xFFFF_FFFF so a
+        // Lavf renderer treats the stream as unbounded and reads until close,
+        // instead of stopping at the finite 0x7FFF_FFFF (~2 GiB) size.
+        let h = build_wav_header_streaming(2, 48000, 16);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        assert_eq!(data_size, 0xFFFF_FFFF);
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert_eq!(riff_size, 0xFFFF_FFFF);
+        // Format fields still reflect the true stream: 48000/16/2.
+        let sample_rate = u32::from_le_bytes([h[24], h[25], h[26], h[27]]);
+        assert_eq!(sample_rate, 48000);
+        let byte_rate = u32::from_le_bytes([h[28], h[29], h[30], h[31]]);
+        assert_eq!(byte_rate, 48000 * 2 * 2);
     }
 
     #[test]
