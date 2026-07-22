@@ -630,7 +630,11 @@ async fn save_radio_favorite(
     let artist = body.artist.unwrap_or_default();
     let station = body.station_name.unwrap_or_default();
     match state.backend.execute(
-        "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?)",
+        // `INSERT OR IGNORE` is SQLite-only; the Postgres backend forwards it
+        // verbatim → `syntax error at or near "OR"` (500), so saving a radio
+        // favorite failed on PG (.15) and the heart never lit up. `ON CONFLICT
+        // DO NOTHING` (no target) is valid on both SQLite (3.24+) and Postgres.
+        "INSERT INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         &[&body.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station as &dyn ToSqlValue, &body.cover_url as &dyn ToSqlValue, &body.stream_url as &dyn ToSqlValue],
     ) {
         Ok(_) => {
@@ -685,7 +689,10 @@ async fn save_current_as_favorite(
 
     use tune_core::db::backend::ToSqlValue;
     match state.backend.execute(
-        "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?)",
+        // Portable upsert-ignore (SQLite `INSERT OR IGNORE` 500s on the PG
+        // backend — see save_radio_favorite above). This is the /save-current
+        // path the heart button hits.
+        "INSERT INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         &[&title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station_name as &dyn ToSqlValue, &cover_url as &dyn ToSqlValue],
     ) {
         Ok(_) => {

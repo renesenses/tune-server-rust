@@ -422,6 +422,20 @@ impl QobuzService {
             )
             .await?;
 
+        // Qobuz returns a 30-second preview (audio/mpeg, URL carries `range=20-30`,
+        // `"sample": true`) instead of an error when the requested format_id is
+        // above the subscription's entitlement — e.g. asking for Hi-Res (27) on a
+        // "streaming-studio" CD-max plan. Accepting it silently makes playback cut
+        // at exactly 30s (DLNA renderers download the whole preview, then stall;
+        // Qobuz → DMP-A8, .15). Reject a sample so `get_track_url` falls down the
+        // quality ladder to a format the subscription can actually stream in full.
+        if data["sample"].as_bool().unwrap_or(false) {
+            info!(track_id, format_id, "qobuz_sample_preview_rejected");
+            return Err(format!(
+                "qobuz returned a 30s sample for format_id {format_id} — not entitled at this quality"
+            ));
+        }
+
         let url = data["url"].as_str().ok_or("no url")?.to_string();
         let mime = data["mime_type"]
             .as_str()
