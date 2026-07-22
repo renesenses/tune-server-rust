@@ -3817,15 +3817,23 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        // Multi-service scrobble dispatch with tier gating.
-        // Free tier: only the first configured service fires.
-        // Premium tier: all configured services fire simultaneously.
-        self.dispatch_scrobble(title, artist, album);
+        // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
+        // at play-start, which (a) scrobbled a track the instant it began — so
+        // skipping after a few seconds still scrobbled it, ignoring Last.fm's
+        // 50%/4-min rule — and (b) was gated by `record_history`, which the
+        // gapless/prefetch advance paths bypass (`play_without_history`), so
+        // every other track on an album was silently dropped (Bilou, #1113). The
+        // poller now dispatches the scrobble once the track has actually been
+        // listened past the threshold (see `dispatch_scrobble`).
     }
 
     /// Dispatch scrobbles to all configured services, respecting tier limits.
     /// Free = 1 service max, Premium = all simultaneously.
-    fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+    ///
+    /// Called by the poller once the current track has been played past the
+    /// Last.fm threshold (50% or 4 min), so a scrobble reflects a real listen
+    /// rather than a mere play-start (#1113).
+    pub fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let settings = SettingsRepo::with_backend(self.db.clone());
 
         let lastfm_ready = self.lastfm_keys().is_some();
