@@ -304,6 +304,16 @@ jobs:
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources/web"
           cp target/${{ matrix.target }}/release/tune-server "$APP/Contents/Resources/"
+          # AirPlay 2 daemon: bundle it next to tune-server inside the .app so
+          # find_daemon_binary/daemon_available() find it on DMG installs too.
+          # The .tar.gz path already bundled it, but the DMG did not — so every
+          # macOS DMG user fell back to unauthenticated AirPlay 1 and any AirPlay 2
+          # receiver requiring pairing/auth failed with SETUP 403 (Vincent
+          # Guillemin / VUmètre, Luxman NT-07, v0.8.359). Only if it built for
+          # this target — never ship a placeholder (defeats the AirPlay 1 fallback).
+          if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
+            cp "$RUNNER_TEMP/apd/bin/airplay-daemon" "$APP/Contents/Resources/"
+          fi
           cp -r web/* "$APP/Contents/Resources/web/"
           # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
@@ -345,6 +355,12 @@ jobs:
           if [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
             codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
+            # signing) so the bundle stays valid and notarization does not reject
+            # an unsigned executable.
+            if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
+              codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/airplay-daemon"
+            fi
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
           fi
           DMG_DIR="dmg-staging"
