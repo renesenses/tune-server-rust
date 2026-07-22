@@ -587,6 +587,11 @@ fn resumable_proxy_body(
     initial: reqwest::Response,
     abs_offset: u64,
     reresolve: Option<ReresolveFn>,
+    // Bytes to discard from the FRONT of `initial` before yielding. Non-zero
+    // only when the upstream was fetched from byte 0 but the client asked for a
+    // small `bytes=N-` range we serve locally (OpenHome renderers, see caller).
+    // Applies to the first upstream connection only; reconnects fetch from `pos`.
+    skip_prefix: u64,
 ) -> Body {
     Body::from_stream(async_stream::stream! {
         use futures_util::StreamExt;
@@ -595,13 +600,22 @@ fn resumable_proxy_body(
         let mut url = upstream_url;
         // Absolute file offset of the next byte we expect to yield.
         let mut pos = abs_offset;
+        let mut to_skip = skip_prefix;
         let mut resumes: u32 = 0;
         loop {
             let mut stream = resp.bytes_stream();
             let mut clean_eof = true;
             loop {
                 match stream.next().await {
-                    Some(Ok(chunk)) => {
+                    Some(Ok(mut chunk)) => {
+                        if to_skip > 0 {
+                            let n = to_skip.min(chunk.len() as u64) as usize;
+                            let _ = chunk.split_to(n);
+                            to_skip -= n as u64;
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                        }
                         pos += chunk.len() as u64;
                         yield Ok::<_, std::io::Error>(chunk);
                     }
@@ -789,6 +803,7 @@ async fn proxy_stream(
             upstream_resp,
             start,
             reresolve.clone(),
+            0,
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -835,8 +850,43 @@ async fn proxy_stream(
             upstream_resp,
             0,
             reresolve.clone(),
+            0,
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
+
+    // OpenHome renderers (Lumin/Linn) read the FLAC header via `bytes=0-`, then
+    // re-request the audio body via a small `bytes=N-` (N below the 1 MiB resume
+    // threshold, so it is NOT forwarded to the CDN). The 200-from-byte-0
+    // fall-through below made the renderer receive the header again and loop the
+    // first ~2 s (Vincent Guillemin / VUmètre, Lumin). Serve the range locally:
+    // skip the first N bytes of the already-fetched from-0 body and answer 206
+    // with the correct Content-Range — one CDN fetch, no extra Akamai load.
+    let small_range_start = range_value
+        .as_deref()
+        .and_then(parse_range_start)
+        .filter(|&n| n > 0 && n < RESUME_RANGE_THRESHOLD);
+    if let (Some(start), Some(cl)) = (small_range_start, content_length) {
+        if start < cl {
+            headers.insert("Content-Length", HeaderValue::from(cl - start));
+            headers.insert(
+                "Content-Range",
+                HeaderValue::from_str(&format!("bytes {start}-{}/{}", cl - 1, cl)).unwrap(),
+            );
+            info!(
+                url = upstream_url,
+                start, "proxy_small_range_206_local_skip"
+            );
+            let body = resumable_proxy_body(
+                client,
+                upstream_url.to_string(),
+                upstream_resp,
+                start,
+                reresolve.clone(),
+                start,
+            );
+            return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+        }
     }
 
     if let Some(cl) = content_length {
@@ -849,6 +899,7 @@ async fn proxy_stream(
         upstream_resp,
         0,
         reresolve.clone(),
+        0,
     );
     (StatusCode::OK, headers, body).into_response()
 }
