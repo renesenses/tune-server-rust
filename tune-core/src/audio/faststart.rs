@@ -71,10 +71,16 @@ fn is_container(kind: &[u8; 4]) -> bool {
     )
 }
 
-/// Recursively walk a moov (or child container) payload and add `delta` to every
-/// `stco`/`co64` chunk offset. `buf` is the container's *children* bytes.
-/// Returns `false` if an `stco` entry would overflow u32 after the shift.
-fn patch_offsets(buf: &mut [u8], delta: u64) -> bool {
+/// Recursively walk a moov (or child container) payload and add `delta` (which
+/// may be negative) to every `stco`/`co64` chunk offset. `buf` is the container's
+/// *children* bytes. Returns `false` if any offset would underflow 0 or overflow
+/// u32 (`stco`) after the shift.
+///
+/// A positive delta is used when `moov` is relocated in FRONT of the media
+/// (faststart) or grows; a NEGATIVE delta when the media shifts UP because bytes
+/// before it were removed — e.g. stripping cover art from a moov that already
+/// sits before `mdat` (the media then starts `shrink` bytes earlier).
+fn patch_offsets(buf: &mut [u8], delta: i64) -> bool {
     let mut pos = 0usize;
     while pos + 8 <= buf.len() {
         let Some(size32) = be_u32(buf, pos) else {
@@ -105,9 +111,9 @@ fn patch_offsets(buf: &mut [u8], delta: u64) -> bool {
                     let Some(old) = be_u32(buf, e) else {
                         return true;
                     };
-                    let new = old as u64 + delta;
-                    if new > u32::MAX as u64 {
-                        // Would need a co64 promotion — bail to be safe.
+                    let new = old as i64 + delta;
+                    if new < 0 || new > u32::MAX as i64 {
+                        // Underflow, or would need a co64 promotion — bail.
                         return false;
                     }
                     buf[e..e + 4].copy_from_slice(&(new as u32).to_be_bytes());
@@ -127,8 +133,11 @@ fn patch_offsets(buf: &mut [u8], delta: u64) -> bool {
                         Ok(a) => a,
                         Err(_) => return true,
                     });
-                    let new = old + delta;
-                    buf[e..e + 8].copy_from_slice(&new.to_be_bytes());
+                    let new = old as i64 + delta;
+                    if new < 0 {
+                        return false;
+                    }
+                    buf[e..e + 8].copy_from_slice(&(new as u64).to_be_bytes());
                     e += 8;
                 }
             }
@@ -257,7 +266,7 @@ pub fn faststart_m4a(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     let moov = &atoms[moov_idx];
-    let moov_size = moov.size as u64;
+    let moov_size = moov.size as i64;
 
     // Copy moov and patch its chunk-offset tables (+moov_size, the amount every
     // media chunk shifts once moov is inserted before mdat).
@@ -286,7 +295,7 @@ pub fn faststart_m4a(data: &[u8]) -> Option<Vec<u8>> {
 /// Build the faststart header = `ftyp` ++ patched `moov` (chunk offsets shifted
 /// by `+moov.len()`). Returns `None` on 32-bit `stco` overflow.
 pub fn faststart_header(ftyp: &[u8], moov: &[u8]) -> Option<Vec<u8>> {
-    let delta = moov.len() as u64;
+    let delta = moov.len() as i64;
     let mut moov_owned = moov.to_vec();
     if moov_owned.len() < 8 || !patch_offsets(&mut moov_owned[8..], delta) {
         return None;
@@ -385,6 +394,105 @@ pub fn prepare_faststart(path: &std::path::Path) -> Option<FaststartMap> {
     }
 
     let header = faststart_header(&ftyp_bytes, &moov_bytes)?;
+    let total = header.len() as u64 + body_len;
+    Some(FaststartMap {
+        header,
+        body_src_start,
+        body_len,
+        total,
+    })
+}
+
+/// Strip cover art from an ALREADY-faststart M4A (`ftyp | moov | mdat…`, moov
+/// BEFORE mdat) so ALAC passthrough doesn't "ploc" on renderers like the LHC-56.
+///
+/// [`prepare_faststart`] only handles the moov-after-mdat layout (it relocates
+/// moov and strips the cover on the way). Files that are already faststart —
+/// common with modern encoders / `ffmpeg -movflags +faststart` — skipped that
+/// path entirely, so their cover survived and they still ploc'd (Yves: Aurora
+/// fixed, but "Do What U Will" / "ABOVE AND BEYOND" still clicked; no
+/// `m4a_faststart_applied` was logged for them).
+///
+/// Here moov stays at the front; removing `covr` only shrinks it, so `mdat`
+/// (served untouched from disk as the body) starts `shrink` bytes earlier — we
+/// patch the chunk offsets by `-shrink`. Requires the simple `ftyp` immediately
+/// followed by `moov`, then the rest; returns `None` (serve raw) otherwise or
+/// when there's no cover to remove.
+pub fn prepare_cover_strip_faststart(path: &std::path::Path) -> Option<FaststartMap> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+
+    let mut atoms: Vec<([u8; 4], u64, u64)> = Vec::new();
+    let mut pos = 0u64;
+    let mut hdr = [0u8; 16];
+    while pos + 8 <= file_len {
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        f.read_exact(&mut hdr[..8]).ok()?;
+        let size32 = u32::from_be_bytes(hdr[0..4].try_into().ok()?) as u64;
+        let kind = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let size = if size32 == 1 {
+            f.read_exact(&mut hdr[8..16]).ok()?;
+            u64::from_be_bytes(hdr[8..16].try_into().ok()?)
+        } else if size32 == 0 {
+            file_len - pos
+        } else {
+            size32
+        };
+        if size < 8 || pos + size > file_len {
+            return None;
+        }
+        atoms.push((kind, pos, size));
+        pos += size;
+    }
+    if atoms.is_empty() {
+        return None;
+    }
+
+    let ftyp = *atoms.iter().find(|a| &a.0 == b"ftyp")?;
+    let moov = *atoms.iter().find(|a| &a.0 == b"moov")?;
+    let mdat = *atoms.iter().find(|a| &a.0 == b"mdat")?;
+
+    // ftyp first (at 0), moov immediately after ftyp, and moov BEFORE mdat
+    // (already faststart). Anything else → let prepare_faststart / raw handle it.
+    if ftyp.1 != 0 || &atoms[0].0 != b"ftyp" {
+        return None;
+    }
+    let ftyp_end = ftyp.1 + ftyp.2;
+    if moov.1 != ftyp_end {
+        return None; // atoms between ftyp and moov — not the simple faststart shape
+    }
+    if moov.1 >= mdat.1 {
+        return None; // moov after mdat → prepare_faststart's job
+    }
+
+    let moov_end = moov.1 + moov.2;
+
+    let mut ftyp_bytes = vec![0u8; ftyp.2 as usize];
+    f.seek(SeekFrom::Start(ftyp.1)).ok()?;
+    f.read_exact(&mut ftyp_bytes).ok()?;
+    let mut moov_bytes = vec![0u8; moov.2 as usize];
+    f.seek(SeekFrom::Start(moov.1)).ok()?;
+    f.read_exact(&mut moov_bytes).ok()?;
+
+    // No cover → nothing to do (an already-faststart file without art doesn't
+    // ploc and needs no rewrite).
+    let (stripped_moov, shrink) = strip_covr_from_moov(&moov_bytes)?;
+
+    // mdat now starts `shrink` bytes earlier → shift every chunk offset down.
+    let mut patched = stripped_moov;
+    if patched.len() < 8 || !patch_offsets(&mut patched[8..], -(shrink as i64)) {
+        return None;
+    }
+
+    let mut header = Vec::with_capacity(ftyp_bytes.len() + patched.len());
+    header.extend_from_slice(&ftyp_bytes);
+    header.extend_from_slice(&patched);
+
+    // Body = everything after the original moov (mdat + any trailing atoms),
+    // served untouched from disk.
+    let body_src_start = moov_end;
+    let body_len = file_len - moov_end;
     let total = header.len() as u64 + body_len;
     Some(FaststartMap {
         header,
@@ -532,6 +640,69 @@ mod tests {
         assert_eq!(patched as usize, chunk_off as usize + stripped_moov_len);
         // header + body == total (self-consistent virtual file).
         assert_eq!(map.header.len() as u64 + map.body_len, map.total);
+    }
+
+    #[test]
+    fn prepare_cover_strip_faststart_strips_and_shifts_down() {
+        // Already-faststart file: ftyp | moov(with cover) | mdat. prepare_faststart
+        // declines it; prepare_cover_strip_faststart must strip the cover in place
+        // and shift the chunk offsets DOWN by the removed bytes (mdat moves up).
+        let ftyp = atom(b"ftyp", b"M4A isom");
+        let cover = vec![0x99u8; 800];
+        let covr_total = 8 + cover.len();
+        // moov length is independent of the stco offset value, so size it first.
+        let moov_len = moov_with_stco_and_meta(&[0], Some(&cover)).len();
+        // In the original faststart file the first sample sits at ftyp|moov|mdat-header.
+        let chunk_off = (ftyp.len() + moov_len + 8) as u32;
+        let moov = moov_with_stco_and_meta(&[chunk_off], Some(&cover));
+        let mdat = atom(b"mdat", &vec![0x22u8; 400]);
+
+        let mut original = ftyp.clone();
+        original.extend_from_slice(&moov);
+        original.extend_from_slice(&mdat);
+
+        let path = std::env::temp_dir().join("tune-faststart-cover-inplace-test.m4a");
+        std::fs::write(&path, &original).unwrap();
+        assert!(
+            prepare_faststart(&path).is_none(),
+            "already faststart → declined"
+        );
+        let map = prepare_cover_strip_faststart(&path).expect("cover strip in place");
+        std::fs::remove_file(&path).ok();
+
+        // Served size = disk minus the removed cover.
+        assert_eq!(map.total, original.len() as u64 - covr_total as u64);
+        assert!(
+            !map.header.windows(4).any(|w| w == b"covr"),
+            "no covr served"
+        );
+        assert_eq!(&map.header[4..8], b"ftyp");
+        // Body = the mdat region, from the ORIGINAL moov_end to EOF.
+        let moov_end = ftyp.len() + moov.len();
+        assert_eq!(map.body_src_start, moov_end as u64);
+        assert_eq!(map.body_len, mdat.len() as u64);
+        // stco shifted DOWN by the cover size (mdat starts earlier now).
+        let sidx = map.header.windows(4).position(|w| w == b"stco").unwrap();
+        let patched = be_u32(&map.header, sidx + 4 + 8).unwrap();
+        assert_eq!(patched as usize, chunk_off as usize - covr_total);
+        // Self-consistent virtual file.
+        assert_eq!(map.header.len() as u64 + map.body_len, map.total);
+    }
+
+    #[test]
+    fn prepare_cover_strip_faststart_none_without_cover() {
+        // Already-faststart file with no cover art → nothing to do.
+        let ftyp = atom(b"ftyp", b"M4A isom");
+        let moov = moov_with_stco_and_meta(&[(ftyp.len() + 200 + 8) as u32], None);
+        let mdat = atom(b"mdat", &vec![0u8; 100]);
+        let mut original = ftyp;
+        original.extend_from_slice(&moov);
+        original.extend_from_slice(&mdat);
+        let path = std::env::temp_dir().join("tune-faststart-nocover-inplace-test.m4a");
+        std::fs::write(&path, &original).unwrap();
+        let r = prepare_cover_strip_faststart(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(r.is_none(), "no cover → serve raw");
     }
 
     #[test]

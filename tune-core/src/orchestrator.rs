@@ -1990,7 +1990,14 @@ impl PlaybackOrchestrator {
             let faststart_map = if source_format == Some(AudioFormat::Alac) {
                 let fp = file_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                    // Non-faststart (moov after mdat): relocate moov + strip cover.
+                    // Already-faststart (moov before mdat): strip the cover in
+                    // place — otherwise these files kept their cover and still
+                    // "ploc'd" on the LHC-56 (Yves: Aurora fixed, but modern
+                    // faststart-encoded albums still clicked).
+                    let p = std::path::Path::new(&fp);
+                    crate::audio::faststart::prepare_faststart(p)
+                        .or_else(|| crate::audio::faststart::prepare_cover_strip_faststart(p))
                 })
                 .await
                 .ok()
