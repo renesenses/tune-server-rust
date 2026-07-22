@@ -1688,7 +1688,17 @@ impl PositionPoller {
                 }
             }
 
-            info!(zone_id, "queue_ended");
+            // Log the queue geometry so a "doesn't advance to next track" report
+            // (Jean-Pierre) can be told apart at a glance: queue_len=1 means the
+            // play truncated the queue to a single track (single-track play path),
+            // whereas queue_len>1 with pos+1<len would be a genuine advance bug.
+            info!(
+                zone_id,
+                queue_pos = zone_state.queue_position,
+                queue_len = zone_state.queue_length,
+                repeat = ?zone_state.repeat,
+                "queue_ended"
+            );
             self.orchestrator.stop(zone_id, device_id.as_deref()).await;
             return;
         };
