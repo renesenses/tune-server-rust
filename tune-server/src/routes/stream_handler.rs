@@ -14,6 +14,55 @@ use tune_core::http::streamer::{
     build_wav_header, build_wav_header_streaming, extract_stream_id,
 };
 
+/// Tracks one HTTP consumer of a radio→WAV session for the lifetime of its
+/// stream (drops on normal end AND on client disconnect, since the streaming
+/// body future is cancelled at a yield point). Diagnostics for the
+/// "FIP silent after upstream reconnect" case: the PCM channel is
+/// single-consumer, so a second concurrent request would split the stream.
+struct RadioConsumerGuard {
+    session: std::sync::Arc<StreamSession>,
+    started: std::time::Instant,
+    /// Set true when the channel closed cleanly (recv returned None), so the
+    /// Drop path can tell a graceful end from a client disconnect.
+    completed: bool,
+}
+
+impl RadioConsumerGuard {
+    fn new(session: std::sync::Arc<StreamSession>) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = session.active_consumers.fetch_add(1, Relaxed) + 1;
+        if n > 1 {
+            warn!(
+                stream_id = %session.id,
+                consumers = n,
+                "radio_stream_concurrent_consumer — a 2nd request is racing the \
+                 single-consumer PCM channel; chunks will be split between \
+                 connections (renderer re-requested without closing the first)"
+            );
+        }
+        Self {
+            session,
+            started: std::time::Instant::now(),
+            completed: false,
+        }
+    }
+}
+
+impl Drop for RadioConsumerGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let remaining = self.session.active_consumers.fetch_sub(1, Relaxed).saturating_sub(1);
+        if !self.completed {
+            info!(
+                stream_id = %self.session.id,
+                connected_secs = self.started.elapsed().as_secs(),
+                remaining_consumers = remaining,
+                "radio_stream_client_disconnect — HTTP consumer dropped mid-stream"
+            );
+        }
+    }
+}
+
 pub async fn handle_head(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
@@ -266,9 +315,22 @@ pub async fn handle_stream(
             // but can cause the browser's <audio> element (or the local
             // output's HTTP reader) to stall waiting for the first data
             // after the WAV header, resulting in silence.
+            // The guard counts concurrent consumers and logs how the stream
+            // ends (diagnostics for the FIP silent-after-reconnect case).
+            let mut guard = RadioConsumerGuard::new(session.clone());
             while let Some(chunk) = session.recv_chunk().await {
                 yield Ok(bytes::Bytes::from(chunk));
             }
+            // recv returned None → the PCM channel was closed (all senders,
+            // incl. the keep-alive, dropped). A radio session should stay open
+            // across upstream reconnects, so this is worth surfacing.
+            guard.completed = true;
+            info!(
+                stream_id = %session.id,
+                connected_secs = guard.started.elapsed().as_secs(),
+                "radio_stream_channel_closed — PCM channel ended (senders dropped); \
+                 renderer will see EOF"
+            );
         } else {
             // Coalesce small chunks into larger HTTP writes (target >=64 KB).
             // Network outputs like Squeezebox/LMS fetch audio from this HTTP

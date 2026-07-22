@@ -99,6 +99,12 @@ pub struct StreamSession {
     pub wav_header_included: std::sync::atomic::AtomicBool,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// Number of HTTP requests currently streaming this session. The radio→WAV
+    /// channel is single-consumer (`rx` behind a Mutex): a second concurrent
+    /// reader would race the first for each PCM chunk and split the stream. This
+    /// counter surfaces that case for diagnostics (a renderer that re-requests
+    /// without closing its first connection — DMP-A8 FIP silent-after-reconnect).
+    pub active_consumers: std::sync::atomic::AtomicU32,
     pub first_request: std::sync::Arc<tokio::sync::Notify>,
     pub data_ready: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -128,6 +134,7 @@ impl StreamSession {
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            active_consumers: std::sync::atomic::AtomicU32::new(0),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
