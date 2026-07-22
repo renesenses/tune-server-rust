@@ -5,7 +5,9 @@ use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
-use crate::audio::wav::build_wav_header_with_duration;
+use crate::audio::wav::{
+    build_wav_header_streaming as wav_header_streaming, build_wav_header_with_duration,
+};
 
 pub const ICY_METAINT: usize = 16384;
 
@@ -85,6 +87,15 @@ pub struct StreamSession {
     pub cover_url: Option<String>,
     pub bit_perfect: bool,
     pub is_radio: bool,
+    /// True audio format detected by the radio decoder once the upstream is
+    /// probed. The WAV header advertised to the renderer is built from the
+    /// hard-coded `info` (44100/16/2) at request time — but a station may
+    /// decode at a different rate (FIP is 48000). The decoder publishes the
+    /// real rate/channels here so the header can reflect them instead of
+    /// declaring 44100 for a 48000 stream (which plays ~8.8% too slow and
+    /// skews the renderer's byte accounting). `0` means "not yet detected".
+    pub detected_sample_rate: std::sync::atomic::AtomicU32,
+    pub detected_channels: std::sync::atomic::AtomicU16,
     pub wav_header_included: std::sync::atomic::AtomicBool,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
@@ -112,6 +123,8 @@ impl StreamSession {
             cover_url: None,
             bit_perfect,
             is_radio: false,
+            detected_sample_rate: std::sync::atomic::AtomicU32::new(0),
+            detected_channels: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
@@ -231,6 +244,7 @@ impl AudioStreamer {
         String,
         mpsc::Sender<Vec<u8>>,
         std::sync::Arc<tokio::sync::Notify>,
+        Arc<StreamSession>,
     ) {
         let id = uuid::Uuid::new_v4().to_string();
         let mut session = StreamSession::new(id.clone(), info, false, buffer_size);
@@ -242,12 +256,13 @@ impl AudioStreamer {
             .take()
             .expect("freshly created session has tx");
         let data_ready = session.data_ready.clone();
+        let session = Arc::new(session);
         self.sessions
             .lock()
             .await
-            .insert(id.clone(), Arc::new(session));
+            .insert(id.clone(), session.clone());
         info!(stream_id = %id, "radio_stream_session_created");
-        (id, tx, data_ready)
+        (id, tx, data_ready, session)
     }
 
     pub async fn create_proxy_session(
@@ -427,6 +442,14 @@ pub fn build_wav_header(
     duration_ms: Option<u64>,
 ) -> [u8; 44] {
     build_wav_header_with_duration(channels, sample_rate, bit_depth, duration_ms)
+}
+
+/// Build a WAV header for an infinite live radio stream, using the streaming
+/// (`0xFFFF_FFFF`) indeterminate-length convention so a Lavf DLNA renderer
+/// keeps reading until the connection closes instead of stopping after it has
+/// buffered the finite `data` size.
+pub fn build_wav_header_streaming(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    wav_header_streaming(channels, sample_rate, bit_depth)
 }
 
 /// Check if a file path is a temporary transcode file created by the

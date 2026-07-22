@@ -1018,7 +1018,7 @@ impl PlaybackOrchestrator {
                     ..Default::default()
                 };
 
-                let (session_id, tx, data_ready) =
+                let (session_id, tx, data_ready, session) =
                     self.streamer.create_radio_session(wav_info, 256).await;
 
                 info!(
@@ -1032,7 +1032,7 @@ impl PlaybackOrchestrator {
                     // Download + decode in a blocking thread since symphonia and
                     // reqwest::blocking are both synchronous.
                     let result = tokio::task::spawn_blocking(move || {
-                        decode_radio_stream_to_pcm(radio_url, tx, data_ready)
+                        decode_radio_stream_to_pcm(radio_url, tx, data_ready, session)
                     })
                     .await;
 
@@ -1105,13 +1105,13 @@ impl PlaybackOrchestrator {
                         duration_ms: None,
                         ..Default::default()
                     };
-                    let (session_id, tx, data_ready) =
+                    let (session_id, tx, data_ready, session) =
                         self.streamer.create_radio_session(wav_info, 256).await;
                     info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
                     let radio_url = audio_url.to_string();
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
-                            decode_radio_stream_to_pcm(radio_url, tx, data_ready)
+                            decode_radio_stream_to_pcm(radio_url, tx, data_ready, session)
                         })
                         .await;
                         match result {
@@ -4891,6 +4891,7 @@ fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
+    session: std::sync::Arc<crate::http::streamer::StreamSession>,
 ) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
@@ -5039,6 +5040,17 @@ fn decode_radio_stream_to_pcm(
             }
             _ => {}
         }
+
+        // Publish the true decoded format so the HTTP handler advertises the
+        // correct WAV sample rate/channels to the renderer (FIP is 48000, not
+        // the placeholder 44100 in StreamInfo). Set BEFORE first_chunk so the
+        // header, which is emitted after data_ready, reflects the real rate.
+        session
+            .detected_sample_rate
+            .store(source_sample_rate, std::sync::atomic::Ordering::Relaxed);
+        session
+            .detected_channels
+            .store(source_channels, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             channels = source_channels,

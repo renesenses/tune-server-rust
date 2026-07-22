@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
-    build_wav_header, extract_stream_id,
+    build_wav_header, build_wav_header_streaming, extract_stream_id,
 };
 
 pub async fn handle_head(
@@ -151,11 +151,17 @@ pub async fn handle_stream(
     // (DMP-A6/A8) don't need to probe the stream end with seek requests.
     let is_wav = session.info.format == "wav";
     let is_radio = session.is_radio;
-    let wav_length = if is_wav {
+    // A live radio→WAV stream is infinite: never advertise a Content-Length and
+    // send an explicit chunked, close-delimited body so a Lavf DLNA renderer
+    // reads until the connection closes instead of stopping at a finite size.
+    let wav_length = if is_wav && !is_radio {
         session.info.wav_content_length()
     } else {
         None
     };
+    if is_radio {
+        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+    }
 
     // DLNA renderers (Marantz SR7009, Eversolo DMP-A8) send Range: bytes=0-
     // even for the initial request and expect a 206 Partial Content response
@@ -207,9 +213,33 @@ pub async fn handle_stream(
     let wav_header_included = session
         .wav_header_included
         .load(std::sync::atomic::Ordering::Relaxed);
+    let data_ready = session.data_ready.clone();
     let body = Body::from_stream(async_stream::stream! {
         if is_wav && !wav_header_included {
-            let hdr = build_wav_header(ch, sr, bd, dur_ms);
+            // Live radio is infinite — emit the streaming (0xFFFF_FFFF)
+            // indeterminate-length WAV header so a Lavf renderer keeps reading
+            // until the connection closes. Finite tracks keep the sized header.
+            let hdr = if is_radio {
+                // Wait until the decoder has probed the upstream so the header
+                // advertises the TRUE sample rate/channels (FIP is 48000, not
+                // the placeholder 44100). Fall back to the StreamInfo values if
+                // the decoder hasn't populated them within a short window.
+                use std::sync::atomic::Ordering::Relaxed;
+                if session.detected_sample_rate.load(Relaxed) == 0 {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        data_ready.notified(),
+                    )
+                    .await;
+                }
+                let det_sr = session.detected_sample_rate.load(Relaxed);
+                let det_ch = session.detected_channels.load(Relaxed);
+                let real_sr = if det_sr != 0 { det_sr } else { sr };
+                let real_ch = if det_ch != 0 { det_ch } else { ch };
+                build_wav_header_streaming(real_ch, real_sr, bd)
+            } else {
+                build_wav_header(ch, sr, bd, dur_ms)
+            };
             yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
         }
 
