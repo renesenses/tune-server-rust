@@ -3062,29 +3062,25 @@ impl OutputTarget for LocalOutput {
             // Signal that HTTP reading is done
             finished_flag.store(true, Ordering::SeqCst);
 
-            // Signal natural track end BEFORE draining when the HTTP stream
-            // reached EOF.  This is critical when resampling causes slow
-            // ring-buffer consumption (e.g. 44.1→192 kHz, ×4.35 expansion):
-            // the HTTP stream finishes sending all data, but the ring drains
-            // slowly.  If a new play command (next track or poller timeout)
-            // sets force_silent during the drain, the old code would exit
-            // without setting track_ended_naturally, causing the poller to
-            // never detect end-of-track and never advance the queue.
-            // Setting the flag here ensures the orchestrator sees it
-            // immediately.  play_url() clears the flag for the next track.
-            if http_eof {
-                track_ended_naturally.store(true, Ordering::SeqCst);
-                track_ended_generation.store(my_generation, Ordering::SeqCst);
-                TRACK_END_NOTIFY.notify_one();
-                debug!(
-                    ring_available = ring.available(),
-                    total_bytes_read,
-                    total_frames_fed,
-                    "local_audio_track_ended_naturally_pre_drain"
-                );
-            }
-
-            // Wait for ring buffer to drain or stop signal
+            // Wait for the ring buffer to drain (real playback) before signalling
+            // the natural track end. The HTTP thread finishes FEEDING all samples
+            // well before the DAC has PLAYED them — up to ~2s at the output rate
+            // (more when resampling 44.1→192). The old code signalled end + left
+            // the reported position at the fed/decoded end BEFORE draining, so the
+            // poller saw position past (DB) duration + margin while up to ~2s was
+            // still queued in the ring, and advanced the queue early — cutting the
+            // end of every track (JP Borderies, WASAPI/ASIO exclusive, VX248: log
+            // showed ring_available ~1.4M f32 samples still queued at advance time).
+            //
+            // Fix: during the drain, report the PLAYED position (fed − what is
+            // still queued in the ring) so the poller's position-past-end check
+            // tracks real playback; only signal track_ended_naturally once the ring
+            // is actually empty. If a new play/stop interrupts the drain
+            // (force_silent/stop_rx), the queue already moved on (force_silent is
+            // only set by a fresh play_url) — so we must NOT emit a natural end for
+            // this superseded track.
+            let fed_position_ms = position_ms.load(Ordering::Relaxed);
+            let mut drained_naturally = false;
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -3092,10 +3088,30 @@ impl OutputTarget for LocalOutput {
                 if force_silent.load(Ordering::Relaxed) {
                     break;
                 }
-                if ring.available() == 0 {
+                let remaining = ring.available();
+                if remaining == 0 {
+                    drained_naturally = true;
                     break;
                 }
+                // Report real playback: subtract the still-queued ring content
+                // (interleaved f32 samples at the output rate/channels).
+                if output_sr > 0 && output_ch > 0 {
+                    let ring_ms =
+                        (remaining as f64 / output_ch as f64 / output_sr as f64 * 1000.0) as u64;
+                    position_ms.store(fed_position_ms.saturating_sub(ring_ms), Ordering::Relaxed);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            if http_eof && drained_naturally {
+                position_ms.store(fed_position_ms, Ordering::Relaxed);
+                track_ended_naturally.store(true, Ordering::SeqCst);
+                track_ended_generation.store(my_generation, Ordering::SeqCst);
+                TRACK_END_NOTIFY.notify_one();
+                debug!(
+                    total_bytes_read,
+                    total_frames_fed, "local_audio_track_ended_naturally_post_drain"
+                );
             }
 
             drop(stream);
