@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::{debug, info, warn};
+use unicode_normalization::UnicodeNormalization;
 
 /// Best-effort diagnostic counter of artwork downloads rejected with a
 /// rate-limit status (429/503), incremented in [`download_image`]. An
@@ -95,29 +96,57 @@ pub(crate) fn extended_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     Cow::Owned(std::path::PathBuf::from(prefixed))
 }
 
+/// Candidate on-disk paths to try, differing only in Unicode normalization.
+///
+/// The scanner stores file paths NFC-normalized (`walker.rs`), but a file copied
+/// from macOS keeps an NFD (decomposed) name on disk. Opening the stored NFC
+/// path then fails with "cannot find the path specified" — even though the track
+/// scanned fine, because the walker read it via the raw enumerated path. Trying
+/// the NFD (then NFC) form recovers the <1% of albums whose names carry
+/// decomposable diacritics (Thibaud, #995: "Camarón de la Isla", "Możdżer",
+/// "orð vǫlu"). Deduped, original first so the common case does one open.
+fn normalization_variants(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Some(s) = path.to_str() {
+        for variant in [s.nfd().collect::<String>(), s.nfc().collect::<String>()] {
+            let p = PathBuf::from(variant);
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    match lofty::read_from_path(&*extended_path(audio_path)) {
-        Ok(tagged) => {
-            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-                if let Some(pic) = tag.pictures().first() {
-                    let mime = match pic.mime_type() {
-                        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
-                        Some(lofty::picture::MimeType::Png) => "image/png",
-                        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
-                        _ => "image/jpeg",
-                    };
-                    return Some((pic.data().to_vec(), mime.to_string()));
+    for candidate in normalization_variants(audio_path) {
+        match lofty::read_from_path(&*extended_path(&candidate)) {
+            Ok(tagged) => {
+                if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+                    if let Some(pic) = tag.pictures().first() {
+                        let mime = match pic.mime_type() {
+                            Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
+                            Some(lofty::picture::MimeType::Png) => "image/png",
+                            Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                            _ => "image/jpeg",
+                        };
+                        return Some((pic.data().to_vec(), mime.to_string()));
+                    }
                 }
+                // The file opened but carries no embedded picture — other
+                // normalizations point at the same physical file, so stop.
+                break;
             }
-        }
-        Err(e) => {
-            debug!(
-                path = %audio_path.display(),
-                error = %e,
-                "artwork_lofty_read_failed"
-            );
+            Err(e) => {
+                debug!(
+                    path = %candidate.display(),
+                    error = %e,
+                    "artwork_lofty_read_failed"
+                );
+                // "Path not found" for this normalization — try the next form.
+            }
         }
     }
 
@@ -1348,6 +1377,32 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalization_variants_covers_nfd_and_nfc() {
+        // A decomposable diacritic path yields both a decomposed (NFD) and a
+        // composed (NFC) candidate so a stored-NFC path can still open an
+        // NFD-on-disk file (#995). Compute the forms from the input so the test
+        // does not depend on this source file's own normalization.
+        let input = "M:\\Music\\Camarón\\track.m4a";
+        let nfd: String = input.nfd().collect();
+        let nfc: String = input.nfc().collect();
+        assert_ne!(nfd, nfc, "composable diacritic must have distinct NFD/NFC");
+
+        let strs: Vec<String> = normalization_variants(Path::new(input))
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+        assert!(strs.contains(&nfd), "NFD variant missing");
+        assert!(strs.contains(&nfc), "NFC variant missing");
+    }
+
+    #[test]
+    fn normalization_variants_dedupes_ascii() {
+        // Pure ASCII has one canonical form → a single candidate, no wasted opens.
+        let variants = normalization_variants(Path::new("/music/Track.flac"));
+        assert_eq!(variants.len(), 1);
+    }
 
     #[test]
     fn extended_path_windows_and_noop() {
