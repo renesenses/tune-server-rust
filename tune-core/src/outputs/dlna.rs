@@ -314,6 +314,32 @@ impl OutputTarget for DlnaOutput {
         )).await?;
 
         if set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>") {
+            // Error 714 ("Illegal MIME-type") means the renderer parsed the DIDL
+            // but its ConnectionManager Sink does not list the advertised MIME /
+            // protocolInfo. Surface the exact MIME + protocolInfo we sent AND the
+            // renderer's Sink, so the mismatch is diagnosable from a single log
+            // line (Mickaël, #1146: TIDAL → Beoplay 714). This is a strict-parser
+            // renderer (B&O, Lyngdorf); the same MIME works on lax renderers, so
+            // the actionable signal is "which MIME the Sink actually accepts".
+            let is_714 = set_uri_resp.contains(">714<")
+                || set_uri_resp.to_lowercase().contains("illegal mime");
+            if is_714 {
+                let sink = self.get_protocol_info().await.unwrap_or_default();
+                warn!(
+                    device = %self.name,
+                    advertised_mime = media.mime_type,
+                    live_stream = media.live_stream,
+                    sink_entries = sink.len(),
+                    sink = ?sink,
+                    response = %set_uri_resp,
+                    "dlna_set_uri_illegal_mime_714"
+                );
+                return Err(format!(
+                    "SetAVTransportURI rejected 714 Illegal MIME-type: renderer Sink does not accept advertised MIME '{}' (sink has {} entries); rejected: {set_uri_resp}",
+                    media.mime_type,
+                    sink.len()
+                ));
+            }
             warn!(device = %self.name, response = %set_uri_resp, "dlna_set_uri_error");
             return Err(format!("SetAVTransportURI rejected: {set_uri_resp}"));
         }
