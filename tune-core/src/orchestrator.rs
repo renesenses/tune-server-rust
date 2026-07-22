@@ -4918,6 +4918,9 @@ fn decode_radio_stream_to_pcm(
     // MAX_RECONNECTS so a permanently-dead station still falls back to the poller.
     const MAX_RECONNECTS: u32 = 30;
     let mut reconnects: u32 = 0;
+    // When the upstream last dropped, so we can measure how long the renderer
+    // was starved during a reconnect (diagnostics: FIP silent-after-reconnect).
+    let mut dropped_at: Option<std::time::Instant> = None;
     // Format of the first successful connection. A reconnect that returns a
     // different rate/channel layout would feed PCM that doesn't match the WAV
     // header already sent to the renderer, so we bail to a fresh session instead.
@@ -5052,12 +5055,21 @@ fn decode_radio_stream_to_pcm(
             .detected_channels
             .store(source_channels, std::sync::atomic::Ordering::Relaxed);
 
+        // Measure the reconnect gap: how long the session went without fresh
+        // PCM. A long gap can starve the renderer's HTTP read.
+        let gap_ms = dropped_at.take().map(|t| t.elapsed().as_millis());
         info!(
             channels = source_channels,
             sample_rate = source_sample_rate,
             reconnect = reconnects,
+            gap_ms = ?gap_ms,
             "radio_local_decode_started"
         );
+        if let Some(g) = gap_ms {
+            if g > 2000 {
+                warn!(gap_ms = g, reconnect = reconnects, "radio_reconnect_gap_long — renderer may have been starved");
+            }
+        }
 
         // ---- Decode loop ----
         loop {
@@ -5134,6 +5146,7 @@ fn decode_radio_stream_to_pcm(
             warn!(url = %url, reconnects, "radio_reconnect_giving_up");
             return Ok(());
         }
+        dropped_at = Some(std::time::Instant::now());
         info!(url = %url, attempt = reconnects, "radio_upstream_dropped_reconnecting");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
