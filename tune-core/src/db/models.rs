@@ -55,6 +55,12 @@ pub struct Album {
     pub musicbrainz_release_group_id: Option<String>,
     pub release_date: Option<String>,
     pub original_date: Option<String>,
+    /// Epoch seconds when the album entered the library (max of its tracks'
+    /// file_first_seen, mtime fallback). Populated only by the added-date
+    /// sorted listing — None elsewhere. Lets the client build the
+    /// added-date scrubber (Bertrand: "slider date d'ajout manquant").
+    #[serde(default)]
+    pub added_at: Option<f64>,
 }
 
 impl Album {
@@ -109,6 +115,7 @@ impl Album {
             musicbrainz_release_group_id: None,
             release_date: None,
             original_date: None,
+            added_at: None,
         }
     }
 }
@@ -342,6 +349,7 @@ mod tests {
             musicbrainz_release_group_id: None,
             release_date: None,
             original_date: None,
+            added_at: None,
         };
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["title"], "Kind of Blue");
