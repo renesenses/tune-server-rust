@@ -396,13 +396,32 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         }
                         OutputType::Airplay => {
                             let is_v2 = dev.airplay_version.as_deref() == Some("2");
-                            if is_v2 && tune_core::outputs::airplay2::daemon_available() {
-                                let ap_dev_id = dev
-                                    .capabilities
-                                    .get("deviceid")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                            // The AirPlay deviceid (a MAC) is stored on `mac_address`
+                            // by the mDNS handler; `capabilities["deviceid"]` is never
+                            // populated. Reading only the latter left ap_device_id empty,
+                            // so the AirPlay 2 daemon rejected every connection ("MAC
+                            // address must be 12 hex characters, got 0") — Matteo's Sonos
+                            // Era 100 "Chambre Missou". Prefer mac_address, fall back to
+                            // the capability.
+                            let ap_dev_id = dev
+                                .mac_address
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    dev.capabilities
+                                        .get("deviceid")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_default();
+                            // Without a device id the AirPlay 2 daemon can't connect, so
+                            // a v2 output would be a dead zone. Fall back to legacy AirPlay
+                            // in that case instead of registering a broken v2 zone.
+                            if is_v2
+                                && tune_core::outputs::airplay2::daemon_available()
+                                && !ap_dev_id.is_empty()
+                            {
                                 let ap2 = tune_core::outputs::airplay2::Airplay2Output::new(
                                     dev.name.clone(),
                                     dev.host.clone(),
