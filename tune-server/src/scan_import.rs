@@ -283,7 +283,11 @@ impl TrackImporter {
             } else {
                 let result = self
                     .artist_repo
-                    .get_or_create(&track_artist_name, meta.musicbrainz_artist_id.as_deref(), None)
+                    .get_or_create(
+                        &track_artist_name,
+                        meta.musicbrainz_artist_id.as_deref(),
+                        None,
+                    )
                     .ok()
                     .map(Arc::new);
                 if let Some(ref a) = result {
@@ -326,7 +330,11 @@ impl TrackImporter {
             } else {
                 t.clone()
             };
-            (title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
+            (
+                title,
+                album_artist_id.unwrap_or(0),
+                meta.year.map(|y| y as i32),
+            )
         });
 
         let album = if let Some(ref key) = album_key {
@@ -534,7 +542,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        let track = build_track_row(&meta, &sf("/m/kob/01.flac"), Some(7), Some(3), "Miles Davis");
+        let track = build_track_row(
+            &meta,
+            &sf("/m/kob/01.flac"),
+            Some(7),
+            Some(3),
+            "Miles Davis",
+        );
 
         assert_eq!(track.id, None);
         assert_eq!(track.title, "So What");
@@ -563,7 +577,13 @@ mod tests {
     #[test]
     fn build_track_row_title_falls_back_to_file_stem_and_defaults() {
         let meta = TrackMetadata::default();
-        let track = build_track_row(&meta, &sf("/m/x/Untitled Take.flac"), None, None, "Unknown Artist");
+        let track = build_track_row(
+            &meta,
+            &sf("/m/x/Untitled Take.flac"),
+            None,
+            None,
+            "Unknown Artist",
+        );
         assert_eq!(track.title, "Untitled Take");
         // Sensible defaults when tags are absent.
         assert_eq!(track.disc_number, 1);

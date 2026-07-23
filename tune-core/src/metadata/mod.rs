@@ -179,6 +179,19 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Canonical grouping key for a genre label, insensitive to case AND to the
+/// space-vs-hyphen separator, so "Trip Hop" and "Trip-Hop" (or "trip hop")
+/// collapse to a single key ("trip hop"). Used to dedup the library genre
+/// views, which otherwise show one card per spelling variant (#1161).
+pub fn genre_key(genre: &str) -> String {
+    genre
+        .to_lowercase()
+        .replace('-', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Normalize a lofty `FileType` debug string into a user-friendly format name.
 ///
 /// lofty's `FileType` Debug representation doesn't always match what users expect:

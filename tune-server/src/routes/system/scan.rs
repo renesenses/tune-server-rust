@@ -513,10 +513,26 @@ pub(super) async fn trigger_scan(
             // persist between full scans. The EXISTS guard avoids nulling an
             // album genre when no track carries one.
             if force {
+                // Pick the album genre by MAJORITY VOTE across its tracks, with a
+                // deterministic tie-break, instead of an arbitrary `LIMIT 1` track.
+                // A bare `LIMIT 1` (no ORDER BY) let SQLite return any row, so a
+                // multi-genre album — or one track carrying a stray tag — got a
+                // random genre that could differ per album and change between
+                // scans (#1160/#1161). `genres` is rebuilt from the SAME chosen
+                // genre so the two columns can never disagree (previously they
+                // came from two independent subqueries, which is how an album
+                // tagged "Alternatif & Indé" surfaced a stale "singer; Songwriter"
+                // genres value from an unrelated track — #1160).
                 if let Err(e) = db.execute(
                     "UPDATE albums SET \
-                     genre = (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1), \
-                     genres = (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL LIMIT 1) \
+                     genre = (SELECT t.genre FROM tracks t \
+                              WHERE t.album_id = albums.id AND t.genre IS NOT NULL \
+                              GROUP BY t.genre ORDER BY COUNT(*) DESC, t.genre ASC LIMIT 1), \
+                     genres = '[\"' || REPLACE( \
+                                 (SELECT t.genre FROM tracks t \
+                                  WHERE t.album_id = albums.id AND t.genre IS NOT NULL \
+                                  GROUP BY t.genre ORDER BY COUNT(*) DESC, t.genre ASC LIMIT 1), \
+                                 '\"', '\\\"') || '\"]' \
                      WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL)",
                     &[],
                 ) {
