@@ -425,6 +425,35 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
         }
     }
 
+    // Mirror the Last.fm API key/secret from env into the settings DB. The whole
+    // scrobbling flow (auth.getSession exchange in service_tokens.rs, and the
+    // scrobbler in orchestrator.rs) reads these from the settings table, not from
+    // config — so a user who only set TUNE_LASTFM_API_KEY/SECRET in .env got
+    // "lastfm_api_key not configured" and no scrobbling, even though the keys were
+    // loaded (forum #1113). Read straight from env (the server TuneConfig does not
+    // carry Last.fm) and persist once when absent, exactly like discogs_token.
+    for (env_var, key) in [
+        ("TUNE_LASTFM_API_KEY", "lastfm_api_key"),
+        ("TUNE_LASTFM_API_SECRET", "lastfm_api_secret"),
+    ] {
+        let env_val = match std::env::var(env_var) {
+            Ok(v) if !v.is_empty() => v,
+            _ => continue,
+        };
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let already_set = settings
+            .get(key)
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+            .is_some();
+        if !already_set {
+            settings.set(key, &env_val).ok();
+            info!("{key}_persisted_from_env");
+        }
+    }
+
     // Seed the quality_split default so the DB is the single source of truth.
     // get_config injects a `true` default in memory but never persists it, so an
     // untouched DB has no row — and both the manual and auto scanners fall back

@@ -127,6 +127,13 @@ pub struct PlayRequest {
     pub duration_ms: Option<i64>,
     pub seek_ms: Option<u64>,
     pub temp_file_path: Option<String>,
+    /// Real resolution/codec for a media-server (`source="upnp"`) URL, taken from
+    /// the DIDL res@ attributes (the same the DartZeel reads). Lets the signal
+    /// path show the true rate/bit-depth and infer ALAC-vs-AAC instead of
+    /// defaulting to "AAC 44kHz/16bit — Avec perte" (Yves, NAS ALAC).
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u16>,
+    pub media_format: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +485,12 @@ impl PlaybackOrchestrator {
                     "qobuz" => Some("flac".to_string()),
                     _ => None,
                 })
+                // A media-server (UPnP/NAS) item has no local track row, so the
+                // codec the client read from the DIDL res@protocolInfo is the only
+                // authoritative source: audio/mp4 is ambiguous ALAC-vs-AAC, so
+                // surface "alac" here instead of falling back to the "mp4" MIME
+                // and mislabeling a lossless ALAC as lossy AAC (Yves, NAS).
+                .or_else(|| req.media_format.clone())
                 .or_else(|| {
                     let mime = &resolved.mime_type;
                     Some(
@@ -1141,12 +1154,16 @@ impl PlaybackOrchestrator {
                     (direct_url, None, mime_type.to_string(), None, None, None)
                 }
             } else {
+                // Media-server / podcast direct URL. Carry the real resolution the
+                // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
+                // instead of letting the signal path default to 44.1kHz/16bit and
+                // mislabel a hi-res ALAC as lossy AAC (Yves, NAS).
                 (
                     audio_url.to_string(),
                     None,
                     mime_type.to_string(),
-                    None,
-                    None,
+                    req.sample_rate,
+                    req.bit_depth.map(|b| b as u32),
                     None,
                 )
             };
@@ -3817,15 +3834,23 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        // Multi-service scrobble dispatch with tier gating.
-        // Free tier: only the first configured service fires.
-        // Premium tier: all configured services fire simultaneously.
-        self.dispatch_scrobble(title, artist, album);
+        // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
+        // at play-start, which (a) scrobbled a track the instant it began — so
+        // skipping after a few seconds still scrobbled it, ignoring Last.fm's
+        // 50%/4-min rule — and (b) was gated by `record_history`, which the
+        // gapless/prefetch advance paths bypass (`play_without_history`), so
+        // every other track on an album was silently dropped (Bilou, #1113). The
+        // poller now dispatches the scrobble once the track has actually been
+        // listened past the threshold (see `dispatch_scrobble`).
     }
 
     /// Dispatch scrobbles to all configured services, respecting tier limits.
     /// Free = 1 service max, Premium = all simultaneously.
-    fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+    ///
+    /// Called by the poller once the current track has been played past the
+    /// Last.fm threshold (50% or 4 min), so a scrobble reflects a real listen
+    /// rather than a mere play-start (#1113).
+    pub fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let settings = SettingsRepo::with_backend(self.db.clone());
 
         let lastfm_ready = self.lastfm_keys().is_some();
@@ -3839,7 +3864,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_scrobble(title, artist);
+            self.lastfm_scrobble(title, artist, album);
         }
 
         if lb_ready {
@@ -3868,7 +3893,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_now_playing(title, artist);
+            self.lastfm_now_playing(title, artist, album);
         }
 
         if lb_ready {
@@ -3889,7 +3914,7 @@ impl PlaybackOrchestrator {
         Some((api_key, api_secret, session_key))
     }
 
-    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>) {
+    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3898,17 +3923,23 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
+        // Send the album too: Last.fm/Pano apps rely on it to fetch the cover
+        // (the web site does a looser track-level match), so scrobbles without
+        // an album showed no artwork in the apps (#1113).
+        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::scrobble(
+            if let Err(e) = crate::scrobble::scrobble_full(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
+                album.as_deref(),
+                None,
                 timestamp,
             )
             .await
@@ -3918,7 +3949,7 @@ impl PlaybackOrchestrator {
         });
     }
 
-    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>) {
+    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3927,13 +3958,16 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
+        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::update_now_playing(
+            if let Err(e) = crate::scrobble::update_now_playing_full(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
+                album.as_deref(),
+                None,
             )
             .await
             {
@@ -4288,6 +4322,9 @@ impl PlaybackOrchestrator {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: None,
                         temp_file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        media_format: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -4388,6 +4425,9 @@ impl PlaybackOrchestrator {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: Some(position_ms),
                         temp_file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        media_format: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -4541,6 +4581,9 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             }
         } else {
             // Streaming track.
@@ -4599,6 +4642,9 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             }
         };
 
@@ -4732,6 +4778,9 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -4796,6 +4845,9 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -5514,6 +5566,9 @@ mod tests {
             duration_ms: None,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -5543,6 +5598,9 @@ mod tests {
             duration_ms: None,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -5567,6 +5625,9 @@ mod tests {
             duration_ms: Some(3600000),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(

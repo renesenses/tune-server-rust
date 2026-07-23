@@ -892,9 +892,20 @@ impl AlbumRepo {
         next_ph += 1;
         let offset_ph = make_ph(next_ph);
 
+        // Expose the added-at timestamp as a 25th column when sorting by it,
+        // so the client can render a chronological scrubber. Same expression
+        // as the ORDER BY — the planner evaluates the correlated subquery once.
+        let base_select = if matches!(sort, "added_at" | "added_date") {
+            sql::select_album().replacen(
+                " FROM albums a",
+                ", (SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(t.file_mtime, '') AS DOUBLE PRECISION)))                    FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path                    WHERE t.album_id = a.id) AS added_at FROM albums a",
+                1,
+            )
+        } else {
+            sql::select_album().to_string()
+        };
         let sql = format!(
-            "{}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}",
-            sql::select_album()
+            "{base_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
         );
 
         bind_values.push(SqlValue::Int(limit));
@@ -1065,6 +1076,9 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         genre: cols.get(6).and_then(|v| v.as_string()),
         // Index 23 (after the 23-col select): a.genres
         genres: cols.get(23).and_then(|v| v.as_string()),
+        // Index 24: added_at — present only on the added-date sorted listing
+        // (list_filtered injects the column); None for every other query.
+        added_at: cols.get(24).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
         cover_path: cols.get(9).and_then(|v| v.as_string()),

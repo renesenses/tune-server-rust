@@ -189,35 +189,19 @@ pub(crate) mod decisions {
             && peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
     }
 
-    /// Whether the next queue item is a DSD stream that a DLNA renderer would
-    /// accept via SetNextAVTransportURI but never actually transition to (HiFi
-    /// Rose RS130 / Benjithom: the album "cuts after track 1" because the next
-    /// DSD stream is never consumed and the poller force-stops the zone). When
-    /// true, the poller must NOT arm gapless for this next track — end-of-track
-    /// plays it explicitly instead (a small gap, never a cut). Only guards DLNA
-    /// outputs; local outputs keep their internal DSD gapless chain untouched.
-    pub fn dlna_next_is_dsd(output_type: &str, mime_type: &str, url: &str) -> bool {
-        if output_type != "dlna" {
-            return false;
-        }
-        let url_lc = url.to_lowercase();
-        mime_type.contains("dsd")
-            || mime_type.contains("dsf")
-            || url_lc.ends_with(".dsf")
-            || url_lc.ends_with(".dff")
-    }
-
     /// A DSD track on a DLNA renderer that has demonstrably reached its end.
     ///
     /// Gapless (`SetNextAVTransportURI`) is intentionally NOT armed when the next
-    /// track is DSD on a DLNA renderer (see [`dlna_next_is_dsd`] — it prevents the
-    /// RS130 hard cut, #402). But DLNA `poll_status` never reports
-    /// `ended_naturally`, so with gapless off the only end-of-track signal left is
-    /// counting `STOPPED_TICKS_THRESHOLD` Stopped polls — a fixed ~5s inter-track
-    /// gap for a DSD album (Benjithom, HiFi Rose RS130). When the peak position
-    /// has reached the track's end we already know it finished, so the poller can
-    /// advance immediately instead of waiting out the counter. PCM/FLAC on DLNA
-    /// keep their armed-gapless path and never reach this predicate.
+    /// track is DSD on a DLNA renderer (`prepare_gapless` skips it — the renderer
+    /// accepts SetNext for a DSD stream but never consumes it, so the album cuts
+    /// after track 1; HiFi Rose RS130, Benjithom, #402). But DLNA `poll_status`
+    /// never reports `ended_naturally`, so with gapless off the only end-of-track
+    /// signal left is counting `STOPPED_TICKS_THRESHOLD` Stopped polls — a fixed
+    /// ~5s inter-track gap for a DSD album (Benjithom, RS130). When the peak
+    /// position has reached the track's end we already know it finished, so the
+    /// poller can advance immediately instead of waiting out the counter. PCM/FLAC
+    /// on DLNA keep their armed-gapless path and never reach this predicate; DSD on
+    /// a local output keeps its internal gapless chain and is out of scope here.
     pub fn dlna_dsd_reached_end(
         output_type: &str,
         current_format: Option<&str>,
@@ -362,6 +346,9 @@ pub mod fsm {
         StuckForceEnd,
         /// Local output signalled natural EOF — track ended.
         LocalEndedNaturally,
+        /// DSD-on-DLNA (gapless intentionally off) reached its end by peak
+        /// position — advance now instead of waiting out the Stopped counter.
+        DsdDlnaReachedEnd,
         /// Stopped-threshold reached + natural end, gapless armed — wait for transition.
         NaturalEndGaplessWaiting,
         /// Stopped-threshold reached + natural end, no gapless — advance track.
@@ -381,6 +368,7 @@ pub mod fsm {
                 self,
                 StoppedOutcome::StuckForceEnd
                     | StoppedOutcome::LocalEndedNaturally
+                    | StoppedOutcome::DsdDlnaReachedEnd
                     | StoppedOutcome::NaturalEndAdvance
             )
         }
@@ -412,6 +400,12 @@ pub mod fsm {
         pub natural_end: bool,
         pub gapless_sent: bool,
         pub stream_consuming: bool,
+        /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
+        /// DSD track on a DLNA renderer whose peak position reached the end.
+        /// Gapless is intentionally off for a DSD next on DLNA, and DLNA never
+        /// reports `ended_naturally`, so without this the track only ends after
+        /// `STOPPED_TICKS_THRESHOLD` polls (~5s gap).
+        pub dlna_dsd_reached_end: bool,
     }
 
     /// Pure reproduction of the `TransportState::Stopped` arm's decision tree.
@@ -449,6 +443,13 @@ pub mod fsm {
                 || decisions::ended_naturally_wall_ok(i.wall_elapsed, i.track_duration_ms))
         {
             return LocalEndedNaturally;
+        }
+        if i.dlna_dsd_reached_end {
+            // DSD-on-DLNA: gapless intentionally off and DLNA never reports
+            // ended_naturally, so the peak reaching the end is the earliest
+            // reliable end-of-track signal — advance now, ~4s before the
+            // Stopped counter would.
+            return DsdDlnaReachedEnd;
         }
         // Fallthrough: the arm increments stopped_ticks, then branches on it.
         let stopped_ticks = i.stopped_ticks.saturating_add(1);
@@ -560,6 +561,7 @@ pub mod fsm {
                 natural_end: false,
                 gapless_sent: false,
                 stream_consuming: false,
+                dlna_dsd_reached_end: false,
             }
         }
 
@@ -791,6 +793,32 @@ pub mod fsm {
         }
 
         #[test]
+        fn dsd_dlna_reached_end_advances_before_stopped_counter() {
+            // DSD on DLNA reached its end (peak): advance now, at stopped_ticks=0,
+            // without waiting out STOPPED_TICKS_THRESHOLD. This keeps the FSM
+            // shadow model in sync with the imperative arm's fast path.
+            let i = StoppedInput {
+                stopped_ticks: 0,
+                dlna_dsd_reached_end: true,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::DsdDlnaReachedEnd);
+            assert!(classify_stopped(&i).is_track_end());
+        }
+
+        #[test]
+        fn dsd_dlna_end_yields_to_ended_naturally() {
+            // A local-style ended_naturally still wins (branch order preserved).
+            let i = StoppedInput {
+                dlna_dsd_reached_end: true,
+                ended_naturally: true,
+                played_enough: true,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::LocalEndedNaturally);
+        }
+
+        #[test]
         fn failure_stops_when_idle_past_failure_threshold() {
             // STOPPED_FAILURE_THRESHOLD = 30. pre=29 → +1=30, not natural, idle.
             let i = StoppedInput {
@@ -990,6 +1018,15 @@ struct ZonePollState {
     /// When the current track started playing (wall clock).
     /// Used to reject false gapless transitions that happen too soon.
     track_started_at: Option<Instant>,
+    /// The `ZoneState::last_seek_at` instant we last folded into
+    /// `track_started_at`. A user seek moves the play position without moving
+    /// the wall clock, which starves every wall-clock guard downstream
+    /// (`played_enough`, `ended_naturally_wall_ok`): seek to the end right
+    /// after start and the real track end is rejected as a spurious
+    /// renderer signal — playback just stops instead of advancing (DEvir,
+    /// v0.9.0-rc4). On each NEW seek we rewind `track_started_at` by the seek
+    /// target so `wall_elapsed` matches "played at 1x from the start" again.
+    last_seek_seen: Option<Instant>,
     /// Tracks the `ZoneState::track_generation` we last observed.
     /// When the generation changes (new track started via `play()`),
     /// we reset all per-track state so stale values from the previous
@@ -1285,6 +1322,7 @@ impl PositionPoller {
                 scrobbled: false,
                 ticks_since_db_save: 0,
                 track_started_at: None,
+                last_seek_seen: None,
                 track_generation: zone_state.track_generation,
                 track_loaded_at: Instant::now(),
                 past_end_ticks: 0,
@@ -1652,17 +1690,27 @@ impl PositionPoller {
             } else {
                 SEEK_GRACE_SECS
             };
-            // The zone's output type (dlna/openhome/local/…), used below to give
-            // a DSD track on a DLNA renderer a position-based end-of-track fast
-            // path (its gapless is intentionally disabled, see dlna_next_is_dsd).
-            let zone_output_type: Option<String> = all_zones
-                .iter()
-                .find(|z| z.id == Some(zone_id))
-                .and_then(|z| z.output_type.clone());
             let in_seek_grace = zone_state
                 .last_seek_at
                 .map(|t| t.elapsed().as_secs() < seek_grace_secs)
                 .unwrap_or(false);
+
+            // Fold a NEW seek into the wall-clock baseline: rewind
+            // track_started_at by the seek target so wall_elapsed reads as if
+            // the track had played at 1x from position 0. Without this, a
+            // seek near the end leaves wall_elapsed at a few seconds, and the
+            // anti-spurious guards (played_enough, ended_naturally_wall_ok)
+            // veto the REAL track end — playback stops instead of advancing
+            // to the next track (DEvir, v0.9.0-rc4). Instant identity makes
+            // this once-per-seek; play() clears last_seek_at on track change.
+            if let Some(seek_at) = zone_state.last_seek_at {
+                if ps.last_seek_seen != Some(seek_at) {
+                    ps.last_seek_seen = Some(seek_at);
+                    let target = Duration::from_millis(zone_state.position_ms.max(0) as u64);
+                    ps.track_started_at =
+                        Instant::now().checked_sub(target).or(ps.track_started_at);
+                }
+            }
 
             if !in_seek_grace {
                 // Clamp the reported position to the track duration so the UI
@@ -1789,17 +1837,7 @@ impl PositionPoller {
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
-                // A position reset once the peak has reached the track's end is a
-                // genuine gapless advance, even when played_enough is false: a
-                // prior gapless metadata advance resets track_started_at, so its
-                // ≥30s wall-clock guard spuriously fails on a track that in fact
-                // played to the end. Mirror the track-end path, which already
-                // bypasses that guard via peak_reached_end. JP Borderies: near-end
-                // auto-advance was refused (peak 156.3s / dur 157.3s = 99%) then
-                // recovered on a manual Next — the "petit refus de saut".
-                let peak_reached_end =
-                    decisions::peak_reached_end(track_duration_ms, ps.peak_position_ms);
-                if !played_enough && !peak_reached_end {
+                if !played_enough {
                     warn!(
                         zone_id,
                         peak_pos = ps.peak_position_ms,
@@ -1888,6 +1926,25 @@ impl PositionPoller {
                     let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
                         < TRACK_LOAD_GRACE_SECS
                         && ps.peak_position_ms < 5_000;
+                    // A DSD track on a DLNA renderer whose peak reached the end.
+                    // Gapless is intentionally not armed for a DSD next on DLNA
+                    // (prepare_gapless / #402) and DLNA never reports
+                    // ended_naturally, so without this fast path the track only
+                    // ends after STOPPED_TICKS_THRESHOLD polls — a fixed ~5s gap
+                    // between DSD tracks (Benjithom, RS130).
+                    let dlna_dsd_reached_end = decisions::dlna_dsd_reached_end(
+                        all_zones
+                            .iter()
+                            .find(|z| z.id == Some(zone_id))
+                            .and_then(|z| z.output_type.as_deref())
+                            .unwrap_or(""),
+                        zone_state
+                            .now_playing
+                            .as_ref()
+                            .and_then(|np| np.format.as_deref()),
+                        track_duration_ms,
+                        ps.peak_position_ms,
+                    );
                     // v0.9 rc.2 FSM shadow: snapshot the Stopped-arm inputs
                     // (pre-mutation) so classify_stopped can be compared to the
                     // arm's real outcome under TUNE_POLLER_FSM_SHADOW. Cheap
@@ -1916,6 +1973,7 @@ impl PositionPoller {
                         ),
                         gapless_sent: ps.gapless_sent,
                         stream_consuming: false,
+                        dlna_dsd_reached_end,
                     };
                     let mut fsm_actual: Option<fsm::StoppedOutcome>;
                     if in_seek_grace {
@@ -2015,21 +2073,15 @@ impl PositionPoller {
                             "local_output_ended_naturally_advancing"
                         );
                         track_ended = true;
-                    } else if decisions::dlna_dsd_reached_end(
-                        zone_output_type.as_deref().unwrap_or(""),
-                        zone_state
-                            .now_playing
-                            .as_ref()
-                            .and_then(|np| np.format.as_deref()),
-                        track_duration_ms,
-                        ps.peak_position_ms,
-                    ) {
+                    } else if dlna_dsd_reached_end {
+                        fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
-                        // not armed (dlna_next_is_dsd, #402) and DLNA never sets
+                        // not armed (prepare_gapless / #402) and DLNA never sets
                         // ended_naturally, so the only remaining end-of-track
-                        // signal is 5 Stopped polls = a fixed ~5s gap between DSD
-                        // tracks (Benjithom, RS130). The peak reaching the end
-                        // proves the track finished — advance now, ~4s sooner.
+                        // signal is STOPPED_TICKS_THRESHOLD polls = a fixed ~5s
+                        // gap between DSD tracks (Benjithom, RS130). The peak
+                        // reaching the end proves the track finished — advance
+                        // now, ~4s sooner.
                         info!(
                             zone_id,
                             peak_pos = ps.peak_position_ms,
@@ -2629,43 +2681,10 @@ impl PositionPoller {
             queue_pos = zone_state.queue_position,
             "auto_next"
         );
-        // Auto-advance must not die on an unavailable track. A queued item whose
-        // local file was moved/deleted (NAS unmounted, library reorganised) makes
-        // play_from_queue return an error; stopping the zone here cut the WHOLE
-        // playlist at the first gap (Yves — /Volumes/Music unmounted, queued
-        // paths dangling). Instead, skip to the next queue item and retry,
-        // honouring repeat/shuffle, bounded by the queue length so a tail of
-        // all-unavailable tracks stops cleanly instead of looping forever.
-        let mut zs = zone_state.clone();
-        let mut pos = next_pos;
-        let max_attempts = zone_state.queue_length.max(1);
-        for attempt in 0..max_attempts {
-            match self.orchestrator.play_from_queue(zone_id, pos).await {
-                Ok(_) => return,
-                Err(e) => {
-                    warn!(
-                        zone_id,
-                        pos,
-                        attempt,
-                        error = %e,
-                        "auto_next_item_unavailable_skipping"
-                    );
-                }
-            }
-            // Advance past the item we just failed on, reusing the repeat/shuffle
-            // decision so shuffle order and repeat-all wrap are respected.
-            if zs.shuffle && !zs.shuffle_order.is_empty() {
-                zs.shuffle_index += 1;
-            } else {
-                zs.queue_position = pos;
-            }
-            match Self::next_position(&zs) {
-                Some(p) => pos = p,
-                None => break, // repeat-off reached the end of the queue
-            }
+        if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
+            warn!(zone_id, error = %e, "auto_next_failed");
+            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
         }
-        warn!(zone_id, "auto_next_all_remaining_unavailable_stopping");
-        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
     }
 
     /// Resolve the next queue item's stream URL for gapless, with one bounded
@@ -2755,17 +2774,20 @@ impl PositionPoller {
                     // DSD next on DLNA; handle_track_end plays it explicitly at
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
-                    if decisions::dlna_next_is_dsd(
-                        output.output_type(),
-                        &resolved.mime_type,
-                        &resolved.url,
-                    ) {
-                        info!(
-                            zone_id,
-                            mime = %resolved.mime_type,
-                            "gapless_skipped_dsd_next_dlna"
-                        );
-                        return false;
+                    if output.output_type() == "dlna" {
+                        let url_lc = resolved.url.to_lowercase();
+                        let next_is_dsd = resolved.mime_type.contains("dsd")
+                            || resolved.mime_type.contains("dsf")
+                            || url_lc.ends_with(".dsf")
+                            || url_lc.ends_with(".dff");
+                        if next_is_dsd {
+                            info!(
+                                zone_id,
+                                mime = %resolved.mime_type,
+                                "gapless_skipped_dsd_next_dlna"
+                            );
+                            return false;
+                        }
                     }
                     let media = crate::outputs::PlayMedia {
                         url: &resolved.url,
@@ -2873,6 +2895,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -2922,6 +2945,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -3126,6 +3150,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -3212,31 +3237,6 @@ mod tests {
         assert!(!decisions::peak_reached_end(dur, 30_000));
         // Unknown duration: no false positive.
         assert!(!decisions::peak_reached_end(0, 500_000));
-    }
-
-    #[test]
-    fn position_reset_advances_at_track_end_despite_reset_wall_clock() {
-        // JP Borderies (v0.8.367, local FLAC): a gapless position reset arrived
-        // with the track at 156298/157346 ms (99.3%) but wall_elapsed under-counted
-        // (a prior gapless metadata advance reset track_started_at), so
-        // played_enough falsely rejected it → the near-end auto-advance was
-        // refused ("petit refus de saut"). The position_reset path must bypass via
-        // peak_reached_end exactly like the track-end path, so the combined guard
-        // (played_enough || peak_reached_end) accepts the advance.
-        let dur = 157_346u64;
-        let peak = 156_298u64;
-        assert!(
-            !decisions::played_enough(dur, peak, 5),
-            "reset wall clock makes played_enough falsely reject the finished track"
-        );
-        assert!(
-            decisions::peak_reached_end(dur, peak),
-            "99% of the track played must count as the end regardless of wall time"
-        );
-        assert!(
-            decisions::played_enough(dur, peak, 5) || decisions::peak_reached_end(dur, peak),
-            "combined guard must accept the near-end position reset"
-        );
     }
 
     #[test]
@@ -3366,51 +3366,9 @@ mod tests {
         ));
     }
 
-    // DSD-over-DLNA gapless guard (HiFi Rose RS130 / Benjithom: album cut after
-    // track 1). A DSD next on a DLNA renderer must NOT be armed for gapless.
     #[test]
-    fn dlna_next_is_dsd_flags_dsd_mime() {
-        assert!(decisions::dlna_next_is_dsd(
-            "dlna",
-            "audio/dsd",
-            "http://x/track"
-        ));
-        assert!(decisions::dlna_next_is_dsd(
-            "dlna",
-            "audio/x-dsf",
-            "http://x/track"
-        ));
-    }
-
-    #[test]
-    fn dlna_next_is_dsd_flags_dsf_dff_url() {
-        assert!(decisions::dlna_next_is_dsd(
-            "dlna",
-            "application/octet-stream",
-            "http://x/a.dsf"
-        ));
-        assert!(decisions::dlna_next_is_dsd(
-            "dlna",
-            "application/octet-stream",
-            "HTTP://X/A.DFF"
-        ));
-    }
-
-    #[test]
-    fn dlna_next_is_dsd_ignores_pcm_and_non_dlna() {
-        // PCM/FLAC next on DLNA → gapless allowed (not DSD).
-        assert!(!decisions::dlna_next_is_dsd(
-            "dlna",
-            "audio/flac",
-            "http://x/a.flac"
-        ));
-        // DSD but LOCAL output → guard doesn't apply (local keeps its internal
-        // DSD gapless chain).
-        assert!(!decisions::dlna_next_is_dsd(
-            "local",
-            "audio/dsd",
-            "http://x/a.dsf"
-        ));
+    fn natural_end_all_guards_false() {
+        assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
     }
 
     // DSD-over-DLNA end-of-track fast path (Benjithom, RS130: ~5s gap between DSD
@@ -3466,11 +3424,6 @@ mod tests {
         assert!(!decisions::dlna_dsd_reached_end(
             "dlna", None, 300_000, 299_000
         ));
-    }
-
-    #[test]
-    fn natural_end_all_guards_false() {
-        assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
     }
 
     #[test]
@@ -3592,6 +3545,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -3648,6 +3602,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,

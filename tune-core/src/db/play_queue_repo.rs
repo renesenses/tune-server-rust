@@ -105,7 +105,7 @@ pub mod sql {
     /// now-free positions instead of colliding. `{1}=count, {2}=zone, {3}=start`.
     pub fn shift_positions_up<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE play_queue SET position = position + {} WHERE zone_id = {} AND position >= {}",
+            "UPDATE queue_items SET position = position + {} WHERE zone_id = {} AND position >= {}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
