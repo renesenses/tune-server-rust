@@ -5084,7 +5084,11 @@ fn decode_radio_stream_to_pcm(
         );
         if let Some(g) = gap_ms {
             if g > 2000 {
-                warn!(gap_ms = g, reconnect = reconnects, "radio_reconnect_gap_long — renderer may have been starved");
+                warn!(
+                    gap_ms = g,
+                    reconnect = reconnects,
+                    "radio_reconnect_gap_long — renderer may have been starved"
+                );
             }
         }
 

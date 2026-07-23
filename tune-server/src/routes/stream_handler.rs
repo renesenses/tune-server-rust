@@ -51,7 +51,11 @@ impl RadioConsumerGuard {
 impl Drop for RadioConsumerGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let remaining = self.session.active_consumers.fetch_sub(1, Relaxed).saturating_sub(1);
+        let remaining = self
+            .session
+            .active_consumers
+            .fetch_sub(1, Relaxed)
+            .saturating_sub(1);
         if !self.completed {
             info!(
                 stream_id = %self.session.id,
