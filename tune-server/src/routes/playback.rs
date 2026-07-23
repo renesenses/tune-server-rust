@@ -218,6 +218,12 @@ struct PlayRequest {
     duration_ms: Option<i64>,
     seek_ms: Option<u64>,
     temp_file_path: Option<String>,
+    // Real resolution/codec for a media-server (source="upnp") item, passed by
+    // the client from the DIDL res@ attributes so the signal path shows the true
+    // rate/bit-depth and ALAC-vs-AAC instead of "AAC 44kHz/16bit" (Yves, NAS).
+    sample_rate: Option<u32>,
+    bit_depth: Option<u16>,
+    media_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -456,6 +462,9 @@ async fn play(
                     duration_ms: Some(np.duration_ms),
                     seek_ms: None,
                     temp_file_path: None,
+                    sample_rate: None,
+                    bit_depth: None,
+                    media_format: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -544,6 +553,9 @@ async fn play(
                             duration_ms: None,
                             seek_ms: None,
                             temp_file_path: None,
+                            sample_rate: None,
+                            bit_depth: None,
+                            media_format: None,
                         };
                         if let Ok(result) = state.orchestrator.play(orch_req).await {
                             return Json(
@@ -639,6 +651,9 @@ async fn play(
             duration_ms: Some(first.duration_ms as i64),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -723,6 +738,9 @@ async fn play(
             duration_ms: Some(first.duration_ms as i64),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -768,6 +786,9 @@ async fn play(
             duration_ms: body.duration_ms,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: body.sample_rate,
+            bit_depth: body.bit_depth,
+            media_format: body.media_format,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -855,6 +876,9 @@ async fn play(
                 duration_ms: Some(np.duration_ms),
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -944,6 +968,9 @@ async fn play(
             .or_else(|| track.as_ref().map(|t| t.duration_ms)),
         seek_ms: body.seek_ms,
         temp_file_path: body.temp_file_path,
+        sample_rate: body.sample_rate,
+        bit_depth: body.bit_depth,
+        media_format: body.media_format,
     };
 
     match state.orchestrator.play(orch_req).await {
@@ -1004,6 +1031,9 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 duration_ms: Some(np.duration_ms),
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -1106,6 +1136,9 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     duration_ms: None,
                     seek_ms: None,
                     temp_file_path: None,
+                    sample_rate: None,
+                    bit_depth: None,
+                    media_format: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -2140,6 +2173,9 @@ async fn invoke_zone_pin(
         duration_ms: None,
         seek_ms: None,
         temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -2386,6 +2422,9 @@ pub async fn shuffle_all(
         duration_ms: track.as_ref().map(|t| t.duration_ms),
         seek_ms: None,
         temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
