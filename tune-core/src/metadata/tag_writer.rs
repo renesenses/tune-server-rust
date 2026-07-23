@@ -249,6 +249,7 @@ fn tune_key_to_lofty(key: &str) -> Option<ItemKey> {
         "barcode" => Some(ItemKey::Barcode),
         "catalog_number" => Some(ItemKey::CatalogNumber),
         "media_type" => Some(ItemKey::OriginalMediaType),
+        "release_country" => Some(ItemKey::ReleaseCountry),
 
         // Dates
         "release_date" => Some(ItemKey::ReleaseDate),
@@ -258,6 +259,8 @@ fn tune_key_to_lofty(key: &str) -> Option<ItemKey> {
         "copyright" => Some(ItemKey::CopyrightMessage),
         "language" => Some(ItemKey::Language),
         "encoder" => Some(ItemKey::EncodedBy),
+        // ENCODER (Vorbis) — encoding software, distinct from `encoder`/ENCODEDBY.
+        "encoder_software" => Some(ItemKey::EncoderSoftware),
 
         // Sort order
         "sort_artist" => Some(ItemKey::TrackArtistSortOrder),
@@ -273,6 +276,7 @@ fn tune_key_to_lofty(key: &str) -> Option<ItemKey> {
         "mb_artist_id" => Some(ItemKey::MusicBrainzArtistId),
         "mb_release_artist_id" => Some(ItemKey::MusicBrainzReleaseArtistId),
         "mb_release_group_id" => Some(ItemKey::MusicBrainzReleaseGroupId),
+        "mb_release_track_id" => Some(ItemKey::MusicBrainzTrackId),
         "mb_work_id" => Some(ItemKey::MusicBrainzWorkId),
 
         // ReplayGain (read-only typically, but allow writing)
@@ -426,6 +430,8 @@ mod tests {
             "copyright",
             "language",
             "encoder",
+            "encoder_software",
+            "release_country",
             "sort_artist",
             "sort_album",
             "sort_album_artist",
@@ -435,7 +441,10 @@ mod tests {
             "mb_artist_id",
             "mb_release_artist_id",
             "mb_release_group_id",
+            "mb_release_track_id",
             "mb_work_id",
+            // Note: `source_media` (Vorbis SOURCE) is intentionally read-only —
+            // it has no lofty ItemKey and is read via raw_vorbis_field.
             "rg_track_gain",
             "rg_track_peak",
             "rg_album_gain",
