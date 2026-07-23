@@ -147,6 +147,7 @@ pub(super) async fn create_album(
         musicbrainz_release_group_id: None,
         release_date: None,
         original_date: None,
+        added_at: None,
     };
     let id = repo
         .create(&album)
