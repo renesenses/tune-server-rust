@@ -1018,6 +1018,15 @@ struct ZonePollState {
     /// When the current track started playing (wall clock).
     /// Used to reject false gapless transitions that happen too soon.
     track_started_at: Option<Instant>,
+    /// The `ZoneState::last_seek_at` instant we last folded into
+    /// `track_started_at`. A user seek moves the play position without moving
+    /// the wall clock, which starves every wall-clock guard downstream
+    /// (`played_enough`, `ended_naturally_wall_ok`): seek to the end right
+    /// after start and the real track end is rejected as a spurious
+    /// renderer signal — playback just stops instead of advancing (DEvir,
+    /// v0.9.0-rc4). On each NEW seek we rewind `track_started_at` by the seek
+    /// target so `wall_elapsed` matches "played at 1x from the start" again.
+    last_seek_seen: Option<Instant>,
     /// Tracks the `ZoneState::track_generation` we last observed.
     /// When the generation changes (new track started via `play()`),
     /// we reset all per-track state so stale values from the previous
@@ -1313,6 +1322,7 @@ impl PositionPoller {
                 scrobbled: false,
                 ticks_since_db_save: 0,
                 track_started_at: None,
+                last_seek_seen: None,
                 track_generation: zone_state.track_generation,
                 track_loaded_at: Instant::now(),
                 past_end_ticks: 0,
@@ -1684,6 +1694,23 @@ impl PositionPoller {
                 .last_seek_at
                 .map(|t| t.elapsed().as_secs() < seek_grace_secs)
                 .unwrap_or(false);
+
+            // Fold a NEW seek into the wall-clock baseline: rewind
+            // track_started_at by the seek target so wall_elapsed reads as if
+            // the track had played at 1x from position 0. Without this, a
+            // seek near the end leaves wall_elapsed at a few seconds, and the
+            // anti-spurious guards (played_enough, ended_naturally_wall_ok)
+            // veto the REAL track end — playback stops instead of advancing
+            // to the next track (DEvir, v0.9.0-rc4). Instant identity makes
+            // this once-per-seek; play() clears last_seek_at on track change.
+            if let Some(seek_at) = zone_state.last_seek_at {
+                if ps.last_seek_seen != Some(seek_at) {
+                    ps.last_seek_seen = Some(seek_at);
+                    let target = Duration::from_millis(zone_state.position_ms.max(0) as u64);
+                    ps.track_started_at =
+                        Instant::now().checked_sub(target).or(ps.track_started_at);
+                }
+            }
 
             if !in_seek_grace {
                 // Clamp the reported position to the track duration so the UI
@@ -2868,6 +2895,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -2917,6 +2945,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -3121,6 +3150,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -3515,6 +3545,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
@@ -3571,6 +3602,7 @@ mod tests {
             scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
+            last_seek_seen: None,
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
