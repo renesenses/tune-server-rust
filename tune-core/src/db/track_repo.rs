@@ -500,6 +500,10 @@ impl TrackRepo {
         label: Option<&str>,
         composer: Option<&str>,
         q: Option<&str>,
+        artist: Option<&str>,
+        country: Option<&str>,
+        mood: Option<&str>,
+        source_media: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -564,6 +568,30 @@ impl TrackRepo {
             conditions.push(format!("LOWER(t.composer) LIKE LOWER({})", make_ph(idx)));
             owned_params.push(SqlValue::Text(format!("%{}%", cmp)));
             idx += 1;
+        }
+
+        if let Some(a) = artist {
+            conditions.push(format!("t.artist_name = {}", make_ph(idx)));
+            owned_params.push(SqlValue::Text(a.to_string()));
+            idx += 1;
+        }
+
+        // Extended-tag filters via the open `track_metadata` k/v store. The key
+        // is a fixed literal; only the value is a bound parameter.
+        for (opt, key) in [
+            (country, "release_country"),
+            (mood, "mood"),
+            (source_media, "source_media"),
+        ] {
+            if let Some(v) = opt {
+                conditions.push(format!(
+                    "EXISTS (SELECT 1 FROM track_metadata tm \
+                     WHERE tm.track_id = t.id AND tm.key = '{key}' AND tm.value = {})",
+                    make_ph(idx)
+                ));
+                owned_params.push(SqlValue::Text(v.to_string()));
+                idx += 1;
+            }
         }
 
         if let Some(query) = q {

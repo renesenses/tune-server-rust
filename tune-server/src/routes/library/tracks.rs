@@ -85,6 +85,10 @@ pub(super) struct TrackFilterQuery {
     pub label: Option<String>,
     pub composer: Option<String>,
     pub q: Option<String>,
+    pub artist: Option<String>,
+    pub country: Option<String>,
+    pub mood: Option<String>,
+    pub source_media: Option<String>,
 }
 
 pub(super) async fn list_tracks(
@@ -103,7 +107,11 @@ pub(super) async fn list_tracks(
         || p.source.is_some()
         || p.label.is_some()
         || p.composer.is_some()
-        || p.q.is_some();
+        || p.q.is_some()
+        || p.artist.is_some()
+        || p.country.is_some()
+        || p.mood.is_some()
+        || p.source_media.is_some();
 
     if has_filters {
         match repo.list_filtered(
@@ -116,6 +124,10 @@ pub(super) async fn list_tracks(
             p.label.as_deref(),
             p.composer.as_deref(),
             p.q.as_deref(),
+            p.artist.as_deref(),
+            p.country.as_deref(),
+            p.mood.as_deref(),
+            p.source_media.as_deref(),
             limit,
             offset,
         ) {

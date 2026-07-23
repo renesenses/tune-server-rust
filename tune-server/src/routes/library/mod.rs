@@ -6,6 +6,7 @@ mod collections;
 mod credits;
 mod duplicates;
 mod enrich;
+mod facets;
 mod genres;
 mod ratings;
 mod search;
@@ -160,6 +161,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/batch-update", post(albums::batch_update_albums))
         .route("/albums/count", get(albums::album_count))
         .route("/albums/filters", get(albums::album_filters))
+        .route("/facets", get(facets::library_facets))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
