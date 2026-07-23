@@ -1390,6 +1390,55 @@ fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
     }
 }
 
+/// Read a raw Vorbis comment value using its exact 4-byte length prefix.
+///
+/// Every Vorbis comment is stored as `[len: u32 LE]["KEY=value"]`. Unlike
+/// [`raw_vorbis_field`] — which scans for a control-char delimiter and can
+/// over-read (then fail UTF-8) on a value sitting at the very end of the comment
+/// block, right before the audio frames — this recovers the exact value
+/// regardless of what follows. Used for keys lofty has no `ItemKey` for (e.g.
+/// `SOURCE`), which are dropped during the VorbisComments → generic-tag split.
+fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+        return None;
+    }
+    // Vorbis comments live in the file header; a bounded prefix read finds them
+    // without slurping a multi-GB hi-res FLAC into RAM.
+    const HEADER_BYTES: u64 = 1024 * 1024;
+    let mut data = Vec::new();
+    {
+        use std::io::Read;
+        std::fs::File::open(path)
+            .ok()?
+            .take(HEADER_BYTES)
+            .read_to_end(&mut data)
+            .ok()?;
+    }
+    let needle = format!("{}=", field_name.to_ascii_uppercase());
+    let nlen = needle.len();
+    if data.len() <= nlen {
+        return None;
+    }
+    for i in 4..=data.len() - nlen {
+        if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
+            continue;
+        }
+        // The 4-byte LE length prefix precedes the "KEY=value" string and covers
+        // its whole length, so the value ends at `i + len`.
+        let len = u32::from_le_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
+        if len < nlen || i + len > data.len() {
+            continue;
+        }
+        if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len]) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
@@ -1827,7 +1876,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     }
     // SOURCE (Vorbis) — source medium of the rip (CD, SACD, Vinyl…). Not in
     // lofty's VORBIS_MAP, so it never reaches the generic tag; read it raw.
-    if let Some(v) = raw_vorbis_field(path, "SOURCE") {
+    if let Some(v) = raw_vorbis_comment(path, "SOURCE") {
         meta.insert("source_media".into(), v);
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
