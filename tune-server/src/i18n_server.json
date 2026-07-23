@@ -439,6 +439,50 @@
   "ko": "인코더",
   "ro": "Codificator"
  },
+ "metafield.encoder_software": {
+  "fr": "Logiciel d'encodage",
+  "en": "Encoder software",
+  "de": "Encoder-Software",
+  "es": "Software de codificación",
+  "it": "Software di codifica",
+  "zh": "编码软件",
+  "ja": "エンコードソフトウェア",
+  "ko": "인코더 소프트웨어",
+  "ro": "Software de codare"
+ },
+ "metafield.source_media": {
+  "fr": "Support source",
+  "en": "Source medium",
+  "de": "Quellmedium",
+  "es": "Soporte de origen",
+  "it": "Supporto sorgente",
+  "zh": "源介质",
+  "ja": "ソース媒体",
+  "ko": "소스 매체",
+  "ro": "Suport sursă"
+ },
+ "metafield.mb_release_track_id": {
+  "fr": "MusicBrainz Release Track ID",
+  "en": "MusicBrainz Release Track ID",
+  "de": "MusicBrainz Release Track ID",
+  "es": "MusicBrainz Release Track ID",
+  "it": "MusicBrainz Release Track ID",
+  "zh": "MusicBrainz Release Track ID",
+  "ja": "MusicBrainz Release Track ID",
+  "ko": "MusicBrainz Release Track ID",
+  "ro": "MusicBrainz Release Track ID"
+ },
+ "metafield.release_country": {
+  "fr": "Pays de sortie",
+  "en": "Release country",
+  "de": "Veröffentlichungsland",
+  "es": "País de lanzamiento",
+  "it": "Paese di pubblicazione",
+  "zh": "发行国家/地区",
+  "ja": "リリース国",
+  "ko": "발매 국가",
+  "ro": "Țara de lansare"
+ },
  "metafield.copyright": {
   "fr": "Copyright",
   "en": "Copyright",
