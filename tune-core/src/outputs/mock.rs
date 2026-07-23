@@ -17,6 +17,7 @@ pub struct PlayCall {
 pub struct MockOutput {
     id: String,
     name: String,
+    output_type: String,
     state: Arc<Mutex<TransportState>>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -32,6 +33,7 @@ impl MockOutput {
         Self {
             id: id.into(),
             name: name.into(),
+            output_type: "mock".into(),
             state: Arc::new(Mutex::new(TransportState::Stopped)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
@@ -41,6 +43,13 @@ impl MockOutput {
             stop_calls: Arc::new(AtomicU64::new(0)),
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Override the reported `output_type` (default "mock"), so tests can model
+    /// a specific protocol (e.g. "dlna" vs "squeezebox").
+    pub fn with_type(mut self, output_type: &str) -> Self {
+        self.output_type = output_type.into();
+        self
     }
 
     pub async fn set_state(&self, state: TransportState) {
@@ -102,7 +111,7 @@ impl OutputTarget for MockOutput {
     }
 
     fn output_type(&self) -> &str {
-        "mock"
+        &self.output_type
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
