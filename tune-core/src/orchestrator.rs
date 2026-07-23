@@ -3817,15 +3817,23 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        // Multi-service scrobble dispatch with tier gating.
-        // Free tier: only the first configured service fires.
-        // Premium tier: all configured services fire simultaneously.
-        self.dispatch_scrobble(title, artist, album);
+        // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
+        // at play-start, which (a) scrobbled a track the instant it began — so
+        // skipping after a few seconds still scrobbled it, ignoring Last.fm's
+        // 50%/4-min rule — and (b) was gated by `record_history`, which the
+        // gapless/prefetch advance paths bypass (`play_without_history`), so
+        // every other track on an album was silently dropped (Bilou, #1113). The
+        // poller now dispatches the scrobble once the track has actually been
+        // listened past the threshold (see `dispatch_scrobble`).
     }
 
     /// Dispatch scrobbles to all configured services, respecting tier limits.
     /// Free = 1 service max, Premium = all simultaneously.
-    fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+    ///
+    /// Called by the poller once the current track has been played past the
+    /// Last.fm threshold (50% or 4 min), so a scrobble reflects a real listen
+    /// rather than a mere play-start (#1113).
+    pub fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let settings = SettingsRepo::with_backend(self.db.clone());
 
         let lastfm_ready = self.lastfm_keys().is_some();
@@ -3839,7 +3847,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_scrobble(title, artist);
+            self.lastfm_scrobble(title, artist, album);
         }
 
         if lb_ready {
@@ -3868,7 +3876,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_now_playing(title, artist);
+            self.lastfm_now_playing(title, artist, album);
         }
 
         if lb_ready {
@@ -3889,7 +3897,7 @@ impl PlaybackOrchestrator {
         Some((api_key, api_secret, session_key))
     }
 
-    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>) {
+    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3898,17 +3906,23 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
+        // Send the album too: Last.fm/Pano apps rely on it to fetch the cover
+        // (the web site does a looser track-level match), so scrobbles without
+        // an album showed no artwork in the apps (#1113).
+        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::scrobble(
+            if let Err(e) = crate::scrobble::scrobble_full(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
+                album.as_deref(),
+                None,
                 timestamp,
             )
             .await
@@ -3918,7 +3932,7 @@ impl PlaybackOrchestrator {
         });
     }
 
-    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>) {
+    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3927,13 +3941,16 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
+        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::update_now_playing(
+            if let Err(e) = crate::scrobble::update_now_playing_full(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
+                album.as_deref(),
+                None,
             )
             .await
             {

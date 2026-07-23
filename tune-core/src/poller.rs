@@ -936,6 +936,10 @@ struct ZonePollState {
     /// to verify that enough of the track was actually played before
     /// accepting a gapless transition.
     peak_position_ms: u64,
+    /// Whether the current track has already been scrobbled. Latched true once
+    /// the track crosses the Last.fm threshold (50% / 4 min) so it scrobbles
+    /// exactly once, and reset on a real track change (#1113).
+    scrobbled: bool,
     /// Tick counter for throttling DB position saves.
     ticks_since_db_save: u64,
     /// When the current track started playing (wall clock).
@@ -1233,6 +1237,7 @@ impl PositionPoller {
                 gapless_sent_at: None,
                 last_position_ms: 0,
                 peak_position_ms: 0,
+                scrobbled: false,
                 ticks_since_db_save: 0,
                 track_started_at: None,
                 track_generation: zone_state.track_generation,
@@ -1279,6 +1284,7 @@ impl PositionPoller {
                     );
                     ps.last_position_ms = 0;
                     ps.peak_position_ms = 0;
+                    ps.scrobbled = false;
                     ps.last_bytes_sent = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
@@ -1292,6 +1298,29 @@ impl PositionPoller {
                 ps.past_end_ticks = 0;
                 ps.gapless_advance_pending = false;
                 ps.gapless_stuck_ticks = 0;
+            }
+
+            // Scrobble the current track once it has genuinely been listened past
+            // the Last.fm threshold (50% or 4 min). Driven from a single place
+            // that sees every track regardless of how it was reached (direct
+            // play, gapless, prefetch) and uses the live position — unlike the old
+            // play-start dispatch that scrobbled instantly on a skip and dropped
+            // every prefetched track (Bilou, #1113). Radio and sub-30s / unknown
+            // tracks are excluded by `should_scrobble`.
+            if !ps.scrobbled
+                && zone_state.state == PlayState::Playing
+                && let Some(np) = zone_state.now_playing.as_ref()
+                && np.source != "radio"
+            {
+                let dur = (np.duration_ms > 0).then_some(np.duration_ms);
+                if crate::scrobble::should_scrobble(dur, zone_state.position_ms) {
+                    self.orchestrator.dispatch_scrobble(
+                        &np.title,
+                        np.artist_name.as_deref(),
+                        np.album_title.as_deref(),
+                    );
+                    ps.scrobbled = true;
+                }
             }
 
             if ps.backoff_remaining > 0 {
@@ -1747,6 +1776,13 @@ impl PositionPoller {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
                         ps.gapless_cooldown = 4;
+                        // A gapless advance updates now-playing WITHOUT bumping
+                        // track_generation, so the generation-based reset above
+                        // never fires for it — leaving the scrobble latch stuck
+                        // `true`, so every 2nd track of an album (the gapless-
+                        // reached ones) was never scrobbled (#1113). Reset it here
+                        // where the track actually advances.
+                        ps.scrobbled = false;
                     }
                 }
             }
@@ -2101,6 +2137,9 @@ impl PositionPoller {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
                             ps.gapless_cooldown = 4;
+                            // Reset the once-per-track scrobble latch on advance
+                            // (gapless doesn't bump track_generation) — #1113.
+                            ps.scrobbled = false;
                         }
                     }
                     if ps.track_started_at.is_none() {
@@ -2165,6 +2204,9 @@ impl PositionPoller {
                             // gapless transition, which would otherwise send a
                             // redundant Stop+Play and cause an audible restart.
                             ps.gapless_cooldown = 4;
+                            // Reset the once-per-track scrobble latch on advance
+                            // (gapless doesn't bump track_generation) — #1113.
+                            ps.scrobbled = false;
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
@@ -2710,6 +2752,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
+            scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
@@ -2758,6 +2801,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
+            scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
@@ -2961,6 +3005,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
+            scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
@@ -3299,6 +3344,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
+            scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
@@ -3354,6 +3400,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
+            scrobbled: false,
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
