@@ -177,6 +177,55 @@ async fn main() {
             .init();
     }
 
+    // Bind the HTTP listener BEFORE opening the database. If another
+    // tune-server instance is already running (old LaunchAgent, manual
+    // install, update race — Jean-Marie/FRIDER #1158), the previous order
+    // opened + migrated the shared DB to the new schema, then died on the
+    // bind failure — leaving the old binary serving a database it no longer
+    // understood (tags "lost", albums split, Next broken). Failing fast on
+    // the port keeps the DB untouched. Connections arriving before the
+    // router is up simply queue in the backlog.
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let listener = {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("failed to create socket");
+        socket.set_reuse_address(true).ok();
+        for attempt in 1..=10u32 {
+            match socket.bind(&addr.into()) {
+                Ok(()) => break,
+                Err(e) if attempt < 10 => {
+                    tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                Err(e) => {
+                    // Another tune-server is already listening on this port
+                    // (e.g. an old instance that wasn't stopped before an
+                    // update/restart — Elie). Exit cleanly with an actionable
+                    // message instead of panicking, which dumped core and
+                    // spammed the journal on every restart of the crash loop.
+                    tracing::error!(
+                        %addr,
+                        error = %e,
+                        "failed to bind after 10 attempts — another tune-server \
+                         instance is probably already bound to this port. Stop \
+                         it before starting a new one \
+                         (e.g. `systemctl stop tune-server` or `pkill -f tune-server`)."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        socket.listen(128).expect("failed to listen");
+        socket
+            .set_nonblocking(true)
+            .expect("failed to set nonblocking");
+        tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
+    };
+
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
 
@@ -260,47 +309,8 @@ async fn main() {
 
     let app = routes::router(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .expect("failed to create socket");
-        socket.set_reuse_address(true).ok();
-        for attempt in 1..=10u32 {
-            match socket.bind(&addr.into()) {
-                Ok(()) => break,
-                Err(e) if attempt < 10 => {
-                    tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-                Err(e) => {
-                    // Another tune-server is already listening on this port
-                    // (e.g. an old instance that wasn't stopped before an
-                    // update/restart — Elie). Exit cleanly with an actionable
-                    // message instead of panicking, which dumped core and
-                    // spammed the journal on every restart of the crash loop.
-                    tracing::error!(
-                        %addr,
-                        error = %e,
-                        "failed to bind after 10 attempts — another tune-server \
-                         instance is probably already bound to this port. Stop \
-                         it before starting a new one \
-                         (e.g. `systemctl stop tune-server` or `pkill -f tune-server`)."
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-        socket.listen(128).expect("failed to listen");
-        socket
-            .set_nonblocking(true)
-            .expect("failed to set nonblocking");
-        tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
-    };
-
+    // Listener was bound before the DB was opened (see above) — the socket's
+    // backlog has been queueing connections since then.
     info!(%addr, "listening");
 
     // Auto-resume local zones now that the listener is bound. Wait until the
