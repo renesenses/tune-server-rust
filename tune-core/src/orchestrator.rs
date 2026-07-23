@@ -127,6 +127,13 @@ pub struct PlayRequest {
     pub duration_ms: Option<i64>,
     pub seek_ms: Option<u64>,
     pub temp_file_path: Option<String>,
+    /// Real resolution/codec for a media-server (`source="upnp"`) URL, taken from
+    /// the DIDL res@ attributes (the same the DartZeel reads). Lets the signal
+    /// path show the true rate/bit-depth and infer ALAC-vs-AAC instead of
+    /// defaulting to "AAC 44kHz/16bit — Avec perte" (Yves, NAS ALAC).
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u16>,
+    pub media_format: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +485,12 @@ impl PlaybackOrchestrator {
                     "qobuz" => Some("flac".to_string()),
                     _ => None,
                 })
+                // A media-server (UPnP/NAS) item has no local track row, so the
+                // codec the client read from the DIDL res@protocolInfo is the only
+                // authoritative source: audio/mp4 is ambiguous ALAC-vs-AAC, so
+                // surface "alac" here instead of falling back to the "mp4" MIME
+                // and mislabeling a lossless ALAC as lossy AAC (Yves, NAS).
+                .or_else(|| req.media_format.clone())
                 .or_else(|| {
                     let mime = &resolved.mime_type;
                     Some(
@@ -1122,12 +1135,16 @@ impl PlaybackOrchestrator {
                     (direct_url, None, mime_type.to_string(), None, None, None)
                 }
             } else {
+                // Media-server / podcast direct URL. Carry the real resolution the
+                // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
+                // instead of letting the signal path default to 44.1kHz/16bit and
+                // mislabel a hi-res ALAC as lossy AAC (Yves, NAS).
                 (
                     audio_url.to_string(),
                     None,
                     mime_type.to_string(),
-                    None,
-                    None,
+                    req.sample_rate,
+                    req.bit_depth.map(|b| b as u32),
                     None,
                 )
             };
@@ -4282,6 +4299,9 @@ impl PlaybackOrchestrator {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: None,
                         temp_file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        media_format: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -4382,6 +4402,9 @@ impl PlaybackOrchestrator {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: Some(position_ms),
                         temp_file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        media_format: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -4526,6 +4549,9 @@ impl PlaybackOrchestrator {
                 duration_ms: item.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             // Set the queue index before play() emits "started" so the event
             // carries the correct queue_position (#1096).
@@ -4603,6 +4629,9 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
 
         let result = self.play(req).await?;
@@ -4741,6 +4770,9 @@ impl PlaybackOrchestrator {
                 duration_ms: item.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -4807,6 +4839,9 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -5508,6 +5543,9 @@ mod tests {
             duration_ms: None,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -5537,6 +5575,9 @@ mod tests {
             duration_ms: None,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -5561,6 +5602,9 @@ mod tests {
             duration_ms: Some(3600000),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(

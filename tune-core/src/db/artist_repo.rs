@@ -120,6 +120,10 @@ pub mod sql {
         "SELECT id, name FROM artists WHERE (image_path IS NULL OR image_path = '') AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
 
+    pub fn list_with_image_no_mbid() -> &'static str {
+        "SELECT id, name, image_path FROM artists WHERE image_path IS NOT NULL AND image_path != '' AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
+    }
+
     pub fn list_without_bio() -> &'static str {
         "SELECT id, name, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
@@ -486,6 +490,24 @@ impl ArtistRepo {
                 (
                     cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                     cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Return artists that HAVE an image_path but NO MBID.
+    /// Each entry is (artist_id, name, image_path). Used to re-queue untagged
+    /// artists whose stored image is a remote URL / missing cache file so
+    /// enrichment can localize a real picture.
+    pub fn list_with_image_no_mbid(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_image_no_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
                 )
             })
             .collect())
