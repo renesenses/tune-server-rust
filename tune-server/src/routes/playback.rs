@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use tune_core::db::play_queue_repo::PlayQueueRepo;
+use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
@@ -471,12 +471,7 @@ async fn play(
                         // Restore queue_length from DB so the poller can
                         // advance tracks (fixes repeat-all after restart).
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                        let local_c = qr.count(zone_id).unwrap_or(0);
-                        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                        // Combined length: a zone can hold a local queue AND a
-                        // streaming queue at once. Sum them so queue-end detection
-                        // doesn't drop the streaming tail → silence (Sandro S1b).
-                        let q_len = local_c + stream_c;
+                        let q_len = qr.count_all(zone_id).unwrap_or(0);
                         if q_len > 0 {
                             let cur_pos = state.playback.get_state(zone_id).await.queue_position;
                             state
@@ -492,12 +487,7 @@ async fn play(
                         tracing::warn!(zone_id, error = %e, "play_resume_failed_trying_queue");
                         // Fallback: try to play from queue position 0
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                        let local_c = qr.count(zone_id).unwrap_or(0);
-                        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                        // Combined length: a zone can hold a local queue AND a
-                        // streaming queue at once. Sum them so queue-end detection
-                        // doesn't drop the streaming tail → silence (Sandro S1b).
-                        let q_len = local_c + stream_c;
+                        let q_len = qr.count_all(zone_id).unwrap_or(0);
                         if q_len > 0 {
                             let pos = current.queue_position.min(q_len - 1);
                             state.playback.update_queue_info(zone_id, pos, q_len).await;
@@ -517,12 +507,7 @@ async fn play(
             // No now_playing — try queue fallback
             {
                 let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                let local_c = qr.count(zone_id).unwrap_or(0);
-                let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                // Combined length: a zone can hold a local queue AND a
-                // streaming queue at once. Sum them so queue-end detection
-                // doesn't drop the streaming tail → silence (Sandro S1b).
-                let q_len = local_c + stream_c;
+                let q_len = qr.count_all(zone_id).unwrap_or(0);
                 if q_len > 0 {
                     let current = state.playback.get_state(zone_id).await;
                     let pos = current.queue_position.min(q_len - 1);
@@ -799,30 +784,35 @@ async fn play(
                 // single-track queue would truncate the album down to the current
                 // title (Pierre M: "Si STOP et relance, la file d'attente se
                 // limite au titre en cours").
-                let existing = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-                let existing_idx = existing.iter().position(|it| {
-                    it["source_id"].as_str() == Some(source_id_val.as_str())
+                let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
+                let existing = entries.iter().find(|e| {
+                    e.source_id.as_deref() == Some(source_id_val.as_str())
                         && (source_for_q.is_none()
-                            || it["source"].as_str() == source_for_q.as_deref())
+                            || e.source.as_deref() == source_for_q.as_deref())
                 });
-                if let Some(idx) = existing_idx {
+                if let Some(e) = existing {
+                    // Keep the full queue, just move the current position onto it
+                    // (its unified position, valid whether the queue is mixed).
                     state
                         .playback
-                        .update_queue_info(zone_id, idx as i64, existing.len() as i64)
+                        .update_queue_info(zone_id, e.position, entries.len() as i64)
                         .await;
                 } else {
-                    // Persist single streaming track to DB so GET /queue returns it
-                    let queue_item = vec![(
-                        source_id_val,
-                        title_val,
-                        artist_val,
-                        album_val,
-                        cover_val,
-                        duration_val,
-                        source_for_q,
-                    )];
-                    if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_item) {
-                        warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                    // Not queued yet — make this single streaming track the queue.
+                    queue_repo.clear(zone_id).ok();
+                    if let Err(e) = queue_repo.append(
+                        zone_id,
+                        &[QueueInput::Streaming {
+                            source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                            source_id: source_id_val,
+                            title: title_val,
+                            artist: artist_val,
+                            album: album_val,
+                            cover_url: cover_val,
+                            duration_ms: duration_val,
+                        }],
+                    ) {
+                        warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
                     }
                     state.playback.update_queue_info(zone_id, 0, 1).await;
                 }
@@ -891,12 +881,7 @@ async fn play(
         }
         // No now_playing — try queue fallback (same as empty-body path)
         let qr_fallback = PlayQueueRepo::with_backend(state.backend.clone());
-        let local_c = qr_fallback.count(zone_id).unwrap_or(0);
-        let stream_c = qr_fallback.count_streaming(zone_id).unwrap_or(0);
-        // Combined length: a zone can hold a local queue AND a
-        // streaming queue at once. Sum them so queue-end detection
-        // doesn't drop the streaming tail → silence (Sandro S1b).
-        let q_len = local_c + stream_c;
+        let q_len = qr_fallback.count_all(zone_id).unwrap_or(0);
         if q_len > 0 {
             let current = state.playback.get_state(zone_id).await;
             let pos = current.queue_position.min(q_len - 1);
@@ -976,12 +961,7 @@ async fn play(
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
             let qr = PlayQueueRepo::with_backend(state.backend.clone());
-            let local_c = qr.count(zone_id).unwrap_or(0);
-            let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-            // Combined length: a zone can hold a local queue AND a
-            // streaming queue at once. Sum them so queue-end detection
-            // doesn't drop the streaming tail → silence (Sandro S1b).
-            let q_len = local_c + stream_c;
+            let q_len = qr.count_all(zone_id).unwrap_or(0);
             let q_len = if q_len > 0 {
                 q_len
             } else {
@@ -1040,12 +1020,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     // Restore queue_length from DB so the poller can
                     // advance tracks (fixes repeat-all after restart).
                     let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                    let local_c = qr.count(zone_id).unwrap_or(0);
-                    let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                    // Combined length: a zone can hold a local queue AND a
-                    // streaming queue at once. Sum them so queue-end detection
-                    // doesn't drop the streaming tail → silence (Sandro S1b).
-                    let q_len = local_c + stream_c;
+                    let q_len = qr.count_all(zone_id).unwrap_or(0);
                     if q_len > 0 {
                         let cur_pos = state.playback.get_state(zone_id).await.queue_position;
                         state
@@ -1161,12 +1136,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
     // populated — it may be zero after a server restart.
     {
         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-        let local_c = qr.count(zone_id).unwrap_or(0);
-        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-        // Combined length: a zone can hold a local queue AND a
-        // streaming queue at once. Sum them so queue-end detection
-        // doesn't drop the streaming tail → silence (Sandro S1b).
-        let q_len = local_c + stream_c;
+        let q_len = qr.count_all(zone_id).unwrap_or(0);
         if q_len > 0 {
             let cur_pos = state.playback.get_state(zone_id).await.queue_position;
             state
@@ -1297,39 +1267,21 @@ async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> J
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let ps = state.playback.get_state(zone_id).await;
 
-    // A zone can hold BOTH a local play_queue and a streaming_queue at once
-    // (a Qobuz track added while a local file plays). Return ONE combined list —
-    // local first (positions 0..L), then streaming (L..L+S) — matching the
-    // combined position space the poller and orchestrator advance through.
-    // The old either/or logic hid the streaming rows when a local queue was
-    // present (Progman: an added Qobuz track was invisible and never played).
-    // Playing a streaming album normally clears the local table via
-    // set_streaming_queue, so usually exactly one is populated; merging is safe
-    // and only surfaces genuine mixed queues.
-    let local = queue_repo.get_queue(zone_id).unwrap_or_default();
-    let local_count = local.len();
-    let streaming = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-
-    let mut tracks: Vec<Value> = Vec::with_capacity(local_count + streaming.len());
-    for it in &local {
-        tracks.push(serde_json::to_value(it).unwrap_or(Value::Null));
-    }
-    for (i, it) in streaming.iter().enumerate() {
-        let mut v = it.clone();
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("position".into(), json!(local_count + i));
-        }
-        tracks.push(v);
-    }
-
-    // Position: the current local item if one is marked current, otherwise the
-    // playback state's combined queue position (a streaming item is current).
-    let position = local
+    // One ordered list across the unified single position space (local +
+    // streaming). `get_ordered` reads the whole `queue_items` table for the zone
+    // in `position` order, COALESCE-ing the display fields from the tracks join
+    // (local) or the inline columns (streaming).
+    let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
+    let position = entries
         .iter()
-        .position(|i| i.is_current)
+        .position(|e| e.is_current)
         .map(|p| p as i64)
         .unwrap_or(ps.queue_position);
-    let length = tracks.len();
+    let length = entries.len();
+    let tracks: Vec<Value> = entries
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+        .collect();
     Json(json!({ "tracks": tracks, "position": position, "length": length }))
 }
 
@@ -1340,9 +1292,15 @@ async fn queue_add(
 ) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
-    // --- Streaming track: add to streaming queue ---
+    // Build a single, source-agnostic list of items, then insert them at
+    // `body.position` (the client sends current+1 for "Play Next") in the
+    // unified queue. `insert_at` shifts existing rows to open the gap, so a
+    // streaming track added "next" while a local album plays now lands right
+    // after the current track instead of at the end of the album (Sandro S1).
+    let mut inputs: Vec<QueueInput> = Vec::new();
+
+    // Single streaming track.
     if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
-        // Resolve metadata if not provided by the client
         let (title, artist, album, cover, duration) = if body.title.is_some() {
             (
                 body.title.clone().unwrap_or_default(),
@@ -1352,7 +1310,6 @@ async fn queue_add(
                 body.duration_ms.unwrap_or(0),
             )
         } else {
-            // Fetch track metadata from the streaming service
             let registry = state.services.lock().await;
             if let Some(svc) = registry.get(source) {
                 let svc = svc.lock().await;
@@ -1370,135 +1327,94 @@ async fn queue_add(
                 ("Unknown".into(), String::new(), None, None, 0)
             }
         };
-
-        let queue_item = vec![(
-            source_id.clone(),
+        inputs.push(QueueInput::Streaming {
+            source: source.clone(),
+            source_id: source_id.clone(),
             title,
             artist,
             album,
-            cover,
-            duration,
-            Some(source.clone()),
-        )];
-        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_item) {
-            warn!(zone_id, error = %e, "append_streaming_queue_failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let total = local_count + streaming_count;
-        let current_pos = state.playback.get_state(zone_id).await.queue_position;
-        state
-            .playback
-            .update_queue_info(zone_id, current_pos, total)
-            .await;
-        persist_queue_async(&state, zone_id);
-        let total = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        return (
-            StatusCode::CREATED,
-            Json(json!({ "added": 1, "queue_length": total })),
-        )
-            .into_response();
+            cover_url: cover,
+            duration_ms: duration,
+        });
     }
 
-    // --- Batch streaming tracks: [{source, source_id, ...}] ---
-    if !body.tracks.is_empty() {
-        let mut queue_items = Vec::with_capacity(body.tracks.len());
-        for item in &body.tracks {
-            let (title, artist, album, cover, duration) = if item.title.is_some() {
-                (
-                    item.title.clone().unwrap_or_default(),
-                    item.artist_name.clone().unwrap_or_default(),
-                    item.album_title.clone(),
-                    item.cover_path.clone(),
-                    item.duration_ms.unwrap_or(0),
-                )
-            } else {
-                let registry = state.services.lock().await;
-                if let Some(svc) = registry.get(&item.source) {
-                    let svc = svc.lock().await;
-                    match svc.get_track(&item.source_id).await {
-                        Ok(t) => (
-                            t.title,
-                            t.artist,
-                            t.album,
-                            t.cover_path,
-                            t.duration_ms as i64,
-                        ),
-                        Err(_) => ("Unknown".into(), String::new(), None, None, 0),
-                    }
-                } else {
-                    ("Unknown".into(), String::new(), None, None, 0)
+    // Batch streaming tracks: [{source, source_id, ...}]
+    for item in &body.tracks {
+        let (title, artist, album, cover, duration) = if item.title.is_some() {
+            (
+                item.title.clone().unwrap_or_default(),
+                item.artist_name.clone().unwrap_or_default(),
+                item.album_title.clone(),
+                item.cover_path.clone(),
+                item.duration_ms.unwrap_or(0),
+            )
+        } else {
+            let registry = state.services.lock().await;
+            if let Some(svc) = registry.get(&item.source) {
+                let svc = svc.lock().await;
+                match svc.get_track(&item.source_id).await {
+                    Ok(t) => (
+                        t.title,
+                        t.artist,
+                        t.album,
+                        t.cover_path,
+                        t.duration_ms as i64,
+                    ),
+                    Err(_) => ("Unknown".into(), String::new(), None, None, 0),
                 }
-            };
-            queue_items.push((
-                item.source_id.clone(),
-                title,
-                artist,
-                album,
-                cover,
-                duration,
-                Some(item.source.clone()),
-            ));
-        }
-        let count = queue_items.len();
-        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_items) {
-            warn!(zone_id, error = %e, "batch_append_streaming_queue_failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let total = local_count + streaming_count;
-        let current_pos = state.playback.get_state(zone_id).await.queue_position;
-        state
-            .playback
-            .update_queue_info(zone_id, current_pos, total)
-            .await;
-        persist_queue_async(&state, zone_id);
-        state.event_bus.emit(
-            "playback.queue.track_added",
-            json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
-        );
-        return (
-            StatusCode::CREATED,
-            Json(json!({ "added": count, "queue_length": total })),
-        )
-            .into_response();
+            } else {
+                ("Unknown".into(), String::new(), None, None, 0)
+            }
+        };
+        inputs.push(QueueInput::Streaming {
+            source: item.source.clone(),
+            source_id: item.source_id.clone(),
+            title,
+            artist,
+            album,
+            cover_url: cover,
+            duration_ms: duration,
+        });
     }
 
-    // --- Local tracks ---
-    let mut ids = body.track_ids;
+    // Local tracks.
+    let mut local_ids = body.track_ids.clone();
     if let Some(single) = body.track_id {
-        ids.push(single);
+        local_ids.push(single);
     }
-    if ids.is_empty() {
+    for id in &local_ids {
+        inputs.push(QueueInput::Local { track_id: *id });
+    }
+
+    if inputs.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             "track_ids, track_id, source+source_id, or tracks[] required".to_string(),
         )
             .into_response();
     }
-    match queue_repo.add_tracks(zone_id, &ids, body.position) {
-        Ok(_) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0);
-            let current_pos = state.playback.get_state(zone_id).await.queue_position;
-            state
-                .playback
-                .update_queue_info(zone_id, current_pos, new_length)
-                .await;
-            persist_queue_async(&state, zone_id);
-            state.event_bus.emit(
-                "playback.queue.track_added",
-                json!({ "zone_id": zone_id, "added": ids.len(), "queue_length": new_length }),
-            );
-            (
-                StatusCode::CREATED,
-                Json(json!({ "added": ids.len(), "queue_length": new_length })),
-            )
-                .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+
+    let count = inputs.len();
+    if let Err(e) = queue_repo.insert_at(zone_id, &inputs, body.position) {
+        warn!(zone_id, error = %e, "queue_insert_failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    let total = queue_repo.count_all(zone_id).unwrap_or(0);
+    let current_pos = state.playback.get_state(zone_id).await.queue_position;
+    state
+        .playback
+        .update_queue_info(zone_id, current_pos, total)
+        .await;
+    persist_queue_async(&state, zone_id);
+    state.event_bus.emit(
+        "playback.queue.track_added",
+        json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
+    );
+    (
+        StatusCode::CREATED,
+        Json(json!({ "added": count, "queue_length": total })),
+    )
+        .into_response()
 }
 
 async fn queue_move(
@@ -1509,24 +1425,23 @@ async fn queue_move(
     // Queue order changed — invalidate prefetched track
     state.orchestrator.clear_prefetch().await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
-    let mut items = queue_repo.get_queue(zone_id).unwrap_or_default();
-    let from = body.from_position as usize;
-    let to = body.to_position as usize;
-
-    if from < items.len() && to < items.len() {
-        let item = items.remove(from);
-        items.insert(to, item);
-        let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
-        queue_repo.set_queue(zone_id, &track_ids).ok();
-        persist_queue_async(&state, zone_id);
-        state.event_bus.emit(
-            "playback.queue.moved",
-            json!({ "zone_id": zone_id, "from": from, "to": to }),
-        );
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, "position out of range").into_response()
+    let total = queue_repo.count_all(zone_id).unwrap_or(0);
+    let from = body.from_position;
+    let to = body.to_position;
+    if from < 0 || to < 0 || from >= total || to >= total {
+        return (StatusCode::BAD_REQUEST, "position out of range").into_response();
     }
+    // Unified move: reorders across the whole queue (local + streaming), which
+    // the old local-only path could not do.
+    if let Err(e) = queue_repo.move_pos(zone_id, from, to) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    persist_queue_async(&state, zone_id);
+    state.event_bus.emit(
+        "playback.queue.moved",
+        json!({ "zone_id": zone_id, "from": from, "to": to }),
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn queue_jump(
@@ -1573,37 +1488,10 @@ async fn queue_remove(
     state.orchestrator.clear_prefetch().await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
-    // Try the local play_queue first.
-    match queue_repo.remove_at(zone_id, position) {
+    // One position space: remove the row at `position` regardless of source.
+    match queue_repo.remove_pos(zone_id, position) {
         Ok(true) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0)
-                + queue_repo.count_streaming(zone_id).unwrap_or(0);
-            let current_pos = state.playback.get_state(zone_id).await.queue_position;
-            let adjusted_pos = if position < current_pos {
-                current_pos - 1
-            } else {
-                current_pos
-            };
-            state
-                .playback
-                .update_queue_info(zone_id, adjusted_pos, new_length)
-                .await;
-            persist_queue_async(&state, zone_id);
-            state.event_bus.emit(
-                "playback.queue.track_removed",
-                json!({ "zone_id": zone_id, "position": position }),
-            );
-            return Json(json!({ "queue_length": new_length })).into_response();
-        }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        Ok(false) => { /* fall through to streaming_queue */ }
-    }
-
-    // Fall back to the streaming_queue (Tidal, Qobuz, Deezer, etc.).
-    match queue_repo.remove_streaming_at(zone_id, position) {
-        Ok(true) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0)
-                + queue_repo.count_streaming(zone_id).unwrap_or(0);
+            let new_length = queue_repo.count_all(zone_id).unwrap_or(0);
             let current_pos = state.playback.get_state(zone_id).await.queue_position;
             let adjusted_pos = if position < current_pos {
                 current_pos - 1

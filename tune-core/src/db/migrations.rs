@@ -8,6 +8,19 @@ struct Migration {
     up: &'static str,
 }
 
+/// v0.9 — collapse the two per-source position spaces into ONE contiguous space
+/// per zone. After the unified copy (v52), local rows sit at 0..L-1 and
+/// streaming rows at 0..S-1 (overlapping); shift streaming rows up by the zone's
+/// local count so the whole queue is one ordered sequence 0..L+S-1, which the
+/// unified repo/orchestrator expect. Runs exactly once via version tracking, so
+/// it can't double-shift an already-unified queue.
+const RENUMBER_QUEUE_POSITIONS_SQL: &str = "UPDATE queue_items \
+    SET position = position + ( \
+        SELECT COUNT(*) FROM queue_items q2 \
+        WHERE q2.zone_id = queue_items.zone_id AND q2.track_id IS NOT NULL \
+    ) \
+    WHERE track_id IS NULL;";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -626,7 +639,29 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
 ",
     },
     Migration {
+        // v0.9 — unified queue (kept at 52; existing release/v0.9 DBs already
+        // applied it here). The actual work is done idempotently by
+        // migrate_to_unified_queue() in init_schema, so the marker is a no-op.
         version: 52,
+        name: "unified_queue_items",
+        up: "",
+    },
+    Migration {
+        // v0.9 — one contiguous position space per zone (streaming rows move
+        // from 0..S-1 to L..L+S-1). Runs after init_schema's unified copy.
+        version: 53,
+        name: "unify_queue_positions",
+        up: RENUMBER_QUEUE_POSITIONS_SQL,
+    },
+    Migration {
+        version: 54,
+        name: "bio_provenance",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
+    // Brought over from main in the main→release/v0.9 merge (numbered 55/56 so
+    // they run on existing release/v0.9 DBs, whose highest applied version is 54).
+    Migration {
+        version: 55,
         name: "add_streaming_auth",
         up: "
 CREATE TABLE IF NOT EXISTS streaming_auth (
@@ -635,15 +670,10 @@ CREATE TABLE IF NOT EXISTS streaming_auth (
 );
 ",
     },
-    // Create streaming_queue eagerly. It used to be created lazily on first
-    // write in play_queue_repo, so on a FRESH database any code that READS it
-    // before the first write — the startup orphan cleanup (startup.rs) and the
-    // Deezer/streaming connect path — hit \"no such table: streaming_queue\"
-    // (forum: Yan Tasset, Bilou; Dominique's log). Schema mirrors
-    // play_queue_repo::sql::CREATE_STREAMING_QUEUE_SQLITE; IF NOT EXISTS makes
-    // it a no-op on DBs where the table already exists.
+    // streaming_queue is also created unconditionally in init_schema (the
+    // idempotent guarantee); this numbered marker mirrors main. IF NOT EXISTS.
     Migration {
-        version: 53,
+        version: 56,
         name: "create_streaming_queue_table",
         up: "
 CREATE TABLE IF NOT EXISTS streaming_queue (
@@ -661,12 +691,10 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
 ",
     },
     Migration {
-        version: 54,
-        name: "bio_provenance",
-        up: "", // Applied programmatically via add_column_if_missing
-    },
-    Migration {
-        version: 55,
+        // Renumbered from 55 (its value on the main line): on release/v0.9,
+        // 55/56 are already taken by the streaming migrations that the
+        // main→v0.9 merge renumbered, so this lands at 57.
+        version: 57,
         name: "add_profile_id_to_playlists",
         up: "", // Applied programmatically via add_column_if_missing (existing rows → profile 1)
     },
@@ -676,7 +704,9 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
     // the local/streaming_queue split. Metadata (title/artist/album/cover) is
     // stored so the favorites list needs no per-item hydration for streaming.
     Migration {
-        version: 56,
+        // Renumbered from 56 (its value on main): on release/v0.9, 56 is already
+        // taken by create_streaming_queue_table (main→v0.9 merge), so this is 58.
+        version: 58,
         name: "add_streaming_favorites",
         up: "
 CREATE TABLE IF NOT EXISTS streaming_favorites (
@@ -696,6 +726,63 @@ CREATE INDEX IF NOT EXISTS idx_streaming_favorites_profile ON streaming_favorite
 ",
     },
 ];
+
+/// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
+/// tables into the unified `queue_items` table. Idempotent: copies only when
+/// `queue_items` is empty, so re-runs never duplicate. Tolerant of a missing
+/// `streaming_queue` table (it is lazily created by the repo). Created without
+/// FK constraints so orphaned rows migrate cleanly; the fresh CORE_SCHEMA
+/// version carries the FKs.
+fn migrate_to_unified_queue(db: &SqliteDb) {
+    let conn = db.connection().lock().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queue_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zone_id INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            is_current INTEGER DEFAULT 0,
+            track_id INTEGER,
+            source TEXT,
+            source_id TEXT,
+            title TEXT,
+            artist TEXT,
+            album TEXT,
+            cover_url TEXT,
+            duration_ms INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_items_zone_id ON queue_items(zone_id);",
+    )
+    .ok();
+
+    // Only copy once — when the unified table has no rows yet.
+    let already: i64 = conn
+        .query_row("SELECT COUNT(*) FROM queue_items", [], |r| r.get(0))
+        .unwrap_or(0);
+    if already > 0 {
+        return;
+    }
+
+    // Local rows: keep track_id, tag source='local'. Display fields stay NULL
+    // (joined from tracks at read time, as before).
+    conn.execute_batch(
+        "INSERT INTO queue_items (zone_id, position, is_current, track_id, source, duration_ms)
+         SELECT zone_id, position, is_current, track_id, 'local', 0 FROM play_queue;",
+    )
+    .ok();
+
+    // Streaming rows: inline metadata. Tolerant if streaming_queue is absent.
+    conn.execute_batch(
+        "INSERT INTO queue_items (zone_id, position, is_current, source, source_id, title, artist, album, cover_url, duration_ms)
+         SELECT zone_id, position, 0, source, source_id, title, artist, album, cover_url, duration_ms FROM streaming_queue;",
+    )
+    .ok();
+
+    // Data is now in queue_items — drop the legacy split tables. This runs only
+    // on the one-time copy pass (the early return above skips it afterwards),
+    // so the drop always immediately follows a successful copy.
+    conn.execute_batch("DROP TABLE IF EXISTS play_queue; DROP TABLE IF EXISTS streaming_queue;")
+        .ok();
+}
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
     let conn = db.connection().lock().unwrap();
@@ -1016,8 +1103,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 add_column_if_missing(db, table, "bio_fetched_at", "TEXT");
             }
         }
-        if migration.version == 55 {
+        if migration.version == 57 {
             // Scope playlists per profile. Existing rows default to profile 1 (Default).
+            // (Version 57 on the v0.9 line; 55 on main — see the migration entry.)
             add_column_if_missing(db, "playlists", "profile_id", "INTEGER NOT NULL DEFAULT 1");
         }
 
@@ -1099,13 +1187,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
-    // streaming_queue is created by migration v53, but that only runs when a DB
-    // upgrades THROUGH v53 — and on Windows a migration can fail silently (file
-    // locking) or the tracking row can be written without the CREATE taking.
-    // Re-create it unconditionally here (IF NOT EXISTS = no-op otherwise) so the
-    // Deezer/streaming connect path never hits "no such table: streaming_queue"
-    // again (forum #951: Bilou/Yan still saw it in v0.8.287+ despite the v53
-    // fix). Schema mirrors migration v53 / play_queue_repo.
+    // Ensure streaming_queue exists BEFORE the unified-queue copy reads it. It
+    // used to be created lazily on first write, so on a fresh DB the unified
+    // migration and the Deezer/streaming connect path could hit "no such table:
+    // streaming_queue" (forum #951: Bilou/Yan, still seen in v0.8.287+ on Windows
+    // where a numbered migration can fail silently). IF NOT EXISTS = no-op
+    // otherwise. Runs every startup, so it is the idempotent guarantee across the
+    // main↔release/v0.9 merge (the numbered migrations may collide/skip).
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS streaming_queue (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -1122,8 +1210,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
-    // Streaming favorites (migration v56); re-create unconditionally so DBs from
-    // any prior version get it regardless of which migration they came from.
+    // Streaming favorites (migration v58 on the v0.9 line); re-create
+    // unconditionally so DBs from any prior version get it regardless of which
+    // migration they came from.
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS streaming_favorites (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -1140,6 +1229,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         );",
     )
     .ok();
+
+    // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
+    // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
+    // on DBs that skipped the numbered unified-queue migration.
+    migrate_to_unified_queue(db);
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
@@ -1362,6 +1456,43 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    #[test]
+    fn renumber_queue_positions_sql_unifies_position_space() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // Pre-unification layout: local rows at 0,1 and streaming rows at 0,1
+        // (overlapping) for one zone.
+        let conn = db.connection().lock().unwrap();
+        // Isolated SQL test: no real zones/tracks, so relax FK enforcement.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO queue_items (zone_id, position, track_id, source) VALUES (1, 0, 101, 'local');
+             INSERT INTO queue_items (zone_id, position, track_id, source) VALUES (1, 1, 102, 'local');
+             INSERT INTO queue_items (zone_id, position, source_id, source) VALUES (1, 0, 'q1', 'qobuz');
+             INSERT INTO queue_items (zone_id, position, source_id, source) VALUES (1, 1, 'q2', 'qobuz');",
+        )
+        .unwrap();
+        // The v53 renumber SQL: streaming rows shift to L..L+S-1.
+        conn.execute_batch(RENUMBER_QUEUE_POSITIONS_SQL).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT track_id, position FROM queue_items WHERE zone_id = 1 ORDER BY position",
+            )
+            .unwrap();
+        let rows: Vec<(Option<i64>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Local stays 0,1; streaming now 2,3 → one contiguous space, no collisions.
+        assert_eq!(
+            rows,
+            vec![(Some(101), 0), (Some(102), 1), (None, 2), (None, 3)]
+        );
     }
 
     #[test]

@@ -59,6 +59,17 @@ pub fn router() -> Router<AppState> {
         .route("/preview", post(preview_albums))
 }
 
+/// Normalize a stored `sort_order` value to the bare `asc`/`desc` the
+/// SortOrder enum expects. The tune-core save path stores it JSON-encoded
+/// (`"asc"` with quotes) while this route's save path stores it raw (`asc`);
+/// stripping surrounding quotes tolerates both, avoiding the compile error
+/// `unknown variant "asc", expected asc or desc`.
+fn normalize_sort_order(raw: Option<String>) -> String {
+    raw.map(|s| s.trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "asc".into())
+}
+
 /// Decode a row from `smart_collections` into a JSON object.
 /// Column order: id(0), name(1), rules(2), match_mode(3), sort_by(4),
 /// sort_order(5), max_limit(6), description(7), icon(8), color(9), created_at(10).
@@ -74,7 +85,7 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
         "rules": rules,
         "match_mode": r.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
         "sort_by": r.get(4).and_then(|v| v.as_string()),
-        "sort_order": r.get(5).and_then(|v| v.as_string()).unwrap_or_else(|| "asc".into()),
+        "sort_order": normalize_sort_order(r.get(5).and_then(|v| v.as_string())),
         "max_limit": r.get(6).and_then(|v| v.as_i64()),
         "description": r.get(7).and_then(|v| v.as_string()),
         "icon": r.get(8).and_then(|v| v.as_string()),
@@ -720,4 +731,22 @@ async fn preview_albums(
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sort_order;
+
+    #[test]
+    fn normalize_sort_order_tolerates_encodings() {
+        // Raw form (this route's save path).
+        assert_eq!(normalize_sort_order(Some("asc".into())), "asc");
+        assert_eq!(normalize_sort_order(Some("desc".into())), "desc");
+        // Legacy JSON-encoded form (tune-core save path) — the bug source.
+        assert_eq!(normalize_sort_order(Some("\"asc\"".into())), "asc");
+        assert_eq!(normalize_sort_order(Some("\"desc\"".into())), "desc");
+        // Missing / empty -> default.
+        assert_eq!(normalize_sort_order(None), "asc");
+        assert_eq!(normalize_sort_order(Some(String::new())), "asc");
+    }
 }

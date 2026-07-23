@@ -12,6 +12,16 @@ use tracing::{debug, info, warn};
 /// average 500 ms gap between tracks on local output.
 pub static TRACK_END_NOTIFY: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::new()));
 
+/// v0.9 rc.2 — when set (`TUNE_POLLER_FSM_SHADOW=1`), the poller runs the FSM
+/// `fsm::classify_stopped` in shadow alongside the imperative `Stopped` arm and
+/// logs any divergence. The FSM never acts; the legacy arm stays authoritative.
+static POLLER_FSM_SHADOW: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("TUNE_POLLER_FSM_SHADOW").as_deref(),
+        Ok("1") | Ok("true")
+    )
+});
+
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
@@ -110,9 +120,14 @@ const VOLUME_GRACE_SECS: u64 = 5;
 /// `transition` will call exactly these functions.
 pub(crate) mod decisions {
     use super::{
-        MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
         MIN_WALL_FRACTION_FOR_NATURAL_END,
     };
+
+    /// Margin (ms) added to the track duration before position-based
+    /// end-of-track is accepted, to avoid clipping the last fraction of a
+    /// second on renderers that report position slightly ahead of playback.
+    pub const END_MARGIN_MS: u64 = 3000;
 
     /// Has enough of the current track been played to accept a track-end or
     /// gapless transition?
@@ -238,6 +253,705 @@ pub(crate) mod decisions {
             || (ended_naturally && ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
     }
+
+    /// Should the poller adopt the renderer-reported volume into the saved
+    /// zone volume? Only when the reported value actually MOVED since the last
+    /// poll (a real change on the device) AND it now differs from what we have
+    /// stored. A renderer that keeps reporting a stale default (Fabien's
+    /// Devialet stuck at 50%) reports the same value every tick, so `prev`
+    /// never differs from `device` and the user's saved volume is preserved.
+    pub fn should_adopt_device_volume(
+        prev_device_vol: Option<f64>,
+        device_vol: f64,
+        db_vol: f64,
+    ) -> bool {
+        prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
+            && (device_vol - db_vol).abs() > 0.02
+    }
+
+    /// The renderer now reports a duration that differs from the current
+    /// track's by more than 2s — a signal that a gapless transition to the
+    /// next track has occurred (only meaningful once gapless was armed).
+    pub fn duration_changed(
+        gapless_sent: bool,
+        track_duration_ms: u64,
+        reported_duration_ms: u64,
+    ) -> bool {
+        gapless_sent
+            && track_duration_ms > 0
+            && reported_duration_ms > 0
+            && (reported_duration_ms as i64 - track_duration_ms as i64).unsigned_abs() > 2000
+    }
+
+    /// Does the reported position confirm we are genuinely at the end of the
+    /// current track (or reset to the start of the next one)? Guarded by
+    /// `played_enough` to reject false transitions on renderers (DMP-A8) that
+    /// briefly report position < 5s right after SetNextAVTransportURI.
+    pub fn position_confirms_transition(
+        played_enough: bool,
+        position_ms: u64,
+        track_duration_ms: u64,
+    ) -> bool {
+        played_enough
+            && (position_ms < 5000
+                || (track_duration_ms > 0
+                    && position_ms >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)))
+    }
+
+    /// Should `SetNextAVTransportURI` be sent now — i.e. playback has entered
+    /// the final `GAPLESS_WINDOW_MS` of the track and gapless is not yet armed?
+    pub fn should_arm_gapless(
+        gapless_sent: bool,
+        reported_duration_ms: u64,
+        position_ms: u64,
+    ) -> bool {
+        !gapless_sent
+            && reported_duration_ms > GAPLESS_WINDOW_MS
+            && position_ms >= reported_duration_ms - GAPLESS_WINDOW_MS
+    }
+
+    /// Position-based end-of-track: the output still reports Playing but the
+    /// position has run past `duration + END_MARGIN_MS` (e.g. a local/cpal
+    /// output draining its ring buffer). One tick's worth of the condition —
+    /// the caller still requires `POSITION_PAST_END_TICKS` consecutive hits.
+    pub fn past_end_reached(track_duration_ms: u64, played_enough: bool, position_ms: u64) -> bool {
+        track_duration_ms > END_MARGIN_MS
+            && played_enough
+            && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+}
+
+/// Explicit poller state machine — **shadow model** of the `Stopped`-state
+/// decision in `tick()` (v0.9 rc.2 step 2).
+///
+/// `classify_stopped` is a pure, exhaustive reproduction of the
+/// `TransportState::Stopped` match arm's terminal decision. It composes the
+/// `decisions` predicates and the poller thresholds. The caller supplies
+/// I/O-derived facts (e.g. `stream_consuming`) as inputs so the function stays
+/// pure and unit-testable.
+///
+/// Wiring plan: the live loop calls this in shadow mode behind the `poller_fsm`
+/// flag and logs any divergence from the imperative arm before the FSM ever
+/// becomes authoritative (per-zone flip). This is the seed that will replace
+/// the 23-field `ZonePollState`.
+pub mod fsm {
+    use super::{
+        GAPLESS_STUCK_THRESHOLD, POSITION_PAST_END_TICKS, STOPPED_FAILURE_THRESHOLD,
+        STOPPED_TICKS_THRESHOLD, decisions,
+    };
+
+    /// Terminal decision of one poll tick when the output reports Stopped.
+    /// Each variant maps 1:1 to a branch of the `TransportState::Stopped` arm.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StoppedOutcome {
+        /// Tune is not playing on this zone — device Stopped is ignored.
+        Ignore,
+        /// Suppressed by the seek grace window.
+        SuppressSeekGrace,
+        /// Suppressed by the track-load grace window.
+        SuppressLoadGrace,
+        /// Suppressed by the post-gapless cooldown.
+        SuppressCooldown,
+        /// In the gapless guard but not enough played — ignore (false-skip guard).
+        GuardStoppedIgnored,
+        /// In the gapless guard, enough played — arm pending confirmation.
+        GuardStoppedPending,
+        /// Advance pending, renderer still stuck below threshold — keep waiting.
+        StuckWaiting,
+        /// Advance pending + stuck threshold reached — force track end.
+        StuckForceEnd,
+        /// Local output signalled natural EOF — track ended.
+        LocalEndedNaturally,
+        /// Stopped-threshold reached + natural end, gapless armed — wait for transition.
+        NaturalEndGaplessWaiting,
+        /// Stopped-threshold reached + natural end, no gapless — advance track.
+        NaturalEndAdvance,
+        /// Failure threshold reached but the stream is still consuming — keep waiting.
+        FailureWaitingConsuming,
+        /// Failure threshold reached, stream idle — stop the zone.
+        FailureStop,
+        /// Below threshold, or above threshold without a natural end — accumulate.
+        Waiting,
+    }
+
+    impl StoppedOutcome {
+        /// Does this outcome conclude the track has ended (loop sets `track_ended`)?
+        pub fn is_track_end(self) -> bool {
+            matches!(
+                self,
+                StoppedOutcome::StuckForceEnd
+                    | StoppedOutcome::LocalEndedNaturally
+                    | StoppedOutcome::NaturalEndAdvance
+            )
+        }
+
+        /// Does this outcome stop the zone (loop sets `force_stop`)?
+        pub fn is_force_stop(self) -> bool {
+            matches!(self, StoppedOutcome::FailureStop)
+        }
+    }
+
+    /// Snapshot of the inputs the Stopped arm reads, taken BEFORE the arm
+    /// mutates `ZonePollState`. Counters are pre-increment (the classifier
+    /// applies the `+1` the arm would).
+    #[derive(Debug, Clone, Copy)]
+    pub struct StoppedInput {
+        pub tune_is_playing: bool,
+        pub tune_has_track: bool,
+        pub in_seek_grace: bool,
+        pub in_track_load_grace: bool,
+        pub gapless_cooldown: u8,
+        pub in_gapless_guard: bool,
+        pub played_enough: bool,
+        pub gapless_advance_pending: bool,
+        pub gapless_stuck_ticks: u8,
+        pub ended_naturally: bool,
+        pub wall_elapsed: u64,
+        pub track_duration_ms: u64,
+        pub stopped_ticks: u8,
+        pub natural_end: bool,
+        pub gapless_sent: bool,
+        pub stream_consuming: bool,
+    }
+
+    /// Pure reproduction of the `TransportState::Stopped` arm's decision tree.
+    /// Branch order is significant and mirrors `tick()` exactly.
+    pub fn classify_stopped(i: &StoppedInput) -> StoppedOutcome {
+        use StoppedOutcome::*;
+        if !i.tune_is_playing || !i.tune_has_track {
+            return Ignore;
+        }
+        if i.in_seek_grace {
+            return SuppressSeekGrace;
+        }
+        if i.in_track_load_grace {
+            return SuppressLoadGrace;
+        }
+        if i.gapless_cooldown > 0 {
+            return SuppressCooldown;
+        }
+        if i.in_gapless_guard {
+            return if !i.played_enough {
+                GuardStoppedIgnored
+            } else {
+                GuardStoppedPending
+            };
+        }
+        if i.gapless_advance_pending {
+            return if i.gapless_stuck_ticks.saturating_add(1) >= GAPLESS_STUCK_THRESHOLD {
+                StuckForceEnd
+            } else {
+                StuckWaiting
+            };
+        }
+        if i.ended_naturally
+            && (i.played_enough
+                || decisions::ended_naturally_wall_ok(i.wall_elapsed, i.track_duration_ms))
+        {
+            return LocalEndedNaturally;
+        }
+        // Fallthrough: the arm increments stopped_ticks, then branches on it.
+        let stopped_ticks = i.stopped_ticks.saturating_add(1);
+        if stopped_ticks >= STOPPED_TICKS_THRESHOLD {
+            if i.natural_end {
+                return if i.gapless_sent {
+                    NaturalEndGaplessWaiting
+                } else {
+                    NaturalEndAdvance
+                };
+            }
+            if stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
+                return if i.stream_consuming {
+                    FailureWaitingConsuming
+                } else {
+                    FailureStop
+                };
+            }
+            return Waiting;
+        }
+        Waiting
+    }
+
+    /// Decisions taken by the `Playing`/`Transitioning` arm. Unlike the Stopped
+    /// arm (a single-outcome tree), the Playing arm performs a *sequence* of
+    /// independent effects, so this is a bundle of flags, not one enum.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct PlayingDecision {
+        /// (A) A gapless advance was pending and a next track exists — advance
+        /// the queue metadata now.
+        pub confirm_gapless_advance: bool,
+        /// (B) A gapless transition to the next track was detected.
+        pub transition_detected: bool,
+        /// (C) Entered the final window, not armed, gapless enabled — arm SetNext.
+        pub arm_gapless: bool,
+        /// (D) Position ran past the end for POSITION_PAST_END_TICKS ticks —
+        /// the arm sets track_ended.
+        pub past_end_track_ended: bool,
+    }
+
+    /// Inputs read by the Playing arm, snapshot pre-mutation. `has_next` and
+    /// `gapless_enabled` are supplied by the caller (queue lookup / zone config).
+    #[derive(Debug, Clone, Copy)]
+    pub struct PlayingInput {
+        pub gapless_advance_pending: bool,
+        pub has_next: bool,
+        pub gapless_sent: bool,
+        pub track_duration_ms: u64,
+        pub reported_duration_ms: u64,
+        pub played_enough: bool,
+        pub position_ms: u64,
+        pub past_end_ticks: u8,
+        pub gapless_enabled: bool,
+    }
+
+    /// Pure reproduction of the `Playing`/`Transitioning` arm's decisions.
+    /// Mirrors the arm's ordering: a detected transition (B) resets the
+    /// past-end tick counter before (D) is evaluated.
+    pub fn classify_playing(i: &PlayingInput) -> PlayingDecision {
+        let confirm_gapless_advance = i.gapless_advance_pending && i.has_next;
+        let transition_detected = decisions::duration_changed(
+            i.gapless_sent,
+            i.track_duration_ms,
+            i.reported_duration_ms,
+        ) && decisions::position_confirms_transition(
+            i.played_enough,
+            i.position_ms,
+            i.track_duration_ms,
+        );
+        let arm_gapless = !transition_detected
+            && decisions::should_arm_gapless(i.gapless_sent, i.reported_duration_ms, i.position_ms)
+            && i.gapless_enabled;
+        // (B) resets past_end_ticks to 0 before (D) runs.
+        let effective_past_end_ticks = if transition_detected {
+            0
+        } else {
+            i.past_end_ticks
+        };
+        let past_end_track_ended =
+            decisions::past_end_reached(i.track_duration_ms, i.played_enough, i.position_ms)
+                && effective_past_end_ticks.saturating_add(1) >= POSITION_PAST_END_TICKS;
+        PlayingDecision {
+            confirm_gapless_advance,
+            transition_detected,
+            arm_gapless,
+            past_end_track_ended,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn base() -> StoppedInput {
+            StoppedInput {
+                tune_is_playing: true,
+                tune_has_track: true,
+                in_seek_grace: false,
+                in_track_load_grace: false,
+                gapless_cooldown: 0,
+                in_gapless_guard: false,
+                played_enough: false,
+                gapless_advance_pending: false,
+                gapless_stuck_ticks: 0,
+                ended_naturally: false,
+                wall_elapsed: 0,
+                track_duration_ms: 0,
+                stopped_ticks: 0,
+                natural_end: false,
+                gapless_sent: false,
+                stream_consuming: false,
+            }
+        }
+
+        #[test]
+        fn volume_not_adopted_on_first_observation() {
+            // No previous reading yet — never overwrite on the first poll.
+            assert!(!super::super::decisions::should_adopt_device_volume(
+                None, 0.5, 0.3
+            ));
+        }
+
+        #[test]
+        fn volume_not_adopted_when_device_reports_stale_default() {
+            // Devialet keeps reporting 0.50 while the user saved 0.30 — the
+            // value never moves, so the saved volume must be preserved (Fabien).
+            assert!(!super::super::decisions::should_adopt_device_volume(
+                Some(0.5),
+                0.5,
+                0.3
+            ));
+        }
+
+        #[test]
+        fn volume_adopted_on_real_device_change() {
+            // The knob moved on the device (0.50 -> 0.62) and now differs from
+            // the saved volume — adopt it.
+            assert!(super::super::decisions::should_adopt_device_volume(
+                Some(0.5),
+                0.62,
+                0.3
+            ));
+        }
+
+        #[test]
+        fn volume_not_adopted_when_change_matches_saved() {
+            // Device moved but landed on what we already have stored.
+            assert!(!super::super::decisions::should_adopt_device_volume(
+                Some(0.5),
+                0.62,
+                0.62
+            ));
+        }
+
+        #[test]
+        fn ignore_when_tune_not_playing() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    tune_is_playing: false,
+                    ..base()
+                }),
+                StoppedOutcome::Ignore
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    tune_has_track: false,
+                    ..base()
+                }),
+                StoppedOutcome::Ignore
+            );
+        }
+
+        #[test]
+        fn grace_windows_suppress() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_seek_grace: true,
+                    ..base()
+                }),
+                StoppedOutcome::SuppressSeekGrace
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_track_load_grace: true,
+                    ..base()
+                }),
+                StoppedOutcome::SuppressLoadGrace
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    gapless_cooldown: 3,
+                    ..base()
+                }),
+                StoppedOutcome::SuppressCooldown
+            );
+        }
+
+        #[test]
+        fn seek_grace_beats_load_grace() {
+            let i = StoppedInput {
+                in_seek_grace: true,
+                in_track_load_grace: true,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::SuppressSeekGrace);
+        }
+
+        #[test]
+        fn gapless_guard_branches_on_played_enough() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_gapless_guard: true,
+                    played_enough: false,
+                    ..base()
+                }),
+                StoppedOutcome::GuardStoppedIgnored
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_gapless_guard: true,
+                    played_enough: true,
+                    ..base()
+                }),
+                StoppedOutcome::GuardStoppedPending
+            );
+        }
+
+        #[test]
+        fn stuck_waits_then_forces_end() {
+            // GAPLESS_STUCK_THRESHOLD = 2. pre=0 → +1=1 < 2 → wait.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    gapless_advance_pending: true,
+                    gapless_stuck_ticks: 0,
+                    ..base()
+                }),
+                StoppedOutcome::StuckWaiting
+            );
+            // pre=1 → +1=2 >= 2 → force end.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    gapless_advance_pending: true,
+                    gapless_stuck_ticks: 1,
+                    ..base()
+                }),
+                StoppedOutcome::StuckForceEnd
+            );
+        }
+
+        #[test]
+        fn local_ended_naturally_paths() {
+            // played_enough qualifies.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: true,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // wall_elapsed >= 5 also qualifies.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    wall_elapsed: 5,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // ended_naturally but too early and not played_enough → falls through.
+            assert_ne!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    wall_elapsed: 4,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+        }
+
+        #[test]
+        fn dmp_a8_false_ended_naturally_rejected() {
+            // DMP-A8 regression: renderer falsely reports ended_naturally ~35s
+            // into a 4-minute (240s) track (played_enough false). Wall-clock is
+            // far below MIN_WALL_FRACTION_FOR_NATURAL_END·duration → NOT an end.
+            assert_ne!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 35,
+                    track_duration_ms: 240_000,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // A genuine end near the track duration is still trusted.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 200,
+                    track_duration_ms: 240_000,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+        }
+
+        #[test]
+        fn below_threshold_waits() {
+            // STOPPED_TICKS_THRESHOLD = 5. pre=0 → +1=1 < 5 → waiting.
+            assert_eq!(classify_stopped(&base()), StoppedOutcome::Waiting);
+        }
+
+        #[test]
+        fn natural_end_advances_without_gapless() {
+            let i = StoppedInput {
+                stopped_ticks: 4,
+                natural_end: true,
+                gapless_sent: false,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::NaturalEndAdvance);
+            assert!(classify_stopped(&i).is_track_end());
+        }
+
+        #[test]
+        fn natural_end_waits_when_gapless_armed() {
+            let i = StoppedInput {
+                stopped_ticks: 4,
+                natural_end: true,
+                gapless_sent: true,
+                ..base()
+            };
+            assert_eq!(
+                classify_stopped(&i),
+                StoppedOutcome::NaturalEndGaplessWaiting
+            );
+            assert!(!classify_stopped(&i).is_track_end());
+        }
+
+        #[test]
+        fn failure_stops_when_idle_past_failure_threshold() {
+            // STOPPED_FAILURE_THRESHOLD = 30. pre=29 → +1=30, not natural, idle.
+            let i = StoppedInput {
+                stopped_ticks: 29,
+                natural_end: false,
+                stream_consuming: false,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::FailureStop);
+            assert!(classify_stopped(&i).is_force_stop());
+        }
+
+        #[test]
+        fn failure_waits_when_stream_consuming() {
+            let i = StoppedInput {
+                stopped_ticks: 29,
+                natural_end: false,
+                stream_consuming: true,
+                ..base()
+            };
+            assert_eq!(
+                classify_stopped(&i),
+                StoppedOutcome::FailureWaitingConsuming
+            );
+            assert!(!classify_stopped(&i).is_force_stop());
+        }
+
+        #[test]
+        fn between_thresholds_waits() {
+            // pre=10 → +1=11, >=5 but <30, not natural_end → Waiting.
+            let i = StoppedInput {
+                stopped_ticks: 10,
+                natural_end: false,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::Waiting);
+        }
+
+        fn pbase() -> PlayingInput {
+            PlayingInput {
+                gapless_advance_pending: false,
+                has_next: true,
+                gapless_sent: false,
+                track_duration_ms: 300_000,
+                reported_duration_ms: 300_000,
+                played_enough: false,
+                position_ms: 0,
+                past_end_ticks: 0,
+                gapless_enabled: true,
+            }
+        }
+
+        #[test]
+        fn playing_confirm_gapless_advance() {
+            assert!(
+                classify_playing(&PlayingInput {
+                    gapless_advance_pending: true,
+                    has_next: true,
+                    ..pbase()
+                })
+                .confirm_gapless_advance
+            );
+            // pending but no next → no metadata advance.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    gapless_advance_pending: true,
+                    has_next: false,
+                    ..pbase()
+                })
+                .confirm_gapless_advance
+            );
+        }
+
+        #[test]
+        fn playing_transition_detected_requires_armed() {
+            let armed = PlayingInput {
+                gapless_sent: true,
+                track_duration_ms: 200_000,
+                reported_duration_ms: 210_000,
+                played_enough: true,
+                position_ms: 2_000,
+                ..pbase()
+            };
+            assert!(classify_playing(&armed).transition_detected);
+            // Not armed → duration_changed is false → no transition.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    gapless_sent: false,
+                    ..armed
+                })
+                .transition_detected
+            );
+        }
+
+        #[test]
+        fn playing_arm_gapless_gated_by_enabled_and_not_transitioning() {
+            let i = PlayingInput {
+                gapless_sent: false,
+                reported_duration_ms: 300_000,
+                position_ms: 275_000,
+                gapless_enabled: true,
+                ..pbase()
+            };
+            let d = classify_playing(&i);
+            assert!(d.arm_gapless && !d.transition_detected);
+            // Disabled for the zone → don't arm.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    gapless_enabled: false,
+                    ..i
+                })
+                .arm_gapless
+            );
+        }
+
+        #[test]
+        fn playing_past_end_advances_after_threshold() {
+            // POSITION_PAST_END_TICKS = 3. pre=2 → +1=3 >= 3, past end reached.
+            let i = PlayingInput {
+                track_duration_ms: 240_000,
+                played_enough: true,
+                position_ms: 244_000,
+                past_end_ticks: 2,
+                ..pbase()
+            };
+            assert!(classify_playing(&i).past_end_track_ended);
+            // pre=1 → +1=2 < 3 → not yet.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    past_end_ticks: 1,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+        }
+
+        #[test]
+        fn playing_transition_resets_past_end_counter() {
+            // Past-end IS reached, but a detected transition resets the counter
+            // to 0 before (D), so no past-end advance this tick.
+            let i = PlayingInput {
+                gapless_sent: true,
+                track_duration_ms: 240_000,
+                reported_duration_ms: 250_000,
+                played_enough: true,
+                position_ms: 244_000,
+                past_end_ticks: 5,
+                ..pbase()
+            };
+            let d = classify_playing(&i);
+            assert!(d.transition_detected);
+            assert!(!d.past_end_track_ended);
+            // Without a transition, the pre-tick counter stands: 5+1 >= 3 → advance.
+            let d2 = classify_playing(&PlayingInput {
+                gapless_sent: false,
+                ..i
+            });
+            assert!(!d2.transition_detected);
+            assert!(d2.past_end_track_ended);
+        }
+    }
 }
 
 struct ZonePollState {
@@ -314,17 +1028,6 @@ struct ZonePollState {
     /// renderer that persistently reports a stale default (e.g. Devialet at
     /// 50%), which must not overwrite the user's saved volume.
     last_device_volume: Option<f64>,
-}
-
-/// Should the poller adopt the renderer-reported volume into the saved zone
-/// volume? Only when the reported value actually MOVED since the last poll (a
-/// real change on the device) AND it now differs from what we have stored. A
-/// renderer that keeps reporting a stale default (Fabien's Devialet stuck at
-/// 50%) reports the same value every tick, so `prev` never differs from
-/// `device` and the user's saved volume is preserved.
-fn should_adopt_device_volume(prev_device_vol: Option<f64>, device_vol: f64, db_vol: f64) -> bool {
-    prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
-        && (device_vol - db_vol).abs() > 0.02
 }
 
 pub struct PositionPoller {
@@ -447,16 +1150,19 @@ impl PositionPoller {
             {
                 let db_vol = zone.volume as f64 / 100.0;
                 let prev_device_vol = poll_states.get(&zone_id).and_then(|p| p.last_device_volume);
-                // Edge-triggered: adopt only when the renderer's volume actually
-                // moved since the last poll, so a stale default (Fabien's
+                // Edge-triggered: adopt the renderer's volume only when it
+                // actually moved since the last poll (see decisions::
+                // should_adopt_device_volume), so a stale default (Fabien's
                 // Devialet stuck at 50%) can't overwrite the saved volume.
-                if should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
+                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
                     self.playback.set_volume(zone_id, status.volume).await;
                     let vol_int = (status.volume * 100.0) as i32;
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                         .update_volume(zone_id, vol_int)
                         .ok();
                 }
+                // Remember what the renderer reported so the next tick can
+                // detect a genuine change.
                 if let Some(ps) = poll_states.get_mut(&zone_id) {
                     ps.last_device_volume = Some(status.volume);
                 }
@@ -761,7 +1467,7 @@ impl PositionPoller {
                     if !zone_fixed_volume
                         && !in_vol_grace
                         && status.volume < 0.999
-                        && should_adopt_device_volume(
+                        && decisions::should_adopt_device_volume(
                             ps.last_device_volume,
                             status.volume,
                             zone_state.volume,
@@ -992,7 +1698,7 @@ impl PositionPoller {
                 && !in_vol_grace2
                 && status.volume > 0.001
                 && status.volume < 0.999
-                && should_adopt_device_volume(
+                && decisions::should_adopt_device_volume(
                     ps.last_device_volume,
                     status.volume,
                     zone_state.volume,
@@ -1101,10 +1807,18 @@ impl PositionPoller {
                         "gapless_position_reset_ignored_not_enough_played"
                     );
                 } else {
+                    // Real time elapsed between arming SetNext (next-track URL
+                    // resolved) and the renderer actually transitioning. Key
+                    // metric for streaming URL/token expiry diagnosis.
+                    let arm_to_advance_ms = ps
+                        .gapless_sent_at
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
                     info!(
                         zone_id,
                         prev_pos = ps.last_position_ms,
                         new_pos = status.position_ms,
+                        arm_to_advance_ms,
                         "gapless_position_reset_detected"
                     );
                     ps.gapless_sent = false;
@@ -1174,7 +1888,38 @@ impl PositionPoller {
                     let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
                         < TRACK_LOAD_GRACE_SECS
                         && ps.peak_position_ms < 5_000;
+                    // v0.9 rc.2 FSM shadow: snapshot the Stopped-arm inputs
+                    // (pre-mutation) so classify_stopped can be compared to the
+                    // arm's real outcome under TUNE_POLLER_FSM_SHADOW. Cheap
+                    // (no I/O); the compare/log at the arm tail is flag-gated.
+                    let mut fsm_in = fsm::StoppedInput {
+                        tune_is_playing,
+                        tune_has_track,
+                        in_seek_grace,
+                        in_track_load_grace,
+                        gapless_cooldown: ps.gapless_cooldown,
+                        in_gapless_guard,
+                        played_enough,
+                        gapless_advance_pending: ps.gapless_advance_pending,
+                        gapless_stuck_ticks: ps.gapless_stuck_ticks,
+                        ended_naturally: status.ended_naturally,
+                        wall_elapsed,
+                        track_duration_ms,
+                        stopped_ticks: ps.stopped_ticks,
+                        natural_end: decisions::natural_end(
+                            played_enough,
+                            matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All),
+                            ps.peak_position_ms,
+                            status.ended_naturally,
+                            wall_elapsed,
+                            track_duration_ms,
+                        ),
+                        gapless_sent: ps.gapless_sent,
+                        stream_consuming: false,
+                    };
+                    let mut fsm_actual: Option<fsm::StoppedOutcome>;
                     if in_seek_grace {
+                        fsm_actual = Some(fsm::StoppedOutcome::SuppressSeekGrace);
                         ps.stopped_ticks = 0;
                         debug!(
                             zone_id,
@@ -1182,6 +1927,7 @@ impl PositionPoller {
                             "seek_grace_suppressing_stopped_ticks"
                         );
                     } else if in_track_load_grace {
+                        fsm_actual = Some(fsm::StoppedOutcome::SuppressLoadGrace);
                         ps.stopped_ticks = 0;
                         debug!(
                             zone_id,
@@ -1190,10 +1936,12 @@ impl PositionPoller {
                             "track_load_grace_suppressing_stopped_ticks"
                         );
                     } else if ps.gapless_cooldown > 0 {
+                        fsm_actual = Some(fsm::StoppedOutcome::SuppressCooldown);
                         ps.gapless_cooldown -= 1;
                         ps.stopped_ticks = 0;
                     } else if in_gapless_guard {
                         if !played_enough {
+                            fsm_actual = Some(fsm::StoppedOutcome::GuardStoppedIgnored);
                             // Renderer reported Stopped during guard but not
                             // enough of the track was played — ignore to avoid
                             // false skip (DMP-A8 quirk).
@@ -1204,6 +1952,7 @@ impl PositionPoller {
                                 "gapless_guard_stopped_ignored_not_enough_played"
                             );
                         } else {
+                            fsm_actual = Some(fsm::StoppedOutcome::GuardStoppedPending);
                             // During the gapless guard period, a Stopped state
                             // MAY mean the renderer transitioned via gapless.
                             // Don't advance metadata yet — wait for the renderer
@@ -1229,6 +1978,7 @@ impl PositionPoller {
                         // doesn't pick up within GAPLESS_STUCK_THRESHOLD.
                         ps.gapless_stuck_ticks += 1;
                         if ps.gapless_stuck_ticks >= GAPLESS_STUCK_THRESHOLD {
+                            fsm_actual = Some(fsm::StoppedOutcome::StuckForceEnd);
                             warn!(
                                 zone_id,
                                 stuck_ticks = ps.gapless_stuck_ticks,
@@ -1239,6 +1989,7 @@ impl PositionPoller {
                             ps.stopped_ticks = 0;
                             track_ended = true;
                         } else {
+                            fsm_actual = Some(fsm::StoppedOutcome::StuckWaiting);
                             debug!(
                                 zone_id,
                                 stuck_ticks = ps.gapless_stuck_ticks,
@@ -1251,6 +2002,7 @@ impl PositionPoller {
                             || decisions::peak_reached_end(track_duration_ms, ps.peak_position_ms)
                             || decisions::ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
                     {
+                        fsm_actual = Some(fsm::StoppedOutcome::LocalEndedNaturally);
                         // Local outputs (WASAPI/ALSA/CoreAudio) signal
                         // ended_naturally when the audio stream reaches EOF.
                         // Skip the STOPPED_TICKS_THRESHOLD wait — we know
@@ -1287,6 +2039,9 @@ impl PositionPoller {
                         ps.stopped_ticks = 0;
                         track_ended = true;
                     } else {
+                        // Default for this block; overridden by the natural-end
+                        // and failure sub-branches below.
+                        fsm_actual = Some(fsm::StoppedOutcome::Waiting);
                         ps.stopped_ticks += 1;
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
                             // When repeat mode is active (One or All) on DLNA,
@@ -1334,6 +2089,8 @@ impl PositionPoller {
                                     }
                                 };
                                 if awaiting_dlna_transition {
+                                    fsm_actual =
+                                        Some(fsm::StoppedOutcome::NaturalEndGaplessWaiting);
                                     // Gapless was prepared via SetNextAVTransportURI.
                                     // Don't advance metadata yet — wait for the
                                     // renderer to confirm the transition by starting
@@ -1352,6 +2109,7 @@ impl PositionPoller {
                                     ps.gapless_stuck_ticks = 0;
                                     ps.gapless_cooldown = 4;
                                 } else {
+                                    fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                     ps.gapless_sent = false;
                                     track_ended = true;
                                 }
@@ -1375,8 +2133,10 @@ impl PositionPoller {
                                 let stream_consuming =
                                     current_bytes > 0 && current_bytes > ps.last_bytes_sent;
                                 ps.last_bytes_sent = current_bytes;
+                                fsm_in.stream_consuming = stream_consuming;
 
                                 if stream_consuming {
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
                                     if ps.stopped_ticks % 30 == 0 {
                                         debug!(
                                             zone_id,
@@ -1387,6 +2147,7 @@ impl PositionPoller {
                                         );
                                     }
                                 } else {
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureStop);
                                     warn!(
                                         zone_id,
                                         peak_pos = ps.peak_position_ms,
@@ -1415,10 +2176,38 @@ impl PositionPoller {
                             }
                         }
                     }
+                    // v0.9 rc.2 — FSM shadow-compare (flag-gated, log only).
+                    if *POLLER_FSM_SHADOW {
+                        if let Some(actual) = fsm_actual {
+                            let predicted = fsm::classify_stopped(&fsm_in);
+                            if predicted != actual {
+                                warn!(zone_id, ?predicted, ?actual, "poller_fsm_shadow_divergence");
+                            }
+                        }
+                    }
                 }
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
                     ps.gapless_cooldown = 0;
+                    // v0.9 rc.2 FSM shadow: snapshot the Playing-arm inputs
+                    // (pre-mutation). gapless_enabled is filled in the arm branch
+                    // when it is actually read; default true matches the arm.
+                    let fsm_has_next = Self::next_position(zone_state).is_some();
+                    let mut fsm_pin = fsm::PlayingInput {
+                        gapless_advance_pending: ps.gapless_advance_pending,
+                        has_next: fsm_has_next,
+                        gapless_sent: ps.gapless_sent,
+                        track_duration_ms,
+                        reported_duration_ms: status.duration_ms,
+                        played_enough,
+                        position_ms: status.position_ms,
+                        past_end_ticks: ps.past_end_ticks,
+                        gapless_enabled: true,
+                    };
+                    let mut fsm_pact = fsm::PlayingDecision {
+                        confirm_gapless_advance: ps.gapless_advance_pending && fsm_has_next,
+                        ..Default::default()
+                    };
                     // Renderer started playing — gapless transition confirmed.
                     // NOW advance metadata (deferred from the Stopped handler
                     // to avoid showing the wrong track on renderers that don't
@@ -1450,27 +2239,33 @@ impl PositionPoller {
                     // the track actually ended (near end or reset to start).
                     // Some DLNA renderers (DMP-A6/A8) report inaccurate durations
                     // from the start, so duration mismatch alone is insufficient.
-                    let duration_changed = ps.gapless_sent
-                        && track_duration_ms > 0
-                        && status.duration_ms > 0
-                        && (status.duration_ms as i64 - track_duration_ms as i64).unsigned_abs()
-                            > 2000;
+                    let duration_changed = decisions::duration_changed(
+                        ps.gapless_sent,
+                        track_duration_ms,
+                        status.duration_ms,
+                    );
                     // Position must confirm we are actually at the end of the
                     // current track OR that the position has reset to the
                     // start of the next track.  The played_enough guard
                     // prevents false transitions when a renderer (DMP-A8)
                     // reports position < 5s immediately after SetNext.
-                    let position_confirms_transition = played_enough
-                        && (status.position_ms < 5000
-                            || (track_duration_ms > 0
-                                && status.position_ms
-                                    >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)));
+                    let position_confirms_transition = decisions::position_confirms_transition(
+                        played_enough,
+                        status.position_ms,
+                        track_duration_ms,
+                    );
+                    fsm_pact.transition_detected = duration_changed && position_confirms_transition;
                     if duration_changed && position_confirms_transition {
+                        let arm_to_advance_ms = ps
+                            .gapless_sent_at
+                            .map(|t| t.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
                             track_dur = track_duration_ms,
                             peak_pos = ps.peak_position_ms,
+                            arm_to_advance_ms,
                             "gapless_transition_detected"
                         );
                         ps.gapless_sent = false;
@@ -1503,10 +2298,11 @@ impl PositionPoller {
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
-                    } else if !ps.gapless_sent
-                        && status.duration_ms > GAPLESS_WINDOW_MS
-                        && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS
-                    {
+                    } else if decisions::should_arm_gapless(
+                        ps.gapless_sent,
+                        status.duration_ms,
+                        status.position_ms,
+                    ) {
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -1514,6 +2310,8 @@ impl PositionPoller {
                             .flatten()
                             .map(|z| z.gapless_enabled)
                             .unwrap_or(true);
+                        fsm_pin.gapless_enabled = gapless_enabled;
+                        fsm_pact.arm_gapless = gapless_enabled;
                         if gapless_enabled {
                             // Exclusive-mode local outputs (ASIO / WASAPI
                             // exclusive) can't chain internally. Detect that
@@ -1558,21 +2356,25 @@ impl PositionPoller {
                     // Add a 3-second margin to avoid cutting off the end of
                     // tracks on DLNA renderers that report position slightly
                     // ahead of actual playback.
-                    let end_margin_ms = 3000u64;
-                    let past_end_by_margin =
-                        status.position_ms >= track_duration_ms.saturating_add(end_margin_ms);
+                    // Margin path (pure predicate, v0.9 extraction): position ran
+                    // past duration + END_MARGIN_MS.
+                    let past_end = decisions::past_end_reached(
+                        track_duration_ms,
+                        played_enough,
+                        status.position_ms,
+                    );
                     // Exclusive local outputs (ASIO / WASAPI exclusive) cap the
                     // reported position at exactly the track duration and keep
                     // reporting Playing — their blocking HTTP read never sees a
-                    // clean EOF at the loop point, so the drain/stop never runs
-                    // and the position never exceeds duration+margin. For those
-                    // outputs, treat "reached the very end (within 250ms) and
+                    // clean EOF at the loop point, so the +3s margin above never
+                    // triggers. Treat "reached the very end (within 250ms) and
                     // held there for POSITION_PAST_END_TICKS ticks" as ended, so
                     // repeat/advance fires (DEvir: ASIO Fireface repeat never
                     // looped). Gated to exclusive outputs so DLNA — which can sit
                     // near the end legitimately — keeps the +3s margin above.
-                    let reached_end_exclusive = !past_end_by_margin
-                        && track_duration_ms > 0
+                    let reached_end_exclusive = !past_end
+                        && track_duration_ms > decisions::END_MARGIN_MS
+                        && played_enough
                         && status.position_ms + 250 >= track_duration_ms
                         && {
                             let outputs = self.outputs.lock().await;
@@ -1581,10 +2383,7 @@ impl PositionPoller {
                                 None => false,
                             }
                         };
-                    if track_duration_ms > end_margin_ms
-                        && played_enough
-                        && (past_end_by_margin || reached_end_exclusive)
-                    {
+                    if past_end || reached_end_exclusive {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
                             info!(
@@ -1596,9 +2395,22 @@ impl PositionPoller {
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
+                            fsm_pact.past_end_track_ended = true;
                         }
                     } else {
                         ps.past_end_ticks = 0;
+                    }
+                    // v0.9 rc.2 — FSM shadow-compare for the Playing arm.
+                    if *POLLER_FSM_SHADOW {
+                        let predicted = fsm::classify_playing(&fsm_pin);
+                        if predicted != fsm_pact {
+                            warn!(
+                                zone_id,
+                                ?predicted,
+                                actual = ?fsm_pact,
+                                "poller_fsm_shadow_divergence_playing"
+                            );
+                        }
                     }
                 }
                 TransportState::Paused => {
@@ -1856,6 +2668,31 @@ impl PositionPoller {
         self.orchestrator.stop(zone_id, device_id.as_deref()).await;
     }
 
+    /// Resolve the next queue item's stream URL for gapless, with one bounded
+    /// retry on transient failure (F1). Streaming next-track resolution can
+    /// fail transiently (network blip, DASH parse, token refreshed mid-flight);
+    /// previously a single failure silently abandoned gapless, producing an
+    /// audible Stop+Play gap. The happy path is unchanged (first-try success).
+    async fn resolve_gapless_next(
+        &self,
+        zone_id: i64,
+        next_pos: i64,
+    ) -> Result<crate::orchestrator::ResolvedQueueItem, String> {
+        match self
+            .orchestrator
+            .resolve_queue_item_url(zone_id, next_pos)
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                warn!(zone_id, error = %e, attempt = 1, "gapless_resolve_retry");
+                self.orchestrator
+                    .resolve_queue_item_url(zone_id, next_pos)
+                    .await
+            }
+        }
+    }
+
     async fn prepare_gapless(
         &self,
         zone_id: i64,
@@ -1866,15 +2703,28 @@ impl PositionPoller {
             return false;
         };
 
-        match self
-            .orchestrator
-            .resolve_queue_item_url(zone_id, next_pos)
-            .await
-        {
+        // v0.9 gapless characterization: time the next-track resolution and
+        // surface failures at warn. These paths were debug-only, so streaming
+        // gapless instability (Tidal DASH download slowness, URL/token issues)
+        // was invisible in production journald. Logging only — no behaviour change.
+        let t0 = Instant::now();
+        match self.resolve_gapless_next(zone_id, next_pos).await {
             Ok(resolved) => {
+                let resolve_ms = t0.elapsed().as_millis() as u64;
+                let is_streaming = resolved.stream_id.is_some();
                 if let Some(ref sid) = resolved.stream_id {
+                    let w0 = Instant::now();
                     if !self.orchestrator.wait_stream_data_ready(sid, 5000).await {
-                        debug!(zone_id, "gapless_data_ready_timeout");
+                        // The next track's transcode session produced no data
+                        // within the 5s budget — common for Tidal Hi-Res DASH
+                        // multi-segment downloads. We still arm SetNext, but this
+                        // is a prime instability signal.
+                        warn!(
+                            zone_id,
+                            resolve_ms,
+                            waited_ms = w0.elapsed().as_millis() as u64,
+                            "gapless_data_ready_timeout"
+                        );
                     }
                 }
                 let output_arc = {
@@ -1933,10 +2783,16 @@ impl PositionPoller {
                         live_stream: false,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
-                        debug!(zone_id, error = %e, "gapless_set_next_failed");
+                        warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
                         false
                     } else {
-                        info!(zone_id, title = %resolved.title, "gapless_next_set");
+                        info!(
+                            zone_id,
+                            title = %resolved.title,
+                            resolve_ms,
+                            streaming = is_streaming,
+                            "gapless_next_set"
+                        );
                         true
                     }
                 } else {
@@ -1944,7 +2800,12 @@ impl PositionPoller {
                 }
             }
             Err(e) => {
-                debug!(zone_id, error = %e, "gapless_resolve_failed");
+                warn!(
+                    zone_id,
+                    error = %e,
+                    resolve_ms = t0.elapsed().as_millis() as u64,
+                    "gapless_resolve_failed"
+                );
                 false
             }
         }
@@ -1966,27 +2827,31 @@ mod tests {
     #[test]
     fn volume_not_adopted_on_first_observation() {
         // No previous reading yet — never overwrite on the first poll.
-        assert!(!should_adopt_device_volume(None, 0.5, 0.3));
+        assert!(!decisions::should_adopt_device_volume(None, 0.5, 0.3));
     }
 
     #[test]
     fn volume_not_adopted_when_device_reports_stale_default() {
         // Devialet keeps reporting 0.50 while the user saved 0.30 — the value
         // never moves, so the saved volume must be preserved (Fabien).
-        assert!(!should_adopt_device_volume(Some(0.5), 0.5, 0.3));
+        assert!(!decisions::should_adopt_device_volume(Some(0.5), 0.5, 0.3));
     }
 
     #[test]
     fn volume_adopted_on_real_device_change() {
         // The knob moved on the device (0.50 -> 0.62) and now differs from the
         // saved volume — adopt it.
-        assert!(should_adopt_device_volume(Some(0.5), 0.62, 0.3));
+        assert!(decisions::should_adopt_device_volume(Some(0.5), 0.62, 0.3));
     }
 
     #[test]
     fn volume_not_adopted_when_change_matches_saved() {
         // Device moved but landed on what we already have stored.
-        assert!(!should_adopt_device_volume(Some(0.5), 0.62, 0.62));
+        assert!(!decisions::should_adopt_device_volume(
+            Some(0.5),
+            0.62,
+            0.62
+        ));
     }
 
     #[test]
@@ -2606,6 +3471,63 @@ mod tests {
     #[test]
     fn natural_end_all_guards_false() {
         assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
+    }
+
+    #[test]
+    fn duration_changed_requires_armed_and_delta() {
+        // Armed + reported duration differs by > 2s → changed.
+        assert!(decisions::duration_changed(true, 200_000, 210_000));
+        // Not armed → never "changed".
+        assert!(!decisions::duration_changed(false, 200_000, 210_000));
+        // Delta within 2s → not changed.
+        assert!(!decisions::duration_changed(true, 200_000, 201_000));
+        // Zero durations → not changed.
+        assert!(!decisions::duration_changed(true, 0, 210_000));
+        assert!(!decisions::duration_changed(true, 200_000, 0));
+    }
+
+    #[test]
+    fn position_confirms_transition_near_end_or_reset() {
+        // played_enough + position reset to start → confirmed.
+        assert!(decisions::position_confirms_transition(
+            true, 2_000, 300_000
+        ));
+        // played_enough + within GAPLESS_WINDOW_MS of the end → confirmed.
+        assert!(decisions::position_confirms_transition(
+            true, 275_000, 300_000
+        ));
+        // Mid-track, not near end, not reset → not confirmed.
+        assert!(!decisions::position_confirms_transition(
+            true, 150_000, 300_000
+        ));
+        // Not played_enough → never confirmed even at reset.
+        assert!(!decisions::position_confirms_transition(
+            false, 2_000, 300_000
+        ));
+    }
+
+    #[test]
+    fn should_arm_gapless_in_final_window() {
+        // Entered the final GAPLESS_WINDOW_MS, not yet armed → arm.
+        assert!(decisions::should_arm_gapless(false, 300_000, 275_000));
+        // Already armed → don't re-arm.
+        assert!(!decisions::should_arm_gapless(true, 300_000, 275_000));
+        // Still before the final window → don't arm.
+        assert!(!decisions::should_arm_gapless(false, 300_000, 100_000));
+        // Duration shorter than the window → never arm (no underflow).
+        assert!(!decisions::should_arm_gapless(false, 10_000, 9_000));
+    }
+
+    #[test]
+    fn past_end_reached_beyond_margin() {
+        // Position past duration + END_MARGIN_MS, played enough → reached.
+        assert!(decisions::past_end_reached(240_000, true, 244_000));
+        // Just past duration but within the margin → not yet.
+        assert!(!decisions::past_end_reached(240_000, true, 240_500));
+        // Past end but not played_enough → not reached.
+        assert!(!decisions::past_end_reached(240_000, false, 244_000));
+        // Duration at/below the margin → not reached.
+        assert!(!decisions::past_end_reached(1_000, true, 50_000));
     }
 
     #[test]

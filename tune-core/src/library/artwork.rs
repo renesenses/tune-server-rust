@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::{debug, info, warn};
-use unicode_normalization::UnicodeNormalization;
 
 /// Best-effort diagnostic counter of artwork downloads rejected with a
 /// rate-limit status (429/503), incremented in [`download_image`]. An
@@ -96,57 +95,29 @@ pub(crate) fn extended_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     Cow::Owned(std::path::PathBuf::from(prefixed))
 }
 
-/// Candidate on-disk paths to try, differing only in Unicode normalization.
-///
-/// The scanner stores file paths NFC-normalized (`walker.rs`), but a file copied
-/// from macOS keeps an NFD (decomposed) name on disk. Opening the stored NFC
-/// path then fails with "cannot find the path specified" — even though the track
-/// scanned fine, because the walker read it via the raw enumerated path. Trying
-/// the NFD (then NFC) form recovers the <1% of albums whose names carry
-/// decomposable diacritics (Thibaud, #995: "Camarón de la Isla", "Możdżer",
-/// "orð vǫlu"). Deduped, original first so the common case does one open.
-fn normalization_variants(path: &Path) -> Vec<PathBuf> {
-    let mut out = vec![path.to_path_buf()];
-    if let Some(s) = path.to_str() {
-        for variant in [s.nfd().collect::<String>(), s.nfc().collect::<String>()] {
-            let p = PathBuf::from(variant);
-            if !out.contains(&p) {
-                out.push(p);
-            }
-        }
-    }
-    out
-}
-
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    for candidate in normalization_variants(audio_path) {
-        match lofty::read_from_path(&*extended_path(&candidate)) {
-            Ok(tagged) => {
-                if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-                    if let Some(pic) = tag.pictures().first() {
-                        let mime = match pic.mime_type() {
-                            Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
-                            Some(lofty::picture::MimeType::Png) => "image/png",
-                            Some(lofty::picture::MimeType::Bmp) => "image/bmp",
-                            _ => "image/jpeg",
-                        };
-                        return Some((pic.data().to_vec(), mime.to_string()));
-                    }
+    match lofty::read_from_path(&*extended_path(audio_path)) {
+        Ok(tagged) => {
+            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+                if let Some(pic) = tag.pictures().first() {
+                    let mime = match pic.mime_type() {
+                        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
+                        Some(lofty::picture::MimeType::Png) => "image/png",
+                        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                        _ => "image/jpeg",
+                    };
+                    return Some((pic.data().to_vec(), mime.to_string()));
                 }
-                // The file opened but carries no embedded picture — other
-                // normalizations point at the same physical file, so stop.
-                break;
             }
-            Err(e) => {
-                debug!(
-                    path = %candidate.display(),
-                    error = %e,
-                    "artwork_lofty_read_failed"
-                );
-                // "Path not found" for this normalization — try the next form.
-            }
+        }
+        Err(e) => {
+            debug!(
+                path = %audio_path.display(),
+                error = %e,
+                "artwork_lofty_read_failed"
+            );
         }
     }
 
@@ -217,6 +188,7 @@ pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     // this release.
     for size in ["front-1200", "front-500"] {
         let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
+        crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
         let Ok(resp) = client.get(&url).send().await else {
             continue;
         };
@@ -232,52 +204,6 @@ pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-/// Upscale an Apple `artworkUrl100` (a 100×100 thumbnail) to a full-resolution
-/// rendition by swapping the size segment (e.g. `.../100x100bb.jpg` →
-/// `.../1200x1200bb.jpg`). Returns `None` if the URL isn't in the expected form.
-fn itunes_hires_url(art100: &str) -> Option<String> {
-    if art100.contains("100x100bb") {
-        Some(art100.replace("100x100bb", "1200x1200bb"))
-    } else {
-        None
-    }
-}
-
-/// Apple/iTunes cover-art fallback. Cover Art Archive is sparse and the
-/// MusicBrainz release match is strict, so many local albums never get a cover.
-/// Apple's catalog is far denser for mainstream music and needs no MBID — search
-/// by artist + title and download the highest-res rendition available.
-async fn fetch_itunes_cover(artist: &str, title: &str) -> Option<Vec<u8>> {
-    let term = format!("{artist} {title}");
-    let url = format!(
-        "https://itunes.apple.com/search?term={}&media=music&entity=album&limit=1",
-        urlencoding::encode(&term)
-    );
-    let client = crate::http::client::builder()
-        .user_agent(MB_USER_AGENT)
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let art100 = data
-        .get("results")?
-        .as_array()?
-        .first()?
-        .get("artworkUrl100")?
-        .as_str()?;
-    // Try the hi-res rendition first, then fall back to the 100px thumbnail.
-    if let Some(hi) = itunes_hires_url(art100)
-        && let Some(bytes) = download_image(&client, &hi).await
-    {
-        return Some(bytes);
-    }
-    download_image(&client, art100).await
 }
 
 /// Search MusicBrainz for a release MBID by artist name and album title.
@@ -297,6 +223,7 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -329,6 +256,7 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -391,9 +319,9 @@ pub async fn batch_enrich_artwork(
         let mbid_to_use = if let Some(id) = resolved_mbid {
             Some(id)
         } else {
-            // Search MusicBrainz for the release
+            // Search MusicBrainz for the release (the shared MB rate limiter
+            // inside `search_musicbrainz_release` enforces the ~1 req/s spacing).
             searched += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
             let found = search_musicbrainz_release(artist, title).await;
             if let Some(ref id) = found {
                 // Store the discovered MBID on the album for future use
@@ -406,37 +334,19 @@ pub async fn batch_enrich_artwork(
             found
         };
 
-        // Step 2: Fetch the cover. Cover Art Archive (needs an MBID) first;
-        // fall back to Apple/iTunes artwork, which needs no MBID and has a far
-        // denser catalog for mainstream music. Without this fallback, albums
-        // with no MB match or no CAA image never get a cover (Fabien: 0/22).
-        let mut data: Option<Vec<u8>> = None;
-        if let Some(ref mbid_val) = mbid_to_use {
-            // Rate limit: wait 1.1s between CAA requests
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-            data = fetch_cover_art(mbid_val).await;
-            if data.is_none() {
-                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
-            }
-        }
-        if data.is_none() && artist != "Unknown Artist" {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            data = fetch_itunes_cover(artist, title).await;
-            if data.is_some() {
-                debug!(album_id, album = %title, "batch_artwork_itunes_found");
-            }
-        }
+        let Some(ref mbid_val) = mbid_to_use else {
+            debug!(album_id, album = %title, artist = %artist, "batch_artwork_no_mbid");
+            failed += 1;
+            continue;
+        };
 
-        match data {
-            Some(bytes) => {
-                // Key the cache by MBID when we have one, else by album identity
-                // so the same iTunes cover maps to a stable cache file.
-                let key = mbid_to_use
-                    .clone()
-                    .unwrap_or_else(|| format!("{artist}|{title}"));
-                let hash = artwork_hash(&key);
+        // Step 2: Fetch cover from Cover Art Archive (the shared MB rate limiter
+        // inside `fetch_cover_art` enforces the ~1 req/s spacing).
+        match fetch_cover_art(mbid_val).await {
+            Some(data) => {
+                let hash = artwork_hash(mbid_val);
                 std::fs::create_dir_all(&cache_dir).ok();
-                if save_to_cache(&bytes, &cache_dir, &hash, "jpg").is_some() {
+                if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
                     album_repo.update_cover_path(*album_id, &hash).ok();
                     enriched += 1;
                     info!(
@@ -444,7 +354,7 @@ pub async fn batch_enrich_artwork(
                         album = %title,
                         artist = %artist,
                         hash = %hash,
-                        size = bytes.len(),
+                        size = data.len(),
                         "batch_artwork_enriched"
                     );
                 } else {
@@ -454,7 +364,7 @@ pub async fn batch_enrich_artwork(
             }
             None => {
                 failed += 1;
-                debug!(album_id, album = %title, artist = %artist, "batch_artwork_not_found");
+                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
             }
         }
     }
@@ -667,6 +577,7 @@ async fn fetch_artist_image_musicbrainz_full(
     mbid: &str,
 ) -> Option<Vec<u8>> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -827,44 +738,24 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    // Single choke point for every artwork/artist-image download: log *why* a
-    // fetch produced nothing so an enrichment run that "finds nothing" can be
-    // diagnosed (rate-limit vs genuinely absent vs network), instead of every
-    // failure being an indistinguishable `None` (#1096). Behaviour is unchanged
-    // — all four failure cases still return `None`.
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(url, error = %e, "artwork_download_network_error");
-            return None;
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        if status.as_u16() == 429 || status.as_u16() == 503 {
+    // Single choke point for every artwork/artist-image download: classify the
+    // failure via the shared `FetchOutcome` so an enrichment run that "finds
+    // nothing" can be diagnosed — rate-limit vs genuinely absent vs network —
+    // instead of every failure being an indistinguishable `None` (#1096).
+    // Behaviour is unchanged: all failure cases still return `None`.
+    match crate::http::fetch::fetch_bytes(client, url, 1000).await {
+        crate::http::fetch::FetchOutcome::Success(bytes) => Some(bytes),
+        crate::http::fetch::FetchOutcome::RateLimited => {
+            // Counter read per-run by the enrichment batch to report throttling.
             ARTWORK_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                url,
-                status = status.as_u16(),
-                "artwork_download_rate_limited"
-            );
-        } else {
-            debug!(url, status = status.as_u16(), "artwork_download_http_error");
+            warn!(url, "artwork_download_rate_limited");
+            None
         }
-        return None;
-    }
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(url, error = %e, "artwork_download_read_error");
-            return None;
+        other => {
+            debug!(url, reason = other.reason(), "artwork_download_failed");
+            None
         }
-    };
-    if bytes.len() < 1000 {
-        debug!(url, len = bytes.len(), "artwork_download_too_small");
-        return None;
     }
-    Some(bytes.to_vec())
 }
 
 /// Run batch artist image enrichment for all artists with an MBID but no image.
@@ -1020,39 +911,6 @@ async fn batch_enrich_artist_artwork_inner(
                 }
             }
             Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
-        }
-
-        // Artists WITHOUT an MBID are excluded by every list above (they all
-        // require musicbrainz_id), yet the enrichment loop below can resolve an
-        // MBID from the name and fall back to by-name image sources. Untagged
-        // artists therefore stay grey forever in normal mode — the whole batch
-        // even reports "all have images" while these are simply never looked at
-        // (Fabien: 171/1183 artists unmatched, Tidal premium, grey squares).
-        // Include (a) those with no image at all, and (b) those whose stored
-        // image is a remote URL / missing cache file (Tidal stores unusable
-        // remote URLs), so the loop can localize a real picture.
-        let before_no_mbid = artists.len();
-        match artist_repo.list_without_image_no_mbid() {
-            Ok(no_img) => {
-                for (id, name) in no_img {
-                    artists.push((id, name, String::new()));
-                }
-            }
-            Err(e) => warn!(error = %e, "batch_artist_artwork_no_mbid_list_failed"),
-        }
-        match artist_repo.list_with_image_no_mbid() {
-            Ok(with_img) => {
-                for (id, name, image_path) in with_img {
-                    if !cached_artwork_exists(&cache_dir, &image_path) {
-                        artists.push((id, name, String::new()));
-                    }
-                }
-            }
-            Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_no_mbid_list_failed"),
-        }
-        let added_no_mbid = artists.len() - before_no_mbid;
-        if added_no_mbid > 0 {
-            info!(added_no_mbid, "batch_artist_artwork_no_mbid_included");
         }
     }
 
@@ -1472,54 +1330,6 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn itunes_hires_url_upscales() {
-        assert_eq!(
-            itunes_hires_url("https://is1.mzstatic.com/image/thumb/aaa/100x100bb.jpg"),
-            Some("https://is1.mzstatic.com/image/thumb/aaa/1200x1200bb.jpg".to_string())
-        );
-        // Unexpected shape → None so the caller falls back to the original URL.
-        assert_eq!(itunes_hires_url("https://example.com/cover.jpg"), None);
-    }
-
-    #[test]
-    fn cached_artwork_exists_rejects_remote_urls() {
-        // Remote URLs (Tidal etc.) are not local cache files, so enrichment must
-        // treat them as "missing" and localize them.
-        let dir = std::env::temp_dir();
-        assert!(!cached_artwork_exists(
-            &dir,
-            "https://resources.tidal.com/x.jpg"
-        ));
-        assert!(!cached_artwork_exists(&dir, "http://example.com/y.png"));
-    }
-
-    #[test]
-    fn normalization_variants_covers_nfd_and_nfc() {
-        // A decomposable diacritic path yields both a decomposed (NFD) and a
-        // composed (NFC) candidate so a stored-NFC path can still open an
-        // NFD-on-disk file (#995). Compute the forms from the input so the test
-        // does not depend on this source file's own normalization.
-        let input = "M:\\Music\\Camarón\\track.m4a";
-        let nfd: String = input.nfd().collect();
-        let nfc: String = input.nfc().collect();
-        assert_ne!(nfd, nfc, "composable diacritic must have distinct NFD/NFC");
-
-        let strs: Vec<String> = normalization_variants(Path::new(input))
-            .iter()
-            .map(|p| p.to_str().unwrap().to_string())
-            .collect();
-        assert!(strs.contains(&nfd), "NFD variant missing");
-        assert!(strs.contains(&nfc), "NFC variant missing");
-    }
-
-    #[test]
-    fn normalization_variants_dedupes_ascii() {
-        // Pure ASCII has one canonical form → a single candidate, no wasted opens.
-        let variants = normalization_variants(Path::new("/music/Track.flac"));
-        assert_eq!(variants.len(), 1);
-    }
 
     #[test]
     fn extended_path_windows_and_noop() {

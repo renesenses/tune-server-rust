@@ -501,6 +501,12 @@ pub fn prepare_cover_strip_faststart(path: &std::path::Path) -> Option<Faststart
     let body_src_start = moov_end;
     let body_len = file_len - moov_end;
     let total = header.len() as u64 + body_len;
+
+    // NOTE: no size-invariant cross-check here. `total` may legitimately be
+    // smaller than the on-disk size once the cover-strip faststart path lands
+    // (it removes `covr` art from `moov`, the real fix for the 24-bit ALAC
+    // "ploc"). An earlier guard rejecting `total != file_len` wrongly blocked
+    // that shrink; the strip path validates its own byte accounting.
     Some(FaststartMap {
         header,
         body_src_start,

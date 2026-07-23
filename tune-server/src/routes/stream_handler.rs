@@ -14,6 +14,59 @@ use tune_core::http::streamer::{
     build_wav_header, build_wav_header_streaming, extract_stream_id,
 };
 
+/// Tracks one HTTP consumer of a radio→WAV session for the lifetime of its
+/// stream (drops on normal end AND on client disconnect, since the streaming
+/// body future is cancelled at a yield point). Diagnostics for the
+/// "FIP silent after upstream reconnect" case: the PCM channel is
+/// single-consumer, so a second concurrent request would split the stream.
+struct RadioConsumerGuard {
+    session: std::sync::Arc<StreamSession>,
+    started: std::time::Instant,
+    /// Set true when the channel closed cleanly (recv returned None), so the
+    /// Drop path can tell a graceful end from a client disconnect.
+    completed: bool,
+}
+
+impl RadioConsumerGuard {
+    fn new(session: std::sync::Arc<StreamSession>) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = session.active_consumers.fetch_add(1, Relaxed) + 1;
+        if n > 1 {
+            warn!(
+                stream_id = %session.id,
+                consumers = n,
+                "radio_stream_concurrent_consumer — a 2nd request is racing the \
+                 single-consumer PCM channel; chunks will be split between \
+                 connections (renderer re-requested without closing the first)"
+            );
+        }
+        Self {
+            session,
+            started: std::time::Instant::now(),
+            completed: false,
+        }
+    }
+}
+
+impl Drop for RadioConsumerGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let remaining = self
+            .session
+            .active_consumers
+            .fetch_sub(1, Relaxed)
+            .saturating_sub(1);
+        if !self.completed {
+            info!(
+                stream_id = %self.session.id,
+                connected_secs = self.started.elapsed().as_secs(),
+                remaining_consumers = remaining,
+                "radio_stream_client_disconnect — HTTP consumer dropped mid-stream"
+            );
+        }
+    }
+}
+
 pub async fn handle_head(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
@@ -266,9 +319,22 @@ pub async fn handle_stream(
             // but can cause the browser's <audio> element (or the local
             // output's HTTP reader) to stall waiting for the first data
             // after the WAV header, resulting in silence.
+            // The guard counts concurrent consumers and logs how the stream
+            // ends (diagnostics for the FIP silent-after-reconnect case).
+            let mut guard = RadioConsumerGuard::new(session.clone());
             while let Some(chunk) = session.recv_chunk().await {
                 yield Ok(bytes::Bytes::from(chunk));
             }
+            // recv returned None → the PCM channel was closed (all senders,
+            // incl. the keep-alive, dropped). A radio session should stay open
+            // across upstream reconnects, so this is worth surfacing.
+            guard.completed = true;
+            info!(
+                stream_id = %session.id,
+                connected_secs = guard.started.elapsed().as_secs(),
+                "radio_stream_channel_closed — PCM channel ended (senders dropped); \
+                 renderer will see EOF"
+            );
         } else {
             // Coalesce small chunks into larger HTTP writes (target >=64 KB).
             // Network outputs like Squeezebox/LMS fetch audio from this HTTP
@@ -587,11 +653,6 @@ fn resumable_proxy_body(
     initial: reqwest::Response,
     abs_offset: u64,
     reresolve: Option<ReresolveFn>,
-    // Bytes to discard from the FRONT of `initial` before yielding. Non-zero
-    // only when the upstream was fetched from byte 0 but the client asked for a
-    // small `bytes=N-` range we serve locally (OpenHome renderers, see caller).
-    // Applies to the first upstream connection only; reconnects fetch from `pos`.
-    skip_prefix: u64,
 ) -> Body {
     Body::from_stream(async_stream::stream! {
         use futures_util::StreamExt;
@@ -600,22 +661,13 @@ fn resumable_proxy_body(
         let mut url = upstream_url;
         // Absolute file offset of the next byte we expect to yield.
         let mut pos = abs_offset;
-        let mut to_skip = skip_prefix;
         let mut resumes: u32 = 0;
         loop {
             let mut stream = resp.bytes_stream();
             let mut clean_eof = true;
             loop {
                 match stream.next().await {
-                    Some(Ok(mut chunk)) => {
-                        if to_skip > 0 {
-                            let n = to_skip.min(chunk.len() as u64) as usize;
-                            let _ = chunk.split_to(n);
-                            to_skip -= n as u64;
-                            if chunk.is_empty() {
-                                continue;
-                            }
-                        }
+                    Some(Ok(chunk)) => {
                         pos += chunk.len() as u64;
                         yield Ok::<_, std::io::Error>(chunk);
                     }
@@ -803,7 +855,6 @@ async fn proxy_stream(
             upstream_resp,
             start,
             reresolve.clone(),
-            0,
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -850,43 +901,8 @@ async fn proxy_stream(
             upstream_resp,
             0,
             reresolve.clone(),
-            0,
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
-    }
-
-    // OpenHome renderers (Lumin/Linn) read the FLAC header via `bytes=0-`, then
-    // re-request the audio body via a small `bytes=N-` (N below the 1 MiB resume
-    // threshold, so it is NOT forwarded to the CDN). The 200-from-byte-0
-    // fall-through below made the renderer receive the header again and loop the
-    // first ~2 s (Vincent Guillemin / VUmètre, Lumin). Serve the range locally:
-    // skip the first N bytes of the already-fetched from-0 body and answer 206
-    // with the correct Content-Range — one CDN fetch, no extra Akamai load.
-    let small_range_start = range_value
-        .as_deref()
-        .and_then(parse_range_start)
-        .filter(|&n| n > 0 && n < RESUME_RANGE_THRESHOLD);
-    if let (Some(start), Some(cl)) = (small_range_start, content_length) {
-        if start < cl {
-            headers.insert("Content-Length", HeaderValue::from(cl - start));
-            headers.insert(
-                "Content-Range",
-                HeaderValue::from_str(&format!("bytes {start}-{}/{}", cl - 1, cl)).unwrap(),
-            );
-            info!(
-                url = upstream_url,
-                start, "proxy_small_range_206_local_skip"
-            );
-            let body = resumable_proxy_body(
-                client,
-                upstream_url.to_string(),
-                upstream_resp,
-                start,
-                reresolve.clone(),
-                start,
-            );
-            return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
-        }
     }
 
     if let Some(cl) = content_length {
@@ -899,7 +915,6 @@ async fn proxy_stream(
         upstream_resp,
         0,
         reresolve.clone(),
-        0,
     );
     (StatusCode::OK, headers, body).into_response()
 }

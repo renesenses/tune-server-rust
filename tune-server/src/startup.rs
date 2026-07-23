@@ -70,41 +70,7 @@ fn deduplicate_zones(state: &AppState) {
 }
 
 fn cleanup_orphan_queues(state: &AppState) {
-    // `streaming_queue` is NOT part of CORE_SCHEMA (init_schema); it is created
-    // by migration v53 and re-created belt-and-suspenders at the end of
-    // run_migrations. Both run before this cleanup — but if that CREATE ever
-    // fails silently (e.g. a WAL/file lock on a NAS like Synology, where the
-    // migration's `.ok()`/execute_batch swallows the error), the DELETE below
-    // hits "no such table: streaming_queue" and logs `orphan_queue_cleanup_failed`
-    // (tester Yacine, DS418j). Re-assert the table here immediately before the
-    // DELETE so the cleanup is self-healing and the warning can never fire on a
-    // correctly-migrated DB. IF NOT EXISTS = no-op when it already exists.
-    // Schema is IDENTICAL to migration v53 / play_queue_repo::CREATE_STREAMING_QUEUE.
-    // `play_queue` is in CORE_SCHEMA so it always exists; only SQLite needs this
-    // guard (PG creates streaming_queue in migration 006 before any cleanup).
-    if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        if let Err(e) = state.backend.execute_batch(
-            "CREATE TABLE IF NOT EXISTS streaming_queue (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT,\
-                zone_id INTEGER NOT NULL,\
-                position INTEGER NOT NULL,\
-                source TEXT,\
-                source_id TEXT,\
-                title TEXT,\
-                artist TEXT,\
-                album TEXT,\
-                cover_url TEXT,\
-                duration_ms INTEGER DEFAULT 0\
-            );",
-        ) {
-            tracing::warn!(error = %e, "orphan_queue_ensure_streaming_queue_failed");
-        }
-    }
-
-    let sqls = [
-        "DELETE FROM play_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
-        "DELETE FROM streaming_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
-    ];
+    let sqls = ["DELETE FROM queue_items WHERE zone_id NOT IN (SELECT id FROM zones)"];
     for sql in &sqls {
         match state.backend.execute(sql, &[]) {
             Ok(removed) if removed > 0 => {
@@ -314,24 +280,16 @@ async fn restore_playback_positions(state: &AppState) {
             }
             let np = if let Some(track_id) = zone.last_track_id {
                 if let Ok(Some(track)) = track_repo.get(track_id) {
+                    // Restore the source/source_id from the *zone* row (the
+                    // saved playback origin), not the library row — a track may
+                    // have been played from a streaming source.
                     tune_core::playback::NowPlaying {
-                        track_id: Some(track_id),
-                        title: track.title.clone(),
-                        artist_name: track.artist_name.clone(),
-                        album_title: track.album_title.clone(),
-                        cover_path: track.cover_path.clone(),
-                        duration_ms: track.duration_ms,
                         source: zone
                             .last_track_source
                             .clone()
                             .unwrap_or_else(|| "local".into()),
                         source_id: zone.last_track_source_id.clone(),
-                        stream_id: None,
-                        format: track.format.clone(),
-                        sample_rate: track.sample_rate.map(|v| v as u32),
-                        bit_depth: track.bit_depth.map(|v| v as u32),
-                        genre: track.genre.clone(),
-                        year: track.year,
+                        ..tune_core::playback::NowPlaying::from_track(&track)
                     }
                 } else {
                     continue;
@@ -464,35 +422,6 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
         if !already_set {
             settings.set("discogs_token", token).ok();
             info!("discogs_token_persisted_from_env");
-        }
-    }
-
-    // Mirror the Last.fm API key/secret from env into the settings DB. The whole
-    // scrobbling flow (auth.getSession exchange in service_tokens.rs, and the
-    // scrobbler in orchestrator.rs) reads these from the settings table, not from
-    // config — so a user who only set TUNE_LASTFM_API_KEY/SECRET in .env got
-    // "lastfm_api_key not configured" and no scrobbling, even though the keys were
-    // loaded (forum #1113). Read straight from env (the server TuneConfig does not
-    // carry Last.fm) and persist once when absent, exactly like discogs_token.
-    for (env_var, key) in [
-        ("TUNE_LASTFM_API_KEY", "lastfm_api_key"),
-        ("TUNE_LASTFM_API_SECRET", "lastfm_api_secret"),
-    ] {
-        let env_val = match std::env::var(env_var) {
-            Ok(v) if !v.is_empty() => v,
-            _ => continue,
-        };
-        let settings =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-        let already_set = settings
-            .get(key)
-            .ok()
-            .flatten()
-            .filter(|v| !v.is_empty())
-            .is_some();
-        if !already_set {
-            settings.set(key, &env_val).ok();
-            info!("{key}_persisted_from_env");
         }
     }
 

@@ -127,13 +127,6 @@ pub struct PlayRequest {
     pub duration_ms: Option<i64>,
     pub seek_ms: Option<u64>,
     pub temp_file_path: Option<String>,
-    /// Real resolution/codec for a media-server (`source="upnp"`) URL, taken from
-    /// the DIDL res@ attributes (the same the DartZeel reads). Lets the signal
-    /// path show the true rate/bit-depth and infer ALAC-vs-AAC instead of
-    /// defaulting to "AAC 44kHz/16bit — Avec perte" (Yves, NAS ALAC).
-    pub sample_rate: Option<u32>,
-    pub bit_depth: Option<u16>,
-    pub media_format: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -485,12 +478,6 @@ impl PlaybackOrchestrator {
                     "qobuz" => Some("flac".to_string()),
                     _ => None,
                 })
-                // A media-server (UPnP/NAS) item has no local track row, so the
-                // codec the client read from the DIDL res@protocolInfo is the only
-                // authoritative source: audio/mp4 is ambiguous ALAC-vs-AAC, so
-                // surface "alac" here instead of falling back to the "mp4" MIME
-                // and mislabeling a lossless ALAC as lossy AAC (Yves, NAS).
-                .or_else(|| req.media_format.clone())
                 .or_else(|| {
                     let mime = &resolved.mime_type;
                     Some(
@@ -972,6 +959,25 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
+    /// Some radio servers (Icecast) answer HEAD with 400 Bad Request. A DLNA
+    /// renderer that HEAD-probes the stream URL before playback then refuses to
+    /// play it (Cyrille's Yamaha R-N2000A: the MP3 Icecast stations Radio
+    /// Classique / TSF Jazz stay silent while AAC stations work). Returns false
+    /// ONLY on a confirmed non-success HEAD, so we proxy just those; a transient
+    /// network error stays `true` to avoid needlessly proxying working stations.
+    async fn radio_head_ok(&self, url: &str) -> bool {
+        let probe = url.replacen("https://", "http://", 1);
+        match crate::http::client::shared()
+            .head(&probe)
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => true,
+        }
+    }
+
     async fn resolve_direct_url(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let audio_url = req
             .source_id
@@ -1135,16 +1141,12 @@ impl PlaybackOrchestrator {
                     (direct_url, None, mime_type.to_string(), None, None, None)
                 }
             } else {
-                // Media-server / podcast direct URL. Carry the real resolution the
-                // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
-                // instead of letting the signal path default to 44.1kHz/16bit and
-                // mislabel a hi-res ALAC as lossy AAC (Yves, NAS).
                 (
                     audio_url.to_string(),
                     None,
                     mime_type.to_string(),
-                    req.sample_rate,
-                    req.bit_depth.map(|b| b as u32),
+                    None,
+                    None,
                     None,
                 )
             };
@@ -1989,51 +1991,13 @@ impl PlaybackOrchestrator {
             let passthrough_file_size =
                 passthrough_disk_size.or_else(|| track.file_size.map(|s| s as u64));
 
-            // For M4A/ALAC passthrough, build the on-the-fly faststart map UP
-            // FRONT so the advertised size (DIDL `res@size` + HEAD Content-Length)
-            // matches the bytes actually served. The map serves the file as
-            // `ftyp + patched-moov + mdat` (moov relocated to the front) so the
-            // renderer reads its metadata immediately instead of seeking to the
-            // END of the file first — a slow start + Range storm, esp. over a NAS
-            // mount (Yves, LHC-56, 192/24 ALAC on SMB). It also strips embedded
-            // cover art (`covr`) from the moov, which triggers a start-of-track
-            // "ploc" on some renderers in ALAC passthrough (Yves, LHC-56). Pure
-            // relocation keeps `total == disk size`; a cover-strip makes `total`
-            // SMALLER, so the served Content-Length and the DIDL `res@size` MUST
-            // both come from `map.total` — otherwise the renderer waits for cover
-            // bytes that never arrive and restarts/loops near EOF (#1132 inverse).
-            // Reads only ftyp+moov (never mdat), so it adds no copy latency; falls
-            // back to the original file if not applicable.
-            let faststart_map = if source_format == Some(AudioFormat::Alac) {
-                let fp = file_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Non-faststart (moov after mdat): relocate moov + strip cover.
-                    // Already-faststart (moov before mdat): strip the cover in
-                    // place — otherwise these files kept their cover and still
-                    // "ploc'd" on the LHC-56 (Yves: Aurora fixed, but modern
-                    // faststart-encoded albums still clicked).
-                    let p = std::path::Path::new(&fp);
-                    crate::audio::faststart::prepare_faststart(p)
-                        .or_else(|| crate::audio::faststart::prepare_cover_strip_faststart(p))
-                })
-                .await
-                .ok()
-                .flatten()
-            } else {
-                None
-            };
-            let advertised_file_size = faststart_map
-                .as_ref()
-                .map(|m| m.total)
-                .or(passthrough_file_size);
-
             let info = StreamInfo {
                 format: fmt.clone(),
                 mime_type: mime.clone(),
                 sample_rate,
                 bit_depth,
                 channels,
-                file_size: advertised_file_size,
+                file_size: passthrough_file_size,
                 duration_ms: Some(track.duration_ms as u64),
                 ..Default::default()
             };
@@ -2043,14 +2007,23 @@ impl PlaybackOrchestrator {
                 .create_file_session(info, file_path.clone(), false)
                 .await;
 
-            if let Some(map) = faststart_map {
-                info!(
-                    file = %file_path,
-                    total = map.total,
-                    disk = ?passthrough_file_size,
-                    "m4a_faststart_applied"
-                );
-                self.streamer.set_faststart(&session_id, map).await;
+            // For M4A/ALAC passthrough, attach an on-the-fly faststart map so the
+            // file is served as `ftyp + patched-moov + mdat` (moov relocated to
+            // the front). The renderer then reads its metadata up front and starts
+            // immediately instead of seeking to the END of the file first — a slow
+            // start + Range storm, esp. over a NAS mount (Yves, LHC-56, 192/24
+            // ALAC on SMB). This reads only ftyp+moov (never mdat), so it adds no
+            // copy latency, and falls back to the original file if not applicable.
+            if source_format == Some(AudioFormat::Alac) {
+                let fp = file_path.clone();
+                if let Ok(Some(map)) = tokio::task::spawn_blocking(move || {
+                    crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                })
+                .await
+                {
+                    info!(file = %file_path, "m4a_faststart_applied");
+                    self.streamer.set_faststart(&session_id, map).await;
+                }
             }
 
             // Parallel decode-for-levels: decode the audio in the background
@@ -2127,7 +2100,7 @@ impl PlaybackOrchestrator {
                 session_id,
                 mime,
                 fmt.clone(),
-                advertised_file_size,
+                passthrough_file_size,
                 Some(sample_rate),
                 Some(bit_depth as u32),
                 Some(channels as u32),
@@ -2353,7 +2326,31 @@ impl PlaybackOrchestrator {
         let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
             let upstream_url = stream_data.url.clone();
             let codec = stream_data.quality.codec.to_lowercase();
-            let sr = stream_data.quality.sample_rate;
+            // Cap the WAV rate to the zone's max_sample_rate (e.g. an OAAT
+            // endpoint whose DAC tops out at 96k). resolve_local_track applies
+            // this cap for local files; the streaming path historically did NOT,
+            // so a 192k Qobuz/Tidal track was transcoded to a 192k WAV and handed
+            // to a 96k OAAT endpoint → the DAC rejected the rate → silence with no
+            // server-side error (radio at 44.1/48k on the same zone played fine).
+            // decode_to_pcm_streaming_with_levels resamples to `sr`, so capping
+            // here downsamples the PCM, not just the WAV header.
+            let zone_max_sample_rate = ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.max_sample_rate);
+            let mut sr = stream_data.quality.sample_rate;
+            if let Some(max_sr) = zone_max_sample_rate {
+                if sr > max_sr {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = sr,
+                        max_rate = max_sr,
+                        "streaming_zone_max_sample_rate_cap_applied"
+                    );
+                    sr = max_sr;
+                }
+            }
             // Local output: 32-bit to avoid 24-bit byte misalignment noise
             // (see local_needs_wav comment in resolve_local_track).
             // OAAT: cap at 24-bit (endpoints may not support 32-bit WAV).
@@ -3820,23 +3817,15 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
-        // at play-start, which (a) scrobbled a track the instant it began — so
-        // skipping after a few seconds still scrobbled it, ignoring Last.fm's
-        // 50%/4-min rule — and (b) was gated by `record_history`, which the
-        // gapless/prefetch advance paths bypass (`play_without_history`), so
-        // every other track on an album was silently dropped (Bilou, #1113). The
-        // poller now dispatches the scrobble once the track has actually been
-        // listened past the threshold (see `dispatch_scrobble`).
+        // Multi-service scrobble dispatch with tier gating.
+        // Free tier: only the first configured service fires.
+        // Premium tier: all configured services fire simultaneously.
+        self.dispatch_scrobble(title, artist, album);
     }
 
     /// Dispatch scrobbles to all configured services, respecting tier limits.
     /// Free = 1 service max, Premium = all simultaneously.
-    ///
-    /// Called by the poller once the current track has been played past the
-    /// Last.fm threshold (50% or 4 min), so a scrobble reflects a real listen
-    /// rather than a mere play-start (#1113).
-    pub fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+    fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let settings = SettingsRepo::with_backend(self.db.clone());
 
         let lastfm_ready = self.lastfm_keys().is_some();
@@ -3850,7 +3839,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_scrobble(title, artist, album);
+            self.lastfm_scrobble(title, artist);
         }
 
         if lb_ready {
@@ -3879,7 +3868,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_now_playing(title, artist, album);
+            self.lastfm_now_playing(title, artist);
         }
 
         if lb_ready {
@@ -3900,7 +3889,7 @@ impl PlaybackOrchestrator {
         Some((api_key, api_secret, session_key))
     }
 
-    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3909,23 +3898,17 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
-        // Send the album too: Last.fm/Pano apps rely on it to fetch the cover
-        // (the web site does a looser track-level match), so scrobbles without
-        // an album showed no artwork in the apps (#1113).
-        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::scrobble_full(
+            if let Err(e) = crate::scrobble::scrobble(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
-                album.as_deref(),
-                None,
                 timestamp,
             )
             .await
@@ -3935,7 +3918,7 @@ impl PlaybackOrchestrator {
         });
     }
 
-    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3944,16 +3927,13 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
-        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::update_now_playing_full(
+            if let Err(e) = crate::scrobble::update_now_playing(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
-                album.as_deref(),
-                None,
             )
             .await
             {
@@ -4308,9 +4288,6 @@ impl PlaybackOrchestrator {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: None,
                         temp_file_path: None,
-                        sample_rate: None,
-                        bit_depth: None,
-                        media_format: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -4411,9 +4388,6 @@ impl PlaybackOrchestrator {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: Some(position_ms),
                         temp_file_path: None,
-                        sample_rate: None,
-                        bit_depth: None,
-                        media_format: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -4541,202 +4515,177 @@ impl PlaybackOrchestrator {
             .flatten()
             .and_then(|z| z.output_device_id);
 
-        // Try local queue first
-        queue_repo.set_current(zone_id, position).ok();
-        let queue = queue_repo.get_queue(zone_id)?;
-        if let Some(item) = queue.iter().find(|i| i.is_current) {
-            let req = PlayRequest {
-                zone_id,
-                output_device_id,
-                track_id: Some(item.track_id),
-                source: None,
-                source_id: None,
-                title: item.title.clone(),
-                artist_name: item.artist_name.clone(),
-                album_title: item.album_title.clone(),
-                cover_url: item.cover_path.clone(),
-                duration_ms: item.duration_ms,
-                seek_ms: None,
-                temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
-            };
-            // Set the queue index before play() emits "started" so the event
-            // carries the correct queue_position (#1096).
-            self.playback
-                .update_queue_info(zone_id, position, queue.len() as i64)
-                .await;
-            let result = self.play(req).await?;
-            return Ok(result);
-        }
-
-        // Fallback to streaming queue. A zone can hold BOTH a local play_queue
-        // and a streaming_queue at once (a Qobuz track added while a local file
-        // plays), and the poller advances through a COMBINED position space:
-        // local items occupy 0..L, streaming items L..L+S. Index the streaming
-        // vec by the offset within its own 0-based table, not the raw combined
-        // position (Progman: the added Qobuz track never played because
-        // streaming.get(1) was None for 1 local + 1 streaming).
-        let local_count = queue.len() as i64;
-        let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        let item = streaming
-            .get((position - local_count).max(0) as usize)
+        // Unified single-position-space resolution: `position` indexes ONE
+        // ordered queue (local + streaming). Look the row up directly — no more
+        // "try local, then offset into streaming by position - local_count",
+        // which broke manual Next across a source boundary (Sandro S2: the local
+        // "next" was never found after a Qobuz track, so the zone froze).
+        queue_repo.set_current_pos(zone_id, position).ok();
+        let total = queue_repo.count_all(zone_id)?;
+        let entry = queue_repo
+            .get_at(zone_id, position)?
             .ok_or("no queue item at position")?;
 
-        let source_id = item["source_id"].as_str().unwrap_or("").to_string();
-        let mut title = item["title"].as_str().map(String::from);
-        let mut artist = item["artist_name"].as_str().map(String::from);
-        let mut album = item["album_title"].as_str().map(String::from);
-        let mut cover = item["cover_path"].as_str().map(String::from);
-        let duration = item["duration_ms"].as_i64();
-
-        let current_state = self.playback.get_state(zone_id).await;
-
-        // Repeat on a single-track queue re-plays the SAME position, but the
-        // streaming_queue row can carry an empty title (persisted without
-        // metadata). play() would then hand an empty title down the prefetched
-        // path and blank Now Playing (DEvir: auto_next title=CHANGGWI followed by
-        // orchestrator_play title=). When the row title is empty AND now_playing
-        // is still the very same track (same source_id), reuse its metadata
-        // synchronously — no network round-trip, and it can't mislabel a
-        // different track because the source_id must match.
-        let title_empty = title.as_deref().unwrap_or("").is_empty();
-        if title_empty
-            && let Some(np) = current_state.now_playing.as_ref()
-            && np.source_id.as_deref() == Some(source_id.as_str())
-            && !np.title.is_empty()
-        {
-            title = Some(np.title.clone());
-            artist = artist.or_else(|| np.artist_name.clone());
-            album = album.or_else(|| np.album_title.clone());
-            cover = cover.or_else(|| np.cover_path.clone());
-        }
-
-        // Use the stored source from the streaming_queue, falling back to
-        // the current now_playing source (handles old DB rows without source).
-        let source = if let Some(s) = item["source"].as_str() {
-            s.to_string()
+        let req = if let Some(track_id) = entry.track_id {
+            // Local track.
+            PlayRequest {
+                zone_id,
+                output_device_id,
+                track_id: Some(track_id),
+                source: None,
+                source_id: None,
+                title: entry.title.clone(),
+                artist_name: entry.artist_name.clone(),
+                album_title: entry.album_title.clone(),
+                cover_url: entry.cover_path.clone(),
+                duration_ms: entry.duration_ms,
+                seek_ms: None,
+                temp_file_path: None,
+            }
         } else {
-            current_state
-                .now_playing
-                .as_ref()
-                .map(|np| np.source.clone())
-                .unwrap_or_else(|| "tidal".into())
+            // Streaming track.
+            let source_id = entry.source_id.clone().unwrap_or_default();
+            let mut title = entry.title.clone();
+            let mut artist = entry.artist_name.clone();
+            let mut album = entry.album_title.clone();
+            let mut cover = entry.cover_path.clone();
+
+            let current_state = self.playback.get_state(zone_id).await;
+
+            // Repeat on a single-track queue re-plays the SAME position, but the
+            // streaming row can carry an empty title (persisted without
+            // metadata). play() would then hand an empty title down the
+            // prefetched path and blank Now Playing (DEvir). When the row title
+            // is empty AND now_playing is still the very same track (same
+            // source_id), reuse its metadata synchronously — no network
+            // round-trip, and it can't mislabel a different track since the
+            // source_id must match.
+            let title_empty = title.as_deref().unwrap_or("").is_empty();
+            if title_empty
+                && let Some(np) = current_state.now_playing.as_ref()
+                && np.source_id.as_deref() == Some(source_id.as_str())
+                && !np.title.is_empty()
+            {
+                title = Some(np.title.clone());
+                artist = artist.or_else(|| np.artist_name.clone());
+                album = album.or_else(|| np.album_title.clone());
+                cover = cover.or_else(|| np.cover_path.clone());
+            }
+
+            // Use the stored source, falling back to the current now_playing
+            // source (handles old DB rows without a source value).
+            let source = entry
+                .source
+                .clone()
+                .filter(|s| !s.is_empty() && s != "local")
+                .unwrap_or_else(|| {
+                    current_state
+                        .now_playing
+                        .as_ref()
+                        .map(|np| np.source.clone())
+                        .unwrap_or_else(|| "tidal".into())
+                });
+
+            PlayRequest {
+                zone_id,
+                output_device_id,
+                track_id: None,
+                source: Some(source),
+                source_id: Some(source_id),
+                title,
+                artist_name: artist,
+                album_title: album,
+                cover_url: cover,
+                duration_ms: entry.duration_ms,
+                seek_ms: None,
+                temp_file_path: None,
+            }
         };
 
-        let req = PlayRequest {
-            zone_id,
-            output_device_id,
-            track_id: None,
-            source: Some(source),
-            source_id: Some(source_id),
-            title,
-            artist_name: artist,
-            album_title: album,
-            cover_url: cover,
-            duration_ms: duration,
-            seek_ms: None,
-            temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
-        };
-
-        let result = self.play(req).await?;
+        // Set the queue index BEFORE play() emits "started" so the event
+        // carries the correct queue_position and the client updates its
+        // highlight without refetching the whole queue (#1096).
         self.playback
-            .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
+            .update_queue_info(zone_id, position, total)
             .await;
+        let result = self.play(req).await?;
         Ok(result)
     }
 
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
-        queue_repo.set_current(zone_id, position).ok();
+        queue_repo.set_current_pos(zone_id, position).ok();
 
-        let queue = queue_repo.get_queue(zone_id)?;
-        if let Some(item) = queue.iter().find(|i| i.is_current) {
+        let total = queue_repo.count_all(zone_id)?;
+        let entry = queue_repo
+            .get_at(zone_id, position)?
+            .ok_or("no queue item at position")?;
+
+        let np = if let Some(track_id) = entry.track_id {
             let track_repo = crate::db::track_repo::TrackRepo::with_backend(self.db.clone());
-            let track = track_repo.get(item.track_id).ok().flatten();
+            let track = track_repo.get(track_id).ok().flatten();
             let cover_path = track.as_ref().and_then(|t| t.cover_path.clone());
-            let np = crate::playback::NowPlaying {
-                track_id: Some(item.track_id),
-                title: item.title.clone().unwrap_or_default(),
-                artist_name: item.artist_name.clone(),
-                album_title: item.album_title.clone(),
+            // Audio-format fields (format/sample_rate/bit_depth/genre/year) come
+            // from the library row via `from_track` (single source of the
+            // source-over-output bit-depth rule); display fields come from the
+            // queue-entry cache and source is pinned local.
+            crate::playback::NowPlaying {
+                track_id: Some(track_id),
+                title: entry.title.clone().unwrap_or_default(),
+                artist_name: entry.artist_name.clone(),
+                album_title: entry.album_title.clone(),
                 cover_path: self.resolve_cover_url(cover_path.as_deref()),
-                duration_ms: item.duration_ms.unwrap_or(0),
+                duration_ms: entry.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
-                stream_id: None,
-                format: track.as_ref().and_then(|t| t.format.clone()),
-                sample_rate: track.as_ref().and_then(|t| t.sample_rate.map(|v| v as u32)),
-                bit_depth: track.as_ref().and_then(|t| t.bit_depth.map(|v| v as u32)),
-                genre: track.as_ref().and_then(|t| t.genre.clone()),
-                year: track.as_ref().and_then(|t| t.year),
-            };
-            // Set the queue index BEFORE emitting track_changed so the event
-            // carries the new queue_position — the client then updates its
-            // highlight without refetching the whole queue (#1096).
-            self.playback
-                .update_queue_info(zone_id, position, queue.len() as i64)
-                .await;
-            // Use update_now_playing (not play) to avoid bumping
-            // track_generation — the poller must keep its gapless_cooldown
-            // intact so it doesn't falsely detect track-end on renderers
-            // that briefly report Stopped during gapless transitions.
-            self.playback.update_now_playing(zone_id, np).await;
-            // Reset position to 0 — the new track starts from the beginning.
-            // Without this, the UI shows the cumulative position from the
-            // previous track until the next poller tick overwrites it.
-            self.playback.update_position(zone_id, 0).await;
-            self.playback.emit_position(zone_id, 0);
-            return Ok(());
-        }
-
-        let local_count = queue.len() as i64;
-        let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        if let Some(item) = streaming.get((position - local_count).max(0) as usize) {
-            let title = item["title"].as_str().unwrap_or("").to_string();
-            let artist = item["artist_name"].as_str().map(String::from);
-            let album = item["album_title"].as_str().map(String::from);
-            let cover = item["cover_path"].as_str().map(String::from);
-            let duration = item["duration_ms"].as_i64().unwrap_or(0);
-            let source = if let Some(s) = item["source"].as_str() {
-                s.to_string()
-            } else {
+                ..track
+                    .as_ref()
+                    .map(crate::playback::NowPlaying::from_track)
+                    .unwrap_or_default()
+            }
+        } else {
+            let source = entry
+                .source
+                .clone()
+                .filter(|s| !s.is_empty() && s != "local")
+                .unwrap_or_else(|| "streaming".into());
+            let source = if source == "streaming" {
                 let cs = self.playback.get_state(zone_id).await;
                 cs.now_playing
                     .as_ref()
                     .map(|np| np.source.clone())
                     .unwrap_or_else(|| "streaming".into())
+            } else {
+                source
             };
-            let np = crate::playback::NowPlaying {
+            crate::playback::NowPlaying {
                 track_id: None,
-                title,
-                artist_name: artist,
-                album_title: album,
-                cover_path: self.resolve_cover_url(cover.as_deref()),
-                duration_ms: duration,
+                title: entry.title.clone().unwrap_or_default(),
+                artist_name: entry.artist_name.clone(),
+                album_title: entry.album_title.clone(),
+                cover_path: self.resolve_cover_url(entry.cover_path.as_deref()),
+                duration_ms: entry.duration_ms.unwrap_or(0),
                 source,
-                source_id: item["source_id"].as_str().map(String::from),
+                source_id: entry.source_id.clone(),
                 stream_id: None,
                 ..Default::default()
-            };
-            // Set the queue index before emitting track_changed (see above).
-            self.playback
-                .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
-                .await;
-            // Same rationale: gapless metadata-only advance must not
-            // bump track_generation — but position MUST reset to 0
-            // because the new track starts from the beginning.
-            self.playback.update_now_playing(zone_id, np).await;
-            self.playback.update_position(zone_id, 0).await;
-            self.playback.emit_position(zone_id, 0);
-            return Ok(());
-        }
+            }
+        };
 
-        Err("no queue item at position".into())
+        // Set the queue index BEFORE update_now_playing emits "track_changed"
+        // so the event carries the new queue_position — the client updates its
+        // highlight/badge without refetching the whole queue (#1096).
+        self.playback
+            .update_queue_info(zone_id, position, total)
+            .await;
+        // Use update_now_playing (not play) to avoid bumping track_generation —
+        // the poller must keep its gapless_cooldown intact so it doesn't falsely
+        // detect track-end on renderers that briefly report Stopped during
+        // gapless transitions. Position MUST reset to 0 (new track from start).
+        self.playback.update_now_playing(zone_id, np).await;
+        self.playback.update_position(zone_id, 0).await;
+        self.playback.emit_position(zone_id, 0);
+        Ok(())
     }
 
     pub async fn resolve_queue_item_url(
@@ -4750,11 +4699,15 @@ impl PlaybackOrchestrator {
 
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
-        // Try local queue first
-        let queue = queue_repo.get_queue(zone_id)?;
-        if let Some(item) = queue.iter().find(|i| i.position == position) {
-            let album = item.album_title.clone();
-            let cover = item.cover_path.clone();
+        // Unified single-position-space lookup (local or streaming).
+        let entry = queue_repo
+            .get_at(zone_id, position)?
+            .ok_or("no queue item at position (local or streaming)")?;
+
+        // Local track.
+        if let Some(track_id) = entry.track_id {
+            let album = entry.album_title.clone();
+            let cover = entry.cover_path.clone();
             // Resolve the gapless/prefetch stream FOR THE ACTUAL OUTPUT. Without
             // the device id, resolve_stream doesn't apply the output's format
             // rules, so a local output (which needs WAV/PCM) was pre-armed with
@@ -4769,19 +4722,16 @@ impl PlaybackOrchestrator {
             let req = PlayRequest {
                 zone_id,
                 output_device_id,
-                track_id: Some(item.track_id),
+                track_id: Some(track_id),
                 source: None,
                 source_id: None,
-                title: item.title.clone(),
-                artist_name: item.artist_name.clone(),
+                title: entry.title.clone(),
+                artist_name: entry.artist_name.clone(),
                 album_title: album.clone(),
                 cover_url: cover.clone(),
-                duration_ms: item.duration_ms,
+                duration_ms: entry.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -4807,28 +4757,26 @@ impl PlaybackOrchestrator {
             });
         }
 
-        // Fallback to streaming queue (Tidal, Qobuz, Deezer, etc.). Combined
-        // position space: local 0..L, streaming L..L+S — index by the offset
-        // within the streaming table.
-        let local_count = queue.len() as i64;
-        let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        let item = streaming
-            .get((position - local_count).max(0) as usize)
-            .ok_or("no queue item at position (local or streaming)")?;
-        let source_id = item["source_id"].as_str().unwrap_or("").to_string();
-        let title = item["title"].as_str().map(String::from);
-        let artist = item["artist_name"].as_str().map(String::from);
-        let album = item["album_title"].as_str().map(String::from);
-        let cover = item["cover_path"].as_str().map(String::from);
-        let duration = item["duration_ms"].as_i64();
-        let source = if let Some(s) = item["source"].as_str() {
-            s.to_string()
-        } else {
-            let cs = self.playback.get_state(zone_id).await;
-            cs.now_playing
-                .as_ref()
-                .map(|np| np.source.clone())
-                .unwrap_or_else(|| "tidal".into())
+        // Streaming track (Tidal, Qobuz, Deezer, etc.).
+        let source_id = entry.source_id.clone().unwrap_or_default();
+        let title = entry.title.clone();
+        let artist = entry.artist_name.clone();
+        let album = entry.album_title.clone();
+        let cover = entry.cover_path.clone();
+        let duration = entry.duration_ms;
+        let source = match entry
+            .source
+            .clone()
+            .filter(|s| !s.is_empty() && s != "local")
+        {
+            Some(s) => s,
+            None => {
+                let cs = self.playback.get_state(zone_id).await;
+                cs.now_playing
+                    .as_ref()
+                    .map(|np| np.source.clone())
+                    .unwrap_or_else(|| "tidal".into())
+            }
         };
         let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
@@ -4848,9 +4796,6 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -4973,6 +4918,9 @@ fn decode_radio_stream_to_pcm(
     // MAX_RECONNECTS so a permanently-dead station still falls back to the poller.
     const MAX_RECONNECTS: u32 = 30;
     let mut reconnects: u32 = 0;
+    // When the upstream last dropped, so we can measure how long the renderer
+    // was starved during a reconnect (diagnostics: FIP silent-after-reconnect).
+    let mut dropped_at: Option<std::time::Instant> = None;
     // Format of the first successful connection. A reconnect that returns a
     // different rate/channel layout would feed PCM that doesn't match the WAV
     // header already sent to the renderer, so we bail to a fresh session instead.
@@ -5107,12 +5055,25 @@ fn decode_radio_stream_to_pcm(
             .detected_channels
             .store(source_channels, std::sync::atomic::Ordering::Relaxed);
 
+        // Measure the reconnect gap: how long the session went without fresh
+        // PCM. A long gap can starve the renderer's HTTP read.
+        let gap_ms = dropped_at.take().map(|t| t.elapsed().as_millis());
         info!(
             channels = source_channels,
             sample_rate = source_sample_rate,
             reconnect = reconnects,
+            gap_ms = ?gap_ms,
             "radio_local_decode_started"
         );
+        if let Some(g) = gap_ms {
+            if g > 2000 {
+                warn!(
+                    gap_ms = g,
+                    reconnect = reconnects,
+                    "radio_reconnect_gap_long — renderer may have been starved"
+                );
+            }
+        }
 
         // ---- Decode loop ----
         loop {
@@ -5189,6 +5150,7 @@ fn decode_radio_stream_to_pcm(
             warn!(url = %url, reconnects, "radio_reconnect_giving_up");
             return Ok(());
         }
+        dropped_at = Some(std::time::Instant::now());
         info!(url = %url, attempt = reconnects, "radio_upstream_dropped_reconnecting");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -5552,9 +5514,6 @@ mod tests {
             duration_ms: None,
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -5584,9 +5543,6 @@ mod tests {
             duration_ms: None,
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -5611,9 +5567,6 @@ mod tests {
             duration_ms: Some(3600000),
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(

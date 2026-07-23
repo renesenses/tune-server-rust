@@ -179,6 +179,19 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Canonical grouping key for a genre label, insensitive to case AND to the
+/// space-vs-hyphen separator, so "Trip Hop" and "Trip-Hop" (or "trip hop")
+/// collapse to a single key ("trip hop"). Used to dedup the library genre
+/// views, which otherwise show one card per spelling variant (#1161).
+pub fn genre_key(genre: &str) -> String {
+    genre
+        .to_lowercase()
+        .replace('-', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Normalize a lofty `FileType` debug string into a user-friendly format name.
 ///
 /// lofty's `FileType` Debug representation doesn't always match what users expect:
@@ -1390,55 +1403,6 @@ fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
     }
 }
 
-/// Read a raw Vorbis comment value using its exact 4-byte length prefix.
-///
-/// Every Vorbis comment is stored as `[len: u32 LE]["KEY=value"]`. Unlike
-/// [`raw_vorbis_field`] — which scans for a control-char delimiter and can
-/// over-read (then fail UTF-8) on a value sitting at the very end of the comment
-/// block, right before the audio frames — this recovers the exact value
-/// regardless of what follows. Used for keys lofty has no `ItemKey` for (e.g.
-/// `SOURCE`), which are dropped during the VorbisComments → generic-tag split.
-fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
-    let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
-        return None;
-    }
-    // Vorbis comments live in the file header; a bounded prefix read finds them
-    // without slurping a multi-GB hi-res FLAC into RAM.
-    const HEADER_BYTES: u64 = 1024 * 1024;
-    let mut data = Vec::new();
-    {
-        use std::io::Read;
-        std::fs::File::open(path)
-            .ok()?
-            .take(HEADER_BYTES)
-            .read_to_end(&mut data)
-            .ok()?;
-    }
-    let needle = format!("{}=", field_name.to_ascii_uppercase());
-    let nlen = needle.len();
-    if data.len() <= nlen {
-        return None;
-    }
-    for i in 4..=data.len() - nlen {
-        if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
-            continue;
-        }
-        // The 4-byte LE length prefix precedes the "KEY=value" string and covers
-        // its whole length, so the value ends at `i + len`.
-        let len = u32::from_le_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
-        if len < nlen || i + len > data.len() {
-            continue;
-        }
-        if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len]) {
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
@@ -1450,7 +1414,9 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     // into RAM (twice: the old code also built a full from_utf8_lossy copy that
     // was never read) just to recover one tag. On the rare file whose comment
     // block sits past the window this returns None, exactly as before when lofty
-    // already missed the field.
+    // already missed the field. (Port from main: unbounded fs::read here spiked
+    // the scanner to ~14 GB RSS across 32 workers on .15's hi-res library → OOM
+    // crash-loop — the real cause behind the RC3 scan OOM.)
     const HEADER_BYTES: u64 = 1024 * 1024;
     let mut data = Vec::new();
     {
@@ -1851,10 +1817,6 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::OriginalMediaType) {
         meta.insert("media_type".into(), v);
     }
-    // RELEASECOUNTRY (Vorbis) — country of the specific release, ISO 3166-1.
-    if let Some(v) = get(ItemKey::ReleaseCountry) {
-        meta.insert("release_country".into(), v);
-    }
 
     // Dates
     if let Some(v) = get(ItemKey::ReleaseDate) {
@@ -1867,17 +1829,6 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // Technical
     if let Some(v) = get(ItemKey::EncodedBy) {
         meta.insert("encoder".into(), v);
-    }
-    // ENCODER (Vorbis) — encoding software that produced the file. Distinct from
-    // `encoder` (ENCODEDBY / who encoded). lofty falls back to the FLAC vendor
-    // string when no explicit ENCODER field is present.
-    if let Some(v) = get(ItemKey::EncoderSoftware) {
-        meta.insert("encoder_software".into(), v);
-    }
-    // SOURCE (Vorbis) — source medium of the rip (CD, SACD, Vinyl…). Not in
-    // lofty's VORBIS_MAP, so it never reaches the generic tag; read it raw.
-    if let Some(v) = raw_vorbis_comment(path, "SOURCE") {
-        meta.insert("source_media".into(), v);
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
         meta.insert("copyright".into(), v);
@@ -1903,11 +1854,6 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // MusicBrainz IDs
     if let Some(v) = get(ItemKey::MusicBrainzRecordingId) {
         meta.insert("mb_track_id".into(), v);
-    }
-    // MUSICBRAINZ_RELEASETRACKID — per-release track MBID, distinct from the
-    // recording id above (which is MUSICBRAINZ_TRACKID in Vorbis terms).
-    if let Some(v) = get(ItemKey::MusicBrainzTrackId) {
-        meta.insert("mb_release_track_id".into(), v);
     }
     if let Some(v) = get(ItemKey::MusicBrainzReleaseId) {
         meta.insert("mb_release_id".into(), v);
@@ -2117,29 +2063,6 @@ fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn raw_vorbis_comment_reads_value_at_end_of_block() {
-        use std::io::Write;
-        // A Vorbis comment is `[len: u32 LE]["KEY=value"]`. Place the value at
-        // the very end of the buffer with no trailing delimiter — the exact case
-        // where the old delimiter-scanning raw_vorbis_field over-reads. Using the
-        // 4-byte length prefix recovers "CD" precisely. `SOURCE=CD` is 9 bytes.
-        let mut f = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
-        f.write_all(&9u32.to_le_bytes()).unwrap();
-        f.write_all(b"SOURCE=CD").unwrap();
-        f.flush().unwrap();
-        assert_eq!(
-            raw_vorbis_comment(f.path(), "SOURCE"),
-            Some("CD".to_string())
-        );
-        // Case-insensitive key, and a missing key yields None.
-        assert_eq!(
-            raw_vorbis_comment(f.path(), "source"),
-            Some("CD".to_string())
-        );
-        assert_eq!(raw_vorbis_comment(f.path(), "ARTIST"), None);
-    }
 
     #[test]
     fn mb_artist_query_includes_alias_clause() {
