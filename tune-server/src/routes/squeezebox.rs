@@ -77,7 +77,10 @@ fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
         Duration::from_secs(5),
     )
     .map_err(|e| {
-        tracing::error!(addr = %addr, error = %e, "lms_cli_command: TCP connect failed");
+        // An unreachable/refused optional LMS is a warning, not an app-level
+        // ERROR — logging it at error! flooded Yacine's log (a Daphile box that
+        // refuses :9090 every poll). The Err string still reaches the UI.
+        tracing::warn!(addr = %addr, error = %e, "lms_cli_command: TCP connect failed");
         format!(
             "Impossible de se connecter au serveur Squeezebox (LMS) sur {addr}: {e}. Verifiez que Logitech Media Server est demarre."
         )
