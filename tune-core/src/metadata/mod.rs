@@ -2119,6 +2119,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_vorbis_comment_reads_value_at_end_of_block() {
+        use std::io::Write;
+        // A Vorbis comment is `[len: u32 LE]["KEY=value"]`. Place the value at
+        // the very end of the buffer with no trailing delimiter — the exact case
+        // where the old delimiter-scanning raw_vorbis_field over-reads. Using the
+        // 4-byte length prefix recovers "CD" precisely. `SOURCE=CD` is 9 bytes.
+        let mut f = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+        f.write_all(&9u32.to_le_bytes()).unwrap();
+        f.write_all(b"SOURCE=CD").unwrap();
+        f.flush().unwrap();
+        assert_eq!(
+            raw_vorbis_comment(f.path(), "SOURCE"),
+            Some("CD".to_string())
+        );
+        // Case-insensitive key, and a missing key yields None.
+        assert_eq!(
+            raw_vorbis_comment(f.path(), "source"),
+            Some("CD".to_string())
+        );
+        assert_eq!(raw_vorbis_comment(f.path(), "ARTIST"), None);
+    }
+
+    #[test]
     fn mb_artist_query_includes_alias_clause() {
         // The alias clause is what lets non-Latin (Hangul/CJK) names resolve:
         // MusicBrainz indexes their romanized form as `name` and the native
