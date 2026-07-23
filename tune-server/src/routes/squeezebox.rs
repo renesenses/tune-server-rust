@@ -286,6 +286,32 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             .to_string();
         let device_id = format!("squeezebox-{player_id}");
 
+        // Don't expose the same physical device as two zones. When the DAC is a
+        // USB player on a Lyrion/Daphile box, Tune sees it BOTH as a Squeezebox
+        // player (this CLI path) AND as a DLNA renderer (the LMS's UPnP bridge) —
+        // same name, two protocols — which produced Yacine's duplicate zones and
+        // conflicting playback. If a non-squeezebox output already carries this
+        // name AND we haven't already registered this squeezebox player, skip it
+        // and prefer the native DLNA zone. Conservative: never removes an
+        // existing/possibly-playing output, so no regression for pure-Squeezebox
+        // setups (no same-name other-type output ⇒ registers normally).
+        {
+            let reg = state.outputs.lock().await;
+            if !reg.contains(&device_id) {
+                let conflicts = reg.conflicting_outputs(&player_name, "squeezebox");
+                if !conflicts.is_empty() {
+                    drop(reg);
+                    tracing::info!(
+                        name = %player_name,
+                        id = %device_id,
+                        existing = ?conflicts,
+                        "squeezebox_output_skipped_duplicate_of_other_zone"
+                    );
+                    continue;
+                }
+            }
+        }
+
         // Register output using CLI port
         let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(
             player_name.clone(),
