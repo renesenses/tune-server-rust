@@ -174,6 +174,24 @@ pub(crate) mod decisions {
             && peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
     }
 
+    /// Whether the next queue item is a DSD stream that a DLNA renderer would
+    /// accept via SetNextAVTransportURI but never actually transition to (HiFi
+    /// Rose RS130 / Benjithom: the album "cuts after track 1" because the next
+    /// DSD stream is never consumed and the poller force-stops the zone). When
+    /// true, the poller must NOT arm gapless for this next track — end-of-track
+    /// plays it explicitly instead (a small gap, never a cut). Only guards DLNA
+    /// outputs; local outputs keep their internal DSD gapless chain untouched.
+    pub fn dlna_next_is_dsd(output_type: &str, mime_type: &str, url: &str) -> bool {
+        if output_type != "dlna" {
+            return false;
+        }
+        let url_lc = url.to_lowercase();
+        mime_type.contains("dsd")
+            || mime_type.contains("dsf")
+            || url_lc.ends_with(".dsf")
+            || url_lc.ends_with(".dff")
+    }
+
     /// After `STOPPED_TICKS_THRESHOLD` consecutive Stopped ticks, should this be
     /// treated as a natural track end (re-trigger play) rather than a playback
     /// failure (stop the zone)?
@@ -1794,20 +1812,17 @@ impl PositionPoller {
                     // DSD next on DLNA; handle_track_end plays it explicitly at
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
-                    if output.output_type() == "dlna" {
-                        let url_lc = resolved.url.to_lowercase();
-                        let next_is_dsd = resolved.mime_type.contains("dsd")
-                            || resolved.mime_type.contains("dsf")
-                            || url_lc.ends_with(".dsf")
-                            || url_lc.ends_with(".dff");
-                        if next_is_dsd {
-                            info!(
-                                zone_id,
-                                mime = %resolved.mime_type,
-                                "gapless_skipped_dsd_next_dlna"
-                            );
-                            return false;
-                        }
+                    if decisions::dlna_next_is_dsd(
+                        output.output_type(),
+                        &resolved.mime_type,
+                        &resolved.url,
+                    ) {
+                        info!(
+                            zone_id,
+                            mime = %resolved.mime_type,
+                            "gapless_skipped_dsd_next_dlna"
+                        );
+                        return false;
                     }
                     let media = crate::outputs::PlayMedia {
                         url: &resolved.url,
@@ -2365,6 +2380,53 @@ mod tests {
         // Short track but < 50% peak → not yet.
         assert!(!decisions::natural_end(
             false, false, 4_000, false, 0, 10_000
+        ));
+    }
+
+    // DSD-over-DLNA gapless guard (HiFi Rose RS130 / Benjithom: album cut after
+    // track 1). A DSD next on a DLNA renderer must NOT be armed for gapless.
+    #[test]
+    fn dlna_next_is_dsd_flags_dsd_mime() {
+        assert!(decisions::dlna_next_is_dsd(
+            "dlna",
+            "audio/dsd",
+            "http://x/track"
+        ));
+        assert!(decisions::dlna_next_is_dsd(
+            "dlna",
+            "audio/x-dsf",
+            "http://x/track"
+        ));
+    }
+
+    #[test]
+    fn dlna_next_is_dsd_flags_dsf_dff_url() {
+        assert!(decisions::dlna_next_is_dsd(
+            "dlna",
+            "application/octet-stream",
+            "http://x/a.dsf"
+        ));
+        assert!(decisions::dlna_next_is_dsd(
+            "dlna",
+            "application/octet-stream",
+            "HTTP://X/A.DFF"
+        ));
+    }
+
+    #[test]
+    fn dlna_next_is_dsd_ignores_pcm_and_non_dlna() {
+        // PCM/FLAC next on DLNA → gapless allowed (not DSD).
+        assert!(!decisions::dlna_next_is_dsd(
+            "dlna",
+            "audio/flac",
+            "http://x/a.flac"
+        ));
+        // DSD but LOCAL output → guard doesn't apply (local keeps its internal
+        // DSD gapless chain).
+        assert!(!decisions::dlna_next_is_dsd(
+            "local",
+            "audio/dsd",
+            "http://x/a.dsf"
         ));
     }
 

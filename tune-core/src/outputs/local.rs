@@ -934,6 +934,20 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 ///   - PCM integer: `wBitsPerSample` (or `wValidBitsPerSample` for EXTENSIBLE)
 ///   - IEEE Float 32-bit: returns 0 as a sentinel so `pcm_bytes_to_f32`
 ///     uses the float path.
+/// Whether a failed header read should be retried rather than treated as a hard
+/// failure. When a gapless/next track's transcode session has just started, its
+/// WAV header isn't emitted yet, so the first reads return `TimedOut`/
+/// `WouldBlock`. The pre-#522 code `break`-ed on any error, abandoning the chain
+/// and skipping track 2 in a gapless album (Alain #981). Retrying on these
+/// transient kinds — while a real error (broken pipe, etc.) still fails fast —
+/// is what aligns the gapless path with the direct `play_url` path.
+fn header_read_should_retry(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     if header.len() < 44 {
         return None;
@@ -1303,10 +1317,7 @@ impl OutputTarget for LocalOutput {
                 }
                 match reader.read(&mut header_buf) {
                     Ok(n) => break n,
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
+                    Err(ref e) if header_read_should_retry(e.kind()) => {
                         // Retry header read (stream not ready yet)
                         continue;
                     }
@@ -3869,6 +3880,19 @@ fn rubato_resample_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_read_retries_only_transient_kinds() {
+        use std::io::ErrorKind;
+        // #522: the next track's transcode hasn't emitted its WAV header yet →
+        // retry instead of abandoning the gapless chain (would skip track 2).
+        assert!(header_read_should_retry(ErrorKind::TimedOut));
+        assert!(header_read_should_retry(ErrorKind::WouldBlock));
+        // Real errors still fail fast (no infinite retry on a dead stream).
+        assert!(!header_read_should_retry(ErrorKind::BrokenPipe));
+        assert!(!header_read_should_retry(ErrorKind::UnexpectedEof));
+        assert!(!header_read_should_retry(ErrorKind::NotFound));
+    }
 
     #[test]
     fn test_parse_wav_header() {
