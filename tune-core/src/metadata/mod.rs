@@ -1792,6 +1792,10 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::OriginalMediaType) {
         meta.insert("media_type".into(), v);
     }
+    // RELEASECOUNTRY (Vorbis) — country of the specific release, ISO 3166-1.
+    if let Some(v) = get(ItemKey::ReleaseCountry) {
+        meta.insert("release_country".into(), v);
+    }
 
     // Dates
     if let Some(v) = get(ItemKey::ReleaseDate) {
@@ -1804,6 +1808,17 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // Technical
     if let Some(v) = get(ItemKey::EncodedBy) {
         meta.insert("encoder".into(), v);
+    }
+    // ENCODER (Vorbis) — encoding software that produced the file. Distinct from
+    // `encoder` (ENCODEDBY / who encoded). lofty falls back to the FLAC vendor
+    // string when no explicit ENCODER field is present.
+    if let Some(v) = get(ItemKey::EncoderSoftware) {
+        meta.insert("encoder_software".into(), v);
+    }
+    // SOURCE (Vorbis) — source medium of the rip (CD, SACD, Vinyl…). Not in
+    // lofty's VORBIS_MAP, so it never reaches the generic tag; read it raw.
+    if let Some(v) = raw_vorbis_field(path, "SOURCE") {
+        meta.insert("source_media".into(), v);
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
         meta.insert("copyright".into(), v);
@@ -1829,6 +1844,11 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // MusicBrainz IDs
     if let Some(v) = get(ItemKey::MusicBrainzRecordingId) {
         meta.insert("mb_track_id".into(), v);
+    }
+    // MUSICBRAINZ_RELEASETRACKID — per-release track MBID, distinct from the
+    // recording id above (which is MUSICBRAINZ_TRACKID in Vorbis terms).
+    if let Some(v) = get(ItemKey::MusicBrainzTrackId) {
+        meta.insert("mb_release_track_id".into(), v);
     }
     if let Some(v) = get(ItemKey::MusicBrainzReleaseId) {
         meta.insert("mb_release_id".into(), v);
