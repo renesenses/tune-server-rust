@@ -1776,6 +1776,13 @@ impl PositionPoller {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
                         ps.gapless_cooldown = 4;
+                        // A gapless advance updates now-playing WITHOUT bumping
+                        // track_generation, so the generation-based reset above
+                        // never fires for it — leaving the scrobble latch stuck
+                        // `true`, so every 2nd track of an album (the gapless-
+                        // reached ones) was never scrobbled (#1113). Reset it here
+                        // where the track actually advances.
+                        ps.scrobbled = false;
                     }
                 }
             }
@@ -2130,6 +2137,9 @@ impl PositionPoller {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
                             ps.gapless_cooldown = 4;
+                            // Reset the once-per-track scrobble latch on advance
+                            // (gapless doesn't bump track_generation) — #1113.
+                            ps.scrobbled = false;
                         }
                     }
                     if ps.track_started_at.is_none() {
@@ -2194,6 +2204,9 @@ impl PositionPoller {
                             // gapless transition, which would otherwise send a
                             // redundant Stop+Play and cause an audible restart.
                             ps.gapless_cooldown = 4;
+                            // Reset the once-per-track scrobble latch on advance
+                            // (gapless doesn't bump track_generation) — #1113.
+                            ps.scrobbled = false;
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
