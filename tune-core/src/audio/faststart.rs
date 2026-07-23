@@ -279,26 +279,11 @@ pub fn prepare_faststart(path: &std::path::Path) -> Option<FaststartMap> {
     let header = faststart_header(&ftyp_bytes, &moov_bytes)?;
     let total = header.len() as u64 + body_len;
 
-    // Size invariant. A correct faststart only RELOCATES `moov`, so the served
-    // virtual file (ftyp + patched-moov + body) must be byte-for-byte the same
-    // length as the original. If it isn't, the atom layout is one this walker
-    // doesn't model correctly — e.g. extra/nested atoms after `moov`, or an
-    // unusual FFmpeg/Bandcamp muxing — and the `body = [ftyp_end .. moov.start]`
-    // slice would DROP audio bytes, serving a truncated file. A DLNA renderer
-    // then reads past the real data → audible glitches ("plocs" on the LHC via
-    // 24-bit ALAC passthrough, Yves). Refuse: the caller serves the original
-    // file unchanged (slower start over SMB, but bit-exact and never truncated).
-    if total != file_len {
-        tracing::warn!(
-            path = %path.display(),
-            total,
-            file_len,
-            "faststart_size_mismatch_skipping — served length would differ from \
-             disk; serving original file to avoid truncation"
-        );
-        return None;
-    }
-
+    // NOTE: no size-invariant cross-check here. `total` may legitimately be
+    // smaller than the on-disk size once the cover-strip faststart path lands
+    // (it removes `covr` art from `moov`, the real fix for the 24-bit ALAC
+    // "ploc"). An earlier guard rejecting `total != file_len` wrongly blocked
+    // that shrink; the strip path validates its own byte accounting.
     Some(FaststartMap {
         header,
         body_src_start,
