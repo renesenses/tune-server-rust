@@ -59,14 +59,14 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
         }
     }
 
-    // Case-insensitive dedup so "Classique"/"classique" and "Folk/Rock"/"Folk/rock"
-    // collapse into a single genre instead of appearing as duplicate rows (Bilou).
-    // genre_set is a BTreeSet, so capitalized variants sort first (uppercase <
-    // lowercase in ASCII) and are the ones kept.
+    // Canonical dedup (case- AND separator-insensitive) so "Classique"/"classique"
+    // and "Trip Hop"/"Trip-Hop" collapse into a single genre instead of appearing
+    // as duplicate rows (Bilou, #1161). genre_set is a BTreeSet, so the variant
+    // that sorts first is the one kept.
     let mut seen_lc: std::collections::HashSet<String> = std::collections::HashSet::new();
     let genres: Vec<String> = genre_set
         .into_iter()
-        .filter(|g| seen_lc.insert(g.to_lowercase()))
+        .filter(|g| seen_lc.insert(tune_core::metadata::genre_key(g)))
         .collect();
 
     // Load saved tree from settings (persisted by PUT /genre-tree).
@@ -88,14 +88,14 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
 
     let mut classified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (parent, children) in &tree {
-        classified.insert(parent.to_lowercase());
+        classified.insert(tune_core::metadata::genre_key(parent));
         for child in children {
-            classified.insert(child.to_lowercase());
+            classified.insert(tune_core::metadata::genre_key(child));
         }
     }
     let unclassified: Vec<String> = genres
         .iter()
-        .filter(|g| !classified.contains(&g.to_lowercase()))
+        .filter(|g| !classified.contains(&tune_core::metadata::genre_key(g)))
         .cloned()
         .collect();
 
@@ -141,8 +141,13 @@ pub(super) async fn list_genres(
         .unwrap_or_default();
     drop(conn);
 
-    // Split multi-genre values and count individual genres
-    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    // Split multi-genre values and count albums per genre. Genres are grouped
+    // by a canonical key that ignores case and the space-vs-hyphen separator,
+    // so "Trip Hop" and "Trip-Hop" collapse into a single card instead of two
+    // (#1161). For each key we keep per-spelling tallies to choose a stable
+    // display label.
+    let mut groups: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
+        std::collections::BTreeMap::new();
     for (genre_col, genres_col) in &raw {
         let mut genres_for_album: Vec<String> = Vec::new();
         // Prefer the structured genres JSON array if present
@@ -161,21 +166,36 @@ pub(super) async fn list_genres(
                 genres_for_album = tune_core::metadata::split_genre_tag(raw_genre);
             }
         }
+        // Dedup within this album by canonical key so an album that tags the
+        // same genre under two spellings still counts once toward it.
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for g in genres_for_album {
-            *counts.entry(g).or_insert(0) += 1;
+            let key = tune_core::metadata::genre_key(&g);
+            if key.is_empty() || !seen_keys.insert(key.clone()) {
+                continue;
+            }
+            *groups.entry(key).or_default().entry(g).or_insert(0) += 1;
         }
     }
 
     // Filter by query parameter (case-insensitive LIKE match)
     let filter = params.query.map(|q| q.to_lowercase());
 
-    let items: Vec<Value> = counts
+    let items: Vec<Value> = groups
         .iter()
-        .filter(|(name, _)| match &filter {
-            Some(q) => name.to_lowercase().contains(q),
-            None => true,
+        .filter_map(|(_key, variants)| {
+            let count: i64 = variants.values().sum();
+            // Display label = the most common spelling; ties broken by the
+            // lexicographically smallest for a stable, deterministic label.
+            let name = variants
+                .iter()
+                .max_by(|(an, ac), (bn, bc)| ac.cmp(bc).then_with(|| bn.cmp(an)))
+                .map(|(name, _)| name.clone())?;
+            match &filter {
+                Some(q) if !name.to_lowercase().contains(q) => None,
+                _ => Some(json!({ "name": name, "count": count })),
+            }
         })
-        .map(|(name, count)| json!({ "name": name, "count": count }))
         .collect();
 
     Ok(Json(json!(items)))

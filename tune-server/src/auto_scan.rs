@@ -160,7 +160,8 @@ pub fn build_track_from_metadata_opts(
     // Field mapping is shared with the manual scan via `scan_import` — this
     // path now also populates `genres` and `composer`, which the old inline
     // mapping here dropped.
-    let track = crate::scan_import::build_track_row(meta, sf, album_id, artist_id, track_artist_name);
+    let track =
+        crate::scan_import::build_track_row(meta, sf, album_id, artist_id, track_artist_name);
     Some((track, album_id))
 }
 
