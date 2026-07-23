@@ -691,6 +691,12 @@ const METADATA_FIELDS: &[(&str, &str, &str)] = &[
         "MusicBrainz Release Group ID",
         "Identifiants",
     ),
+    (
+        "mb_release_track_id",
+        "MusicBrainz Release Track ID",
+        "Identifiants",
+    ),
+    ("release_country", "Pays de sortie", "Identifiants"),
     // Dates
     ("release_date", "Date de sortie", "Dates"),
     ("original_date", "Date originale", "Dates"),
@@ -704,6 +710,8 @@ const METADATA_FIELDS: &[(&str, &str, &str)] = &[
     ("file_size", "Taille du fichier", "Technique"),
     ("file_path", "Chemin du fichier", "Technique"),
     ("encoder", "Encodeur", "Technique"),
+    ("encoder_software", "Logiciel d'encodage", "Technique"),
+    ("source_media", "Support source", "Technique"),
     ("copyright", "Copyright", "Technique"),
     ("language", "Langue", "Technique"),
     // ReplayGain
@@ -720,6 +728,10 @@ const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
     "format",
     "sample_rate",
     "bit_depth",
+    "release_country",
+    "mb_release_track_id",
+    "encoder_software",
+    "source_media",
 ];
 
 fn metadata_fields_key(pid: i64) -> String {
