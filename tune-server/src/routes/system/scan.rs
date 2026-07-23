@@ -758,13 +758,24 @@ pub(super) async fn trigger_scan(
         if auto_enrich_allowed {
             let enrich_db = db.clone();
             let artist_cache_dir = cache_dir.clone();
+            let artist_mbid_db = db.clone();
             let artist_enrich_db = db.clone();
             handle.spawn(async move {
                 tune_core::library::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
             });
 
             handle.spawn(async move {
+                // Resolve MusicBrainz IDs BEFORE fetching artist images. The
+                // image cascade only enriches artists that already have an MBID
+                // (ArtistRepo::list_without_image filters on musicbrainz_id IS
+                // NOT NULL), so a library scanned from files without MB tags
+                // gets ZERO artist images despite Premium — the candidate list
+                // is empty. Mirror the manual enrichment route (system/enrich.rs):
+                // match MBIDs first, then fetch images (Fabien: 0 image on 1183
+                // artists, none carrying an MBID).
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tune_core::metadata::matcher::batch_match_artist_mbids(artist_mbid_db).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 tune_core::library::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
             });
         } else {
