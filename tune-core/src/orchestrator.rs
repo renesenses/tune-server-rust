@@ -3850,7 +3850,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_scrobble(title, artist);
+            self.lastfm_scrobble(title, artist, album);
         }
 
         if lb_ready {
@@ -3879,7 +3879,7 @@ impl PlaybackOrchestrator {
         };
 
         if lastfm_ready {
-            self.lastfm_now_playing(title, artist);
+            self.lastfm_now_playing(title, artist, album);
         }
 
         if lb_ready {
@@ -3900,7 +3900,7 @@ impl PlaybackOrchestrator {
         Some((api_key, api_secret, session_key))
     }
 
-    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>) {
+    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3909,17 +3909,23 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
+        // Send the album too: Last.fm/Pano apps rely on it to fetch the cover
+        // (the web site does a looser track-level match), so scrobbles without
+        // an album showed no artwork in the apps (#1113).
+        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::scrobble(
+            if let Err(e) = crate::scrobble::scrobble_full(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
+                album.as_deref(),
+                None,
                 timestamp,
             )
             .await
@@ -3929,7 +3935,7 @@ impl PlaybackOrchestrator {
         });
     }
 
-    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>) {
+    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
         let artist = match artist {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => return,
@@ -3938,13 +3944,16 @@ impl PlaybackOrchestrator {
             return;
         };
         let title = title.to_string();
+        let album = album.filter(|a| !a.is_empty()).map(|a| a.to_string());
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::update_now_playing(
+            if let Err(e) = crate::scrobble::update_now_playing_full(
                 &api_key,
                 &api_secret,
                 &session_key,
                 &artist,
                 &title,
+                album.as_deref(),
+                None,
             )
             .await
             {
