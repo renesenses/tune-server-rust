@@ -72,7 +72,15 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&norm);
-            json!({ "path": norm, "name": name, "track_count": count })
+            // Whether the configured directory still exists on disk. A stale
+            // music dir (renamed/unmounted share, e.g. a NAS mount that moved)
+            // otherwise shows as an empty phantom folder with no explanation
+            // (Yacine: two configured roots — one gone, one empty — while the
+            // real music sits under a different root). Surfacing this lets the
+            // UI flag "introuvable / vérifier le montage" vs a genuinely empty
+            // but valid directory.
+            let exists = std::path::Path::new(&norm).is_dir();
+            json!({ "path": norm, "name": name, "track_count": count, "exists": exists })
         })
         .collect();
     Ok(Json(json!({ "roots": roots })))
