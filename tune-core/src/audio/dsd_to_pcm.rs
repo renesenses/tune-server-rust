@@ -254,6 +254,11 @@ pub struct DsdToPcmStreamer {
     ring_bufs: Vec<Vec<f64>>,
     /// Write position in the ring buffer (wraps at filter_len).
     ring_pos: usize,
+    /// `filter_len - 1`. filter_len is always a power of two (256/512/1024/2048),
+    /// so ring wrapping is `pos & ring_mask` instead of `pos % filter_len` — a
+    /// real integer division per DSD sample (millions/sec) turned into a mask.
+    /// Bit-identical result.
+    ring_mask: usize,
     /// Total DSD samples fed so far (across all calls to `feed`), per channel.
     total_dsd_samples: usize,
     /// Number of PCM output samples already emitted per channel.
@@ -279,6 +284,10 @@ impl DsdToPcmStreamer {
         };
 
         let filter_coeffs = design_lowpass_fir(filter_len, decimation_ratio);
+        debug_assert!(
+            filter_len.is_power_of_two(),
+            "ring_mask wrapping requires a power-of-two filter_len"
+        );
 
         DsdToPcmStreamer {
             decimation_ratio,
@@ -289,6 +298,7 @@ impl DsdToPcmStreamer {
             lsb_first,
             ring_bufs: vec![vec![0.0f64; filter_len]; channels],
             ring_pos: 0,
+            ring_mask: filter_len - 1,
             total_dsd_samples: 0,
             output_sample_idx: 0,
         }
@@ -353,7 +363,7 @@ impl DsdToPcmStreamer {
                         (ch_bytes[ch] >> (7 - bit)) & 1
                     };
                     let sample = if bit_val == 1 { 1.0 } else { -1.0 };
-                    self.ring_bufs[ch][self.ring_pos % filter_len] = sample;
+                    self.ring_bufs[ch][self.ring_pos & self.ring_mask] = sample;
                 }
 
                 // Advance ring_pos once per DSD sample position (all channels written)
@@ -389,7 +399,7 @@ impl DsdToPcmStreamer {
                     // misaligned (center + half_filter < total) and take the
                     // general path.
                     let aligned = center + half_filter == self.total_dsd_samples;
-                    let ring_start = self.ring_pos % filter_len;
+                    let ring_start = self.ring_pos & self.ring_mask;
 
                     for emit_ch in 0..channels {
                         let sum = if aligned {
@@ -416,7 +426,7 @@ impl DsdToPcmStreamer {
                                     let age = self.total_dsd_samples - pos as usize;
                                     if age <= filter_len {
                                         let ring_idx =
-                                            (self.ring_pos + filter_len - age) % filter_len;
+                                            (self.ring_pos + filter_len - age) & self.ring_mask;
                                         s += self.ring_bufs[emit_ch][ring_idx] * coeff;
                                     }
                                 }
