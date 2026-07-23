@@ -92,16 +92,31 @@ pub(super) async fn trigger_scan(
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
     let force = q.force.unwrap_or(false) || q.full.unwrap_or(false);
-    if force {
-        tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
-    }
     // Targeted sub-folder scan (empty/blank string = full scan as before).
-    let targeted_req: Option<String> = q
+    let targeted_path: Option<String> = q
         .path
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| tune_core::scanner::walker::normalize_path(s));
+    spawn_library_scan(state, force, targeted_path).await;
+    (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
+}
+
+/// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
+/// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
+/// right away instead of only at the next restart (Jean-Pierre: newly-added
+/// folders stayed invisible until the app was restarted). `targeted_path`
+/// limits the scan to a single sub-folder; `None` scans the whole library.
+pub(super) async fn spawn_library_scan(
+    state: AppState,
+    force: bool,
+    targeted_path: Option<String>,
+) {
+    if force {
+        tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
+    }
+    let targeted_req: Option<String> = targeted_path;
     // Clear any leftover cancel request from a previous scan before starting.
     SCAN_CANCEL.store(false, Ordering::SeqCst);
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1212,8 +1227,6 @@ pub(super) async fn trigger_scan(
             }
         }
     });
-
-    (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
