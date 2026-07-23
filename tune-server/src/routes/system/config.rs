@@ -558,13 +558,23 @@ pub(super) async fn add_music_dir(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    if !dirs.contains(&normalized) {
+    let newly_added = !dirs.contains(&normalized);
+    if newly_added {
         dirs.push(normalized);
     }
 
     settings
         .set("music_dirs", &serde_json::to_string(&dirs)?)
         .ok();
+
+    // Scan right away so the new folder's tracks appear without an app restart.
+    // Previously add_music_dir only saved the path: the startup scan and the
+    // file-watcher are both initialised once at boot with the old dir list, so a
+    // folder added later was neither scanned nor watched — it only showed up
+    // after a restart (Jean-Pierre).
+    if newly_added {
+        super::scan::spawn_library_scan(state.clone(), false).await;
+    }
     Ok(Json(json!({ "dirs": dirs })).into_response())
 }
 
