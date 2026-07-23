@@ -20,7 +20,7 @@ pub fn build_track_from_metadata(
     artist_repo: &ArtistRepo,
     album_repo: &AlbumRepo,
 ) -> Option<(Track, Option<i64>)> {
-    build_track_from_metadata_opts(sf, artist_repo, album_repo, true)
+    build_track_from_metadata_opts(sf, artist_repo, album_repo, true, None)
 }
 
 pub fn build_track_from_metadata_opts(
@@ -28,16 +28,26 @@ pub fn build_track_from_metadata_opts(
     artist_repo: &ArtistRepo,
     album_repo: &AlbumRepo,
     quality_split: bool,
+    // Folder-level compilation decision from the caller (the batch/watcher sees
+    // an album's other tracks; a lone file can't). `None` = decide from this
+    // file's own tags, the previous behaviour. Passing `Some(true)` keeps a
+    // various-artists compilation whose tracks each carry their own artist as
+    // album_artist from splitting into one album per artist (JP Borderies).
+    compilation_override: Option<bool>,
 ) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
-    let is_compilation = meta.compilation
-        || meta
-            .album_artist
-            .as_deref()
-            .map(|s| s.to_lowercase())
-            .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
-            .unwrap_or(false);
+    let is_compilation = compilation_override.unwrap_or_else(|| {
+        meta.compilation
+            || meta
+                .album_artist
+                .as_deref()
+                .map(|s| s.to_lowercase())
+                .map(|s| {
+                    s == "various artists" || s == "various" || s == "va" || s == "compilations"
+                })
+                .unwrap_or(false)
+    });
 
     let album_artist_name = if is_compilation {
         "Various Artists"
@@ -643,11 +653,52 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                         track_repo.delete_by_path(&sf.path).ok();
                                     }
 
+                                    // Decide compilation over the whole folder from
+                                    // the siblings already in the DB, so re-importing
+                                    // a single file (MP3tag save → Modified event)
+                                    // doesn't split a various-artists album tagged
+                                    // with per-track album_artist into one album per
+                                    // artist (JP Borderies). The manual/batch scan
+                                    // sees the whole album at once; the watcher sees
+                                    // one file, so it reconstructs the folder view
+                                    // from the DB. Any doubt → None → per-file
+                                    // self-decide (previous behaviour, no regression).
+                                    let comp_override: Option<bool> =
+                                        sf.metadata.as_ref().and_then(|meta| {
+                                            let dir = std::path::Path::new(&sf.path).parent()?;
+                                            let mut comp = meta.compilation;
+                                            let mut artists: std::collections::HashSet<String> =
+                                                std::collections::HashSet::new();
+                                            let mut note = |aa: Option<&str>| {
+                                                if let Some(a) =
+                                                    aa.map(str::trim).filter(|s| !s.is_empty())
+                                                {
+                                                    if crate::scan_import::is_various_artists(a) {
+                                                        comp = true;
+                                                    }
+                                                    artists.insert(a.to_lowercase());
+                                                }
+                                            };
+                                            note(meta.album_artist.as_deref());
+                                            let siblings = track_repo
+                                                .siblings_album_artists(&dir.to_string_lossy())
+                                                .ok()?;
+                                            for (fp, aa) in &siblings {
+                                                // Direct children only (exclude
+                                                // sub-folders sharing the prefix).
+                                                if std::path::Path::new(fp).parent() != Some(dir) {
+                                                    continue;
+                                                }
+                                                note(aa.as_deref());
+                                            }
+                                            Some(comp || artists.len() >= 2)
+                                        });
                                     let Some((track, album_id)) = build_track_from_metadata_opts(
                                         sf,
                                         &artist_repo,
                                         &album_repo,
                                         watcher_quality_split,
+                                        comp_override,
                                     ) else {
                                         tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                         continue;
