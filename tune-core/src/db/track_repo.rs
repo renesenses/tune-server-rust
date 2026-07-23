@@ -709,6 +709,33 @@ impl TrackRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
+    /// `(file_path, album_artist)` of every track whose file path begins with
+    /// `dir_prefix`. Used by the file-watcher to decide compilation status for a
+    /// single re-imported file from its already-scanned siblings — a folder with
+    /// 2+ distinct album_artists is a various-artists compilation (JP Borderies).
+    /// The caller filters to direct children of the folder.
+    pub fn siblings_album_artists(
+        &self,
+        dir_prefix: &str,
+    ) -> Result<Vec<(String, Option<String>)>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}");
+        let like = format!("{dir_prefix}%");
+        let params: [&dyn ToSqlValue; 1] = [&like];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|c| {
+                let fp = c.first().and_then(|v| v.as_string())?;
+                let aa = c.get(1).and_then(|v| v.as_string());
+                Some((fp, aa))
+            })
+            .collect())
+    }
+
     pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
         let like = format!("%{title}%");
         let make_ph = |i: usize| match self.db.engine() {

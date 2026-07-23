@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SCAN_CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// True when an `album_artist` value denotes a various-artists compilation.
-fn is_various_artists(s: &str) -> bool {
+pub(crate) fn is_various_artists(s: &str) -> bool {
     let l = s.trim().to_lowercase();
     l == "various artists" || l == "various" || l == "va" || l == "compilations"
 }
@@ -39,7 +39,7 @@ fn is_various_artists(s: &str) -> bool {
 /// album_artist, which otherwise splits into one album (and cover) per artist.
 ///
 /// Keys are `(folder, album_title.to_lowercase())`.
-fn decide_compilation_albums<'a>(
+pub(crate) fn decide_compilation_albums<'a>(
     items: impl Iterator<Item = (String, &'a str, Option<&'a str>, bool)>,
 ) -> std::collections::HashMap<(String, String), bool> {
     let mut acc: std::collections::HashMap<
