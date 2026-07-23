@@ -421,8 +421,20 @@ fn build_signal_path(
     // A zone forced to serve WAV/LPCM (`dlna_lpcm`) always transcodes, so it takes
     // precedence over ALAC passthrough — matching the orchestrator.
     let zone_id = zone.id.unwrap_or(0);
-    let dlna_lpcm =
-        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
+    // Mirror the orchestrator: some renderers can't stream ALAC passthrough and
+    // are auto-routed to WAV/LPCM by name (Lindemann LHC — range-storm plocs), so
+    // the signal path must show WAV even when the per-zone LPCM toggle is off.
+    let renderer_forces_lpcm = source_format == Some(AudioFormat::Alac)
+        && is_network_output
+        && renderer_label
+            .map(|n| {
+                let l = n.to_lowercase();
+                l.contains("lhc") || l.contains("lindemann")
+            })
+            .unwrap_or(false);
+    let dlna_lpcm = is_network_output
+        && (renderer_forces_lpcm
+            || ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id));
     // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
     // signal path shows a real 16-bit downconvert instead of a phantom
     // bit-perfect passthrough when the source is hi-res.
@@ -448,7 +460,16 @@ fn build_signal_path(
 
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if needs_transcode_for_output || dlna_cap_16bit {
+            if dlna_lpcm {
+                // Zone forced to WAV/LPCM: the orchestrator transcodes to WAV,
+                // capped at 16-bit for the standardised DLNA LPCM profile (see
+                // orchestrator `dlna_needs_wav`, #1137). The generic branch below
+                // would mislabel this as the FLAC transcode target — show the real
+                // output (WAV 16-bit). Bit-perfect only when the source is already
+                // ≤16-bit; a hi-res source is downconverted (Yves, LHC).
+                let out = if bit_depth > 16 { "WAV 16-bit" } else { "WAV" };
+                (bit_depth <= 16, "DLNA/UPnP", out)
+            } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
                 // an otherwise-direct FLAC source (Ruark R3, #1137).
                 let target = source_format
@@ -554,8 +575,10 @@ fn build_signal_path(
     }
 
     // Transcoding step (only if transcoding occurs)
-    let transcode_active =
-        needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
+    let transcode_active = needs_transcode_for_output
+        || oaat_transcodes
+        || output_type == "airplay"
+        || dlna_lpcm;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
         // lossy domain conversion (see the "oaat" transport arm above).

@@ -1329,8 +1329,47 @@ impl PlaybackOrchestrator {
         // LPCM override: a zone set to serve WAV/LPCM must transcode (to strip
         // the renderer's ALAC decoder quirks — e.g. LHC-56 pops at start), so it
         // takes precedence over ALAC passthrough.
-        let dlna_lpcm =
-            is_network_output && ZoneRepo::with_backend(self.db.clone()).get_dlna_lpcm(req.zone_id);
+        //
+        // Some DLNA renderers can't stream ALAC passthrough cleanly at all: their
+        // Lavf-based parser range-storms the M4A container (a repeated end↔start
+        // byte-range seek loop) that starves the buffer over a NAS/SMB mount and
+        // produces audible "plocs" — even with faststart + cover-strip applied
+        // (Yves, Lindemann LHC-61 / LHC-56). Route those to WAV/LPCM automatically
+        // (a linear PCM stream, matched by renderer name). WAV — not the FLAC
+        // transcode target: hi-res ALAC→FLAC over an SMB mount is too slow and
+        // times out (Castanarc, transcode_timeout_120s), whereas WAV is decode-only.
+        fn renderer_cant_alac_passthrough(name: &str) -> bool {
+            let n = name.to_lowercase();
+            n.contains("lhc") || n.contains("lindemann")
+        }
+        let renderer_forces_lpcm =
+            if source_format == Some(AudioFormat::Alac) && is_network_output {
+                let did = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                    .unwrap_or("");
+                let arc = { self.outputs.lock().await.get(did) };
+                match arc {
+                    Some(output) => {
+                        let name = output.lock().await.name().to_string();
+                        renderer_cant_alac_passthrough(&name)
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+        if renderer_forces_lpcm {
+            info!(
+                zone_id = req.zone_id,
+                "alac_auto_wav_for_renderer — renderer range-storms the M4A container; \
+                 forcing WAV/LPCM to avoid plocs and slow-FLAC timeouts (LHC)"
+            );
+        }
+        let dlna_lpcm = is_network_output
+            && (renderer_forces_lpcm
+                || ZoneRepo::with_backend(self.db.clone()).get_dlna_lpcm(req.zone_id));
         // Opt-in per zone: cap output to 16-bit. Some renderers advertise
         // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode
         // 16-bit internally — 24-bit direct plays SILENCE (Ruark R3, Yves #1137).
