@@ -1709,7 +1709,17 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         p.options(
             ParseOptions::new()
                 .parsing_mode(ParsingMode::Relaxed)
-                .max_junk_bytes(1024 * 1024),
+                .max_junk_bytes(1024 * 1024)
+                // Don't load embedded cover art: this pass only reads text tags
+                // (sort orders, credits, ISRC, lyrics…) via get_string and never
+                // touches the picture. Without this, lofty reads the whole PICTURE
+                // block into memory for EVERY file the scanner processes (called
+                // per file in auto_scan's batch callback), and a huge/malformed
+                // embedded image spikes RSS past the OOM killer — the same failure
+                // try_read_metadata was hardened against (#JeromeQ), which this
+                // second read path was missing (.15: 31 115 new files → ~14 GB RSS
+                // → OOM crash-loop). Cover extraction stays in artwork::get_or_extract.
+                .read_cover_art(false),
         )
         .guess_file_type()?
         .read()
