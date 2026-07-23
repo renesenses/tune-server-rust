@@ -1049,7 +1049,17 @@ impl PositionPoller {
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
-                if !played_enough {
+                // A position reset once the peak has reached the track's end is a
+                // genuine gapless advance, even when played_enough is false: a
+                // prior gapless metadata advance resets track_started_at, so its
+                // ≥30s wall-clock guard spuriously fails on a track that in fact
+                // played to the end. Mirror the track-end path, which already
+                // bypasses that guard via peak_reached_end. JP Borderies: near-end
+                // auto-advance was refused (peak 156.3s / dur 157.3s = 99%) then
+                // recovered on a manual Next — the "petit refus de saut".
+                let peak_reached_end =
+                    decisions::peak_reached_end(track_duration_ms, ps.peak_position_ms);
+                if !played_enough && !peak_reached_end {
                     warn!(
                         zone_id,
                         peak_pos = ps.peak_position_ms,
@@ -2267,6 +2277,31 @@ mod tests {
         assert!(!decisions::peak_reached_end(dur, 30_000));
         // Unknown duration: no false positive.
         assert!(!decisions::peak_reached_end(0, 500_000));
+    }
+
+    #[test]
+    fn position_reset_advances_at_track_end_despite_reset_wall_clock() {
+        // JP Borderies (v0.8.367, local FLAC): a gapless position reset arrived
+        // with the track at 156298/157346 ms (99.3%) but wall_elapsed under-counted
+        // (a prior gapless metadata advance reset track_started_at), so
+        // played_enough falsely rejected it → the near-end auto-advance was
+        // refused ("petit refus de saut"). The position_reset path must bypass via
+        // peak_reached_end exactly like the track-end path, so the combined guard
+        // (played_enough || peak_reached_end) accepts the advance.
+        let dur = 157_346u64;
+        let peak = 156_298u64;
+        assert!(
+            !decisions::played_enough(dur, peak, 5),
+            "reset wall clock makes played_enough falsely reject the finished track"
+        );
+        assert!(
+            decisions::peak_reached_end(dur, peak),
+            "99% of the track played must count as the end regardless of wall time"
+        );
+        assert!(
+            decisions::played_enough(dur, peak, 5) || decisions::peak_reached_end(dur, peak),
+            "combined guard must accept the near-end position reset"
+        );
     }
 
     #[test]
