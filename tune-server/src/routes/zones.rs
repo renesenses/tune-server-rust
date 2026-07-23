@@ -374,14 +374,18 @@ fn build_signal_path(
         // from_extension() returned None and the signal path showed "Unknown"
         // (Yves: NAS as source). Recognize the codec from the raw string instead.
         let l = fmt_str.to_lowercase();
-        if l.contains("aac") || l.contains("mp4") || l.contains("m4a") {
+        let is_m4a = l.contains("mp4") || l.contains("m4a") || l.contains("aac");
+        if l.contains("alac") || (is_m4a && bit_depth >= 24) {
+            // audio/mp4 (M4A) is ambiguous ALAC vs AAC — same container/MIME. A
+            // DIDL res@bitsPerSample >= 24 means lossless ALAC, not lossy AAC
+            // (Yves: NAS ALAC read 24-bit by the DartZeel but shown as AAC here).
+            "ALAC"
+        } else if is_m4a {
             "AAC"
         } else if l.contains("mp3") || l.contains("mpeg") {
             "MP3"
         } else if l.contains("flac") {
             "FLAC"
-        } else if l.contains("alac") {
-            "ALAC"
         } else if l.contains("wav") {
             "WAV"
         } else if l.contains("ogg") || l.contains("vorbis") {
@@ -392,7 +396,13 @@ fn build_signal_path(
             "Unknown"
         }
     };
-    let is_lossless = source_format.as_ref().is_some_and(|f| f.is_lossless());
+    // For a media-server source (no from_extension AudioFormat) the lossless
+    // verdict follows the recognized codec name, so a 24-bit ALAC is no longer
+    // shown "Avec perte" (Yves).
+    let is_lossless = source_format
+        .as_ref()
+        .map(|f| f.is_lossless())
+        .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
 
