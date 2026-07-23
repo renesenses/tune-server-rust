@@ -175,6 +175,9 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                         duration_ms: Some(np.duration_ms),
                         seek_ms: None,
                         temp_file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        media_format: None,
                     };
                     match orchestrator.play(req).await {
                         Ok(_) => {

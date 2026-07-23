@@ -376,6 +376,9 @@ impl AlarmScheduler {
                 duration_ms: None,
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             if let Err(e) = self.orchestrator.play(req).await {
                 warn!(alarm_id, zone_id = target_zone, error = %e, "alarm_play_error");
