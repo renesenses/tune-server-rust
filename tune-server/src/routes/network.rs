@@ -752,6 +752,17 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     let album = extract_xml_tag(element, "upnp:album");
                     let duration_ms =
                         extract_res_attr(element, "duration").and_then(|d| parse_upnp_duration(&d));
+                    // Real resolution + codec from the server's DIDL res@ attributes.
+                    // Without these the signal path defaulted to "AAC 44kHz/16bit —
+                    // Avec perte", mislabelling a hi-res ALAC (audio/mp4) as lossy AAC
+                    // (Yves: NAS ALAC shown as AAC while the DartZeel read 24-bit).
+                    let sample_rate = extract_res_attr(element, "sampleFrequency")
+                        .and_then(|s| s.parse::<u32>().ok());
+                    let bit_depth = extract_res_attr(element, "bitsPerSample")
+                        .and_then(|s| s.parse::<u16>().ok());
+                    let channels = extract_res_attr(element, "nrAudioChannels")
+                        .and_then(|s| s.parse::<u16>().ok());
+                    let protocol_info = extract_res_attr(element, "protocolInfo");
                     items.push(json!({
                         "id": id,
                         "title": title,
@@ -760,6 +771,10 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "res_url": res_url,
                         "album_art_uri": album_art_uri,
                         "duration_ms": duration_ms,
+                        "sample_rate": sample_rate,
+                        "bit_depth": bit_depth,
+                        "channels": channels,
+                        "protocol_info": protocol_info,
                     }));
                 }
 

@@ -847,6 +847,9 @@ impl PositionPoller {
                                             duration_ms: None,
                                             seek_ms: None,
                                             temp_file_path: None,
+                                            sample_rate: None,
+                                            bit_depth: None,
+                                            media_format: None,
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.

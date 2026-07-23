@@ -110,6 +110,9 @@ impl ToolExecutor {
             duration_ms: Some(first_track.duration_ms),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
 
         // Queue remaining tracks
@@ -160,6 +163,9 @@ impl ToolExecutor {
             duration_ms: Some(track.duration_ms),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
 
         match self.orchestrator.play(req).await {
