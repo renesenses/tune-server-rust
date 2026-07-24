@@ -1641,6 +1641,7 @@ impl OutputTarget for LocalOutput {
                 let mut total_frames_fed: u64 = 0;
 
                 // Read and feed the rest of the stream
+                let mut read_buf = vec![0u8; 65536];
                 let mut leftover: Vec<u8> = Vec::new();
 
                 // Process leftover from header read
@@ -1814,7 +1815,6 @@ impl OutputTarget for LocalOutput {
                 let mut skipped_bytes_asio: u64 = 0;
 
                 // Read and feed the rest of the stream
-                let mut read_buf = vec![0u8; 65536];
                 let mut leftover: Vec<u8> = Vec::new();
 
                 // Process leftover from header read
