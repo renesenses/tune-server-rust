@@ -1875,34 +1875,56 @@ impl OutputTarget for LocalOutput {
                 // (500ms) and honours stop within one tick; the pump thread
                 // may linger in a blocked read but only owns the socket, and
                 // exits when the receiver drops or the session closes.
+                // Approximate depth of the pump→device channel. Incremented by
+                // the pump before each send, decremented by the device loop on
+                // each successful recv. A high steady depth means the device
+                // thread is NOT draining (ring full / callback dead); a depth of
+                // ~0 means the device is starved (EOF never latches). Surfaced in
+                // the periodic `asio_exclusive_feed_stats` log (DEvir bug-22).
+                let pump_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let (pump_tx, pump_rx) =
                     std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(64);
-                std::thread::spawn(move || {
-                    let mut reader = reader;
-                    let mut buf = vec![0u8; 65536];
-                    loop {
-                        match reader.read(&mut buf) {
-                            Ok(0) => {
-                                let _ = pump_tx.send(Ok(Vec::new()));
-                                break;
-                            }
-                            Ok(n) => {
-                                if pump_tx.send(Ok(buf[..n].to_vec())).is_err() {
-                                    break; // receiver gone — playback stopped
-                                }
-                            }
-                            Err(e) => {
-                                let transient = matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                                );
-                                if pump_tx.send(Err(e)).is_err() || !transient {
+                {
+                    let pump_depth = pump_depth.clone();
+                    std::thread::spawn(move || {
+                        let mut reader = reader;
+                        let mut buf = vec![0u8; 65536];
+                        loop {
+                            match reader.read(&mut buf) {
+                                Ok(0) => {
+                                    pump_depth.fetch_add(1, Ordering::Relaxed);
+                                    if pump_tx.send(Ok(Vec::new())).is_err() {
+                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                                    }
                                     break;
+                                }
+                                Ok(n) => {
+                                    pump_depth.fetch_add(1, Ordering::Relaxed);
+                                    if pump_tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                                        break; // receiver gone — playback stopped
+                                    }
+                                }
+                                Err(e) => {
+                                    let transient = matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::TimedOut
+                                            | std::io::ErrorKind::WouldBlock
+                                    );
+                                    pump_depth.fetch_add(1, Ordering::Relaxed);
+                                    if pump_tx.send(Err(e)).is_err() {
+                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    if !transient {
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    });
+                }
+                let mut last_stats_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1912,7 +1934,27 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
 
-                    let chunk = match pump_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                    // Periodic health snapshot (~500ms) so a wedge is diagnosable
+                    // from DEvir's next log: ring full + high pump_depth => the
+                    // callback stopped draining; ring/pump ~empty => starved / EOF
+                    // never latched (bug-22 / #789).
+                    if last_stats_at.elapsed() >= std::time::Duration::from_millis(500) {
+                        debug!(
+                            ring_available = ring.available(),
+                            ring_capacity = ring.capacity(),
+                            total_frames_fed,
+                            pump_depth = pump_depth.load(Ordering::Relaxed),
+                            leftover_bytes = leftover.len(),
+                            "asio_exclusive_feed_stats"
+                        );
+                        last_stats_at = std::time::Instant::now();
+                    }
+
+                    let recv = pump_rx.recv_timeout(std::time::Duration::from_millis(500));
+                    if recv.is_ok() {
+                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    let chunk = match recv {
                         Ok(Ok(data)) if data.is_empty() => {
                             http_eof_asio = true;
                             break;
@@ -2017,7 +2059,25 @@ impl OutputTarget for LocalOutput {
                     TRACK_END_NOTIFY.notify_one();
                 }
 
-                // Wait for ring buffer to drain
+                // Wait for the ring to drain — but NEVER block forever. If the
+                // ASIO render callback stops consuming (RME driver wedged after a
+                // stop→start reopen at a Repeat loop point — DEvir bug-22, the
+                // #789 regression), `ring.available()` never reaches 0 and this
+                // loop used to spin indefinitely, stranding this thread AND the
+                // process-wide ASIO_DEVICE_LOCK (held until `exclusive` is dropped
+                // just below). Bound it two ways: a hard wall-clock deadline of
+                // ~2× the ring's time-capacity, and a stall detector that bails if
+                // `available()` has not decreased for ~1.5s.
+                let ring_capacity_ms = if sample_rate > 0 && channels > 0 {
+                    (ring.capacity() as u64 * 1000) / (sample_rate as u64 * channels as u64)
+                } else {
+                    0
+                };
+                let drain_deadline =
+                    std::time::Duration::from_millis((ring_capacity_ms * 2).max(1000));
+                let drain_started = std::time::Instant::now();
+                let mut last_avail = ring.available();
+                let mut last_progress_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -2025,13 +2085,38 @@ impl OutputTarget for LocalOutput {
                     if force_silent.load(Ordering::Relaxed) {
                         break;
                     }
-                    if ring.available() == 0 {
+                    let avail = ring.available();
+                    if avail == 0 {
+                        break;
+                    }
+                    if avail < last_avail {
+                        last_avail = avail;
+                        last_progress_at = std::time::Instant::now();
+                    } else if last_progress_at.elapsed() >= std::time::Duration::from_millis(1500) {
+                        warn!(
+                            device = %device_name,
+                            ring_available = avail,
+                            total_frames_fed,
+                            "asio_drain_timeout"
+                        );
+                        break;
+                    }
+                    if drain_started.elapsed() >= drain_deadline {
+                        warn!(
+                            device = %device_name,
+                            ring_available = avail,
+                            elapsed_ms = drain_started.elapsed().as_millis() as u64,
+                            "asio_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
-                // AsioExclusiveOutput::drop() releases the ASIO device
+                // AsioExclusiveOutput::drop() releases the ASIO device and, with
+                // it, the process-wide ASIO_DEVICE_LOCK. Both loops above are now
+                // bounded and any panic unwinds through this owned local, so this
+                // drop runs on EVERY exit path — the lock can never be stranded.
                 drop(exclusive);
                 if play_generation.load(Ordering::SeqCst) == my_generation {
                     playing.store(false, Ordering::SeqCst);
@@ -3399,6 +3484,14 @@ fn feed_ring_abortable(
     abort: Option<&AtomicBool>,
 ) {
     let mut offset = 0;
+    // Wedge detector: if the render callback stops consuming, the ring stays
+    // full and `ring.push` returns 0 forever. Bail after a sustained stall so
+    // the device-owning thread can tear down (and release the ASIO device lock)
+    // instead of blocking permanently (DEvir bug-22 / #789: the callback
+    // quiesced at a Repeat loop point). The 5s threshold is far longer than any
+    // normal back-pressure wait (the callback drains a full ring within a few
+    // buffer periods), so this never trips during healthy playback.
+    let mut last_progress_at = std::time::Instant::now();
     while offset < samples.len() {
         if stop_rx.try_recv().is_ok() {
             return;
@@ -3415,12 +3508,23 @@ fn feed_ring_abortable(
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+            // A deliberate pause is not a stall.
+            last_progress_at = std::time::Instant::now();
         }
         let written = ring.push(&samples[offset..]);
         offset += written;
         if written == 0 {
+            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
+                warn!(
+                    remaining_samples = samples.len() - offset,
+                    "asio_feed_ring_stall_timeout"
+                );
+                return;
+            }
             // Ring buffer full — wait a bit
             std::thread::sleep(std::time::Duration::from_millis(5));
+        } else {
+            last_progress_at = std::time::Instant::now();
         }
     }
 }
