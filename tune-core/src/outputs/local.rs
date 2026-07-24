@@ -1826,7 +1826,6 @@ impl OutputTarget for LocalOutput {
                 let mut skipped_bytes_asio: u64 = 0;
 
                 // Read and feed the rest of the stream
-                let mut read_buf = vec![0u8; 65536];
                 let mut leftover: Vec<u8> = Vec::new();
 
                 // Process leftover from header read
@@ -1875,6 +1874,46 @@ impl OutputTarget for LocalOutput {
 
                 let mut http_eof_asio = false;
                 let mut last_data_at = std::time::Instant::now();
+                // Pump thread: it owns the blocking HTTP read so the thread
+                // that HOLDS THE ASIO DEVICE never blocks on the network.
+                // Before this, stop() set force_silent but the device thread
+                // sat in reader.read() until the HTTP session died as a side
+                // effect of the NEXT play — it then released the ASIO lock
+                // ~2.5s INTO the new play. Two repeats survived by timing;
+                // the 3rd hit the wrong interleaving: silent output and the
+                // poller oscillating at EOF (DEvir, Fireface ASIO, repeat-all,
+                // v0.9.0). With the pump, the device thread polls a channel
+                // (500ms) and honours stop within one tick; the pump thread
+                // may linger in a blocked read but only owns the socket, and
+                // exits when the receiver drops or the session closes.
+                let (pump_tx, pump_rx) =
+                    std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(64);
+                std::thread::spawn(move || {
+                    let mut reader = reader;
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => {
+                                let _ = pump_tx.send(Ok(Vec::new()));
+                                break;
+                            }
+                            Ok(n) => {
+                                if pump_tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                    break; // receiver gone — playback stopped
+                                }
+                            }
+                            Err(e) => {
+                                let transient = matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                );
+                                if pump_tx.send(Err(e)).is_err() || !transient {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1884,16 +1923,16 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
 
-                    let n = match reader.read(&mut read_buf) {
-                        Ok(0) => {
+                    let chunk = match pump_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(Ok(data)) if data.is_empty() => {
                             http_eof_asio = true;
                             break;
                         }
-                        Ok(n) => {
+                        Ok(Ok(data)) => {
                             last_data_at = std::time::Instant::now();
-                            n
+                            data
                         }
-                        Err(ref e)
+                        Ok(Err(ref e))
                             if e.kind() == std::io::ErrorKind::TimedOut
                                 || e.kind() == std::io::ErrorKind::WouldBlock =>
                         {
@@ -1918,12 +1957,31 @@ impl OutputTarget for LocalOutput {
                             }
                             continue;
                         }
-                        Err(e) => {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Same sustained-idle EOF heuristic as the
+                            // transient-read-error arm above.
+                            if total_frames_fed > 0
+                                && leftover.is_empty()
+                                && ring.available() == 0
+                                && last_data_at.elapsed() > std::time::Duration::from_secs(5)
+                            {
+                                info!("local_audio_asio_exclusive_stream_idle_eof");
+                                http_eof_asio = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        Ok(Err(e)) => {
                             warn!(error = %e, "local_audio_asio_exclusive_read_error");
                             http_eof_asio = true;
                             break;
                         }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            http_eof_asio = true;
+                            break;
+                        }
                     };
+                    let n = chunk.len();
 
                     if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
                         let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
@@ -1932,9 +1990,9 @@ impl OutputTarget for LocalOutput {
                             continue;
                         }
                         skipped_bytes_asio = skip_bytes_asio;
-                        leftover.extend_from_slice(&read_buf[remaining..n]);
+                        leftover.extend_from_slice(&chunk[remaining..]);
                     } else {
-                        leftover.extend_from_slice(&read_buf[..n]);
+                        leftover.extend_from_slice(&chunk);
                     }
 
                     let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
