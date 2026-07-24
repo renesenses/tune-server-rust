@@ -617,20 +617,54 @@ fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Resul
             .unwrap_or_else(|_| exe_dir.join("web"))
     };
 
-    if target_web.exists() {
-        std::fs::remove_dir_all(&target_web).map_err(|e| format!("remove old web/: {e}"))?;
-    }
-    copy_dir_all(&new_web, &target_web).map_err(|e| format!("copy new web/: {e}"))?;
+    // Atomic swap: the old remove-then-copy left a BROKEN web/ (missing
+    // index.html → no UI at all) whenever the copy failed partway — e.g.
+    // stale root-owned files from a manual deploy (Bertrand, .15, v0.9.2
+    // update). Stage a FULL copy next to the target, then swap via two
+    // renames: at every instant the target is either the complete old web
+    // or the complete new one. Rollback restores the old on a failed swap.
+    swap_dir_atomic(&new_web, &target_web)?;
 
     let exe_web = exe_dir.join("web");
     if exe_web != target_web {
-        if exe_web.exists() {
-            std::fs::remove_dir_all(&exe_web).ok();
-        }
-        copy_dir_all(&new_web, &exe_web).ok();
+        swap_dir_atomic(&new_web, &exe_web).ok();
     }
 
     info!(dir = %target_web.display(), "web_directory_updated");
+    Ok(())
+}
+
+/// Replace `target` with a copy of `src` without ever leaving a partial
+/// directory at `target`: stage the full copy as `target.new` (same
+/// filesystem → rename is atomic), move the old dir to `target.old`, rename
+/// the staged copy into place, then delete the backup. On a failed final
+/// rename the old directory is restored.
+fn swap_dir_atomic(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    let staged = target.with_extension("new");
+    let backup = target.with_extension("old");
+    // Clear leftovers from a previous interrupted attempt.
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged).map_err(|e| format!("clear staged web: {e}"))?;
+    }
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup).map_err(|e| format!("clear web backup: {e}"))?;
+    }
+    copy_dir_all(src, &staged).map_err(|e| format!("stage new web/: {e}"))?;
+    let had_old = target.exists();
+    if had_old {
+        std::fs::rename(target, &backup).map_err(|e| format!("park old web/: {e}"))?;
+    }
+    if let Err(e) = std::fs::rename(&staged, target) {
+        // Roll the old directory back so the UI keeps serving.
+        if had_old {
+            std::fs::rename(&backup, target).ok();
+        }
+        std::fs::remove_dir_all(&staged).ok();
+        return Err(format!("swap new web/ into place: {e}"));
+    }
+    if had_old {
+        std::fs::remove_dir_all(&backup).ok();
+    }
     Ok(())
 }
 
@@ -648,6 +682,44 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod web_swap_tests {
+    use super::swap_dir_atomic;
+
+    #[test]
+    fn swap_replaces_and_cleans() {
+        let tmp = std::env::temp_dir().join(format!("tune-swap-{}", std::process::id()));
+        let src = tmp.join("src");
+        let target = tmp.join("web");
+        std::fs::create_dir_all(src.join("assets")).unwrap();
+        std::fs::write(src.join("index.html"), b"new").unwrap();
+        std::fs::write(src.join("assets/a.js"), b"x").unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.html"), b"old").unwrap();
+
+        swap_dir_atomic(&src, &target).unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.html")).unwrap(), b"new");
+        assert!(target.join("assets/a.js").exists());
+        assert!(!tmp.join("web.old").exists(), "backup must be cleaned");
+        assert!(!tmp.join("web.new").exists(), "staging must be cleaned");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn swap_into_missing_target_works() {
+        let tmp = std::env::temp_dir().join(format!("tune-swap2-{}", std::process::id()));
+        let src = tmp.join("src");
+        let target = tmp.join("web");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("index.html"), b"new").unwrap();
+
+        swap_dir_atomic(&src, &target).unwrap();
+        assert!(target.join("index.html").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }
 
 /// GET /system/update/status
