@@ -55,11 +55,18 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
         // Find tracks with missing metadata: no MB ID OR missing genre/year/label
         let track_rows: Vec<Vec<tune_core::db::backend::SqlValue>> = backend2
             .query_many(
-                "SELECT t.id, t.title, t.artist_name, t.album_title, t.file_path, \
+                // artist_name / album_title are NOT columns of `tracks` — they are
+                // only derived via joins (artists.name / albums.title). Selecting
+                // them off `t` made the prepare fail with "no such column:
+                // t.artist_name", which .unwrap_or_default() swallowed to an empty
+                // Vec → total=0, so enrich-all silently did nothing for everyone
+                // (Fabien, v0.9.0). Join albums and read the joined columns.
+                "SELECT t.id, t.title, a.name, al.title, t.file_path, \
                  t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
                  t.artist_id, a.musicbrainz_id \
                  FROM tracks t \
                  LEFT JOIN artists a ON a.id = t.artist_id \
+                 LEFT JOIN albums al ON al.id = t.album_id \
                  WHERE t.file_path IS NOT NULL AND ( \
                    t.musicbrainz_recording_id IS NULL OR t.musicbrainz_recording_id = '' \
                    OR t.genre IS NULL OR t.genre = '' \
@@ -69,7 +76,11 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                  )",
                 &[],
             )
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                // Never swallow a query failure to total=0 again — surface it.
+                warn!(error = %e, "enrich_all query failed — reporting 0 tracks");
+                Vec::new()
+            });
 
         let total = track_rows.len();
 
