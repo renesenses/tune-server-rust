@@ -194,11 +194,31 @@ async fn main() {
         )
         .expect("failed to create socket");
         socket.set_reuse_address(true).ok();
+        #[cfg(unix)]
+        let mut reclaim_tried = false;
         for attempt in 1..=10u32 {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,
                 Err(e) if attempt < 10 => {
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
+                    // The port is held by another process. If it is a *stale*
+                    // tune-server instance (an old build that wasn't stopped
+                    // before this launch / in-app update — Vincent's macOS
+                    // dual-instance "boucle", #1158), the updater re-execs the
+                    // new binary but never tells the previous separate process
+                    // to quit, so two servers keep controlling the renderer and
+                    // the track restarts every few seconds. Reclaim the port
+                    // from that stale sibling exactly once so the freshly
+                    // launched/updated binary wins ("last launch wins"), instead
+                    // of exiting and leaving the old one alive. Only a process
+                    // that (a) is bound to *our* port and (b) is itself a
+                    // tune-server is ever signalled — never an unrelated
+                    // process, never a tune-server on a different port.
+                    #[cfg(unix)]
+                    if !reclaim_tried {
+                        reclaim_tried = true;
+                        reclaim_port_from_stale_instance(config.port);
+                    }
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 Err(e) => {
@@ -410,4 +430,160 @@ async fn shutdown_signal() {
         tracing::warn!("shutdown_timeout_forcing_exit");
         std::process::exit(0);
     });
+}
+
+/// Terminate a *stale* tune-server instance that is holding `port`, so a newly
+/// launched or freshly-updated binary can bind and take over.
+///
+/// This runs only when our own `bind()` has already failed, i.e. the port is
+/// genuinely contended — a normal startup with a free port never signals
+/// anything. It is deliberately surgical to avoid the danger of killing the
+/// wrong process:
+///
+///   1. `lsof` tells us the exact PID(s) *listening* on our port.
+///   2. We skip our own PID.
+///   3. We only signal a PID whose executable base name matches ours — an
+///      unrelated program that happens to hold the port (or a tune-server
+///      bound to a *different* port) is never touched. If the holder can't be
+///      confirmed as a tune-server we leave it alone and let the caller's
+///      bind-retry / exit(1) guard handle it (protecting the shared DB).
+///
+/// SIGTERM is sent first (graceful), with SIGKILL as a backstop so the port is
+/// reliably freed even if the old instance is wedged in its dlna_play loop.
+///
+/// Trade-off: the historical behaviour was "first launch wins" — a second
+/// instance failed to bind and exited (main.rs bind guard), which protected the
+/// DB but is wrong for an update, where the *new* binary must supersede the old
+/// one. Reclaiming the contended port makes it "last launch wins" for that one
+/// port only, which is exactly what an in-app update needs, while keeping the
+/// exit(1) guard as a backstop for the case where the holder is not a
+/// tune-server we can safely stop.
+#[cfg(unix)]
+fn reclaim_port_from_stale_instance(port: u16) {
+    let self_pid = std::process::id();
+
+    let own_name = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            tracing::warn!(
+                "could not determine own executable name; skipping stale-instance cleanup"
+            );
+            return;
+        }
+    };
+
+    let listeners = pids_listening_on(port);
+    if listeners.is_empty() {
+        // lsof missing or nothing detected — leave the bind guard to handle it.
+        return;
+    }
+
+    let mut targets: Vec<u32> = Vec::new();
+    for pid in listeners {
+        if pid == self_pid {
+            continue;
+        }
+        match process_base_name(pid) {
+            Some(name) if same_executable(&name, &own_name) => targets.push(pid),
+            Some(name) => tracing::warn!(
+                pid,
+                port,
+                holder = %name,
+                "port held by a non-tune-server process — not signalling it"
+            ),
+            None => tracing::warn!(
+                pid,
+                port,
+                "could not identify port holder — not signalling it"
+            ),
+        }
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        ?targets,
+        port,
+        "reclaiming port from stale tune-server instance(s) so the new binary can bind (last-launch-wins)"
+    );
+    for pid in &targets {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+    // Give the old instance a moment to release the socket gracefully, then
+    // force-kill anything that ignored SIGTERM so bind() can succeed on retry.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    for pid in &targets {
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// PIDs listening on `port` (TCP), via `lsof`. Empty on any failure.
+#[cfg(unix)]
+fn pids_listening_on(port: u16) -> Vec<u32> {
+    // `-iTCP:<port>` + `-sTCP:LISTEN` selects only the process listening on that
+    // TCP port; `-t` prints bare PIDs.
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-sTCP:LISTEN"])
+        .arg(format!("-iTCP:{port}"))
+        .arg("-t")
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect()
+}
+
+/// Executable base name of `pid` (e.g. `tune-server`), via `ps`. `None` on
+/// failure. macOS exposes the basename as `ucomm`, Linux as `comm`.
+#[cfg(unix)]
+fn process_base_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let field = "ucomm=";
+    #[cfg(not(target_os = "macos"))]
+    let field = "comm=";
+
+    let output = std::process::Command::new("ps")
+        .args(["-o", field, "-p"])
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let line = raw.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // `comm`/`ucomm` may still be a full path on some platforms — reduce to the
+    // final path component.
+    let base = std::path::Path::new(line)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| line.to_string());
+    Some(base)
+}
+
+/// Whether two executable base names refer to the same binary, tolerating the
+/// 15/16-char truncation that `ps` applies to the accounting name.
+#[cfg(unix)]
+fn same_executable(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    // One side may be truncated by ps (TASK_COMM_LEN / MAXCOMLEN).
+    (a.len() >= 15 && b.starts_with(a)) || (b.len() >= 15 && a.starts_with(b))
 }

@@ -88,7 +88,7 @@ jobs:
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
