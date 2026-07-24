@@ -462,15 +462,27 @@ impl OutputTarget for OaatOutput {
                         }
 
                         diag.connected.store(true, Ordering::SeqCst);
+
+                        // Prefer file header duration when the PlayMedia
+                        // metadata left duration at 0 (disables the seek bar).
+                        if duration_ms_arc.load(Ordering::Relaxed) == 0 && dsf_info.sample_rate > 0 {
+                            let d_ms = dsf_info.total_samples * 1000 / dsf_info.sample_rate as u64;
+                            duration_ms_arc.store(d_ms, Ordering::SeqCst);
+                        }
+
                         let stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                        let start = std::time::Instant::now();
+                        let mut start = std::time::Instant::now();
+                        let mut pause_offset = std::time::Duration::ZERO;
                         let mut sample_offset: u64 = 0;
                         let mut pending: Vec<u8> = Vec::new();
                         let mut first = true;
                         let mut eof = false;
+                        let mut stopped = false;
+                        let ch_usize = ch.max(1) as usize;
 
-                        while playing.load(Ordering::Relaxed) {
+                        while playing.load(Ordering::Relaxed) && !stopped {
                             if stop_rx.try_recv().is_ok() {
+                                stopped = true;
                                 break;
                             }
                             while let Ok(cmd) = command_rx.try_recv() {
@@ -481,16 +493,126 @@ impl OutputTarget for OaatOutput {
                                     OaatCommand::Mute(muted) => {
                                         endpoint.send_mute(muted).await.ok();
                                     }
-                                    OaatCommand::Pause => paused.store(true, Ordering::SeqCst),
-                                    OaatCommand::Resume => paused.store(false, Ordering::SeqCst),
-                                    _ => {}
+                                    OaatCommand::Pause => {
+                                        paused.store(true, Ordering::SeqCst);
+                                        pause_offset = start.elapsed();
+                                        endpoint
+                                            .send_message(&oaat_core::Message::Pause(
+                                                oaat_core::message::Pause {
+                                                    stream_id: stream_id.clone(),
+                                                },
+                                            ))
+                                            .await
+                                            .ok();
+                                        info!(device = %device_name, "oaat: DSD paused");
+                                    }
+                                    OaatCommand::Resume => {
+                                        paused.store(false, Ordering::SeqCst);
+                                        start = std::time::Instant::now() - pause_offset;
+                                        endpoint.send_play(&stream_id).await.ok();
+                                        info!(device = %device_name, "oaat: DSD resumed");
+                                    }
+                                    OaatCommand::Seek { position_ms: seek_pos } => {
+                                        endpoint
+                                            .send_message(&oaat_core::Message::Seek(
+                                                oaat_core::message::Seek {
+                                                    stream_id: stream_id.clone(),
+                                                    position_ms: seek_pos,
+                                                },
+                                            ))
+                                            .await
+                                            .ok();
+                                        // Bytes per channel at seek point (8 DSD bits / byte).
+                                        let target_bpc = (seek_pos as f64
+                                            * cur_sample_rate as f64
+                                            / 1000.0
+                                            / 8.0) as usize;
+                                        match tokio::task::block_in_place(|| {
+                                            reader.seek_to_bytes_per_channel(target_bpc)
+                                        }) {
+                                            Ok(reached_bpc) => {
+                                                pending.clear();
+                                                eof = false;
+                                                sample_offset = reached_bpc as u64 * 8;
+                                                let elapsed_eq =
+                                                    std::time::Duration::from_millis(seek_pos);
+                                                start = std::time::Instant::now() - elapsed_eq;
+                                                pause_offset = std::time::Duration::ZERO;
+                                                position_ms.store(seek_pos, Ordering::SeqCst);
+                                                // Re-anchor PTS so the endpoint
+                                                // doesn't discard post-seek packets.
+                                                // (stream_start_ns is captured above;
+                                                //  sample_offset drives relative PTS.)
+                                                info!(
+                                                    device = %device_name,
+                                                    seek_pos,
+                                                    reached_bpc,
+                                                    "oaat: DSD seek complete"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(device = %device_name, error = %e, "oaat: DSD seek failed");
+                                            }
+                                        }
+                                    }
+                                    OaatCommand::PrepareNext { .. } => {}
                                 }
                             }
-                            while paused.load(Ordering::Relaxed) {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                            while paused.load(Ordering::Relaxed) && playing.load(Ordering::Relaxed) {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 if stop_rx.try_recv().is_ok() {
+                                    stopped = true;
                                     break;
                                 }
+                                // Drain commands so Resume/Seek/Stop arrive while paused.
+                                while let Ok(cmd) = command_rx.try_recv() {
+                                    match cmd {
+                                        OaatCommand::Resume => {
+                                            paused.store(false, Ordering::SeqCst);
+                                            start = std::time::Instant::now() - pause_offset;
+                                            endpoint.send_play(&stream_id).await.ok();
+                                            info!(device = %device_name, "oaat: DSD resumed");
+                                        }
+                                        OaatCommand::Pause => {}
+                                        OaatCommand::SetVolume(level) => {
+                                            endpoint.send_volume(level).await.ok();
+                                        }
+                                        OaatCommand::Mute(muted) => {
+                                            endpoint.send_mute(muted).await.ok();
+                                        }
+                                        OaatCommand::Seek { position_ms: seek_pos } => {
+                                            endpoint
+                                                .send_message(&oaat_core::Message::Seek(
+                                                    oaat_core::message::Seek {
+                                                        stream_id: stream_id.clone(),
+                                                        position_ms: seek_pos,
+                                                    },
+                                                ))
+                                                .await
+                                                .ok();
+                                            let target_bpc = (seek_pos as f64
+                                                * cur_sample_rate as f64
+                                                / 1000.0
+                                                / 8.0) as usize;
+                                            if let Ok(reached_bpc) = tokio::task::block_in_place(|| {
+                                                reader.seek_to_bytes_per_channel(target_bpc)
+                                            }) {
+                                                pending.clear();
+                                                eof = false;
+                                                sample_offset = reached_bpc as u64 * 8;
+                                                start = std::time::Instant::now()
+                                                    - std::time::Duration::from_millis(seek_pos);
+                                                pause_offset = std::time::Duration::ZERO;
+                                                position_ms.store(seek_pos, Ordering::SeqCst);
+                                            }
+                                        }
+                                        OaatCommand::PrepareNext { .. } => {}
+                                    }
+                                }
+                            }
+                            if stopped || !playing.load(Ordering::Relaxed) {
+                                break;
                             }
 
                             while pending.len() < DSD_CHUNK_SIZE && !eof {
@@ -515,12 +637,12 @@ impl OutputTarget for OaatOutput {
                             }
 
                             let mut take = DSD_CHUNK_SIZE.min(pending.len());
-                            take -= take % ch.max(1) as usize;
+                            take -= take % ch_usize;
                             if take == 0 {
                                 break;
                             }
                             let payload: Vec<u8> = pending.drain(..take).collect();
-                            let bits_this = (take / ch.max(1) as usize) * 8;
+                            let bits_this = (take / ch_usize) * 8;
                             let pts_ns = stream_start_ns
                                 + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
                             let flags = if first {
@@ -551,7 +673,7 @@ impl OutputTarget for OaatOutput {
                                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
                             position_ms.store(
                                 sample_offset * 1000 / cur_sample_rate.max(1) as u64,
-                                Ordering::Relaxed,
+                                Ordering::SeqCst,
                             );
 
                             let expected = std::time::Duration::from_nanos(
