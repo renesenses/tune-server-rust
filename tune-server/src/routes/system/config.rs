@@ -573,7 +573,7 @@ pub(super) async fn add_music_dir(
     // folder added later was neither scanned nor watched — it only showed up
     // after a restart (Jean-Pierre).
     if newly_added {
-        super::scan::spawn_library_scan(state.clone(), false).await;
+        super::scan::spawn_library_scan(state.clone(), false, None).await;
     }
     Ok(Json(json!({ "dirs": dirs })).into_response())
 }
