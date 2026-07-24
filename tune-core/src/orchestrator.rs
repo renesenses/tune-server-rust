@@ -4724,6 +4724,17 @@ impl PlaybackOrchestrator {
         self.playback
             .update_queue_info(zone_id, position, total)
             .await;
+        // Last.fm/ListenBrainz "now playing": a gapless advance is a real track
+        // change, but it bypasses play_inner — the only other dispatch site —
+        // so the now-playing of every gapless-reached track (tracks 2, 4, 6… of
+        // an album) was never sent (#1113). This method is the single funnel
+        // for all gapless advance paths (position reset, duration change,
+        // confirmed pending advance), so dispatch here exactly once per track.
+        self.dispatch_now_playing(
+            &np.title,
+            np.artist_name.as_deref(),
+            np.album_title.as_deref(),
+        );
         // Use update_now_playing (not play) to avoid bumping track_generation —
         // the poller must keep its gapless_cooldown intact so it doesn't falsely
         // detect track-end on renderers that briefly report Stopped during
