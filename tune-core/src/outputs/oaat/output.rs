@@ -375,6 +375,220 @@ impl OutputTarget for OaatOutput {
             if let Some(ref fp) = file_path {
                 debug!("reading file directly: {fp}");
                 let direct_ok = 'direct: {
+                    // Fast path for native DSD: avoid loading multi-hundred-MB
+                    // DSF files into RAM when the endpoint can take DSD_U8.
+                    let is_dsf = std::path::Path::new(fp)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("dsf"));
+                    if is_dsf && endpoint.info.capabilities.dsd_max_rate.is_some() {
+                        let dsf_info = match crate::audio::dsf::parse_dsf(fp) {
+                            Ok(i) => i,
+                            Err(e) => {
+                                debug!("native DSD parse_dsf failed: {e}");
+                                break 'direct false;
+                            }
+                        };
+                        let dsd_mult = dsd_rate_from_sample_rate(dsf_info.sample_rate);
+                        if let (Some(m), Some(max)) =
+                            (dsd_mult, endpoint.info.capabilities.dsd_max_rate)
+                        {
+                            if m > max {
+                                debug!(
+                                    dsd = m,
+                                    max, "DSD rate exceeds endpoint max, falling back to PCM"
+                                );
+                                break 'direct false;
+                            }
+                        }
+                        let mut reader =
+                            match crate::audio::dsf::DsfStreamReader::open(fp, dsf_info.clone()) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    debug!("DsfStreamReader open failed: {e}");
+                                    break 'direct false;
+                                }
+                            };
+
+                        let cur_format = AudioFormat::DsdU8;
+                        let cur_sample_rate = dsf_info.sample_rate;
+                        let ch = dsf_info.channels.min(8) as u8;
+                        let layout = ChannelLayout::Stereo;
+                        let fmt_str = format_rate_display(cur_sample_rate, 1, cur_format);
+
+                        info!(
+                            device = %device_name,
+                            sample_rate = cur_sample_rate,
+                            channels = ch,
+                            dsd_rate = ?dsd_mult,
+                            "oaat: native DSD streaming"
+                        );
+
+                        if let Err(e) = endpoint
+                            .send_message(&oaat_core::Message::FormatPropose(
+                                oaat_core::message::FormatPropose {
+                                    stream_id: stream_id.clone(),
+                                    format: cur_format,
+                                    sample_rate: cur_sample_rate,
+                                    channels: ch,
+                                    channel_layout: layout,
+                                    bits_per_sample: 1,
+                                    dsd_rate: dsd_mult,
+                                },
+                            ))
+                            .await
+                        {
+                            error!(device = %device_name, error = %e, "oaat: DSD format propose failed");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+
+                        endpoint
+                            .send_metadata(oaat_core::message::TrackMetadata {
+                                title: title.clone(),
+                                artist: artist.clone(),
+                                album: album.clone(),
+                                duration_ms: track_duration_ms,
+                                artwork_url: cover_url.clone(),
+                                format: Some(fmt_str),
+                            })
+                            .await
+                            .ok();
+
+                        if let Err(e) = endpoint.send_play(&stream_id).await {
+                            error!(device = %device_name, error = %e, "oaat: DSD play failed");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+
+                        diag.connected.store(true, Ordering::SeqCst);
+                        let stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                        let start = std::time::Instant::now();
+                        let mut sample_offset: u64 = 0;
+                        let mut pending: Vec<u8> = Vec::new();
+                        let mut first = true;
+                        let mut eof = false;
+
+                        while playing.load(Ordering::Relaxed) {
+                            if stop_rx.try_recv().is_ok() {
+                                break;
+                            }
+                            while let Ok(cmd) = command_rx.try_recv() {
+                                match cmd {
+                                    OaatCommand::SetVolume(level) => {
+                                        endpoint.send_volume(level).await.ok();
+                                    }
+                                    OaatCommand::Mute(muted) => {
+                                        endpoint.send_mute(muted).await.ok();
+                                    }
+                                    OaatCommand::Pause => paused.store(true, Ordering::SeqCst),
+                                    OaatCommand::Resume => paused.store(false, Ordering::SeqCst),
+                                    _ => {}
+                                }
+                            }
+                            while paused.load(Ordering::Relaxed) {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                if stop_rx.try_recv().is_ok() {
+                                    break;
+                                }
+                            }
+
+                            while pending.len() < DSD_CHUNK_SIZE && !eof {
+                                let chunk = match tokio::task::block_in_place(|| reader.next_chunk())
+                                {
+                                    Ok(Some(c)) => c,
+                                    Ok(None) => {
+                                        eof = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        warn!(device = %device_name, error = %e, "oaat: DSD read error");
+                                        eof = true;
+                                        break;
+                                    }
+                                };
+                                pending.extend_from_slice(&chunk);
+                            }
+
+                            if pending.is_empty() {
+                                break;
+                            }
+
+                            let mut take = DSD_CHUNK_SIZE.min(pending.len());
+                            take -= take % ch.max(1) as usize;
+                            if take == 0 {
+                                break;
+                            }
+                            let payload: Vec<u8> = pending.drain(..take).collect();
+                            let bits_this = (take / ch.max(1) as usize) * 8;
+                            let pts_ns = stream_start_ns
+                                + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
+                            let flags = if first {
+                                first = false;
+                                PacketFlags::FIRST_PACKET
+                            } else {
+                                PacketFlags::empty()
+                            };
+
+                            if endpoint
+                                .send_audio(
+                                    stream_num,
+                                    cur_format,
+                                    pts_ns,
+                                    sample_offset,
+                                    &payload,
+                                    flags,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+
+                            sample_offset += bits_this as u64;
+                            diag.packets_sent.fetch_add(1, Ordering::Relaxed);
+                            diag.bytes_sent
+                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            position_ms.store(
+                                sample_offset * 1000 / cur_sample_rate.max(1) as u64,
+                                Ordering::Relaxed,
+                            );
+
+                            let expected = std::time::Duration::from_nanos(
+                                (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
+                            );
+                            let elapsed = start.elapsed();
+                            if expected > elapsed {
+                                tokio::time::sleep(expected - elapsed).await;
+                            }
+
+                            if eof && pending.is_empty() {
+                                break;
+                            }
+                        }
+
+                        endpoint
+                            .send_audio(
+                                stream_num,
+                                cur_format,
+                                0,
+                                sample_offset,
+                                &[],
+                                PacketFlags::LAST_PACKET,
+                            )
+                            .await
+                            .ok();
+                        endpoint.send_stop(&stream_id).await.ok();
+                        playing.store(false, Ordering::SeqCst);
+                        diag.connected.store(false, Ordering::SeqCst);
+                        info!(
+                            device = %device_name,
+                            bits = sample_offset,
+                            "oaat: native DSD playback complete"
+                        );
+                        break 'direct true;
+                    }
+
                     let file_data = match tokio::fs::read(fp).await {
                         Ok(d) => d,
                         Err(e) => {
@@ -406,6 +620,7 @@ impl OutputTarget for OaatOutput {
 
                     // DSD needs conversion to PCM — let the orchestrator handle
                     // it via HTTP streaming rather than sending raw DSD bits
+                    // (endpoint has no DSD capability, or file is not .dsf).
                     if is_dsd {
                         debug!("DSD file, falling back to HTTP stream for PCM conversion");
                         break 'direct false;
