@@ -2,6 +2,26 @@ use tracing::info;
 
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 
+/// rust_cast opens a plain blocking `TcpStream` with no connect/read timeout:
+/// a Chromecast that vanished from the network (sleep, Wi-Fi drop — some flap
+/// every few minutes) turns that connect into a minutes-long hang that
+/// strands a blocking-pool thread. Probe with a bounded connect first so a
+/// dead host fails fast.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `true` when `host:port` accepts a TCP connection within `timeout`. Returns
+/// `true` on resolution failure so rust_cast surfaces the real error itself.
+fn probe_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => TcpStream::connect_timeout(&addr, timeout).is_ok(),
+            None => true,
+        },
+        Err(_) => true,
+    }
+}
+
 pub struct ChromecastOutput {
     name: String,
     device_id: String,
@@ -315,6 +335,9 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
+            if !probe_reachable(&host, port, PROBE_TIMEOUT) {
+                return Ok(OutputStatus::default());
+            }
             let device = match rust_cast::CastDevice::connect_without_host_verification(&host, port)
             {
                 Ok(d) => d,
@@ -422,9 +445,52 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
-            rust_cast::CastDevice::connect_without_host_verification(&host, port).is_ok()
+            probe_reachable(&host, port, PROBE_TIMEOUT)
+                && rust_cast::CastDevice::connect_without_host_verification(&host, port).is_ok()
         })
         .await
         .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn reachable_host_probes_true() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_reachable(
+            "127.0.0.1",
+            port,
+            std::time::Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn dead_host_probes_false_fast() {
+        // Bind then drop: the port is closed, connect is refused immediately.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let start = std::time::Instant::now();
+        assert!(!probe_reachable(
+            "127.0.0.1",
+            port,
+            std::time::Duration::from_millis(500)
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn unresolvable_host_falls_through_true() {
+        // rust_cast must surface the real error itself.
+        assert!(probe_reachable(
+            "definitely-not-a-real-host.invalid",
+            8009,
+            std::time::Duration::from_millis(500)
+        ));
     }
 }

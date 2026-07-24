@@ -25,8 +25,44 @@ static POLLER_FSM_SHADOW: LazyLock<bool> = LazyLock::new(|| {
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
-use crate::outputs::traits::TransportState;
+use crate::outputs::traits::{OutputStatus, OutputTarget, TransportState};
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
+
+/// Upper bound on a single `get_status` poll (device lock + transport call).
+/// The poller is ONE sequential task over every zone: an output whose
+/// transport blocks with no socket timeout (rust_cast/Chromecast does raw
+/// blocking I/O) would otherwise freeze end-of-track detection for ALL
+/// zones — tracks end but nothing ever advances. Override with
+/// `TUNE_POLLER_STATUS_TIMEOUT_SECS`; 0 disables the bound (pre-fix behavior).
+static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
+    let secs = std::env::var("TUNE_POLLER_STATUS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    (secs > 0).then(|| Duration::from_secs(secs))
+});
+
+/// Lock the output and poll its status, bounded by `timeout`. On timeout the
+/// in-flight transport call is abandoned (a blocking-pool thread may linger
+/// until its socket dies) but the poller moves on to the next zone instead of
+/// stalling every zone behind one dead device. The bound covers the lock
+/// acquisition too: an orchestrator call hung inside the same output must not
+/// stall the poller either.
+async fn get_status_bounded(
+    output_arc: &Arc<Mutex<Box<dyn OutputTarget>>>,
+    timeout: Option<Duration>,
+) -> Result<OutputStatus, String> {
+    let poll = async {
+        let output = output_arc.lock().await;
+        output.get_status().await
+    };
+    match timeout {
+        Some(t) => tokio::time::timeout(t, poll)
+            .await
+            .unwrap_or_else(|_| Err(format!("get_status timed out after {}s", t.as_secs()))),
+        None => poll.await,
+    }
+}
 
 pub type PollerMetricsMap = Arc<Mutex<HashMap<i64, ZonePollerMetrics>>>;
 
@@ -1158,8 +1194,7 @@ impl PositionPoller {
                         None => continue,
                     }
                 };
-                let output = output_arc.lock().await;
-                match output.get_status().await {
+                match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok(s) => s,
                     Err(_) => continue,
                 }
@@ -1439,8 +1474,7 @@ impl PositionPoller {
                         None => continue,
                     }
                 };
-                let output = output_arc.lock().await;
-                match output.get_status().await {
+                match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok(s) => {
                         ps.consecutive_errors = 0;
                         let latency = poll_start.elapsed().as_millis() as u32;
@@ -3621,5 +3655,132 @@ mod tests {
         }
         assert!(!ps.gapless_advance_pending);
         assert_eq!(ps.gapless_stuck_ticks, 0);
+    }
+}
+
+#[cfg(test)]
+mod status_timeout_tests {
+    use super::*;
+
+    /// Output whose `get_status` never returns — models a transport doing
+    /// blocking I/O against a dead device (Chromecast gone mid-connection).
+    struct HungOutput;
+
+    #[async_trait::async_trait]
+    impl OutputTarget for HungOutput {
+        fn name(&self) -> &str {
+            "hung"
+        }
+        fn device_id(&self) -> &str {
+            "hung"
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Err("n/a".into())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Err("n/a".into())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Err("n/a".into())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Err("n/a".into())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Err("n/a".into())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Err("n/a".into())
+        }
+        async fn get_status(&self) -> Result<OutputStatus, String> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Output that answers immediately.
+    struct FastOutput;
+
+    #[async_trait::async_trait]
+    impl OutputTarget for FastOutput {
+        fn name(&self) -> &str {
+            "fast"
+        }
+        fn device_id(&self) -> &str {
+            "fast"
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_status(&self) -> Result<OutputStatus, String> {
+            Ok(OutputStatus {
+                state: TransportState::Playing,
+                ..Default::default()
+            })
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn arc(output: Box<dyn OutputTarget>) -> Arc<Mutex<Box<dyn OutputTarget>>> {
+        Arc::new(Mutex::new(output))
+    }
+
+    #[tokio::test]
+    async fn hung_transport_times_out_instead_of_stalling_the_poller() {
+        let out = arc(Box::new(HungOutput));
+        let res = get_status_bounded(&out, Some(Duration::from_millis(50))).await;
+        let err = res.expect_err("a hung get_status must yield an error, not block");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn hung_lock_holder_times_out_too() {
+        // An orchestrator call stuck inside the output holds its lock; the
+        // poller must not wait behind it forever.
+        let out = arc(Box::new(FastOutput));
+        let _held = out.lock().await;
+        let res = get_status_bounded(&out, Some(Duration::from_millis(50))).await;
+        assert!(res.is_err(), "a held output lock must not stall the poller");
+    }
+
+    #[tokio::test]
+    async fn healthy_transport_passes_through() {
+        let out = arc(Box::new(FastOutput));
+        let res = get_status_bounded(&out, Some(Duration::from_secs(5))).await;
+        assert_eq!(res.unwrap().state, TransportState::Playing);
+    }
+
+    #[tokio::test]
+    async fn timeout_disabled_preserves_unbounded_behavior() {
+        // TUNE_POLLER_STATUS_TIMEOUT_SECS=0 → rollback to the pre-fix path.
+        let out = arc(Box::new(FastOutput));
+        let res = get_status_bounded(&out, None).await;
+        assert_eq!(res.unwrap().state, TransportState::Playing);
     }
 }
