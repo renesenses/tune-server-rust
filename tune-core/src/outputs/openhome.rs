@@ -212,37 +212,54 @@ impl OpenHomeOutput {
 
     async fn select_playlist_source(&self) {
         let Some(url) = self.svc_url("product") else {
+            info!(device = %self.name, "oh_source_no_product_service");
             return;
         };
-        let Ok(resp) = self.soap_call(url, SVC_PRODUCT, "SourceXml", &[]).await else {
-            return;
+        let resp = match self.soap_call(url, SVC_PRODUCT, "SourceXml", &[]).await {
+            Ok(r) => r,
+            Err(e) => {
+                info!(device = %self.name, error = %e, "oh_source_xml_call_failed");
+                return;
+            }
         };
         let Some(xml) = extract_tag(&resp, "Value") else {
+            info!(device = %self.name, "oh_source_xml_no_value");
             return;
         };
+        // DIAGNOSTIC (Vincent's LUXMAN NT-07: track inserted but never fetched):
+        // log a head of the SourceXml so we can see if `<Source>` arrives
+        // entity-encoded (`&lt;Source&gt;`) — in which case the split below finds
+        // nothing, the Playlist source is never selected, and the renderer plays
+        // no source (bytes_sent=0). Also log the parsed source types.
+        let head: String = xml.chars().take(160).collect();
+        info!(device = %self.name, xml_head = %head, "oh_source_xml_head");
 
+        let mut types: Vec<String> = Vec::new();
         let mut idx = 0u32;
         for chunk in xml.split("<Source>").skip(1) {
-            if let Some(stype) = extract_tag(chunk, "Type")
-                && stype.trim() == "Playlist"
-            {
-                if let Err(e) = self
-                    .soap_call(
-                        url,
-                        SVC_PRODUCT,
-                        "SetSourceIndex",
-                        &[("Value", &idx.to_string())],
-                    )
-                    .await
-                {
-                    warn!(device = %self.name, error = %e, "oh_source_select_failed");
-                } else {
-                    debug!(device = %self.name, index = idx, "oh_source_set_playlist");
+            if let Some(stype) = extract_tag(chunk, "Type") {
+                let t = stype.trim().to_string();
+                types.push(t.clone());
+                if t == "Playlist" {
+                    if let Err(e) = self
+                        .soap_call(
+                            url,
+                            SVC_PRODUCT,
+                            "SetSourceIndex",
+                            &[("Value", &idx.to_string())],
+                        )
+                        .await
+                    {
+                        warn!(device = %self.name, error = %e, "oh_source_select_failed");
+                    } else {
+                        info!(device = %self.name, index = idx, "oh_source_set_playlist");
+                    }
+                    return;
                 }
-                return;
             }
             idx += 1;
         }
+        info!(device = %self.name, source_types = ?types, "oh_source_no_playlist_found");
     }
 
     async fn wake_from_standby(&self) {
@@ -343,6 +360,15 @@ impl OutputTarget for OpenHomeOutput {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let metadata = Self::build_didl(media);
+        // DIAGNOSTIC: the exact URI + DIDL handed to the renderer, so we can see
+        // whether the res URI matches the working stream URL and whether the DIDL
+        // is well-formed (Vincent's LUXMAN NT-07 inserts but never fetches).
+        info!(
+            device = %self.name,
+            uri = media.url,
+            didl = %metadata,
+            "oh_insert_uri_didl"
+        );
 
         self.playlist_delete_all().await?;
 
