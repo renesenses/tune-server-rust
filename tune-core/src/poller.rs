@@ -339,6 +339,59 @@ pub(crate) mod decisions {
             && played_enough
             && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
+
+    /// Identity key of the currently playing track for the once-per-track
+    /// scrobble latch (#1113).
+    ///
+    /// The latch used to be a plain boolean reset only when
+    /// `track_generation` changed — but a gapless advance
+    /// (`advance_queue_metadata`) deliberately does NOT bump the generation
+    /// (the poller needs its cooldown intact), so every gapless-reached track
+    /// (tracks 2, 4, 6… of an album) kept the latch stuck `true` and was never
+    /// scrobbled. Keying the latch on the track's identity re-arms it on ANY
+    /// path that changes what is playing — explicit play (generation bump),
+    /// gapless metadata advance (queue position / track change), or the local
+    /// output's internal chain — without per-call-site reset bookkeeping.
+    ///
+    /// `track_generation` still participates so repeat-one (same track, same
+    /// queue position, new play) scrobbles each pass.
+    pub fn scrobble_track_key(
+        track_generation: u64,
+        queue_position: i64,
+        track_id: Option<i64>,
+        title: &str,
+        artist: Option<&str>,
+    ) -> String {
+        // Prefer the stable library id: mid-track metadata refinements
+        // (cover/format updates) must not look like a new track.
+        match track_id {
+            Some(id) => format!("{track_generation}:{queue_position}:id={id}"),
+            None => format!(
+                "{track_generation}:{queue_position}:{title}\u{1f}{}",
+                artist.unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Should the poller dispatch a scrobble this tick?
+    ///
+    /// True when the playing track differs from the one already latched
+    /// (`latched_key`) AND it has genuinely been listened past the Last.fm
+    /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
+    pub fn should_dispatch_scrobble(
+        latched_key: Option<&str>,
+        current_key: &str,
+        source: &str,
+        duration_ms: i64,
+        position_ms: i64,
+    ) -> bool {
+        source != "radio"
+            && latched_key != Some(current_key)
+            && crate::scrobble::should_scrobble(
+                (duration_ms > 0).then_some(duration_ms),
+                position_ms,
+            )
+    }
 }
 
 /// Explicit poller state machine — **shadow model** of the `Stopped`-state
@@ -1045,10 +1098,13 @@ struct ZonePollState {
     /// to verify that enough of the track was actually played before
     /// accepting a gapless transition.
     peak_position_ms: u64,
-    /// Whether the current track has already been scrobbled. Latched true once
-    /// the track crosses the Last.fm threshold (50% / 4 min) so it scrobbles
-    /// exactly once, and reset on a real track change (#1113).
-    scrobbled: bool,
+    /// Identity key (`decisions::scrobble_track_key`) of the track already
+    /// scrobbled, latched once it crosses the Last.fm threshold (50% / 4 min)
+    /// so it scrobbles exactly once. A plain boolean here was only reset on
+    /// `track_generation` changes, which gapless advances skip — so every
+    /// gapless-reached track was silently dropped (#1113). The identity key
+    /// re-arms on any track change regardless of the advance path.
+    scrobbled_key: Option<String>,
     /// Tick counter for throttling DB position saves.
     ticks_since_db_save: u64,
     /// When the current track started playing (wall clock).
@@ -1354,7 +1410,7 @@ impl PositionPoller {
                 gapless_sent_at: None,
                 last_position_ms: 0,
                 peak_position_ms: 0,
-                scrobbled: false,
+                scrobbled_key: None,
                 ticks_since_db_save: 0,
                 track_started_at: None,
                 last_seek_seen: None,
@@ -1402,7 +1458,7 @@ impl PositionPoller {
                     );
                     ps.last_position_ms = 0;
                     ps.peak_position_ms = 0;
-                    ps.scrobbled = false;
+                    ps.scrobbled_key = None;
                     ps.last_bytes_sent = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
@@ -1424,20 +1480,33 @@ impl PositionPoller {
             // play, gapless, prefetch) and uses the live position — unlike the old
             // play-start dispatch that scrobbled instantly on a skip and dropped
             // every prefetched track (Bilou, #1113). Radio and sub-30s / unknown
-            // tracks are excluded by `should_scrobble`.
-            if !ps.scrobbled
-                && zone_state.state == PlayState::Playing
+            // tracks are excluded by `should_dispatch_scrobble`. The latch is
+            // keyed on the track's identity, so a gapless metadata advance —
+            // which swaps now-playing WITHOUT bumping track_generation — re-arms
+            // it for the new track (tracks 2, 4, 6… of an album, #1113).
+            if zone_state.state == PlayState::Playing
                 && let Some(np) = zone_state.now_playing.as_ref()
-                && np.source != "radio"
             {
-                let dur = (np.duration_ms > 0).then_some(np.duration_ms);
-                if crate::scrobble::should_scrobble(dur, zone_state.position_ms) {
+                let key = decisions::scrobble_track_key(
+                    zone_state.track_generation,
+                    zone_state.queue_position,
+                    np.track_id,
+                    &np.title,
+                    np.artist_name.as_deref(),
+                );
+                if decisions::should_dispatch_scrobble(
+                    ps.scrobbled_key.as_deref(),
+                    &key,
+                    &np.source,
+                    np.duration_ms,
+                    zone_state.position_ms,
+                ) {
                     self.orchestrator.dispatch_scrobble(
                         &np.title,
                         np.artist_name.as_deref(),
                         np.album_title.as_deref(),
                     );
-                    ps.scrobbled = true;
+                    ps.scrobbled_key = Some(key);
                 }
             }
 
@@ -1913,13 +1982,11 @@ impl PositionPoller {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
                         ps.gapless_cooldown = 4;
-                        // A gapless advance updates now-playing WITHOUT bumping
-                        // track_generation, so the generation-based reset above
-                        // never fires for it — leaving the scrobble latch stuck
-                        // `true`, so every 2nd track of an album (the gapless-
-                        // reached ones) was never scrobbled (#1113). Reset it here
-                        // where the track actually advances.
-                        ps.scrobbled = false;
+                        // The identity-keyed latch re-arms by itself on the new
+                        // track; clearing it here additionally covers gapless
+                        // repeat-one, where the advanced track has the same
+                        // identity as the latched one (#1113).
+                        ps.scrobbled_key = None;
                     }
                 }
             }
@@ -2311,9 +2378,9 @@ impl PositionPoller {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
                             ps.gapless_cooldown = 4;
-                            // Reset the once-per-track scrobble latch on advance
-                            // (gapless doesn't bump track_generation) — #1113.
-                            ps.scrobbled = false;
+                            // Identity-keyed latch re-arms on the new track;
+                            // clearing also covers gapless repeat-one (#1113).
+                            ps.scrobbled_key = None;
                         }
                     }
                     if ps.track_started_at.is_none() {
@@ -2378,9 +2445,9 @@ impl PositionPoller {
                             // gapless transition, which would otherwise send a
                             // redundant Stop+Play and cause an audible restart.
                             ps.gapless_cooldown = 4;
-                            // Reset the once-per-track scrobble latch on advance
-                            // (gapless doesn't bump track_generation) — #1113.
-                            ps.scrobbled = false;
+                            // Identity-keyed latch re-arms on the new track;
+                            // clearing also covers gapless repeat-one (#1113).
+                            ps.scrobbled_key = None;
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
@@ -2911,6 +2978,118 @@ mod tests {
     }
 
     #[test]
+    fn gapless_metadata_advance_rearms_scrobble_latch_1113() {
+        // Characterization of forum #1113: in continuous album playback only
+        // tracks 1, 3, 5… were scrobbled. Tracks reached via the gapless path
+        // (the poller calls advance_queue_metadata, which swaps now-playing and
+        // bumps queue_position WITHOUT bumping track_generation) never re-armed
+        // the boolean latch, so their scrobble — and now-playing — was dropped.
+        //
+        // This simulates the full flow with the identity-keyed latch and NO
+        // orchestrator play (i.e. no generation bump) between tracks.
+        let dur = 200_000_i64; // 3:20 track
+        let generation = 7_u64; // set by the explicit play of track 1, never bumped
+
+        // --- Track 1 (explicit play, gen=7, queue pos 0) ---
+        let k1 =
+            decisions::scrobble_track_key(generation, 0, Some(41), "Track One", Some("Artist"));
+        let mut latched: Option<String> = None;
+
+        // Early in the track: below the 50% threshold, no scrobble yet.
+        assert!(!decisions::should_dispatch_scrobble(
+            latched.as_deref(),
+            &k1,
+            "local",
+            dur,
+            30_000
+        ));
+        // Past 50%: dispatch once, then latch.
+        assert!(decisions::should_dispatch_scrobble(
+            latched.as_deref(),
+            &k1,
+            "local",
+            dur,
+            100_000
+        ));
+        latched = Some(k1.clone());
+        // Subsequent ticks of the same track must NOT scrobble again.
+        assert!(!decisions::should_dispatch_scrobble(
+            latched.as_deref(),
+            &k1,
+            "local",
+            dur,
+            150_000
+        ));
+
+        // --- Gapless transition to track 2: advance_queue_metadata updates
+        // now-playing and queue_position (0 → 1) but NOT track_generation. ---
+        let k2 =
+            decisions::scrobble_track_key(generation, 1, Some(42), "Track Two", Some("Artist"));
+        assert_ne!(
+            k1, k2,
+            "a gapless advance must produce a new latch identity even without a generation bump"
+        );
+
+        // Right after the transition (position reset to 0): armed but below
+        // threshold — no premature scrobble.
+        assert!(!decisions::should_dispatch_scrobble(
+            latched.as_deref(),
+            &k2,
+            "local",
+            dur,
+            2_000
+        ));
+        // Track 2 crosses 50%: it MUST scrobble (this is exactly what the
+        // stuck boolean latch prevented — tracks 2, 4, 6… were dropped).
+        assert!(decisions::should_dispatch_scrobble(
+            latched.as_deref(),
+            &k2,
+            "local",
+            dur,
+            100_000
+        ));
+        latched = Some(k2.clone());
+        // Once per track, still.
+        assert!(!decisions::should_dispatch_scrobble(
+            latched.as_deref(),
+            &k2,
+            "local",
+            dur,
+            190_000
+        ));
+    }
+
+    #[test]
+    fn scrobble_key_stable_across_metadata_refinements() {
+        // Cover/format refinements re-emit now-playing mid-track; with a
+        // library id the key must not change (no double scrobble).
+        let a = decisions::scrobble_track_key(3, 5, Some(9), "Title", Some("A"));
+        let b = decisions::scrobble_track_key(3, 5, Some(9), "Title (Remaster)", Some("A"));
+        assert_eq!(a, b);
+        // Streaming (no track id) falls back to title+artist identity.
+        let c = decisions::scrobble_track_key(3, 5, None, "Song", Some("A"));
+        let d = decisions::scrobble_track_key(3, 5, None, "Song", Some("B"));
+        assert_ne!(c, d);
+    }
+
+    #[test]
+    fn scrobble_key_rearms_on_generation_bump_for_repeat_one() {
+        // Repeat-one via handle_track_end re-plays the same track at the same
+        // queue position — the generation bump alone must re-arm the latch.
+        let first = decisions::scrobble_track_key(3, 0, Some(9), "Title", Some("A"));
+        let replay = decisions::scrobble_track_key(4, 0, Some(9), "Title", Some("A"));
+        assert_ne!(first, replay);
+    }
+
+    #[test]
+    fn radio_never_scrobbles() {
+        let k = decisions::scrobble_track_key(1, 0, None, "Song", Some("A"));
+        assert!(!decisions::should_dispatch_scrobble(
+            None, &k, "radio", 200_000, 150_000
+        ));
+    }
+
+    #[test]
     fn gapless_cooldown_suppresses_stopped() {
         let mut ps = ZonePollState {
             gapless_sent: false,
@@ -2926,7 +3105,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
-            scrobbled: false,
+            scrobbled_key: None,
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
@@ -2976,7 +3155,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
-            scrobbled: false,
+            scrobbled_key: None,
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
@@ -3181,7 +3360,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
-            scrobbled: false,
+            scrobbled_key: None,
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
@@ -3576,7 +3755,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
-            scrobbled: false,
+            scrobbled_key: None,
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
@@ -3633,7 +3812,7 @@ mod tests {
             gapless_sent_at: None,
             last_position_ms: 0,
             peak_position_ms: 0,
-            scrobbled: false,
+            scrobbled_key: None,
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
