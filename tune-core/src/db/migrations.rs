@@ -1421,13 +1421,12 @@ mod tests {
     }
 
     #[test]
-    fn streaming_queue_exists_after_migrations() {
-        // Regression (tester Yacine, Synology DS418j): startup's orphan-queue
-        // cleanup runs `DELETE FROM streaming_queue` and logged
-        // `orphan_queue_cleanup_failed error=... no such table: streaming_queue`.
-        // streaming_queue is NOT in CORE_SCHEMA — it must be created by
-        // run_migrations (v53 + the belt-and-suspenders tail block) which always
-        // runs before the cleanup. This asserts that guarantee on a fresh DB.
+    fn unified_queue_exists_after_migrations() {
+        // Regression class (tester Yacine, Synology DS418j — originally on the
+        // legacy streaming_queue): startup's orphan-queue cleanup must never
+        // hit a missing table on a fresh DB. Since the v0.9 unified queue the
+        // cleanup targets queue_items — assert run_migrations creates it and
+        // that the exact startup DELETE succeeds.
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
@@ -1435,18 +1434,16 @@ mod tests {
         let conn = db.connection().lock().unwrap();
         let exists: i32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='streaming_queue'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='queue_items'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(exists, 1, "streaming_queue must exist after run_migrations");
+        assert_eq!(exists, 1, "queue_items must exist after run_migrations");
 
-        // The orphan cleanup DELETE must not error now that the table exists.
-        conn.execute_batch(
-            "DELETE FROM streaming_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
-        )
-        .expect("orphan cleanup DELETE must succeed on a migrated DB");
+        // The startup orphan cleanup DELETE must not error on a migrated DB.
+        conn.execute_batch("DELETE FROM queue_items WHERE zone_id NOT IN (SELECT id FROM zones)")
+            .expect("orphan cleanup DELETE must succeed on a migrated DB");
     }
 
     #[test]
