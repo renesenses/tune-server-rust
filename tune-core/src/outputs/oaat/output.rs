@@ -68,6 +68,11 @@ pub struct OaatOutput {
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
+    /// Start position (ms) for the next play_media call. Set by the
+    /// orchestrator on seek-recreate; consumed (reset to 0) by play_media.
+    /// Needed because the native DSD path reads the file directly and
+    /// ignores the seek-positioned HTTP transcode URL.
+    pending_start_ms: Arc<AtomicU64>,
     current_uri: Arc<Mutex<Option<String>>>,
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
@@ -96,6 +101,7 @@ impl OaatOutput {
             volume: Arc::new(AtomicU32::new(800)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
+            pending_start_ms: Arc::new(AtomicU64::new(0)),
             current_uri: Arc::new(Mutex::new(None)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
@@ -104,6 +110,11 @@ impl OaatOutput {
             command_tx: Mutex::new(None),
             diag: Arc::new(OaatDiagnostics::default()),
         }
+    }
+
+    /// Arm a start position for the next play_media (orchestrator seek path).
+    pub fn set_pending_start_position_ms(&self, ms: u64) {
+        self.pending_start_ms.store(ms, Ordering::SeqCst);
     }
 
     pub fn diagnostics_snapshot(&self) -> serde_json::Value {
@@ -242,6 +253,10 @@ impl OutputTarget for OaatOutput {
         "oaat"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     #[cfg(feature = "oaat")]
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         use oaat_controller::{ConnectedEndpoint, ControllerConfig};
@@ -259,6 +274,9 @@ impl OutputTarget for OaatOutput {
         let album = media.album.unwrap_or("").to_owned();
         let cover_url = media.cover_url.map(|s| s.to_owned());
         let track_duration_ms = media.duration_ms.unwrap_or(0);
+        // Armed by the orchestrator when a seek recreates the stream; the
+        // native DSD path uses it to start reading the file at that offset.
+        let start_position_ms = self.pending_start_ms.swap(0, Ordering::SeqCst);
 
         *self.current_uri.lock().await = Some(url.clone());
         *self.current_title.lock().await = Some(title.clone());
@@ -288,7 +306,7 @@ impl OutputTarget for OaatOutput {
 
         playing.store(true, Ordering::SeqCst);
         paused.store(false, Ordering::SeqCst);
-        position_ms.store(0, Ordering::SeqCst);
+        position_ms.store(start_position_ms, Ordering::SeqCst);
 
         tokio::spawn(async move {
             use futures_util::StreamExt;
@@ -470,10 +488,54 @@ impl OutputTarget for OaatOutput {
                             duration_ms_arc.store(d_ms, Ordering::SeqCst);
                         }
 
-                        let stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                        let mut start = std::time::Instant::now();
+                        // Seek support: the orchestrator implements seek by
+                        // recreating the stream with a start position (it
+                        // never sends an in-stream Seek command). Position
+                        // the DSF reader here, otherwise every seek restarts
+                        // playback at 0:00 while the UI shows the seek point.
+                        let mut initial_bits: u64 = 0;
+                        if start_position_ms > 0 {
+                            let target_bpc = (start_position_ms as f64
+                                * cur_sample_rate as f64
+                                / 1000.0
+                                / 8.0) as usize;
+                            match tokio::task::block_in_place(|| {
+                                reader.seek_to_bytes_per_channel(target_bpc)
+                            }) {
+                                Ok(reached_bpc) => {
+                                    initial_bits = reached_bpc as u64 * 8;
+                                    info!(
+                                        device = %device_name,
+                                        start_position_ms,
+                                        reached_bpc,
+                                        "oaat: native DSD starting at seek position"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(device = %device_name, error = %e, "oaat: native DSD start seek failed");
+                                }
+                            }
+                        }
+
+                        let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                        let mut start = std::time::Instant::now()
+                            - std::time::Duration::from_nanos(
+                                (initial_bits as f64 / cur_sample_rate as f64 * 1e9) as u64,
+                            );
                         let mut pause_offset = std::time::Duration::ZERO;
-                        let mut sample_offset: u64 = 0;
+                        let mut sample_offset: u64 = initial_bits;
+                        // PTS must be relative to the first packet actually
+                        // sent: the endpoint only schedules playback when the
+                        // first PTS is < 5 s ahead of its clock, so encoding
+                        // the absolute seek offset into the PTS would break
+                        // scheduling and confuse the drift servo.
+                        let mut pts_bits_base: u64 = initial_bits;
+                        if initial_bits > 0 {
+                            position_ms.store(
+                                initial_bits * 1000 / cur_sample_rate.max(1) as u64,
+                                Ordering::SeqCst,
+                            );
+                        }
                         let mut pending: Vec<u8> = Vec::new();
                         let mut first = true;
                         let mut eof = false;
@@ -539,10 +601,13 @@ impl OutputTarget for OaatOutput {
                                                 start = std::time::Instant::now() - elapsed_eq;
                                                 pause_offset = std::time::Duration::ZERO;
                                                 position_ms.store(seek_pos, Ordering::SeqCst);
-                                                // Re-anchor PTS so the endpoint
-                                                // doesn't discard post-seek packets.
-                                                // (stream_start_ns is captured above;
-                                                //  sample_offset drives relative PTS.)
+                                                // Re-anchor PTS at the seek point:
+                                                // the endpoint disarmed its servo on
+                                                // the Seek message, so post-seek
+                                                // packets restart a fresh timeline.
+                                                pts_bits_base = sample_offset;
+                                                stream_start_ns =
+                                                    super::helpers::now_ns() + 200_000_000;
                                                 info!(
                                                     device = %device_name,
                                                     seek_pos,
@@ -605,6 +670,9 @@ impl OutputTarget for OaatOutput {
                                                     - std::time::Duration::from_millis(seek_pos);
                                                 pause_offset = std::time::Duration::ZERO;
                                                 position_ms.store(seek_pos, Ordering::SeqCst);
+                                                pts_bits_base = sample_offset;
+                                                stream_start_ns =
+                                                    super::helpers::now_ns() + 200_000_000;
                                             }
                                         }
                                         OaatCommand::PrepareNext { .. } => {}
@@ -644,7 +712,9 @@ impl OutputTarget for OaatOutput {
                             let payload: Vec<u8> = pending.drain(..take).collect();
                             let bits_this = (take / ch_usize) * 8;
                             let pts_ns = stream_start_ns
-                                + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
+                                + (sample_offset.saturating_sub(pts_bits_base) as f64
+                                    / cur_sample_rate as f64
+                                    * 1e9) as u64;
                             let flags = if first {
                                 first = false;
                                 PacketFlags::FIRST_PACKET
