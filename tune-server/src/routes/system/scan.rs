@@ -37,6 +37,15 @@ pub(super) struct ScanQuery {
     /// a rescan then skipped every unchanged file, so only "Vider la
     /// bibliothèque" + cold scan repaired the DB (Yacine, Synology ARM64).
     full: Option<bool>,
+    /// Targeted scan: when set, only this sub-directory is walked instead of
+    /// re-walking every configured music dir. On a network mount (SMB/NFS) the
+    /// live `notify` watcher receives no events, so the only way to pick up a
+    /// few new tracks was a full re-walk of the whole NAS (stat of every file
+    /// = a round-trip each) — minutes to hours for 3 new tracks. Point the scan
+    /// at just the folder that changed. The path MUST be inside a configured
+    /// music dir; the deleted-track prune is scoped to this sub-tree so tracks
+    /// elsewhere are never touched.
+    path: Option<String>,
 }
 
 pub(super) async fn trigger_scan(
@@ -44,7 +53,14 @@ pub(super) async fn trigger_scan(
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
     let force = q.force.unwrap_or(false) || q.full.unwrap_or(false);
-    spawn_library_scan(state, force).await;
+    // Targeted sub-folder scan (empty/blank string = full scan as before).
+    let targeted_req: Option<String> = q
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| tune_core::scanner::walker::normalize_path(s));
+    spawn_library_scan(state, force, targeted_req).await;
     (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
 }
 
@@ -52,7 +68,7 @@ pub(super) async fn trigger_scan(
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
 /// folders stayed invisible until the app was restarted).
-pub(super) async fn spawn_library_scan(state: AppState, force: bool) {
+pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
@@ -108,13 +124,30 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool) {
             .filter(|d| !d.is_empty())
             .collect();
 
+        // Resolve a targeted sub-folder scan. The path must be inside a
+        // configured music dir (defence against scanning arbitrary paths); if it
+        // is not, fall back to a full scan rather than silently doing nothing.
+        let targeted: Option<String> = targeted_req.as_ref().and_then(|p| {
+            if music_dirs.iter().any(|root| p == root || p.starts_with(&format!("{root}/"))) {
+                Some(p.clone())
+            } else {
+                tracing::warn!(path = %p, dirs = ?music_dirs, "scan_targeted_path_outside_music_dirs — falling back to full scan");
+                None
+            }
+        });
+        let scan_dirs: Vec<String> = match &targeted {
+            Some(p) => vec![p.clone()],
+            None => music_dirs.clone(),
+        };
+
         tracing::info!(
-            dirs = ?music_dirs,
+            dirs = ?scan_dirs,
+            targeted = ?targeted,
             platform = std::env::consts::OS,
             "scan_starting"
         );
 
-        let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
         let missing_dirs = list_result.missing_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
@@ -441,6 +474,15 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool) {
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
+                // Targeted scan: only consider tracks under the scanned sub-tree.
+                // `discovered_paths` only holds files below that folder, so a
+                // track anywhere else would look "missing" and get wrongly
+                // deleted — pruning the whole library except the sub-folder.
+                if let Some(ref t) = targeted {
+                    if db_path.as_str() != t && !db_path.starts_with(&format!("{t}/")) {
+                        continue;
+                    }
+                }
                 if !discovered_paths.contains(db_path.as_str()) {
                     let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
                     if in_missing_dir {

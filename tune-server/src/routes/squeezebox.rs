@@ -77,7 +77,10 @@ fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
         Duration::from_secs(5),
     )
     .map_err(|e| {
-        tracing::error!(addr = %addr, error = %e, "lms_cli_command: TCP connect failed");
+        // An unreachable/refused optional LMS is a warning, not an app-level
+        // ERROR — logging it at error! flooded Yacine's log (a Daphile box that
+        // refuses :9090 every poll). The Err string still reaches the UI.
+        tracing::warn!(addr = %addr, error = %e, "lms_cli_command: TCP connect failed");
         format!(
             "Impossible de se connecter au serveur Squeezebox (LMS) sur {addr}: {e}. Verifiez que Logitech Media Server est demarre."
         )
@@ -282,6 +285,32 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             .unwrap_or("Squeezebox")
             .to_string();
         let device_id = format!("squeezebox-{player_id}");
+
+        // Don't expose the same physical device as two zones. When the DAC is a
+        // USB player on a Lyrion/Daphile box, Tune sees it BOTH as a Squeezebox
+        // player (this CLI path) AND as a DLNA renderer (the LMS's UPnP bridge) —
+        // same name, two protocols — which produced Yacine's duplicate zones and
+        // conflicting playback. If a non-squeezebox output already carries this
+        // name AND we haven't already registered this squeezebox player, skip it
+        // and prefer the native DLNA zone. Conservative: never removes an
+        // existing/possibly-playing output, so no regression for pure-Squeezebox
+        // setups (no same-name other-type output ⇒ registers normally).
+        {
+            let reg = state.outputs.lock().await;
+            if !reg.contains(&device_id) {
+                let conflicts = reg.conflicting_outputs(&player_name, "squeezebox");
+                if !conflicts.is_empty() {
+                    drop(reg);
+                    tracing::info!(
+                        name = %player_name,
+                        id = %device_id,
+                        existing = ?conflicts,
+                        "squeezebox_output_skipped_duplicate_of_other_zone"
+                    );
+                    continue;
+                }
+            }
+        }
 
         // Register output using CLI port
         let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(

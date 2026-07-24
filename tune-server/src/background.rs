@@ -323,6 +323,16 @@ fn spawn_squeezebox_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Base cadence when the LMS answers; exponential backoff up to the cap
+        // when it doesn't. Without this, an unreachable/refused LMS (e.g. a
+        // Daphile box that's off, or a user who never ran one) is hammered with
+        // a failed TCP connect every 60s forever — that was Yacine's log filled
+        // with `lms_cli_command: TCP connect failed` every minute. Backing off
+        // stops the spam and the wasted connects; a reachable LMS is polled
+        // normally and recovery resets the interval immediately.
+        const BASE_INTERVAL_SECS: u64 = 60;
+        const MAX_INTERVAL_SECS: u64 = 600; // 10 min ceiling for a dead LMS
+        let mut interval_secs = BASE_INTERVAL_SECS;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -345,14 +355,26 @@ fn spawn_squeezebox_poller(state: &AppState) {
                         if !players.is_empty() {
                             info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
                         }
+                        // Reachable → back to normal cadence.
+                        interval_secs = BASE_INTERVAL_SECS;
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, lms = %host, "squeezebox_poll_failed");
+                        interval_secs = (interval_secs * 2).min(MAX_INTERVAL_SECS);
+                        tracing::debug!(
+                            error = %e,
+                            lms = %host,
+                            next_retry_secs = interval_secs,
+                            "squeezebox_poll_failed_backing_off"
+                        );
                     }
                 }
+            } else {
+                // Integration off / no host configured — idle at base cadence so
+                // a freshly configured host is picked up promptly.
+                interval_secs = BASE_INTERVAL_SECS;
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
     });
 }
