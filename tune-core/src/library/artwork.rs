@@ -278,6 +278,59 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
 /// artwork cache, and updates the album's `cover_path` in the database.
 ///
 /// Respects MusicBrainz rate limit: max 1 request/second.
+/// Upscale an Apple `artworkUrl100` (a 100x100 thumbnail) to a full-resolution
+/// rendition by swapping the size segment (e.g. `.../100x100bb.jpg` ->
+/// `.../1200x1200bb.jpg`). Returns `None` if the URL isn't in the expected form.
+fn itunes_hires_url(art100: &str) -> Option<String> {
+    if art100.contains("100x100bb") {
+        Some(art100.replace("100x100bb", "1200x1200bb"))
+    } else {
+        None
+    }
+}
+
+/// Apple/iTunes cover-art fallback (port of #769, adapted to the v0.9
+/// enrichment structure). Cover Art Archive is sparse and the MusicBrainz
+/// release match is strict, so many local albums never get a cover. Apple's
+/// catalog is far denser for mainstream music and needs no MBID — search by
+/// artist + title and download the highest-res rendition available.
+async fn fetch_itunes_cover(artist: &str, title: &str) -> Option<Vec<u8>> {
+    let term = format!("{artist} {title}");
+    let url = format!(
+        "https://itunes.apple.com/search?term={}&media=music&entity=album&limit=1",
+        urlencoding::encode(&term)
+    );
+    let client = crate::http::client::builder()
+        .user_agent(MB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let art100 = data
+        .get("results")?
+        .as_array()?
+        .first()?
+        .get("artworkUrl100")?
+        .as_str()?;
+    async fn dl(client: &reqwest::Client, u: &str) -> Option<Vec<u8>> {
+        let r = client.get(u).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.bytes().await.ok().map(|b| b.to_vec())
+    }
+    if let Some(hi) = itunes_hires_url(art100)
+        && let Some(bytes) = dl(&client, &hi).await
+    {
+        return Some(bytes);
+    }
+    dl(&client, art100).await
+}
+
 pub async fn batch_enrich_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
@@ -334,17 +387,34 @@ pub async fn batch_enrich_artwork(
             found
         };
 
-        let Some(ref mbid_val) = mbid_to_use else {
+        // Step 2: Cover Art Archive first (needs an MBID; the shared MB rate
+        // limiter inside `fetch_cover_art` enforces the ~1 req/s spacing);
+        // fall back to Apple/iTunes artwork, which needs no MBID and has a far
+        // denser catalog for mainstream music. Without this fallback, albums
+        // with no MB match or no CAA image never got a cover (Fabien: 0/22).
+        let mut fetched: Option<Vec<u8>> = None;
+        if let Some(ref mbid_val) = mbid_to_use {
+            fetched = fetch_cover_art(mbid_val).await;
+            if fetched.is_none() {
+                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
+            }
+        } else {
             debug!(album_id, album = %title, artist = %artist, "batch_artwork_no_mbid");
-            failed += 1;
-            continue;
-        };
+        }
+        if fetched.is_none() && artist != "Unknown Artist" {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            fetched = fetch_itunes_cover(artist, title).await;
+            if fetched.is_some() {
+                debug!(album_id, album = %title, "batch_artwork_itunes_found");
+            }
+        }
 
-        // Step 2: Fetch cover from Cover Art Archive (the shared MB rate limiter
-        // inside `fetch_cover_art` enforces the ~1 req/s spacing).
-        match fetch_cover_art(mbid_val).await {
+        match fetched {
             Some(data) => {
-                let hash = artwork_hash(mbid_val);
+                let key = mbid_to_use
+                    .clone()
+                    .unwrap_or_else(|| format!("{artist}|{title}"));
+                let hash = artwork_hash(&key);
                 std::fs::create_dir_all(&cache_dir).ok();
                 if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
                     album_repo.update_cover_path(*album_id, &hash).ok();
@@ -364,7 +434,7 @@ pub async fn batch_enrich_artwork(
             }
             None => {
                 failed += 1;
-                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
+                debug!(album_id, album = %title, artist = %artist, "batch_artwork_not_found");
             }
         }
     }
@@ -914,6 +984,41 @@ async fn batch_enrich_artist_artwork_inner(
         }
     }
 
+    // Artists WITHOUT an MBID are excluded by every list above (they all
+    // require musicbrainz_id), yet the enrichment loop below can resolve an
+    // MBID from the name and fall back to by-name image sources. Untagged
+    // artists therefore stayed grey forever in normal mode — the whole batch
+    // even reported "all have images" while these were simply never looked at
+    // (Fabien: 171/1183 artists unmatched, Tidal premium, grey squares).
+    // Include (a) those with no image at all, and (b) those whose stored
+    // image is a remote URL / missing cache file (Tidal stores unusable
+    // remote URLs), so the loop can localize a real picture. (Port of #769.)
+    if !force {
+        let before_no_mbid = artists.len();
+        match artist_repo.list_without_image_no_mbid() {
+            Ok(no_img) => {
+                for (id, name) in no_img {
+                    artists.push((id, name, String::new()));
+                }
+            }
+            Err(e) => warn!(error = %e, "batch_artist_artwork_no_mbid_list_failed"),
+        }
+        match artist_repo.list_with_image_no_mbid() {
+            Ok(with_img) => {
+                for (id, name, image_path) in with_img {
+                    if !cached_artwork_exists(&cache_dir, &image_path) {
+                        artists.push((id, name, String::new()));
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_no_mbid_list_failed"),
+        }
+        let added_no_mbid = artists.len() - before_no_mbid;
+        if added_no_mbid > 0 {
+            info!(added_no_mbid, "batch_artist_artwork_no_mbid_included");
+        }
+    }
+
     if artists.is_empty() {
         info!("batch_artist_artwork_skip_all_have_images");
         // Store result even when nothing to fetch
@@ -1371,6 +1476,15 @@ mod tests {
                 .unwrap(),
             "album/cover.jpg"
         );
+    }
+
+    #[test]
+    fn itunes_hires_url_upscales() {
+        assert_eq!(
+            itunes_hires_url("https://x/100x100bb.jpg").as_deref(),
+            Some("https://x/1200x1200bb.jpg")
+        );
+        assert!(itunes_hires_url("https://x/cover.jpg").is_none());
     }
 
     #[test]
