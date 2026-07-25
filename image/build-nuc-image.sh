@@ -333,11 +333,42 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 
+# --- Port 80 → 8888 proxy ---
+# Browsers (Chrome HTTPS-First, Safari) silently upgrade http:// links to
+# https://; with only :8888 open the TLS attempt is refused and the user sees
+# a dead link unless they hand-edit the URL back to http (retour Bertrand,
+# tune-e32f.local). Serving port 80 lets the URL drop scheme AND port
+# (tune-xxxx.local), and the browsers' https→http fallback then works.
+# systemd-socket-proxyd ships with systemd — no extra package, no firewall.
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.socket" <<EOF
+[Unit]
+Description=Tune OS web UI on port 80 (proxied to :8888)
+
+[Socket]
+ListenStream=80
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.service" <<EOF
+[Unit]
+Description=Proxy port 80 to the Tune web UI on :8888
+Requires=tune-web80.socket
+After=tune.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8888
+PrivateTmp=yes
+PrivateNetwork=no
+EOF
+
 # Enable services
 chroot "$ROOTFS" systemctl enable tune.service
 chroot "$ROOTFS" systemctl enable NetworkManager
 chroot "$ROOTFS" systemctl enable avahi-daemon
 chroot "$ROOTFS" systemctl enable ssh
+chroot "$ROOTFS" systemctl enable tune-web80.socket
 
 ok "Tune systemd service installed"
 
@@ -399,7 +430,7 @@ cat > "${ROOTFS}/etc/motd" <<EOF
 
   ♫  Tune OS v${TUNE_VERSION}
   ─────────────────────────────
-  Web UI:    http://tune.local:8888
+  Web UI:    http://tune.local   (ou http://tune.local:8888)
   Music:     USB drives auto-mount under /media
              NAS/SMB shares: web UI → Settings → Network
   WiFi:      web UI → Settings → Network (first boot: ethernet)
@@ -415,7 +446,7 @@ EOF
 # le réseau monte ; agetty relit /etc/issue à chaque affichage du prompt.
 cat > "${ROOTFS}/etc/issue" <<'EOF'
 
-  Tune OS — Web UI : http://\n.local:8888
+  Tune OS — Web UI : http://\n.local
 
 EOF
 
@@ -431,9 +462,9 @@ HN=$(hostname)
 {
     echo ""
     if [ -n "$IP" ]; then
-        echo "  Tune OS — Web UI : http://${HN}.local:8888   (IP : http://${IP}:8888)"
+        echo "  Tune OS — Web UI : http://${HN}.local   (IP : http://${IP})"
     else
-        echo "  Tune OS — Web UI : http://${HN}.local:8888"
+        echo "  Tune OS — Web UI : http://${HN}.local"
     fi
     echo ""
 } > /etc/issue
