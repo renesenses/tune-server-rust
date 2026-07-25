@@ -507,13 +507,49 @@ fn account_premium_active(state: &LicenseState) -> bool {
     }
 }
 
+/// Whether the license *key* currently counts as Premium: tier is Premium, the
+/// key's own expiry (if known) has not passed, and it was validated within the
+/// offline grace window. Mirrors `account_premium_active` so the key gets the
+/// same *live* graceful degradation the SSO account already has: a valid key
+/// survives a transient cloud rejection (bad `license_valid:false` verdict,
+/// fingerprint re-binding) or an offline period, and is only revoked once grace
+/// lapses or on a genuine past-expiry — never on a single bad heartbeat.
+fn key_premium_active(state: &LicenseState) -> bool {
+    if state.tier != Tier::Premium {
+        return false;
+    }
+    // Key expiry (if known): past expiry → not active.
+    if let Some(ref exp) = state.expires_at {
+        if is_expired(exp, 0) {
+            return false;
+        }
+    }
+    // Offline grace: must have been validated (or set) within the window.
+    match state.last_validated {
+        Some(ref validated) => !is_expired(validated, GRACE_PERIOD_DAYS),
+        None => false,
+    }
+}
+
 /// Effective tier = Premium if the license key is premium OR the account premium
 /// (SSO) is active. Otherwise Free.
 fn effective_tier(state: &LicenseState) -> Tier {
-    if state.tier == Tier::Premium || account_premium_active(state) {
+    if key_premium_active(state) || account_premium_active(state) {
         Tier::Premium
     } else {
         Tier::Free
+    }
+}
+
+/// Whether an ISO-8601 (`%Y-%m-%dT%H:%M:%SZ`) timestamp lies in the past.
+/// Unlike [`is_expired`] (which fails *closed*: malformed → expired), this fails
+/// *open*: unparseable input returns `false` so malformed server data never
+/// triggers a license revocation. Used by the heartbeat to tell a genuine past
+/// expiry from a transient `license_valid:false` verdict.
+pub fn is_timestamp_past(timestamp: &str) -> bool {
+    match chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") {
+        Ok(parsed) => parsed.and_utc() < chrono::Utc::now(),
+        Err(_) => false,
     }
 }
 
@@ -608,11 +644,32 @@ mod tests {
             tier,
             license_key: None,
             expires_at: None,
-            last_validated: None,
+            // A premium key is always stamped when set/validated; these
+            // account-focused tests model that reality so the key path (which
+            // now requires a recent validation, like the account path) doesn't
+            // spuriously read as lapsed.
+            last_validated: Some(now_iso()),
             hardware_fingerprint: "test".into(),
             account_premium,
             account_premium_expires,
             account_premium_checked,
+        }
+    }
+
+    fn key_state(
+        tier: Tier,
+        expires_at: Option<String>,
+        last_validated: Option<String>,
+    ) -> LicenseState {
+        LicenseState {
+            tier,
+            license_key: Some("TUNE-TEST-KEY".into()),
+            expires_at,
+            last_validated,
+            hardware_fingerprint: "test".into(),
+            account_premium: false,
+            account_premium_expires: None,
+            account_premium_checked: None,
         }
     }
 
@@ -689,6 +746,70 @@ mod tests {
                 Tier::Premium,
                 true,
                 Some(past_iso(1)),
+                Some(now_iso())
+            )),
+            Tier::Premium
+        );
+    }
+
+    // ---- effective_tier / license key (live grace) ----
+
+    #[test]
+    fn effective_premium_key_recently_validated() {
+        // Premium key validated now → Premium.
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, Some(now_iso()))),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_key_survives_within_grace() {
+        // Premium key last validated 10 days ago (< 30-day grace) → Premium.
+        // This is JP's case: the cloud rejects the key but a valid key must not
+        // be revoked on a transient `license_valid:false` verdict.
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, Some(past_iso(10)))),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_key_free_when_grace_expired() {
+        // Not validated for 40 days (past the 30-day grace) → degrade to Free.
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, Some(past_iso(40)))),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_key_free_when_never_validated() {
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, None)),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_key_free_when_expiry_past() {
+        // A genuine past expiry revokes even if recently validated.
+        assert_eq!(
+            effective_tier(&key_state(
+                Tier::Premium,
+                Some(past_iso(1)),
+                Some(now_iso())
+            )),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_key_premium_when_expiry_future() {
+        assert_eq!(
+            effective_tier(&key_state(
+                Tier::Premium,
+                Some(future_iso(30)),
                 Some(now_iso())
             )),
             Tier::Premium
