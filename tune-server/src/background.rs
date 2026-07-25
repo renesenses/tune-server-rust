@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use tune_core::outputs::OutputRegistry;
 
@@ -740,9 +740,34 @@ fn spawn_heartbeat(state: &AppState) {
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(true);
 
-                            if !valid {
-                                // Server explicitly says the license is invalid.
-                                info!("license_invalidated_by_server");
+                            // A genuine, authoritative revocation is a *past*
+                            // expiry date — not a bare `license_valid:false`,
+                            // which can be transient (fingerprint re-binding,
+                            // server hiccup, key bound to another machine while
+                            // the account is still premium).
+                            let expired_authoritatively = body
+                                .get("license_expires_at")
+                                .and_then(|v| v.as_str())
+                                .map(tune_core::license::is_timestamp_past)
+                                .unwrap_or(false);
+                            let has_key = ls.license_key.is_some();
+
+                            if !valid && has_key && !expired_authoritatively {
+                                // Do NOT immediately strip a key-based Premium on
+                                // a transient rejection: persisting Free here used
+                                // to destroy the premium marker permanently. Keep
+                                // the cached tier and, crucially, do NOT refresh
+                                // `last_validated` — the 30-day offline grace then
+                                // lapses on its own if the rejection persists, so a
+                                // valid key survives a bad verdict while a genuinely
+                                // revoked one still degrades. (JP #v0.9.9)
+                                warn!(
+                                    "license_key_rejected_by_server (keeping cached tier within grace)"
+                                );
+                            } else if !valid {
+                                // No key present, or an authoritative expiry:
+                                // honor the downgrade to Free.
+                                info!(expired_authoritatively, "license_invalidated_by_server");
                                 license
                                     .update_from_server(tune_core::license::Tier::Free, None)
                                     .await;
