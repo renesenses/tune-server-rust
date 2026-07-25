@@ -4920,10 +4920,15 @@ fn guess_mime_from_url(url: &str) -> &'static str {
         "audio/mp4"
     } else if path.ends_with(".ogg") || path.ends_with(".opus") {
         "audio/ogg"
-    } else if path.ends_with(".flac") {
+    } else if path.ends_with(".flac") || path.ends_with(".flc") {
+        // ".flc" is the extension Lyrion/LMS uses for FLAC in its stream URLs
+        // (…/music/<id>/download.flc); it fell through to the "audio/mpeg"
+        // default, so the DLNA renderer got FLAC bytes labelled as MP3.
         "audio/flac"
     } else if path.ends_with(".wav") {
         "audio/wav"
+    } else if path.ends_with(".aif") || path.ends_with(".aiff") {
+        "audio/aiff"
     } else {
         "audio/mpeg"
     }
