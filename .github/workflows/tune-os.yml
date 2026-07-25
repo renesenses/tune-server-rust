@@ -65,6 +65,7 @@ jobs:
       - name: Sanity check
         run: |
           IMG="image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz"
+          sudo chown -R "$(id -u):$(id -g)" image/output
           ls -lh image/output/
           test -s "$IMG"
           # Une image plausible fait plusieurs centaines de Mo compressée
