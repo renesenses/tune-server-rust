@@ -10,8 +10,8 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use tune_core::http::streamer::{
-    build_icy_metadata, build_wav_header, build_wav_header_streaming, extract_stream_id,
-    ReresolveFn, SharedSessions, StreamInfo, StreamSession, ICY_METAINT,
+    ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
+    build_wav_header, build_wav_header_streaming, extract_stream_id,
 };
 
 /// Tracks one HTTP consumer of a radio→WAV session for the lifetime of its
@@ -756,16 +756,16 @@ async fn proxy_stream(
     // ranges (FLAC header parsing) are NOT forwarded — forwarding every
     // micro-range hammers Akamai and itself causes the drops.
     const RESUME_RANGE_THRESHOLD: u64 = 1_048_576; // 1 MiB
-                                                   // The 1 MiB threshold exists ONLY to tame the DMP-A8 (Lavf), which fires many
-                                                   // rapid micro-Range requests while parsing the FLAC header — forwarding each
-                                                   // to the CDN hammers Akamai. Other renderers don't do that. The Lumin
-                                                   // firmware (Luxman NT-07 OpenHome, Vincent) instead does a two-step seek:
-                                                   // `bytes=0-` to read the header, then `bytes=244-` to fetch the first audio
-                                                   // frame. When we neither forward that small range nor answer 206 from 244 —
-                                                   // returning 200 from byte 0 — the renderer gets header bytes where it expects
-                                                   // audio, rejects the stream, and loops re-reading the header (peak_pos=0,
-                                                   // stopped after 74s). So keep the 1 MiB threshold ONLY for Lavf; for every
-                                                   // other agent honour any non-zero `bytes=N-` by forwarding it (→ 206 from N).
+    // The 1 MiB threshold exists ONLY to tame the DMP-A8 (Lavf), which fires many
+    // rapid micro-Range requests while parsing the FLAC header — forwarding each
+    // to the CDN hammers Akamai. Other renderers don't do that. The Lumin
+    // firmware (Luxman NT-07 OpenHome, Vincent) instead does a two-step seek:
+    // `bytes=0-` to read the header, then `bytes=244-` to fetch the first audio
+    // frame. When we neither forward that small range nor answer 206 from 244 —
+    // returning 200 from byte 0 — the renderer gets header bytes where it expects
+    // audio, rejects the stream, and loops re-reading the header (peak_pos=0,
+    // stopped after 74s). So keep the 1 MiB threshold ONLY for Lavf; for every
+    // other agent honour any non-zero `bytes=N-` by forwarding it (→ 206 from N).
     let is_lavf = req_headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())

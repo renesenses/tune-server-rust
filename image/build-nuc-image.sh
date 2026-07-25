@@ -395,12 +395,37 @@ cat > "${ROOTFS}/etc/motd" <<EOF
 
 EOF
 
-# Login screen (before login): live hostname (\n) and IPv4 (\4) via agetty
+# Login screen (before login): live hostname via agetty (\n). L'IP n'utilise
+# PAS \4 : agetty rend /etc/issue avant l'acquisition DHCP → champ vide
+# (retour Stéphane). Un dispatcher NetworkManager réécrit le fichier dès que
+# le réseau monte ; agetty relit /etc/issue à chaque affichage du prompt.
 cat > "${ROOTFS}/etc/issue" <<'EOF'
 
-  Tune OS — Web UI : http://\n.local:8888   (IP : http://\4:8888)
+  Tune OS — Web UI : http://\n.local:8888
 
 EOF
+
+cat > "${ROOTFS}/etc/NetworkManager/dispatcher.d/50-tune-issue" <<'EOF'
+#!/bin/bash
+# Tune OS : affiche l'URL et l'IP réelles sur l'écran de login.
+case "$2" in
+    up|dhcp4-change|hostname) ;;
+    *) exit 0 ;;
+esac
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+HN=$(hostname)
+{
+    echo ""
+    if [ -n "$IP" ]; then
+        echo "  Tune OS — Web UI : http://${HN}.local:8888   (IP : http://${IP}:8888)"
+    else
+        echo "  Tune OS — Web UI : http://${HN}.local:8888"
+    fi
+    echo ""
+} > /etc/issue
+exit 0
+EOF
+chmod +x "${ROOTFS}/etc/NetworkManager/dispatcher.d/50-tune-issue"
 
 # --- Install GRUB ---
 log "Installing GRUB bootloader..."
