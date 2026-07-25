@@ -8,7 +8,7 @@ on:
   # workflow_dispatch ne voyant que la branche par défaut. À retirer.
   push:
     branches: [feature/appliance-wifi]
-    paths: ['.github/workflows/tune-os.yml']
+    paths: ['.github/workflows/tune-os.yml', 'image/**']
   workflow_dispatch:
     inputs:
       version:
