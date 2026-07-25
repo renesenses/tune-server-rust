@@ -3658,6 +3658,22 @@ impl PlaybackOrchestrator {
             }
         };
         if let Some(output_arc) = output_arc {
+            // For OAAT outputs, arm the start position before play: the
+            // native DSD direct path reads the local file itself and must
+            // seek to this offset (the seek-positioned HTTP transcode URL
+            // is bypassed on that path).
+            if let Some(position_ms) = start_position_ms {
+                if device_id.starts_with("oaat:") {
+                    let output = output_arc.lock().await;
+                    if let Some(oaat_output) = output
+                        .as_any()
+                        .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                    {
+                        oaat_output.set_pending_start_position_ms(position_ms);
+                    }
+                    drop(output);
+                }
+            }
             // For local outputs, set the pending start position before play
             #[cfg(feature = "local-audio")]
             if let Some(position_ms) = start_position_ms {
