@@ -676,7 +676,19 @@ async fn service_favorites(
 ) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
-        Err(e) => return e.into_response(),
+        // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
+        // items) has no streaming favorites. Return an empty list (200) rather
+        // than a plain-text 404 so the web client's `.json()` doesn't blow up
+        // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
+        // GET /streaming/upnp/favorites/tracks 404).
+        Err(_) => {
+            let empty = match fav_type.as_str() {
+                "albums" => json!({ "albums": [] }),
+                "artists" => json!({ "artists": [] }),
+                _ => json!({ "tracks": [] }),
+            };
+            return Json(empty).into_response();
+        }
     };
     let mut svc = svc.lock().await;
     let result = match fav_type.as_str() {
