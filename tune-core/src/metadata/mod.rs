@@ -1692,7 +1692,12 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         disc_number: tag.disk(),
         total_tracks,
         total_discs,
-        disc_subtitle: get(ItemKey::SetSubtitle),
+        // lofty's SetSubtitle maps Vorbis DISCSUBTITLE / ID3 TSST only — it has
+        // NO mapping for the Vorbis `SETSUBTITLE` alias, which is the canonical
+        // key in D. Pamingle's Vademecum. Read it raw as a fallback so those
+        // files show per-disc subtitles too (Dominique, v0.9.9).
+        disc_subtitle: get(ItemKey::SetSubtitle)
+            .or_else(|| raw_vorbis_comment(path, "SETSUBTITLE")),
         year: tag
             .date()
             .map(|d| d.year as u32)

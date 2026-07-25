@@ -587,7 +587,11 @@ impl TrackRepo {
         }
 
         if let Some(a) = artist {
-            conditions.push(format!("t.artist_name = {}", make_ph(idx)));
+            // Filter on the joined artists.name, not the denormalized
+            // t.artist_name column — the latter is empty on some libraries
+            // (never back-filled), so artist filtering returned nothing (a-ha →
+            // 0 tracks on Bertrand's .18).
+            conditions.push(format!("ar.name = {}", make_ph(idx)));
             owned_params.push(SqlValue::Text(a.to_string()));
             idx += 1;
         }
