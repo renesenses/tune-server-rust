@@ -265,20 +265,22 @@ mkdir -p "${ROOTFS}/mnt/music"
 
 # Tune configuration
 mkdir -p "${ROOTFS}/opt/tune/data"
+# Format PLAT (cf. tune.toml.example) — les sections [server]/[library]
+# ne sont pas lues et le serveur retombait sur db_path relatif ("tune.db")
+# dans /opt/tune, en lecture seule (ProtectSystem=strict) → crash-loop.
 cat > "${ROOTFS}/opt/tune/tune.toml" <<EOF
 # Tune OS default configuration
 # Edit via web UI at http://tune.local:8888/settings
 
-[server]
 port = 8888
-data_dir = "/opt/tune/data"
+db_path = "/opt/tune/data/tune.db"
+web_dir = "/opt/tune/web"
+artwork_dir = "/opt/tune/data/artwork_cache"
+auto_scan = true
+log_level = "info"
 
-[library]
 # /media : disques USB auto-montés ; /mnt/music : montages NAS manuels
 music_dirs = ["/mnt/music", "/media"]
-
-[audio]
-backend = "auto"
 EOF
 
 # --- Systemd service ---
