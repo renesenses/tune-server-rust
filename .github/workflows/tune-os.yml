@@ -47,16 +47,20 @@ jobs:
             || { echo "::error::asset linux-x86_64.tar.gz absent de la release v$VERSION"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Install build dependencies
+      # Build dans un conteneur bookworm : le debootstrap d'ubuntu-22.04
+      # échoue à configurer les paquets de base de bookworm (polkitd).
+      # --privileged : losetup/chroot ; le noyau est partagé avec le runner.
+      - name: Build image (debian bookworm container)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y debootstrap parted dosfstools grub-efi-amd64-bin
-          # Le debootstrap d'ubuntu-22.04 peut ne pas connaître bookworm
-          [ -e /usr/share/debootstrap/scripts/bookworm ] \
-            || sudo ln -s sid /usr/share/debootstrap/scripts/bookworm
-
-      - name: Build image
-        run: sudo ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}"
+          docker run --rm --privileged -v "$PWD":/repo -w /repo -v /dev:/dev \
+            debian:bookworm bash -ec '
+              apt-get update -qq
+              apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null
+              ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}" || {
+                echo "=== debootstrap.log (fin) ==="
+                tail -n 150 /tmp/tune-os-build/rootfs/debootstrap/debootstrap.log 2>/dev/null || true
+                exit 1
+              }'
 
       - name: Sanity check
         run: |
