@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,6 +62,11 @@ struct ScannerState {
     known_locations: HashMap<String, String>,
     miss_count: HashMap<String, u32>,
     create_failures: HashMap<String, u32>,
+    // Device ids with an in-flight byebye liveness probe. A chatty renderer
+    // (Samsung/LG TV) fires one ssdp:byebye per embedded service, all collapsing
+    // to the same bare uuid — this set debounces the burst so only ONE probe runs
+    // per device instead of ~10-15 redundant ones (forum #1183).
+    byebye_pending: HashSet<String>,
     initial_scan_done: bool,
     last_periodic_rescan: Instant,
 }
@@ -73,6 +78,7 @@ impl ScannerState {
             known_locations: HashMap::new(),
             miss_count: HashMap::new(),
             create_failures: HashMap::new(),
+            byebye_pending: HashSet::new(),
             initial_scan_done: false,
             last_periodic_rescan: Instant::now(),
         }
@@ -216,13 +222,38 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                 }
                 let is_byebye = head.contains("ssdp:byebye");
                 if is_byebye {
-                    if let Some(resp) = parse_ssdp_response(data) {
-                        let dev_id = device_id_from_usn(&resp.usn);
-                        let _ = event_tx.send(SsdpEvent::DeviceLost(dev_id)).await;
-                    } else if let Some(usn) = usn_from_raw(data) {
-                        let _ = event_tx
-                            .send(SsdpEvent::DeviceLost(device_id_from_usn(&usn)))
-                            .await;
+                    let dev_id = parse_ssdp_response(data)
+                        .map(|resp| device_id_from_usn(&resp.usn))
+                        .or_else(|| usn_from_raw(data).map(|usn| device_id_from_usn(&usn)));
+                    if let Some(dev_id) = dev_id {
+                        // Do NOT trust a byebye blindly: chatty TVs (Samsung S95,
+                        // forum #1183) emit a byebye burst on rediscovery while the
+                        // renderer is still very much alive, and removing its DLNA
+                        // output flips the zone offline → play is rejected → 503.
+                        // Probe the device first (same defense the M-SEARCH miss
+                        // path already uses) and only declare it lost if the probe
+                        // fails. Debounced per dev_id so the burst runs ONE probe,
+                        // and spawned so the listener keeps receiving datagrams.
+                        let already_pending = {
+                            let mut st = state.lock().await;
+                            !st.byebye_pending.insert(dev_id.clone())
+                        };
+                        if !already_pending {
+                            let state = state.clone();
+                            let event_tx = event_tx.clone();
+                            tokio::spawn(async move {
+                                let alive = unicast_probe(&state, &dev_id).await;
+                                let mut st = state.lock().await;
+                                st.byebye_pending.remove(&dev_id);
+                                drop(st);
+                                if alive {
+                                    debug!(id = %dev_id, "ssdp_byebye_probe_ok");
+                                } else {
+                                    info!(id = %dev_id, "ssdp_byebye_confirmed_lost");
+                                    let _ = event_tx.send(SsdpEvent::DeviceLost(dev_id)).await;
+                                }
+                            });
+                        }
                     }
                     continue;
                 }
