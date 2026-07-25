@@ -575,7 +575,8 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     // frames can be parsed. Old taggers commonly set this on DSD/DSF files
     // (Benjithom, #959) — without reversing it the frame sizes desync (notably
     // when a PIC image precedes the title) and the title is lost, so Tune fell
-    // back to the filename. (v2.4 uses per-frame unsync, not handled here.)
+    // back to the filename. v2.4 is handled per frame below (its synchsafe frame
+    // sizes count the *stored* length, so a whole-tag deunsync would desync them).
     let unsync = flags & 0x80 != 0;
     let raw_frames = &data[pos.min(tag_end)..tag_end];
     let deunsynced;
@@ -619,6 +620,13 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
             }
         };
 
+        // v2.4 unsynchronisation is per frame: either the whole-tag flag (0x80)
+        // or the frame's own format flag (0x02, second flag byte). Its synchsafe
+        // frame size counts the *stored* (still-stuffed) bytes, so we slice with
+        // frame_size first, then reverse the 0xFF 0x00 stuffing on the slice.
+        let frame_unsync =
+            major_version == 4 && (unsync || (header_len == 10 && frames[fpos + 9] & 0x02 != 0));
+
         fpos += header_len; // skip frame header
 
         // Normalize v2.2 3-char ids to their v2.3/v2.4 equivalents.
@@ -636,6 +644,15 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
 
         let frame_data = &frames[fpos..fpos + frame_size];
         fpos += frame_size;
+
+        // Reverse per-frame unsynchronisation before reading the payload.
+        let deunsynced_frame;
+        let frame_data: &[u8] = if frame_unsync {
+            deunsynced_frame = deunsynchronise(frame_data);
+            &deunsynced_frame
+        } else {
+            frame_data
+        };
 
         // Check for picture frames (APIC in v2.3/2.4, PIC in v2.2).
         if frame_id == "APIC" {
@@ -2287,6 +2304,96 @@ mod tests {
         let parsed = parse_id3v2_tag(&tag).expect("tag parses");
         assert_eq!(parsed.title(), Some("Hi"));
         assert!(parsed.has_picture);
+    }
+
+    #[test]
+    fn parse_id3v24_unsynchronised_frames() {
+        // Pierre Mack's DSF (Mp3tag-written): ID3v2.4 with the whole-tag unsync
+        // flag (0x80). Unlike v2.3, a v2.4 frame's synchsafe size counts the
+        // *stored* (still-0x00-stuffed) bytes, so the tag body must NOT be
+        // deunsynchronised as a whole — each frame is unstuffed individually
+        // after slicing by its stored size. A large APIC full of 0xFF stuffing
+        // precedes the title; whole-tag deunsync would desync every later frame.
+        fn frame_v24(id: &str, data: &[u8]) -> Vec<u8> {
+            // Unsynchronise the payload; the stored size is the stuffed length.
+            let mut stuffed = Vec::new();
+            for &b in data {
+                stuffed.push(b);
+                if b == 0xFF {
+                    stuffed.push(0x00);
+                }
+            }
+            let n = stuffed.len() as u32;
+            let mut f = id.as_bytes().to_vec();
+            f.push(((n >> 21) & 0x7F) as u8);
+            f.push(((n >> 14) & 0x7F) as u8);
+            f.push(((n >> 7) & 0x7F) as u8);
+            f.push((n & 0x7F) as u8);
+            f.extend_from_slice(&[0, 0]); // frame flags
+            f.extend_from_slice(&stuffed);
+            f
+        }
+
+        // APIC body with 0xFF bytes (front cover JPEG-ish), then the title.
+        let mut apic_body = vec![0u8]; // Latin-1
+        apic_body.extend_from_slice(b"image/jpeg");
+        apic_body.push(0);
+        apic_body.push(3); // front cover
+        apic_body.push(0); // empty description
+        apic_body.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 0xFF, 0xFF]);
+        let apic = frame_v24("APIC", &apic_body);
+        let tit2 = frame_v24("TIT2", &[0x00, b'H', b'i']); // Latin-1 "Hi"
+
+        let mut body = apic;
+        body.extend_from_slice(&tit2);
+
+        let size = body.len();
+        let mut tag = vec![b'I', b'D', b'3', 0x04, 0x00, 0x80]; // v2.4, whole-tag unsync
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&body);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("Hi"));
+        assert!(parsed.has_picture);
+        let (mime, data) = parsed.picture.expect("picture present");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn parse_id3v24_per_frame_unsync_flag() {
+        // v2.4 also allows a single frame to opt into unsync via its format flag
+        // (0x02, second flag byte) while the tag header does not set 0x80.
+        let title = [0x00u8, b'F', 0xFF, b'x']; // Latin-1 with a raw 0xFF
+        let mut stuffed = Vec::new();
+        for &b in &title {
+            stuffed.push(b);
+            if b == 0xFF {
+                stuffed.push(0x00);
+            }
+        }
+        let n = stuffed.len() as u32;
+        let mut frame = b"TIT2".to_vec();
+        frame.push(((n >> 21) & 0x7F) as u8);
+        frame.push(((n >> 14) & 0x7F) as u8);
+        frame.push(((n >> 7) & 0x7F) as u8);
+        frame.push((n & 0x7F) as u8);
+        frame.extend_from_slice(&[0x00, 0x02]); // per-frame unsync flag
+        frame.extend_from_slice(&stuffed); // stored (still-stuffed) payload
+
+        let size = frame.len();
+        let mut tag = vec![b'I', b'D', b'3', 0x04, 0x00, 0x00]; // v2.4, no tag flag
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&frame);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("F\u{FF}x"));
     }
 
     #[test]
