@@ -587,7 +587,13 @@ impl TrackRepo {
         }
 
         if let Some(a) = artist {
-            conditions.push(format!("t.artist_name = {}", make_ph(idx)));
+            // The artist name lives on the joined `artists` table (tracks stores
+            // only artist_id) — `tracks` has no artist_name column, so the old
+            // `t.artist_name` predicate raised a SQL error that list_tracks
+            // swallowed into an empty result: clicking an Oxygen "Artistes" facet
+            // returned zero tracks (forum #1189). The base query + count both
+            // LEFT JOIN artists ar, so filter on ar.name.
+            conditions.push(format!("ar.name = {}", make_ph(idx)));
             owned_params.push(SqlValue::Text(a.to_string()));
             idx += 1;
         }
