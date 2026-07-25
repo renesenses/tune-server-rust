@@ -246,6 +246,10 @@ async fn main() {
         tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
     };
 
+    // Appliance : ne jamais démarrer sur une base vide si le disque de
+    // données externe est absent (docs/DATA-RELOCATION.md).
+    tune_server::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
+
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
 

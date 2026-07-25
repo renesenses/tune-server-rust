@@ -202,16 +202,44 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 
+# Port 80 -> 8888 proxy: browsers silently upgrade http:// links to https://
+# and the TLS attempt on :8888 is refused (retour Bertrand). Port 80 lets the
+# printed URL drop the port; the https->http fallback then works. See
+# build-nuc-image.sh for details.
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.socket" <<EOF
+[Unit]
+Description=Tune OS web UI on port 80 (proxied to :8888)
+
+[Socket]
+ListenStream=80
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.service" <<EOF
+[Unit]
+Description=Proxy port 80 to the Tune web UI on :8888
+Requires=tune-web80.socket
+After=tune.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8888
+PrivateTmp=yes
+PrivateNetwork=no
+EOF
+
 chroot "$ROOTFS" systemctl enable tune.service
 chroot "$ROOTFS" systemctl enable NetworkManager
 chroot "$ROOTFS" systemctl enable avahi-daemon
 chroot "$ROOTFS" systemctl enable ssh
+chroot "$ROOTFS" systemctl enable tune-web80.socket
 
 cat > "${ROOTFS}/etc/motd" <<EOF
 
   ♫  Tune OS v${TUNE_VERSION} (Raspberry Pi)
   ─────────────────────────────────────
-  Web UI:    http://tune.local:8888
+  Web UI:    http://tune.local   (ou http://tune.local:8888)
   Music:     /mnt/music
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
@@ -248,4 +276,4 @@ echo "  GZ:     ${FINAL_IMG}.gz ($(du -h "${FINAL_IMG}.gz" | cut -f1))"
 echo ""
 echo "  Flash:  sudo dd if=${FINAL_IMG} of=/dev/sdX bs=4M status=progress"
 echo "  Login:  tune / tune"
-echo "  Web:    http://tune.local:8888"
+echo "  Web:    http://tune.local"
