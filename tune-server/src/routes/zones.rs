@@ -938,27 +938,7 @@ async fn create_zone(
     Json(body): Json<CreateZone>,
 ) -> impl IntoResponse {
     let output_type = body.output_type.as_deref();
-    let output_device_id = body.output_device_id.as_deref().filter(|d| !d.is_empty());
-
-    // Reject creating a zone that can never produce sound: a non-browser zone
-    // with no output device is an orphan. play() would be rejected by the
-    // orchestrator's orphan guard (#820), and such rows otherwise accumulate as
-    // duplicates on rename / discovery churn (Yacine, DENAFRIPS: several
-    // "DENAFRIPS USB HiRes Audio (Squeezebox)" rows, output_type=local, no
-    // device → silent no-op play). Browser zones are exempt: the web client
-    // pulls the stream itself and legitimately has no output device.
-    if output_device_id.is_none() && output_type != Some("browser") {
-        warn!(
-            name = %body.name,
-            output_type = ?output_type,
-            "create_zone_rejected_no_output_device"
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"detail": "A zone must be created from a discovered output device. This zone has no output device assigned."})),
-        )
-            .into_response();
-    }
+    let output_device_id = body.output_device_id.as_deref();
 
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
     // A previously soft-deleted zone (is_hidden=1) is resurrected so the user's
