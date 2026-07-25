@@ -148,7 +148,13 @@ pub(super) async fn library_facets(
     Query(q): Query<FacetQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    // `limit <= 0` means "no limit" (show every facet value); otherwise clamp to
+    // a sane ceiling. Absent → the historical default of 200.
+    let limit: Option<i64> = match q.limit {
+        Some(n) if n <= 0 => None,
+        Some(n) => Some(n.clamp(1, 5000)),
+        None => Some(200),
+    };
     let requested: Vec<String> = q
         .fields
         .as_deref()
@@ -189,7 +195,7 @@ pub(super) async fn library_facets(
 fn column_facet(
     state: &AppState,
     col: &str,
-    limit: i64,
+    limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
@@ -198,10 +204,11 @@ fn column_facet(
     } else {
         format!(" AND {}", conds.join(" AND "))
     };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     let sql = format!(
         "SELECT t.{col}, COUNT(*) AS n FROM tracks t \
          WHERE t.{col} IS NOT NULL AND CAST(t.{col} AS TEXT) <> ''{extra} \
-         GROUP BY t.{col} ORDER BY n DESC LIMIT {limit}"
+         GROUP BY t.{col} ORDER BY n DESC{limit_clause}"
     );
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
@@ -229,7 +236,7 @@ fn column_facet(
 fn kv_facet(
     state: &AppState,
     key: &str,
-    limit: i64,
+    limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
@@ -241,10 +248,11 @@ fn kv_facet(
             conds.join(" AND ")
         )
     };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     let sql = format!(
         "SELECT value, COUNT(DISTINCT track_id) AS n FROM track_metadata \
          WHERE key = '{key}' AND value <> ''{narrow} \
-         GROUP BY value ORDER BY n DESC LIMIT {limit}"
+         GROUP BY value ORDER BY n DESC{limit_clause}"
     );
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
