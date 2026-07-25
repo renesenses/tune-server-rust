@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::traits::*;
 use crate::TuneError;
@@ -186,6 +186,32 @@ impl QobuzService {
                 accumulated = all_items.len(),
                 "qobuz_paginate"
             );
+
+            // Diagnostic for the "favorites empty while playlists load" reports
+            // (Stéphane): on the FIRST page, surface at INFO the counts so a normal
+            // tester log tells us whether Qobuz returned nothing (total==0 → an
+            // API/account issue) or returned rows we then dropped (total>0 but
+            // count==0 → a response-shape/mapping mismatch on our side). When the
+            // items_key sub-object is entirely absent we log the top-level keys
+            // the response DID carry, to catch Qobuz nesting the data elsewhere.
+            if offset == 0 {
+                let key_present = data.get(items_key).map(|v| !v.is_null()).unwrap_or(false);
+                if total == 0 && count == 0 {
+                    let top_keys: Vec<&str> = data
+                        .as_object()
+                        .map(|m| m.keys().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    warn!(
+                        path,
+                        items_key,
+                        key_present,
+                        response_keys = ?top_keys,
+                        "qobuz_favorites_empty"
+                    );
+                } else {
+                    info!(path, items_key, count, total, "qobuz_favorites_first_page");
+                }
+            }
 
             offset += count;
 
