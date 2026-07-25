@@ -163,6 +163,16 @@ pub struct ResolvedStream {
     pub channels: Option<u32>,
 }
 
+/// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
+/// file served on the HI-RES streaming path (cache-hit → a previously-finished
+/// transcode instead of a fresh one), so it stays OFF until validated on a real
+/// DLNA renderer. Enable with `TUNE_DASH_WARM_CACHE=1`.
+fn dash_warm_cache_enabled() -> bool {
+    std::env::var("TUNE_DASH_WARM_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -2628,6 +2638,129 @@ impl PlaybackOrchestrator {
                 return Err("DASH file missing (already consumed by prior decode)".into());
             }
 
+            // Warm-cache (opt-in, TUNE_DASH_WARM_CACHE): a prior play/warm of this
+            // exact track+quality+format may have left a finished transcode on
+            // disk. All the format-decision work (incl. a dlna_supports_mime await)
+            // runs ONLY when the flag is on, so a disabled build is byte-identical.
+            // `warm` carries (cache_path, enc_format, key_bit_depth); it is None
+            // when the flag is off or a zone EQ is active (EQ is out of the key).
+            let warm: Option<(String, &'static str, u16)> = if dash_warm_cache_enabled() {
+                let wsr = stream_data.quality.sample_rate;
+                let wbd = stream_data.quality.bit_depth.max(16).min(24);
+                let wdid = req.output_device_id.as_deref().unwrap_or("");
+                let wflac =
+                    ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
+                let wfmt = if wdid.is_empty()
+                    || wflac
+                    || self.dlna_supports_mime(wdid, "audio/flac").await
+                {
+                    "flac"
+                } else {
+                    "wav"
+                };
+                let wkbd = if wfmt == "wav" { 16 } else { wbd };
+                if self.load_eq_processor(req.zone_id, wsr, 2).is_none() {
+                    Some((
+                        crate::transcode_cache::cache_path_streaming(
+                            service_name,
+                            source_id,
+                            wfmt,
+                            wsr,
+                            wkbd,
+                            2,
+                        ),
+                        wfmt,
+                        wkbd,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Cache hit → serve the finished transcode, skipping the whole
+            // download+decode+encode. The fMP4 on disk is left untouched (not
+            // renamed to `.decoding` / consumed), so a concurrent path can still
+            // use it. Mirrors the common metadata tail before returning.
+            if let Some((cp, wfmt, wkbd)) = warm.as_ref() {
+                if crate::transcode_cache::is_hit(cp) {
+                    crate::transcode_cache::touch(cp);
+                    if let Ok(md) = std::fs::metadata(cp) {
+                        let file_size = md.len();
+                        let hit_mime = if *wfmt == "flac" {
+                            "audio/flac"
+                        } else {
+                            "audio/wav"
+                        };
+                        let file_info = StreamInfo {
+                            format: (*wfmt).into(),
+                            mime_type: hit_mime.into(),
+                            sample_rate: stream_data.quality.sample_rate,
+                            bit_depth: *wkbd,
+                            channels: 2,
+                            file_size: Some(file_size),
+                            duration_ms: None,
+                            ..Default::default()
+                        };
+                        let session_id = self
+                            .streamer
+                            .create_file_session(file_info, cp.clone(), false)
+                            .await;
+                        let server_ip = self.server_ip();
+                        let stream_url =
+                            self.streamer.get_stream_url(&session_id, &server_ip, *wfmt);
+                        info!(cache = %cp, file_size, "streaming_dash_warm_cache_hit");
+
+                        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+                        let (title, artist, album, duration_ms, cover_path) = if has_title {
+                            (
+                                req.title.clone().unwrap_or_default(),
+                                req.artist_name.clone(),
+                                req.album_title.clone(),
+                                req.duration_ms,
+                                req.cover_url.clone(),
+                            )
+                        } else {
+                            match svc.get_track(source_id).await {
+                                Ok(track) => (
+                                    track.title,
+                                    Some(track.artist),
+                                    track.album,
+                                    Some(track.duration_ms as i64),
+                                    track.cover_path,
+                                ),
+                                Err(_) => (
+                                    req.title
+                                        .clone()
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "Unknown".into()),
+                                    req.artist_name.clone(),
+                                    req.album_title.clone(),
+                                    req.duration_ms,
+                                    req.cover_url.clone(),
+                                ),
+                            }
+                        };
+                        return Ok(ResolvedStream {
+                            url: stream_url,
+                            mime_type: hit_mime.into(),
+                            title,
+                            artist,
+                            album,
+                            duration_ms,
+                            source: service_name.into(),
+                            cover_url: cover_path,
+                            stream_id: Some(session_id),
+                            file_size: Some(file_size),
+                            sample_rate: Some(stream_data.quality.sample_rate),
+                            bit_depth: Some(stream_data.quality.bit_depth as u32),
+                            channels: Some(2),
+                        });
+                    }
+                }
+            }
+
             let unique_path = format!("{}.decoding", &dash_file_path);
             if std::fs::rename(&dash_file_path, &unique_path).is_err() {
                 warn!(path = %dash_file_path, "streaming_dash_file_already_being_decoded");
@@ -2763,9 +2896,21 @@ impl PlaybackOrchestrator {
                         duration_ms: None,
                         ..Default::default()
                     };
+                    // Store into the warm cache (atomic rename) when enabled, so
+                    // the next play of this exact track is an instant hit. Any
+                    // rename failure falls back to serving the temp file — no
+                    // regression. `evict` keeps the cache under its size cap.
+                    let serve_path = match warm.as_ref() {
+                        Some((cp, _, _)) if std::fs::rename(&tmp_path, cp).is_ok() => {
+                            tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                            info!(cache = %cp, file_size, "streaming_dash_warm_cache_store");
+                            cp.clone()
+                        }
+                        _ => tmp_path,
+                    };
                     let session_id = self
                         .streamer
-                        .create_file_session(file_info, tmp_path, false)
+                        .create_file_session(file_info, serve_path, false)
                         .await;
 
                     let server_ip = self.server_ip();

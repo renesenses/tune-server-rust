@@ -75,6 +75,47 @@ pub fn cache_path(
     )
 }
 
+/// Deterministic cache path for a transcoded *streaming* rendition (Tidal /
+/// Qobuz HI-RES DASH), keyed by stream identity rather than a source file.
+///
+/// Unlike [`cache_path`], there is no stable source file to stat: the DASH fMP4
+/// is downloaded to a random temp name, renamed to `.decoding`, then deleted, so
+/// its path/mtime/size are meaningless as a key. Instead we hash the durable
+/// stream identity — `service | source_id | out_ext | sample_rate | bit_depth |
+/// channels` — which is what actually determines the transcoded bytes. This is
+/// **infallible** (no `metadata()` call): a HI-RES track resolved for the same
+/// zone always maps to the same cached FLAC/WAV.
+///
+/// Shares the `tune-tcache-` prefix so [`is_hit`], [`touch`] and [`evict`] cover
+/// these entries identically. EQ is out of the key (see the module docs): the
+/// caller must skip the cache when a zone EQ is active. `bit_depth` must be the
+/// pre-decode *negotiated* target (16 when capped to WAV, else the source depth)
+/// so warm and play agree before the expensive decode.
+pub fn cache_path_streaming(
+    service: &str,
+    source_id: &str,
+    out_ext: &str,
+    sample_rate: u32,
+    bit_depth: u16,
+    channels: u16,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(service.as_bytes());
+    h.update([0u8]); // domain separator so "ab|c" ≠ "a|bc"
+    h.update(source_id.as_bytes());
+    h.update([0u8]);
+    h.update(out_ext.as_bytes());
+    h.update(sample_rate.to_le_bytes());
+    h.update(bit_depth.to_le_bytes());
+    h.update(channels.to_le_bytes());
+    let hex = format!("{:x}", h.finalize());
+    let name = format!("{CACHE_PREFIX}{}.{out_ext}", &hex[..32]);
+    std::env::temp_dir()
+        .join(name)
+        .to_string_lossy()
+        .to_string()
+}
+
 /// True when `path` holds a completed transcode (exists, non-trivial size).
 pub fn is_hit(path: &str) -> bool {
     std::fs::metadata(path)
@@ -196,6 +237,52 @@ mod tests {
     #[test]
     fn cache_path_none_for_missing_source() {
         assert!(cache_path("/no/such/file.flac", "flac", 44100, 16, 2).is_none());
+    }
+
+    #[test]
+    fn cache_path_streaming_is_deterministic_and_param_sensitive() {
+        let a = cache_path_streaming("tidal", "12345", "flac", 96000, 24, 2);
+        let b = cache_path_streaming("tidal", "12345", "flac", 96000, 24, 2);
+        assert_eq!(a, b, "same inputs → same path");
+        // Shares the cache prefix so is_hit / touch / evict cover it.
+        assert!(a.contains("tune-tcache-"));
+        assert!(a.ends_with(".flac"));
+
+        // Every identity/output param changes the path.
+        assert_ne!(
+            a,
+            cache_path_streaming("qobuz", "12345", "flac", 96000, 24, 2)
+        );
+        assert_ne!(
+            a,
+            cache_path_streaming("tidal", "67890", "flac", 96000, 24, 2)
+        );
+        assert_ne!(
+            a,
+            cache_path_streaming("tidal", "12345", "wav", 96000, 24, 2)
+        );
+        assert_ne!(
+            a,
+            cache_path_streaming("tidal", "12345", "flac", 44100, 24, 2)
+        );
+        assert_ne!(
+            a,
+            cache_path_streaming("tidal", "12345", "flac", 96000, 16, 2)
+        );
+        assert_ne!(
+            a,
+            cache_path_streaming("tidal", "12345", "flac", 96000, 24, 1)
+        );
+    }
+
+    #[test]
+    fn cache_path_streaming_domain_separated() {
+        // The NUL separators prevent field-boundary collisions between
+        // service+source_id that would otherwise concatenate to the same bytes.
+        assert_ne!(
+            cache_path_streaming("ti", "dal1", "flac", 96000, 24, 2),
+            cache_path_streaming("tid", "al1", "flac", 96000, 24, 2),
+        );
     }
 
     #[test]
