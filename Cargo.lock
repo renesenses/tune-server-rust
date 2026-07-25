@@ -4372,6 +4372,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tracing",
+ "tune-output-api",
  "unicode-normalization",
  "urlencoding",
  "uuid",
@@ -4391,6 +4392,15 @@ dependencies = [
  "tracing-subscriber",
  "tune-core",
  "tune-server",
+]
+
+[[package]]
+name = "tune-output-api"
+version = "0.9.6"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
