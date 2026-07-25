@@ -3,6 +3,9 @@ use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tune_core::db::backend::SqlValue;
+use tune_core::db::engine::Engine;
+
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -12,6 +15,126 @@ pub(super) struct FacetQuery {
     fields: Option<String>,
     /// Max values per facet (default 200).
     limit: Option<i64>,
+    // Optional active filters — when present, each facet is counted over the
+    // narrowed track set (cumulative faceting, Dominique: "le genre filtre les
+    // labels"). Same names as /library/tracks. A facet never filters on its own
+    // field, so its other values stay visible to switch to.
+    genre: Option<String>,
+    year: Option<i32>,
+    format: Option<String>,
+    sample_rate: Option<i32>,
+    bit_depth: Option<i32>,
+    source: Option<String>,
+    label: Option<String>,
+    composer: Option<String>,
+    artist: Option<String>,
+    country: Option<String>,
+    mood: Option<String>,
+    source_media: Option<String>,
+    q: Option<String>,
+}
+
+/// Build the WHERE conditions (over alias `t` = tracks) for the active filters,
+/// skipping the facet's own field so its alternatives remain countable. Values
+/// are always bound parameters; column/key names come from fixed literals only.
+fn build_conditions(q: &FacetQuery, engine: Engine, exclude: &str) -> (Vec<String>, Vec<SqlValue>) {
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<SqlValue> = Vec::new();
+    let mut idx = 1usize;
+    let ph = |i: usize| match engine {
+        Engine::Sqlite => "?".to_string(),
+        Engine::Postgres => format!("${i}"),
+    };
+
+    if exclude != "genre" {
+        if let Some(g) = q.genre.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!(
+                "(LOWER(t.genre) = LOWER({p}) OR t.genres LIKE {p2})",
+                p = ph(idx),
+                p2 = ph(idx + 1)
+            ));
+            params.push(SqlValue::Text(g.to_string()));
+            params.push(SqlValue::Text(format!("%\"{g}\"%")));
+            idx += 2;
+        }
+    }
+    if exclude != "year" {
+        if let Some(y) = q.year {
+            conds.push(format!("t.year = {}", ph(idx)));
+            params.push(SqlValue::Int(y as i64));
+            idx += 1;
+        }
+    }
+    if let Some(f) = q.format.as_deref().filter(|s| !s.is_empty()) {
+        conds.push(format!("LOWER(t.format) = LOWER({})", ph(idx)));
+        params.push(SqlValue::Text(f.to_string()));
+        idx += 1;
+    }
+    if let Some(sr) = q.sample_rate {
+        conds.push(format!("t.sample_rate = {}", ph(idx)));
+        params.push(SqlValue::Int(sr as i64));
+        idx += 1;
+    }
+    if let Some(bd) = q.bit_depth {
+        conds.push(format!("t.bit_depth = {}", ph(idx)));
+        params.push(SqlValue::Int(bd as i64));
+        idx += 1;
+    }
+    if let Some(s) = q.source.as_deref().filter(|s| !s.is_empty()) {
+        conds.push(format!("t.source = {}", ph(idx)));
+        params.push(SqlValue::Text(s.to_string()));
+        idx += 1;
+    }
+    if exclude != "label" {
+        if let Some(l) = q.label.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!("LOWER(t.label) LIKE LOWER({})", ph(idx)));
+            params.push(SqlValue::Text(format!("%{l}%")));
+            idx += 1;
+        }
+    }
+    if let Some(c) = q.composer.as_deref().filter(|s| !s.is_empty()) {
+        conds.push(format!("LOWER(t.composer) LIKE LOWER({})", ph(idx)));
+        params.push(SqlValue::Text(format!("%{c}%")));
+        idx += 1;
+    }
+    if exclude != "artist" {
+        if let Some(a) = q.artist.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!("t.artist_name = {}", ph(idx)));
+            params.push(SqlValue::Text(a.to_string()));
+            idx += 1;
+        }
+    }
+    // Extended-tag filters via the open `track_metadata` k/v store. `source`
+    // facet == source_media key. Key is a fixed literal; value is bound.
+    for (opt, key, own) in [
+        (&q.country, "release_country", "country"),
+        (&q.mood, "mood", "mood"),
+        (&q.source_media, "source_media", "source"),
+    ] {
+        if exclude == own {
+            continue;
+        }
+        if let Some(v) = opt.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!(
+                "EXISTS (SELECT 1 FROM track_metadata tm \
+                 WHERE tm.track_id = t.id AND tm.key = '{key}' AND tm.value = {})",
+                ph(idx)
+            ));
+            params.push(SqlValue::Text(v.to_string()));
+            idx += 1;
+        }
+    }
+    if let Some(query) = q.q.as_deref().filter(|s| !s.is_empty()) {
+        conds.push(format!(
+            "(LOWER(t.title) LIKE LOWER({p}) OR LOWER(t.artist_name) LIKE LOWER({p2}))",
+            p = ph(idx),
+            p2 = ph(idx + 1)
+        ));
+        let like = format!("%{query}%");
+        params.push(SqlValue::Text(like.clone()));
+        params.push(SqlValue::Text(like));
+    }
+    (conds, params)
 }
 
 /// GET /api/v1/library/facets?fields=genre,label,year,artist,country,mood,source
@@ -35,18 +158,21 @@ pub(super) async fn library_facets(
         .filter(|s| !s.is_empty())
         .collect();
 
+    let engine = state.backend.engine();
     let mut out = serde_json::Map::new();
     for field in requested {
+        // Conditions narrow the count by the OTHER active facets (cumulative).
+        let (conds, params) = build_conditions(&q, engine, &field);
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
-            "genre" => column_facet(&state, "genre", limit),
-            "label" => column_facet(&state, "label", limit),
-            "year" => column_facet(&state, "year", limit),
-            "artist" => column_facet(&state, "artist_name", limit),
-            "country" => kv_facet(&state, "release_country", limit),
-            "mood" => kv_facet(&state, "mood", limit),
-            "source" => kv_facet(&state, "source_media", limit),
+            "genre" => column_facet(&state, "genre", limit, &conds, &params),
+            "label" => column_facet(&state, "label", limit, &conds, &params),
+            "year" => column_facet(&state, "year", limit, &conds, &params),
+            "artist" => column_facet(&state, "artist_name", limit, &conds, &params),
+            "country" => kv_facet(&state, "release_country", limit, &conds, &params),
+            "mood" => kv_facet(&state, "mood", limit, &conds, &params),
+            "source" => kv_facet(&state, "source_media", limit, &conds, &params),
             _ => continue,
         };
         let arr: Vec<Value> = rows
@@ -58,16 +184,32 @@ pub(super) async fn library_facets(
     Ok(Json(Value::Object(out)))
 }
 
-/// Count distinct values of a fixed `tracks` column.
-fn column_facet(state: &AppState, col: &str, limit: i64) -> Vec<(String, i64)> {
+/// Count distinct values of a fixed `tracks` column, optionally narrowed by the
+/// active-facet conditions (over alias `t`).
+fn column_facet(
+    state: &AppState,
+    col: &str,
+    limit: i64,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
     let sql = format!(
-        "SELECT {col}, COUNT(*) AS n FROM tracks \
-         WHERE {col} IS NOT NULL AND CAST({col} AS TEXT) <> '' \
-         GROUP BY {col} ORDER BY n DESC LIMIT {limit}"
+        "SELECT t.{col}, COUNT(*) AS n FROM tracks t \
+         WHERE t.{col} IS NOT NULL AND CAST(t.{col} AS TEXT) <> ''{extra} \
+         GROUP BY t.{col} ORDER BY n DESC LIMIT {limit}"
     );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
     state
         .backend
-        .query_many(&sql, &[])
+        .query_many(&sql, &bound)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|row| {
@@ -82,16 +224,35 @@ fn column_facet(state: &AppState, col: &str, limit: i64) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// Count distinct values of an extended tag in the `track_metadata` k/v store.
-fn kv_facet(state: &AppState, key: &str, limit: i64) -> Vec<(String, i64)> {
+/// Count distinct values of an extended tag in the `track_metadata` k/v store,
+/// optionally narrowed to the tracks matching the active-facet conditions.
+fn kv_facet(
+    state: &AppState,
+    key: &str,
+    limit: i64,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let narrow = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND track_id IN (SELECT t.id FROM tracks t WHERE {})",
+            conds.join(" AND ")
+        )
+    };
     let sql = format!(
         "SELECT value, COUNT(DISTINCT track_id) AS n FROM track_metadata \
-         WHERE key = '{key}' AND value <> '' \
+         WHERE key = '{key}' AND value <> ''{narrow} \
          GROUP BY value ORDER BY n DESC LIMIT {limit}"
     );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
     state
         .backend
-        .query_many(&sql, &[])
+        .query_many(&sql, &bound)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|row| {
