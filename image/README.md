@@ -31,12 +31,24 @@ Or use [balenaEtcher](https://etcher.balena.io/) / [Rufus](https://rufus.ie/).
 
 - **Debian 12 (bookworm)** minimal headless
 - **Tune Server** with web client at `http://tune.local:8888`
+- **Appliance mode** (`/etc/tune-appliance`): WiFi setup from the web UI
+  (Settings → Network) after a first boot on ethernet — see `docs/APPLIANCE.md`
+- **WiFi firmware** (non-free): Intel, Realtek, Atheros, Broadcom
+- **USB storage auto-mount** under `/media` (exFAT/NTFS/FAT/ext4), indexed
+  automatically as a music folder
+- **SMB/CIFS tools** for NAS shares mounted from the web UI
 - **ALSA** with USB audio support (auto-detected)
 - **avahi-daemon** for mDNS (`.local` discovery)
 - **NetworkManager** (DHCP auto on all interfaces)
 - **SSH** enabled (user: `tune`, password: `tune`)
 - **Auto-resize** root partition on first boot
-- **systemd hardened** service with audio RT priority
+- **systemd** service with audio RT priority
+
+## CI build
+
+The `Tune OS Image` GitHub Actions workflow (`.github/workflows/tune-os.yml`,
+manual dispatch) builds the x86_64 image for an existing release and attaches
+`tune-os-x86_64-vX.Y.Z.img.gz` (+ `.sha256`) to it.
 
 ## Default credentials
 

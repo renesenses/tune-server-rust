@@ -19,7 +19,7 @@ if [[ "$TUNE_VERSION" == "--version" ]]; then
 fi
 
 IMAGE_NAME="tune-os-x86_64"
-IMAGE_SIZE="2G"
+IMAGE_SIZE="3G"
 DEBIAN_RELEASE="bookworm"
 DEBIAN_MIRROR="http://deb.debian.org/debian"
 WORK_DIR="/tmp/tune-os-build"
@@ -114,13 +114,18 @@ mount "$PART_ROOT" "$ROOTFS"
 mkdir -p "${ROOTFS}/boot/efi"
 mount "$PART_EFI" "${ROOTFS}/boot/efi"
 
-log "Bootstrapping Debian ${DEBIAN_RELEASE}..."
+log "Bootstrapping Debian ${DEBIAN_RELEASE} (base minimale)..."
+# Base minimale seulement : le reste s'installe via apt en chroot, qui sait
+# ordonner les dépendances (le configure naïf de debootstrap échoue sur
+# polkitd ↔ default-logind).
 debootstrap --arch=amd64 --variant=minbase \
-    --include=systemd,systemd-sysv,dbus,udev,kmod,linux-image-amd64,\
-grub-efi-amd64,sudo,curl,ca-certificates,avahi-daemon,libnss-mdns,\
-alsa-utils,libasound2,wpasupplicant,networkmanager,openssh-server,\
-locales,procps,iproute2,less,nano \
-    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR"
+    --components=main,contrib,non-free-firmware \
+    --include=systemd,systemd-sysv \
+    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR" || {
+    err "debootstrap failed — dernières lignes de debootstrap.log :"
+    tail -n 200 "${ROOTFS}/debootstrap/debootstrap.log" 2>/dev/null || true
+    exit 1
+}
 
 ok "Debian bootstrap complete"
 
@@ -129,6 +134,31 @@ mount --bind /dev "${ROOTFS}/dev"
 mount --bind /dev/pts "${ROOTFS}/dev/pts"
 mount -t proc proc "${ROOTFS}/proc"
 mount -t sysfs sys "${ROOTFS}/sys"
+
+# --- Install packages with apt (proper dependency ordering) ---
+log "Installing packages via apt..."
+cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE} main contrib non-free-firmware
+deb http://security.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free-firmware
+EOF
+
+# Prevent services from starting inside the chroot
+printf '#!/bin/sh\nexit 101\n' > "${ROOTFS}/usr/sbin/policy-rc.d"
+chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
+
+# non-free-firmware: WiFi chipsets of consumer PCs (Intel/Realtek/Atheros/Broadcom)
+chroot "$ROOTFS" bash -ec "
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq \
+        dbus udev kmod linux-image-amd64 grub-efi-amd64 sudo curl \
+        ca-certificates avahi-daemon libnss-mdns alsa-utils wpasupplicant \
+        network-manager openssh-server \
+        firmware-iwlwifi firmware-realtek firmware-atheros firmware-brcm80211 \
+        wireless-regdb cloud-guest-utils cifs-utils smbclient exfatprogs ntfs-3g \
+        locales procps iproute2 less nano
+"
+ok "Packages installed"
 
 # --- Configure the system ---
 log "Configuring system..."
@@ -168,6 +198,18 @@ EOF
 
 # Enable mDNS (tune.local)
 sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' "${ROOTFS}/etc/nsswitch.conf"
+
+# Appliance marker: unlocks /api/v1/appliance (WiFi setup from the web UI)
+# and the appliance flag in /system/config — see docs/APPLIANCE.md
+echo "Tune OS appliance image" > "${ROOTFS}/etc/tune-appliance"
+
+# USB storage: auto-mount partitions under /media/<kernel> (headless, no udisks
+# session). exFAT/NTFS/FAT mount root-owned world-readable — enough for scanning.
+mkdir -p "${ROOTFS}/media"
+cat > "${ROOTFS}/etc/udev/rules.d/99-tune-usb-mount.rules" <<'EOF'
+ACTION=="add", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-mount --no-block --automount=yes --collect $devnode /media/%k"
+ACTION=="remove", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-umount /media/%k"
+EOF
 
 # SSH: enable but disable password auth by default (key only)
 mkdir -p "${ROOTFS}/etc/ssh/sshd_config.d"
@@ -223,19 +265,22 @@ mkdir -p "${ROOTFS}/mnt/music"
 
 # Tune configuration
 mkdir -p "${ROOTFS}/opt/tune/data"
+# Format PLAT (cf. tune.toml.example) — les sections [server]/[library]
+# ne sont pas lues et le serveur retombait sur db_path relatif ("tune.db")
+# dans /opt/tune, en lecture seule (ProtectSystem=strict) → crash-loop.
 cat > "${ROOTFS}/opt/tune/tune.toml" <<EOF
 # Tune OS default configuration
 # Edit via web UI at http://tune.local:8888/settings
 
-[server]
 port = 8888
-data_dir = "/opt/tune/data"
+db_path = "/opt/tune/data/tune.db"
+web_dir = "/opt/tune/web"
+artwork_dir = "/opt/tune/data/artwork_cache"
+auto_scan = true
+log_level = "info"
 
-[library]
-music_dirs = ["/mnt/music"]
-
-[audio]
-backend = "auto"
+# /media : disques USB auto-montés ; /mnt/music : montages NAS manuels
+music_dirs = ["/mnt/music", "/media"]
 EOF
 
 # --- Systemd service ---
@@ -247,8 +292,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=tune
-Group=audio
+# Root sur l'image appliance : le serveur pilote nmcli (config WiFi) et
+# mount.cifs (partages SMB) directement — cf. /etc/tune-appliance.
+User=root
 WorkingDirectory=/opt/tune
 ExecStart=/opt/tune/tune-server
 Restart=always
@@ -261,11 +307,10 @@ LimitNOFILE=65536
 LimitRTPRIO=95
 LimitMEMLOCK=infinity
 
-# Hardening
+# Hardening (root, mais système en lecture seule hors chemins listés)
 ProtectSystem=strict
-ReadWritePaths=/opt/tune/data /mnt/music /tmp
+ReadWritePaths=/opt/tune/data /mnt /media /tmp
 ProtectHome=yes
-NoNewPrivileges=yes
 PrivateTmp=yes
 
 [Install]
@@ -336,14 +381,12 @@ cat > "${ROOTFS}/etc/motd" <<EOF
   ♫  Tune OS v${TUNE_VERSION}
   ─────────────────────────────
   Web UI:    http://tune.local:8888
-  Music:     /mnt/music
+  Music:     USB drives auto-mount under /media
+             NAS/SMB shares: web UI → Settings → Network
+  WiFi:      web UI → Settings → Network (first boot: ethernet)
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
   User:      tune / tune
-
-  Mount your NAS music share:
-    sudo mount -t cifs //nas/music /mnt/music -o guest
-    (add to /etc/fstab for permanent mount)
 
 EOF
 
@@ -374,6 +417,7 @@ ok "GRUB installed"
 
 # --- Cleanup ---
 log "Cleaning up rootfs..."
+rm -f "${ROOTFS}/usr/sbin/policy-rc.d"
 chroot "$ROOTFS" apt-get clean
 rm -rf "${ROOTFS}/var/cache/apt/archives"/*.deb
 rm -rf "${ROOTFS}/var/lib/apt/lists"/*
