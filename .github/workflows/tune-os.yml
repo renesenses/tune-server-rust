@@ -4,6 +4,11 @@ name: Tune OS Image
 # Déclenchement manuel : la release (et son asset linux-x86_64.tar.gz)
 # doit déjà exister — l'image télécharge le binaire depuis la release.
 on:
+  # TEMPORAIRE (validation avant merge) : run auto sur la branche feature,
+  # workflow_dispatch ne voyant que la branche par défaut. À retirer.
+  push:
+    branches: [feature/appliance-wifi]
+    paths: ['.github/workflows/tune-os.yml']
   workflow_dispatch:
     inputs:
       version:
