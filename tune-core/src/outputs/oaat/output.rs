@@ -741,6 +741,17 @@ impl OutputTarget for OaatOutput {
                             diag.packets_sent.fetch_add(1, Ordering::Relaxed);
                             diag.bytes_sent
                                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            // Feed the stall watchdog: the supervisor restarts
+                            // the zone when last_packet_age_ms > 30 s, and this
+                            // field otherwise keeps the epoch of the previous
+                            // (HTTP) playback.
+                            diag.last_packet_epoch_ms.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
                             position_ms.store(
                                 sample_offset * 1000 / cur_sample_rate.max(1) as u64,
                                 Ordering::SeqCst,
@@ -981,6 +992,14 @@ impl OutputTarget for OaatOutput {
                         diag.packets_sent.fetch_add(1, Ordering::Relaxed);
                         diag.bytes_sent
                             .fetch_add(chunk_bytes as u64, Ordering::Relaxed);
+                        // Feed the stall watchdog (see native DSD path above).
+                        diag.last_packet_epoch_ms.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
                         position_ms.store(
                             sample_offset * 1000 / cur_sample_rate as u64,
                             Ordering::Relaxed,
