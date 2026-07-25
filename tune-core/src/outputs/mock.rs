@@ -18,6 +18,7 @@ pub struct MockOutput {
     id: String,
     name: String,
     output_type: String,
+    host: Option<String>,
     state: Arc<Mutex<TransportState>>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -34,6 +35,7 @@ impl MockOutput {
             id: id.into(),
             name: name.into(),
             output_type: "mock".into(),
+            host: None,
             state: Arc::new(Mutex::new(TransportState::Stopped)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
@@ -49,6 +51,13 @@ impl MockOutput {
     /// a specific protocol (e.g. "dlna" vs "squeezebox").
     pub fn with_type(mut self, output_type: &str) -> Self {
         self.output_type = output_type.into();
+        self
+    }
+
+    /// Override the reported `host` (default `None`), so tests can model two
+    /// outputs living on the same LMS box (same-device dedup).
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.host = Some(host.into());
         self
     }
 
@@ -112,6 +121,10 @@ impl OutputTarget for MockOutput {
 
     fn output_type(&self) -> &str {
         &self.output_type
+    }
+
+    fn host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
