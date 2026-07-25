@@ -715,7 +715,15 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 json!(zone_repo.get_dlna_cap_16bit(zone_id)),
             );
             let online = match z.output_type.as_deref() {
-                Some("local") | Some("browser") => true,
+                // Browser zones have no output device by design (the web
+                // client pulls stream_url itself) — always online.
+                Some("browser") => true,
+                // A local zone is online as long as it still has a device
+                // assigned; an orphan row without output_device_id can never
+                // play (Yacine, 24/07) and must be reported offline so
+                // clients grey it out. Other types already fall through to
+                // unwrap_or(false) when output_device_id is NULL.
+                Some("local") => z.output_device_id.is_some(),
                 _ => z
                     .output_device_id
                     .as_deref()
@@ -797,7 +805,11 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
                 let online = match zone.output_type.as_deref() {
-                    Some("local") | Some("browser") => true,
+                    // Same rules as list_zones: browser zones need no device;
+                    // a local zone without output_device_id is an orphan that
+                    // can never play → offline.
+                    Some("browser") => true,
+                    Some("local") => zone.output_device_id.is_some(),
                     _ => zone
                         .output_device_id
                         .as_deref()
