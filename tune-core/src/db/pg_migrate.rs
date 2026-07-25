@@ -136,6 +136,12 @@ const MIGRATION_TABLES: &[&str] = &[
     "playlists",
     "playlist_tracks",
     "zones",
+    // Unified queue (v0.9 rc.2). Current SQLite DBs carry the queue here;
+    // migrate_to_unified_queue() drops the legacy play_queue / streaming_queue
+    // tables after copying, so those two below are only for pre-unification DBs
+    // and are harmlessly skipped ("no columns or does not exist") when absent.
+    // Without queue_items here the queue would NOT migrate at all.
+    "queue_items",
     "play_queue",
     "streaming_queue",
     "listen_history",
@@ -172,6 +178,11 @@ CREATE TABLE IF NOT EXISTS artists (
     musicbrainz_id TEXT,
     discogs_id TEXT,
     bio TEXT,
+    bio_source TEXT,
+    bio_source_url TEXT,
+    bio_license TEXT,
+    bio_lang TEXT,
+    bio_fetched_at TEXT,
     image_path TEXT,
     image_source TEXT
 );
@@ -196,6 +207,11 @@ CREATE TABLE IF NOT EXISTS albums (
     sample_rate TEXT,
     bit_depth TEXT,
     bio TEXT,
+    bio_source TEXT,
+    bio_source_url TEXT,
+    bio_license TEXT,
+    bio_lang TEXT,
+    bio_fetched_at TEXT,
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,
@@ -288,7 +304,16 @@ CREATE TABLE IF NOT EXISTS zones (
     max_sample_rate TEXT,
     fixed_volume TEXT DEFAULT 0,
     dsp_preset_id TEXT,
-    dsp_enabled TEXT DEFAULT 0
+    dsp_enabled TEXT DEFAULT 0,
+    autoplay_enabled TEXT DEFAULT 0,
+    is_hidden TEXT DEFAULT 0,
+    last_play_state TEXT DEFAULT 'stopped',
+    dsd_mode TEXT DEFAULT 'auto',
+    dlna_native_flac TEXT DEFAULT 0,
+    host TEXT,
+    alac_passthrough TEXT DEFAULT 0,
+    dlna_lpcm TEXT DEFAULT 0,
+    dlna_cap_16bit TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
@@ -351,7 +376,10 @@ CREATE TABLE IF NOT EXISTS listen_history (
     duration_ms TEXT DEFAULT 0,
     listened_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     zone_id TEXT,
-    cover_url TEXT
+    cover_url TEXT,
+    source_id TEXT,
+    album_id TEXT,
+    profile_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -464,6 +492,7 @@ CREATE TABLE IF NOT EXISTS smart_playlists (
     sort_by TEXT DEFAULT 'title',
     sort_order TEXT DEFAULT 'asc',
     max_tracks TEXT,
+    match_mode TEXT NOT NULL DEFAULT 'all',
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     updated_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
@@ -614,6 +643,52 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 INSERT INTO schema_version (version, name) VALUES (99, 'sqlite_migration')
     ON CONFLICT (version) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Idempotent column back-fills for ALREADY-CREATED PG databases.
+--
+-- A PG database created by an EARLIER version of this migration is missing
+-- columns that later SQLite migrations added (bio provenance, zone playback/
+-- DLNA flags, listen_history profile scoping, smart_playlists match_mode).
+-- Without these, the data copy fails with `column "X" does not exist` and the
+-- whole table is silently skipped (tester JP, forum). `ADD COLUMN IF NOT EXISTS`
+-- brings such a DB up to date without a manual drop; it is a no-op on a fresh DB
+-- (the CREATE TABLEs above already carry these columns). Types/defaults mirror
+-- the CREATE TABLEs (booleans stay TEXT 0/1 to match the copied SQLite data).
+-- ─────────────────────────────────────────────────────────────────────
+
+-- artists / albums: bio provenance (SQLite migration v54)
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source_url TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_license TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_lang TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source_url TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
+
+-- zones: playback state + DLNA/DSD flags (SQLite migrations v36/v38/v39/v40/v50
+-- and the post-migration safety pass: alac_passthrough / dlna_lpcm /
+-- dlna_cap_16bit / host)
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped';
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto';
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_native_flac TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
+
+-- listen_history: streaming source id + album id + profile scoping (v32/v37/v45)
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
+
+-- smart_playlists: match_mode (SQLite migration v48)
+ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
 "#;
 
 /// Run the full SQLite → PostgreSQL migration.
