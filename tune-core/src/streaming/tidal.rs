@@ -221,10 +221,18 @@ impl TidalService {
                 .map_err(|e| format!("tmp write init: {e}"))?;
         }
 
-        // Download media segments sequentially and append to file.
-        // Sequential to avoid overwhelming Tidal CDN and to maintain order.
-        // For a typical 3-4 min track at 96kHz/24bit, there are ~54 segments
-        // of ~4s each, total ~30-50MB. Each segment is ~500KB-1MB.
+        // Download media segments and append to file in order. Sequential by
+        // default (gentle on the Tidal CDN, trivially in-order). With
+        // TUNE_DASH_CONCURRENT set, fetch up to CONCURRENCY segments at once via
+        // `buffered`, which still YIELDS them in request order — so they're
+        // appended in the correct fMP4 sequence while N transfers run in
+        // parallel, cutting the ~10s serial download (66 segments at 96kHz/24bit)
+        // to ~2-3s (#1146 Plan C, step 1). Opt-in so a disabled build is
+        // byte-identical and the CDN-load profile only changes when asked.
+        // For a typical 3-4 min track there are ~54 segments (~500KB-1MB each).
+        let concurrent = std::env::var("TUNE_DASH_CONCURRENT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut total_bytes = init_data.len() as u64;
         let mut failed_segments = 0u32;
 
@@ -235,14 +243,39 @@ impl TidalService {
                 .open(&tmp_path)
                 .map_err(|e| format!("tmp reopen: {e}"))?;
 
-            for i in 0..total {
-                let seg_number = segments.start_number + i;
-                let seg_url = segments
-                    .media_template
-                    .replace("$Number$", &seg_number.to_string());
+            if concurrent {
+                use futures_util::stream::{self, StreamExt};
+                // Bounded so we never hammer the CDN with the full 66 at once.
+                const CONCURRENCY: usize = 6;
+                let mut fetches = stream::iter(0..total)
+                    .map(|i| {
+                        let seg_number = segments.start_number + i;
+                        let seg_url = segments
+                            .media_template
+                            .replace("$Number$", &seg_number.to_string());
+                        // reqwest::Client is an Arc internally — cheap to clone.
+                        let client = self.client.clone();
+                        async move {
+                            let res = async {
+                                let resp = client
+                                    .get(&seg_url)
+                                    .send()
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                let status = resp.status();
+                                if !status.is_success() {
+                                    return Err(format!("http {}", status.as_u16()));
+                                }
+                                resp.bytes().await.map_err(|e| e.to_string())
+                            }
+                            .await;
+                            (seg_number, res)
+                        }
+                    })
+                    .buffered(CONCURRENCY);
 
-                match self.client.get(&seg_url).send().await {
-                    Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                while let Some((seg_number, res)) = fetches.next().await {
+                    match res {
                         Ok(data) => {
                             file.write_all(&data)
                                 .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
@@ -253,29 +286,55 @@ impl TidalService {
                                 track_id,
                                 segment = seg_number,
                                 error = %e,
-                                "tidal_dash_segment_read_failed"
+                                "tidal_dash_segment_concurrent_failed"
                             );
                             failed_segments += 1;
                         }
-                    },
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        warn!(
-                            track_id,
-                            segment = seg_number,
-                            status,
-                            "tidal_dash_segment_http_error"
-                        );
-                        failed_segments += 1;
                     }
-                    Err(e) => {
-                        warn!(
-                            track_id,
-                            segment = seg_number,
-                            error = %e,
-                            "tidal_dash_segment_fetch_error"
-                        );
-                        failed_segments += 1;
+                }
+            } else {
+                for i in 0..total {
+                    let seg_number = segments.start_number + i;
+                    let seg_url = segments
+                        .media_template
+                        .replace("$Number$", &seg_number.to_string());
+
+                    match self.client.get(&seg_url).send().await {
+                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                            Ok(data) => {
+                                file.write_all(&data)
+                                    .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
+                                total_bytes += data.len() as u64;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    track_id,
+                                    segment = seg_number,
+                                    error = %e,
+                                    "tidal_dash_segment_read_failed"
+                                );
+                                failed_segments += 1;
+                            }
+                        },
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            warn!(
+                                track_id,
+                                segment = seg_number,
+                                status,
+                                "tidal_dash_segment_http_error"
+                            );
+                            failed_segments += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                track_id,
+                                segment = seg_number,
+                                error = %e,
+                                "tidal_dash_segment_fetch_error"
+                            );
+                            failed_segments += 1;
+                        }
                     }
                 }
             }
