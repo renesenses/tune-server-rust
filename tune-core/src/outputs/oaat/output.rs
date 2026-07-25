@@ -483,7 +483,8 @@ impl OutputTarget for OaatOutput {
 
                         // Prefer file header duration when the PlayMedia
                         // metadata left duration at 0 (disables the seek bar).
-                        if duration_ms_arc.load(Ordering::Relaxed) == 0 && dsf_info.sample_rate > 0 {
+                        if duration_ms_arc.load(Ordering::Relaxed) == 0 && dsf_info.sample_rate > 0
+                        {
                             let d_ms = dsf_info.total_samples * 1000 / dsf_info.sample_rate as u64;
                             duration_ms_arc.store(d_ms, Ordering::SeqCst);
                         }
@@ -495,8 +496,7 @@ impl OutputTarget for OaatOutput {
                         // playback at 0:00 while the UI shows the seek point.
                         let mut initial_bits: u64 = 0;
                         if start_position_ms > 0 {
-                            let target_bpc = (start_position_ms as f64
-                                * cur_sample_rate as f64
+                            let target_bpc = (start_position_ms as f64 * cur_sample_rate as f64
                                 / 1000.0
                                 / 8.0) as usize;
                             match tokio::task::block_in_place(|| {
@@ -574,7 +574,9 @@ impl OutputTarget for OaatOutput {
                                         endpoint.send_play(&stream_id).await.ok();
                                         info!(device = %device_name, "oaat: DSD resumed");
                                     }
-                                    OaatCommand::Seek { position_ms: seek_pos } => {
+                                    OaatCommand::Seek {
+                                        position_ms: seek_pos,
+                                    } => {
                                         endpoint
                                             .send_message(&oaat_core::Message::Seek(
                                                 oaat_core::message::Seek {
@@ -585,10 +587,10 @@ impl OutputTarget for OaatOutput {
                                             .await
                                             .ok();
                                         // Bytes per channel at seek point (8 DSD bits / byte).
-                                        let target_bpc = (seek_pos as f64
-                                            * cur_sample_rate as f64
+                                        let target_bpc = (seek_pos as f64 * cur_sample_rate as f64
                                             / 1000.0
-                                            / 8.0) as usize;
+                                            / 8.0)
+                                            as usize;
                                         match tokio::task::block_in_place(|| {
                                             reader.seek_to_bytes_per_channel(target_bpc)
                                         }) {
@@ -624,7 +626,8 @@ impl OutputTarget for OaatOutput {
                                 }
                             }
 
-                            while paused.load(Ordering::Relaxed) && playing.load(Ordering::Relaxed) {
+                            while paused.load(Ordering::Relaxed) && playing.load(Ordering::Relaxed)
+                            {
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 if stop_rx.try_recv().is_ok() {
                                     stopped = true;
@@ -646,7 +649,9 @@ impl OutputTarget for OaatOutput {
                                         OaatCommand::Mute(muted) => {
                                             endpoint.send_mute(muted).await.ok();
                                         }
-                                        OaatCommand::Seek { position_ms: seek_pos } => {
+                                        OaatCommand::Seek {
+                                            position_ms: seek_pos,
+                                        } => {
                                             endpoint
                                                 .send_message(&oaat_core::Message::Seek(
                                                     oaat_core::message::Seek {
@@ -659,10 +664,13 @@ impl OutputTarget for OaatOutput {
                                             let target_bpc = (seek_pos as f64
                                                 * cur_sample_rate as f64
                                                 / 1000.0
-                                                / 8.0) as usize;
-                                            if let Ok(reached_bpc) = tokio::task::block_in_place(|| {
-                                                reader.seek_to_bytes_per_channel(target_bpc)
-                                            }) {
+                                                / 8.0)
+                                                as usize;
+                                            if let Ok(reached_bpc) =
+                                                tokio::task::block_in_place(|| {
+                                                    reader.seek_to_bytes_per_channel(target_bpc)
+                                                })
+                                            {
                                                 pending.clear();
                                                 eof = false;
                                                 sample_offset = reached_bpc as u64 * 8;
@@ -684,8 +692,9 @@ impl OutputTarget for OaatOutput {
                             }
 
                             while pending.len() < DSD_CHUNK_SIZE && !eof {
-                                let chunk = match tokio::task::block_in_place(|| reader.next_chunk())
-                                {
+                                let chunk = match tokio::task::block_in_place(|| {
+                                    reader.next_chunk()
+                                }) {
                                     Ok(Some(c)) => c,
                                     Ok(None) => {
                                         eof = true;
