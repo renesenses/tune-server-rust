@@ -114,16 +114,13 @@ mount "$PART_ROOT" "$ROOTFS"
 mkdir -p "${ROOTFS}/boot/efi"
 mount "$PART_EFI" "${ROOTFS}/boot/efi"
 
-log "Bootstrapping Debian ${DEBIAN_RELEASE}..."
-# non-free-firmware: WiFi chipsets of consumer PCs (Intel/Realtek/Atheros/Broadcom)
+log "Bootstrapping Debian ${DEBIAN_RELEASE} (base minimale)..."
+# Base minimale seulement : le reste s'installe via apt en chroot, qui sait
+# ordonner les dépendances (le configure naïf de debootstrap échoue sur
+# polkitd ↔ default-logind).
 debootstrap --arch=amd64 --variant=minbase \
     --components=main,contrib,non-free-firmware \
-    --include=systemd,systemd-sysv,dbus,udev,kmod,linux-image-amd64,\
-grub-efi-amd64,sudo,curl,ca-certificates,avahi-daemon,libnss-mdns,\
-alsa-utils,libasound2,wpasupplicant,network-manager,openssh-server,\
-firmware-iwlwifi,firmware-realtek,firmware-atheros,firmware-brcm80211,\
-wireless-regdb,cloud-guest-utils,cifs-utils,smbclient,exfatprogs,ntfs-3g,\
-locales,procps,iproute2,less,nano \
+    --include=systemd,systemd-sysv \
     "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR" || {
     err "debootstrap failed — dernières lignes de debootstrap.log :"
     tail -n 200 "${ROOTFS}/debootstrap/debootstrap.log" 2>/dev/null || true
@@ -137,6 +134,31 @@ mount --bind /dev "${ROOTFS}/dev"
 mount --bind /dev/pts "${ROOTFS}/dev/pts"
 mount -t proc proc "${ROOTFS}/proc"
 mount -t sysfs sys "${ROOTFS}/sys"
+
+# --- Install packages with apt (proper dependency ordering) ---
+log "Installing packages via apt..."
+cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE} main contrib non-free-firmware
+deb http://security.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free-firmware
+EOF
+
+# Prevent services from starting inside the chroot
+printf '#!/bin/sh\nexit 101\n' > "${ROOTFS}/usr/sbin/policy-rc.d"
+chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
+
+# non-free-firmware: WiFi chipsets of consumer PCs (Intel/Realtek/Atheros/Broadcom)
+chroot "$ROOTFS" bash -ec "
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq \
+        dbus udev kmod linux-image-amd64 grub-efi-amd64 sudo curl \
+        ca-certificates avahi-daemon libnss-mdns alsa-utils wpasupplicant \
+        network-manager openssh-server \
+        firmware-iwlwifi firmware-realtek firmware-atheros firmware-brcm80211 \
+        wireless-regdb cloud-guest-utils cifs-utils smbclient exfatprogs ntfs-3g \
+        locales procps iproute2 less nano
+"
+ok "Packages installed"
 
 # --- Configure the system ---
 log "Configuring system..."
@@ -393,6 +415,7 @@ ok "GRUB installed"
 
 # --- Cleanup ---
 log "Cleaning up rootfs..."
+rm -f "${ROOTFS}/usr/sbin/policy-rc.d"
 chroot "$ROOTFS" apt-get clean
 rm -rf "${ROOTFS}/var/cache/apt/archives"/*.deb
 rm -rf "${ROOTFS}/var/lib/apt/lists"/*
