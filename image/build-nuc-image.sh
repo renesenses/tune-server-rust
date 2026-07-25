@@ -124,7 +124,11 @@ alsa-utils,libasound2,wpasupplicant,network-manager,openssh-server,\
 firmware-iwlwifi,firmware-realtek,firmware-atheros,firmware-brcm80211,\
 wireless-regdb,cloud-guest-utils,cifs-utils,smbclient,exfatprogs,ntfs-3g,\
 locales,procps,iproute2,less,nano \
-    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR"
+    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR" || {
+    err "debootstrap failed — dernières lignes de debootstrap.log :"
+    tail -n 200 "${ROOTFS}/debootstrap/debootstrap.log" 2>/dev/null || true
+    exit 1
+}
 
 ok "Debian bootstrap complete"
 
