@@ -309,7 +309,9 @@ LimitMEMLOCK=infinity
 
 # Hardening (root, mais système en lecture seule hors chemins listés)
 ProtectSystem=strict
-ReadWritePaths=/opt/tune/data /mnt /media /tmp
+# /opt/tune entier : l'auto-update remplace le binaire et web/ in place
+# (install_unix sur current_exe) — /opt/tune/data seul bloquait la MAJ.
+ReadWritePaths=/opt/tune /mnt /media /tmp
 ProtectHome=yes
 PrivateTmp=yes
 
