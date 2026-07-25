@@ -489,59 +489,6 @@ pub(crate) mod decisions {
             && wall_elapsed_secs.saturating_mul(1000)
                 >= queue_duration_ms.saturating_add(END_MARGIN_MS)
     }
-
-    /// Identity key of the currently playing track for the once-per-track
-    /// scrobble latch (#1113).
-    ///
-    /// The latch used to be a plain boolean reset only when
-    /// `track_generation` changed — but a gapless advance
-    /// (`advance_queue_metadata`) deliberately does NOT bump the generation
-    /// (the poller needs its cooldown intact), so every gapless-reached track
-    /// (tracks 2, 4, 6… of an album) kept the latch stuck `true` and was never
-    /// scrobbled. Keying the latch on the track's identity re-arms it on ANY
-    /// path that changes what is playing — explicit play (generation bump),
-    /// gapless metadata advance (queue position / track change), or the local
-    /// output's internal chain — without per-call-site reset bookkeeping.
-    ///
-    /// `track_generation` still participates so repeat-one (same track, same
-    /// queue position, new play) scrobbles each pass.
-    pub fn scrobble_track_key(
-        track_generation: u64,
-        queue_position: i64,
-        track_id: Option<i64>,
-        title: &str,
-        artist: Option<&str>,
-    ) -> String {
-        // Prefer the stable library id: mid-track metadata refinements
-        // (cover/format updates) must not look like a new track.
-        match track_id {
-            Some(id) => format!("{track_generation}:{queue_position}:id={id}"),
-            None => format!(
-                "{track_generation}:{queue_position}:{title}\u{1f}{}",
-                artist.unwrap_or_default()
-            ),
-        }
-    }
-
-    /// Should the poller dispatch a scrobble this tick?
-    ///
-    /// True when the playing track differs from the one already latched
-    /// (`latched_key`) AND it has genuinely been listened past the Last.fm
-    /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
-    pub fn should_dispatch_scrobble(
-        latched_key: Option<&str>,
-        current_key: &str,
-        source: &str,
-        duration_ms: i64,
-        position_ms: i64,
-    ) -> bool {
-        source != "radio"
-            && latched_key != Some(current_key)
-            && crate::scrobble::should_scrobble(
-                (duration_ms > 0).then_some(duration_ms),
-                position_ms,
-            )
-    }
 }
 
 /// Explicit poller state machine — **shadow model** of the `Stopped`-state
