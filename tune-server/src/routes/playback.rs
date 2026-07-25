@@ -52,20 +52,6 @@ fn play_error_response(e: String) -> axum::response::Response {
         )
             .into_response();
     }
-    // Missing-file sentinel from orchestrator.play(): the track's file_path no
-    // longer exists on disk (moved/deleted drive, stale scan). 404 so the client
-    // shows a real error instead of the track "playing" silently (JP).
-    if let Some(path) = e.strip_prefix("file_not_found:") {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "file_not_found",
-                "message": format!("File not found: {path} — it may have been moved or deleted. Rescan your library."),
-                "path": path,
-            })),
-        )
-            .into_response();
-    }
     let code = if e.contains("YouTube")
         || e.contains("youtube")
         || e.contains("yt-dlp")
