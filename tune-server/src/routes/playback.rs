@@ -657,6 +657,17 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
+                // Re-assert queue length AFTER play(). The pre-play
+                // update_queue_info above is a silent no-op when the zone's
+                // in-memory state doesn't exist yet, and play() then creates that
+                // state with queue_length=0 — so a streaming album/playlist on a
+                // fresh zone stopped after track 1 (next_position saw an empty
+                // queue → the poller stopped instead of advancing). The local
+                // track path already re-asserts after play(); mirror it here.
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
@@ -744,6 +755,17 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
+                // Re-assert queue length AFTER play(). The pre-play
+                // update_queue_info above is a silent no-op when the zone's
+                // in-memory state doesn't exist yet, and play() then creates that
+                // state with queue_length=0 — so a streaming album/playlist on a
+                // fresh zone stopped after track 1 (next_position saw an empty
+                // queue → the poller stopped instead of advancing). The local
+                // track path already re-asserts after play(); mirror it here.
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
@@ -2261,6 +2283,11 @@ pub struct ShuffleAllQuery {
     artist_id: Option<i64>,
 }
 
+/// Maximum number of tracks a single "shuffle all" enqueues. Enqueuing an entire
+/// large library (Yves, 50k) froze the web UI and gains nothing musically — a few
+/// hundred randomly-shuffled tracks is a "shuffle all" for all practical use.
+const SHUFFLE_MAX_TRACKS: i64 = 500;
+
 pub async fn shuffle_all(
     State(state): State<AppState>,
     Query(q): Query<ShuffleAllQuery>,
@@ -2297,12 +2324,15 @@ pub async fn shuffle_all(
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
             .unwrap_or_default()
     } else {
-        // Whole-library shuffle: queue every track, not just 100 (tester wanted
-        // to shuffle the entire library). Album/artist shuffles above are
-        // already uncapped, so this makes the no-filter case consistent. IDs are
-        // i64s so even a large library is cheap to hold; the Fisher-Yates below
-        // reshuffles them anyway.
-        track_repo.random_ids(i64::MAX).unwrap_or_default()
+        // Whole-library shuffle: take a random SHUFFLE_MAX_TRACKS sample straight
+        // from the DB rather than every row. Enqueuing an entire 50k-track library
+        // froze the web UI (rendering the queue) and served no purpose — a random
+        // few-hundred is a "shuffle all" in every practical sense (Yves, 50k
+        // library). random_ids already returns a random subset, so we don't load
+        // the whole table just to discard most of it.
+        track_repo
+            .random_ids(SHUFFLE_MAX_TRACKS)
+            .unwrap_or_default()
     };
     if all_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();
@@ -2321,6 +2351,10 @@ pub async fn shuffle_all(
         let j = (seed % (i as u64 + 1)) as usize;
         all_ids.swap(i, j);
     }
+
+    // Cap the enqueued set uniformly (a filtered path — album/artist — could also
+    // be large). A queue of a few hundred shuffled tracks never freezes the UI.
+    all_ids.truncate(SHUFFLE_MAX_TRACKS as usize);
 
     let zone_id = q.zone_id.unwrap_or(1);
     queue_repo.set_queue(zone_id, &all_ids).ok();

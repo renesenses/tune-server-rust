@@ -163,6 +163,16 @@ pub struct ResolvedStream {
     pub channels: Option<u32>,
 }
 
+/// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
+/// file served on the HI-RES streaming path (cache-hit → a previously-finished
+/// transcode instead of a fresh one), so it stays OFF until validated on a real
+/// DLNA renderer. Enable with `TUNE_DASH_WARM_CACHE=1`.
+fn dash_warm_cache_enabled() -> bool {
+    std::env::var("TUNE_DASH_WARM_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -626,33 +636,33 @@ impl PlaybackOrchestrator {
                     .get(req.zone_id)
                     .ok()
                     .flatten();
-                let db_volume = zone_db.as_ref().map(|z| z.volume).unwrap_or(50);
                 let is_fixed = zone_db.as_ref().is_some_and(|z| z.fixed_volume);
-                let zone_volume = if is_fixed {
-                    1.0
-                } else {
-                    let ps = self.playback.get_state(req.zone_id).await;
-                    if ps.volume > 0.0 {
-                        ps.volume
-                    } else {
-                        db_volume as f64 / 100.0
-                    }
-                };
-                let did = device_id.clone();
-                let outputs = self.outputs.clone();
-                let zone_id = req.zone_id;
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let arc = { outputs.lock().await.get(&did) };
-                    if let Some(output) = arc {
-                        let vol_clamped = zone_volume.clamp(0.0, 1.0);
-                        if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
-                            warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
-                        } else {
-                            info!(zone_id, volume = %vol_clamped, "play_initial_volume_sent");
+                // Only (re)assert the volume on play for fixed-volume (bit-perfect)
+                // zones, which must sit at 100%. For a normal zone, leave the
+                // device's current volume untouched: Tune previously pushed the
+                // stored zone volume on EVERY play, overriding a level the user
+                // had set directly on the device — the stored value drifts from
+                // the device (no external-change sync) so a low device jumped to
+                // the stored 50% on play (Fabien, "Salon"). Trade-off: this drops
+                // the old "re-apply saved volume after a restart to avoid a blast"
+                // behaviour for normal zones; the device keeps whatever level it
+                // is physically at.
+                if is_fixed {
+                    let did = device_id.clone();
+                    let outputs = self.outputs.clone();
+                    let zone_id = req.zone_id;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let arc = { outputs.lock().await.get(&did) };
+                        if let Some(output) = arc {
+                            if let Err(e) = output.lock().await.set_volume(1.0).await {
+                                warn!(zone_id, volume = 1.0, error = %e, "play_initial_volume_failed");
+                            } else {
+                                info!(zone_id, volume = 1.0, "play_initial_volume_sent");
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
 
             result
@@ -2061,12 +2071,27 @@ impl PlaybackOrchestrator {
             // copy latency, and falls back to the original file if not applicable.
             if source_format == Some(AudioFormat::Alac) {
                 let fp = file_path.clone();
-                if let Ok(Some(map)) = tokio::task::spawn_blocking(move || {
+                // Two shapes to fix: (1) moov-after-mdat → relocate moov to the
+                // front (and strip the cover on the way); (2) ALREADY faststart
+                // (ftyp|moov|mdat) → moov stays put but its `covr` cover art still
+                // makes the LHC-56 "ploc" at track start, so strip it in place.
+                // prepare_faststart handles (1) and returns None for (2), which was
+                // the gap: already-faststart files with artwork kept clicking
+                // (Yves: "Do What U Will" / "ABOVE AND BEYOND"). Fall back to the
+                // in-place cover strip. Both read only ftyp+moov (no mdat copy).
+                let mapped = tokio::task::spawn_blocking(move || {
                     crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                        .map(|m| ("relocate", m))
+                        .or_else(|| {
+                            crate::audio::faststart::prepare_cover_strip_faststart(
+                                std::path::Path::new(&fp),
+                            )
+                            .map(|m| ("cover_strip", m))
+                        })
                 })
-                .await
-                {
-                    info!(file = %file_path, "m4a_faststart_applied");
+                .await;
+                if let Ok(Some((how, map))) = mapped {
+                    info!(file = %file_path, how, "m4a_faststart_applied");
                     self.streamer.set_faststart(&session_id, map).await;
                 }
             }
@@ -2628,6 +2653,154 @@ impl PlaybackOrchestrator {
                 return Err("DASH file missing (already consumed by prior decode)".into());
             }
 
+            // Zone EQ, loaded ONCE and reused by both the warm-cache decision and
+            // the transcode below. A second load could observe a just-enabled EQ
+            // and store an EQ'd transcode under the EQ-less cache key, poisoning
+            // every later hit for this track.
+            let eq_profile_pretranscode =
+                self.load_eq_processor(req.zone_id, stream_data.quality.sample_rate, 2);
+
+            struct DashWarm {
+                cache_path: String,
+                enc_format: &'static str,
+                key_bit_depth: u16,
+                force_flac: bool,
+            }
+
+            // Warm-cache (opt-in, TUNE_DASH_WARM_CACHE): a prior play/warm of this
+            // exact track+quality+format may have left a finished transcode on
+            // disk. All the format-decision work (incl. a dlna_supports_mime await)
+            // runs ONLY when the flag is on, so a disabled build is byte-identical.
+            // `warm` is None when the flag is off or a zone EQ is active (EQ is
+            // out of the key). When Some, its format decision is authoritative for
+            // the whole DASH arm (see dash_enc_format below), so the cache key and
+            // the encoded bytes can never disagree.
+            let warm: Option<DashWarm> = if dash_warm_cache_enabled() {
+                let wsr = stream_data.quality.sample_rate;
+                let wbd = stream_data.quality.bit_depth.max(16).min(24);
+                let wdid = req.output_device_id.as_deref().unwrap_or("");
+                let wflac =
+                    ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
+                let wfmt = if wdid.is_empty()
+                    || wflac
+                    || self.dlna_supports_mime(wdid, "audio/flac").await
+                {
+                    "flac"
+                } else {
+                    "wav"
+                };
+                let wkbd = if wfmt == "wav" { 16 } else { wbd };
+                if eq_profile_pretranscode.is_none() {
+                    Some(DashWarm {
+                        cache_path: crate::transcode_cache::cache_path_streaming(
+                            service_name,
+                            source_id,
+                            wfmt,
+                            wsr,
+                            wkbd,
+                            2,
+                        ),
+                        enc_format: wfmt,
+                        key_bit_depth: wkbd,
+                        force_flac: wflac,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Cache hit → serve the finished transcode, skipping the whole
+            // download+decode+encode. The fMP4 on disk is left untouched (not
+            // renamed to `.decoding` / consumed), so a concurrent path can still
+            // use it. Mirrors the common metadata tail before returning.
+            if let Some(w) = warm.as_ref() {
+                if crate::transcode_cache::is_hit(&w.cache_path) {
+                    crate::transcode_cache::touch(&w.cache_path);
+                    if let Ok(md) = std::fs::metadata(&w.cache_path) {
+                        let file_size = md.len();
+                        let hit_mime = if w.enc_format == "flac" {
+                            "audio/flac"
+                        } else {
+                            "audio/wav"
+                        };
+                        let file_info = StreamInfo {
+                            format: w.enc_format.into(),
+                            mime_type: hit_mime.into(),
+                            sample_rate: stream_data.quality.sample_rate,
+                            bit_depth: w.key_bit_depth,
+                            channels: 2,
+                            file_size: Some(file_size),
+                            duration_ms: None,
+                            ..Default::default()
+                        };
+                        let session_id = self
+                            .streamer
+                            .create_file_session(file_info, w.cache_path.clone(), false)
+                            .await;
+                        let server_ip = self.server_ip();
+                        let stream_url =
+                            self.streamer
+                                .get_stream_url(&session_id, &server_ip, w.enc_format);
+                        info!(cache = %w.cache_path, file_size, "streaming_dash_warm_cache_hit");
+                        // Warm N+1 into the cache while this track plays (same
+                        // device → same FLAC/WAV decision, so inherit it).
+                        self.spawn_warm_next_streaming(
+                            req.zone_id,
+                            source_id.to_string(),
+                            w.enc_format,
+                        );
+
+                        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+                        let (title, artist, album, duration_ms, cover_path) = if has_title {
+                            (
+                                req.title.clone().unwrap_or_default(),
+                                req.artist_name.clone(),
+                                req.album_title.clone(),
+                                req.duration_ms,
+                                req.cover_url.clone(),
+                            )
+                        } else {
+                            match svc.get_track(source_id).await {
+                                Ok(track) => (
+                                    track.title,
+                                    Some(track.artist),
+                                    track.album,
+                                    Some(track.duration_ms as i64),
+                                    track.cover_path,
+                                ),
+                                Err(_) => (
+                                    req.title
+                                        .clone()
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "Unknown".into()),
+                                    req.artist_name.clone(),
+                                    req.album_title.clone(),
+                                    req.duration_ms,
+                                    req.cover_url.clone(),
+                                ),
+                            }
+                        };
+                        return Ok(ResolvedStream {
+                            url: stream_url,
+                            mime_type: hit_mime.into(),
+                            title,
+                            artist,
+                            album,
+                            duration_ms,
+                            source: service_name.into(),
+                            cover_url: cover_path,
+                            stream_id: Some(session_id),
+                            file_size: Some(file_size),
+                            sample_rate: Some(stream_data.quality.sample_rate),
+                            bit_depth: Some(stream_data.quality.bit_depth as u32),
+                            channels: Some(2),
+                        });
+                    }
+                }
+            }
+
             let unique_path = format!("{}.decoding", &dash_file_path);
             if std::fs::rename(&dash_file_path, &unique_path).is_err() {
                 warn!(path = %dash_file_path, "streaming_dash_file_already_being_decoded");
@@ -2661,15 +2834,26 @@ impl PlaybackOrchestrator {
             // FLAC but never advertise it (Marco's Denon Ceol N12 returns an
             // empty GetProtocolInfo Sink), so negotiation wrongly falls back to
             // WAV. When the zone forces native FLAC, keep FLAC here as well.
-            let dash_force_flac =
-                ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-            let dash_enc_format = if dash_did.is_empty()
-                || dash_force_flac
-                || self.dlna_supports_mime(dash_did, "audio/flac").await
-            {
-                "flac"
-            } else {
-                "wav"
+            //
+            // When the warm-cache key was computed above, REUSE its decision
+            // instead of re-deriving it: the same logic evaluated twice can
+            // diverge (device cache refresh, zone toggle flipped mid-request)
+            // and would store a transcode under a key describing other bytes.
+            let (dash_enc_format, dash_force_flac) = match warm.as_ref() {
+                Some(w) => (w.enc_format, w.force_flac),
+                None => {
+                    let force =
+                        ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
+                    let fmt = if dash_did.is_empty()
+                        || force
+                        || self.dlna_supports_mime(dash_did, "audio/flac").await
+                    {
+                        "flac"
+                    } else {
+                        "wav"
+                    };
+                    (fmt, force)
+                }
             };
             // Make the streaming-DLNA format decision explicit in the log so we
             // can tell why a renderer got WAV vs FLAC (Marco: multiple Denon
@@ -2684,7 +2868,6 @@ impl PlaybackOrchestrator {
 
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
-            let eq_profile_pretranscode = self.load_eq_processor(req.zone_id, sr, 2);
             // When falling back to WAV/LPCM (renderer has no audio/flac sink),
             // the served WAV is advertised with `DLNA.ORG_PN=LPCM`, a 16-bit-only
             // DLNA profile. A 24-bit Hi-Res stream (Tidal/Qobuz) served under it
@@ -2730,14 +2913,14 @@ impl PlaybackOrchestrator {
                     .map_err(|e| format!("write temp file: {e}"))?;
 
                 let file_size = encoded_data.len() as u64;
-                Ok::<(u64, u16), String>((file_size, actual_bd))
+                Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
             })
             .await;
 
             let _ = std::fs::remove_file(&unique_path);
 
             match transcode_result {
-                Ok(Ok((file_size, actual_bd))) => {
+                Ok(Ok((file_size, actual_bd, actual_sr))) => {
                     info!(
                         tmp = %tmp_path,
                         file_size,
@@ -2763,9 +2946,43 @@ impl PlaybackOrchestrator {
                         duration_ms: None,
                         ..Default::default()
                     };
+                    // Store into the warm cache (atomic rename) when enabled, so
+                    // the next play of this exact track is an instant hit. Any
+                    // rename failure falls back to serving the temp file — no
+                    // regression. `evict` keeps the cache under its size cap.
+                    //
+                    // Guard: only store when the DECODED reality matches the key.
+                    // `quality.bit_depth`/`sample_rate` come from the service API
+                    // and can lie about the actual stream; a later hit would then
+                    // advertise a depth/rate the file doesn't have in DIDL — the
+                    // Ruark-silence class of bug (#1137, 24-bit LPCM). A skipped
+                    // store just means the old temp-file behaviour for this track.
+                    let key_matches_reality =
+                        warm.as_ref().is_some_and(|w| w.key_bit_depth == actual_bd)
+                            && sr == actual_sr;
+                    let serve_path = match warm.as_ref() {
+                        Some(w)
+                            if key_matches_reality
+                                && std::fs::rename(&tmp_path, &w.cache_path).is_ok() =>
+                        {
+                            tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                            info!(cache = %w.cache_path, file_size, "streaming_dash_warm_cache_store");
+                            w.cache_path.clone()
+                        }
+                        _ => tmp_path,
+                    };
+                    // Warm the next streaming track into the cache in the
+                    // background (same zone/device → inherit dash_enc_format).
+                    if warm.is_some() {
+                        self.spawn_warm_next_streaming(
+                            req.zone_id,
+                            source_id.to_string(),
+                            dash_enc_format,
+                        );
+                    }
                     let session_id = self
                         .streamer
-                        .create_file_session(file_info, tmp_path, false)
+                        .create_file_session(file_info, serve_path, false)
                         .await;
 
                     let server_ip = self.server_ip();
@@ -3658,6 +3875,28 @@ impl PlaybackOrchestrator {
             }
         };
         if let Some(output_arc) = output_arc {
+            // For OAAT outputs, arm the start position before play: the
+            // native DSD direct path reads the local file itself and must
+            // seek to this offset (the seek-positioned HTTP transcode URL
+            // is bypassed on that path).
+            //
+            // Gated on `oaat`: `crate::outputs::oaat` only exists with that
+            // feature (outputs/mod.rs), so an ungated reference broke the
+            // postgres-without-oaat build (test-postgres "Engine module tests"),
+            // mirroring the `local-audio` gate on the analogous block below.
+            #[cfg(feature = "oaat")]
+            if let Some(position_ms) = start_position_ms {
+                if device_id.starts_with("oaat:") {
+                    let output = output_arc.lock().await;
+                    if let Some(oaat_output) = output
+                        .as_any()
+                        .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                    {
+                        oaat_output.set_pending_start_position_ms(position_ms);
+                    }
+                    drop(output);
+                }
+            }
             // For local outputs, set the pending start position before play
             #[cfg(feature = "local-audio")]
             if let Some(position_ms) = start_position_ms {
@@ -3797,6 +4036,146 @@ impl PlaybackOrchestrator {
                 Ok((size, _, _)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
                     tokio::task::spawn_blocking(crate::transcode_cache::evict);
                     info!(zone_id, cache = %cp, "transcode_cache_warmed_next");
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        });
+    }
+
+    /// Pre-transcode the NEXT streaming track (Tidal/Qobuz HI-RES DASH) into the
+    /// warm cache while the current one plays, so an album/playlist advance is an
+    /// instant cache hit instead of another 6-23s blocking download+transcode
+    /// (#1146). Opt-in via TUNE_DASH_WARM_CACHE (same flag as the check/store).
+    ///
+    /// The next track goes to the SAME zone/device as the current one, so the
+    /// FLAC-vs-WAV decision is identical — we inherit `out_fmt` from the current
+    /// play instead of re-probing the renderer from this detached task. The
+    /// current track is located by `cur_source_id` in the streaming queue (robust
+    /// against in-flight playback-state timing); we warm the item right after it.
+    fn spawn_warm_next_streaming(
+        &self,
+        zone_id: i64,
+        cur_source_id: String,
+        out_fmt: &'static str,
+    ) {
+        if !dash_warm_cache_enabled() {
+            return;
+        }
+        let db = self.db.clone();
+        let services = self.services.clone();
+        tokio::spawn(async move {
+            // Find the current track in the streaming queue, then the next item.
+            let sq = PlayQueueRepo::with_backend(db.clone())
+                .get_streaming_queue(zone_id)
+                .unwrap_or_default();
+            let Some(cur_idx) = sq
+                .iter()
+                .position(|it| it["source_id"].as_str() == Some(cur_source_id.as_str()))
+            else {
+                return;
+            };
+            let Some(item) = sq.get(cur_idx + 1) else {
+                return;
+            };
+            let source = item["source"].as_str().unwrap_or("").to_string();
+            let source_id = item["source_id"].as_str().unwrap_or("").to_string();
+            if source.is_empty() || source_id.is_empty() {
+                return;
+            }
+
+            // Resolve the next track's stream. Only a DASH (file://) result is
+            // worth caching — a direct proxy stream isn't transcoded.
+            let stream_data = {
+                let registry = services.lock().await;
+                let Some(svc) = registry.get(&source) else {
+                    return;
+                };
+                let svc = svc.lock().await;
+                match svc.get_track_url(&source_id, None).await {
+                    Ok(d) => d,
+                    Err(_) => return,
+                }
+            };
+            let Some(dash_file) = stream_data.url.strip_prefix("file://").map(String::from) else {
+                return;
+            };
+            if !std::path::Path::new(&dash_file).exists() {
+                return;
+            }
+
+            let sr = stream_data.quality.sample_rate;
+            let bd = stream_data.quality.bit_depth.max(16).min(24);
+            let key_bd = if out_fmt == "wav" { 16 } else { bd };
+            let cp = crate::transcode_cache::cache_path_streaming(
+                &source, &source_id, out_fmt, sr, key_bd, 2,
+            );
+            if crate::transcode_cache::is_hit(&cp) {
+                return; // already warmed
+            }
+
+            // Decode the fMP4 → encode (FLAC/WAV, WAV capped at 16-bit) → temp,
+            // then atomically rename into the cache. Mirrors the play path.
+            let is_wav = out_fmt == "wav";
+            let tmp = std::env::temp_dir()
+                .join(format!(
+                    "tune-dash-warm-{}.{}",
+                    uuid::Uuid::new_v4(),
+                    out_fmt
+                ))
+                .to_string_lossy()
+                .to_string();
+            let dash_file_c = dash_file.clone();
+            let tmp_c = tmp.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let decoded =
+                    crate::audio::decode::decode_to_pcm(&dash_file_c, Some(sr), Some(2), 0.0, 0.0)?;
+                let mut pcm_bytes = decoded.pcm_bytes();
+                let mut actual_bd = decoded.bit_depth;
+                if is_wav && actual_bd > 16 {
+                    pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                    actual_bd = 16;
+                }
+                let rt = tokio::runtime::Handle::try_current()
+                    .map_err(|e| format!("no tokio runtime: {e}"))?;
+                let encoded = rt.block_on(async {
+                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                        out_fmt,
+                        decoded.sample_rate,
+                        actual_bd as u32,
+                        decoded.channels,
+                    );
+                    encoder.start().await?;
+                    encoder.write(&pcm_bytes).await?;
+                    encoder.finish().await
+                })?;
+                std::fs::write(&tmp_c, &encoded).map_err(|e| format!("write temp: {e}"))?;
+                Ok::<(u64, u16, u32), String>((
+                    encoded.len() as u64,
+                    actual_bd,
+                    decoded.sample_rate,
+                ))
+            })
+            .await;
+
+            // The fMP4 has served its purpose (a warm cache-hit serves the FLAC),
+            // so consume it like the play path does.
+            let _ = std::fs::remove_file(&dash_file);
+
+            // Same guard as the play-path store: only cache when the decoded
+            // reality matches the key (`quality.*` from the service API can lie);
+            // a mismatched entry would mis-advertise depth/rate in DIDL on every
+            // later hit (Ruark-silence class, #1137).
+            match result {
+                Ok(Ok((size, actual_bd, actual_sr)))
+                    if size >= 1024
+                        && actual_bd == key_bd
+                        && actual_sr == sr
+                        && std::fs::rename(&tmp, &cp).is_ok() =>
+                {
+                    tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                    info!(zone_id, cache = %cp, next_source_id = %source_id, "streaming_dash_warm_next_stored");
                 }
                 _ => {
                     let _ = std::fs::remove_file(&tmp);

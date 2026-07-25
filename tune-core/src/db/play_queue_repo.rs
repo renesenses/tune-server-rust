@@ -402,14 +402,32 @@ impl PlayQueueRepo {
 
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
         let delete_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
-        let insert_sql = self.dialect_sql(sql::insert_queue_row, sql::insert_queue_row);
+        // Guarded insert: only enqueue a track that still exists. A queue
+        // persisted before a rescan can reference tracks deleted since — the
+        // first missing id would raise "FOREIGN KEY constraint failed" and roll
+        // back the whole set_queue, leaving the zone with an empty/broken queue
+        // (JP Borderies: delete + re-ingest → playback cut off). Skipping missing
+        // ids keeps the rest of the queue playable.
+        let ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let insert_sql = format!(
+            "INSERT INTO queue_items (zone_id, track_id, position, is_current, source) \
+             SELECT {}, {}, {}, {}, 'local' WHERE EXISTS (SELECT 1 FROM tracks WHERE id = {})",
+            ph(1),
+            ph(2),
+            ph(3),
+            ph(4),
+            ph(5)
+        );
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             tx.execute(&delete_sql, &p)?;
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = i as i64;
                 let is_current = if i == 0 { 1i64 } else { 0i64 };
-                let p: [&dyn ToSqlValue; 4] = [&zone_id, tid, &pos, &is_current];
+                let p: [&dyn ToSqlValue; 5] = [&zone_id, tid, &pos, &is_current, tid];
                 tx.execute(&insert_sql, &p)?;
             }
             Ok(())

@@ -438,6 +438,18 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::delete, sql::delete);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        // Drop any queue entry referencing this track. The FK ON DELETE CASCADE
+        // is present on a fresh schema but absent on DBs created by the
+        // unified-queue migration, so a stale queue_items row would otherwise
+        // linger and later break set_queue with a FK error (JP Borderies).
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let _ = self.db.execute(
+            &format!("DELETE FROM queue_items WHERE track_id = {ph}"),
+            &params,
+        );
         Ok(())
     }
 
@@ -450,6 +462,10 @@ impl TrackRepo {
             let _ = tx.execute("DELETE FROM albums", &[]);
             let _ = tx.execute("DELETE FROM artists", &[]);
             let _ = tx.execute("DELETE FROM track_credits", &[]);
+            // Clear local (track-backed) queue entries too — CASCADE is missing
+            // on migrated DBs, so wiping the library must not leave a queue
+            // pointing at deleted tracks (JP Borderies).
+            let _ = tx.execute("DELETE FROM queue_items WHERE track_id IS NOT NULL", &[]);
             Ok(())
         })?;
         Ok(count)
@@ -941,8 +957,21 @@ impl TrackRepo {
                 &track.musicbrainz_recording_id,
                 &track.comments,
             ];
-            if self.db.execute(&insert_sql, &params).is_ok() {
-                count += 1;
+            match self.db.execute(&insert_sql, &params) {
+                Ok(_) => count += 1,
+                // Previously this failure was swallowed silently: the scanner
+                // reported "files=N errors=0" while the tracks never landed in
+                // the library (JP Borderies: ~205 tracks in DB vs ~779 on disk
+                // after a delete + full rescan). Log it so the drop is visible
+                // and the root cause (stale album_id/artist_id FK from an
+                // importer cache surviving a batch rollback) is diagnosable.
+                Err(e) => tracing::warn!(
+                    file = ?track.file_path,
+                    album_id = ?track.album_id,
+                    artist_id = ?track.artist_id,
+                    error = %e,
+                    "track_insert_failed_in_batch"
+                ),
             }
         }
         Ok(count)

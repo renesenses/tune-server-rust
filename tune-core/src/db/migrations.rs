@@ -193,6 +193,7 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
     author TEXT,
     image_url TEXT,
     description TEXT,
+    source_id TEXT,
     last_checked TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
@@ -725,6 +726,15 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (
 CREATE INDEX IF NOT EXISTS idx_streaming_favorites_profile ON streaming_favorites(profile_id, item_type);
 ",
     },
+    // Podcast subscriptions gained a `source_id` column so the client can match a
+    // subscription by its streaming source id (Apple Podcasts id) rather than
+    // feed_url alone — the "+ S'abonner" button stayed active because the browse
+    // list keys on source_id while the subscription only stored feed_url (Fabien).
+    Migration {
+        version: 59,
+        name: "add_source_id_to_podcast_subscriptions",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1108,6 +1118,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // (Version 57 on the v0.9 line; 55 on main — see the migration entry.)
             add_column_if_missing(db, "playlists", "profile_id", "INTEGER NOT NULL DEFAULT 1");
         }
+        if migration.version == 59 {
+            // Match subscriptions by streaming source id (Apple Podcasts id), not
+            // just feed_url — keeps the browse "S'abonner" button in sync (Fabien).
+            add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -1178,6 +1193,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
+
+    // Podcast subscriptions matched by streaming source id (migration v59). Safety
+    // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
+    add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");
 
     // Persistent "date added" side table (survives full rescan). CREATE IF NOT
     // EXISTS here too so DBs from any prior version get it regardless of which
@@ -1418,6 +1437,32 @@ mod tests {
         assert!(tables.contains(&"listen_history".to_string()));
         assert!(tables.contains(&"settings".to_string()));
         assert!(tables.contains(&"bookmarks".to_string()));
+    }
+
+    #[test]
+    fn unified_queue_exists_after_migrations() {
+        // Regression class (tester Yacine, Synology DS418j — originally on the
+        // legacy streaming_queue): startup's orphan-queue cleanup must never
+        // hit a missing table on a fresh DB. Since the v0.9 unified queue the
+        // cleanup targets queue_items — assert run_migrations creates it and
+        // that the exact startup DELETE succeeds.
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let exists: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='queue_items'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "queue_items must exist after run_migrations");
+
+        // The startup orphan cleanup DELETE must not error on a migrated DB.
+        conn.execute_batch("DELETE FROM queue_items WHERE zone_id NOT IN (SELECT id FROM zones)")
+            .expect("orphan cleanup DELETE must succeed on a migrated DB");
     }
 
     #[test]

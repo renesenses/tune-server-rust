@@ -98,8 +98,8 @@ async fn search_podcasts(
     }
 }
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description FROM podcast_subscriptions ORDER BY title", &[]).map_err(|e| AppError::internal(e))?;
-    let items: Vec<Value> = rows.into_iter().map(|r| json!({"id": r.get(0).and_then(|v| v.as_i64()), "feed_url": r.get(1).and_then(|v| v.as_string()), "title": r.get(2).and_then(|v| v.as_string()), "author": r.get(3).and_then(|v| v.as_string()), "image_url": r.get(4).and_then(|v| v.as_string()), "description": r.get(5).and_then(|v| v.as_string())})).collect();
+    let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description, source_id FROM podcast_subscriptions ORDER BY title", &[]).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows.into_iter().map(|r| json!({"id": r.get(0).and_then(|v| v.as_i64()), "feed_url": r.get(1).and_then(|v| v.as_string()), "title": r.get(2).and_then(|v| v.as_string()), "author": r.get(3).and_then(|v| v.as_string()), "image_url": r.get(4).and_then(|v| v.as_string()), "description": r.get(5).and_then(|v| v.as_string()), "source_id": r.get(6).and_then(|v| v.as_string())})).collect();
     Ok(Json(json!(items)))
 }
 async fn subscribe(
@@ -138,9 +138,9 @@ async fn subscribe(
     };
 
     let sql = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-        "INSERT INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (feed_url) DO NOTHING"
+        "INSERT INTO podcast_subscriptions (feed_url, title, author, image_url, description, source_id) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (feed_url) DO NOTHING"
     } else {
-        "INSERT OR IGNORE INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES (?, ?, ?, ?, ?)"
+        "INSERT OR IGNORE INTO podcast_subscriptions (feed_url, title, author, image_url, description, source_id) VALUES (?, ?, ?, ?, ?, ?)"
     };
     match state.backend.execute(
         sql,
@@ -150,6 +150,7 @@ async fn subscribe(
             &body.author as &dyn ToSqlValue,
             &body.image_url as &dyn ToSqlValue,
             &body.description as &dyn ToSqlValue,
+            &body.source_id as &dyn ToSqlValue,
         ],
     ) {
         Ok(_) => {
