@@ -2653,13 +2653,29 @@ impl PlaybackOrchestrator {
                 return Err("DASH file missing (already consumed by prior decode)".into());
             }
 
+            // Zone EQ, loaded ONCE and reused by both the warm-cache decision and
+            // the transcode below. A second load could observe a just-enabled EQ
+            // and store an EQ'd transcode under the EQ-less cache key, poisoning
+            // every later hit for this track.
+            let eq_profile_pretranscode =
+                self.load_eq_processor(req.zone_id, stream_data.quality.sample_rate, 2);
+
+            struct DashWarm {
+                cache_path: String,
+                enc_format: &'static str,
+                key_bit_depth: u16,
+                force_flac: bool,
+            }
+
             // Warm-cache (opt-in, TUNE_DASH_WARM_CACHE): a prior play/warm of this
             // exact track+quality+format may have left a finished transcode on
             // disk. All the format-decision work (incl. a dlna_supports_mime await)
             // runs ONLY when the flag is on, so a disabled build is byte-identical.
-            // `warm` carries (cache_path, enc_format, key_bit_depth); it is None
-            // when the flag is off or a zone EQ is active (EQ is out of the key).
-            let warm: Option<(String, &'static str, u16)> = if dash_warm_cache_enabled() {
+            // `warm` is None when the flag is off or a zone EQ is active (EQ is
+            // out of the key). When Some, its format decision is authoritative for
+            // the whole DASH arm (see dash_enc_format below), so the cache key and
+            // the encoded bytes can never disagree.
+            let warm: Option<DashWarm> = if dash_warm_cache_enabled() {
                 let wsr = stream_data.quality.sample_rate;
                 let wbd = stream_data.quality.bit_depth.max(16).min(24);
                 let wdid = req.output_device_id.as_deref().unwrap_or("");
@@ -2674,9 +2690,9 @@ impl PlaybackOrchestrator {
                     "wav"
                 };
                 let wkbd = if wfmt == "wav" { 16 } else { wbd };
-                if self.load_eq_processor(req.zone_id, wsr, 2).is_none() {
-                    Some((
-                        crate::transcode_cache::cache_path_streaming(
+                if eq_profile_pretranscode.is_none() {
+                    Some(DashWarm {
+                        cache_path: crate::transcode_cache::cache_path_streaming(
                             service_name,
                             source_id,
                             wfmt,
@@ -2684,9 +2700,10 @@ impl PlaybackOrchestrator {
                             wkbd,
                             2,
                         ),
-                        wfmt,
-                        wkbd,
-                    ))
+                        enc_format: wfmt,
+                        key_bit_depth: wkbd,
+                        force_flac: wflac,
+                    })
                 } else {
                     None
                 }
@@ -2698,21 +2715,21 @@ impl PlaybackOrchestrator {
             // download+decode+encode. The fMP4 on disk is left untouched (not
             // renamed to `.decoding` / consumed), so a concurrent path can still
             // use it. Mirrors the common metadata tail before returning.
-            if let Some((cp, wfmt, wkbd)) = warm.as_ref() {
-                if crate::transcode_cache::is_hit(cp) {
-                    crate::transcode_cache::touch(cp);
-                    if let Ok(md) = std::fs::metadata(cp) {
+            if let Some(w) = warm.as_ref() {
+                if crate::transcode_cache::is_hit(&w.cache_path) {
+                    crate::transcode_cache::touch(&w.cache_path);
+                    if let Ok(md) = std::fs::metadata(&w.cache_path) {
                         let file_size = md.len();
-                        let hit_mime = if *wfmt == "flac" {
+                        let hit_mime = if w.enc_format == "flac" {
                             "audio/flac"
                         } else {
                             "audio/wav"
                         };
                         let file_info = StreamInfo {
-                            format: (*wfmt).into(),
+                            format: w.enc_format.into(),
                             mime_type: hit_mime.into(),
                             sample_rate: stream_data.quality.sample_rate,
-                            bit_depth: *wkbd,
+                            bit_depth: w.key_bit_depth,
                             channels: 2,
                             file_size: Some(file_size),
                             duration_ms: None,
@@ -2720,15 +2737,20 @@ impl PlaybackOrchestrator {
                         };
                         let session_id = self
                             .streamer
-                            .create_file_session(file_info, cp.clone(), false)
+                            .create_file_session(file_info, w.cache_path.clone(), false)
                             .await;
                         let server_ip = self.server_ip();
                         let stream_url =
-                            self.streamer.get_stream_url(&session_id, &server_ip, *wfmt);
-                        info!(cache = %cp, file_size, "streaming_dash_warm_cache_hit");
+                            self.streamer
+                                .get_stream_url(&session_id, &server_ip, w.enc_format);
+                        info!(cache = %w.cache_path, file_size, "streaming_dash_warm_cache_hit");
                         // Warm N+1 into the cache while this track plays (same
-                        // device → same FLAC/WAV decision, so inherit *wfmt).
-                        self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), *wfmt);
+                        // device → same FLAC/WAV decision, so inherit it).
+                        self.spawn_warm_next_streaming(
+                            req.zone_id,
+                            source_id.to_string(),
+                            w.enc_format,
+                        );
 
                         let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
                         let (title, artist, album, duration_ms, cover_path) = if has_title {
@@ -2812,15 +2834,26 @@ impl PlaybackOrchestrator {
             // FLAC but never advertise it (Marco's Denon Ceol N12 returns an
             // empty GetProtocolInfo Sink), so negotiation wrongly falls back to
             // WAV. When the zone forces native FLAC, keep FLAC here as well.
-            let dash_force_flac =
-                ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-            let dash_enc_format = if dash_did.is_empty()
-                || dash_force_flac
-                || self.dlna_supports_mime(dash_did, "audio/flac").await
-            {
-                "flac"
-            } else {
-                "wav"
+            //
+            // When the warm-cache key was computed above, REUSE its decision
+            // instead of re-deriving it: the same logic evaluated twice can
+            // diverge (device cache refresh, zone toggle flipped mid-request)
+            // and would store a transcode under a key describing other bytes.
+            let (dash_enc_format, dash_force_flac) = match warm.as_ref() {
+                Some(w) => (w.enc_format, w.force_flac),
+                None => {
+                    let force =
+                        ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
+                    let fmt = if dash_did.is_empty()
+                        || force
+                        || self.dlna_supports_mime(dash_did, "audio/flac").await
+                    {
+                        "flac"
+                    } else {
+                        "wav"
+                    };
+                    (fmt, force)
+                }
             };
             // Make the streaming-DLNA format decision explicit in the log so we
             // can tell why a renderer got WAV vs FLAC (Marco: multiple Denon
@@ -2835,7 +2868,6 @@ impl PlaybackOrchestrator {
 
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
-            let eq_profile_pretranscode = self.load_eq_processor(req.zone_id, sr, 2);
             // When falling back to WAV/LPCM (renderer has no audio/flac sink),
             // the served WAV is advertised with `DLNA.ORG_PN=LPCM`, a 16-bit-only
             // DLNA profile. A 24-bit Hi-Res stream (Tidal/Qobuz) served under it
@@ -2881,14 +2913,14 @@ impl PlaybackOrchestrator {
                     .map_err(|e| format!("write temp file: {e}"))?;
 
                 let file_size = encoded_data.len() as u64;
-                Ok::<(u64, u16), String>((file_size, actual_bd))
+                Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
             })
             .await;
 
             let _ = std::fs::remove_file(&unique_path);
 
             match transcode_result {
-                Ok(Ok((file_size, actual_bd))) => {
+                Ok(Ok((file_size, actual_bd, actual_sr))) => {
                     info!(
                         tmp = %tmp_path,
                         file_size,
@@ -2918,11 +2950,24 @@ impl PlaybackOrchestrator {
                     // the next play of this exact track is an instant hit. Any
                     // rename failure falls back to serving the temp file — no
                     // regression. `evict` keeps the cache under its size cap.
+                    //
+                    // Guard: only store when the DECODED reality matches the key.
+                    // `quality.bit_depth`/`sample_rate` come from the service API
+                    // and can lie about the actual stream; a later hit would then
+                    // advertise a depth/rate the file doesn't have in DIDL — the
+                    // Ruark-silence class of bug (#1137, 24-bit LPCM). A skipped
+                    // store just means the old temp-file behaviour for this track.
+                    let key_matches_reality =
+                        warm.as_ref().is_some_and(|w| w.key_bit_depth == actual_bd)
+                            && sr == actual_sr;
                     let serve_path = match warm.as_ref() {
-                        Some((cp, _, _)) if std::fs::rename(&tmp_path, cp).is_ok() => {
+                        Some(w)
+                            if key_matches_reality
+                                && std::fs::rename(&tmp_path, &w.cache_path).is_ok() =>
+                        {
                             tokio::task::spawn_blocking(crate::transcode_cache::evict);
-                            info!(cache = %cp, file_size, "streaming_dash_warm_cache_store");
-                            cp.clone()
+                            info!(cache = %w.cache_path, file_size, "streaming_dash_warm_cache_store");
+                            w.cache_path.clone()
                         }
                         _ => tmp_path,
                     };
@@ -3834,6 +3879,12 @@ impl PlaybackOrchestrator {
             // native DSD direct path reads the local file itself and must
             // seek to this offset (the seek-positioned HTTP transcode URL
             // is bypassed on that path).
+            //
+            // Gated on `oaat`: `crate::outputs::oaat` only exists with that
+            // feature (outputs/mod.rs), so an ungated reference broke the
+            // postgres-without-oaat build (test-postgres "Engine module tests"),
+            // mirroring the `local-audio` gate on the analogous block below.
+            #[cfg(feature = "oaat")]
             if let Some(position_ms) = start_position_ms {
                 if device_id.starts_with("oaat:") {
                     let output = output_arc.lock().await;
@@ -4100,7 +4151,11 @@ impl PlaybackOrchestrator {
                     encoder.finish().await
                 })?;
                 std::fs::write(&tmp_c, &encoded).map_err(|e| format!("write temp: {e}"))?;
-                Ok::<u64, String>(encoded.len() as u64)
+                Ok::<(u64, u16, u32), String>((
+                    encoded.len() as u64,
+                    actual_bd,
+                    decoded.sample_rate,
+                ))
             })
             .await;
 
@@ -4108,8 +4163,17 @@ impl PlaybackOrchestrator {
             // so consume it like the play path does.
             let _ = std::fs::remove_file(&dash_file);
 
+            // Same guard as the play-path store: only cache when the decoded
+            // reality matches the key (`quality.*` from the service API can lie);
+            // a mismatched entry would mis-advertise depth/rate in DIDL on every
+            // later hit (Ruark-silence class, #1137).
             match result {
-                Ok(Ok(size)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
+                Ok(Ok((size, actual_bd, actual_sr)))
+                    if size >= 1024
+                        && actual_bd == key_bd
+                        && actual_sr == sr
+                        && std::fs::rename(&tmp, &cp).is_ok() =>
+                {
                     tokio::task::spawn_blocking(crate::transcode_cache::evict);
                     info!(zone_id, cache = %cp, next_source_id = %source_id, "streaming_dash_warm_next_stored");
                 }

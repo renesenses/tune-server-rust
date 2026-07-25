@@ -352,6 +352,9 @@ fi
 MAC=$(ip link show | grep -m1 'link/ether' | awk '{print $2}' | tr -d ':' | tail -c 5)
 if [[ -n "$MAC" ]]; then
     hostnamectl set-hostname "tune-${MAC}"
+    # Keep the printed URL truthful: tune.local dies with the rename
+    # (retour Stéphane : « machine injoignable après redémarrage »)
+    sed -i "s|http://tune\.local|http://tune-${MAC}.local|" /etc/motd
 fi
 
 touch "$MARKER"
@@ -387,6 +390,13 @@ cat > "${ROOTFS}/etc/motd" <<EOF
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
   User:      tune / tune
+
+EOF
+
+# Login screen (before login): live hostname (\n) and IPv4 (\4) via agetty
+cat > "${ROOTFS}/etc/issue" <<'EOF'
+
+  Tune OS — Web UI : http://\n.local:8888   (IP : http://\4:8888)
 
 EOF
 
