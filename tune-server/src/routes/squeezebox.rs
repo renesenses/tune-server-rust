@@ -286,53 +286,80 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             .to_string();
         let device_id = format!("squeezebox-{player_id}");
 
-        // Don't expose the same physical device as two zones. When the DAC is a
-        // USB player on a Lyrion/Daphile box, Tune sees it BOTH as a Squeezebox
-        // player (this CLI path) AND as a DLNA renderer (the LMS's UPnP bridge) —
-        // same name, two protocols — which produced Yacine's duplicate zones and
-        // conflicting playback. If a non-squeezebox output already carries this
-        // name AND we haven't already registered this squeezebox player, skip it
-        // and prefer the native DLNA zone. Conservative: never removes an
-        // existing/possibly-playing output, so no regression for pure-Squeezebox
-        // setups (no same-name other-type output ⇒ registers normally).
+        // The DAC on a Lyrion/Daphile box is exposed to Tune TWICE: as a
+        // Squeezebox player (this CLI path) AND as the LMS's UPnP-bridge DLNA
+        // renderer — same name AND same host (the LMS box), two protocols. This
+        // produced Yacine/Jean-Pierre's duplicate zones. The earlier dedup
+        // PREFERRED the DLNA zone and SKIPPED this Squeezebox one — but auto-
+        // advance never works on that LMS UPnP bridge (it reports no track
+        // duration; 0/196 advances), while it works natively on the Squeezebox
+        // zone (LMS gapless). So the user was routed to the broken path and
+        // couldn't wake the working Squeezebox zone.
+        //
+        // Reverse the preference: always register the Squeezebox output so its
+        // zone stays wakeable. The DLNA duplicate is DEFERRED — but only
+        // passively: it is never removed/offlined here, because SSDP owns its
+        // lifecycle and re-onlines it every scan pass, so touching it would just
+        // flip-flop. The same-name + same-host match is precise, so a different
+        // renderer that merely shares a display name is not affected; matching
+        // is used only to log the preference for diagnosability.
         {
             let reg = state.outputs.lock().await;
-            if !reg.contains(&device_id) {
-                let conflicts = reg.conflicting_outputs(&player_name, "squeezebox");
-                if !conflicts.is_empty() {
-                    drop(reg);
-                    tracing::info!(
-                        name = %player_name,
-                        id = %device_id,
-                        existing = ?conflicts,
-                        "squeezebox_output_skipped_duplicate_of_other_zone"
-                    );
-                    continue;
-                }
+            let dlna_duplicates =
+                reg.conflicting_outputs_same_host(&player_name, "squeezebox", &lms_host_str);
+            if !dlna_duplicates.is_empty() {
+                drop(reg);
+                tracing::info!(
+                    name = %player_name,
+                    id = %device_id,
+                    dlna_duplicates = ?dlna_duplicates,
+                    "squeezebox_output_preferred_over_dlna_duplicate"
+                );
             }
         }
 
-        // Register output using CLI port
-        let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(
-            player_name.clone(),
-            device_id.clone(),
-            lms_host_str.clone(),
-            lms_port,
-        );
-        {
-            let mut reg = state.outputs.lock().await;
-            reg.register(Box::new(output));
+        // Register the output using the CLI port — but only when it is genuinely
+        // new or its LMS host changed. discover_and_register runs every 60s;
+        // calling register() unconditionally replaced the output object and
+        // re-logged squeezebox_output_registered on every pass (register-thrash
+        // + log spam, 1441x). device_id is stable per player, so contains() +
+        // an unchanged host means nothing to do.
+        let needs_register = {
+            let reg = state.outputs.lock().await;
+            !reg.contains(&device_id) || reg.host_of(&device_id).as_deref() != Some(&lms_host_str)
+        };
+        if needs_register {
+            let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(
+                player_name.clone(),
+                device_id.clone(),
+                lms_host_str.clone(),
+                lms_port,
+            );
+            {
+                let mut reg = state.outputs.lock().await;
+                reg.register(Box::new(output));
+            }
+            tracing::info!(name = %player_name, id = %device_id, lms_host = %lms_host_str, lms_port, "squeezebox_output_registered");
         }
-        tracing::info!(name = %player_name, id = %device_id, lms_host = %lms_host_str, lms_port, "squeezebox_output_registered");
 
-        // Auto-create zone if not already present
+        // Auto-create zone if not already present. Only log a reconnect on an
+        // actual offline→online transition — the previous code logged
+        // squeezebox_zone_reconnected on every 60s pass for every live zone.
         match zone_repo.get_or_create(&player_name, Some("squeezebox"), &device_id) {
             Ok((zid, true)) => {
                 tracing::info!(name = %player_name, zone_id = zid, "squeezebox_zone_auto_created");
             }
             Ok((_, false)) => {
+                let was_online = zone_repo
+                    .get_by_device_id(&device_id)
+                    .ok()
+                    .flatten()
+                    .map(|z| z.online)
+                    .unwrap_or(false);
                 let _ = zone_repo.set_online_by_device(&device_id, true);
-                tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_reconnected");
+                if !was_online {
+                    tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_reconnected");
+                }
             }
             Err(e) => {
                 tracing::warn!(name = %player_name, id = %device_id, error = %e, "squeezebox_zone_create_failed");
