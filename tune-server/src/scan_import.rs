@@ -151,7 +151,12 @@ pub struct TrackImporter {
     cache_dir: std::path::PathBuf,
     /// Caches persist across batches for the lifetime of a scan.
     artist_cache: HashMap<String, Arc<Artist>>,
-    album_cache: HashMap<(String, i64, Option<i32>), Arc<Album>>,
+    // Keyed by (title, album_artist_id, year, mb_release_id) — the MB release id
+    // is part of the identity so two distinct editions sharing title+artist+year
+    // don't collapse into one via the cache before the DB is even consulted
+    // (Dominique). Tracks of one album that are only partially MB-tagged still
+    // reconcile at the DB layer (see get_or_create_with_mbid).
+    album_cache: HashMap<(String, i64, Option<i32>, Option<String>), Arc<Album>>,
     albums_with_cover: HashSet<i64>,
     /// First track-artist seen per folder, used to pin the album artist when a
     /// track has no `album_artist` tag (classical soloists / features).
@@ -334,6 +339,7 @@ impl TrackImporter {
                 title,
                 album_artist_id.unwrap_or(0),
                 meta.year.map(|y| y as i32),
+                meta.musicbrainz_release_id.clone(),
             )
         });
 

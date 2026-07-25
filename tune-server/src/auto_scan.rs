@@ -134,11 +134,17 @@ pub fn build_track_from_metadata_opts(
         } else {
             format!("{title} ({suffix})")
         };
-        // get_or_create uses (title, artist_id, year) to disambiguate albums.
-        // Compilations use the "Various Artists" artist_id, so same-title albums
-        // by different artists are correctly kept separate.
+        // Disambiguate by (title, artist_id, year) AND the MusicBrainz release
+        // id, so two distinct editions sharing title+artist+year stay separate
+        // (Dominique). Compilations use the "Various Artists" artist_id, so
+        // same-title albums by different artists are already kept apart.
         album_repo
-            .get_or_create(&album_title, aid, meta.year.map(|y| y as i32))
+            .get_or_create_with_mbid(
+                &album_title,
+                aid,
+                meta.year.map(|y| y as i32),
+                meta.musicbrainz_release_id.as_deref(),
+            )
             .ok()
     });
     let album_id = album.as_ref().and_then(|a| a.id);

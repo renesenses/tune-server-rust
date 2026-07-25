@@ -414,6 +414,81 @@ pub(super) struct MigrateQuery {
 /// This does NOT switch the running engine — Tune continues to use
 /// SQLite after the migration. The PG database is populated and ready
 /// for a future engine switch.
+/// Persist the PostgreSQL URL into the .env the server reads at startup, so
+/// the engine switch survives the restart. Search order mirrors main.rs:
+/// CWD/.env first, then (Windows) %LOCALAPPDATA%\TuneServer\.env — created
+/// there when none exists.
+#[cfg(feature = "postgres")]
+fn persist_database_url(url: &str) -> Result<std::path::PathBuf, String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(".env"));
+    }
+    #[cfg(windows)]
+    if let Ok(la) = std::env::var("LOCALAPPDATA") {
+        candidates.push(std::path::PathBuf::from(la).join("TuneServer").join(".env"));
+    }
+    let target = candidates
+        .iter()
+        .find(|p| p.is_file())
+        .cloned()
+        .or_else(|| candidates.last().cloned())
+        .ok_or_else(|| "no .env location available".to_string())?;
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let mut lines: Vec<String> = std::fs::read_to_string(&target)
+        .map(|c| c.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let entry = format!("TUNE_DATABASE_URL={url}");
+    if let Some(l) = lines
+        .iter_mut()
+        .find(|l| l.trim_start().starts_with("TUNE_DATABASE_URL="))
+    {
+        *l = entry;
+    } else {
+        lines.push(entry);
+    }
+    std::fs::write(&target, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
+    Ok(target)
+}
+
+/// Restart the server after a successful migration so it comes back on
+/// PostgreSQL. Unlike the update flow there is no binary swap involved, so
+/// spawning the SAME executable is safe on Windows too (the update path must
+/// NOT spawn — see update.rs — but here no .bat is waiting on our exit).
+fn restart_after_migration() {
+    tokio::spawn(async {
+        // Let the HTTP response flush to the client first.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let exe = std::env::current_exe().unwrap_or_default();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            tracing::info!(exe = %exe.display(), "migrate_reexec");
+            let err = std::process::Command::new(&exe).args(&args).exec();
+            tracing::warn!(error = %err, "migrate_reexec_failed — falling back to spawn+exit");
+        }
+        match std::process::Command::new(&exe)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => {
+                tracing::info!(pid = child.id(), "migrate_new_process_spawned");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "migrate_restart_spawn_failed — manual restart required");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+}
+
 pub(super) async fn migrate_database(
     State(state): State<AppState>,
     Query(q): Query<MigrateQuery>,
@@ -476,8 +551,24 @@ pub(super) async fn migrate_database(
         match tune_core::db::pg_migrate::migrate_sqlite_to_pg(&state.db, pg_url).await {
             Ok(result) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
+                // The UI promises « le serveur va redémarrer » — deliver it:
+                // persist the engine switch, then re-exec on PostgreSQL (JF:
+                // no restart happened and a manual relaunch stayed on SQLite).
+                let env_path = match persist_database_url(pg_url) {
+                    Ok(p) => {
+                        tracing::info!(path = %p.display(), "migrate_database_url_persisted");
+                        restart_after_migration();
+                        Some(p.display().to_string())
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "migrate_database_url_persist_failed — NOT restarting");
+                        None
+                    }
+                };
                 Json(json!({
                     "status": "complete",
+                    "restarting": env_path.is_some(),
+                    "env_path": env_path,
                     "tables_migrated": result.tables_migrated,
                     "total_rows": result.total_rows,
                     "duration_ms": duration_ms,
