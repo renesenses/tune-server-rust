@@ -2726,6 +2726,9 @@ impl PlaybackOrchestrator {
                         let stream_url =
                             self.streamer.get_stream_url(&session_id, &server_ip, *wfmt);
                         info!(cache = %cp, file_size, "streaming_dash_warm_cache_hit");
+                        // Warm N+1 into the cache while this track plays (same
+                        // device → same FLAC/WAV decision, so inherit *wfmt).
+                        self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), *wfmt);
 
                         let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
                         let (title, artist, album, duration_ms, cover_path) = if has_title {
@@ -2923,6 +2926,15 @@ impl PlaybackOrchestrator {
                         }
                         _ => tmp_path,
                     };
+                    // Warm the next streaming track into the cache in the
+                    // background (same zone/device → inherit dash_enc_format).
+                    if warm.is_some() {
+                        self.spawn_warm_next_streaming(
+                            req.zone_id,
+                            source_id.to_string(),
+                            dash_enc_format,
+                        );
+                    }
                     let session_id = self
                         .streamer
                         .create_file_session(file_info, serve_path, false)
@@ -3822,6 +3834,12 @@ impl PlaybackOrchestrator {
             // native DSD direct path reads the local file itself and must
             // seek to this offset (the seek-positioned HTTP transcode URL
             // is bypassed on that path).
+            //
+            // Gated on `oaat`: `crate::outputs::oaat` only exists with that
+            // feature (outputs/mod.rs), so an ungated reference broke the
+            // postgres-without-oaat build (test-postgres "Engine module tests"),
+            // mirroring the `local-audio` gate on the analogous block below.
+            #[cfg(feature = "oaat")]
             if let Some(position_ms) = start_position_ms {
                 if device_id.starts_with("oaat:") {
                     let output = output_arc.lock().await;
@@ -3973,6 +3991,133 @@ impl PlaybackOrchestrator {
                 Ok((size, _, _)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
                     tokio::task::spawn_blocking(crate::transcode_cache::evict);
                     info!(zone_id, cache = %cp, "transcode_cache_warmed_next");
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        });
+    }
+
+    /// Pre-transcode the NEXT streaming track (Tidal/Qobuz HI-RES DASH) into the
+    /// warm cache while the current one plays, so an album/playlist advance is an
+    /// instant cache hit instead of another 6-23s blocking download+transcode
+    /// (#1146). Opt-in via TUNE_DASH_WARM_CACHE (same flag as the check/store).
+    ///
+    /// The next track goes to the SAME zone/device as the current one, so the
+    /// FLAC-vs-WAV decision is identical — we inherit `out_fmt` from the current
+    /// play instead of re-probing the renderer from this detached task. The
+    /// current track is located by `cur_source_id` in the streaming queue (robust
+    /// against in-flight playback-state timing); we warm the item right after it.
+    fn spawn_warm_next_streaming(
+        &self,
+        zone_id: i64,
+        cur_source_id: String,
+        out_fmt: &'static str,
+    ) {
+        if !dash_warm_cache_enabled() {
+            return;
+        }
+        let db = self.db.clone();
+        let services = self.services.clone();
+        tokio::spawn(async move {
+            // Find the current track in the streaming queue, then the next item.
+            let sq = PlayQueueRepo::with_backend(db.clone())
+                .get_streaming_queue(zone_id)
+                .unwrap_or_default();
+            let Some(cur_idx) = sq
+                .iter()
+                .position(|it| it["source_id"].as_str() == Some(cur_source_id.as_str()))
+            else {
+                return;
+            };
+            let Some(item) = sq.get(cur_idx + 1) else {
+                return;
+            };
+            let source = item["source"].as_str().unwrap_or("").to_string();
+            let source_id = item["source_id"].as_str().unwrap_or("").to_string();
+            if source.is_empty() || source_id.is_empty() {
+                return;
+            }
+
+            // Resolve the next track's stream. Only a DASH (file://) result is
+            // worth caching — a direct proxy stream isn't transcoded.
+            let stream_data = {
+                let registry = services.lock().await;
+                let Some(svc) = registry.get(&source) else {
+                    return;
+                };
+                let svc = svc.lock().await;
+                match svc.get_track_url(&source_id, None).await {
+                    Ok(d) => d,
+                    Err(_) => return,
+                }
+            };
+            let Some(dash_file) = stream_data.url.strip_prefix("file://").map(String::from) else {
+                return;
+            };
+            if !std::path::Path::new(&dash_file).exists() {
+                return;
+            }
+
+            let sr = stream_data.quality.sample_rate;
+            let bd = stream_data.quality.bit_depth.max(16).min(24);
+            let key_bd = if out_fmt == "wav" { 16 } else { bd };
+            let cp = crate::transcode_cache::cache_path_streaming(
+                &source, &source_id, out_fmt, sr, key_bd, 2,
+            );
+            if crate::transcode_cache::is_hit(&cp) {
+                return; // already warmed
+            }
+
+            // Decode the fMP4 → encode (FLAC/WAV, WAV capped at 16-bit) → temp,
+            // then atomically rename into the cache. Mirrors the play path.
+            let is_wav = out_fmt == "wav";
+            let tmp = std::env::temp_dir()
+                .join(format!(
+                    "tune-dash-warm-{}.{}",
+                    uuid::Uuid::new_v4(),
+                    out_fmt
+                ))
+                .to_string_lossy()
+                .to_string();
+            let dash_file_c = dash_file.clone();
+            let tmp_c = tmp.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let decoded =
+                    crate::audio::decode::decode_to_pcm(&dash_file_c, Some(sr), Some(2), 0.0, 0.0)?;
+                let mut pcm_bytes = decoded.pcm_bytes();
+                let mut actual_bd = decoded.bit_depth;
+                if is_wav && actual_bd > 16 {
+                    pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                    actual_bd = 16;
+                }
+                let rt = tokio::runtime::Handle::try_current()
+                    .map_err(|e| format!("no tokio runtime: {e}"))?;
+                let encoded = rt.block_on(async {
+                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                        out_fmt,
+                        decoded.sample_rate,
+                        actual_bd as u32,
+                        decoded.channels,
+                    );
+                    encoder.start().await?;
+                    encoder.write(&pcm_bytes).await?;
+                    encoder.finish().await
+                })?;
+                std::fs::write(&tmp_c, &encoded).map_err(|e| format!("write temp: {e}"))?;
+                Ok::<u64, String>(encoded.len() as u64)
+            })
+            .await;
+
+            // The fMP4 has served its purpose (a warm cache-hit serves the FLAC),
+            // so consume it like the play path does.
+            let _ = std::fs::remove_file(&dash_file);
+
+            match result {
+                Ok(Ok(size)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
+                    tokio::task::spawn_blocking(crate::transcode_cache::evict);
+                    info!(zone_id, cache = %cp, next_source_id = %source_id, "streaming_dash_warm_next_stored");
                 }
                 _ => {
                     let _ = std::fs::remove_file(&tmp);

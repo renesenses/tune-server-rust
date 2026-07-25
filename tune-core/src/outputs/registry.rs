@@ -7,11 +7,12 @@ use super::traits::OutputTarget;
 
 pub struct OutputRegistry {
     outputs: HashMap<String, Arc<Mutex<Box<dyn OutputTarget>>>>,
-    /// device_id → (name, output_type). A synchronous sidecar so callers can
-    /// look up an output's name/type without locking its async Mutex (which,
-    /// held under the registry lock, would risk a deadlock). `name`/`output_type`
-    /// are sync trait methods, so they're captured cheaply at `register` time.
-    meta: HashMap<String, (String, String)>,
+    /// device_id → (name, output_type, host). A synchronous sidecar so callers
+    /// can look up an output's name/type/host without locking its async Mutex
+    /// (which, held under the registry lock, would risk a deadlock).
+    /// `name`/`output_type`/`host` are sync trait methods, so they're captured
+    /// cheaply at `register` time.
+    meta: HashMap<String, (String, String, Option<String>)>,
 }
 
 impl Default for OutputRegistry {
@@ -32,7 +33,11 @@ impl OutputRegistry {
         let id = output.device_id().to_string();
         self.meta.insert(
             id.clone(),
-            (output.name().to_string(), output.output_type().to_string()),
+            (
+                output.name().to_string(),
+                output.output_type().to_string(),
+                output.host().map(|h| h.to_string()),
+            ),
         );
         self.outputs.insert(id, Arc::new(Mutex::new(output)));
     }
@@ -45,13 +50,44 @@ impl OutputRegistry {
     pub fn conflicting_outputs(&self, name: &str, own_type: &str) -> Vec<String> {
         self.meta
             .iter()
-            .filter(|(_, (n, t))| t != own_type && n.eq_ignore_ascii_case(name))
+            .filter(|(_, (n, t, _))| t != own_type && n.eq_ignore_ascii_case(name))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Like [`conflicting_outputs`], but also requires the conflicting output to
+    /// live on the same `host` (case-insensitive). This is the precise
+    /// "genuinely the same physical device seen both ways" test: an LMS
+    /// Squeezebox player and that same LMS's UPnP-bridge DLNA renderer report
+    /// the same name AND the same host (the LMS box). A different renderer that
+    /// merely happens to share a display name is NOT matched, so it is never
+    /// wrongly deferred. A conflict whose host is unknown (`None`) is excluded.
+    pub fn conflicting_outputs_same_host(
+        &self,
+        name: &str,
+        own_type: &str,
+        host: &str,
+    ) -> Vec<String> {
+        self.meta
+            .iter()
+            .filter(|(_, (n, t, h))| {
+                t != own_type
+                    && n.eq_ignore_ascii_case(name)
+                    && h.as_deref().is_some_and(|hh| hh.eq_ignore_ascii_case(host))
+            })
             .map(|(id, _)| id.clone())
             .collect()
     }
 
     pub fn get(&self, device_id: &str) -> Option<Arc<Mutex<Box<dyn OutputTarget>>>> {
         self.outputs.get(device_id).cloned()
+    }
+
+    /// The host recorded for a registered output at `register` time, if any.
+    /// Read from the sync `meta` sidecar so callers can compare it without
+    /// locking the output's async Mutex.
+    pub fn host_of(&self, device_id: &str) -> Option<String> {
+        self.meta.get(device_id).and_then(|(_, _, h)| h.clone())
     }
 
     /// Returns `true` if a device with the given ID is already registered.
@@ -150,6 +186,47 @@ mod tests {
         assert!(
             reg.conflicting_outputs("DENAFRIPS USB HiRes Audio", "squeezebox")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn conflicting_outputs_same_host_requires_matching_host() {
+        let mut reg = OutputRegistry::new();
+        // A DLNA renderer bridged by the LMS box at 192.168.1.20.
+        reg.register(Box::new(
+            MockOutput::new("dlna-lms", "DENAFRIPS USB HiRes Audio")
+                .with_type("dlna")
+                .with_host("192.168.1.20"),
+        ));
+        // A DIFFERENT DLNA renderer that merely shares the display name, on
+        // another box — must NOT be treated as the same device.
+        reg.register(Box::new(
+            MockOutput::new("dlna-other", "DENAFRIPS USB HiRes Audio")
+                .with_type("dlna")
+                .with_host("192.168.1.99"),
+        ));
+
+        // The Squeezebox player served by the same LMS box (192.168.1.20)
+        // matches only the co-hosted DLNA renderer.
+        assert_eq!(
+            reg.conflicting_outputs_same_host(
+                "denafrips usb hires audio",
+                "squeezebox",
+                "192.168.1.20"
+            ),
+            vec!["dlna-lms".to_string()]
+        );
+        // A conflict with an unknown host is excluded.
+        reg.register(Box::new(
+            MockOutput::new("dlna-nohost", "DENAFRIPS USB HiRes Audio").with_type("dlna"),
+        ));
+        assert_eq!(
+            reg.conflicting_outputs_same_host(
+                "DENAFRIPS USB HiRes Audio",
+                "squeezebox",
+                "192.168.1.20"
+            ),
+            vec!["dlna-lms".to_string()]
         );
     }
 }

@@ -560,6 +560,7 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
     author TEXT,
     image_url TEXT,
     description TEXT,
+    source_id TEXT,
     last_checked TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
@@ -689,6 +690,9 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
+
+-- podcast_subscriptions: streaming source id (SQLite migration v59)
+ALTER TABLE podcast_subscriptions ADD COLUMN IF NOT EXISTS source_id TEXT;
 "#;
 
 /// Run the full SQLite → PostgreSQL migration.
