@@ -657,6 +657,17 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
+                // Re-assert queue length AFTER play(). The pre-play
+                // update_queue_info above is a silent no-op when the zone's
+                // in-memory state doesn't exist yet, and play() then creates that
+                // state with queue_length=0 — so a streaming album/playlist on a
+                // fresh zone stopped after track 1 (next_position saw an empty
+                // queue → the poller stopped instead of advancing). The local
+                // track path already re-asserts after play(); mirror it here.
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
@@ -744,6 +755,17 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
+                // Re-assert queue length AFTER play(). The pre-play
+                // update_queue_info above is a silent no-op when the zone's
+                // in-memory state doesn't exist yet, and play() then creates that
+                // state with queue_length=0 — so a streaming album/playlist on a
+                // fresh zone stopped after track 1 (next_position saw an empty
+                // queue → the poller stopped instead of advancing). The local
+                // track path already re-asserts after play(); mirror it here.
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
