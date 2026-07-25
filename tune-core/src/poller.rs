@@ -133,6 +133,10 @@ const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 /// the output time to drain its buffer and report Stopped naturally.
 /// If it doesn't, this threshold forces the advance.
 const POSITION_PAST_END_TICKS: u8 = 3;
+/// Minimum consecutive failed status polls before the DLNA wall-clock poll-fail
+/// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
+/// couple of failures avoids acting on a single transient SOAP blip.
+const POLL_FAIL_END_MIN_ERRORS: u8 = 2;
 /// After a gapless metadata advance (the poller called advance_queue_metadata
 /// expecting the renderer to auto-transition), if the renderer stays Stopped
 /// for this many ticks (after gapless_cooldown expires), force a play_from_queue.
@@ -157,7 +161,7 @@ const VOLUME_GRACE_SECS: u64 = 5;
 pub(crate) mod decisions {
     use super::{
         GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
-        MIN_WALL_FRACTION_FOR_NATURAL_END,
+        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS,
     };
 
     /// Margin (ms) added to the track duration before position-based
@@ -320,14 +324,26 @@ pub(crate) mod decisions {
 
     /// Should `SetNextAVTransportURI` be sent now — i.e. playback has entered
     /// the final `GAPLESS_WINDOW_MS` of the track and gapless is not yet armed?
+    ///
+    /// Uses the renderer-reported duration when it is available, otherwise falls
+    /// back to the queue-known duration (`queue_duration_ms`). The LMS UPnP
+    /// bridge (Yacine/Jean-Pierre) reports `reported_duration_ms == 0`, so
+    /// without the fallback gapless was never armed for it (0/196 advances). A
+    /// well-behaved renderer reports its own duration and is unaffected.
     pub fn should_arm_gapless(
         gapless_sent: bool,
         reported_duration_ms: u64,
+        queue_duration_ms: u64,
         position_ms: u64,
     ) -> bool {
+        let effective_duration_ms = if reported_duration_ms > 0 {
+            reported_duration_ms
+        } else {
+            queue_duration_ms
+        };
         !gapless_sent
-            && reported_duration_ms > GAPLESS_WINDOW_MS
-            && position_ms >= reported_duration_ms - GAPLESS_WINDOW_MS
+            && effective_duration_ms > GAPLESS_WINDOW_MS
+            && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
     }
 
     /// Position-based end-of-track: the output still reports Playing but the
@@ -391,6 +407,86 @@ pub(crate) mod decisions {
                 (duration_ms > 0).then_some(duration_ms),
                 position_ms,
             )
+
+    /// Wall-clock end-of-track fallback for a DLNA renderer that reports no
+    /// usable duration of its own (`reported_duration_ms == 0`) — the LMS UPnP
+    /// bridge over a USB/Squeezebox DAC (Yacine/Jean-Pierre). Such a bridge
+    /// never reports an advancing position past the end and never signals
+    /// `ended_naturally`, so BOTH `past_end_reached` (needs a real position) and
+    /// the Stopped-arm natural-end path stall — 0/196 auto-advances.
+    ///
+    /// When Tune knows the track length from the QUEUE (`queue_duration_ms`) and
+    /// the wall clock (from `track_started_at`, folded on seek) says the whole
+    /// track plus `END_MARGIN_MS` has elapsed while the renderer still claims to
+    /// be Playing, the track has effectively ended. The caller still requires
+    /// `POSITION_PAST_END_TICKS` consecutive hits (shared counter) so a single
+    /// stray tick can't false-advance.
+    ///
+    /// Guards against regressing a well-behaved renderer:
+    /// - `is_dlna`: only the DLNA output type (openhome/chromecast/bluos/local
+    ///   keep their own paths).
+    /// - `reported_duration_ms == 0`: a renderer that reports its own duration
+    ///   uses the accurate position/duration path and never reaches here.
+    /// - Only evaluated inside the `Playing` arm, so a Paused device is excluded.
+    /// - The caller additionally gates on `!in_seek_grace`.
+    ///
+    /// It intentionally does NOT require the peak-position `played_enough` guard:
+    /// the offending bridge freezes its reported position (often at 0), so a
+    /// peak-based check would veto every real end. The wall clock — which only
+    /// reaches `duration + margin` after that much real time has genuinely
+    /// elapsed at 1x — is the sole reliable evidence here.
+    pub fn wall_clock_past_end(
+        is_dlna: bool,
+        reported_duration_ms: u64,
+        queue_duration_ms: u64,
+        wall_elapsed_secs: u64,
+    ) -> bool {
+        is_dlna
+            && reported_duration_ms == 0
+            && queue_duration_ms > END_MARGIN_MS
+            && wall_elapsed_secs.saturating_mul(1000)
+                >= queue_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+
+    /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
+    /// outright — the LMS UPnP bridge's `GetPositionInfo` SOAP call errors, so
+    /// `get_status` returns `Err` and Tune gets NO transport state, position, or
+    /// duration from the renderer at all (Yacine/Jean-Pierre's Denafrips on
+    /// Daphile: `soap_all_retries_failed action="GetPositionInfo"`).
+    ///
+    /// The decision is based purely on Tune's OWN wall clock versus the
+    /// queue-known duration — it never touches renderer-reported values (there
+    /// are none). Distinguishing "genuinely still playing" from "poll failing
+    /// but the track really ended":
+    /// - `tune_playing`: Tune's own intended state is `Playing` (NOT Paused or
+    ///   Stopped). A user pause/stop through Tune flips this false, so a paused
+    ///   track never advances. (`track_started_at` is set when the orchestrator
+    ///   starts the track — generation change — so the wall clock counts real
+    ///   elapsed play time, resetting on each track and on seek.)
+    /// - `wall_elapsed_secs >= queue_duration + END_MARGIN_MS`: the whole track
+    ///   plus margin has actually elapsed at 1x. Below that, still playing.
+    /// - `consecutive_errors >= POLL_FAIL_END_MIN_ERRORS`: the poll is really
+    ///   down, not a one-off blip.
+    /// - `already_fired`: fire at most once per track (the caller sets a per-track
+    ///   latch, cleared on track-generation change).
+    ///
+    /// A well-behaved DLNA renderer keeps answering `GetPositionInfo`, so its
+    /// `consecutive_errors` stays 0 and this never triggers — no regression.
+    pub fn poll_failed_past_end(
+        is_dlna: bool,
+        tune_playing: bool,
+        queue_duration_ms: u64,
+        wall_elapsed_secs: u64,
+        consecutive_errors: u8,
+        already_fired: bool,
+    ) -> bool {
+        is_dlna
+            && tune_playing
+            && !already_fired
+            && consecutive_errors >= POLL_FAIL_END_MIN_ERRORS
+            && queue_duration_ms > END_MARGIN_MS
+            && wall_elapsed_secs.saturating_mul(1000)
+                >= queue_duration_ms.saturating_add(END_MARGIN_MS)
     }
 }
 
@@ -592,6 +688,11 @@ pub mod fsm {
         pub position_ms: u64,
         pub past_end_ticks: u8,
         pub gapless_enabled: bool,
+        /// The zone's output is a DLNA renderer — enables the wall-clock
+        /// end-of-track fallback for renderers reporting no duration.
+        pub is_dlna: bool,
+        /// Seconds elapsed since `track_started_at` (folded on seek).
+        pub wall_elapsed_secs: u64,
     }
 
     /// Pure reproduction of the `Playing`/`Transitioning` arm's decisions.
@@ -609,7 +710,12 @@ pub mod fsm {
             i.track_duration_ms,
         );
         let arm_gapless = !transition_detected
-            && decisions::should_arm_gapless(i.gapless_sent, i.reported_duration_ms, i.position_ms)
+            && decisions::should_arm_gapless(
+                i.gapless_sent,
+                i.reported_duration_ms,
+                i.track_duration_ms,
+                i.position_ms,
+            )
             && i.gapless_enabled;
         // (B) resets past_end_ticks to 0 before (D) runs.
         let effective_past_end_ticks = if transition_detected {
@@ -617,9 +723,19 @@ pub mod fsm {
         } else {
             i.past_end_ticks
         };
-        let past_end_track_ended =
+        // (D) is reached either by a real position running past the end, or —
+        // for a DLNA bridge that reports no position/duration — by the wall
+        // clock passing the queue-known duration.
+        let reached_end =
             decisions::past_end_reached(i.track_duration_ms, i.played_enough, i.position_ms)
-                && effective_past_end_ticks.saturating_add(1) >= POSITION_PAST_END_TICKS;
+                || decisions::wall_clock_past_end(
+                    i.is_dlna,
+                    i.reported_duration_ms,
+                    i.track_duration_ms,
+                    i.wall_elapsed_secs,
+                );
+        let past_end_track_ended =
+            reached_end && effective_past_end_ticks.saturating_add(1) >= POSITION_PAST_END_TICKS;
         PlayingDecision {
             confirm_gapless_advance,
             transition_detected,
@@ -957,6 +1073,8 @@ pub mod fsm {
                 position_ms: 0,
                 past_end_ticks: 0,
                 gapless_enabled: true,
+                is_dlna: false,
+                wall_elapsed_secs: 0,
             }
         }
 
@@ -1068,6 +1186,73 @@ pub mod fsm {
             assert!(!d2.transition_detected);
             assert!(d2.past_end_track_ended);
         }
+
+        #[test]
+        fn playing_dlna_wall_clock_past_end_advances() {
+            // LMS UPnP bridge: renderer reports duration 0 and a frozen
+            // position, but Tune knows the queue duration (300s) and the wall
+            // clock has passed duration + margin. POSITION_PAST_END_TICKS = 3,
+            // pre=2 → +1=3 → advance. played_enough is false (peak frozen), which
+            // must NOT block the wall-clock fallback.
+            let i = PlayingInput {
+                is_dlna: true,
+                reported_duration_ms: 0,
+                track_duration_ms: 300_000,
+                position_ms: 0,
+                played_enough: false,
+                wall_elapsed_secs: 304,
+                past_end_ticks: 2,
+                ..pbase()
+            };
+            assert!(classify_playing(&i).past_end_track_ended);
+        }
+
+        #[test]
+        fn playing_dlna_wall_clock_negatives() {
+            let armed = PlayingInput {
+                is_dlna: true,
+                reported_duration_ms: 0,
+                track_duration_ms: 300_000,
+                position_ms: 0,
+                played_enough: false,
+                wall_elapsed_secs: 304,
+                past_end_ticks: 2,
+                ..pbase()
+            };
+            // Queue duration unknown (0) → no wall-clock advance.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    track_duration_ms: 0,
+                    ..armed
+                })
+                .past_end_track_ended
+            );
+            // Not enough wall time elapsed (< duration + margin) → no advance.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    wall_elapsed_secs: 120,
+                    ..armed
+                })
+                .past_end_track_ended
+            );
+            // Not a DLNA renderer → fallback disabled entirely.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    is_dlna: false,
+                    ..armed
+                })
+                .past_end_track_ended
+            );
+            // Renderer reports its own duration → uses the accurate path, the
+            // wall-clock fallback is disabled (no regression for good renderers).
+            assert!(
+                !classify_playing(&PlayingInput {
+                    reported_duration_ms: 300_000,
+                    ..armed
+                })
+                .past_end_track_ended
+            );
+        }
     }
 }
 
@@ -1157,6 +1342,11 @@ struct ZonePollState {
     /// renderer that persistently reports a stale default (e.g. Devialet at
     /// 50%), which must not overwrite the user's saved volume.
     last_device_volume: Option<f64>,
+    /// Per-track latch for the DLNA poll-fail wall-clock end-of-track fallback
+    /// (`decisions::poll_failed_past_end`). The Err poll branch can't remove the
+    /// poll state (it holds a live borrow), so this ensures the fallback fires at
+    /// most once per track. Cleared on every track-generation change.
+    wall_clock_end_fired: bool,
 }
 
 pub struct PositionPoller {
@@ -1423,6 +1613,7 @@ impl PositionPoller {
                 radio_stopped_ticks: 0,
                 last_radio_position_ms: 0,
                 last_device_volume: None,
+                wall_clock_end_fired: false,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -1472,6 +1663,8 @@ impl PositionPoller {
                 ps.past_end_ticks = 0;
                 ps.gapless_advance_pending = false;
                 ps.gapless_stuck_ticks = 0;
+                // Re-arm the DLNA poll-fail wall-clock fallback for the new track.
+                ps.wall_clock_end_fired = false;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -1564,6 +1757,56 @@ impl PositionPoller {
                             backoff = ps.backoff_remaining,
                             "poll_failed_backing_off"
                         );
+
+                        // Poll-fail end-of-track fallback for a DLNA renderer
+                        // whose status poll errors outright (LMS UPnP bridge:
+                        // GetPositionInfo SOAP fails). We get no state/position/
+                        // duration, so end-of-track is decided purely on Tune's
+                        // wall clock vs the queue-known duration. Guarded so a
+                        // paused/stopped track (Tune not Playing), a mid-track
+                        // blip (< a couple failures), a seek, or a re-fire can't
+                        // false-advance. We can't remove the poll state here (it's
+                        // borrowed), so a per-track latch prevents re-firing.
+                        let is_dlna = all_zones
+                            .iter()
+                            .find(|z| z.id == Some(zone_id))
+                            .and_then(|z| z.output_type.as_deref())
+                            == Some("dlna");
+                        let tune_playing = zone_state.state == PlayState::Playing;
+                        let track_duration_ms = zone_state
+                            .now_playing
+                            .as_ref()
+                            .map(|np| np.duration_ms as u64)
+                            .unwrap_or(0);
+                        let wall_elapsed = ps
+                            .track_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let in_seek_grace = zone_state
+                            .last_seek_at
+                            .map(|t| t.elapsed().as_secs() < SEEK_STREAMING_GRACE_SECS)
+                            .unwrap_or(false);
+                        if !in_seek_grace
+                            && decisions::poll_failed_past_end(
+                                is_dlna,
+                                tune_playing,
+                                track_duration_ms,
+                                wall_elapsed,
+                                ps.consecutive_errors,
+                                ps.wall_clock_end_fired,
+                            )
+                        {
+                            info!(
+                                zone_id,
+                                device = %device_id,
+                                track_dur = track_duration_ms,
+                                wall_secs = wall_elapsed,
+                                consec_err = ps.consecutive_errors,
+                                "dlna_poll_failed_wall_clock_advancing"
+                            );
+                            ps.wall_clock_end_fired = true;
+                            self.handle_track_end(zone_id, zone_state).await;
+                        }
                         continue;
                     }
                 }
@@ -2346,6 +2589,11 @@ impl PositionPoller {
                     // (pre-mutation). gapless_enabled is filled in the arm branch
                     // when it is actually read; default true matches the arm.
                     let fsm_has_next = Self::next_position(zone_state).is_some();
+                    let is_dlna = all_zones
+                        .iter()
+                        .find(|z| z.id == Some(zone_id))
+                        .and_then(|z| z.output_type.as_deref())
+                        == Some("dlna");
                     let mut fsm_pin = fsm::PlayingInput {
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
@@ -2356,6 +2604,8 @@ impl PositionPoller {
                         position_ms: status.position_ms,
                         past_end_ticks: ps.past_end_ticks,
                         gapless_enabled: true,
+                        is_dlna,
+                        wall_elapsed_secs: wall_elapsed,
                     };
                     let mut fsm_pact = fsm::PlayingDecision {
                         confirm_gapless_advance: ps.gapless_advance_pending && fsm_has_next,
@@ -2454,6 +2704,7 @@ impl PositionPoller {
                     } else if decisions::should_arm_gapless(
                         ps.gapless_sent,
                         status.duration_ms,
+                        track_duration_ms,
                         status.position_ms,
                     ) {
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
@@ -2536,15 +2787,30 @@ impl PositionPoller {
                                 None => false,
                             }
                         };
-                    if past_end || reached_end_exclusive {
+                    // Wall-clock fallback for a DLNA renderer (LMS UPnP bridge)
+                    // that reports no duration of its own and never advances its
+                    // position: treat the track as ended once the queue-known
+                    // duration (plus margin) has elapsed on the wall clock.
+                    // Guarded to `!in_seek_grace` on top of the helper's DLNA +
+                    // reported-duration==0 gate (see wall_clock_past_end).
+                    let wall_clock_past_end = !in_seek_grace
+                        && decisions::wall_clock_past_end(
+                            is_dlna,
+                            status.duration_ms,
+                            track_duration_ms,
+                            wall_elapsed,
+                        );
+                    if past_end || reached_end_exclusive || wall_clock_past_end {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
                             info!(
                                 zone_id,
                                 position_ms = status.position_ms,
                                 track_dur = track_duration_ms,
+                                wall_secs = wall_elapsed,
                                 past_end_ticks = ps.past_end_ticks,
                                 exclusive_end = reached_end_exclusive,
+                                wall_clock_end = wall_clock_past_end,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
@@ -3118,6 +3384,7 @@ mod tests {
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
+            wall_clock_end_fired: false,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -3168,6 +3435,7 @@ mod tests {
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
+            wall_clock_end_fired: false,
         };
 
         // Simulates entering Playing state
@@ -3373,6 +3641,7 @@ mod tests {
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
+            wall_clock_end_fired: false,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -3640,6 +3909,59 @@ mod tests {
     }
 
     #[test]
+    fn wall_clock_past_end_dlna_no_reported_duration() {
+        // DLNA renderer reports duration 0 (LMS UPnP bridge) but Tune knows the
+        // queue duration (300s) and the wall clock passed duration + margin.
+        assert!(decisions::wall_clock_past_end(true, 0, 300_000, 304));
+        // Not enough wall time elapsed → no advance.
+        assert!(!decisions::wall_clock_past_end(true, 0, 300_000, 120));
+        // Renderer reports its own duration → accurate path, fallback disabled.
+        assert!(!decisions::wall_clock_past_end(true, 300_000, 300_000, 304));
+        // Non-DLNA output → fallback disabled.
+        assert!(!decisions::wall_clock_past_end(false, 0, 300_000, 304));
+        // Queue duration unknown → no advance.
+        assert!(!decisions::wall_clock_past_end(true, 0, 0, 304));
+    }
+
+    #[test]
+    fn poll_failed_past_end_advances_when_poll_errors() {
+        // DLNA bridge: GetPositionInfo SOAP failed (poll errored), Tune is
+        // Playing, wall clock passed duration + margin, enough consecutive
+        // failures, not yet fired → advance.
+        assert!(decisions::poll_failed_past_end(
+            true, true, 300_000, 304, 2, false
+        ));
+    }
+
+    #[test]
+    fn poll_failed_past_end_negatives() {
+        // Not enough wall time elapsed → still playing, no advance.
+        assert!(!decisions::poll_failed_past_end(
+            true, true, 300_000, 120, 2, false
+        ));
+        // Tune not Playing (user paused/stopped) → never advance a paused track.
+        assert!(!decisions::poll_failed_past_end(
+            true, false, 300_000, 304, 2, false
+        ));
+        // Single transient failure (below POLL_FAIL_END_MIN_ERRORS) → no advance.
+        assert!(!decisions::poll_failed_past_end(
+            true, true, 300_000, 304, 1, false
+        ));
+        // Already fired for this track → don't re-fire.
+        assert!(!decisions::poll_failed_past_end(
+            true, true, 300_000, 304, 2, true
+        ));
+        // Non-DLNA output → fallback disabled.
+        assert!(!decisions::poll_failed_past_end(
+            false, true, 300_000, 304, 2, false
+        ));
+        // Queue duration unknown → no advance (nothing to compare against).
+        assert!(!decisions::poll_failed_past_end(
+            true, true, 0, 304, 2, false
+        ));
+    }
+
+    #[test]
     fn duration_changed_requires_armed_and_delta() {
         // Armed + reported duration differs by > 2s → changed.
         assert!(decisions::duration_changed(true, 200_000, 210_000));
@@ -3675,13 +3997,36 @@ mod tests {
     #[test]
     fn should_arm_gapless_in_final_window() {
         // Entered the final GAPLESS_WINDOW_MS, not yet armed → arm.
-        assert!(decisions::should_arm_gapless(false, 300_000, 275_000));
+        assert!(decisions::should_arm_gapless(
+            false, 300_000, 300_000, 275_000
+        ));
         // Already armed → don't re-arm.
-        assert!(!decisions::should_arm_gapless(true, 300_000, 275_000));
+        assert!(!decisions::should_arm_gapless(
+            true, 300_000, 300_000, 275_000
+        ));
         // Still before the final window → don't arm.
-        assert!(!decisions::should_arm_gapless(false, 300_000, 100_000));
+        assert!(!decisions::should_arm_gapless(
+            false, 300_000, 300_000, 100_000
+        ));
         // Duration shorter than the window → never arm (no underflow).
-        assert!(!decisions::should_arm_gapless(false, 10_000, 9_000));
+        assert!(!decisions::should_arm_gapless(false, 10_000, 10_000, 9_000));
+    }
+
+    #[test]
+    fn should_arm_gapless_falls_back_to_queue_duration() {
+        // Renderer reports duration 0 (LMS UPnP bridge) but Tune knows the
+        // queue duration and the renderer position is in the final window →
+        // arm using the queue duration.
+        assert!(decisions::should_arm_gapless(false, 0, 300_000, 275_000));
+        // Renderer reports its own duration → prefer it, ignore the queue value
+        // (well-behaved renderer unaffected): reported=300s window, pos 275s.
+        assert!(decisions::should_arm_gapless(
+            false, 300_000, 999_000, 275_000
+        ));
+        // Both durations unknown → never arm.
+        assert!(!decisions::should_arm_gapless(false, 0, 0, 275_000));
+        // Queue duration known but position not yet in the final window.
+        assert!(!decisions::should_arm_gapless(false, 0, 300_000, 100_000));
     }
 
     #[test]
@@ -3768,6 +4113,7 @@ mod tests {
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
+            wall_clock_end_fired: false,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -3825,6 +4171,7 @@ mod tests {
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
+            wall_clock_end_fired: false,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
