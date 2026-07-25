@@ -457,7 +457,20 @@ impl AlbumRepo {
             }
         }
         if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
-            return Ok(found);
+            // Don't collapse two DISTINCT MusicBrainz releases that merely share
+            // title+artist+year. If we were handed an MBID and the album matched
+            // by title already carries a *different* one, they are separate
+            // editions — fall through and create a new album instead of merging
+            // (Dominique: two releases with distinct MUSICBRAINZ_ALBUMID were
+            // being fused into one). When either side lacks an MBID we keep the
+            // old behaviour so partially-tagged albums stay together.
+            let conflicting_mbid = matches!(
+                (mbid, found.musicbrainz_release_id.as_deref()),
+                (Some(incoming), Some(existing)) if incoming != existing
+            );
+            if !conflicting_mbid {
+                return Ok(found);
+            }
         }
         let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
         let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
@@ -1505,6 +1518,43 @@ mod tests {
             .unwrap();
 
         assert_ne!(a1.id, a2.id);
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn get_or_create_with_mbid_distinct_releases_do_not_merge() {
+        // Two editions with the SAME title+artist+year but DIFFERENT MusicBrainz
+        // release ids must stay separate (Dominique) — while a later track of
+        // the same album that is missing its MBID rejoins one of them instead of
+        // creating a third phantom album.
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+
+        let a1 = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), Some("mbid-aaa"))
+            .unwrap();
+        let a2 = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), Some("mbid-bbb"))
+            .unwrap();
+        assert_ne!(a1.id, a2.id, "distinct MBIDs must not collapse");
+        assert_eq!(repo.count().unwrap(), 2);
+
+        // Same MBID again → returns the existing album, no new row.
+        let a1_again = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), Some("mbid-aaa"))
+            .unwrap();
+        assert_eq!(a1_again.id, a1.id);
+
+        // Untagged track (no MBID) matches by title+artist+year — must not spawn
+        // a third album.
+        let untagged = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), None)
+            .unwrap();
+        assert!(untagged.id == a1.id || untagged.id == a2.id);
         assert_eq!(repo.count().unwrap(), 2);
     }
 
