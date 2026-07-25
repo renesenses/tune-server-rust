@@ -13,11 +13,15 @@ jusqu'à DSD256 en passthrough natif (pas de transcodage DSD).
   serveur + UI web — endpoints WiFi via nmcli, flag `appliance` dans
   `/system/config`, section WiFi dans Réglages → Réseau. Les montages SMB
   existent déjà (`/api/v1/network/*`).
-- **Phase 2** : pipeline CI de build de l'ISO (Debian 12 amd64, live-build,
-  image hybride bootable clé USB avec partition de persistance, firmware
-  non-free inclus pour les chipsets WiFi grand public, NetworkManager, Avahi
-  `tune.local`, service systemd `Restart=always`, marqueur `/etc/tune-appliance`).
-  Publication comme asset de release via le webhook VPS.
+- **Phase 2 (cette branche aussi)** : image disque x86-64 via
+  `image/build-nuc-image.sh` (debootstrap Debian 12, GPT+EFI, .img.gz flashable
+  Rufus/Etcher — pas de live-build : image installée classique, données
+  persistantes nativement, partition racine agrandie au premier boot).
+  Ajouts : firmware WiFi non-free, marqueur `/etc/tune-appliance`, automount
+  USB → `/media` (règle udev + systemd-mount), cifs-utils/smbclient, service
+  en root (nmcli + mount.cifs pilotés par le serveur), `music_dirs` =
+  `/mnt/music` + `/media`. Build CI : workflow `tune-os.yml`
+  (workflow_dispatch, attache l'image à la release existante).
 - **Phase 3** : fallback hotspot `Tune-Setup` (portail de configuration quand
   aucun réseau connu n'est joignable), à la Volumio/moOde.
 

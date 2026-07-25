@@ -1,0 +1,85 @@
+name: Tune OS Image
+
+# Build de l'image appliance x86-64 (clé USB, Rufus/Etcher).
+# Déclenchement manuel : la release (et son asset linux-x86_64.tar.gz)
+# doit déjà exister — l'image télécharge le binaire depuis la release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version Tune (X.Y.Z sans v, ou 'latest')"
+        required: false
+        default: "latest"
+      attach_to_release:
+        description: "Attacher l'image à la release GitHub vX.Y.Z"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-image:
+    name: Build Tune OS x86_64 image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            VERSION=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name | sed 's/^v//')
+          fi
+          test -n "$VERSION"
+          # L'asset binaire doit exister avant de builder l'image
+          gh release view "v$VERSION" --repo "${{ github.repository }}" \
+            --json assets --jq '.assets[].name' | grep -q "linux-x86_64.tar.gz" \
+            || { echo "::error::asset linux-x86_64.tar.gz absent de la release v$VERSION"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap parted dosfstools grub-efi-amd64-bin
+          # Le debootstrap d'ubuntu-22.04 peut ne pas connaître bookworm
+          [ -e /usr/share/debootstrap/scripts/bookworm ] \
+            || sudo ln -s sid /usr/share/debootstrap/scripts/bookworm
+
+      - name: Build image
+        run: sudo ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}"
+
+      - name: Sanity check
+        run: |
+          IMG="image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz"
+          ls -lh image/output/
+          test -s "$IMG"
+          # Une image plausible fait plusieurs centaines de Mo compressée
+          SIZE=$(stat -c%s "$IMG")
+          if [ "$SIZE" -lt 200000000 ]; then
+            echo "::error::image anormalement petite ($SIZE octets)"; exit 1
+          fi
+          sha256sum "$IMG" > "$IMG.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tune-os-x86_64-v${{ steps.ver.outputs.version }}
+          path: |
+            image/output/*.img.gz
+            image/output/*.sha256
+          retention-days: 7
+          compression-level: 0
+
+      - name: Attach to release
+        if: ${{ inputs.attach_to_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "v${{ steps.ver.outputs.version }}" \
+            image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz \
+            image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz.sha256 \
+            --repo "${{ github.repository }}" --clobber
