@@ -118,6 +118,21 @@ pub(super) async fn completeness_stats(
             |row| row.get(0),
         )
         .unwrap_or(0);
+    // Album-level "missing artist" so the Metadata dashboard's Artist card shares
+    // the same denominator (total_albums) as Cover/Genre/Year, and matches the
+    // `no_artist` filter which lists ALBUMS whose artist is empty/Unknown. The
+    // old stat used tracks_without_artist/total_tracks — a different scale
+    // (15078 vs 1197), so the four cards showed inconsistent X/Y (Fabien, v0.9.4).
+    let albums_without_artist: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM albums al \
+             LEFT JOIN artists ar ON ar.id = al.artist_id \
+             WHERE al.artist_id IS NULL OR ar.name IS NULL OR ar.name = '' \
+             OR ar.name = 'Unknown Artist'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     drop(conn);
 
     // Count only album-artists — the same set the library shows — so the
@@ -205,6 +220,7 @@ pub(super) async fn completeness_stats(
         "albums_without_genre": total_albums - albums_with_genre,
         "albums_without_year": total_albums - albums_with_year,
         "tracks_without_artist": total_tracks - with_artist,
+        "albums_without_artist": albums_without_artist,
         "artists_without_image": artists_without_image,
         "genre_pct": genre_pct.round(),
         "year_pct": year_pct.round(),
