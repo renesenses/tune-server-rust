@@ -99,7 +99,12 @@ fn build_conditions(q: &FacetQuery, engine: Engine, exclude: &str) -> (Vec<Strin
     }
     if exclude != "artist" {
         if let Some(a) = q.artist.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!("t.artist_name = {}", ph(idx)));
+            // Match via the artists table, not the denormalized t.artist_name
+            // column (empty on some libraries) so artist filtering actually hits.
+            conds.push(format!(
+                "t.artist_id IN (SELECT id FROM artists WHERE name = {})",
+                ph(idx)
+            ));
             params.push(SqlValue::Text(a.to_string()));
             idx += 1;
         }
@@ -175,7 +180,7 @@ pub(super) async fn library_facets(
             "genre" => column_facet(&state, "genre", limit, &conds, &params),
             "label" => column_facet(&state, "label", limit, &conds, &params),
             "year" => column_facet(&state, "year", limit, &conds, &params),
-            "artist" => column_facet(&state, "artist_name", limit, &conds, &params),
+            "artist" => artist_facet(&state, limit, &conds, &params),
             "country" => kv_facet(&state, "release_country", limit, &conds, &params),
             "mood" => kv_facet(&state, "mood", limit, &conds, &params),
             "source" => kv_facet(&state, "source_media", limit, &conds, &params),
@@ -227,6 +232,45 @@ fn column_facet(
                 .as_string()
                 .or_else(|| v.as_i64().map(|n| n.to_string()))?;
             Some((value, c.as_i64().unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// Count tracks per artist via the `artists` table (joined on `artist_id`), not
+/// the denormalized `t.artist_name` column — which is empty on some libraries,
+/// so the artist facet came back empty (Bertrand's .18).
+fn artist_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT ar.name, COUNT(*) AS n FROM tracks t \
+         JOIN artists ar ON ar.id = t.artist_id \
+         WHERE ar.name IS NOT NULL AND ar.name <> ''{extra} \
+         GROUP BY ar.name ORDER BY n DESC{limit_clause}"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let value = it.next()?.as_string()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((value, count))
         })
         .collect()
 }
