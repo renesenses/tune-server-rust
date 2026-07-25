@@ -1318,5 +1318,49 @@
   "ja": "{host} をスキャンできません：{error}",
   "ko": "{host}을(를) 스캔할 수 없습니다: {error}",
   "ro": "Imposibil de scanat {host}: {error}"
+ },
+ "net.wifiCommandFailed": {
+  "fr": "Échec de la commande réseau : {error}",
+  "en": "Network command failed: {error}",
+  "de": "Netzwerkbefehl fehlgeschlagen: {error}",
+  "es": "Error en el comando de red: {error}",
+  "it": "Comando di rete non riuscito: {error}",
+  "zh": "网络命令失败：{error}",
+  "ja": "ネットワークコマンドが失敗しました：{error}",
+  "ko": "네트워크 명령이 실패했습니다: {error}",
+  "ro": "Comanda de rețea a eșuat: {error}"
+ },
+ "net.wifiUnavailable": {
+  "fr": "Gestion WiFi indisponible sur cet appareil ({error})",
+  "en": "WiFi management unavailable on this device ({error})",
+  "de": "WLAN-Verwaltung auf diesem Gerät nicht verfügbar ({error})",
+  "es": "Gestión WiFi no disponible en este dispositivo ({error})",
+  "it": "Gestione WiFi non disponibile su questo dispositivo ({error})",
+  "zh": "此设备不支持 WiFi 管理（{error}）",
+  "ja": "このデバイスでは WiFi 管理を利用できません（{error}）",
+  "ko": "이 기기에서는 WiFi 관리를 사용할 수 없습니다 ({error})",
+  "ro": "Gestionarea WiFi nu este disponibilă pe acest dispozitiv ({error})"
+ },
+ "net.wifiTimeout": {
+  "fr": "Délai dépassé lors de l'opération WiFi",
+  "en": "WiFi operation timed out",
+  "de": "Zeitüberschreitung beim WLAN-Vorgang",
+  "es": "Tiempo de espera agotado en la operación WiFi",
+  "it": "Timeout durante l'operazione WiFi",
+  "zh": "WiFi 操作超时",
+  "ja": "WiFi 操作がタイムアウトしました",
+  "ko": "WiFi 작업 시간이 초과되었습니다",
+  "ro": "Operațiunea WiFi a expirat"
+ },
+ "net.wifiBadPassword": {
+  "fr": "Mot de passe WiFi incorrect",
+  "en": "Incorrect WiFi password",
+  "de": "Falsches WLAN-Passwort",
+  "es": "Contraseña WiFi incorrecta",
+  "it": "Password WiFi errata",
+  "zh": "WiFi 密码错误",
+  "ja": "WiFi パスワードが正しくありません",
+  "ko": "WiFi 비밀번호가 올바르지 않습니다",
+  "ro": "Parolă WiFi incorectă"
  }
 }

@@ -160,6 +160,11 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .is_some_and(|s| !s.is_empty());
     config.insert("discogs_token_set".to_string(), json!(discogs_token_set));
+    // Appliance mode (Tune OS image): unlocks the host network settings UI.
+    config.insert(
+        "appliance".to_string(),
+        json!(crate::routes::appliance::is_appliance()),
+    );
     // Premium licensing info
     let license_state = state.license.license_state().await;
     let premium_tier = license_state.tier;
