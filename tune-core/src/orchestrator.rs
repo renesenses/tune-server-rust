@@ -343,7 +343,7 @@ impl PlaybackOrchestrator {
                 }
             }
 
-            let looked_up = zone_db.and_then(|z| z.output_device_id);
+            let looked_up = zone_db.as_ref().and_then(|z| z.output_device_id.clone());
             if looked_up.is_some() {
                 debug!(
                     zone_id = req.zone_id,
@@ -355,6 +355,34 @@ impl PlaybackOrchestrator {
                     zone_id = req.zone_id,
                     "output_device_id_missing_not_in_request_nor_zone_db"
                 );
+                // Orphan-zone guard (Yacine, 24/07): a zone row with NO
+                // output_device_id can never produce sound — send_to_output is
+                // skipped and play() "succeeds" with output_sent=false, so the
+                // client shows the track while nothing plays. Fail loudly with
+                // a sentinel the API maps to a clean 4xx instead of a silent
+                // success. Browser zones are exempt: they legitimately have no
+                // output device (the web client pulls stream_url itself). Zones
+                // absent from the DB keep the old behaviour (in-memory tests /
+                // transient states).
+                if let Some(ref zone) = zone_db {
+                    if zone.output_type.as_deref() != Some("browser") {
+                        let msg = format!(
+                            "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
+                            zone.name
+                        );
+                        warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_without_output_device");
+                        if let Some(ref bus) = self.event_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": req.zone_id,
+                                    "error": msg,
+                                }),
+                            );
+                        }
+                        return Err(msg);
+                    }
+                }
             }
             req.output_device_id = looked_up;
         } else {
@@ -4724,6 +4752,17 @@ impl PlaybackOrchestrator {
         self.playback
             .update_queue_info(zone_id, position, total)
             .await;
+        // Last.fm/ListenBrainz "now playing": a gapless advance is a real track
+        // change, but it bypasses play_inner — the only other dispatch site —
+        // so the now-playing of every gapless-reached track (tracks 2, 4, 6… of
+        // an album) was never sent (#1113). This method is the single funnel
+        // for all gapless advance paths (position reset, duration change,
+        // confirmed pending advance), so dispatch here exactly once per track.
+        self.dispatch_now_playing(
+            &np.title,
+            np.artist_name.as_deref(),
+            np.album_title.as_deref(),
+        );
         // Use update_now_playing (not play) to avoid bumping track_generation —
         // the poller must keep its gapless_cooldown intact so it doesn't falsely
         // detect track-end on renderers that briefly report Stopped during
@@ -4909,10 +4948,15 @@ fn guess_mime_from_url(url: &str) -> &'static str {
         "audio/mp4"
     } else if path.ends_with(".ogg") || path.ends_with(".opus") {
         "audio/ogg"
-    } else if path.ends_with(".flac") {
+    } else if path.ends_with(".flac") || path.ends_with(".flc") {
+        // ".flc" is the extension Lyrion/LMS uses for FLAC in its stream URLs
+        // (…/music/<id>/download.flc); it fell through to the "audio/mpeg"
+        // default, so the DLNA renderer got FLAC bytes labelled as MP3.
         "audio/flac"
     } else if path.ends_with(".wav") {
         "audio/wav"
+    } else if path.ends_with(".aif") || path.ends_with(".aiff") {
+        "audio/aiff"
     } else {
         "audio/mpeg"
     }

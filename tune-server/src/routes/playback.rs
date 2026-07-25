@@ -37,6 +37,21 @@ fn play_error_response(e: String) -> axum::response::Response {
         )
             .into_response();
     }
+    // Orphan-zone sentinel from orchestrator.play(): the zone row has no
+    // output_device_id, so playback can never produce sound (Yacine, 24/07).
+    // 409 Conflict: the request is well-formed but the zone's state makes it
+    // impossible — the client should surface the message and grey the zone
+    // (it is also reported online:false by GET /zones).
+    if let Some(msg) = e.strip_prefix("zone_no_output_device:") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zone_no_output_device",
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
     let code = if e.contains("YouTube")
         || e.contains("youtube")
         || e.contains("yt-dlp")
@@ -1160,8 +1175,34 @@ async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<V
     Json(build_zone_json(&state, zone_id).await)
 }
 
+/// Reject playback commands on an orphan zone (a DB row with no
+/// output_device_id): next/previous spawn play_from_queue fire-and-forget and
+/// answer 200 before the orchestrator runs, so its zone_no_output_device error
+/// would only ever reach the logs. Check up front and return the same 409 the
+/// play route produces. Browser zones are exempt (no output device by design).
+fn reject_if_zone_has_no_output_device(
+    state: &AppState,
+    zone_id: i64,
+) -> Option<axum::response::Response> {
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()?;
+    if zone.output_device_id.is_none() && zone.output_type.as_deref() != Some("browser") {
+        warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_without_output_device");
+        return Some(play_error_response(format!(
+            "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
+            zone.name
+        )));
+    }
+    None
+}
+
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_next_requested");
+    if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
+        return resp;
+    }
     let current = state.playback.get_state(zone_id).await;
 
     // Manual skip: ignore repeat-one so the button always changes track (#1110).
@@ -1183,6 +1224,9 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
 
 async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
+    if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
+        return resp;
+    }
     let current = state.playback.get_state(zone_id).await;
 
     if current.position_ms > 3000 {

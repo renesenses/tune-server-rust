@@ -1032,3 +1032,123 @@ async fn queue_add_empty_body_is_rejected() {
     let (status, _) = post_json(&app, &format!("/api/v1/zones/{zid}/queue/add"), json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// ── Orphan zone guard (Yacine, 24/07) ───────────────────────────────
+//
+// A zone row without output_device_id (leftover from manual creation or
+// old delete/re-create cycles) can never produce sound: send_to_output is
+// skipped and play() used to "succeed" with output_sent=false, so the
+// client showed the track playing while nothing came out. play/next/
+// previous must now return a clean 409 and GET /zones must report the
+// zone offline so clients grey it out. The zone row itself is preserved
+// (no automatic destruction of user data).
+
+#[tokio::test]
+async fn orphan_zone_play_returns_409() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Orphan Track");
+    // make_zone POSTs only a name: no output_device_id → orphan zone.
+    let zid = make_zone(&app, "Orphan Zone").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({ "track_id": tid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "play must 409, got {body}");
+    assert_eq!(body["error"], "zone_no_output_device");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Orphan Zone"),
+        "message should name the zone: {body}"
+    );
+
+    // The zone row must still exist (no automatic deletion).
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(zone["name"], "Orphan Zone");
+    // …and be reported offline so clients grey it out.
+    assert_eq!(zone["online"], false, "orphan zone must be offline: {zone}");
+}
+
+#[tokio::test]
+async fn orphan_zone_next_and_previous_return_409() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Orphan Next");
+    let zid = make_zone(&app, "Orphan Nav").await;
+    // Give the zone a queue so next/previous have something to skip to.
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [tid] }),
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &format!("/api/v1/zones/{zid}/next"), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "next must 409, got {body}");
+    assert_eq!(body["error"], "zone_no_output_device");
+
+    let (status, body) = post_json(&app, &format!("/api/v1/zones/{zid}/previous"), json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "previous must 409, got {body}"
+    );
+    assert_eq!(body["error"], "zone_no_output_device");
+}
+
+#[tokio::test]
+async fn orphan_zone_listed_offline_in_zones() {
+    let app = make_app();
+    let zid = make_zone(&app, "Orphan Listed").await;
+
+    let (status, body) = get(&app, "/api/v1/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zones = body.as_array().expect("zones array");
+    let zone = zones
+        .iter()
+        .find(|z| z["id"] == zid)
+        .expect("orphan zone present in listing");
+    assert_eq!(
+        zone["online"], false,
+        "orphan zone must be listed offline: {zone}"
+    );
+}
+
+#[tokio::test]
+async fn browser_zone_without_device_is_not_rejected_as_orphan() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Browser Track");
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/zones",
+        json!({ "name": "Browser Zone", "output_type": "browser" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create browser zone: {body}");
+    let zid = body["id"].as_i64().expect("zone id");
+
+    // Browser zones legitimately have no output device (the web client pulls
+    // stream_url itself): the orphan guard must NOT fire. The play may fail
+    // for other reasons (test track has no real file) but never with 409
+    // zone_no_output_device.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({ "track_id": tid }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "browser zone must not be rejected as orphan: {body}"
+    );
+
+    // And it stays online in the listing.
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(zone["online"], true, "browser zone must be online: {zone}");
+}
