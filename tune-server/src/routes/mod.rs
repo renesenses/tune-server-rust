@@ -2,6 +2,7 @@ pub mod active_profile;
 pub mod ai;
 pub mod airplay_pairing;
 pub mod appliance;
+pub mod appliance_storage;
 pub mod archive;
 pub mod bandcamp;
 pub mod bridge;
@@ -276,7 +277,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/library/smart-collections", smart_collections::router())
         .nest("/export", export::router())
         .nest("/network", network::router())
-        .nest("/appliance", appliance::router())
+        .nest(
+            "/appliance",
+            appliance::router().merge(appliance_storage::router()),
+        )
         .nest("/dashboard", dashboard::router())
         .nest("/digest", digest::router())
         .nest("/peers", peers::router())
