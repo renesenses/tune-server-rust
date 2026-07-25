@@ -343,7 +343,7 @@ impl PlaybackOrchestrator {
                 }
             }
 
-            let looked_up = zone_db.and_then(|z| z.output_device_id);
+            let looked_up = zone_db.as_ref().and_then(|z| z.output_device_id.clone());
             if looked_up.is_some() {
                 debug!(
                     zone_id = req.zone_id,
@@ -355,6 +355,34 @@ impl PlaybackOrchestrator {
                     zone_id = req.zone_id,
                     "output_device_id_missing_not_in_request_nor_zone_db"
                 );
+                // Orphan-zone guard (Yacine, 24/07): a zone row with NO
+                // output_device_id can never produce sound — send_to_output is
+                // skipped and play() "succeeds" with output_sent=false, so the
+                // client shows the track while nothing plays. Fail loudly with
+                // a sentinel the API maps to a clean 4xx instead of a silent
+                // success. Browser zones are exempt: they legitimately have no
+                // output device (the web client pulls stream_url itself). Zones
+                // absent from the DB keep the old behaviour (in-memory tests /
+                // transient states).
+                if let Some(ref zone) = zone_db {
+                    if zone.output_type.as_deref() != Some("browser") {
+                        let msg = format!(
+                            "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
+                            zone.name
+                        );
+                        warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_without_output_device");
+                        if let Some(ref bus) = self.event_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": req.zone_id,
+                                    "error": msg,
+                                }),
+                            );
+                        }
+                        return Err(msg);
+                    }
+                }
             }
             req.output_device_id = looked_up;
         } else {
