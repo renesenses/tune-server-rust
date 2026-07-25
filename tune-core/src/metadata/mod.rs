@@ -701,6 +701,55 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     Some(tags)
 }
 
+/// Return the genre from the FIRST prepended ID3v2 tag of an MP3 — but only when
+/// a SECOND ID3v2 tag immediately follows it.
+///
+/// iTunes M4A→MP3 conversions leave a stale ID3v2.4 tag, and a later re-tag in
+/// Mp3Tag prepends a fresh ID3v2.3 tag in front of it, so the file carries two
+/// consecutive tags. lofty merges both into one tag with last-wins frame
+/// semantics, so the stale second tag's `TCON` ("Singer/Songwriter") overrides
+/// the user's genre ("Alternatif & Indé"). Every standard tool (Mp3Tag, ffprobe)
+/// reads only the first tag — so do we. The single-tag guard keeps this a no-op
+/// for normal files, so lofty's (encoding/numeric-genre-aware) value is untouched
+/// except in exactly this dual-tag case. Forum #1184.
+fn mp3_first_tag_genre_if_dual(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 10];
+    f.read_exact(&mut header).ok()?;
+    if &header[0..3] != b"ID3" {
+        return None;
+    }
+    let major_version = header[3];
+    let flags = header[5];
+    let tag_size = syncsafe_to_u32(&header[6..10]) as usize;
+    // v2.4 may append a 10-byte footer (flag 0x10) after the frames; the next
+    // tag then starts past it.
+    let has_footer = major_version == 4 && (flags & 0x10 != 0);
+    let first_tag_end = 10 + tag_size + if has_footer { 10 } else { 0 };
+
+    // Cap to avoid reading a pathological/corrupt size into memory.
+    if first_tag_end > 4_194_304 {
+        return None;
+    }
+
+    // Is there a SECOND ID3v2 tag right after the first? If not, leave lofty's
+    // genre alone — a single well-formed tag needs no correction.
+    f.seek(SeekFrom::Start(first_tag_end as u64)).ok()?;
+    let mut peek = [0u8; 3];
+    if f.read_exact(&mut peek).is_err() || &peek != b"ID3" {
+        return None;
+    }
+
+    // Re-read and parse just the first tag; its TCON is the user's genre.
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = vec![0u8; first_tag_end];
+    f.read_exact(&mut buf).ok()?;
+    let tags = parse_id3v2_tag(&buf)?;
+    tags.genre().map(|s| s.to_string())
+}
+
 /// Decode an ID3v2 text string given its encoding byte.
 ///
 /// Encodings:
@@ -1628,7 +1677,20 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
 
     let credits = parse_credits(tag);
 
-    let raw_genre = tag.genre().map(|s| s.to_string());
+    let mut raw_genre = tag.genre().map(|s| s.to_string());
+    // MP3s carrying two prepended ID3v2 tags (iTunes M4A→MP3 leftover + Mp3Tag
+    // re-tag) make lofty merge last-wins, so a stale genre overrides the user's.
+    // Read the first tag like every standard player does — no-op unless a second
+    // tag actually follows. Forum #1184.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
+    {
+        if let Some(g) = mp3_first_tag_genre_if_dual(path) {
+            raw_genre = Some(g);
+        }
+    }
     let genres = raw_genre
         .as_deref()
         .map(split_genre_tag)
@@ -2776,6 +2838,42 @@ mod tests {
         assert_eq!(meta.artist.as_deref(), Some("Yes"));
         assert_eq!(meta.album.as_deref(), Some("Fragile"));
         assert_eq!(meta.format.as_deref(), Some("dsd"));
+    }
+
+    #[test]
+    fn mp3_dual_id3v2_prefers_first_tag_genre() {
+        // Forum #1184: an MP3 with two prepended ID3v2 tags (iTunes M4A→MP3
+        // leftover + Mp3Tag re-tag) must report the FIRST tag's genre, like every
+        // standard player — not lofty's last-wins merge of the stale second tag.
+        use std::io::Write;
+        let first = build_id3v2_tag(&[("TIT2", "Song"), ("TCON", "Alternatif")]);
+        let second = build_id3v2_tag(&[("TCON", "Singer/Songwriter")]);
+        let mut buf = first.clone();
+        buf.extend_from_slice(&second);
+        let tmp = std::env::temp_dir().join("tune_test_dual_id3v2.mp3");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let g = mp3_first_tag_genre_if_dual(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(g.as_deref(), Some("Alternatif"));
+    }
+
+    #[test]
+    fn mp3_single_id3v2_leaves_genre_to_lofty() {
+        // Guard: a normal single-tag MP3 must NOT trigger the override (returns
+        // None), so lofty's encoding/numeric-genre-aware value is kept.
+        use std::io::Write;
+        let only = build_id3v2_tag(&[("TIT2", "Song"), ("TCON", "Jazz")]);
+        let tmp = std::env::temp_dir().join("tune_test_single_id3v2.mp3");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&only)
+            .unwrap();
+        let g = mp3_first_tag_genre_if_dual(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(g, None);
     }
 
     #[test]
