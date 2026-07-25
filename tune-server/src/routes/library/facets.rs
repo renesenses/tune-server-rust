@@ -99,8 +99,10 @@ fn build_conditions(q: &FacetQuery, engine: Engine, exclude: &str) -> (Vec<Strin
     }
     if exclude != "artist" {
         if let Some(a) = q.artist.as_deref().filter(|s| !s.is_empty()) {
-            // Match via the artists table, not the denormalized t.artist_name
-            // column (empty on some libraries) so artist filtering actually hits.
+            // `tracks` has no artist_name column (artist is a FK to `artists`),
+            // and these conditions run against `FROM tracks t` with no join, so
+            // resolve the name via a subquery rather than the phantom
+            // t.artist_name (forum #1189).
             conds.push(format!(
                 "t.artist_id IN (SELECT id FROM artists WHERE name = {})",
                 ph(idx)
@@ -130,8 +132,10 @@ fn build_conditions(q: &FacetQuery, engine: Engine, exclude: &str) -> (Vec<Strin
         }
     }
     if let Some(query) = q.q.as_deref().filter(|s| !s.is_empty()) {
+        // Artist match via subquery — no artist_name column / no join here (#1189).
         conds.push(format!(
-            "(LOWER(t.title) LIKE LOWER({p}) OR LOWER(t.artist_name) LIKE LOWER({p2}))",
+            "(LOWER(t.title) LIKE LOWER({p}) OR t.artist_id IN \
+             (SELECT id FROM artists WHERE LOWER(name) LIKE LOWER({p2})))",
             p = ph(idx),
             p2 = ph(idx + 1)
         ));
@@ -236,9 +240,11 @@ fn column_facet(
         .collect()
 }
 
-/// Count tracks per artist via the `artists` table (joined on `artist_id`), not
-/// the denormalized `t.artist_name` column — which is empty on some libraries,
-/// so the artist facet came back empty (Bertrand's .18).
+/// Count tracks per artist. Unlike other facets, the artist name is NOT a column
+/// on `tracks` (it stores only `artist_id`); it lives on the joined `artists`
+/// table. The old code queried the phantom `t.artist_name` → SQL error → empty
+/// facet (forum #1189). Join `artists` and group on its name. The `conds` are
+/// self-contained (they reference `t.*` or subqueries), so the join is additive.
 fn artist_facet(
     state: &AppState,
     limit: Option<i64>,
@@ -253,7 +259,7 @@ fn artist_facet(
     let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     let sql = format!(
         "SELECT ar.name, COUNT(*) AS n FROM tracks t \
-         JOIN artists ar ON ar.id = t.artist_id \
+         JOIN artists ar ON t.artist_id = ar.id \
          WHERE ar.name IS NOT NULL AND ar.name <> ''{extra} \
          GROUP BY ar.name ORDER BY n DESC{limit_clause}"
     );
@@ -268,9 +274,10 @@ fn artist_facet(
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
-            let value = it.next()?.as_string()?;
-            let count = it.next()?.as_i64().unwrap_or(0);
-            Some((value, count))
+            let v = it.next()?;
+            let c = it.next()?;
+            let value = v.as_string()?;
+            Some((value, c.as_i64().unwrap_or(0)))
         })
         .collect()
 }
