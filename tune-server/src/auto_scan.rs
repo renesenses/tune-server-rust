@@ -669,18 +669,15 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                     // one file, so it reconstructs the folder view
                                     // from the DB. Any doubt → None → per-file
                                     // self-decide (previous behaviour, no regression).
-                                    let comp_override: Option<bool> = sf
-                                        .metadata
-                                        .as_ref()
-                                        .and_then(|meta| {
+                                    let comp_override: Option<bool> =
+                                        sf.metadata.as_ref().and_then(|meta| {
                                             let dir = std::path::Path::new(&sf.path).parent()?;
                                             let mut comp = meta.compilation;
                                             let mut artists: std::collections::HashSet<String> =
                                                 std::collections::HashSet::new();
                                             let mut note = |aa: Option<&str>| {
-                                                if let Some(a) = aa
-                                                    .map(str::trim)
-                                                    .filter(|s| !s.is_empty())
+                                                if let Some(a) =
+                                                    aa.map(str::trim).filter(|s| !s.is_empty())
                                                 {
                                                     if crate::scan_import::is_various_artists(a) {
                                                         comp = true;
@@ -690,16 +687,12 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                             };
                                             note(meta.album_artist.as_deref());
                                             let siblings = track_repo
-                                                .siblings_album_artists(
-                                                    &dir.to_string_lossy(),
-                                                )
+                                                .siblings_album_artists(&dir.to_string_lossy())
                                                 .ok()?;
                                             for (fp, aa) in &siblings {
                                                 // Direct children only (exclude
                                                 // sub-folders sharing the prefix).
-                                                if std::path::Path::new(fp).parent()
-                                                    != Some(dir)
-                                                {
+                                                if std::path::Path::new(fp).parent() != Some(dir) {
                                                     continue;
                                                 }
                                                 note(aa.as_deref());

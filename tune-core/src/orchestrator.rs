@@ -3822,6 +3822,7 @@ impl PlaybackOrchestrator {
             // native DSD direct path reads the local file itself and must
             // seek to this offset (the seek-positioned HTTP transcode URL
             // is bypassed on that path).
+            #[cfg(feature = "oaat")]
             if let Some(position_ms) = start_position_ms {
                 if device_id.starts_with("oaat:") {
                     let output = output_arc.lock().await;
