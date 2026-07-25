@@ -1,0 +1,12 @@
+[package]
+name = "tune-output-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Output plugin API for Tune Server: the OutputTarget trait and its data types, for out-of-tree output plugins"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
