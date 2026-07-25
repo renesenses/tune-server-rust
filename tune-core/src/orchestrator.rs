@@ -3822,6 +3822,12 @@ impl PlaybackOrchestrator {
             // native DSD direct path reads the local file itself and must
             // seek to this offset (the seek-positioned HTTP transcode URL
             // is bypassed on that path).
+            //
+            // Gated on `oaat`: `crate::outputs::oaat` only exists with that
+            // feature (outputs/mod.rs), so an ungated reference broke the
+            // postgres-without-oaat build (test-postgres "Engine module tests"),
+            // mirroring the `local-audio` gate on the analogous block below.
+            #[cfg(feature = "oaat")]
             if let Some(position_ms) = start_position_ms {
                 if device_id.starts_with("oaat:") {
                     let output = output_arc.lock().await;
