@@ -1232,6 +1232,21 @@ impl PlaybackOrchestrator {
             .ok_or("track not found")?;
 
         let file_path = track.file_path.ok_or("track has no file_path")?;
+
+        // The DB row can outlive the file (moved/deleted external drive, stale
+        // scan, duplicate compilation entry pointing at an old path). Without
+        // this check the missing file is only discovered later, inside the
+        // spawned streaming transcode task (transcode_streaming_decode_failed),
+        // AFTER output_play_sent — so the track "plays" silently with no error
+        // surfaced and the queue can stall (JP: two "Studio 105" entries, the
+        // one pointing at a moved X:\…\.flac played no sound). Fail fast here so
+        // play() returns a clean error the client shows, instead of streaming
+        // silence.
+        if !std::path::Path::new(&file_path).exists() {
+            warn!(track_id, file = %file_path, "local_track_file_missing");
+            return Err(format!("file_not_found:{file_path}"));
+        }
+
         let fmt = track.format.unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
         // DSD is 1-bit at MHz rates. When the DB row is missing audio props
