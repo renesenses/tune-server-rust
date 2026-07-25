@@ -2061,12 +2061,27 @@ impl PlaybackOrchestrator {
             // copy latency, and falls back to the original file if not applicable.
             if source_format == Some(AudioFormat::Alac) {
                 let fp = file_path.clone();
-                if let Ok(Some(map)) = tokio::task::spawn_blocking(move || {
+                // Two shapes to fix: (1) moov-after-mdat → relocate moov to the
+                // front (and strip the cover on the way); (2) ALREADY faststart
+                // (ftyp|moov|mdat) → moov stays put but its `covr` cover art still
+                // makes the LHC-56 "ploc" at track start, so strip it in place.
+                // prepare_faststart handles (1) and returns None for (2), which was
+                // the gap: already-faststart files with artwork kept clicking
+                // (Yves: "Do What U Will" / "ABOVE AND BEYOND"). Fall back to the
+                // in-place cover strip. Both read only ftyp+moov (no mdat copy).
+                let mapped = tokio::task::spawn_blocking(move || {
                     crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                        .map(|m| ("relocate", m))
+                        .or_else(|| {
+                            crate::audio::faststart::prepare_cover_strip_faststart(
+                                std::path::Path::new(&fp),
+                            )
+                            .map(|m| ("cover_strip", m))
+                        })
                 })
-                .await
-                {
-                    info!(file = %file_path, "m4a_faststart_applied");
+                .await;
+                if let Ok(Some((how, map))) = mapped {
+                    info!(file = %file_path, how, "m4a_faststart_applied");
                     self.streamer.set_faststart(&session_id, map).await;
                 }
             }
