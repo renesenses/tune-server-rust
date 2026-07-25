@@ -318,27 +318,48 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             }
         }
 
-        // Register output using CLI port
-        let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(
-            player_name.clone(),
-            device_id.clone(),
-            lms_host_str.clone(),
-            lms_port,
-        );
-        {
-            let mut reg = state.outputs.lock().await;
-            reg.register(Box::new(output));
+        // Register the output using the CLI port — but only when it is genuinely
+        // new or its LMS host changed. discover_and_register runs every 60s;
+        // calling register() unconditionally replaced the output object and
+        // re-logged squeezebox_output_registered on every pass (register-thrash
+        // + log spam, 1441x). device_id is stable per player, so contains() +
+        // an unchanged host means nothing to do.
+        let needs_register = {
+            let reg = state.outputs.lock().await;
+            !reg.contains(&device_id) || reg.host_of(&device_id).as_deref() != Some(&lms_host_str)
+        };
+        if needs_register {
+            let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(
+                player_name.clone(),
+                device_id.clone(),
+                lms_host_str.clone(),
+                lms_port,
+            );
+            {
+                let mut reg = state.outputs.lock().await;
+                reg.register(Box::new(output));
+            }
+            tracing::info!(name = %player_name, id = %device_id, lms_host = %lms_host_str, lms_port, "squeezebox_output_registered");
         }
-        tracing::info!(name = %player_name, id = %device_id, lms_host = %lms_host_str, lms_port, "squeezebox_output_registered");
 
-        // Auto-create zone if not already present
+        // Auto-create zone if not already present. Only log a reconnect on an
+        // actual offline→online transition — the previous code logged
+        // squeezebox_zone_reconnected on every 60s pass for every live zone.
         match zone_repo.get_or_create(&player_name, Some("squeezebox"), &device_id) {
             Ok((zid, true)) => {
                 tracing::info!(name = %player_name, zone_id = zid, "squeezebox_zone_auto_created");
             }
             Ok((_, false)) => {
+                let was_online = zone_repo
+                    .get_by_device_id(&device_id)
+                    .ok()
+                    .flatten()
+                    .map(|z| z.online)
+                    .unwrap_or(false);
                 let _ = zone_repo.set_online_by_device(&device_id, true);
-                tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_reconnected");
+                if !was_online {
+                    tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_reconnected");
+                }
             }
             Err(e) => {
                 tracing::warn!(name = %player_name, id = %device_id, error = %e, "squeezebox_zone_create_failed");
