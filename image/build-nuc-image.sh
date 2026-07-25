@@ -203,6 +203,20 @@ sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' "${ROOTFS
 # and the appliance flag in /system/config — see docs/APPLIANCE.md
 echo "Tune OS appliance image" > "${ROOTFS}/etc/tune-appliance"
 
+# Une appliance ne dort jamais : sur un portable, logind suspend au rabat
+# du capot (retour Stéphane : « la machine ne répond plus » — Asus).
+mkdir -p "${ROOTFS}/etc/systemd/logind.conf.d"
+cat > "${ROOTFS}/etc/systemd/logind.conf.d/tune-no-sleep.conf" <<EOF
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+IdleAction=ignore
+EOF
+chroot "$ROOTFS" systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
 # USB storage: auto-mount partitions under /media/<kernel> (headless, no udisks
 # session). exFAT/NTFS/FAT mount root-owned world-readable — enough for scanning.
 mkdir -p "${ROOTFS}/media"
