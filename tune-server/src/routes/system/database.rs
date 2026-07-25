@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -222,7 +222,7 @@ pub(super) async fn database_import(
     .into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(super) struct DbConnectionTest {
     /// Engine type: "sqlite" or "postgresql". Defaults to "postgresql".
     engine: Option<String>,
@@ -232,21 +232,46 @@ pub(super) struct DbConnectionTest {
     url: Option<String>,
 }
 
-pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> impl IntoResponse {
-    let engine = body.engine.as_deref().unwrap_or("postgresql");
-    let conn_str = body
+/// Query-string form of the same params. The web client posts the DSN as
+/// `?url=<encoded>&target=<engine>` with NO JSON body, so reading only a JSON
+/// body made axum's `Json` extractor reject the bodyless request with a non-JSON
+/// error — which the client then hit with `.json()`, surfacing the cryptic
+/// "JSON.parse: unexpected character at line 1 column 1" (JP, PG migration).
+/// Accept both: query first, JSON body as fallback for API callers.
+#[derive(Deserialize, Default)]
+pub(super) struct DbConnQuery {
+    engine: Option<String>,
+    target: Option<String>,
+    connection_string: Option<String>,
+    url: Option<String>,
+}
+
+pub(super) async fn test_db_connection(
+    Query(q): Query<DbConnQuery>,
+    body: Option<Json<DbConnectionTest>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let engine = q
+        .engine
+        .or(q.target)
+        .or(body.engine)
+        .unwrap_or_else(|| "postgresql".to_string());
+    let engine = engine.as_str();
+    let conn_owned = q
         .url
-        .as_deref()
-        .or(body.connection_string.as_deref())
-        .unwrap_or("postgresql://localhost/tune");
+        .or(q.connection_string)
+        .or(body.url)
+        .or(body.connection_string)
+        .unwrap_or_else(|| "postgresql://localhost/tune".to_string());
+    let conn_str = conn_owned.as_str();
 
     match engine {
-        "sqlite" => Json(json!({"status": "ok", "engine": "sqlite"})).into_response(),
+        "sqlite" => Json(json!({"ok": true, "status": "ok", "engine": "sqlite"})).into_response(),
         "postgresql" | "postgres" => {
             if !conn_str.starts_with("postgresql://") && !conn_str.starts_with("postgres://") {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "invalid connection string, must start with postgresql:// or postgres://"})),
+                    Json(json!({"ok": false, "status": "error", "error": "invalid connection string, must start with postgresql:// or postgres://"})),
                 )
                     .into_response();
             }
@@ -262,6 +287,7 @@ pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> im
                             .nth(1)
                             .unwrap_or("unknown");
                         Json(json!({
+                            "ok": true,
                             "status": "ok",
                             "engine": "postgres",
                             "version": short_version,
@@ -272,6 +298,7 @@ pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> im
                     Err(e) => (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({
+                            "ok": false,
                             "status": "error",
                             "engine": "postgres",
                             "error": e,
@@ -305,12 +332,22 @@ pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> im
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(super) struct MigrateRequest {
     /// PostgreSQL connection URL
     url: Option<String>,
     /// Alternative field name
     connection_string: Option<String>,
+}
+
+/// Query-string form: the web client posts `?target=postgres&url=<encoded>` with
+/// no JSON body. Accept it (query first, body fallback) so the bodyless request
+/// isn't rejected by the `Json` extractor (JP, PG migration).
+#[derive(Deserialize, Default)]
+pub(super) struct MigrateQuery {
+    url: Option<String>,
+    connection_string: Option<String>,
+    target: Option<String>,
 }
 
 /// POST /system/database/migrate
@@ -326,13 +363,20 @@ pub(super) struct MigrateRequest {
 /// for a future engine switch.
 pub(super) async fn migrate_database(
     State(state): State<AppState>,
-    Json(body): Json<MigrateRequest>,
+    Query(q): Query<MigrateQuery>,
+    body: Option<Json<MigrateRequest>>,
 ) -> impl IntoResponse {
-    let pg_url = body
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let pg_url_owned = q
         .url
-        .as_deref()
-        .or(body.connection_string.as_deref())
-        .unwrap_or("");
+        .or(q.connection_string)
+        .or(body.url)
+        .or(body.connection_string)
+        .unwrap_or_default();
+    // target is accepted (client sends ?target=postgres) but this handler only
+    // implements SQLite → PostgreSQL; the DSN presence drives it.
+    let _ = q.target;
+    let pg_url = pg_url_owned.as_str();
 
     if pg_url.is_empty() {
         return (
