@@ -47,6 +47,27 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
 
+/// Lower CPU and I/O priority of the calling thread (Linux only, no-op
+/// elsewhere). Applied to the dedicated scan pool threads only — never to
+/// shared tokio pools — so a full scan stays in the background instead of
+/// starving the UI and playback on small machines (USB-key appliance,
+/// laptop CPUs: Stéphane, Tune OS). I/O class is best-effort level 7, not
+/// IDLE: IDLE can starve the scan completely under continuous playback.
+fn lower_scan_thread_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid);
+        // Linux semantics: PRIO_PROCESS with a tid targets that thread only.
+        // (`as _` : glibc type __priority_which_t vs c_int selon les libc.)
+        libc::setpriority(libc::PRIO_PROCESS as _, tid as libc::id_t, 10);
+        const IOPRIO_CLASS_BE: libc::c_long = 2;
+        const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        let ioprio = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 7;
+        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, tid, ioprio);
+    }
+}
+
 /// The dedicated I/O thread pool for tag reads, built once for the whole
 /// process. Returns `None` (→ caller falls back to the default rayon pool) if
 /// the pool couldn't be built. Reusing it avoids spawning and tearing down
@@ -57,6 +78,7 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(SCAN_IO_CONCURRENCY)
             .thread_name(|i| format!("scan-io-{i}"))
+            .start_handler(|_| lower_scan_thread_priority())
             .build()
             .ok()
     })

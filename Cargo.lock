@@ -4344,6 +4344,7 @@ dependencies = [
  "csv",
  "futures-util",
  "if-addrs 0.13.4",
+ "libc",
  "lofty",
  "md-5 0.10.6",
  "mdns-sd",

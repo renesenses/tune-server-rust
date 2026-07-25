@@ -55,6 +55,10 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], 
 rustls = "0.23"
 webpki-roots = "0.26"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# nice/ionice des threads du pool de scan (scanner/walker.rs)
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
