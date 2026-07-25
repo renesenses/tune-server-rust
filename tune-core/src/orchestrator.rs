@@ -636,33 +636,33 @@ impl PlaybackOrchestrator {
                     .get(req.zone_id)
                     .ok()
                     .flatten();
-                let db_volume = zone_db.as_ref().map(|z| z.volume).unwrap_or(50);
                 let is_fixed = zone_db.as_ref().is_some_and(|z| z.fixed_volume);
-                let zone_volume = if is_fixed {
-                    1.0
-                } else {
-                    let ps = self.playback.get_state(req.zone_id).await;
-                    if ps.volume > 0.0 {
-                        ps.volume
-                    } else {
-                        db_volume as f64 / 100.0
-                    }
-                };
-                let did = device_id.clone();
-                let outputs = self.outputs.clone();
-                let zone_id = req.zone_id;
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let arc = { outputs.lock().await.get(&did) };
-                    if let Some(output) = arc {
-                        let vol_clamped = zone_volume.clamp(0.0, 1.0);
-                        if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
-                            warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
-                        } else {
-                            info!(zone_id, volume = %vol_clamped, "play_initial_volume_sent");
+                // Only (re)assert the volume on play for fixed-volume (bit-perfect)
+                // zones, which must sit at 100%. For a normal zone, leave the
+                // device's current volume untouched: Tune previously pushed the
+                // stored zone volume on EVERY play, overriding a level the user
+                // had set directly on the device — the stored value drifts from
+                // the device (no external-change sync) so a low device jumped to
+                // the stored 50% on play (Fabien, "Salon"). Trade-off: this drops
+                // the old "re-apply saved volume after a restart to avoid a blast"
+                // behaviour for normal zones; the device keeps whatever level it
+                // is physically at.
+                if is_fixed {
+                    let did = device_id.clone();
+                    let outputs = self.outputs.clone();
+                    let zone_id = req.zone_id;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let arc = { outputs.lock().await.get(&did) };
+                        if let Some(output) = arc {
+                            if let Err(e) = output.lock().await.set_volume(1.0).await {
+                                warn!(zone_id, volume = 1.0, error = %e, "play_initial_volume_failed");
+                            } else {
+                                info!(zone_id, volume = 1.0, "play_initial_volume_sent");
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
 
             result
