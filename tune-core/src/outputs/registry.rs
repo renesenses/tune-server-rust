@@ -90,6 +90,12 @@ impl OutputRegistry {
         self.meta.get(device_id).and_then(|(_, _, h)| h.clone())
     }
 
+    /// The `output_type` recorded for a registered output at `register` time.
+    /// Read from the sync `meta` sidecar (no async lock).
+    pub fn type_of(&self, device_id: &str) -> Option<String> {
+        self.meta.get(device_id).map(|(_, t, _)| t.clone())
+    }
+
     /// Returns `true` if a device with the given ID is already registered.
     pub fn contains(&self, device_id: &str) -> bool {
         self.outputs.contains_key(device_id)

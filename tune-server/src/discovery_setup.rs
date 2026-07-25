@@ -98,13 +98,26 @@ pub fn spawn_ssdp_handler(
                 }
                 SsdpEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
-                    reg.remove(&id);
+                    // DLNA/OpenHome tolerance: a Samsung TV (and similar SOAP
+                    // renderers) stops advertising on SSDP when it goes idle, yet
+                    // still answers an AVTransport command if woken. Keep its
+                    // output in the registry so a play attempt can wake it — the
+                    // offline gate already allows an offline-but-registered zone
+                    // (Bilou's "erreur 503 en DLNA"). Registration is idempotent,
+                    // so a later re-advertise overwrites it with fresh URLs. The
+                    // zone is still flagged offline for the UI. Non-SOAP outputs
+                    // (chromecast, …) are dropped as before.
+                    let soap_wakeable =
+                        matches!(reg.type_of(&id).as_deref(), Some("dlna") | Some("openhome"));
+                    if !soap_wakeable {
+                        reg.remove(&id);
+                    }
                     set_zone_online(&event_bus, &db, &id, false);
                     event_bus.emit_typed(
                         EventType::DeviceLost,
                         serde_json::json!({ "device_id": id }),
                     );
-                    info!(id = %id, "output_removed_zone_offline");
+                    info!(id = %id, kept_registered = soap_wakeable, "device_lost_zone_offline");
                 }
                 SsdpEvent::MediaServerDiscovered(ms) => {
                     let id = ms.id.clone();
