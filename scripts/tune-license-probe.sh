@@ -40,7 +40,9 @@ say("Serveur:", f"v{ver.get('version', '?')} ({ver.get('engine', '?')})")
 say("Mode appliance:", cfg.get("appliance", "non exposé (serveur < 0.9.10)"))
 connected = sso.get("connected", sso.get("authenticated", False))
 say("Compte SSO connecté:", connected)
-say("Email du compte:", sso.get("email") or "(aucun)")
+user = sso.get("user") or {}
+say("Email du compte:", user.get("email") or "(aucun)")
+say("Compte premium:", user.get("premium", "?"))
 key = lic.get("license_key") or ""
 say("Clé licence:", ("****" + key[-4:]) if key else "(aucune clé enregistrée)")
 say("Tier:", lic.get("tier", "?"))
