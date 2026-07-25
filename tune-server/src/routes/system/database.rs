@@ -304,7 +304,29 @@ pub(super) async fn test_db_connection(
 
             #[cfg(feature = "postgres")]
             {
-                match tune_core::db::pg_migrate::test_connection(conn_str).await {
+                // Auto-create the target database when it does not exist:
+                // nobody should have to open psql for CREATE DATABASE (JP).
+                // One retry after a successful create; every other error
+                // falls through to the enriched message below.
+                let mut created = false;
+                let mut attempt = tune_core::db::pg_migrate::test_connection(conn_str).await;
+                if let Err(ref e) = attempt {
+                    let lower = e.to_lowercase();
+                    if lower.contains("does not exist") && lower.contains("database") {
+                        match tune_core::db::pg_migrate::ensure_database(conn_str).await {
+                            Ok(did) => {
+                                created = did;
+                                tracing::info!(created, "pg_database_auto_created");
+                                attempt =
+                                    tune_core::db::pg_migrate::test_connection(conn_str).await;
+                            }
+                            Err(ce) => {
+                                tracing::warn!(error = %ce, "pg_database_auto_create_failed");
+                            }
+                        }
+                    }
+                }
+                match attempt {
                     Ok(result) => {
                         // Extract short version (e.g. "16.2") from full version string
                         let short_version = result
@@ -318,6 +340,7 @@ pub(super) async fn test_db_connection(
                             "engine": "postgres",
                             "version": short_version,
                             "version_full": result.version,
+                            "database_created": created,
                         }))
                         .into_response()
                     }
@@ -444,6 +467,11 @@ pub(super) async fn migrate_database(
 
     #[cfg(feature = "postgres")]
     {
+        // Same auto-create as test_db_connection: a migrate against a
+        // never-created database should just work (JP).
+        if let Err(e) = tune_core::db::pg_migrate::ensure_database(pg_url).await {
+            tracing::warn!(error = %e, "pg_database_auto_create_failed_pre_migrate");
+        }
         let start = Instant::now();
         match tune_core::db::pg_migrate::migrate_sqlite_to_pg(&state.db, pg_url).await {
             Ok(result) => {
