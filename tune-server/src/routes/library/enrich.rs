@@ -345,6 +345,42 @@ pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Val
 
 // ── MusicBrainz helper functions (standalone, no MetadataEnricher needed) ──
 
+/// Send a GET request to MusicBrainz, retrying on transient 503 responses.
+///
+/// MusicBrainz issues `503 Service Unavailable` when its front-end is
+/// overloaded — even for fully compliant clients that respect the 1 req/s
+/// limit — and usually includes a `Retry-After` header. We honour it (capped)
+/// and retry a few times with exponential backoff before giving up so a busy
+/// server no longer aborts the whole enrichment run.
+async fn mb_get_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let req = request
+            .try_clone()
+            .ok_or_else(|| "mb request not cloneable".to_string())?;
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+
+        if resp.status() != StatusCode::SERVICE_UNAVAILABLE || attempt >= MAX_ATTEMPTS {
+            return Ok(resp);
+        }
+
+        // Prefer the server-provided Retry-After, otherwise exponential backoff
+        // (2s, 4s, 8s), capped at 10s to keep the run responsive.
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|secs| secs.min(10) * 1000)
+            .unwrap_or_else(|| (MB_RATE_LIMIT_MS * (1u64 << attempt)).min(10_000));
+
+        debug!(attempt, retry_after_ms = retry_after, "mb_503_retry");
+        tokio::time::sleep(Duration::from_millis(retry_after)).await;
+    }
+}
+
 /// Look up a recording on MusicBrainz by title + artist + album.
 /// Returns the recording ID if found.
 async fn mb_lookup_recording(
@@ -366,16 +402,13 @@ async fn mb_lookup_recording(
     }
     let query = query_parts.join(" AND ");
 
-    let resp = client
-        .get(format!("{MUSICBRAINZ_API}/recording"))
-        .query(&[
-            ("query", &query),
-            ("fmt", &"json".to_string()),
-            ("limit", &"1".to_string()),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("mb lookup: {e}"))?;
+    let resp = mb_get_with_retry(client.get(format!("{MUSICBRAINZ_API}/recording")).query(&[
+        ("query", &query),
+        ("fmt", &"json".to_string()),
+        ("limit", &"1".to_string()),
+    ]))
+    .await
+    .map_err(|e| format!("mb lookup: {e}"))?;
 
     if !resp.status().is_success() {
         return Ok(None);
@@ -397,12 +430,13 @@ async fn mb_fetch_recording_details(
     recording_id: &str,
 ) -> Result<RecordingDetails, String> {
     let url = format!("{MUSICBRAINZ_API}/recording/{recording_id}");
-    let resp = client
-        .get(&url)
-        .query(&[("inc", "releases+tags+artist-credits"), ("fmt", "json")])
-        .send()
-        .await
-        .map_err(|e| format!("mb details: {e}"))?;
+    let resp = mb_get_with_retry(
+        client
+            .get(&url)
+            .query(&[("inc", "releases+tags+artist-credits"), ("fmt", "json")]),
+    )
+    .await
+    .map_err(|e| format!("mb details: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(format!("mb details: HTTP {}", resp.status()));
