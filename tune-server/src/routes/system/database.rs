@@ -222,6 +222,32 @@ pub(super) async fn database_import(
     .into_response()
 }
 
+/// Turn a raw PostgreSQL connection error into a user-facing message. When the
+/// target database doesn't exist yet (the migrate/test flow creates the schema
+/// but NOT the database itself), tell the user to create it first instead of
+/// surfacing the raw driver error (JP: `database "tune" does not exist`).
+/// Returns (message, optional hint).
+#[cfg(feature = "postgres")]
+fn enrich_pg_error(err: &str, conn_str: &str) -> (String, Option<String>) {
+    let lower = err.to_lowercase();
+    if lower.contains("does not exist") && lower.contains("database") {
+        // Best-effort DB name from the DSN path (…/tune, minus any ?query).
+        let db = conn_str
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.split('?').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("tune");
+        let hint = format!(
+            "La base de données « {db} » n'existe pas encore. Créez-la d'abord \
+             (par ex. : CREATE DATABASE {db};), puis relancez."
+        );
+        (format!("{err} — {hint}"), Some(hint))
+    } else {
+        (err.to_string(), None)
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct DbConnectionTest {
     /// Engine type: "sqlite" or "postgresql". Defaults to "postgresql".
@@ -295,16 +321,20 @@ pub(super) async fn test_db_connection(
                         }))
                         .into_response()
                     }
-                    Err(e) => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({
-                            "ok": false,
-                            "status": "error",
-                            "engine": "postgres",
-                            "error": e,
-                        })),
-                    )
-                        .into_response(),
+                    Err(e) => {
+                        let (msg, hint) = enrich_pg_error(&e, conn_str);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "ok": false,
+                                "status": "error",
+                                "engine": "postgres",
+                                "error": msg,
+                                "hint": hint,
+                            })),
+                        )
+                            .into_response()
+                    }
                 }
             }
 
@@ -434,20 +464,24 @@ pub(super) async fn migrate_database(
                 }))
                 .into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "error": e,
-                    "source": {
-                        "engine": "sqlite",
-                        "artists": artists,
-                        "albums": albums,
-                        "tracks": tracks,
-                    },
-                })),
-            )
-                .into_response(),
+            Err(e) => {
+                let (msg, hint) = enrich_pg_error(&e, pg_url);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "status": "error",
+                        "error": msg,
+                        "hint": hint,
+                        "source": {
+                            "engine": "sqlite",
+                            "artists": artists,
+                            "albums": albums,
+                            "tracks": tracks,
+                        },
+                    })),
+                )
+                    .into_response()
+            }
         }
     }
 
