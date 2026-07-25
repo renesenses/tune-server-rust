@@ -407,6 +407,7 @@ pub(crate) mod decisions {
                 (duration_ms > 0).then_some(duration_ms),
                 position_ms,
             )
+    }
 
     /// Wall-clock end-of-track fallback for a DLNA renderer that reports no
     /// usable duration of its own (`reported_duration_ms == 0`) — the LMS UPnP
