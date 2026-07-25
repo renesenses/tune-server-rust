@@ -19,6 +19,61 @@ pub struct PgTestResult {
     pub version: String,
 }
 
+/// Create the target database when it does not exist yet, by connecting to
+/// the maintenance `postgres` database on the same server. No user should
+/// have to open psql just to run CREATE DATABASE (JP, PG migration).
+/// Returns Ok(true) if the database was created, Ok(false) if nothing to do.
+pub async fn ensure_database(url: &str) -> Result<bool, String> {
+    // Split "…/dbname[?query]" — everything before the last '/' is the server part.
+    let (server, rest) = url
+        .rsplit_once('/')
+        .ok_or_else(|| "invalid connection string (no database path)".to_string())?;
+    let (db, query) = match rest.split_once('?') {
+        Some((d, q)) => (d, Some(q)),
+        None => (rest, None),
+    };
+    if db.is_empty() {
+        return Err("invalid connection string (empty database name)".to_string());
+    }
+    // Guard the identifier: CREATE DATABASE cannot take a bind parameter, so
+    // refuse anything that would need quoting/escaping.
+    if !db
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "database name '{db}' contains unsupported characters"
+        ));
+    }
+    let maint = match query {
+        Some(q) => format!("{server}/postgres?{q}"),
+        None => format!("{server}/postgres"),
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&maint)
+        .await
+        .map_err(|e| format!("maintenance connection failed: {e}"))?;
+    let exists: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+    )
+    .bind(db)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| format!("pg_database check failed: {e}"))?;
+    if exists {
+        pool.close().await;
+        return Ok(false);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db}\"")))
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("CREATE DATABASE failed: {e}"))?;
+    pool.close().await;
+    Ok(true)
+}
+
 /// Test a PostgreSQL connection: connect, run SELECT 1, fetch version.
 pub async fn test_connection(url: &str) -> Result<PgTestResult, String> {
     let pool = PgPoolOptions::new()
