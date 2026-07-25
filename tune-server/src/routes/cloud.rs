@@ -979,19 +979,45 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or(true);
 
     if !valid {
-        info!("license_invalidated_by_server_validate");
-        state
-            .license
-            .update_from_server(tune_core::license::Tier::Free, None)
-            .await;
-        state.event_bus.emit(
-            "license.updated",
-            json!({"tier": "free", "expires_at": null}),
-        );
+        // Mirror the heartbeat guard: a bare `license_valid:false` is NOT an
+        // authoritative revocation. A key is always present here (checked above),
+        // so unless the server returned a genuine PAST `license_expires_at`, keep
+        // the cached premium tier and do NOT persist Free. Persisting Free used
+        // to permanently strip a valid key on a transient rejection (fingerprint
+        // re-binding, server hiccup) — and clicking "Valider" would re-trigger it
+        // even with the heartbeat fixed. Only a true past expiry revokes.
+        let expired_authoritatively = body
+            .get("license_expires_at")
+            .and_then(|v| v.as_str())
+            .map(tune_core::license::is_timestamp_past)
+            .unwrap_or(false);
+
+        if expired_authoritatively {
+            info!("license_invalidated_by_server_validate (authoritative expiry)");
+            state
+                .license
+                .update_from_server(tune_core::license::Tier::Free, None)
+                .await;
+            state.event_bus.emit(
+                "license.updated",
+                json!({"tier": "free", "expires_at": null}),
+            );
+            return Json(json!({
+                "status": "invalid",
+                "tier": "free",
+                "message": "License key is not valid",
+            }))
+            .into_response();
+        }
+
+        // Transient rejection: keep the cached tier — Premium survives within the
+        // offline grace window instead of being permanently revoked.
+        warn!("license_validate_rejected_keeping_cached_tier");
         return Json(json!({
-            "status": "invalid",
-            "tier": "free",
-            "message": "License key is not valid",
+            "status": "cached",
+            "tier": ls.tier,
+            "message": "Server could not confirm the license right now; Premium is retained (grace period).",
+            "cached": true,
         }))
         .into_response();
     }
