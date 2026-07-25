@@ -748,21 +748,27 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "album_art_uri": album_art_uri,
                     }));
                 } else {
-                    let res_url = extract_xml_tag(element, "res");
                     let album = extract_xml_tag(element, "upnp:album");
-                    let duration_ms =
-                        extract_res_attr(element, "duration").and_then(|d| parse_upnp_duration(&d));
-                    // Real resolution + codec from the server's DIDL res@ attributes.
+                    // A server may announce SEVERAL <res> per item — Lyrion/LMS
+                    // lists the original file (download.flc, with duration) plus
+                    // on-the-fly transcodes (download.pcm headerless raw PCM with
+                    // duration 0:00, download.mp3, …). The old code took the FIRST
+                    // <res> blindly, so whenever the raw-PCM transcode came first
+                    // the DLNA renderer was handed an unplayable headerless stream
+                    // (Yacine: immediate failure, 0:00, replay loop). Pick the best
+                    // resource instead; single-res items are untouched.
+                    let resources = parse_res_elements(element);
+                    let best = select_best_res(&resources);
+                    let res_url = best.map(|r| r.url.clone());
+                    // Real resolution + codec from the CHOSEN res@ attributes.
                     // Without these the signal path defaulted to "AAC 44kHz/16bit —
                     // Avec perte", mislabelling a hi-res ALAC (audio/mp4) as lossy AAC
                     // (Yves: NAS ALAC shown as AAC while the DartZeel read 24-bit).
-                    let sample_rate = extract_res_attr(element, "sampleFrequency")
-                        .and_then(|s| s.parse::<u32>().ok());
-                    let bit_depth = extract_res_attr(element, "bitsPerSample")
-                        .and_then(|s| s.parse::<u16>().ok());
-                    let channels = extract_res_attr(element, "nrAudioChannels")
-                        .and_then(|s| s.parse::<u16>().ok());
-                    let protocol_info = extract_res_attr(element, "protocolInfo");
+                    let duration_ms = best.and_then(|r| r.duration_ms);
+                    let sample_rate = best.and_then(|r| r.sample_rate);
+                    let bit_depth = best.and_then(|r| r.bit_depth);
+                    let channels = best.and_then(|r| r.channels);
+                    let protocol_info = best.and_then(|r| r.protocol_info.clone());
                     items.push(json!({
                         "id": id,
                         "title": title,
@@ -787,14 +793,147 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
     (containers, items)
 }
 
-fn extract_res_attr(element: &str, attr_name: &str) -> Option<String> {
-    let res_start = element.find("<res ")?;
-    let res_tag_end = element[res_start..].find('>')? + res_start;
-    let res_tag = &element[res_start..res_tag_end];
-    let pattern = format!("{attr_name}=\"");
-    let attr_start = res_tag.find(&pattern)? + pattern.len();
-    let attr_end = res_tag[attr_start..].find('"')? + attr_start;
-    Some(res_tag[attr_start..attr_end].to_string())
+/// One `<res>` element of a DIDL-Lite item.
+#[derive(Debug, Clone)]
+struct DidlRes {
+    url: String,
+    protocol_info: Option<String>,
+    duration_ms: Option<u64>,
+    sample_rate: Option<u32>,
+    bit_depth: Option<u16>,
+    channels: Option<u16>,
+}
+
+/// Parse every `<res …>url</res>` of a DIDL item, in document order.
+fn parse_res_elements(element: &str) -> Vec<DidlRes> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = element[pos..].find("<res") {
+        let abs = pos + start;
+        // Only match the actual <res> tag ("<res " / "<res>"), not e.g. <resType>.
+        let after = &element[abs + 4..];
+        if !(after.starts_with(' ') || after.starts_with('>')) {
+            pos = abs + 4;
+            continue;
+        }
+        let Some(tag_end_rel) = element[abs..].find('>') else {
+            break;
+        };
+        let tag_end = abs + tag_end_rel;
+        let res_tag = &element[abs..tag_end];
+        let Some(close_rel) = element[tag_end..].find("</res>") else {
+            break;
+        };
+        let url = element[tag_end + 1..tag_end + close_rel].trim().to_string();
+        if !url.is_empty() {
+            out.push(DidlRes {
+                url,
+                protocol_info: extract_attr(res_tag, "protocolInfo"),
+                duration_ms: extract_attr(res_tag, "duration")
+                    .and_then(|d| parse_upnp_duration(&d)),
+                sample_rate: extract_attr(res_tag, "sampleFrequency")
+                    .and_then(|s| s.parse::<u32>().ok()),
+                bit_depth: extract_attr(res_tag, "bitsPerSample")
+                    .and_then(|s| s.parse::<u16>().ok()),
+                channels: extract_attr(res_tag, "nrAudioChannels")
+                    .and_then(|s| s.parse::<u16>().ok()),
+            });
+        }
+        pos = tag_end + close_rel + "</res>".len();
+    }
+    out
+}
+
+/// Format-preference rank for a `<res>` — lower is better.
+///
+/// 0 = original/lossless WITH headers (flac/flc, alac/m4a, wav, aiff)
+/// 1 = encapsulated lossy (mp3, aac, ogg/opus, wma)
+/// 2 = unknown audio format
+/// 3 = raw headerless PCM (audio/L16, audio/L24, LPCM, .pcm) — LMS announces
+///     these transcodes with duration 0:00 and DLNA renderers choke on them
+/// 4 = non-audio res (cover images some servers attach as extra <res>)
+fn res_format_rank(res: &DidlRes) -> u8 {
+    let path = res
+        .url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    // protocolInfo = "http-get:*:<mime>:<extra>"
+    let mime = res
+        .protocol_info
+        .as_deref()
+        .and_then(|p| p.split(':').nth(2))
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    if mime.starts_with("image/") || mime.starts_with("video/") {
+        return 4;
+    }
+    if mime.starts_with("audio/l16")
+        || mime.starts_with("audio/l24")
+        || mime.contains("lpcm")
+        || path.ends_with(".pcm")
+    {
+        return 3;
+    }
+    const LOSSLESS_EXT: [&str; 8] = [
+        ".flac", ".flc", ".m4a", ".mp4", ".alac", ".wav", ".aif", ".aiff",
+    ];
+    const LOSSLESS_MIME: [&str; 11] = [
+        "audio/flac",
+        "audio/x-flac",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/x-m4a",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/wave",
+        "audio/aiff",
+        "audio/x-aiff",
+        "audio/x-aif",
+    ];
+    if LOSSLESS_EXT.iter().any(|e| path.ends_with(e)) || LOSSLESS_MIME.contains(&mime.as_str()) {
+        return 0;
+    }
+    const LOSSY_EXT: [&str; 6] = [".mp3", ".aac", ".ogg", ".oga", ".opus", ".wma"];
+    const LOSSY_MIME: [&str; 9] = [
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/aac",
+        "audio/x-aac",
+        "audio/ogg",
+        "audio/x-ogg",
+        "application/ogg",
+        "audio/opus",
+        "audio/x-ms-wma",
+    ];
+    if LOSSY_EXT.iter().any(|e| path.ends_with(e)) || LOSSY_MIME.contains(&mime.as_str()) {
+        return 1;
+    }
+    2
+}
+
+/// Pick the best `<res>` of an item: by format rank, then prefer a resource
+/// with a non-zero `duration` attribute, then keep document order. Items that
+/// announce a single res keep it unconditionally (behaviour unchanged for
+/// servers that only expose one resource, even raw PCM).
+fn select_best_res(resources: &[DidlRes]) -> Option<&DidlRes> {
+    if resources.len() <= 1 {
+        return resources.first();
+    }
+    resources
+        .iter()
+        .enumerate()
+        .min_by_key(|(i, r)| {
+            (
+                res_format_rank(r),
+                u8::from(r.duration_ms.unwrap_or(0) == 0),
+                *i,
+            )
+        })
+        .map(|(_, r)| r)
 }
 
 fn parse_upnp_duration(d: &str) -> Option<u64> {
@@ -921,5 +1060,137 @@ async fn get_share_detail(
         .into_response()),
         Ok(None) => Ok(StatusCode::NOT_FOUND.into_response()),
         Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_didl_browse_response, parse_res_elements, select_best_res};
+
+    /// Build a SOAP Browse response whose escaped DIDL contains one item with
+    /// the given raw `<res>` elements (LMS-style).
+    fn soap_with_res(res_elements: &str) -> String {
+        let didl = format!(
+            r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="t1" parentID="a1" restricted="1"><dc:title>Track</dc:title><upnp:artist>Artist</upnp:artist><upnp:album>Album</upnp:album>{res_elements}</item></DIDL-Lite>"#
+        );
+        let escaped = didl
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        format!(
+            "<s:Envelope><s:Body><u:BrowseResponse><Result>{escaped}</Result><NumberReturned>1</NumberReturned><TotalMatches>1</TotalMatches></u:BrowseResponse></s:Body></s:Envelope>"
+        )
+    }
+
+    // Yacine's case: LMS announces the headerless raw-PCM transcode FIRST
+    // (duration 0:00), then the original FLAC (with duration), then an MP3
+    // transcode. The FLAC must win.
+    const LMS_MULTI_RES: &str = concat!(
+        r#"<res protocolInfo="http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM" duration="0:00:00">http://192.168.1.7:9000/music/123/download.pcm</res>"#,
+        r#"<res protocolInfo="http-get:*:audio/x-flac:*" duration="0:04:33.000" sampleFrequency="44100" bitsPerSample="16" nrAudioChannels="2">http://192.168.1.7:9000/music/123/download.flc</res>"#,
+        r#"<res protocolInfo="http-get:*:audio/mpeg:*" duration="0:04:33.000">http://192.168.1.7:9000/music/123/download.mp3</res>"#,
+    );
+
+    #[test]
+    fn multi_res_lms_prefers_flac_over_raw_pcm() {
+        let resources = parse_res_elements(LMS_MULTI_RES);
+        assert_eq!(resources.len(), 3);
+        let best = select_best_res(&resources).expect("a res must be selected");
+        assert!(
+            best.url.ends_with("download.flc"),
+            "expected the FLAC original, got {}",
+            best.url
+        );
+        assert_eq!(best.duration_ms, Some(273_000));
+        assert_eq!(best.sample_rate, Some(44100));
+        assert_eq!(best.bit_depth, Some(16));
+        assert_eq!(
+            best.protocol_info.as_deref(),
+            Some("http-get:*:audio/x-flac:*")
+        );
+    }
+
+    #[test]
+    fn multi_res_end_to_end_didl_parse_picks_flac() {
+        let soap = soap_with_res(LMS_MULTI_RES);
+        let (containers, items) = parse_didl_browse_response(&soap);
+        assert!(containers.is_empty());
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(
+            item["res_url"].as_str().unwrap(),
+            "http://192.168.1.7:9000/music/123/download.flc"
+        );
+        // duration/resolution must come from the CHOSEN res, not the first one
+        assert_eq!(item["duration_ms"].as_u64(), Some(273_000));
+        assert_eq!(item["sample_rate"].as_u64(), Some(44100));
+        assert_eq!(
+            item["protocol_info"].as_str(),
+            Some("http-get:*:audio/x-flac:*")
+        );
+    }
+
+    #[test]
+    fn single_res_pcm_is_kept() {
+        // A server that only announces raw PCM must keep working as before.
+        let element = r#"<res protocolInfo="http-get:*:audio/L16;rate=44100;channels=2:*">http://10.0.0.2:9000/music/9/download.pcm</res>"#;
+        let resources = parse_res_elements(element);
+        assert_eq!(resources.len(), 1);
+        let best = select_best_res(&resources).unwrap();
+        assert!(best.url.ends_with("download.pcm"));
+    }
+
+    #[test]
+    fn only_lossy_res_picks_mp3() {
+        let element = concat!(
+            r#"<res protocolInfo="http-get:*:audio/L16:*" duration="0:00:00">http://h:9000/music/5/download.pcm</res>"#,
+            r#"<res protocolInfo="http-get:*:audio/mpeg:*" duration="0:03:10.000">http://h:9000/music/5/download.mp3</res>"#,
+        );
+        let resources = parse_res_elements(element);
+        assert_eq!(resources.len(), 2);
+        let best = select_best_res(&resources).unwrap();
+        assert!(
+            best.url.ends_with("download.mp3"),
+            "mp3 must beat raw pcm, got {}",
+            best.url
+        );
+        assert_eq!(best.duration_ms, Some(190_000));
+    }
+
+    #[test]
+    fn equal_format_prefers_res_with_duration() {
+        // Same rank (both FLAC): the one with a real duration wins even if
+        // listed second.
+        let element = concat!(
+            r#"<res protocolInfo="http-get:*:audio/flac:*">http://h/1/nodur.flac</res>"#,
+            r#"<res protocolInfo="http-get:*:audio/flac:*" duration="0:04:00.000">http://h/1/dur.flac</res>"#,
+        );
+        let resources = parse_res_elements(element);
+        let best = select_best_res(&resources).unwrap();
+        assert!(best.url.ends_with("dur.flac"));
+    }
+
+    #[test]
+    fn equal_format_and_duration_keeps_document_order() {
+        let element = concat!(
+            r#"<res protocolInfo="http-get:*:audio/flac:*" duration="0:04:00.000">http://h/1/first.flac</res>"#,
+            r#"<res protocolInfo="http-get:*:audio/flac:*" duration="0:04:00.000">http://h/1/second.flac</res>"#,
+        );
+        let resources = parse_res_elements(element);
+        let best = select_best_res(&resources).unwrap();
+        assert!(best.url.ends_with("first.flac"));
+    }
+
+    #[test]
+    fn image_res_never_beats_audio() {
+        // Some servers attach the cover as an extra <res>.
+        let element = concat!(
+            r#"<res protocolInfo="http-get:*:image/jpeg:*">http://h/cover.jpg</res>"#,
+            r#"<res protocolInfo="http-get:*:audio/mpeg:*" duration="0:03:00.000">http://h/track.mp3</res>"#,
+        );
+        let resources = parse_res_elements(element);
+        let best = select_best_res(&resources).unwrap();
+        assert!(best.url.ends_with("track.mp3"));
     }
 }
