@@ -30,8 +30,11 @@ const DATA_SUBDIR: &str = "TuneData";
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/storage", get(list_storage))
+        .route("/storage/mount", post(mount_volume))
         .route("/data/status", get(data_status))
         .route("/data/relocate", post(relocate))
+        .route("/install-to-disk", post(install_to_disk))
+        .route("/install-to-disk/status", get(install_status))
 }
 
 fn require_appliance() -> Result<(), AppError> {
@@ -330,7 +333,324 @@ async fn list_storage(State(state): State<AppState>) -> Result<Json<Value>, AppE
         let mp = v["mount_path"].as_str().unwrap_or("").to_string();
         v["is_data_target"] = json!(!mp.is_empty() && db_path.starts_with(&mp));
     }
-    Ok(Json(json!({ "volumes": vols })))
+    let inventory = block_inventory().await;
+    Ok(Json(json!({
+        "volumes": vols,
+        "disks": inventory.disks,
+        "unmounted_partitions": inventory.unmounted,
+    })))
+}
+
+// ---------- lsblk inventory: whole disks + unmounted data partitions ----------
+// C'est ce qui rend visible un disque SATA interne plein de musique mais non
+// monté (retour Gil : « tune ne le détecte pas automatiquement »).
+
+const MOUNTABLE_FS: &[&str] = &[
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "vfat", "exfat", "ntfs",
+];
+
+struct BlockInventory {
+    disks: Vec<Value>,
+    unmounted: Vec<Value>,
+}
+
+/// Parse one line of `lsblk -P` (KEY="value" pairs).
+fn parse_lsblk_pairs(line: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut rest = line.trim();
+    while let Some(eq) = rest.find("=\"") {
+        let key = rest[..eq].trim().to_string();
+        let after = &rest[eq + 2..];
+        let Some(end) = after.find('"') else { break };
+        out.insert(key, after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// Physical disk hosting `/` — never a valid target for anything destructive.
+fn boot_disk_name() -> String {
+    let raw =
+        std::fs::read_to_string(env_or("TUNE_PROC_MOUNTS", "/proc/mounts")).unwrap_or_default();
+    let root_dev = raw
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() >= 2 && f[1] == "/").then(|| f[0].to_string())
+        })
+        .unwrap_or_default();
+    // /dev/sdb2 → sdb ; /dev/nvme0n1p2 → nvme0n1 ; LVM/dm laissé tel quel
+    // (l'image Tune OS n'utilise pas LVM).
+    let name = root_dev.trim_start_matches("/dev/");
+    if let Some(idx) = name.find(|c: char| c == 'p') {
+        if name.starts_with("nvme") {
+            return name[..idx].to_string();
+        }
+    }
+    name.trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_string()
+}
+
+async fn block_inventory() -> BlockInventory {
+    let boot = boot_disk_name();
+    let raw = run_tool(
+        "TUNE_LSBLK_BIN",
+        "lsblk",
+        &[
+            "-P",
+            "-o",
+            "NAME,TYPE,FSTYPE,UUID,SIZE,TRAN,MOUNTPOINT,LABEL,MODEL,PKNAME",
+        ],
+    )
+    .await
+    .unwrap_or_default();
+
+    let mut disk_models = std::collections::HashMap::new();
+    let mut disks = Vec::new();
+    let mut unmounted = Vec::new();
+    for line in raw.lines() {
+        let p = parse_lsblk_pairs(line);
+        let get = |k: &str| p.get(k).cloned().unwrap_or_default();
+        match get("TYPE").as_str() {
+            "disk" => {
+                disk_models.insert(get("NAME"), get("MODEL"));
+                disks.push(json!({
+                    "name": get("NAME"),
+                    "size": get("SIZE"),
+                    "model": get("MODEL"),
+                    "tran": get("TRAN"),
+                    "is_boot": get("NAME") == boot,
+                }));
+            }
+            "part" => {
+                let fstype = get("FSTYPE");
+                if get("MOUNTPOINT").is_empty()
+                    && !get("UUID").is_empty()
+                    && MOUNTABLE_FS.contains(&fstype.as_str())
+                    && get("PKNAME") != boot
+                {
+                    unmounted.push(json!({
+                        "name": get("NAME"),
+                        "uuid": get("UUID"),
+                        "fstype": fstype,
+                        "size": get("SIZE"),
+                        "label": get("LABEL"),
+                        "tran": get("TRAN"),
+                        "disk": get("PKNAME"),
+                        "disk_model": disk_models.get(&get("PKNAME")).cloned().unwrap_or_default(),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    BlockInventory { disks, unmounted }
+}
+
+#[derive(Deserialize)]
+struct MountVolumeBody {
+    uuid: String,
+}
+
+/// Monte une partition (par UUID, chemin stable) pour l'utiliser comme source
+/// musique — le client enchaîne ensuite sur POST /system/music-dirs/add avec
+/// le mount_path retourné (validation + scan immédiat déjà en place là-bas).
+async fn mount_volume(Json(body): Json<MountVolumeBody>) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    let inv = block_inventory().await;
+    let part = inv
+        .unmounted
+        .iter()
+        .find(|p| p["uuid"].as_str() == Some(body.uuid.as_str()))
+        .cloned()
+        .ok_or_else(|| AppError::bad_request("unknown or already mounted partition uuid"))?;
+
+    let short: String = body
+        .uuid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let mount_point = format!(
+        "{}/{}",
+        env_or("TUNE_MUSIC_MOUNT_BASE", "/srv/tune-music"),
+        short
+    );
+    let unit_dir = env_or("TUNE_MOUNT_UNIT_DIR", "/etc/systemd/system");
+    let unit_name = mount_unit_name(&mount_point);
+    let unit_path = Path::new(&unit_dir).join(&unit_name);
+    std::fs::write(&unit_path, mount_unit_contents(&body.uuid, &mount_point))
+        .map_err(|e| AppError::internal(format!("write {}: {e}", unit_path.display())))?;
+    for args in [
+        vec!["daemon-reload"],
+        vec!["enable", "--now", unit_name.as_str()],
+    ] {
+        run_tool("TUNE_SYSTEMCTL_BIN", "systemctl", &args)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tracing::info!(uuid = %body.uuid, mount = %mount_point, "music_volume_mounted");
+    Ok(Json(json!({
+        "mount_path": mount_point,
+        "label": part["label"],
+        "fstype": part["fstype"],
+    })))
+}
+
+// ---------- install to disk (façon ROON ROCK, depuis l'UI) ----------
+
+fn install_job() -> &'static Mutex<RelocJob> {
+    static JOB: OnceLock<Mutex<RelocJob>> = OnceLock::new();
+    JOB.get_or_init(|| Mutex::new(RelocJob::default()))
+}
+
+fn set_install(phase: &str, copied: u64) {
+    let mut j = install_job().lock().unwrap();
+    j.phase = phase.into();
+    if copied > 0 {
+        j.copied_bytes = copied;
+    }
+}
+
+fn fail_install(err: String) {
+    tracing::warn!(error = %err, "install_to_disk_failed");
+    let mut j = install_job().lock().unwrap();
+    j.phase = "failed".into();
+    j.error = Some(err);
+}
+
+#[derive(Deserialize)]
+struct InstallBody {
+    device: String,
+    confirm: String,
+}
+
+async fn install_status() -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    let j = install_job().lock().unwrap().clone();
+    Ok(Json(json!({
+        "phase": j.phase,
+        "written_bytes": j.copied_bytes,
+        "error": j.error,
+        "target": j.target,
+    })))
+}
+
+async fn install_to_disk(Json(body): Json<InstallBody>) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    if body.confirm != "EFFACER" {
+        return Err(AppError::bad_request("confirmation manquante (EFFACER)"));
+    }
+    {
+        let j = install_job().lock().unwrap();
+        if matches!(j.phase.as_str(), "resolving" | "writing") {
+            return Err(AppError::conflict("an install job is already running"));
+        }
+    }
+    let inv = block_inventory().await;
+    let boot = boot_disk_name();
+    let device = body.device.trim_start_matches("/dev/").to_string();
+    let disk = inv
+        .disks
+        .iter()
+        .find(|d| d["name"].as_str() == Some(device.as_str()))
+        .cloned()
+        .ok_or_else(|| AppError::bad_request("unknown disk"))?;
+    if device == boot || disk["is_boot"] == json!(true) {
+        return Err(AppError::bad_request(
+            "cible = disque système (la clé) — refusé",
+        ));
+    }
+
+    {
+        let mut j = install_job().lock().unwrap();
+        *j = RelocJob {
+            phase: "resolving".into(),
+            target: format!("/dev/{device}"),
+            ..Default::default()
+        };
+    }
+
+    tokio::spawn(async move {
+        // URL de la dernière image publiée (surchargeable pour les tests).
+        let url = match std::env::var("TUNE_IMAGE_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                let api =
+                    "https://api.github.com/repos/renesenses/tune-server-rust/releases/latest";
+                let tag = match run_tool("TUNE_CURL_BIN", "curl", &["-sL", api]).await {
+                    Ok(body) => body
+                        .lines()
+                        .find(|l| l.contains("\"tag_name\""))
+                        .and_then(|l| l.split('"').nth(3))
+                        .map(|s| s.trim_start_matches('v').to_string()),
+                    Err(e) => return fail_install(e),
+                };
+                let Some(version) = tag else {
+                    return fail_install("impossible de déterminer la dernière version".into());
+                };
+                format!(
+                    "https://github.com/renesenses/tune-server-rust/releases/download/v{version}/tune-os-x86_64-v{version}.img.gz"
+                )
+            }
+        };
+
+        // Même pipeline que le script validé sur le terrain. La progression de
+        // dd (status=progress, stderr) est relayée dans le job.
+        let dev_dir = env_or("TUNE_DEV_DIR", "/dev");
+        let target = format!("{dev_dir}/{device}");
+        set_install("writing", 0);
+        // Pipeline de prod (GNU, identique au script terrain) ; surchargeable
+        // pour les tests (dd BSD de macOS ne connaît ni bs=4M ni
+        // status=progress) — le stub reçoit TUNE_URL / TUNE_TARGET.
+        let pipeline = env_or(
+            "TUNE_INSTALL_PIPELINE",
+            &format!(
+                "curl -sL {url} | gunzip | dd of={target} bs=4M conv=fsync status=progress",
+                url = shell_quote(&url),
+                target = shell_quote(&target),
+            ),
+        );
+        let mut child = match tokio::process::Command::new("bash")
+            .args(["-c", &pipeline])
+            .env("TUNE_URL", &url)
+            .env("TUNE_TARGET", &target)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return fail_install(format!("spawn: {e}")),
+        };
+        if let Some(stderr) = child.stderr.take() {
+            use tokio::io::AsyncBufReadExt;
+            // dd écrit la progression avec des \r ; on lit par segments.
+            let mut reader = tokio::io::BufReader::new(stderr).split(b'\r');
+            while let Ok(Some(seg)) = reader.next_segment().await {
+                let text = String::from_utf8_lossy(&seg);
+                if let Some(bytes) = text
+                    .split_whitespace()
+                    .next()
+                    .and_then(|w| w.parse::<u64>().ok())
+                {
+                    set_install("writing", bytes);
+                }
+            }
+        }
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                tracing::info!(target = %target, "install_to_disk_done");
+                set_install("done", 0);
+            }
+            Ok(status) => fail_install(format!("pipeline exit {status}")),
+            Err(e) => fail_install(format!("wait: {e}")),
+        }
+    });
+
+    Ok(Json(json!({ "started": true })))
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 async fn data_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -559,6 +879,23 @@ tmpfs /run tmpfs rw 0 0
         assert!(out.contains("# conf"));
         assert!(out.contains("port = 8888"));
         assert!(!out.contains("old.db"));
+    }
+
+    #[test]
+    fn parse_lsblk_pairs_handles_spaces_and_empties() {
+        let p = parse_lsblk_pairs(
+            r#"NAME="sda" TYPE="disk" FSTYPE="" UUID="" SIZE="931,5G" TRAN="sata" MOUNTPOINT="" LABEL="" MODEL="Samsung SSD 870 EVO" PKNAME="""#,
+        );
+        assert_eq!(p.get("NAME").unwrap(), "sda");
+        assert_eq!(p.get("MODEL").unwrap(), "Samsung SSD 870 EVO");
+        assert_eq!(p.get("TRAN").unwrap(), "sata");
+        assert_eq!(p.get("FSTYPE").unwrap(), "");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("abc"), "'abc'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
