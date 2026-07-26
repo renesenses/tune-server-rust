@@ -394,20 +394,30 @@ pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
 /// Persist music_dirs and discogs_token from config/env into the settings DB.
 fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
     if !config.music_dirs.is_empty() {
-        let normalized_dirs: Vec<String> = config
-            .music_dirs
-            .iter()
-            .map(|d| tune_core::scanner::walker::normalize_path(d))
-            .filter(|d| !d.is_empty())
-            .collect();
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-        settings
-            .set(
-                "music_dirs",
-                &serde_json::to_string(&normalized_dirs).unwrap(),
-            )
-            .ok();
+        // Seed music_dirs from config ONLY on first run — never clobber a list
+        // the user has since edited in Settings. Overwriting on every boot meant
+        // a too-broad folder removed via the UI (e.g. C:\ = the whole drive)
+        // reappeared on the next restart, so it could never be removed and the
+        // temp dir kept being re-scanned (Frédéric). Mirrors the discogs_token
+        // first-run guard below. An explicit empty list ("[]") counts as set, so
+        // "remove everything" is respected.
+        let already_set = settings.get("music_dirs").ok().flatten().is_some();
+        if !already_set {
+            let normalized_dirs: Vec<String> = config
+                .music_dirs
+                .iter()
+                .map(|d| tune_core::scanner::walker::normalize_path(d))
+                .filter(|d| !d.is_empty())
+                .collect();
+            settings
+                .set(
+                    "music_dirs",
+                    &serde_json::to_string(&normalized_dirs).unwrap(),
+                )
+                .ok();
+        }
     }
 
     if let Some(ref token) = config.discogs_token {
