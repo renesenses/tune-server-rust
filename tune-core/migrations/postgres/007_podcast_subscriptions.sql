@@ -3,13 +3,30 @@
 -- The podcast_subscriptions table was created by SQLite migrations with
 -- AUTOINCREMENT, which PG silently ignores — leaving id as a plain INTEGER
 -- with no auto-generation. Fix: recreate with SERIAL.
+--
+-- The DROP is guarded on the broken condition (id column without a default):
+-- this script must be safe to REPLAY on a healthy database, because the
+-- migration runner replays all scripts when it drops the data-migration
+-- sentinel (version 99). An unconditional DROP wiped the user's podcast
+-- subscriptions on that replay.
 
 BEGIN;
 
--- Drop the broken table (no user data worth preserving) and recreate properly.
-DROP TABLE IF EXISTS podcast_subscriptions;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'podcast_subscriptions'
+          AND column_name = 'id'
+          AND column_default IS NULL
+    ) THEN
+        -- Broken AUTOINCREMENT-less table: no auto-generated ids, inserts
+        -- fail — nothing worth preserving, recreate properly.
+        DROP TABLE podcast_subscriptions;
+    END IF;
+END $$;
 
-CREATE TABLE podcast_subscriptions (
+CREATE TABLE IF NOT EXISTS podcast_subscriptions (
     id SERIAL PRIMARY KEY,
     feed_url TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,

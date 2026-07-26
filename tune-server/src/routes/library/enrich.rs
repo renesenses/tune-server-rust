@@ -84,6 +84,28 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 
         let total = track_rows.len();
 
+        // Publish the total as soon as it is known: the next periodic write
+        // only happens every 50 enriched tracks, and with the ~1 req/s
+        // MusicBrainz rate limit the client's progress bar sat on "0/0" for
+        // minutes even when everything was working (Fabien-5).
+        {
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone());
+            settings
+                .set(
+                    "enrich_all_status",
+                    &json!({
+                        "status": "running",
+                        "task_id": task_id_clone,
+                        "enriched": 0,
+                        "errors": 0,
+                        "total": total,
+                    })
+                    .to_string(),
+                )
+                .ok();
+        }
+
         // Build a dedicated HTTP client with proper UA for MusicBrainz
         let mb_client = tune_core::http::client::builder()
             .timeout(Duration::from_secs(15))
