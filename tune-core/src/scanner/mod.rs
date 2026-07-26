@@ -28,11 +28,24 @@ mod tune_temp_file_tests {
         // Windows separators only parse as separators on Windows.
         #[cfg(windows)]
         assert!(is_tune_temp_file(Path::new(
-            "C:\\Users\\U\\AppData\\Local\\Temp\\tune-stream-abc.flac"
+            "/music/tune-prefetch-xyz.flac"
         )));
         assert!(is_tune_temp_file(Path::new("/music/tune-stream-abc.flac")));
         assert!(is_tune_temp_file(Path::new(
-            "/music/tune-prefetch-xyz.flac"
+            "/anywhere/else/tune-stream-abc.flac"
+        )));
+    }
+
+    /// A backslash-separated path only parses as a path on Windows. On Unix
+    /// `Path::file_name` does not split on `\`, so it hands back the whole
+    /// string and the `tune-stream-` prefix check never sees the leaf. The
+    /// function is right — that spelling only ever occurs on Windows, where
+    /// `file_name` does split — so it is the assertion that has to be gated.
+    #[cfg(windows)]
+    #[test]
+    fn matches_a_windows_temp_path() {
+        assert!(is_tune_temp_file(Path::new(
+            "C:\\Users\\U\\AppData\\Local\\Temp\\tune-stream-abc.flac"
         )));
     }
 

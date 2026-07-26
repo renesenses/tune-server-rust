@@ -393,6 +393,12 @@ pub fn router_with_plugins(
     // (already stated) while `api` is still `Router<AppState>` — nesting it
     // as a service is the only way to combine the two, and it keeps the
     // plugin's internal state entirely its own.
+    //
+    // One consequence: the nested service owns everything under its prefix, so
+    // an unknown sub-path answers with axum's bare 404 rather than
+    // `api_fallback`'s JSON body. Left deliberately — forcing our fallback on
+    // the plugin router would take away its ability to answer its own 404s,
+    // which matters more than a uniform error shape under /ext.
     let api = plugin_routers
         .into_iter()
         .fold(api, |api, (plugin_name, plugin_router)| {

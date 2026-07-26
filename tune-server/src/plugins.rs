@@ -20,6 +20,7 @@
 //! never races the local-device scan for the same zone row) and **before**
 //! `routes::router` (which needs the plugin routers to mount them).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -104,6 +105,15 @@ pub async fn init(state: &AppState, api_base_url: &str) -> PluginRouters {
         return Vec::new();
     }
 
+    // Publish the introspection snapshot for the REST handlers. `setup_all`
+    // already retained only what loaded, so this is a faithful list; the point
+    // of copying it out is contention. Event dispatch holds the loader lock
+    // across every plugin's `on_event`, so a handler taking the same lock would
+    // hang for as long as the slowest plugin — while holding `state.plugins`,
+    // which delays shutdown too. Nothing registers after init, so one snapshot
+    // serves every request with no lock at all.
+    let _ = state.plugin_info.set(loader.loaded_plugins().await);
+
     let registrations = loader.take_registrations();
     let routers = install(state, registrations).await;
 
@@ -123,6 +133,10 @@ async fn install(state: &AppState, registrations: PluginRegistrations) -> Plugin
         routers,
         zones,
     } = registrations;
+
+    // device_ids this plugin actually got into the registry. A zone is only
+    // created for one of these — see the zone loop below.
+    let mut claimed: HashSet<String> = HashSet::new();
 
     if !outputs.is_empty() {
         let mut registry = state.outputs.lock().await;
@@ -144,10 +158,25 @@ async fn install(state: &AppState, registrations: PluginRegistrations) -> Plugin
                 "plugin_output_registered"
             );
             registry.register(output);
+            claimed.insert(device_id);
         }
     }
 
     for zone in zones {
+        // Only bind a zone to a device this plugin just claimed. Two reasons:
+        // an id whose output was refused above belongs to *another* output, so
+        // creating the zone anyway would quietly point the plugin's zone at
+        // someone else's device; and an id no output ever claimed leaves an
+        // orphan zone with nothing behind it.
+        if !claimed.contains(&zone.device_id) {
+            warn!(
+                name = %zone.name,
+                device_id = %zone.device_id,
+                "plugin_zone_skipped — no output of this plugin claimed that device_id"
+            );
+            continue;
+        }
+
         let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
         match repo.get_or_create(&zone.name, Some(&zone.output_type), &zone.device_id) {
             Ok((zone_id, true)) => {

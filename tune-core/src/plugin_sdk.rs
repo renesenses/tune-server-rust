@@ -80,6 +80,13 @@ pub struct PluginInfo {
 }
 
 pub struct PluginContext {
+    /// Base URL of this server's own HTTP API, e.g. `http://127.0.0.1:8080`.
+    ///
+    /// Usable only *after* startup finishes. The host sets plugins up while the
+    /// listener is bound but not yet accepting, so an HTTP request to this URL
+    /// from inside `setup` sits in the accept backlog until it times out. Read
+    /// the library through [`PluginContext::db`] during setup and keep this for
+    /// later, once events start arriving.
     pub api_base_url: String,
     pub data_dir: PathBuf,
     pub event_bus: Option<EventBus>,
@@ -167,8 +174,9 @@ impl PluginContext {
     /// registers concrete instances. A plugin wanting N outputs calls this N
     /// times.
     pub fn register_output(&self, output: Box<dyn OutputTarget>) {
-        if let Ok(mut reg) = self.registrations.lock() {
-            reg.outputs.push(output);
+        match self.registrations.lock() {
+            Ok(mut reg) => reg.outputs.push(output),
+            Err(_) => self.warn_registration_lost("output"),
         }
     }
 
@@ -187,21 +195,38 @@ impl PluginContext {
     /// `tune-core` free of any dependency on `tune-server`'s types.
     #[cfg(feature = "plugin-http")]
     pub fn register_router(&self, router: axum::Router<()>) {
-        if let Ok(mut reg) = self.registrations.lock() {
-            reg.routers.push((self.plugin_name.clone(), router));
+        match self.registrations.lock() {
+            Ok(mut reg) => reg.routers.push((self.plugin_name.clone(), router)),
+            Err(_) => self.warn_registration_lost("router"),
         }
     }
 
     /// Ask the host to create a zone bound to one of this plugin's outputs,
     /// if no zone already targets that `device_id`.
+    /// The host only creates the zone if one of this plugin's outputs actually
+    /// claimed `device_id` — a zone pointing at a device the plugin does not
+    /// own would either be orphaned or, worse, drive somebody else's device.
     pub fn register_zone(&self, name: &str, output_type: &str, device_id: &str) {
-        if let Ok(mut reg) = self.registrations.lock() {
-            reg.zones.push(ZoneRequest {
+        match self.registrations.lock() {
+            Ok(mut reg) => reg.zones.push(ZoneRequest {
                 name: name.to_string(),
                 output_type: output_type.to_string(),
                 device_id: device_id.to_string(),
-            });
+            }),
+            Err(_) => self.warn_registration_lost("zone"),
         }
+    }
+
+    /// A poisoned registrations mutex means an earlier registration panicked
+    /// mid-push. Say so loudly: silently dropping the registration leaves a
+    /// plugin convinced it registered something that then never appears, which
+    /// is a thoroughly miserable thing to debug.
+    fn warn_registration_lost(&self, kind: &str) {
+        warn!(
+            plugin_name = %self.plugin_name,
+            kind,
+            "plugin_registration_lost — registrations mutex poisoned"
+        );
     }
 
     /// Drain what this plugin registered. Called by the loader once `setup`
@@ -229,6 +254,14 @@ pub trait TunePlugin: Send + Sync {
     /// Defaults to the version compiled into the SDK the plugin links, which
     /// is correct for in-tree plugins. Override only to pin an older
     /// generation deliberately.
+    ///
+    /// With plugins compiled in, the default can never disagree: there is
+    /// exactly one `tune-core` in the dependency graph, so a plugin's constant
+    /// *is* the server's. An out-of-tree plugin pinning a semver-incompatible
+    /// `tune-core` would fail to compile against this loader rather than be
+    /// refused at runtime. So today the gate only fires on a deliberate
+    /// override — it is scaffolding for `libloading`, where two generations
+    /// can genuinely coexist in one process.
     fn protocol_version(&self) -> (u32, u32) {
         PLUGIN_PROTOCOL_VERSION
     }

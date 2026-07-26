@@ -179,13 +179,26 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Allow unauthenticated access to health, version, auth, and ws endpoints
+    // Allow unauthenticated access to health, version, auth, and ws endpoints.
+    //
+    // These are *substring* matches, so any path segment an extension controls
+    // could otherwise smuggle itself into the allowlist: a plugin named `auth`
+    // (mounted at /ext/auth/…) or any plugin route containing `/auth/` would
+    // read as public and skip the token check entirely. Plugin namespaces are
+    // never public — settle that before the allowlist gets a chance to match.
+    //
+    // Both spellings are tested because this middleware layers the `api`
+    // router, which is itself nested under /api/v1: whether the prefix is
+    // still on the URI here depends on axum's nesting internals, and this
+    // check must not silently stop working if that changes.
     let path = request.uri().path();
-    if path.contains("/system/health")
-        || path.contains("/system/version")
-        || path.contains("/auth/")
-        || path.contains("/cloud/sso/")
-        || path == "/ws"
+    let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
+    if !is_extension_route
+        && (path.contains("/system/health")
+            || path.contains("/system/version")
+            || path.contains("/auth/")
+            || path.contains("/cloud/sso/")
+            || path == "/ws")
     {
         return next.run(request).await;
     }
