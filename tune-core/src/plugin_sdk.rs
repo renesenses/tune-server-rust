@@ -24,7 +24,8 @@ pub const PLUGIN_PROTOCOL_VERSION: (u32, u32) = (1, 0);
 
 /// A zone a plugin wants the host to create on its behalf.
 ///
-/// Plugins that expose a virtual output (a recorder, a visualiser) generally
+/// Plugins that expose a virtual output (a visualiser, an EQ, a stats
+/// exporter) generally
 /// want a zone pointing at it to exist so the device is selectable in the UI
 /// without the user hand-crafting one.
 #[derive(Debug, Clone)]
@@ -146,7 +147,7 @@ impl PluginContext {
     }
 
     /// The database backend, for plugins that need to query the library
-    /// directly (e.g. a recorder skipping albums already owned).
+    /// directly (e.g. a plugin skipping albums already in the library).
     pub fn db(&self) -> Option<Arc<dyn DbBackend>> {
         self.db.clone()
     }
@@ -301,6 +302,19 @@ impl PluginLoader {
         for plugin in plugins.iter_mut() {
             let name = plugin.name().to_string();
 
+            // Runtime kill switch written by the REST routes
+            // (`plugin_{name}_enabled`): a compiled-in plugin can be disabled
+            // without recompiling (review #907).
+            if let Some(db) = &self.db {
+                let key = format!("plugin_{name}_enabled");
+                if let Ok(Some(v)) = SettingsRepo::with_backend(Arc::clone(db)).get(&key) {
+                    if v == "false" {
+                        info!(plugin_name = %name, "plugin_disabled_by_setting");
+                        continue;
+                    }
+                }
+            }
+
             // ABI gate. A plugin built against a different major generation
             // disagrees about the trait layout, so refuse it outright rather
             // than let it fault at the first dispatch.
@@ -364,6 +378,12 @@ impl PluginLoader {
                 }
             }
         }
+
+        // Drop refused/failed/disabled plugins from the resident set: they
+        // would otherwise show up as loaded in /api/v1/plugins and keep
+        // receiving every event via on_event on half-built state — the very
+        // hazard setup registrations are dropped for (review #907).
+        plugins.retain(|p| loaded.iter().any(|n| n == p.name()));
 
         loaded
     }
@@ -573,6 +593,13 @@ mod tests {
 
         let loaded = loader.setup_all("http://localhost:8888").await;
         assert_eq!(loaded, vec!["test-plugin"]);
+
+        // The failed plugin must not linger: not reported as loaded, and no
+        // longer resident to receive events on half-built state.
+        let infos = loader.loaded_plugins().await;
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "test-plugin");
+        assert_eq!(loader.plugin_count().await, 1);
     }
 
     #[test]
