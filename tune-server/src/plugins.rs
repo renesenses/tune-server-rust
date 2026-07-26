@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use tune_core::plugin_sdk::{PluginLoader, PluginRegistrations};
+use tune_core::plugin_sdk::{PluginLoader, PluginRegistrations, TunePlugin};
 
 use crate::state::AppState;
 
@@ -61,11 +61,13 @@ fn plugins_data_root() -> std::path::PathBuf {
 
 /// The compiled-in plugin set.
 ///
-/// Empty in this tree: no plugin ships in-repo yet. Adding one is three
-/// edits, and an out-of-tree plugin must stay behind a non-default feature so
-/// a plain clone still builds — cargo resolves optional path dependencies
-/// when it writes the lockfile, so a path pointing outside the repo breaks
-/// `cargo check` for everyone, feature enabled or not.
+/// Empty in this tree, and it should stay that way for anything whose source
+/// is not in this repository. A `path` dependency pointing outside the repo
+/// breaks `cargo check` for every clone — cargo resolves optional path
+/// dependencies while writing the lockfile, so `optional = true` does not save
+/// you and neither does leaving the feature off. Such a plugin composes from
+/// its own workspace instead, via [`PluginBuilder`] and
+/// [`crate::bootstrap::run`]; this function is only for source that lives here.
 ///
 /// ```ignore
 /// // 1. Cargo.toml — feature + optional dependency
@@ -90,12 +92,35 @@ fn plugins_data_root() -> std::path::PathBuf {
 #[allow(unused_variables)]
 async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {}
 
+/// Builds the plugins an out-of-tree binary wants registered.
+///
+/// Takes `&AppState` because a plugin's host services — `services`, `backend`,
+/// `http_client` — only exist once state is built. Called once, from [`init`].
+///
+/// This is what makes a closed-source plugin possible: it composes from a
+/// separate workspace that depends on `tune-server` as a library, so this
+/// repository never names it and a plain clone still builds. See
+/// [`crate::bootstrap::run`].
+pub type PluginBuilder = Box<dyn FnOnce(&AppState) -> Vec<Box<dyn TunePlugin>> + Send>;
+
 /// Set every plugin up, install what they registered, and start event
 /// dispatch. Returns the routers for [`crate::routes::router`] to mount.
-pub async fn init(state: &AppState, api_base_url: &str) -> PluginRouters {
+///
+/// `extra` is registered alongside the compiled-in set, on equal terms: same
+/// protocol gate, same `plugin_{name}_enabled` switch, same registration
+/// draining. An out-of-tree plugin is not a second-class one.
+pub async fn init(
+    state: &AppState,
+    api_base_url: &str,
+    extra: Vec<Box<dyn TunePlugin>>,
+) -> PluginRouters {
     let mut loader = state.plugins.lock().await;
 
     register_builtin_plugins(&loader, state).await;
+    for plugin in extra {
+        info!(plugin_name = %plugin.name(), "plugin_registered_out_of_tree");
+        loader.register(plugin).await;
+    }
     if loader.plugin_count().await == 0 {
         return Vec::new();
     }

@@ -1,47 +1,40 @@
-//! Reusable server entry point.
+//! Server startup, as a library function.
 //!
-//! The whole bootstrap that used to live in `main.rs` (panic hook, .env,
-//! logging, port binding, state init, discovery, background tasks, axum)
-//! moved here verbatim so that *composer binaries* can run the full server
-//! with extra, out-of-tree outputs plugged in:
+//! `main.rs` is a shim over [`run`]. The point is composition: a binary that
+//! lives outside this repository can call [`run`] with its own plugins, so a
+//! closed-source plugin never needs a `path` dependency here — which would
+//! break `cargo check` for every clone, since cargo resolves optional path
+//! dependencies while writing the lockfile.
 //!
-//! ```ignore
-//! fn main() {
-//!     tune_server::run::main_blocking(tune_server::run::RunOptions {
-//!         output_providers: vec![std::sync::Arc::new(MyProvider::new())],
-//!     });
+//! ```no_run
+//! # use tune_server::state::AppState;
+//! # use tune_core::plugin_sdk::TunePlugin;
+//! # fn my_plugin(_: &AppState) -> Box<dyn TunePlugin> { unimplemented!() }
+//! #[tokio::main]
+//! async fn main() {
+//!     tune_server::run(Some(Box::new(|state: &AppState| {
+//!         vec![my_plugin(state)]
+//!     })))
+//!     .await;
 //! }
 //! ```
-//!
-//! This is the private-module seam (first consumer: tune-diretta, whose SDK
-//! licence forbids shipping in the public build): the private repo depends on
-//! this public crate, never the other way around.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::config;
-use crate::config::TuneConfig;
+use crate::config::{self, TuneConfig};
+use crate::plugins::PluginBuilder;
 use crate::routes;
 use crate::state::AppState;
 
-use tune_core::outputs::traits::OutputProvider;
-
-/// Options for [`main_blocking`]. Non-exhaustive by design: composer binaries
-/// should always spread `..Default::default()` so new knobs don't break them.
-#[derive(Default)]
-pub struct RunOptions {
-    /// Out-of-tree output sources, registered by
-    /// `discovery_setup::spawn_output_providers` alongside built-in discovery.
-    pub output_providers: Vec<Arc<dyn OutputProvider>>,
-}
-
-/// Build the tokio runtime and run the server to completion.
-/// This is `fn main()` in a callable form; it never returns in normal use.
-pub fn main_blocking(opts: RunOptions) {
+/// Start the server and serve until a shutdown signal arrives.
+///
+/// `build_plugins` is called once, after [`AppState`] is built and local
+/// outputs are registered, to produce plugins to register alongside the
+/// compiled-in ones. Pass `None` for the plain server.
+pub async fn run(build_plugins: Option<PluginBuilder>) {
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]
@@ -61,14 +54,6 @@ pub fn main_blocking(opts: RunOptions) {
         }));
     }
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(run(opts));
-}
-
-async fn run(opts: RunOptions) {
     eprintln!("tune-server starting (pid {})", std::process::id());
 
     #[cfg(windows)]
@@ -326,18 +311,17 @@ async fn run(opts: RunOptions) {
     crate::startup::register_local_outputs(&state).await;
 
     // Plugins. After local outputs so a plugin output never races the
-    // local-device scan for the same zone row; before `routes::router`,
-    // which needs the routers plugins contribute.
+    // local-device scan for the same zone row; before `routes::router`, which
+    // needs the routers plugins contribute.
     //
-    // This composer seam injects out-of-tree *outputs* via `RunOptions`
-    // (`spawn_output_providers` below), not TunePlugins, so no extra plugins
-    // are handed to `plugins::init`. The empty `Vec` matches the 3-arg
-    // `plugins::init` signature introduced on release/v0.9 (#917); the
-    // release plugin-composition path is `bootstrap::run`.
+    // `build_plugins` is where an out-of-tree binary injects its own. It runs
+    // here, and not earlier, because a plugin's host services (`services`,
+    // `backend`, `http_client`) only exist once `state` does.
+    let extra_plugins = build_plugins.map(|build| build(&state)).unwrap_or_default();
     let plugin_routers = crate::plugins::init(
         &state,
         &format!("http://127.0.0.1:{}", config.port),
-        Vec::new(),
+        extra_plugins,
     )
     .await;
 
@@ -354,10 +338,6 @@ async fn run(opts: RunOptions) {
 
     // mDNS discovery (Chromecast, AirPlay, BluOS, OAAT, Squeezebox)
     let _mdns_handle = crate::discovery_setup::spawn_mdns_handler(&state);
-
-    // Out-of-tree outputs handed in by a composer binary (e.g. tune-diretta).
-    // No-op for the stock binary: RunOptions::default() has no providers.
-    crate::discovery_setup::spawn_output_providers(&state, opts.output_providers);
 
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag

@@ -1,7 +1,10 @@
-//! Stock tune-server binary: the full bootstrap lives in `run::main_blocking`
-//! so that composer binaries (private output modules, e.g. tune-diretta) can
-//! run the same server with extra `OutputProvider`s — see tune-server/src/run.rs.
+//! Binary entry point.
+//!
+//! Deliberately empty of logic: everything lives in [`tune_server::run`] so a
+//! downstream binary can compose the same startup with its own plugins. See
+//! `bootstrap.rs`.
 
-fn main() {
-    tune_server::run::main_blocking(tune_server::run::RunOptions::default());
+#[tokio::main]
+async fn main() {
+    tune_server::run(None).await;
 }
