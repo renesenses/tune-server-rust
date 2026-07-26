@@ -494,3 +494,119 @@ mod probe_tests {
         ));
     }
 }
+
+/// Regression tests for forum bug #1185: Chromecast devices presenting a
+/// self-signed X.509 **v1** certificate were rejected during the TLS
+/// handshake with `invalid peer certificate: Other(OtherError(
+/// UnsupportedCertVersion))` — rustls-webpki refuses to parse v1 certs, so
+/// the stock signature-verification helpers failed before rust_cast's
+/// accept-everything `verify_server_cert` was even relevant. Fixed by the
+/// vendored rust_cast patch (vendor/rust_cast, `accept_unparseable_cert`).
+#[cfg(test)]
+mod cast_tls_tests {
+    use rust_cast::NoCertificateVerification;
+    use rustls::DigitallySignedStruct;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::internal::msgs::codec::{Codec, Reader};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    /// Genuine X.509 v1 self-signed cert (what 1st/2nd-gen Chromecasts and
+    /// Chromecast Audio present).
+    const CERT_V1: &[u8] = include_bytes!("../../tests/fixtures/chromecast_x509_v1.der");
+    /// X.509 v3 control cert (parseable by webpki).
+    const CERT_V3: &[u8] = include_bytes!("../../tests/fixtures/chromecast_x509_v3.der");
+
+    /// DigitallySignedStruct::new is pub(crate); build one through the wire
+    /// codec: scheme (u16) + u16-length-prefixed signature bytes.
+    fn dummy_dss(scheme: u16) -> DigitallySignedStruct {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&scheme.to_be_bytes());
+        bytes.extend_from_slice(&256u16.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 256]);
+        DigitallySignedStruct::read(&mut Reader::init(&bytes)).unwrap()
+    }
+
+    /// rsa_pkcs1_sha256 — what a TLS 1.2 Chromecast handshake uses.
+    const RSA_PKCS1_SHA256: u16 = 0x0401;
+    /// rsa_pss_rsae_sha256 — a scheme valid in TLS 1.3.
+    const RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+
+    #[test]
+    fn stock_helper_rejects_v1_cert_proving_the_bug() {
+        // Control: the unpatched code path (rustls' own helper) fails on the
+        // v1 cert at *parse* time — this is exactly the #1185 failure mode.
+        let cert = CertificateDer::from(CERT_V1);
+        let err = rustls::crypto::verify_tls12_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PKCS1_SHA256),
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(_))
+            ),
+            "expected UnsupportedCertVersion-class parse error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn patched_verifier_accepts_v1_cert_tls12() {
+        let cert = CertificateDer::from(CERT_V1);
+        let res = NoCertificateVerification.verify_tls12_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PKCS1_SHA256),
+        );
+        assert!(
+            res.is_ok(),
+            "v1 cert must be tolerated (LAN, unverified): {res:?}"
+        );
+    }
+
+    #[test]
+    fn patched_verifier_accepts_v1_cert_tls13() {
+        let cert = CertificateDer::from(CERT_V1);
+        let res = NoCertificateVerification.verify_tls13_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PSS_RSAE_SHA256),
+        );
+        assert!(
+            res.is_ok(),
+            "v1 cert must be tolerated (LAN, unverified): {res:?}"
+        );
+    }
+
+    #[test]
+    fn patched_verifier_still_rejects_bad_signature_on_parseable_cert() {
+        // The patch must NOT blanket-accept: a parseable (v3) cert with a
+        // garbage signature keeps failing the standard signature check.
+        let cert = CertificateDer::from(CERT_V3);
+        let res = NoCertificateVerification.verify_tls12_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PKCS1_SHA256),
+        );
+        assert!(
+            res.is_err(),
+            "bad signature on parseable cert must still fail"
+        );
+    }
+
+    #[test]
+    fn verify_server_cert_accepts_v1_cert() {
+        let cert = CertificateDer::from(CERT_V1);
+        let server_name = ServerName::try_from("192.168.1.75").unwrap();
+        let res = NoCertificateVerification.verify_server_cert(
+            &cert,
+            &[],
+            &server_name,
+            &[],
+            UnixTime::now(),
+        );
+        assert!(res.is_ok());
+    }
+}

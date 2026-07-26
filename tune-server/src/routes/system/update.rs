@@ -275,10 +275,19 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
 
         // Guard: refuse update if current binary has postgres but new one doesn't
         if cfg!(feature = "postgres") {
+            // Detect postgres support in the DOWNLOADED binary via a string that
+            // only a `--features postgres` build compiles in: the
+            // `info!("postgres_backend_ready")` log lives in the
+            // `#[cfg(feature = "postgres")]` branch of state.rs. The previous
+            // markers were inverted — "PostgreSQL engine requested" is emitted
+            // ONLY by the `cfg(not(feature="postgres"))` fallback (so a PG binary
+            // *lacked* it) and "postgresql://" is nowhere in the code — so every
+            // update on a PG server (.15) was wrongly blocked while a non-PG
+            // binary would have passed. Keep this marker a PG-ONLY literal.
             let new_has_pg = std::fs::read(&new_binary)
                 .map(|bytes| {
                     let s = String::from_utf8_lossy(&bytes);
-                    s.contains("postgresql://") || s.contains("PostgreSQL engine requested")
+                    s.contains("postgres_backend_ready")
                 })
                 .unwrap_or(false);
             if !new_has_pg {

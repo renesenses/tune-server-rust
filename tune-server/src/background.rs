@@ -813,7 +813,7 @@ fn spawn_heartbeat(state: &AppState) {
             // Refresh the account premium (SSO) from /api/v1/user so a lapsed
             // subscription is picked up without waiting for the offline grace or
             // a re-login. No-op when not connected. Never blocks the heartbeat.
-            refresh_account_premium(&backend, &license).await;
+            refresh_account_premium(&backend, &license, &services).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
@@ -827,6 +827,7 @@ fn spawn_heartbeat(state: &AppState) {
 async fn refresh_account_premium(
     backend: &Arc<dyn tune_core::db::backend::DbBackend>,
     license: &Arc<tune_core::license::LicenseManager>,
+    services: &Arc<tokio::sync::Mutex<tune_core::streaming::ServiceRegistry>>,
 ) {
     use tune_core::cloud::sso::{DEFAULT_CLIENT_ID, MozaikAuth};
 
@@ -888,7 +889,30 @@ async fn refresh_account_premium(
         license
             .set_account_premium(user.premium, user.license_expires_at.clone())
             .await;
+        // Propagate the Qobuz endpoint order (founder flag) so a change picked
+        // up by a re-validation reaches the live QobuzService immediately.
+        license.set_qobuz_proxy_first(user.qobuz_proxy_first).await;
+        apply_qobuz_proxy_first(services, user.qobuz_proxy_first).await;
         debug!(premium = user.premium, "mozaik_account_premium_refreshed");
+    }
+}
+
+/// Push the license-signalled Qobuz endpoint order into the live QobuzService
+/// (same downcast pattern as `configure_deezer_proxy`). No-op if the service
+/// isn't registered.
+pub async fn apply_qobuz_proxy_first(
+    services: &Arc<tokio::sync::Mutex<tune_core::streaming::ServiceRegistry>>,
+    proxy_first: bool,
+) {
+    let registry = services.lock().await;
+    if let Some(svc) = registry.get("qobuz") {
+        let mut svc = svc.lock().await;
+        if let Some(qobuz) = svc
+            .as_any_mut()
+            .downcast_mut::<tune_core::streaming::qobuz::QobuzService>()
+        {
+            qobuz.set_proxy_first(proxy_first);
+        }
     }
 }
 

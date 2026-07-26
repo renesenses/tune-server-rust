@@ -29,6 +29,11 @@ pub struct CloudUser {
     /// Subscription end for the account premium (ISO-8601), when known.
     #[serde(default)]
     pub license_expires_at: Option<String>,
+    /// Qobuz endpoint order for this account: `true` = route Qobuz through the
+    /// mozaiklabs proxy first (founder account). Absent on older servers →
+    /// defaults to false (direct-first for every user).
+    #[serde(default)]
+    pub qobuz_proxy_first: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +255,36 @@ fn base64url_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_user_parses_without_qobuz_proxy_first() {
+        // Retro-compat: older servers omit the field → direct-first.
+        let json = r#"{
+            "id": 1,
+            "email": "a@b.fr",
+            "display_name": "A",
+            "is_admin": false,
+            "avatar_url": null
+        }"#;
+        let user: CloudUser = serde_json::from_str(json).unwrap();
+        assert!(!user.qobuz_proxy_first);
+        assert!(!user.premium);
+    }
+
+    #[test]
+    fn cloud_user_parses_with_qobuz_proxy_first() {
+        let json = r#"{
+            "id": 1,
+            "email": "a@b.fr",
+            "display_name": "A",
+            "is_admin": false,
+            "avatar_url": null,
+            "premium": true,
+            "qobuz_proxy_first": true
+        }"#;
+        let user: CloudUser = serde_json::from_str(json).unwrap();
+        assert!(user.qobuz_proxy_first);
+    }
 
     #[test]
     fn authorize_url_format() {

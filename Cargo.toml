@@ -8,7 +8,7 @@ exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.13"
+version = "0.9.14"
 edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
@@ -63,6 +63,15 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 dotenvy = "0.15"
+
+# Chromecast fix (#1185): rust_cast 0.21.0 with a patched TLS verifier that
+# tolerates the X.509 v1 self-signed certificates presented by older
+# Chromecast devices (rustls-webpki refuses to parse v1 certs, so the stock
+# signature-verification helpers abort the handshake with
+# `UnsupportedCertVersion` even under connect_without_host_verification).
+# See vendor/rust_cast/src/lib.rs, `accept_unparseable_cert`.
+[patch.crates-io]
+rust_cast = { path = "vendor/rust_cast" }
 
 [profile.dev]
 opt-level = 0

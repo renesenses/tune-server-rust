@@ -394,6 +394,10 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
         while let Some(event) = mdns_rx.recv().await {
             match event {
                 MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
+                    // Set when an AirPlay 2 device falls back to the legacy
+                    // AirPlay output (daemon unavailable / deviceid unknown):
+                    // the output is registered but no zone is auto-created.
+                    let mut airplay_v2_fallback = false;
                     let (output, output_type_str): (
                         Option<Box<dyn tune_core::outputs::OutputTarget>>,
                         &str,
@@ -445,6 +449,18 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 info!(name = %dev.name, "airplay2_output_registered");
                                 (Some(Box::new(ap2)), "airplay2")
                             } else {
+                                if is_v2 {
+                                    // An AirPlay 2 device served by the legacy
+                                    // path is a dead end: these devices demand
+                                    // the pairing only the airplay2 daemon can
+                                    // perform, so every ANNOUNCE gets a 403
+                                    // (forum #1183, Samsung S95BA TV). Register
+                                    // the output so a manually created zone can
+                                    // still target it, but never auto-create a
+                                    // zone for it (#788 already intended "skip
+                                    // v2 zone if daemon absent").
+                                    airplay_v2_fallback = true;
+                                }
                                 let ap = tune_core::outputs::airplay::AirplayOutput::new(
                                     dev.name.clone(),
                                     dev.id.clone(),
@@ -535,6 +551,14 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                     "name": &dev.name,
                                 }),
                             );
+                        } else if airplay_v2_fallback {
+                            // No existing zone for this device and the legacy
+                            // AirPlay fallback can never play on it (v2 pairing
+                            // required → ANNOUNCE 403): don't auto-create a
+                            // guaranteed-dead zone, and don't let it capture an
+                            // existing same-name/same-host zone of another
+                            // protocol either (forum #1183).
+                            info!(name = %dev.name, id = %dev.id, "mdns_zone_skipped_airplay_v2_fallback");
                         } else {
                             let existing = zone_repo.list().unwrap_or_default();
 
@@ -600,8 +624,44 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                     set_zone_online(&event_bus, &db, &dev.id, true);
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
                                 } else {
-                                    // Check zone_auto_create setting
-                                    let auto_create =
+                                    // Cross-protocol dedup (forum #1183): the
+                                    // same physical device may already be a
+                                    // zone through another protocol — e.g. a
+                                    // Samsung S95BA TV present as a (renamed)
+                                    // DLNA zone that also announces AirPlay
+                                    // over mDNS. Match against the output
+                                    // registry (same name + same host across
+                                    // protocols) AND against existing zones by
+                                    // the REAL host of their registered output
+                                    // (`host_of`, robust for DLNA `uuid:…`
+                                    // device_ids the old "{type}-{host}-{port}"
+                                    // parsing mangled) or by case-insensitive
+                                    // name. Skip zone creation on conflict.
+                                    let registry_conflicts = reg.conflicting_outputs_same_host(
+                                        &dev.name,
+                                        output_type_str,
+                                        &dev.host,
+                                    );
+                                    let zone_conflict = find_cross_protocol_zone_conflict(
+                                        &existing,
+                                        |id| reg.host_of(id),
+                                        &dev.name,
+                                        &dev.host,
+                                        output_type_str,
+                                    );
+                                    if !registry_conflicts.is_empty() || zone_conflict.is_some() {
+                                        info!(
+                                            name = %dev.name,
+                                            id = %dev.id,
+                                            host = %dev.host,
+                                            r#type = output_type_str,
+                                            registry_conflicts = ?registry_conflicts,
+                                            conflicting_zone = ?zone_conflict.map(|z| z.name.as_str()),
+                                            "mdns_zone_skipped_conflicting_protocol"
+                                        );
+                                    } else {
+                                        // Check zone_auto_create setting
+                                        let auto_create =
                                         tune_core::db::settings_repo::SettingsRepo::with_backend(
                                             db.clone(),
                                         )
@@ -610,35 +670,38 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                         .flatten()
                                         .map(|v| v != "false")
                                         .unwrap_or(true);
-                                    if !auto_create {
-                                        info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
-                                    } else {
-                                        // Auto-created zones start dormant; the
-                                        // free-tier cap is enforced at first play.
-                                        {
-                                            match zone_repo.get_or_create(
-                                                &dev.name,
-                                                Some(output_type_str),
-                                                &dev.id,
-                                            ) {
-                                                Ok((zid, true)) => {
-                                                    event_bus.emit_typed(
-                                                        EventType::ZoneCreated,
-                                                        serde_json::json!({
-                                                            "zone_id": zid,
-                                                            "name": dev.name,
-                                                            "device_id": dev.id,
-                                                            "type": output_type_str,
-                                                        }),
-                                                    );
-                                                    info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
-                                                }
-                                                Ok((zid, false)) => {
-                                                    set_zone_online(&event_bus, &db, &dev.id, true);
-                                                    info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                        if !auto_create {
+                                            info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
+                                        } else {
+                                            // Auto-created zones start dormant; the
+                                            // free-tier cap is enforced at first play.
+                                            {
+                                                match zone_repo.get_or_create(
+                                                    &dev.name,
+                                                    Some(output_type_str),
+                                                    &dev.id,
+                                                ) {
+                                                    Ok((zid, true)) => {
+                                                        event_bus.emit_typed(
+                                                            EventType::ZoneCreated,
+                                                            serde_json::json!({
+                                                                "zone_id": zid,
+                                                                "name": dev.name,
+                                                                "device_id": dev.id,
+                                                                "type": output_type_str,
+                                                            }),
+                                                        );
+                                                        info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                                    }
+                                                    Ok((zid, false)) => {
+                                                        set_zone_online(
+                                                            &event_bus, &db, &dev.id, true,
+                                                        );
+                                                        info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                                    }
                                                 }
                                             }
                                         }
@@ -761,9 +824,154 @@ async fn probe_airplay_for_bluos(
     }
 }
 
+/// An existing zone that already exposes the same physical device through a
+/// DIFFERENT protocol, if any. Used by the mDNS auto-create path to avoid
+/// presenting one device as two zones (forum #1183: a Samsung S95BA TV already
+/// present as a renamed DLNA zone also announces AirPlay over mDNS; the
+/// auto-created legacy AirPlay zone was dead — the TV requires AirPlay 2
+/// pairing).
+///
+/// A zone conflicts when its `output_type` differs from `new_type` AND either:
+/// - the REAL host of its registered output equals `dev_host` — the host is
+///   resolved through `resolve_host` (normally [`OutputRegistry::host_of`],
+///   which recorded the output's `host()` at registration). This is robust for
+///   DLNA zones whose `output_device_id` is a `uuid:…` string, which the old
+///   `"{type}-{host}-{port}"` `splitn` parsing mangled into a UUID fragment; or
+/// - the zone name equals the device name case-insensitively (a same-name
+///   zone of another protocol, even if its output isn't registered yet).
+///
+/// [`OutputRegistry::host_of`]: tune_core::outputs::registry::OutputRegistry::host_of
+fn find_cross_protocol_zone_conflict<'a>(
+    zones: &'a [tune_core::db::zone_repo::Zone],
+    resolve_host: impl Fn(&str) -> Option<String>,
+    dev_name: &str,
+    dev_host: &str,
+    new_type: &str,
+) -> Option<&'a tune_core::db::zone_repo::Zone> {
+    zones.iter().find(|z| {
+        let zone_type = z.output_type.as_deref().unwrap_or("");
+        if zone_type.is_empty() || zone_type.eq_ignore_ascii_case(new_type) {
+            return false;
+        }
+        let same_host = z
+            .output_device_id
+            .as_deref()
+            .and_then(&resolve_host)
+            .is_some_and(|h| h.eq_ignore_ascii_case(dev_host));
+        same_host || z.name.eq_ignore_ascii_case(dev_name)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_control_url;
+    use super::{find_cross_protocol_zone_conflict, resolve_control_url};
+    use tune_core::db::zone_repo::Zone;
+
+    fn zone(name: &str, output_type: &str, device_id: &str) -> Zone {
+        Zone {
+            id: Some(1),
+            name: name.to_string(),
+            output_type: Some(output_type.to_string()),
+            output_device_id: Some(device_id.to_string()),
+            volume: 50,
+            muted: false,
+            online: true,
+            gapless_enabled: true,
+            group_id: None,
+            sync_delay_ms: 0,
+            last_position_ms: 0,
+            last_track_id: None,
+            last_track_source: None,
+            last_track_source_id: None,
+            max_sample_rate: None,
+            fixed_volume: false,
+            autoplay_enabled: false,
+        }
+    }
+
+    /// Forum #1183: a Samsung S95BA TV is already a DLNA zone — renamed by the
+    /// user, with a `uuid:…` device_id (so neither the exact-name dedup nor the
+    /// old `splitn('-')` host extraction can match it) — and then announces
+    /// AirPlay over mDNS at the same host. The conflict must be detected via
+    /// the output registry's real host so no second (dead) zone is created.
+    #[test]
+    fn dlna_uuid_zone_conflicts_with_airplay_arrival_on_same_host() {
+        let zones = vec![zone(
+            "TV Salon", // renamed: name no longer matches the device name
+            "dlna",
+            "uuid:3a4eedf4-1bf0-4c9a-9c2b-0123456789ab",
+        )];
+        let resolve = |id: &str| {
+            (id == "uuid:3a4eedf4-1bf0-4c9a-9c2b-0123456789ab").then(|| "192.168.1.42".to_string())
+        };
+        let hit = find_cross_protocol_zone_conflict(
+            &zones,
+            resolve,
+            "Samsung S95BA",
+            "192.168.1.42",
+            "airplay",
+        );
+        assert_eq!(hit.map(|z| z.name.as_str()), Some("TV Salon"));
+
+        // A different host is NOT a conflict.
+        assert!(
+            find_cross_protocol_zone_conflict(
+                &zones,
+                resolve,
+                "Samsung S95BA",
+                "192.168.1.99",
+                "airplay",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn same_protocol_never_conflicts() {
+        // Two AirPlay devices on the same host (e.g. an AV receiver exposing
+        // several inputs) must not dedup against their own protocol.
+        let zones = vec![zone("Ampli HC", "airplay", "airplay-192.168.1.42-7000")];
+        let resolve = |_: &str| Some("192.168.1.42".to_string());
+        assert!(
+            find_cross_protocol_zone_conflict(
+                &zones,
+                resolve,
+                "Ampli HC Zone 2",
+                "192.168.1.42",
+                "airplay",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn case_insensitive_name_conflicts_even_without_registered_output() {
+        // The zone's output isn't registered (host unresolvable), but the name
+        // matches case-insensitively across protocols → still a conflict.
+        let zones = vec![zone("Samsung S95BA", "dlna", "uuid:dead-beef")];
+        let resolve = |_: &str| None;
+        assert!(
+            find_cross_protocol_zone_conflict(
+                &zones,
+                resolve,
+                "SAMSUNG s95ba",
+                "192.168.1.42",
+                "airplay",
+            )
+            .is_some()
+        );
+        // Different name + unresolvable host → no conflict.
+        assert!(
+            find_cross_protocol_zone_conflict(
+                &zones,
+                resolve,
+                "Chambre",
+                "192.168.1.42",
+                "airplay",
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn relative_control_url_joins_host_port() {
