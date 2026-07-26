@@ -12,6 +12,17 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::event_bus::EventBus;
 use tune_core::scanner::walker::ScannedFile;
 
+/// Resets `scan_status` to "idle" on every exit path of the startup scan —
+/// normal completion, early return, or a panic unwind — so the desktop app's
+/// scan banner + "Arrêter le scan" button never stick on forever (#1197/#1196).
+struct ScanStatusGuard(Arc<dyn DbBackend>);
+impl Drop for ScanStatusGuard {
+    fn drop(&mut self) {
+        let _ = tune_core::db::settings_repo::SettingsRepo::with_backend(self.0.clone())
+            .set("scan_status", "idle");
+    }
+}
+
 /// Build a `Track` from scanned file metadata, resolving artist/album in the DB.
 ///
 /// Returns `(track, album_id, is_compilation)` or `None` if metadata is missing.
@@ -218,6 +229,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
 
+        // Make the startup scan first-class, exactly like the manual one:
+        // advertise it via `scan_status` and honour the shared cancel flag.
+        // Previously the boot-time scan set neither, so on the desktop app it ran
+        // with no progress banner and no working "Arrêter le scan" button — the
+        // client's on-mount getScanStatus() saw "idle" and the cancel endpoint
+        // had nothing to stop (#1197 Benjithom / #1196). The guard resets to idle
+        // on every exit path (incl. panic unwind).
+        crate::routes::system::scan::reset_scan_cancel();
+        let _ = settings.set("scan_status", "scanning");
+        let _scan_status_guard = ScanStatusGuard(db.clone());
+
         // NFC-normalized set of every path found on disk this scan. Used after
         // the scan to prune tracks whose files were deleted while the server was
         // stopped (Symptom 2: deleted albums persist). Normalization matches how
@@ -319,6 +341,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             true,
             tune_core::scanner::walker::SCAN_BATCH_SIZE,
             |batch, batch_idx, _total_files| {
+                // Cooperative cancellation: once "Arrêter le scan" was pressed,
+                // skip all remaining batches so the startup scan drains quickly
+                // (same pattern as the manual scan, #1129/#1197).
+                if crate::routes::system::scan::scan_cancel_requested() {
+                    return;
+                }
                 let mut to_insert: Vec<Track> = Vec::with_capacity(batch.len());
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
 

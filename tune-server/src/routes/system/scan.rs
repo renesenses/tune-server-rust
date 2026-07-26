@@ -22,6 +22,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// `false` at the start of every scan.
 static SCAN_CANCEL: AtomicBool = AtomicBool::new(false);
 
+/// Clear the cancel flag at the start of a scan. Shared with the startup
+/// (auto) scan so "Arrêter le scan" works there too (#1197/#1196).
+pub(crate) fn reset_scan_cancel() {
+    SCAN_CANCEL.store(false, Ordering::SeqCst);
+}
+
+/// Whether "Stop scan" was requested. Polled by both the manual and the startup
+/// scan batch loops so either can be cancelled cooperatively.
+pub(crate) fn scan_cancel_requested() -> bool {
+    SCAN_CANCEL.load(Ordering::SeqCst)
+}
+
 #[derive(Deserialize)]
 pub(super) struct ScanQuery {
     /// When true, re-process ALL discovered files (bypass the unchanged-file

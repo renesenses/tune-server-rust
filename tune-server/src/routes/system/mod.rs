@@ -13,7 +13,7 @@ mod import;
 mod playlist_hub;
 mod plugins;
 mod remote;
-mod scan;
+pub(crate) mod scan;
 mod tags;
 mod update;
 mod youtube;
