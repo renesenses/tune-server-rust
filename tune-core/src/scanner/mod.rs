@@ -25,9 +25,12 @@ mod tune_temp_file_tests {
 
     #[test]
     fn matches_stream_and_prefetch_names_anywhere() {
+        // Windows separators only parse as separators on Windows.
+        #[cfg(windows)]
         assert!(is_tune_temp_file(Path::new(
             "C:\\Users\\U\\AppData\\Local\\Temp\\tune-stream-abc.flac"
         )));
+        assert!(is_tune_temp_file(Path::new("/music/tune-stream-abc.flac")));
         assert!(is_tune_temp_file(Path::new(
             "/music/tune-prefetch-xyz.flac"
         )));
