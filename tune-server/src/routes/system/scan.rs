@@ -117,7 +117,7 @@ pub(super) async fn trigger_scan(
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
 /// folders stayed invisible until the app was restarted).
-pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
+pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
