@@ -152,6 +152,27 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let files = list_result.files;
         let total_discovered = files.len();
 
+        // Announce the scan the moment the file list is known — BEFORE the stat
+        // pre-filter and the existing-tracks load, which on a huge NAS still take a
+        // little time. Without this the panel sat at "0 fichiers" through the whole
+        // pre-filter and read as "interminable sans résultat" (Alain Bonnel #1194).
+        event_bus.emit(
+            "library.scan.started",
+            json!({ "music_dirs": &music_dirs, "total": total_discovered }),
+        );
+        event_bus.emit(
+            "library.scan.progress",
+            json!({
+                "phase": "scanning",
+                "scanned": 0i64,
+                "added": 0i64,
+                "total": total_discovered as i64,
+                "inserted": 0i64,
+                "updated": 0i64,
+                "skipped": 0i64,
+            }),
+        );
+
         let discovered_paths: std::collections::HashSet<String> = files
             .iter()
             .map(|p| p.to_string_lossy().nfc().collect::<String>())
@@ -173,34 +194,43 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // Load existing tracks BEFORE scanning to skip unchanged files
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
 
-        // Quick stat pass: skip files whose mtime+size haven't changed
-        let files_to_scan: Vec<std::path::PathBuf> = files
-            .into_iter()
-            .filter(|path| {
-                // Force mode: re-process everything so album_id is re-resolved.
-                if force {
-                    return true;
-                }
-                let path_str = path.to_string_lossy();
-                if let Some(&(_, existing_mtime, existing_size)) =
-                    existing_tracks.get(path_str.as_ref())
-                {
-                    if let Ok(file_meta) = path.metadata() {
-                        let mtime = file_meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let unchanged = existing_mtime
-                            .map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
-                            && existing_size.map_or(false, |s| s == file_meta.len() as i64);
-                        return !unchanged;
-                    }
-                }
-                true
-            })
-            .collect();
+        // Quick stat pass: skip files whose mtime+size haven't changed.
+        // Parallelized over a 32-thread pool — on a large NAS/SMB library this is
+        // one stat() round-trip per file, and single-threaded it was 58k+ serial
+        // round-trips (~hours) before the first batch even started, reading as an
+        // "interminable scan sans résultat" (Alain Bonnel #1194). auto_scan already
+        // runs this pass on the same oversubscribed pool; the manual scan path was
+        // never given the same treatment.
+        use rayon::prelude::*;
+        let is_changed = |path: &std::path::Path| -> bool {
+            // Force mode: re-process everything so album_id is re-resolved.
+            if force {
+                return true;
+            }
+            let path_str = path.to_string_lossy();
+            if let Some(&(_, existing_mtime, existing_size)) =
+                existing_tracks.get(path_str.as_ref())
+                && let Ok(file_meta) = path.metadata()
+            {
+                let mtime = file_meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let unchanged = existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
+                    && existing_size.map_or(false, |s| s == file_meta.len() as i64);
+                return !unchanged;
+            }
+            true
+        };
+        let stat_pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().ok();
+        let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
+            Some(pool) => {
+                pool.install(|| files.into_par_iter().filter(|p| is_changed(p)).collect())
+            }
+            None => files.into_iter().filter(|p| is_changed(p)).collect(),
+        };
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
 
         tracing::info!(
