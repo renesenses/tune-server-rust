@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 tune-output-api = { path = "../tune-output-api" }
+# Only for the plugin SDK's router registration — see the `plugin-http` feature.
+axum = { workspace = true, optional = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -76,6 +78,10 @@ harness = false
 [features]
 default = ["local-audio"]
 local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
+# Lets plugins mount HTTP routes through `PluginContext::register_router`.
+# Gated so tune-cli — which links tune-core but serves no HTTP — does not
+# have to build axum. tune-server enables it.
+plugin-http = ["dep:axum"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]

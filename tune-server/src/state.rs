@@ -57,6 +57,10 @@ pub struct AppState {
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
     pub license: Arc<tune_core::license::LicenseManager>,
     pub skin_manager: Arc<tune_core::skins::SkinManager>,
+    /// Compiled-in plugins. Empty until [`crate::plugins::init`] runs, which
+    /// happens after local outputs are registered and before the router is
+    /// built. See [`crate::plugins`].
+    pub plugins: Arc<Mutex<tune_core::plugin_sdk::PluginLoader>>,
     #[cfg(feature = "cloud-relay")]
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
@@ -174,6 +178,11 @@ impl AppState {
         ));
         skin_manager.ensure_dirs();
 
+        let plugins = Arc::new(Mutex::new(crate::plugins::build_loader(
+            &event_bus,
+            backend.clone(),
+        )));
+
         Ok(Self {
             db,
             backend,
@@ -201,6 +210,7 @@ impl AppState {
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             license,
             skin_manager,
+            plugins,
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })
