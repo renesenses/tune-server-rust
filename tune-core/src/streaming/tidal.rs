@@ -221,6 +221,83 @@ impl TidalService {
                 .map_err(|e| format!("tmp write init: {e}"))?;
         }
 
+        // Streaming DASH (#1146 Plan C step 2): with TUNE_DASH_STREAM_DECODE, hand
+        // a growth handle to the decoder and download the media segments in the
+        // BACKGROUND, so the FLAC transcode can start on the init segment and
+        // consume fragments as they land — overlapping the download under the
+        // transcode. Return the temp path immediately (only the init is present).
+        if crate::audio::dash_growth::stream_decode_enabled() {
+            use std::io::Write;
+            let init_len = init_data.len() as u64;
+            let growth = crate::audio::dash_growth::DashGrowth::new(init_len);
+            crate::audio::dash_growth::register(&tmp_path, growth.clone());
+
+            // Open the append handle NOW, before returning: the orchestrator
+            // renames the temp to `{path}.decoding` right after we return, and an
+            // FD bound to the inode here survives that rename (POSIX), whereas the
+            // background task might otherwise try to open a path that's gone.
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("tmp reopen (stream): {e}"))?;
+            let client = self.client.clone();
+            let seg = segments.clone();
+            let track_bg = track_id.to_string();
+            let path_bg = tmp_path.clone();
+
+            tokio::spawn(async move {
+                let mut written = init_len;
+                let mut failed = 0u32;
+                for i in 0..seg.segment_count {
+                    let seg_number = seg.start_number + i;
+                    let seg_url = seg
+                        .media_template
+                        .replace("$Number$", &seg_number.to_string());
+                    match client.get(&seg_url).send().await {
+                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                            Ok(data) => {
+                                if let Err(e) = file.write_all(&data) {
+                                    warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_write_failed");
+                                    growth.fail();
+                                    return;
+                                }
+                                written += data.len() as u64;
+                                // Publish the new write frontier so the decoder
+                                // can consume the just-landed fragment.
+                                growth.advance(written);
+                            }
+                            Err(e) => {
+                                warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_segment_read_failed");
+                                failed += 1;
+                            }
+                        },
+                        Ok(resp) => {
+                            warn!(track_id = %track_bg, segment = seg_number, status = resp.status().as_u16(), "tidal_dash_stream_segment_http_error");
+                            failed += 1;
+                        }
+                        Err(e) => {
+                            warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_segment_fetch_error");
+                            failed += 1;
+                        }
+                    }
+                }
+                if failed >= seg.segment_count {
+                    growth.fail();
+                } else {
+                    growth.finish();
+                }
+                debug!(track_id = %track_bg, path = %path_bg, written, failed, "tidal_dash_streaming_download_done");
+            });
+
+            info!(
+                track_id,
+                path = tmp_path.as_str(),
+                segment_count = total,
+                "tidal_dash_streaming_download_started"
+            );
+            return Ok(tmp_path);
+        }
+
         // Download media segments sequentially and append to file.
         // Sequential to avoid overwhelming Tidal CDN and to maintain order.
         // For a typical 3-4 min track at 96kHz/24bit, there are ~54 segments

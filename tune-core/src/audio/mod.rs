@@ -3,6 +3,7 @@ pub mod analyzer;
 pub mod ape;
 pub mod channels;
 pub mod convolver;
+pub mod dash_growth;
 pub mod decode;
 pub mod dff;
 pub mod dsd_to_dop;
