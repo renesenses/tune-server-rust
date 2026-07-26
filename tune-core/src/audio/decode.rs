@@ -1167,8 +1167,19 @@ fn decode_symphonia(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    // Streaming DASH (#1146 Plan C step 2): if a background task is still
+    // appending this fMP4, decode it as it grows via a blocking MediaSource
+    // instead of a plain File (which would EOF-truncate at the write frontier).
+    // Registry is empty unless TUNE_DASH_STREAM_DECODE armed a download — then
+    // this is byte-identical to the File path.
+    let mss = if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        let src = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
+            .map_err(|e| format!("open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(src), Default::default())
+    } else {
+        let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
 
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
