@@ -966,8 +966,17 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    if let Err(e) = set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
-        warn!(zone_id, error = %e, "set_queue_failed");
+    match set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
+        Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
+        Err(e) => {
+            // Never proceed on the STALE queue: track 1 would play now and the
+            // natural-end advance would then resurrect whatever the DB still
+            // holds from yesterday (Villerio: album play drifting into old
+            // Qobuz autoplay leftovers). An emptied queue stops cleanly at the
+            // end of track 1 instead — the lesser evil, and diagnosable.
+            warn!(zone_id, error = %e, "set_queue_failed_clearing");
+            let _ = queue_repo.clear(zone_id);
+        }
     }
 
     // When a container (album/playlist) is requested alongside a track_id,
@@ -2387,7 +2396,17 @@ pub async fn shuffle_all(
     all_ids.truncate(SHUFFLE_MAX_TRACKS as usize);
 
     let zone_id = q.zone_id.unwrap_or(1);
-    queue_repo.set_queue(zone_id, &all_ids).ok();
+    // Was `.ok()` — the only call site that swallowed a set_queue failure
+    // with no trace: track 1 played while the STALE queue stayed in the DB,
+    // and the natural-end advance then resurrected yesterday's entries
+    // (Villerio: album play continued into old Qobuz autoplay leftovers).
+    match queue_repo.set_queue(zone_id, &all_ids) {
+        Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
+        Err(e) => {
+            warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
+            let _ = queue_repo.clear(zone_id);
+        }
+    }
 
     let first_id = all_ids[0];
     let track = track_repo.get(first_id).ok().flatten();

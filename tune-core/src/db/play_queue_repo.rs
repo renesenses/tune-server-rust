@@ -402,6 +402,13 @@ impl PlayQueueRepo {
 
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
         let delete_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
+        // set_queue is a FULL replacement of the zone's queue: the streaming
+        // subset must go too. It only deleted the local subset, so streaming
+        // rows (autoplay leftovers, old streaming albums) were IMMORTAL —
+        // every subsequent album/playlist play interleaved its tracks with
+        // yesterday's ghosts by position (Villerio: 10 DSD tracks woven into
+        // 77 stale Qobuz autoplay entries; likely forum #1202/#1049 too).
+        let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
         // Guarded insert: only enqueue a track that still exists. A queue
         // persisted before a rescan can reference tracks deleted since — the
         // first missing id would raise "FOREIGN KEY constraint failed" and roll
@@ -424,6 +431,7 @@ impl PlayQueueRepo {
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             tx.execute(&delete_sql, &p)?;
+            tx.execute(&delete_streaming_sql, &p)?;
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = i as i64;
                 let is_current = if i == 0 { 1i64 } else { 0i64 };
@@ -949,6 +957,54 @@ mod tests {
 
         repo.clear(1).unwrap();
         assert_eq!(repo.count(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn set_queue_purges_streaming_leftovers() {
+        // Streaming rows (track_id NULL) used to survive set_queue — autoplay
+        // leftovers were IMMORTAL and interleaved with every later album play
+        // (Villerio: 10 DSD tracks woven into 77 stale Qobuz entries).
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+
+        repo.append_streaming_queue(
+            1,
+            &[
+                (
+                    "qobuz".into(),
+                    "111".into(),
+                    "Ghost One".into(),
+                    None,
+                    None,
+                    None,
+                    200_000,
+                    None,
+                ),
+                (
+                    "qobuz".into(),
+                    "222".into(),
+                    "Ghost Two".into(),
+                    None,
+                    None,
+                    None,
+                    200_000,
+                    None,
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(repo.count_all(1).unwrap(), 2);
+
+        let mut t = Track::new("Real Local".into());
+        t.file_path = Some("/real.dsf".into());
+        let tid = track_repo.create(&t).unwrap();
+        repo.set_queue(1, &[tid]).unwrap();
+
+        // Full replacement: the ghosts are gone, only the local track remains.
+        assert_eq!(repo.count_all(1).unwrap(), 1);
+        let current = repo.get_current(1).unwrap().unwrap();
+        assert_eq!(current.track_id, tid);
     }
 
     #[test]
