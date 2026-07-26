@@ -217,6 +217,16 @@ IdleAction=ignore
 EOF
 chroot "$ROOTFS" systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
 
+# Autologin console : l'utilisateur ne tape jamais de mot de passe sur la box
+# (retour Gil : « le mot de passe, je vois pas trop pourquoi »). Le mot de
+# passe reste requis pour SSH et sudo.
+mkdir -p "${ROOTFS}/etc/systemd/system/getty@tty1.service.d"
+cat > "${ROOTFS}/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin tune --noclear %I $TERM
+EOF
+
 # USB storage: auto-mount partitions under /media/<kernel> (headless, no udisks
 # session). exFAT/NTFS/FAT mount root-owned world-readable — enough for scanning.
 mkdir -p "${ROOTFS}/media"
