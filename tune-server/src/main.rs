@@ -287,6 +287,12 @@ async fn main() {
     #[cfg(feature = "local-audio")]
     tune_server::startup::register_local_outputs(&state).await;
 
+    // Plugins. After local outputs so a plugin output never races the
+    // local-device scan for the same zone row; before `routes::router`,
+    // which needs the routers plugins contribute.
+    let plugin_routers =
+        tune_server::plugins::init(&state, &format!("http://127.0.0.1:{}", config.port)).await;
+
     // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
     // bound (see below). Running it here fetched the local output's own
     // /stream/ URL before the server was accepting connections, which failed
@@ -331,7 +337,10 @@ async fn main() {
     #[cfg(feature = "local-audio")]
     let resume_state = state.clone();
 
-    let app = routes::router(state);
+    // Kept for the shutdown hook — `state` is moved into the router below.
+    let plugins_handle = state.plugins.clone();
+
+    let app = routes::router_with_plugins(state, plugin_routers);
 
     // Listener was bound before the DB was opened (see above) — the socket's
     // backlog has been queueing connections since then.
@@ -407,6 +416,11 @@ async fn main() {
             let _ = std::fs::write(log_dir.join("tune-crash.log"), format!("SERVER ERROR: {e}"));
         }
     }
+
+    // Graceful shutdown returned — let plugins flush and close before the
+    // process exits. `shutdown_signal` already arms a 3s hard-exit timer, so
+    // a plugin that hangs here cannot wedge the shutdown.
+    tune_server::plugins::shutdown(&plugins_handle).await;
 }
 
 async fn shutdown_signal() {

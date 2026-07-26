@@ -13,7 +13,7 @@ cloud-relay = ["tune-core/cloud-relay"]
 postgres = ["tune-core/postgres"]
 
 [dependencies]
-tune-core = { path = "../tune-core", default-features = false }
+tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
