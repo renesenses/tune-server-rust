@@ -1400,11 +1400,37 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     }
 
     // What has already been applied?
-    let current: i32 =
+    let mut current: i32 =
         sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
             .fetch_one(pool)
             .await
             .map_err(|e| format!("pg read schema_version: {e}"))?;
+
+    // Databases created by the SQLite→PG data migration are stamped with the
+    // sentinel version 99 ("schema as of the migration date"). 99 outranks
+    // every numbered migration, so scripts added AFTER that date (009
+    // smart_playlists match_mode, 010 numeric column types…) were skipped
+    // forever: JF's force-scan added nothing (album resolution fails with
+    // `operator does not exist: text = bigint`, the exact drift 010 repairs)
+    // and album views 500'd. All numbered scripts are idempotent (007's
+    // destructive DROP is guarded on the broken-id condition since this fix),
+    // so drop the sentinel and let the normal loop bring the database to the
+    // real latest, recording true version rows along the way.
+    if current == 99 {
+        sqlx::raw_sql("DELETE FROM schema_version WHERE version = 99")
+            .execute(pool)
+            .await
+            .map_err(|e| format!("pg drop sentinel 99: {e}"))?;
+        current =
+            sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("pg reread schema_version: {e}"))?;
+        info!(
+            resume_from = current,
+            "pg_sentinel_99_dropped_replaying_idempotent_migrations"
+        );
+    }
 
     for &(version, name, sql) in PG_MIGRATIONS {
         if version <= current {
