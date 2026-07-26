@@ -13,6 +13,7 @@ pub mod i18n;
 pub mod plugins;
 pub mod premium_guard;
 pub mod routes;
+pub mod run;
 pub mod scan_import;
 pub mod startup;
 pub mod state;

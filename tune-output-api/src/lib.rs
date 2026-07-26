@@ -177,3 +177,24 @@ pub trait OutputTarget: Send + Sync {
         None
     }
 }
+
+/// A source of out-of-tree outputs, handed to the server at startup.
+///
+/// This is the seam that lets a *private* output crate (e.g. tune-diretta —
+/// the Diretta Host SDK cannot ship in a public build) plug into the public
+/// server without the public workspace ever referencing it: the private repo
+/// builds its own composer binary that calls
+/// `tune_server::run::main_blocking(RunOptions { output_providers, .. })`.
+/// The server polls `discover()` at startup and then periodically, registers
+/// each returned output in the output registry, and gives it the same zone
+/// lifecycle as built-in discovery (reconnect, auto-create, hidden zones).
+#[async_trait::async_trait]
+pub trait OutputProvider: Send + Sync {
+    /// Short provider name for logs (e.g. "diretta").
+    fn provider_name(&self) -> &str;
+
+    /// Discover the devices reachable right now and build one [`OutputTarget`]
+    /// per device. Return every visible device on each call — the server skips
+    /// device_ids that are already registered.
+    async fn discover(&self) -> Vec<Box<dyn OutputTarget>>;
+}
