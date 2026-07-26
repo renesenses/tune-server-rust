@@ -231,6 +231,20 @@ async fn api_fallback(
 }
 
 pub fn router(state: AppState) -> Router {
+    router_with_plugins(state, Vec::new())
+}
+
+/// Build the app router, mounting plugin-contributed routes under
+/// `/api/v1/ext/{plugin_name}`.
+///
+/// They are nested *inside* the `/api/v1` tree, before its layers are
+/// applied, so a plugin route gets the same auth, analytics and body-limit
+/// treatment as a core one. Mounting them at the top level instead would
+/// silently make every plugin endpoint unauthenticated.
+pub fn router_with_plugins(
+    state: AppState,
+    plugin_routers: crate::plugins::PluginRouters,
+) -> Router {
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -373,7 +387,21 @@ pub fn router(state: AppState) -> Router {
             "/services/lastfm/disconnect",
             axum::routing::post(service_tokens::lastfm_disconnect),
         )
-        .fallback(api_fallback)
+        .fallback(api_fallback);
+
+    // Plugin routes. `nest_service` because a plugin router is `Router<()>`
+    // (already stated) while `api` is still `Router<AppState>` — nesting it
+    // as a service is the only way to combine the two, and it keeps the
+    // plugin's internal state entirely its own.
+    let api = plugin_routers
+        .into_iter()
+        .fold(api, |api, (plugin_name, plugin_router)| {
+            let mount = format!("/ext/{plugin_name}");
+            tracing::info!(plugin = %plugin_name, mount = %format!("/api/v1{mount}"), "plugin_routes_mounted");
+            api.nest_service(&mount, plugin_router)
+        });
+
+    let api = api
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,

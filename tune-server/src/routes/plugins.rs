@@ -47,10 +47,49 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         "icon": "vinyl",
     }));
 
+    // Plugins actually loaded through the SDK. These are the only entries
+    // backed by running code — everything above is settings bookkeeping.
+    for info in state.plugins.lock().await.loaded_plugins().await {
+        plugins.push(serde_json::json!({
+            "name": info.name,
+            "display_name": info.name,
+            "description": info.description,
+            "version": info.version,
+            "type": "sdk",
+            "installed": true,
+            "enabled": info.enabled,
+            "url": format!("/api/v1/ext/{}", info.name),
+            "config_schema": info.config_schema,
+        }));
+    }
+
     Json(json!(plugins))
 }
 
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
+    // An SDK plugin is authoritative about itself: it is loaded or it is not,
+    // regardless of what the settings table happens to say.
+    if let Some(info) = state
+        .plugins
+        .lock()
+        .await
+        .loaded_plugins()
+        .await
+        .into_iter()
+        .find(|p| p.name == name)
+    {
+        return Json(json!({
+            "name": info.name,
+            "description": info.description,
+            "version": info.version,
+            "type": "sdk",
+            "installed": true,
+            "enabled": info.enabled,
+            "status": "loaded",
+            "config_schema": info.config_schema,
+        }));
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     let installed = settings
