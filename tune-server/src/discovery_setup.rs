@@ -862,6 +862,121 @@ fn find_cross_protocol_zone_conflict<'a>(
     })
 }
 
+/// Register outputs coming from [`OutputProvider`]s handed to
+/// `run::main_blocking` — the seam for out-of-tree output crates (e.g. the
+/// private tune-diretta) that cannot appear in the public dependency graph.
+///
+/// Polls `discover()` at startup and then every 60 s (providers have no push
+/// discovery the way SSDP/mDNS do), registers unseen device_ids, and applies
+/// the same zone lifecycle as the mDNS handler: hidden zones stay deleted,
+/// known device_ids reconnect (online + restored volume), renamed device_ids
+/// re-attach by zone name, and new devices honour `zone_auto_create`.
+pub fn spawn_output_providers(
+    state: &AppState,
+    providers: Vec<Arc<dyn tune_core::outputs::traits::OutputProvider>>,
+) {
+    if providers.is_empty() {
+        return;
+    }
+    let outputs = state.outputs.clone();
+    let db = state.backend.clone();
+    let event_bus = state.event_bus.clone();
+    let playback = state.playback.clone();
+
+    tokio::spawn(async move {
+        loop {
+            for provider in &providers {
+                for output in provider.discover().await {
+                    let dev_id = output.device_id().to_string();
+                    let name = output.name().to_string();
+                    let otype = output.output_type().to_string();
+                    {
+                        let mut reg = outputs.lock().await;
+                        if reg.contains(&dev_id) {
+                            continue;
+                        }
+                        reg.register(output);
+                    }
+                    info!(
+                        provider = provider.provider_name(),
+                        name = %name,
+                        id = %dev_id,
+                        r#type = %otype,
+                        "provider_output_registered"
+                    );
+
+                    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
+                    if zone_repo.is_device_hidden(&dev_id) {
+                        info!(name = %name, id = %dev_id, "provider_zone_hidden_skipping");
+                        continue;
+                    }
+                    if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev_id) {
+                        set_zone_online(&event_bus, &db, &dev_id, true);
+                        if let Some(zone_id) = zone.id {
+                            let vol = zone.volume as f64 / 100.0;
+                            playback.set_volume(zone_id, vol).await;
+                        }
+                        info!(name = %name, id = %dev_id, "provider_zone_reconnected");
+                        event_bus.emit(
+                            "device.reconnected",
+                            serde_json::json!({
+                                "device_id": &dev_id,
+                                "name": &name,
+                            }),
+                        );
+                    } else {
+                        // Device_id may have changed (firmware update / re-pairing):
+                        // re-attach an existing zone by name before creating one.
+                        let existing = zone_repo.list().unwrap_or_default();
+                        if let Some(z) = existing.iter().find(|z| z.name == name)
+                            && let Some(zid) = z.id
+                        {
+                            let _ = zone_repo.update_output_device(zid, &dev_id);
+                            let _ = zone_repo.update_output_type(zid, &otype);
+                            set_zone_online(&event_bus, &db, &dev_id, true);
+                            info!(name = %name, id = %dev_id, old_id = ?z.output_device_id, "provider_zone_device_updated");
+                        } else {
+                            let auto_create =
+                                tune_core::db::settings_repo::SettingsRepo::with_backend(
+                                    db.clone(),
+                                )
+                                .get("zone_auto_create")
+                                .ok()
+                                .flatten()
+                                .map(|v| v != "false")
+                                .unwrap_or(true);
+                            if !auto_create {
+                                info!(name = %name, id = %dev_id, "provider_zone_auto_create_disabled_skipping");
+                            } else {
+                                match zone_repo.get_or_create(&name, Some(&otype), &dev_id) {
+                                    Ok((zid, true)) => {
+                                        event_bus.emit_typed(
+                                            EventType::ZoneCreated,
+                                            serde_json::json!({
+                                                "zone_id": zid,
+                                                "name": name,
+                                            }),
+                                        );
+                                        set_zone_online(&event_bus, &db, &dev_id, true);
+                                        info!(name = %name, id = %dev_id, zone_id = zid, "provider_zone_created");
+                                    }
+                                    Ok((_, false)) => {
+                                        set_zone_online(&event_bus, &db, &dev_id, true);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(name = %name, id = %dev_id, error = %e, "provider_zone_create_failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{find_cross_protocol_zone_conflict, resolve_control_url};
