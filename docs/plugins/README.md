@@ -20,6 +20,42 @@ so a `path` dependency pointing at a directory that is not in the clone breaks
 `cargo check` for everyone, feature enabled or not.  That is why no concrete
 plugin is referenced in this repository.
 
+### Plugins that live outside this repository
+
+Which is the case for anything closed-source.  Rather than referencing it from
+here, invert the dependency: `tune-server` is a library whose `run` *is* the
+whole server startup, so a binary in its own workspace composes the two.
+
+```toml
+# ~/tune-dist/Cargo.toml — its own workspace, not a member of this one
+[workspace]
+
+[dependencies]
+tune-server = { path = "../tune-server-rust/tune-server" }
+tune-core   = { path = "../tune-server-rust/tune-core", default-features = false, features = ["plugin-http"] }
+tokio       = { version = "1", features = ["full"] }
+```
+
+```rust,ignore
+#[tokio::main]
+async fn main() {
+    tune_server::run(Some(Box::new(|state: &AppState| {
+        vec![Box::new(MyPlugin::new(state.backend.clone())) as Box<dyn TunePlugin>]
+    })))
+    .await;
+}
+```
+
+The closure receives `&AppState` because host services — `backend`,
+`services`, `http_client` — only exist once state is built.  It runs after
+local outputs are registered and before the router is built, the same point as
+`register_builtin_plugins`, and what it returns is registered on **equal
+terms**: same protocol gate, same `plugin_{name}_enabled` switch, same
+registration draining, same `/api/v1/ext/{name}` mount.
+
+This repository never learns the plugin's name, so a plain clone keeps
+building, and there is no cargo feature to add here.
+
 ## Creating a Plugin
 
 ### 1. manifest.json

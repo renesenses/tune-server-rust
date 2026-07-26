@@ -234,6 +234,29 @@ impl TunePlugin for Loads {
     }
 }
 
+/// Registers a router, so the injection path can be checked end to end.
+struct ServesRoutes;
+
+#[async_trait]
+impl TunePlugin for ServesRoutes {
+    fn name(&self) -> &str {
+        "injected"
+    }
+    fn version(&self) -> &str {
+        "0.1.0"
+    }
+    fn description(&self) -> &str {
+        "Built outside the tree and handed to init"
+    }
+    async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
+        ctx.register_router(axum::Router::new().route("/ping", get(|| async { "pong" })));
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 struct FailsSetup;
 
 #[async_trait]
@@ -255,8 +278,12 @@ impl TunePlugin for FailsSetup {
     }
 }
 
-/// `plugin_{name}_enabled = false` keeps a compiled-in plugin out at boot, and
-/// it must not linger in the REST view either.
+/// `plugin_{name}_enabled = false` keeps a plugin out at boot, and it must not
+/// linger in the REST view either.
+///
+/// Injected through `init`'s `extra` — the path an out-of-tree binary uses — to
+/// pin down that such a plugin is governed by the same switch as a compiled-in
+/// one rather than slipping past it.
 #[tokio::test]
 async fn the_enabled_setting_keeps_a_plugin_out() {
     use_scratch_plugin_data_dir();
@@ -266,11 +293,40 @@ async fn the_enabled_setting_keeps_a_plugin_out() {
         .set("plugin_loads_enabled", "false")
         .unwrap();
 
-    state.plugins.lock().await.register(Box::new(Loads)).await;
-    tune_server::plugins::init(&state, "http://127.0.0.1:0").await;
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
 
     let reported = state.plugin_info.get().map(|v| v.len()).unwrap_or_default();
     assert_eq!(reported, 0, "a disabled plugin must not be reported");
+}
+
+/// A plugin handed to `init` from outside the tree loads on equal terms with a
+/// compiled-in one: same setup, same snapshot, same mount.
+#[tokio::test]
+async fn an_injected_plugin_loads_and_mounts_its_router() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    let routers =
+        tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(ServesRoutes)])
+            .await;
+
+    assert_eq!(routers.len(), 1, "the injected plugin contributed a router");
+    assert_eq!(routers[0].0, "injected", "mount name comes from the plugin");
+
+    let names: Vec<&str> = state
+        .plugin_info
+        .get()
+        .expect("init publishes the snapshot")
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["injected"]);
+
+    // End to end: the router it registered actually serves, under its own name.
+    let app = tune_server::routes::router_with_plugins(state.clone(), routers);
+    let (status, body) = body_of(&app, "/api/v1/ext/injected/ping").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "pong");
 }
 
 /// A plugin whose setup failed must not be advertised as installed and enabled.
@@ -281,13 +337,12 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
     use_scratch_plugin_data_dir();
 
     let state = new_state();
-    {
-        let loader = state.plugins.lock().await;
-        loader.register(Box::new(Loads)).await;
-        loader.register(Box::new(FailsSetup)).await;
-    }
-
-    let routers = tune_server::plugins::init(&state, "http://127.0.0.1:0").await;
+    let routers = tune_server::plugins::init(
+        &state,
+        "http://127.0.0.1:0",
+        vec![Box::new(Loads), Box::new(FailsSetup)],
+    )
+    .await;
     assert!(routers.is_empty(), "neither plugin registers a router");
 
     let names: Vec<&str> = state
