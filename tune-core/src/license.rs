@@ -142,6 +142,12 @@ pub struct LicenseState {
     /// drives the offline grace window.
     #[serde(default)]
     pub account_premium_checked: Option<String>,
+    /// Qobuz endpoint order signalled by the cloud license validation:
+    /// `true` = route Qobuz API calls through the mozaiklabs proxy first
+    /// (founder account), `false` (default) = call the Qobuz API directly
+    /// first with the proxy as fallback. Absent on older servers → false.
+    #[serde(default)]
+    pub qobuz_proxy_first: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +230,15 @@ impl LicenseManager {
         let account_premium_expires = settings.get("mozaik_premium_expires").ok().flatten();
         let account_premium_checked = settings.get("mozaik_premium_checked").ok().flatten();
 
+        // Qobuz endpoint order (founder flag) — persisted like the account
+        // premium so the order survives restarts and offline starts.
+        let qobuz_proxy_first = settings
+            .get("qobuz_proxy_first")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         let state = LicenseState {
             tier,
             license_key,
@@ -233,6 +248,7 @@ impl LicenseManager {
             account_premium,
             account_premium_expires,
             account_premium_checked,
+            qobuz_proxy_first,
         };
 
         Self {
@@ -359,6 +375,36 @@ impl LicenseManager {
         state.account_premium_checked = Some(now);
 
         info!(account_premium = premium, "license_account_premium_updated");
+    }
+
+    /// Set the Qobuz endpoint order flag from the cloud license validation.
+    /// `true` = proxy-first (founder account); `false` = direct-first (the
+    /// default for every user). Persisted so it survives restarts, mirroring
+    /// `set_account_premium`.
+    pub async fn set_qobuz_proxy_first(&self, proxy_first: bool) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        settings
+            .set(
+                "qobuz_proxy_first",
+                if proxy_first { "true" } else { "false" },
+            )
+            .ok();
+
+        let mut state = self.state.write().await;
+        let changed = state.qobuz_proxy_first != proxy_first;
+        state.qobuz_proxy_first = proxy_first;
+
+        if changed {
+            info!(
+                qobuz_proxy_first = proxy_first,
+                "license_qobuz_proxy_first_updated"
+            );
+        }
+    }
+
+    /// Current Qobuz endpoint order: `true` = proxy-first (founder account).
+    pub async fn qobuz_proxy_first(&self) -> bool {
+        self.state.read().await.qobuz_proxy_first
     }
 
     /// Clear the account premium (SSO logout / disconnect). The license-key path
@@ -653,6 +699,7 @@ mod tests {
             account_premium,
             account_premium_expires,
             account_premium_checked,
+            qobuz_proxy_first: false,
         }
     }
 
@@ -670,6 +717,7 @@ mod tests {
             account_premium: false,
             account_premium_expires: None,
             account_premium_checked: None,
+            qobuz_proxy_first: false,
         }
     }
 
@@ -866,6 +914,67 @@ mod tests {
         mgr.clear_license().await;
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
+    }
+
+    // ---- qobuz_proxy_first (founder endpoint order) ----
+
+    #[test]
+    fn license_state_parses_without_qobuz_proxy_first() {
+        // Retro-compat: older servers / cached states without the field → false.
+        let json = r#"{
+            "tier": "free",
+            "license_key": null,
+            "expires_at": null,
+            "last_validated": null,
+            "hardware_fingerprint": "test"
+        }"#;
+        let state: LicenseState = serde_json::from_str(json).unwrap();
+        assert!(!state.qobuz_proxy_first);
+    }
+
+    #[test]
+    fn license_state_parses_with_qobuz_proxy_first() {
+        let json = r#"{
+            "tier": "free",
+            "license_key": null,
+            "expires_at": null,
+            "last_validated": null,
+            "hardware_fingerprint": "test",
+            "qobuz_proxy_first": true
+        }"#;
+        let state: LicenseState = serde_json::from_str(json).unwrap();
+        assert!(state.qobuz_proxy_first);
+    }
+
+    #[tokio::test]
+    async fn set_qobuz_proxy_first_persists_and_updates_state() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new(backend.clone());
+
+        // Default: direct-first.
+        assert!(!mgr.qobuz_proxy_first().await);
+
+        mgr.set_qobuz_proxy_first(true).await;
+        assert!(mgr.qobuz_proxy_first().await);
+        assert!(mgr.license_state().await.qobuz_proxy_first);
+
+        // Persisted in settings (same pattern as mozaik_premium).
+        let settings = SettingsRepo::with_backend(backend.clone());
+        assert_eq!(
+            settings.get("qobuz_proxy_first").unwrap().as_deref(),
+            Some("true")
+        );
+
+        // A new manager over the same backend reloads the flag.
+        let mgr2 = LicenseManager::new(backend);
+        assert!(mgr2.qobuz_proxy_first().await);
+
+        // Re-validation can revoke it.
+        mgr2.set_qobuz_proxy_first(false).await;
+        assert!(!mgr2.qobuz_proxy_first().await);
     }
 
     #[tokio::test]

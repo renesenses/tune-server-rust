@@ -248,6 +248,14 @@ async fn sso_callback(
         .set_account_premium(user.premium, user.license_expires_at.clone())
         .await;
 
+    // Qobuz endpoint order (founder flag): persist and push into the live
+    // QobuzService so the order applies without a restart.
+    state
+        .license
+        .set_qobuz_proxy_first(user.qobuz_proxy_first)
+        .await;
+    crate::background::apply_qobuz_proxy_first(&state.services, user.qobuz_proxy_first).await;
+
     // Create or link local profile, then issue a local JWT session
     use tune_core::db::backend::ToSqlValue;
     let existing_id: Option<i64> = state
@@ -360,6 +368,9 @@ async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
         settings.delete(key).ok();
     }
     state.license.clear_account_premium().await;
+    // Founder endpoint order came from this account — revert to direct-first.
+    state.license.set_qobuz_proxy_first(false).await;
+    crate::background::apply_qobuz_proxy_first(&state.services, false).await;
     info!("sso_disconnected");
     Json(json!({ "connected": false }))
 }

@@ -147,6 +147,22 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "scan_starting"
         );
 
+        // Surface an "indexing" phase IMMEDIATELY, before the directory walk and
+        // the mtime/size stat pass below. On a large library over a NAS (SMB)
+        // both are slow (a 58k-file walk + per-file stat) and used to run in
+        // total silence — the panel showed nothing and the Stop button never
+        // appeared, so the scan read as "interminable / frozen" (forum, v0.9.12
+        // Win11/NAS/58k). This gives the UI an indeterminate panel + a working
+        // Stop from t=0. `total: 0` marks it indeterminate until discovery ends.
+        event_bus.emit(
+            "library.scan.started",
+            json!({ "music_dirs": &music_dirs, "phase": "indexing", "total": 0 }),
+        );
+        event_bus.emit(
+            "library.scan.progress",
+            json!({ "phase": "indexing", "scanned": 0i64, "added": 0i64, "total": 0i64 }),
+        );
+
         let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
         let missing_dirs = list_result.missing_dirs;
         let files = list_result.files;
@@ -173,10 +189,20 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // Load existing tracks BEFORE scanning to skip unchanged files
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
 
-        // Quick stat pass: skip files whose mtime+size haven't changed
+        // Quick stat pass: skip files whose mtime+size haven't changed.
+        // Parallelised: each `path.metadata()` is a blocking stat that, over a
+        // NAS/SMB mount, carries real round-trip latency; doing 58k of them
+        // sequentially was a multi-minute silent stall before the first batch
+        // (forum: v0.9.12 Win11/NAS/58k, "scan interminable"). rayon fans the
+        // stats across the pool, and SCAN_CANCEL is honoured here too so Stop
+        // aborts during this phase, not only during batch processing.
+        use rayon::prelude::*;
         let files_to_scan: Vec<std::path::PathBuf> = files
-            .into_iter()
+            .into_par_iter()
             .filter(|path| {
+                if SCAN_CANCEL.load(Ordering::SeqCst) {
+                    return false;
+                }
                 // Force mode: re-process everything so album_id is re-resolved.
                 if force {
                     return true;
