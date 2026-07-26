@@ -312,10 +312,10 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                     if entry.file_name().to_string_lossy().starts_with("._") {
                         continue;
                     }
-                    // Skip Tune's own streaming temp files (tune-stream-*.flac,
-                    // tune-prefetch-*.flac in %TEMP%): a library rooted above the
-                    // temp dir (Frédéric: whole user profile) otherwise indexes
-                    // every transcode as a ghost tagless track.
+                    // Skip Tune's own streaming/transcode temp files
+                    // (tune-stream-*, tune-prefetch-*, tune-tcache-* in %TEMP%):
+                    // a library rooted above the temp dir (Frédéric: whole user
+                    // profile) otherwise indexes every transcode as a ghost track.
                     if crate::scanner::is_tune_temp_file(entry.path()) {
                         continue;
                     }
