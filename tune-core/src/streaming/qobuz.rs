@@ -17,10 +17,74 @@ pub struct QobuzService {
     user_auth_token: Option<String>,
     username: Option<String>,
     subscription: Option<String>,
-    use_proxy: bool,
+    /// Endpoint order: `false` (default) = direct Qobuz API first with the
+    /// mozaiklabs proxy as fallback; `true` = proxy first with direct as
+    /// fallback (founder accounts, signalled by the cloud license via the
+    /// optional `qobuz_proxy_first` field).
+    proxy_first: bool,
     stored_username: Option<String>,
     stored_password: Option<String>,
     enabled_override: Option<bool>,
+}
+
+/// (primary, fallback) API bases for the given endpoint order.
+///
+/// `proxy_first == false` (default, all users): direct Qobuz API first,
+/// mozaiklabs proxy as fallback. `proxy_first == true` (founder account):
+/// proxy first, direct as fallback.
+fn endpoint_order(proxy_first: bool) -> (&'static str, &'static str) {
+    if proxy_first {
+        (API_PROXY, API_BASE)
+    } else {
+        (API_BASE, API_PROXY)
+    }
+}
+
+/// Error from a single API attempt against one base URL.
+#[derive(Debug)]
+enum AttemptError {
+    /// Network-level failure (timeout, DNS, connect) — eligible for fallback.
+    Network(String),
+    /// HTTP error status. 5xx is eligible for fallback; 4xx is final.
+    Http { status: u16, body: String },
+    /// Body of a successful response failed to parse — final, no fallback.
+    Json(String),
+}
+
+impl AttemptError {
+    /// Whether the other endpoint should be tried (network error or 5xx).
+    fn transient(&self) -> bool {
+        match self {
+            Self::Network(_) => true,
+            Self::Http { status, .. } => *status >= 500,
+            Self::Json(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(e) => write!(f, "{e}"),
+            Self::Http { status, body } => write!(f, "{status} {body}"),
+            Self::Json(e) => write!(f, "json: {e}"),
+        }
+    }
+}
+
+/// Log the primary-endpoint failure that triggers the fallback, keeping the
+/// historical proxy-first event names and their direct-first mirrors.
+fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
+    match (proxy_first, err) {
+        (true, AttemptError::Http { status, .. }) => {
+            info!(path, status, "qobuz_proxy_5xx_trying_direct");
+        }
+        (true, _) => info!(path, error = %err, "qobuz_proxy_failed_trying_direct"),
+        (false, AttemptError::Http { status, .. }) => {
+            info!(path, status, "qobuz_direct_5xx_trying_proxy");
+        }
+        (false, _) => info!(path, error = %err, "qobuz_direct_failed_trying_proxy"),
+    }
 }
 
 impl QobuzService {
@@ -36,15 +100,20 @@ impl QobuzService {
             user_auth_token: None,
             username: None,
             subscription: None,
-            use_proxy: true,
+            proxy_first: false,
             stored_username: None,
             stored_password: None,
             enabled_override: None,
         }
     }
 
-    fn api_base(&self) -> &str {
-        if self.use_proxy { API_PROXY } else { API_BASE }
+    /// Set the endpoint order: `true` = proxy first (founder account, from the
+    /// cloud license `qobuz_proxy_first` flag), `false` = direct first.
+    pub fn set_proxy_first(&mut self, proxy_first: bool) {
+        if proxy_first != self.proxy_first {
+            info!(proxy_first, "qobuz_endpoint_order_changed");
+        }
+        self.proxy_first = proxy_first;
     }
 
     async fn refresh_credentials(&mut self) {
@@ -65,12 +134,37 @@ impl QobuzService {
         }
     }
 
+    /// GET against the primary endpoint for the configured order, falling back
+    /// to the other endpoint on a network error or 5xx (symmetric fallback).
     async fn api_get(
         &self,
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let base = self.api_base();
+        let (primary, fallback) = endpoint_order(self.proxy_first);
+        match self.api_get_at(primary, path, params).await {
+            Ok(v) => Ok(v),
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, path, &err);
+                self.api_get_at(fallback, path, params).await.map_err(|e| {
+                    info!(path, error = %e, "qobuz_fallback_api_error");
+                    format!("qobuz {path}: {e}")
+                })
+            }
+            Err(err) => {
+                info!(path, error = %err, "qobuz_api_error");
+                Err(format!("qobuz {path}: {err}"))
+            }
+        }
+    }
+
+    /// One GET attempt against a specific API base.
+    async fn api_get_at(
+        &self,
+        base: &str,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, AttemptError> {
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
         let mut query: Vec<(&str, &str)> = params.to_vec();
@@ -86,61 +180,19 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) if self.use_proxy => {
-                // Proxy unreachable (timeout/network) — fallback to direct API
-                info!(path, error = %e, "qobuz_proxy_failed_trying_direct");
-                return self.api_get_direct(path, params).await;
-            }
-            Err(e) => return Err(format!("qobuz api: {e}")),
-        };
-
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            // If proxy returned 5xx, try direct
-            if self.use_proxy && status >= 500 {
-                info!(path, status, "qobuz_proxy_5xx_trying_direct");
-                return self.api_get_direct(path, params).await;
-            }
-            info!(path, status, body = %body, "qobuz_api_error");
-            return Err(format!("qobuz {path}: {status} {body}"));
+            return Err(AttemptError::Http { status, body });
         }
 
-        resp.json().await.map_err(|e| format!("qobuz json: {e}"))
-    }
-
-    /// Direct API call bypassing the proxy. Used as fallback when proxy is down.
-    async fn api_get_direct(
-        &self,
-        path: &str,
-        params: &[(&str, &str)],
-    ) -> Result<serde_json::Value, String> {
-        let url = format!("{API_BASE}{path}");
-        let app_id = self.app_id.as_str();
-        let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("app_id", app_id));
-
-        let mut req = self
-            .client
-            .get(&url)
-            .query(&query)
-            .header("X-App-Id", app_id);
-
-        if let Some(ref token) = self.user_auth_token {
-            req = req.header("X-User-Auth-Token", token.as_str());
-        }
-
-        let resp = req.send().await.map_err(|e| format!("qobuz direct: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            info!(path, status, body = %body, "qobuz_direct_api_error");
-            return Err(format!("qobuz {path}: {status} {body}"));
-        }
-
-        resp.json().await.map_err(|e| format!("qobuz json: {e}"))
+        resp.json()
+            .await
+            .map_err(|e| AttemptError::Json(e.to_string()))
     }
 
     /// Fetch all pages from a paginated Qobuz endpoint.
@@ -294,14 +346,13 @@ impl QobuzService {
         }
     }
 
-    async fn login_internal(
-        &mut self,
+    /// One login attempt against a specific API base.
+    async fn login_at(
+        &self,
+        base: &str,
         username: &str,
         password: &str,
-    ) -> Result<AuthStatus, String> {
-        self.refresh_credentials().await;
-
-        let base = self.api_base();
+    ) -> Result<serde_json::Value, AttemptError> {
         let resp = self
             .client
             .post(format!("{base}/user/login"))
@@ -309,16 +360,47 @@ impl QobuzService {
             .form(&[("username", username), ("password", password)])
             .send()
             .await
-            .map_err(|e| format!("qobuz login: {e}"))?;
+            .map_err(|e| AttemptError::Network(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            info!(status, body = %body, "qobuz_login_failed");
-            return Err(format!("qobuz login {status}: {body}"));
+            return Err(AttemptError::Http { status, body });
         }
 
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        resp.json()
+            .await
+            .map_err(|e| AttemptError::Json(e.to_string()))
+    }
+
+    /// Login following the configured endpoint order. Direct-first by default so
+    /// user credentials never transit through the VPS unless the direct API is
+    /// unreachable (network error or 5xx) — proxy-first for founder accounts.
+    async fn login_internal(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<AuthStatus, String> {
+        self.refresh_credentials().await;
+
+        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let data = match self.login_at(primary, username, password).await {
+            Ok(d) => d,
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, "/user/login", &err);
+                self.login_at(fallback, username, password)
+                    .await
+                    .map_err(|e| {
+                        info!(error = %e, "qobuz_login_failed");
+                        format!("qobuz login: {e}")
+                    })?
+            }
+            Err(err) => {
+                info!(error = %err, "qobuz_login_failed");
+                return Err(format!("qobuz login: {err}"));
+            }
+        };
+
         self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
         self.username = data["user"]["display_name"].as_str().map(Into::into);
         self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
@@ -345,12 +427,33 @@ impl QobuzService {
         }
     }
 
+    /// POST against the primary endpoint for the configured order, falling back
+    /// to the other endpoint on a network error or 5xx (same order as api_get).
     async fn api_post(
         &self,
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let base = self.api_base();
+        let (primary, fallback) = endpoint_order(self.proxy_first);
+        match self.api_post_at(primary, path, params).await {
+            Ok(v) => Ok(v),
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, path, &err);
+                self.api_post_at(fallback, path, params)
+                    .await
+                    .map_err(|e| format!("qobuz {path}: {e}"))
+            }
+            Err(err) => Err(format!("qobuz {path}: {err}")),
+        }
+    }
+
+    /// One POST attempt against a specific API base.
+    async fn api_post_at(
+        &self,
+        base: &str,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, AttemptError> {
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
         // Qobuz's Akamai edge rejects a body-less POST with HTTP 411 (Length
@@ -372,11 +475,14 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = req.send().await.map_err(|e| format!("qobuz post: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("qobuz {path}: {status} {body}"));
+            return Err(AttemptError::Http { status, body });
         }
         resp.json()
             .await
@@ -1251,6 +1357,46 @@ fn md5_hex(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn endpoint_order_direct_first_by_default() {
+        // All users: direct Qobuz API first, mozaiklabs proxy as fallback.
+        assert_eq!(endpoint_order(false), (API_BASE, API_PROXY));
+    }
+
+    #[test]
+    fn endpoint_order_proxy_first_for_founder() {
+        // Founder account (license `qobuz_proxy_first`): proxy first.
+        assert_eq!(endpoint_order(true), (API_PROXY, API_BASE));
+    }
+
+    #[test]
+    fn new_service_defaults_to_direct_first() {
+        let svc = QobuzService::new("id".into(), "secret".into());
+        assert!(!svc.proxy_first);
+    }
+
+    #[test]
+    fn attempt_error_transient_classification() {
+        // Network errors and 5xx fall back to the other endpoint; 4xx and
+        // JSON parse errors are final.
+        assert!(AttemptError::Network("timeout".into()).transient());
+        assert!(
+            AttemptError::Http {
+                status: 502,
+                body: String::new()
+            }
+            .transient()
+        );
+        assert!(
+            !AttemptError::Http {
+                status: 401,
+                body: String::new()
+            }
+            .transient()
+        );
+        assert!(!AttemptError::Json("eof".into()).transient());
+    }
 
     #[test]
     fn map_track_basic() {
