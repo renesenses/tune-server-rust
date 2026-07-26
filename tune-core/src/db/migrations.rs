@@ -1371,6 +1371,34 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     .await
     .map_err(|e| format!("pg create schema_version: {e}"))?;
 
+    // Heal databases whose schema_version was created by the SQLite→PG data
+    // migration with `version TEXT` (pg_migrate.rs before this fix) while this
+    // runner and the migration scripts use INTEGER. On such a database
+    // `COALESCE(MAX(version), 0)` mixes text and integer and PG aborts — the
+    // server then panics at startup (JF, v0.9.13: "COALESCE types text and
+    // integer cannot be matched"). Values are always digit strings, so the
+    // in-place cast is safe; no-op once the column is integer.
+    let version_type: Option<String> = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_name = 'schema_version' AND column_name = 'version'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("pg inspect schema_version: {e}"))?;
+    if matches!(
+        version_type.as_deref(),
+        Some("text") | Some("character varying")
+    ) {
+        sqlx::raw_sql(
+            "ALTER TABLE schema_version \
+             ALTER COLUMN version TYPE INTEGER USING version::integer",
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| format!("pg heal schema_version type: {e}"))?;
+        info!("pg_schema_version_column_healed_text_to_integer");
+    }
+
     // What has already been applied?
     let current: i32 =
         sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")

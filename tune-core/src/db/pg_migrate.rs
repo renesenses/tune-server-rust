@@ -636,12 +636,20 @@ CREATE INDEX IF NOT EXISTS idx_offline_cache_source ON offline_cache(source, sou
 CREATE INDEX IF NOT EXISTS idx_offline_cache_status ON offline_cache(status);
 CREATE INDEX IF NOT EXISTS idx_sync_snapshots_link ON sync_link_snapshots(playlist_link_id, side);
 
--- Schema version tracking
+-- Schema version tracking. `version` MUST be INTEGER: the migration runner
+-- (migrations.rs run_pg_migrations) and the numbered SQL scripts read/insert
+-- integer versions, and a TEXT column made `COALESCE(MAX(version), 0)` abort
+-- at startup on data-migrated databases (JF, v0.9.13). The runner also heals
+-- existing TEXT columns in place at startup.
 CREATE TABLE IF NOT EXISTS schema_version (
-    version TEXT PRIMARY KEY,
+    version INTEGER PRIMARY KEY,
     applied_at TIMESTAMPTZ DEFAULT now(),
     name TEXT NOT NULL
 );
+-- Re-migration onto a database created before the INTEGER fix: convert the
+-- legacy TEXT column in place BEFORE the INSERT below touches it. Values are
+-- digit strings, the cast is safe; no-op (trivial rewrite) when already INTEGER.
+ALTER TABLE schema_version ALTER COLUMN version TYPE INTEGER USING version::integer;
 INSERT INTO schema_version (version, name) VALUES (99, 'sqlite_migration')
     ON CONFLICT (version) DO NOTHING;
 
