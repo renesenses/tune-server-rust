@@ -2890,6 +2890,24 @@ impl PlaybackOrchestrator {
             // #1137). Cap the LPCM fallback at 16-bit; FLAC keeps full hi-res.
             let dash_is_wav = dash_enc_format == "wav";
             let transcode_result = tokio::task::spawn_blocking(move || {
+                // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
+                // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
+                // (copy the FLAC frames + STREAMINFO into a .flac) instead of
+                // decode→PCM→re-encode — a ~59s CPU transcode becomes a sub-second
+                // I/O copy, bit-identical (#1146). Opt-in via TUNE_DASH_REMUX;
+                // WAV renderers and EQ zones fall through to the decode path.
+                let remux = !dash_is_wav
+                    && eq_profile_pretranscode.is_none()
+                    && std::env::var("TUNE_DASH_REMUX")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                if remux {
+                    return crate::audio::decode::remux_flac_dash(
+                        &unique_path_clone,
+                        &tmp_path_clone,
+                    );
+                }
+
                 let decoded = crate::audio::decode::decode_to_pcm(
                     &unique_path_clone,
                     Some(sr),
