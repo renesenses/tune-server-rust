@@ -2881,6 +2881,103 @@ impl PlaybackOrchestrator {
                 "streaming_dash_dlna_format_decision"
             );
 
+            // Streaming remux (#1146, opt-in TUNE_DASH_STREAM_REMUX): chunked-stream
+            // the remuxed FLAC to a Lavf-class renderer (DMP-A8) AS the DASH file
+            // downloads, matching Qobuz's instant start — no wait for the whole
+            // file + no re-encode. Only FLAC + no-EQ (a WAV renderer or a zone EQ
+            // needs decoded PCM → keep the file path). Reads the GROWING fMP4 via
+            // the dash_growth registry when TUNE_DASH_STREAM_DECODE armed the
+            // background download, so playback begins on the first fragments.
+            if dash_enc_format == "flac"
+                && eq_profile_pretranscode.is_none()
+                && std::env::var("TUNE_DASH_STREAM_REMUX")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            {
+                let info = StreamInfo {
+                    format: "flac".into(),
+                    mime_type: "audio/flac".into(),
+                    sample_rate: sr,
+                    bit_depth: bd,
+                    channels: 2,
+                    file_size: None, // chunked — no Content-Length
+                    duration_ms: None,
+                    ..Default::default()
+                };
+                let (session_id, tx, data_ready, _session) =
+                    self.streamer.create_radio_session(info, 256).await;
+                let up = unique_path.clone();
+                tokio::spawn(async move {
+                    let up_stream = up.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::remux_flac_dash_stream(&up_stream, tx)
+                    })
+                    .await;
+                    match r {
+                        Ok(Ok(())) => debug!("streaming_dash_remux_stream_ended"),
+                        Ok(Err(e)) => warn!(error = %e, "streaming_dash_remux_stream_failed"),
+                        Err(e) => warn!(error = %e, "streaming_dash_remux_stream_panic"),
+                    }
+                    let _ = std::fs::remove_file(&up);
+                });
+                data_ready.notify_one();
+                info!(
+                    zone_id = req.zone_id,
+                    "streaming_dash_remux_chunked_started"
+                );
+
+                let server_ip = self.server_ip();
+                let stream_url = self
+                    .streamer
+                    .get_stream_url(&session_id, &server_ip, "flac");
+
+                let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+                let (title, artist, album, duration_ms, cover_path) = if has_title {
+                    (
+                        req.title.clone().unwrap_or_default(),
+                        req.artist_name.clone(),
+                        req.album_title.clone(),
+                        req.duration_ms,
+                        req.cover_url.clone(),
+                    )
+                } else {
+                    match svc.get_track(source_id).await {
+                        Ok(track) => (
+                            track.title,
+                            Some(track.artist),
+                            track.album,
+                            Some(track.duration_ms as i64),
+                            track.cover_path,
+                        ),
+                        Err(_) => (
+                            req.title
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "Unknown".into()),
+                            req.artist_name.clone(),
+                            req.album_title.clone(),
+                            req.duration_ms,
+                            req.cover_url.clone(),
+                        ),
+                    }
+                };
+                return Ok(ResolvedStream {
+                    url: stream_url,
+                    mime_type: "audio/flac".into(),
+                    title,
+                    artist,
+                    album,
+                    duration_ms,
+                    source: service_name.into(),
+                    cover_url: cover_path,
+                    stream_id: Some(session_id),
+                    file_size: None,
+                    sample_rate: Some(sr),
+                    bit_depth: Some(bd as u32),
+                    channels: Some(2),
+                });
+            }
+
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
             // When falling back to WAV/LPCM (renderer has no audio/flac sink),

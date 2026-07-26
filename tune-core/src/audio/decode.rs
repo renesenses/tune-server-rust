@@ -1252,6 +1252,99 @@ pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16,
     Ok((out.len() as u64, bit_depth, sample_rate))
 }
 
+/// Streaming variant of [`remux_flac_dash`] (#1146): remux a STILL-DOWNLOADING
+/// DASH fMP4 and push the FLAC bytes into an mpsc channel AS the frames arrive,
+/// so a chunked-capable renderer (Lavf/DMP-A8) starts playing almost immediately
+/// — matching Qobuz's instant start — instead of waiting for the whole file to
+/// download+remux. Reads via the growing-file source (dash_growth registry) so
+/// `next_packet` blocks at the download frontier rather than hitting EOF.
+///
+/// Runs on a blocking thread (symphonia is sync) → uses `blocking_send`. Returns
+/// when the stream is fully sent, or early (Ok) if the consumer is gone.
+pub fn remux_flac_dash_stream(input_path: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(), String> {
+    // Source: the growing fMP4 if a streaming download registered a handle, else
+    // a plain file (fully downloaded).
+    let mss = if let Some(growth) = crate::audio::dash_growth::take_for(input_path) {
+        let src = crate::audio::dash_growth::GrowingFileSource::open(input_path, growth)
+            .map_err(|e| format!("remux-stream open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(src), Default::default())
+    } else {
+        let file = File::open(input_path).map_err(|e| format!("remux-stream open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
+
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(input_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("remux-stream probe: {e}"))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("remux-stream: no default audio track")?;
+    let track_id = track.id;
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("remux-stream: track has no audio codec parameters".into()),
+    };
+    let stream_info = audio_params
+        .extra_data
+        .clone()
+        .ok_or("remux-stream: no FLAC STREAMINFO (extra_data)")?;
+    if stream_info.len() != 34 {
+        return Err(format!(
+            "remux-stream: STREAMINFO is {} bytes, expected 34",
+            stream_info.len()
+        ));
+    }
+
+    // Header: fLaC + STREAMINFO + empty VORBIS_COMMENT.
+    let mut header = Vec::with_capacity(64);
+    header.extend_from_slice(b"fLaC");
+    header.push(0x00);
+    header.extend_from_slice(&[0x00, 0x00, 0x22]);
+    header.extend_from_slice(&stream_info);
+    header.push(0x84);
+    header.extend_from_slice(&[0x00, 0x00, 0x08]);
+    header.extend_from_slice(&[0u8; 8]);
+    if tx.blocking_send(header).is_err() {
+        return Ok(()); // consumer already gone
+    }
+
+    // Frames: batch ~64 KB before sending to keep channel churn low.
+    const FLUSH: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(96 * 1024);
+    loop {
+        match format.next_packet() {
+            Ok(Some(packet)) => {
+                if packet.track_id == track_id {
+                    buf.extend_from_slice(&packet.data);
+                    if buf.len() >= FLUSH && tx.blocking_send(std::mem::take(&mut buf)).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("remux-stream next_packet: {e}")),
+        }
+    }
+    if !buf.is_empty() {
+        let _ = tx.blocking_send(buf);
+    }
+    Ok(())
+}
+
 /// Symphonia-based decoder for standard formats (FLAC, MP3, WAV, M4A, OGG, etc).
 fn decode_symphonia(
     file_path: &str,
@@ -1260,8 +1353,19 @@ fn decode_symphonia(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    // Streaming DASH (#1146 Plan C step 2): if a background task is still
+    // appending this fMP4, decode it as it grows via a blocking MediaSource
+    // instead of a plain File (which would EOF-truncate at the write frontier).
+    // Registry is empty unless TUNE_DASH_STREAM_DECODE armed a download — then
+    // this is byte-identical to the File path.
+    let mss = if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        let src = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
+            .map_err(|e| format!("open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(src), Default::default())
+    } else {
+        let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
 
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {

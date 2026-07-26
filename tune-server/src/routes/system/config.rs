@@ -716,7 +716,7 @@ const METADATA_FIELDS: &[(&str, &str, &str)] = &[
     ("file_path", "Chemin du fichier", "Technique"),
     ("encoder", "Encodeur", "Technique"),
     ("encoder_software", "Logiciel d'encodage", "Technique"),
-    ("source_media", "Support source", "Technique"),
+    ("source_media", "Support (MEDIA)", "Technique"),
     ("copyright", "Copyright", "Technique"),
     ("language", "Langue", "Technique"),
     // ReplayGain

@@ -182,6 +182,22 @@ impl OutputTarget for SqueezeboxOutput {
         "squeezebox"
     }
 
+    /// Opt out of the poller's position-polling (DLNA-style) gapless. On this
+    /// LMS-CLI proxy, staging the next track is `playlist add` (an append to
+    /// LMS's OWN playlist), and the poller's gapless advance is metadata-only —
+    /// it never re-issues a play. So LMS ends up with an independent, growing
+    /// playlist that Tune no longer commands track-by-track: after end-of-track
+    /// LMS free-runs its own playlist while Tune silently updates now-playing
+    /// (Yacine, zone 7 — repeat=one re-appends the same track, then a random LMS
+    /// track plays with no Tune trace). With gapless off, the poller's
+    /// natural-end path issues an explicit `playlist play <next>` per track,
+    /// keeping Tune in control (and looping a 1-track Repeat queue). Same choice
+    /// as the native slimproto output; small inter-track gap is the accepted
+    /// trade-off for a CLI-driven renderer.
+    fn supports_internal_gapless(&self) -> bool {
+        false
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.lms_host)
     }
