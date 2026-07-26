@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use tokio::sync::{Mutex, oneshot};
@@ -61,6 +61,15 @@ pub struct AppState {
     /// happens after local outputs are registered and before the router is
     /// built. See [`crate::plugins`].
     pub plugins: Arc<Mutex<tune_core::plugin_sdk::PluginLoader>>,
+    /// What [`crate::plugins::init`] actually loaded, published once and never
+    /// mutated again — no plugin registers after init.
+    ///
+    /// The `/api/v1/plugins` handlers read this instead of the loader on
+    /// purpose: event dispatch holds the loader's lock across *every* plugin's
+    /// `on_event`, so an introspection request that took the same lock would
+    /// hang for as long as the slowest plugin, and would hold `plugins` while
+    /// doing so — delaying shutdown too.
+    pub plugin_info: Arc<OnceLock<Vec<tune_core::plugin_sdk::PluginInfo>>>,
     #[cfg(feature = "cloud-relay")]
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
@@ -211,6 +220,7 @@ impl AppState {
             license,
             skin_manager,
             plugins,
+            plugin_info: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })

@@ -49,7 +49,11 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.
-    for info in state.plugins.lock().await.loaded_plugins().await {
+    //
+    // Read from the snapshot `plugins::init` published, never from the loader:
+    // event dispatch holds the loader's lock across every plugin's `on_event`,
+    // so reaching for it here would let one slow plugin hang this endpoint.
+    for info in plugin_snapshot(&state) {
         plugins.push(serde_json::json!({
             "name": info.name,
             "display_name": info.name,
@@ -66,18 +70,19 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     Json(json!(plugins))
 }
 
+/// The plugins `plugins::init` loaded, or an empty slice before it has run.
+fn plugin_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::PluginInfo] {
+    state
+        .plugin_info
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or_default()
+}
+
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
-    if let Some(info) = state
-        .plugins
-        .lock()
-        .await
-        .loaded_plugins()
-        .await
-        .into_iter()
-        .find(|p| p.name == name)
-    {
+    if let Some(info) = plugin_snapshot(&state).iter().find(|p| p.name == name) {
         return Json(json!({
             "name": info.name,
             "description": info.description,
