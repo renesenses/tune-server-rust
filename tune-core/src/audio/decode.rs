@@ -1159,6 +1159,99 @@ fn decode_ape_to_pcm(
     })
 }
 
+/// Remux a Tidal HI-RES DASH FLAC-in-fMP4 file into a native `.flac` file
+/// WITHOUT decoding or re-encoding (#1146). The source is already FLAC (Tidal
+/// delivers FLAC frames inside a fragmented MP4), so the old path — decode to
+/// PCM then re-encode FLAC — wastes ~59s on a weak CPU (.18, HI-RES) for a
+/// bit-identical result. Here we reuse symphonia's mp4 demuxer to pull the raw
+/// FLAC frames (`packet.data`, unmodified) and the STREAMINFO (`extra_data`, the
+/// 34-byte block body), and write `fLaC` + metadata + frames = a valid, bit-exact
+/// `.flac` in a few hundred ms (I/O-bound copy). MD5 is preserved (frames copied
+/// verbatim → decoded audio unchanged → original checksum still valid).
+///
+/// Only valid when the renderer takes FLAC and no zone EQ is active (an EQ would
+/// mutate samples, which a remux cannot). Returns `(file_size, bit_depth,
+/// sample_rate)`, matching the decode+encode path's tuple.
+pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16, u32), String> {
+    let file = File::open(input_path).map_err(|e| format!("remux open: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(input_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("remux probe: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("remux: no default audio track")?;
+    let track_id = track.id;
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("remux: track has no audio codec parameters".into()),
+    };
+    // The mp4 `dfLa` box exposes the 34-byte METADATA_BLOCK_STREAMINFO body here.
+    let stream_info = audio_params
+        .extra_data
+        .clone()
+        .ok_or("remux: no FLAC STREAMINFO (extra_data) — not a FLAC-in-mp4 track")?;
+    if stream_info.len() != 34 {
+        return Err(format!(
+            "remux: STREAMINFO is {} bytes, expected 34 — refusing to remux",
+            stream_info.len()
+        ));
+    }
+    let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    let bit_depth = resolve_bit_depth(&audio_params);
+
+    let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
+    // "fLaC" stream marker.
+    out.extend_from_slice(b"fLaC");
+    // METADATA_BLOCK_HEADER: is_last=0, type=0 (STREAMINFO), 24-bit length = 34.
+    out.push(0x00);
+    out.extend_from_slice(&[0x00, 0x00, 0x22]);
+    out.extend_from_slice(&stream_info);
+    // Empty VORBIS_COMMENT (is_last=1, type=4, len=8): vendor_len=0 + count=0.
+    // Some DLNA renderers reject a FLAC stream without a VORBIS_COMMENT block, so
+    // append the same empty one the native encoder emits.
+    out.push(0x84);
+    out.extend_from_slice(&[0x00, 0x00, 0x08]);
+    out.extend_from_slice(&[0u8; 8]);
+
+    // Concatenate the raw FLAC frames in order — one mp4 sample = one FLAC frame.
+    let mut frame_count: u64 = 0;
+    loop {
+        match format.next_packet() {
+            Ok(Some(packet)) => {
+                if packet.track_id == track_id {
+                    out.extend_from_slice(&packet.data);
+                    frame_count += 1;
+                }
+            }
+            Ok(None) => break,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("remux next_packet: {e}")),
+        }
+    }
+    if frame_count == 0 {
+        return Err("remux: no FLAC frames extracted".into());
+    }
+
+    std::fs::write(output_path, &out).map_err(|e| format!("remux write: {e}"))?;
+    Ok((out.len() as u64, bit_depth, sample_rate))
+}
+
 /// Symphonia-based decoder for standard formats (FLAC, MP3, WAV, M4A, OGG, etc).
 fn decode_symphonia(
     file_path: &str,
