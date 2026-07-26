@@ -97,10 +97,25 @@ impl AppState {
         services.register(Box::new(
             tune_core::streaming::tidal::TidalService::with_quality(&tune_config.tidal_quality),
         ));
-        services.register(Box::new(tune_core::streaming::qobuz::QobuzService::new(
+        // Qobuz endpoint order: direct-first for everyone; proxy-first only for
+        // founder accounts (persisted `qobuz_proxy_first` flag from the cloud
+        // license validation — see LicenseManager::set_qobuz_proxy_first).
+        let qobuz_proxy_first = {
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            settings
+                .get("qobuz_proxy_first")
+                .ok()
+                .flatten()
+                .map(|v| v == "true")
+                .unwrap_or(false)
+        };
+        let mut qobuz = tune_core::streaming::qobuz::QobuzService::new(
             std::env::var("QOBUZ_APP_ID").unwrap_or_default(),
             std::env::var("QOBUZ_APP_SECRET").unwrap_or_default(),
-        )));
+        );
+        qobuz.set_proxy_first(qobuz_proxy_first);
+        services.register(Box::new(qobuz));
         services.register(Box::new(
             tune_core::streaming::spotify::SpotifyService::with_config(
                 tune_config.spotify_client_id.as_deref(),
