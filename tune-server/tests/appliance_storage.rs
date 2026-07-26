@@ -84,9 +84,13 @@ async fn relocation_full_flow() {
     )
     .unwrap();
 
-    // Faux /proc/mounts + stubs blkid/df/systemctl.
+    // Faux /proc/mounts (avec racine → disque système sdy) + stubs.
     let mounts = tmp.join("mounts");
-    std::fs::write(&mounts, "/dev/sdz1 /media/sdz1 exfat rw 0 0\n").unwrap();
+    std::fs::write(
+        &mounts,
+        "/dev/sdy2 / ext4 rw 0 0\n/dev/sdz1 /media/sdz1 exfat rw 0 0\n",
+    )
+    .unwrap();
     let blkid = write_stub(
         &tmp,
         "blkid.sh",
@@ -98,6 +102,23 @@ async fn relocation_full_flow() {
         "#!/bin/bash\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho '/dev/sdz1 1953480700 100 1953480600 1% /media/sdz1'\n",
     );
     let systemctl = write_stub(&tmp, "systemctl.sh", "#!/bin/bash\nexit 0\n");
+    // Inventaire lsblk : clé système sdy, SATA interne sda avec partition ntfs
+    // NON montée (le cas Gil), disque USB sdz monté.
+    let lsblk = write_stub(
+        &tmp,
+        "lsblk.sh",
+        concat!(
+            "#!/bin/bash\n",
+            "cat << 'EOT'\n",
+            "NAME=\"sdy\" TYPE=\"disk\" FSTYPE=\"\" UUID=\"\" SIZE=\"14,5G\" TRAN=\"usb\" MOUNTPOINT=\"\" LABEL=\"\" MODEL=\"USB Key\" PKNAME=\"\"\n",
+            "NAME=\"sdy2\" TYPE=\"part\" FSTYPE=\"ext4\" UUID=\"ROOT-UUID\" SIZE=\"14G\" TRAN=\"usb\" MOUNTPOINT=\"/\" LABEL=\"tuneroot\" MODEL=\"\" PKNAME=\"sdy\"\n",
+            "NAME=\"sda\" TYPE=\"disk\" FSTYPE=\"\" UUID=\"\" SIZE=\"931,5G\" TRAN=\"sata\" MOUNTPOINT=\"\" LABEL=\"\" MODEL=\"WDC WD10EZEX\" PKNAME=\"\"\n",
+            "NAME=\"sda1\" TYPE=\"part\" FSTYPE=\"ntfs\" UUID=\"MUSIC-UUID\" SIZE=\"931,5G\" TRAN=\"sata\" MOUNTPOINT=\"\" LABEL=\"MUSIQUE\" MODEL=\"\" PKNAME=\"sda\"\n",
+            "NAME=\"sdz\" TYPE=\"disk\" FSTYPE=\"\" UUID=\"\" SIZE=\"931,5G\" TRAN=\"usb\" MOUNTPOINT=\"\" LABEL=\"\" MODEL=\"Ext USB\" PKNAME=\"\"\n",
+            "NAME=\"sdz1\" TYPE=\"part\" FSTYPE=\"exfat\" UUID=\"TEST-UUID\" SIZE=\"931,5G\" TRAN=\"usb\" MOUNTPOINT=\"/media/sdz1\" LABEL=\"DSD2TO\" MODEL=\"\" PKNAME=\"sdz\"\n",
+            "EOT\n",
+        ),
+    );
 
     unsafe {
         std::env::set_var("TUNE_APPLIANCE", "1");
@@ -108,7 +129,11 @@ async fn relocation_full_flow() {
         std::env::set_var("TUNE_MOUNT_UNIT_DIR", &units);
         std::env::set_var("TUNE_DATA_MOUNT_POINT", &srv);
         std::env::set_var("TUNE_CONFIG_PATH", &cfg);
+        std::env::set_var("TUNE_LSBLK_BIN", &lsblk);
+        std::env::set_var("TUNE_MUSIC_MOUNT_BASE", tmp.join("music-mounts"));
+        std::env::set_var("TUNE_DEV_DIR", tmp.join("dev"));
     }
+    std::fs::create_dir_all(tmp.join("dev")).unwrap();
 
     // App dont la config pointe sur la source réelle.
     let config = tune_server::config::TuneConfig {
@@ -190,6 +215,109 @@ async fn relocation_full_flow() {
     assert!(new_cfg.contains("port = 8888"));
     assert!(!new_cfg.contains("source/tune.db"));
 
+    // ---- Inventaire disques + partitions non montées (cas Gil, SATA) ----
+    let (status, body) = get(&app, "/api/v1/appliance/storage").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let disks = body["disks"].as_array().unwrap();
+    assert_eq!(disks.len(), 3, "{body}");
+    let sdy = disks.iter().find(|d| d["name"] == "sdy").unwrap();
+    assert_eq!(sdy["is_boot"], json!(true));
+    let sda = disks.iter().find(|d| d["name"] == "sda").unwrap();
+    assert_eq!(sda["is_boot"], json!(false));
+    assert_eq!(sda["tran"], "sata");
+    let unmounted = body["unmounted_partitions"].as_array().unwrap();
+    assert_eq!(unmounted.len(), 1, "{body}");
+    assert_eq!(unmounted[0]["uuid"], "MUSIC-UUID");
+    assert_eq!(unmounted[0]["label"], "MUSIQUE");
+    assert_eq!(unmounted[0]["disk_model"], "WDC WD10EZEX");
+
+    // Montage de la partition musique par UUID.
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/appliance/storage/mount",
+        json!({"uuid": "MUSIC-UUID"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mount_path = body["mount_path"].as_str().unwrap().to_string();
+    assert!(mount_path.contains("music-mounts"), "{mount_path}");
+    let unit_bodies: Vec<String> = std::fs::read_dir(&units)
+        .unwrap()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(
+        unit_bodies.iter().any(|u| u.contains("by-uuid/MUSIC-UUID")),
+        "unit musique manquante"
+    );
+    // UUID inconnu ou déjà monté → 400.
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/appliance/storage/mount",
+        json!({"uuid": "TEST-UUID"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // ---- Installation sur disque (gardes puis happy path stubé) ----
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sda", "confirm": "oui"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "confirm invalide accepté");
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sdy", "confirm": "EFFACER"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "disque système accepté !");
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "nope", "confirm": "EFFACER"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Happy path : pipeline stub qui écrit la cible + simule la progression dd.
+    unsafe {
+        std::env::set_var("TUNE_IMAGE_URL", "file:///unused");
+        std::env::set_var(
+            "TUNE_INSTALL_PIPELINE",
+            "printf 'tune-os-image' > \"$TUNE_TARGET\"; printf '4194304 bytes copied\\r8388608 bytes copied\\r' >&2",
+        );
+    }
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sda", "confirm": "EFFACER"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut phase = String::new();
+    let mut written = 0u64;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, st) = get(&app, "/api/v1/appliance/install-to-disk/status").await;
+        phase = st["phase"].as_str().unwrap_or("").to_string();
+        written = st["written_bytes"].as_u64().unwrap_or(0);
+        if phase == "done" || phase == "failed" {
+            if phase == "failed" {
+                panic!("install failed: {st}");
+            }
+            break;
+        }
+    }
+    assert_eq!(phase, "done");
+    assert_eq!(written, 8388608, "progression dd non relayée");
+    assert_eq!(
+        std::fs::read_to_string(tmp.join("dev/sda")).unwrap(),
+        "tune-os-image"
+    );
+
     unsafe {
         for v in [
             "TUNE_APPLIANCE",
@@ -200,6 +328,11 @@ async fn relocation_full_flow() {
             "TUNE_MOUNT_UNIT_DIR",
             "TUNE_DATA_MOUNT_POINT",
             "TUNE_CONFIG_PATH",
+            "TUNE_LSBLK_BIN",
+            "TUNE_MUSIC_MOUNT_BASE",
+            "TUNE_DEV_DIR",
+            "TUNE_IMAGE_URL",
+            "TUNE_INSTALL_PIPELINE",
         ] {
             std::env::remove_var(v);
         }
