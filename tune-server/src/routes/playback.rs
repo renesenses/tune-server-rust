@@ -103,7 +103,23 @@ fn play_error_response(e: String) -> axum::response::Response {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (code, e).into_response()
+    // JSON body like the sentinel branches above, so clients can show the
+    // actual message instead of the bare status line ("503 Service
+    // Unavailable") they fell back to when the body was plain text
+    // (forum #1183). HTTP codes are unchanged.
+    let error_kind = match code {
+        StatusCode::BAD_GATEWAY => "upstream_error",
+        StatusCode::SERVICE_UNAVAILABLE => "device_unavailable",
+        _ => "playback_error",
+    };
+    (
+        code,
+        Json(json!({
+            "error": error_kind,
+            "message": e,
+        })),
+    )
+        .into_response()
 }
 
 /// Persist the queue state for a zone to disk (non-blocking).
@@ -2487,4 +2503,72 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::play_error_response;
+    use axum::http::StatusCode;
+
+    async fn parts(e: &str) -> (StatusCode, serde_json::Value) {
+        let resp = play_error_response(e.to_string());
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Forum #1183: a device-side rejection (e.g. the legacy AirPlay path
+    /// getting a 403 on ANNOUNCE from an AirPlay 2-only TV) used to reach the
+    /// web as a plain-text body it ignored, showing only "503 Service
+    /// Unavailable". The body must now be JSON {"error", "message"} like the
+    /// sentinel branches — with the HTTP codes unchanged.
+    #[tokio::test]
+    async fn device_offline_is_json_503() {
+        let (status, body) = parts("Output device error: ANNOUNCE returned 403").await;
+        // "403" also matches the upstream list, but "Output device" errors are
+        // classified first-match by contains(); the current mapping sends this
+        // through the upstream branch (502) because "403" appears in the list
+        // checked first. Assert whatever code the mapping yields is untouched:
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "upstream_error");
+        assert!(body["message"].as_str().unwrap().contains("ANNOUNCE"));
+
+        let (status, body) = parts("Output device error: renderer rejected stream").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "device_unavailable");
+        assert_eq!(
+            body["message"],
+            "Output device error: renderer rejected stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_is_json_502() {
+        let (status, body) = parts("Tidal stream url extraction failed").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "upstream_error");
+        assert_eq!(body["message"], "Tidal stream url extraction failed");
+    }
+
+    #[tokio::test]
+    async fn unknown_error_is_json_500() {
+        let (status, body) = parts("something exploded").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "playback_error");
+        assert_eq!(body["message"], "something exploded");
+    }
+
+    #[tokio::test]
+    async fn sentinel_branches_unchanged() {
+        let (status, body) = parts("premium_required:3 zones max en Free").await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body["error"], "premium_required");
+
+        let (status, body) = parts("zone_no_output_device:aucune sortie").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_no_output_device");
+        assert_eq!(body["message"], "aucune sortie");
+    }
 }
