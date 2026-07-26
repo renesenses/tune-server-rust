@@ -1973,9 +1973,12 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::EncoderSoftware) {
         meta.insert("encoder_software".into(), v);
     }
-    // SOURCE (Vorbis) — source medium of the rip (CD, SACD, Vinyl…). Not in
-    // lofty's VORBIS_MAP, so it never reaches the generic tag; read it raw.
-    if let Some(v) = raw_vorbis_comment(path, "SOURCE") {
+    // Support / medium (CD, SACD, Vinyl…). Aligned on the MusicBrainz standard
+    // MEDIA (Vorbis) / TMED (ID3v2) via ItemKey::OriginalMediaType, with the
+    // legacy Vorbis `SOURCE` tag as a fallback for files tagged before the
+    // switch (D. Pamingle : « nommer MEDIA, ID3v2 TMED, aligné sur MusicBrainz »).
+    if let Some(v) = get(ItemKey::OriginalMediaType).or_else(|| raw_vorbis_comment(path, "SOURCE"))
+    {
         meta.insert("source_media".into(), v);
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
