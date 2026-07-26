@@ -165,6 +165,9 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         "appliance".to_string(),
         json!(crate::routes::appliance::is_appliance()),
     );
+    // Adresses d'accès depuis un autre appareil (Android ne résout pas .local :
+    // l'IP est la seule voie universelle — harmonique131, forum-hifi p.25).
+    config.insert("server_urls".to_string(), json!(server_urls(state.port)));
     // Premium licensing info
     let license_state = state.license.license_state().await;
     let premium_tier = license_state.tier;
@@ -928,4 +931,36 @@ pub(super) async fn set_license(
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
     state.license.clear_license().await;
     Json(json!({ "status": "ok", "tier": "free" }))
+}
+
+/// URLs d'accès au serveur depuis un autre appareil du réseau.
+/// Priorité à TUNE_ADVERTISE_IP (VPN/NordVPN : l'IP détectée serait celle du
+/// tunnel), sinon l'IP LAN détectée par la sonde UDP ; plus le nom mDNS
+/// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
+/// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
+/// est mis en cache.
+pub(super) fn server_urls(port: u16) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
+        if !ip.is_empty() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+    }
+    if urls.is_empty() {
+        if let Some(ip) = tune_core::discovery::ssdp::get_local_ip() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+    }
+    static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let host = HOSTNAME.get_or_init(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    });
+    if !host.is_empty() && host != "localhost" && !host.contains('.') {
+        urls.push(format!("http://{host}.local:{port}"));
+    }
+    urls
 }
