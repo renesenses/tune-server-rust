@@ -213,6 +213,19 @@ pub(crate) mod decisions {
         last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
     }
 
+    /// A renderer can report the PREVIOUS session's position for the first
+    /// seconds after a fresh Play (Villerio's DMP-A6: ~374s — yesterday's end
+    /// position — reported 6s into a new start). That stale sample poisons the
+    /// peak, triggers near-end gapless staging seconds into the track, and the
+    /// snap back to the real position then reads as a phantom
+    /// `position_reset` advance. A real position can never exceed the wall
+    /// time actually elapsed (+15s margin for seek-restore/clock slack), so
+    /// during the first 30s of a track such a sample is provably stale and
+    /// must be discarded outright.
+    pub fn stale_start_position(wall_elapsed_secs: u64, position_ms: u64) -> bool {
+        wall_elapsed_secs < 30 && position_ms > wall_elapsed_secs * 1000 + 15_000
+    }
+
     /// The peak position reached (near) the track's full duration, so the track
     /// has demonstrably finished — independent of the wall clock.
     ///
@@ -2134,6 +2147,26 @@ impl PositionPoller {
             }
 
             // Track the high-water mark for position — used to verify that
+            // Discard provably-stale early samples BEFORE they poison anything:
+            // some renderers report the previous session's position for the
+            // first seconds after a fresh Play (DMP-A6 → near-end staging at
+            // +6s then phantom position_reset advance). Skip the whole
+            // position-driven logic for this tick; the next honest sample
+            // resumes it, and past 30s of wall time the guard stands down.
+            let wall_elapsed_now = ps
+                .track_started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            if decisions::stale_start_position(wall_elapsed_now, status.position_ms) {
+                debug!(
+                    zone_id,
+                    pos_ms = status.position_ms,
+                    wall_s = wall_elapsed_now,
+                    "stale_start_position_ignored"
+                );
+                continue;
+            }
+
             // enough of the track was actually played before accepting a
             // gapless transition.  We update this BEFORE checking for resets
             // so the peak reflects the last known good position.
@@ -3213,6 +3246,18 @@ impl PositionPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_start_position_rejects_previous_session_ghost() {
+        // A6 reporting yesterday's ~374s six seconds into a fresh play.
+        assert!(decisions::stale_start_position(6, 374_000));
+        // Honest early sample: position consistent with wall time.
+        assert!(!decisions::stale_start_position(6, 6_500));
+        // Seek-restore margin: resume at +14s while wall says 2s is tolerated.
+        assert!(!decisions::stale_start_position(2, 14_000));
+        // Past the 30s grace the guard stands down entirely.
+        assert!(!decisions::stale_start_position(40, 374_000));
+    }
 
     #[test]
     fn volume_not_adopted_on_first_observation() {
