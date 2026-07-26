@@ -47,3 +47,7 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only: implementing `TunePlugin` and giving it a scratch data dir in
+# tests/plugin_routes.rs.
+async-trait = { workspace = true }
+tempfile = "3"
