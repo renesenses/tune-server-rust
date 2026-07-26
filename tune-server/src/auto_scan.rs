@@ -627,6 +627,15 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                     );
                     let had_changes = !changes.is_empty();
                     for change in changes {
+                        // Tune's own streaming temp files (tune-stream-*/
+                        // tune-prefetch-* in %TEMP%) fire watcher events on every
+                        // transcode when the library root is a parent of the temp
+                        // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
+                        // degrading the first seconds of each streaming play.
+                        if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path))
+                        {
+                            continue;
+                        }
                         match change.change_type {
                             tune_core::scanner::watcher::ChangeType::Added
                             | tune_core::scanner::watcher::ChangeType::Modified => {
