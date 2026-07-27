@@ -1542,6 +1542,29 @@ impl PlaybackOrchestrator {
                 // no-op (Aiff→Aiff) meant for DLNA, so it must be overridden
                 // here or the Cast device would be fed AIFF again (#1210).
                 AudioFormat::Flac
+            } else if src_fmt == AudioFormat::Dsd && is_network_output {
+                // DSD → network renderer: stream as progressive WAV/LPCM instead
+                // of a blocking pre-transcode to a FLAC file.
+                //
+                // DSD→FLAC is the slowest transcode (74–86s for a track). The
+                // FLAC path takes `use_file_transcode` below, which decodes AND
+                // encodes the WHOLE file to /tmp BEFORE serving a single byte —
+                // so a renderer that can't wait ~80s for its transport URI to
+                // become playable times out and plays SILENCE. Linn Klimax /
+                // OpenHome (Pierre Mack) never decodes DSD itself, so it always
+                // hit this ~80s stall.
+                //
+                // A WAV target routes through the streaming session instead: the
+                // decoder feeds PCM as it runs (first bytes in ~1s), and the HTTP
+                // layer still advertises an exact Content-Length
+                // (StreamInfo::wav_content_length, from the known duration) +
+                // Accept-Ranges + 206-on-`bytes=0-` — exactly what DLNA/OpenHome
+                // renderers require. This is the same streaming-WAV path the
+                // Eversolo DMP-A6/A8 already use. Renderers that need a 16-bit
+                // LPCM cap keep it via `dlna_needs_wav` above; this branch only
+                // catches FLAC-capable renderers (Linn) that were paying the full
+                // ~80s stall for nothing.
+                AudioFormat::Wav
             } else {
                 src_fmt.dlna_transcode_target()
             };
