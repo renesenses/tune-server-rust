@@ -62,8 +62,9 @@ webpki-roots = "0.26"
 # component-model, gc, threads, profiling, pooling, coredump, debug.
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# nice/ionice des threads du pool de scan (scanner/walker.rs)
+[target.'cfg(unix)'.dependencies]
+# Linux : nice/ionice des threads du pool de scan (scanner/walker.rs).
+# macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]

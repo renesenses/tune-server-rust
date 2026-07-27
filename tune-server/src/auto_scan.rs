@@ -658,8 +658,16 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
         return;
     }
 
+    // Normalized roots for the delete guard below — same normalization the
+    // watcher applies internally.
+    let guard_roots: Vec<String> = music_dirs
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .filter(|d| !d.is_empty())
+        .collect();
+
     match tune_core::scanner::watcher::FileWatcher::new(music_dirs) {
-        Ok(watcher) => {
+        Ok(mut watcher) => {
             info!("file_watcher_started");
             tokio::task::spawn_blocking(move || {
                 // Wait for the initial auto-scan to complete before processing
@@ -691,7 +699,16 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                         .flatten()
                         .map(|v| v != "false" && v != "0")
                         .unwrap_or(true);
+                let mut liveness_tick: u32 = 0;
                 loop {
+                    // Every ~2 min (each idle iteration blocks ~2s): re-watch
+                    // roots that appeared or came back after an unmount, and
+                    // drop dead watches. A NAS mounted after boot used to stay
+                    // invisible to live updates until a server restart.
+                    liveness_tick = liveness_tick.wrapping_add(1);
+                    if liveness_tick % 60 == 0 {
+                        watcher.ensure_watches();
+                    }
                     let changes = watcher.poll_debounced(
                         std::time::Duration::from_secs(2),
                         std::time::Duration::from_millis(500),
@@ -854,6 +871,28 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                 }
                             }
                             tune_core::scanner::watcher::ChangeType::Deleted => {
+                                // NEVER delete tracks because a mount dropped:
+                                // when a NAS goes away, the whole subtree fires
+                                // Remove events (and the poll watcher for
+                                // network mounts sees every file "vanish").
+                                // If the owning music root is unreadable, the
+                                // files are unreachable — not deleted.
+                                if std::path::Path::new(&change.path).exists() {
+                                    tracing::debug!(path = %change.path, "watcher_delete_ignored_file_still_present");
+                                    continue;
+                                }
+                                if let Some(root) = guard_roots
+                                    .iter()
+                                    .find(|r| change.path.starts_with(r.as_str()))
+                                    && std::fs::read_dir(root).is_err()
+                                {
+                                    tracing::warn!(
+                                        path = %change.path,
+                                        root = %root,
+                                        "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
+                                    );
+                                    continue;
+                                }
                                 let track_repo = TrackRepo::with_backend(db.clone());
                                 if track_repo.delete_by_path(&change.path).is_ok() {
                                     info!(path = %change.path, "watcher_track_removed");
