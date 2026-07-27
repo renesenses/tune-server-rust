@@ -441,6 +441,9 @@ pub struct WasmPlugin {
     alloc: TypedFunc<u32, u32>,
     dealloc: TypedFunc<(u32, u32), ()>,
     dispatch: TypedFunc<(u32, u32), u64>,
+    /// Optional `plugin_on_event(ptr,len)` export (RFC §3.3/§3.6). Present only
+    /// if the plugin exports it; [`WasmPlugin::on_event`] is a no-op otherwise.
+    on_event: Option<TypedFunc<(u32, u32), ()>>,
     fuel: u64,
 }
 
@@ -551,6 +554,11 @@ impl WasmPlugin {
             .get_typed_func::<(u32, u32), u64>(&mut store, "plugin_dispatch")
             .or_else(|_| instance.get_typed_func::<(u32, u32), u64>(&mut store, "dispatch_c"))
             .map_err(|e| format!("resolve `plugin_dispatch`/`dispatch_c`: {e}"))?;
+        // Optional (RFC §3.3): only plugins that subscribe to events export it.
+        // A wrong-typed export is treated as absent (on_event stays a no-op).
+        let on_event = instance
+            .get_typed_func::<(u32, u32), ()>(&mut store, "plugin_on_event")
+            .ok();
 
         // Stash memory + alloc in the store data so host imports can read from
         // and allocate into the plugin's memory from inside a `Caller`. Done
@@ -574,6 +582,7 @@ impl WasmPlugin {
             alloc,
             dealloc,
             dispatch,
+            on_event,
             fuel: limits.fuel,
         })
     }
@@ -613,6 +622,45 @@ impl WasmPlugin {
         buf.extend_from_slice(action);
         buf.extend_from_slice(payload);
         self.call_raw(&buf)
+    }
+
+    /// Forward a subscribed `event_bus` event to the plugin (RFC §3.6).
+    ///
+    /// Fire-and-forget: `event_json` (the `{name, payload}` object) is written
+    /// into guest memory via `alloc` and passed to the optional
+    /// `plugin_on_event(ptr,len)` export — there is no return value. If the
+    /// plugin does not export `plugin_on_event`, this is a **no-op `Ok`** (the
+    /// plugin simply ignores events). Fuel is replenished so the call is
+    /// independently bounded exactly like [`dispatch`](WasmPlugin::dispatch); a
+    /// runaway `plugin_on_event` traps into `Err` instead of hanging the host.
+    pub fn on_event(&mut self, event_json: &str) -> Result<(), String> {
+        // Plugins without the export ignore events entirely.
+        let Some(on_event) = self.on_event.clone() else {
+            return Ok(());
+        };
+
+        // Fresh per-call fuel budget (see `call_raw`).
+        self.store
+            .set_fuel(self.fuel)
+            .map_err(|e| format!("reset fuel: {e}"))?;
+
+        let input = event_json.as_bytes();
+        let in_len = u32::try_from(input.len()).map_err(|_| "event too large".to_string())?;
+        let in_ptr = self
+            .alloc
+            .call(&mut self.store, in_len)
+            .map_err(|e| format!("plugin `alloc` trapped: {e}"))?;
+        self.memory
+            .write(&mut self.store, in_ptr as usize, input)
+            .map_err(|e| format!("write event to plugin memory: {e}"))?;
+
+        on_event
+            .call(&mut self.store, (in_ptr, in_len))
+            .map_err(|e| format!("plugin on_event trapped (fuel/limit or error): {e}"))?;
+
+        // Best-effort free of the input buffer; a dealloc trap is harmless here.
+        let _ = self.dealloc.call(&mut self.store, (in_ptr, in_len));
+        Ok(())
     }
 
     /// Core marshalling: alloc guest buffer, write input, call dispatch, read
@@ -944,6 +992,73 @@ mod tests {
         assert_eq!(calls.len(), 1, "queue_add must be called exactly once");
         assert_eq!(calls[0].0, 7);
         assert_eq!(calls[0].1, serde_json::json!([{ "id": "t1" }]));
+    }
+
+    // -----------------------------------------------------------------------
+    // P3 — event forwarding (`plugin_on_event`)
+    // -----------------------------------------------------------------------
+
+    /// A plugin that EXPORTS `plugin_on_event`: it stores the received event
+    /// bytes at a fixed offset and remembers their length in a global; its
+    /// `plugin_dispatch` then returns those stored bytes verbatim (packed
+    /// ptr/len). Lets a test push an event and read it back.
+    fn store_event_wat() -> String {
+        format!(
+            r#"(module
+  (memory (export "memory") 4)
+  (global $bump (mut i32) (i32.const 8192))
+  (global $evt_len (mut i32) (i32.const 0))
+
+  (func (export "abi_version") (result i32) (i32.const {abi}))
+
+  (func $alloc (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $bump))
+    (global.set $bump
+      (i32.and
+        (i32.add (i32.add (global.get $bump) (local.get $len)) (i32.const 7))
+        (i32.const -8)))
+    (local.get $ptr))
+
+  (func (export "dealloc") (param $ptr i32) (param $len i32))
+
+  ;; Store the event bytes at offset 4096, remember the length.
+  (func (export "plugin_on_event") (param $ptr i32) (param $len i32)
+    (memory.copy (i32.const 4096) (local.get $ptr) (local.get $len))
+    (global.set $evt_len (local.get $len)))
+
+  ;; Return the last stored event verbatim (ignores its own input).
+  (func (export "plugin_dispatch") (param $ptr i32) (param $len i32) (result i64)
+    (local $out i32)
+    (local.set $out (call $alloc (global.get $evt_len)))
+    (memory.copy (local.get $out) (i32.const 4096) (global.get $evt_len))
+    (i64.or
+      (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+      (i64.extend_i32_u (global.get $evt_len)))))
+"#,
+            abi = HOST_ABI_VERSION
+        )
+    }
+
+    #[test]
+    fn on_event_delivered_to_exporting_plugin() {
+        let mut plugin =
+            WasmPlugin::from_bytes(store_event_wat(), Limits::default()).expect("load");
+        let event = r#"{"name":"playback.state_changed","payload":{"zone":1}}"#;
+        plugin.on_event(event).expect("on_event must succeed");
+        // The plugin stored the event; dispatch hands it back verbatim.
+        assert_eq!(plugin.dispatch("{}").unwrap(), event);
+    }
+
+    #[test]
+    fn on_event_is_noop_without_the_export() {
+        // The echo plugin does NOT export `plugin_on_event`; on_event must be a
+        // silent Ok, never an error.
+        let mut plugin =
+            WasmPlugin::from_bytes(echo_wat(HOST_ABI_VERSION), Limits::default()).expect("load");
+        plugin
+            .on_event(r#"{"name":"zone.created","payload":{}}"#)
+            .expect("on_event on a plugin without the export must be a no-op Ok");
     }
 
     #[test]

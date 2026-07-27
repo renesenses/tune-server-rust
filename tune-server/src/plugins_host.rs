@@ -339,3 +339,165 @@ pub async fn load_wasm_plugins(state: &AppState) {
     info!(count = plugins.len(), "wasm_plugins_ready");
     let _ = state.wasm_plugins.set(WasmRegistry { plugins });
 }
+
+/// Does an event-subscription glob `pattern` match the event `name`?
+///
+/// The tiny grammar the manifest supports (RFC §3.6):
+/// * `"*"` — everything;
+/// * `"prefix.*"` — any event whose name starts with `prefix.` (the wildcard
+///   also matches `prefix` itself, so `"playback.*"` catches `playback`);
+/// * anything else — an exact, case-sensitive match.
+fn event_matches(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        // `playback.*` matches `playback.state_changed` and bare `playback`.
+        return name == prefix || name.starts_with(&format!("{prefix}."));
+    }
+    pattern == name
+}
+
+/// Whether any of a plugin's `event_subscriptions` matches `name`.
+fn any_subscription_matches(subscriptions: &[String], name: &str) -> bool {
+    subscriptions.iter().any(|p| event_matches(p, name))
+}
+
+/// Per-event budget: forwarding to one plugin can never block the bus longer
+/// than this. A slow/looping `plugin_on_event` is abandoned (logged) so a
+/// misbehaving plugin cannot stall event delivery to the others.
+const ON_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// P3 of the plugin ABI (RFC §3.6): forward `event_bus` events to every loaded
+/// wasm plugin whose `event_subscriptions` glob-matches the event name, via the
+/// plugin's optional `plugin_on_event` export.
+///
+/// Spawns a single background task that subscribes to the bus once and, for
+/// each event, fans out to the matching plugins. Each plugin call is
+/// serialised through the plugin's `tokio::sync::Mutex` (its wasmtime `Store`
+/// is not `Sync`), driven on `spawn_blocking` (the store may `block_on` host
+/// capabilities off a runtime worker), and bounded by [`ON_EVENT_TIMEOUT`].
+/// **Every failure is logged and swallowed** — a plugin must never break the
+/// bus (RFC §3.6/§3.7). Broadcast lag drops events silently, matching every
+/// other bus consumer.
+///
+/// Call once, right after [`load_wasm_plugins`], from `run.rs`/`bootstrap.rs`.
+pub fn spawn_wasm_event_forwarder(state: &AppState) {
+    let wasm_plugins = state.wasm_plugins.clone();
+    let mut rx = state.event_bus.subscribe();
+
+    tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+
+        loop {
+            let event = match rx.recv().await {
+                Ok(ev) => ev,
+                // Lagged: some events were dropped for this slow consumer; keep
+                // going with the next one (same policy as the other consumers).
+                Err(RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "wasm_event_forwarder_lagged");
+                    continue;
+                }
+                // Bus closed (shutdown): stop the task.
+                Err(RecvError::Closed) => break,
+            };
+
+            // The registry is published once at startup; if it is not set yet
+            // (or empty) there is nothing to forward to.
+            let Some(registry) = wasm_plugins.get() else {
+                continue;
+            };
+
+            // Which plugins subscribed to this event name?
+            let targets: Vec<String> = registry
+                .plugins
+                .iter()
+                .filter(|(_, loaded)| {
+                    any_subscription_matches(
+                        &loaded.manifest.event_subscriptions,
+                        &event.event_type,
+                    )
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+
+            // Serialise the `{name, payload}` envelope once for all targets.
+            let event_json = json!({
+                "name": event.event_type,
+                "payload": event.data,
+            })
+            .to_string();
+
+            for id in targets {
+                let wasm_plugins = wasm_plugins.clone();
+                let event_json = event_json.clone();
+                let plugin_id = id.clone();
+                // Drive the wasm call on a blocking thread (the Store isn't Sync
+                // and any host-function it triggers may block_on the runtime),
+                // serialised per plugin via its Mutex, and time-box it.
+                let call = tokio::task::spawn_blocking(move || {
+                    let registry = match wasm_plugins.get() {
+                        Some(r) => r,
+                        None => return Ok(()),
+                    };
+                    let Some(loaded) = registry.get(&plugin_id) else {
+                        return Ok(());
+                    };
+                    let mut plugin = loaded.plugin.blocking_lock();
+                    plugin.on_event(&event_json)
+                });
+
+                match tokio::time::timeout(ON_EVENT_TIMEOUT, call).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => {
+                        warn!(id = %id, event = %event.event_type, error = %e, "wasm_plugin_on_event_error");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(id = %id, event = %event.event_type, error = %e, "wasm_plugin_on_event_task_failed");
+                    }
+                    Err(_) => {
+                        warn!(id = %id, event = %event.event_type, timeout_ms = ON_EVENT_TIMEOUT.as_millis() as u64, "wasm_plugin_on_event_timeout");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{any_subscription_matches, event_matches};
+
+    #[test]
+    fn glob_star_matches_everything() {
+        assert!(event_matches("*", "playback.state_changed"));
+        assert!(event_matches("*", "library.scanned"));
+    }
+
+    #[test]
+    fn glob_prefix_matches_namespace_and_bare() {
+        assert!(event_matches("playback.*", "playback.state_changed"));
+        assert!(event_matches("playback.*", "playback"));
+        assert!(!event_matches("playback.*", "library.scanned"));
+        // Must not match a longer sibling namespace by accident.
+        assert!(!event_matches("play.*", "playback.state_changed"));
+    }
+
+    #[test]
+    fn glob_exact_matches_only_the_name() {
+        assert!(event_matches("zone.created", "zone.created"));
+        assert!(!event_matches("zone.created", "zone.updated"));
+    }
+
+    #[test]
+    fn any_subscription_ors_the_patterns() {
+        let subs = vec!["playback.*".to_string(), "zone.created".to_string()];
+        assert!(any_subscription_matches(&subs, "playback.paused"));
+        assert!(any_subscription_matches(&subs, "zone.created"));
+        assert!(!any_subscription_matches(&subs, "library.scanned"));
+        assert!(!any_subscription_matches(&[], "playback.paused"));
+    }
+}

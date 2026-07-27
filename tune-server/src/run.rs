@@ -357,6 +357,11 @@ async fn run(opts: RunOptions) {
     // the registry, though the OnceLock would resolve at request time anyway.
     #[cfg(feature = "plugins-wasm")]
     crate::plugins_host::load_wasm_plugins(&state).await;
+    // P3 of the plugin ABI (RFC §3.6): fan `event_bus` events out to subscribed
+    // wasm plugins' `plugin_on_event`. Background task; fail-safe (a plugin can
+    // never break the bus). Must run after the registry is published above.
+    #[cfg(feature = "plugins-wasm")]
+    crate::plugins_host::spawn_wasm_event_forwarder(&state);
 
     // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
     // bound (see below). Running it here fetched the local output's own
