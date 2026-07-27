@@ -3561,7 +3561,7 @@ impl PlaybackOrchestrator {
         // from the service. The network call only fires when the title is
         // missing, so the happy path is unchanged.
         let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
-        let (title, artist, album, duration_ms, cover_path) = if has_title {
+        let (title, artist, album, mut duration_ms, cover_path) = if has_title {
             (
                 req.title.clone().unwrap_or_default(),
                 req.artist_name.clone(),
@@ -3590,6 +3590,21 @@ impl PlaybackOrchestrator {
                 ),
             }
         };
+
+        // Duration backfill, mirroring serve_prefetched_pcm (#497): a non-empty
+        // title with duration 0 skips the get_track branch above, and duration 0
+        // on an EXCLUSIVE local output disarms the poller's position-past-end
+        // advance (#483, which requires duration > 0) — on a Repeat All loop
+        // transition the ring then starved at exactly one track length and
+        // playback froze forever (DEvir, v0.9.14, ASIO, DASH file reused from
+        // disk). The network call only fires in the degraded duration-0 case,
+        // so the happy path is unchanged.
+        if duration_ms.unwrap_or(0) == 0
+            && let Ok(track) = svc.get_track(source_id).await
+            && track.duration_ms > 0
+        {
+            duration_ms = Some(track.duration_ms as i64);
+        }
 
         Ok(ResolvedStream {
             url: stream_url,
@@ -5129,6 +5144,7 @@ impl PlaybackOrchestrator {
             let mut artist = entry.artist_name.clone();
             let mut album = entry.album_title.clone();
             let mut cover = entry.cover_path.clone();
+            let mut duration_ms = entry.duration_ms;
 
             let current_state = self.playback.get_state(zone_id).await;
 
@@ -5150,6 +5166,18 @@ impl PlaybackOrchestrator {
                 artist = artist.or_else(|| np.artist_name.clone());
                 album = album.or_else(|| np.album_title.clone());
                 cover = cover.or_else(|| np.cover_path.clone());
+                // Also reuse the duration: filling ONLY the title from a row
+                // whose duration_ms is 0 armed the worst combo downstream —
+                // has_title=true disables resolve_streaming_url's get_track
+                // duration backfill (reserved for empty titles), duration 0
+                // reaches the exclusive local output, and the poller's
+                // position-past-end advance (#483) requires duration > 0: on
+                // a Repeat All loop transition the ring starved at exactly
+                // one track length and playback froze forever, zone stuck
+                // "Playing" with a frozen position (DEvir, v0.9.14, ASIO).
+                if duration_ms.unwrap_or(0) == 0 && np.duration_ms > 0 {
+                    duration_ms = Some(np.duration_ms);
+                }
             }
 
             // Use the stored source, falling back to the current now_playing
@@ -5176,7 +5204,7 @@ impl PlaybackOrchestrator {
                 artist_name: artist,
                 album_title: album,
                 cover_url: cover,
-                duration_ms: entry.duration_ms,
+                duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
                 sample_rate: None,
