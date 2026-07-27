@@ -5763,6 +5763,12 @@ fn decode_radio_stream_to_pcm(
             }
         }
 
+        // When this connection started streaming. A healthy station streams for
+        // minutes between periodic upstream drops; only a permanently-dead
+        // station fails in rapid succession. Used below to reset the reconnect
+        // counter after a good stretch (see the drop handler).
+        let connected_at = std::time::Instant::now();
+
         // ---- Decode loop ----
         loop {
             if tx.is_closed() {
@@ -5832,6 +5838,17 @@ fn decode_radio_stream_to_pcm(
         // Reconnect and keep feeding the SAME session (pcm_buf carries over).
         if tx.is_closed() {
             return Ok(());
+        }
+        // MAX_RECONNECTS guards against a *permanently dead* station (rapid
+        // back-to-back failures) — not against a healthy station's periodic
+        // upstream drops. FIP-style streams drop the body roughly every ~6 min,
+        // so a cumulative counter hit 30 at ~3h and cut a good listen (Xavier
+        // #1212, a regression of #382). Reset the counter after any sustained
+        // good stretch so a normal long listen is never capped, while a dead
+        // station (each connection dies in <60s) still burns through
+        // MAX_RECONNECTS in seconds and correctly falls back to the poller.
+        if connected_at.elapsed() >= std::time::Duration::from_secs(60) {
+            reconnects = 0;
         }
         reconnects += 1;
         if reconnects > MAX_RECONNECTS {
