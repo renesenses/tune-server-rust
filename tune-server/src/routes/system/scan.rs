@@ -34,6 +34,43 @@ pub(crate) fn scan_cancel_requested() -> bool {
     SCAN_CANCEL.load(Ordering::SeqCst)
 }
 
+/// Pre-scan skip decision: does `path` need (re)scanning, or is it unchanged
+/// since the last scan and safe to skip?
+///
+/// Returns `true` if the file is new, or its mtime/size differ from what the DB
+/// last recorded for it; `false` if it's unchanged (skip — don't re-read tags).
+///
+/// The lookup key is NFC-normalized because the stored `file_path`s (and the
+/// `discovered_paths` set) are NFC, while a filename on disk may be NFD (a FR
+/// library ripped on macOS, copied to a Synology, read back over SMB). Skipping
+/// this normalization was the "scan interminable" bug: every NFD-named file
+/// missed the map, failed the skip, and lofty re-read its tags (heavy embedded
+/// art) over slow SMB on EVERY scan (Xavier, DS214/18.5k FR).
+///
+/// The manual scan and the auto/watcher scan MUST share this one implementation
+/// so they can't diverge again — they previously held two copies and only one
+/// received the NFC fix.
+pub(crate) fn file_needs_scan(
+    path: &std::path::Path,
+    existing_tracks: &std::collections::HashMap<String, (i64, Option<f64>, Option<i64>)>,
+) -> bool {
+    let path_str: String = path.to_string_lossy().nfc().collect();
+    if let Some(&(_, existing_mtime, existing_size)) = existing_tracks.get(path_str.as_str()) {
+        if let Ok(file_meta) = path.metadata() {
+            let mtime = file_meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let unchanged = existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
+                && existing_size.map_or(false, |s| s == file_meta.len() as i64);
+            return !unchanged;
+        }
+    }
+    true
+}
+
 #[derive(Deserialize)]
 pub(super) struct ScanQuery {
     /// When true, re-process ALL discovered files (bypass the unchanged-file
@@ -255,33 +292,9 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 if force {
                     return true;
                 }
-                // NFC-normalize the lookup key: the stored file_path (and the
-                // `discovered_paths` set above) are NFC, but a filename on disk
-                // may be NFD (a FR library ripped on macOS then copied to a
-                // Synology, read back over SMB). Without this the get() misses
-                // for every NFD-named file, so it fails the skip and lofty
-                // re-reads its tags (heavy embedded art over slow SMB) on EVERY
-                // manual scan → "scan interminable" (Xavier, DS214/18.5k FR).
-                // auto_scan.rs already normalizes here; this brings the manual
-                // scan into line (divergent copy that missed the fix).
-                let path_str: String = path.to_string_lossy().nfc().collect();
-                if let Some(&(_, existing_mtime, existing_size)) =
-                    existing_tracks.get(path_str.as_str())
-                {
-                    if let Ok(file_meta) = path.metadata() {
-                        let mtime = file_meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let unchanged = existing_mtime
-                            .map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
-                            && existing_size.map_or(false, |s| s == file_meta.len() as i64);
-                        return !unchanged;
-                    }
-                }
-                true
+                // Shared with auto_scan so the manual and watcher scans can't
+                // diverge on the NFC key handling (the "scan interminable" bug).
+                file_needs_scan(path, &existing_tracks)
             })
             .collect();
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
