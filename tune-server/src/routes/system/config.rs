@@ -113,7 +113,9 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
-        ("enrich_on_scan", json!(false)),
+        // Default on (unchanged behaviour); scan.rs treats unset as enabled.
+        // The web toggle writes "false" to opt out (JF Paquet).
+        ("enrich_on_scan", json!(true)),
         ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
