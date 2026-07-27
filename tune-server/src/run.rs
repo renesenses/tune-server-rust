@@ -305,6 +305,15 @@ async fn run(opts: RunOptions) {
             .unwrap_or_default()
             .as_secs();
         settings.set("server_last_alive_at", &now.to_string()).ok();
+
+        // A scan cannot be running at boot: a "scanning" status here is a
+        // leftover from a hard crash mid-scan. The startup auto-scan resets it
+        // via its guard, but auto_scan is off by default — without this the
+        // clients showed a scan banner forever and refused to start a new scan.
+        if settings.get("scan_status").ok().flatten().as_deref() == Some("scanning") {
+            tracing::warn!("scan_status_stale_scanning_reset — previous run crashed mid-scan");
+            settings.set("scan_status", "idle").ok();
+        }
     }
 
     // Auto-scan music directories at startup
