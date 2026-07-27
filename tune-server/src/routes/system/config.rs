@@ -643,6 +643,43 @@ pub(super) async fn restart() -> impl IntoResponse {
             }
         }
 
+        // WINDOWS: we can't exec() in place. A plain restart is NOT swapping the
+        // binary (unlike the update flow, which must exit and let tune-update.bat
+        // do the PID-gated swap), so we CAN relaunch the SAME exe ourselves:
+        // spawn a fresh copy, then exit. Without this, `exit(0)` just killed Tune
+        // on a bare Windows install with no supervisor (Mika, #1209: "Network
+        // error: server unreachable" then "Failed to load zones" — the server
+        // never came back and had to be relaunched by hand). The listening socket
+        // is created non-inheritable (socket2 sets WSA_FLAG_NO_HANDLE_INHERIT), so
+        // the child does NOT inherit it and this process's exit fully releases
+        // port 8888; the child's bind() retries for ~20s (main.rs) to cover the
+        // brief release window. On a supervised install the child simply races the
+        // supervisor's relaunch and whichever loses exits cleanly on the bind
+        // guard — no crash loop.
+        #[cfg(windows)]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                tracing::info!(exe = %exe.display(), "restart_windows_spawn");
+                match std::process::Command::new(&exe)
+                    .args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        tracing::info!(pid = child.id(), "restart_windows_new_process_spawned");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "restart_windows_spawn_failed — manual restart required");
+                    }
+                }
+                // Give the child a moment to start before we release the port.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
         std::process::exit(0);
     });
     Json(json!({ "status": "restarting" }))
