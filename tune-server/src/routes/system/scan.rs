@@ -199,8 +199,29 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
 
-        // Load existing tracks BEFORE scanning to skip unchanged files
-        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        // Load existing tracks BEFORE scanning to skip unchanged files.
+        // A DB read error must ABORT the scan, not degrade into an empty map:
+        // with an empty map every file on disk looks new, so a transient DB
+        // hiccup would re-insert the whole library as duplicates.
+        let existing_tracks = match track_repo.get_all_local_file_info() {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(error = %e, "scan_aborted_existing_tracks_read_failed");
+                let settings = SettingsRepo::with_backend(db.clone());
+                settings.set("scan_status", "idle").ok();
+                event_bus.emit(
+                    "library.scan.completed",
+                    json!({
+                        "total_files": 0,
+                        "inserted": 0,
+                        "updated": 0,
+                        "skipped": 0,
+                        "error": format!("database read failed: {e}"),
+                    }),
+                );
+                return;
+            }
+        };
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
         // Parallelised: each `path.metadata()` is a blocking stat that, over a
@@ -287,6 +308,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let cache_dir = crate::routes::library::artwork_cache_dir();
         let mut inserted = 0i64;
         let mut updated = 0i64;
+        let mut db_insert_failed = 0i64;
+        let mut db_update_failed = 0i64;
         // `skipped` stays the aggregate the UI already shows. The manual scan
         // never dedups by audio_hash (only the auto/watcher path does), so
         // everything it skips is either an unchanged file or a file whose
@@ -409,9 +432,14 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     }
                 }
 
-                // Batch insert + update using prepared statements
+                // Batch insert + update using prepared statements. Per-row
+                // failures inside create_batch/update_batch are logged there
+                // and swallowed — count the shortfall so the report shows
+                // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                db_insert_failed += to_insert.len() as i64 - batch_inserted;
+                db_update_failed += to_update.len() as i64 - batch_updated;
                 inserted += batch_inserted;
                 updated += batch_updated;
 
@@ -805,6 +833,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             skipped,
             skipped_unchanged,
             skipped_no_metadata,
+            db_insert_failed,
+            db_update_failed,
             artwork = artwork_extracted,
             orphan_artists,
             "scan_and_import_complete"
@@ -826,6 +856,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "skipped": skipped,
                     "skipped_unchanged": skipped_unchanged,
                     "skipped_no_metadata": skipped_no_metadata,
+                    "db_insert_failed": db_insert_failed,
+                    "db_update_failed": db_update_failed,
                     "artwork_extracted": artwork_extracted,
                     "failed_paths": scan_stats.failed_paths,
                 })
@@ -847,6 +879,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 "skipped": skipped,
                 "skipped_unchanged": skipped_unchanged,
                 "skipped_no_metadata": skipped_no_metadata,
+                "db_insert_failed": db_insert_failed,
+                "db_update_failed": db_update_failed,
                 "artwork_extracted": artwork_extracted,
                 "failed_paths": scan_stats.failed_paths,
             }),
@@ -869,6 +903,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "skipped": skipped,
             "skipped_unchanged": skipped_unchanged,
             "skipped_no_metadata": skipped_no_metadata,
+            "db_insert_failed": db_insert_failed,
+            "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": scan_stats.failed_paths,
         });
