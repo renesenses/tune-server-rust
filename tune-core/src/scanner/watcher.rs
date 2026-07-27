@@ -10,9 +10,12 @@ use tracing::{debug, info, warn};
 /// Poll interval for directories on network mounts. notify's native backends
 /// (FSEvents/inotify/ReadDirectoryChangesW) receive NOTHING for changes made
 /// by other machines on an SMB/NFS share — the watcher looked alive but was
-/// deaf for the most common NAS setup. Polling stats the tree, so keep the
-/// interval long enough to stay cheap over the network.
-const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(120);
+/// deaf for the most common NAS setup. Polling stats the WHOLE tree every
+/// interval: on a large SMB library one sweep alone can take minutes
+/// (Pierre M: 6 min 43 for the baseline walk of K:\), so 120 s would have
+/// kept the NAS under permanent scan. 15 min keeps the sweep an occasional
+/// background cost while still surfacing remote changes without a rescan.
+const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(900);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeType {
