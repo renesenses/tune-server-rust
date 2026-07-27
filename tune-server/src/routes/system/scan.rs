@@ -177,6 +177,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
 
         let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
         let missing_dirs = list_result.missing_dirs;
+        let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -508,7 +509,13 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // Prune tracks whose files no longer exist on disk.
         // SAFETY: skip tracks in missing directories — the volume/NAS may
         // simply be unmounted. Deleting them would wipe the entire library.
-        {
+        // Same protection for `error_dirs`: a subtree where the WALK itself
+        // errored (unreadable subfolder, SMB stall mid-scan) has files that
+        // exist but never made it into `discovered_paths`.
+        // A cancelled scan never prunes: Stop must never be destructive.
+        if SCAN_CANCEL.load(Ordering::SeqCst) {
+            tracing::info!("post_scan_prune_skipped_cancelled");
+        } else {
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
@@ -522,8 +529,11 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     }
                 }
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
-                    if in_missing_dir {
+                    let in_unreadable_scope = missing_dirs
+                        .iter()
+                        .chain(error_dirs.iter())
+                        .any(|d| db_path.starts_with(d));
+                    if in_unreadable_scope {
                         protected += 1;
                         continue;
                     }
@@ -535,8 +545,9 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             if protected > 0 {
                 tracing::warn!(
                     protected,
-                    dirs = ?missing_dirs,
-                    "post_scan_tracks_protected_missing_dirs"
+                    missing = ?missing_dirs,
+                    walk_errors = ?error_dirs,
+                    "post_scan_tracks_protected_unreadable_dirs"
                 );
             }
             if pruned > 0 {
@@ -789,6 +800,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 &json!({
                     "total_files": total_discovered,
                     "missing_dirs": missing_dirs.clone(),
+                    "error_dirs": error_dirs.clone(),
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
@@ -808,6 +820,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             json!({
                 "total_files": total_discovered,
                 "missing_dirs": missing_dirs.clone(),
+                "error_dirs": error_dirs.clone(),
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "metadata_timeout": scan_stats.metadata_timeout,
@@ -826,6 +839,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let report = serde_json::json!({
             "total_files": total_discovered,
             "missing_dirs": missing_dirs.clone(),
+            "error_dirs": error_dirs.clone(),
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "metadata_failed": scan_stats.metadata_failed,
