@@ -882,11 +882,17 @@ pub fn spawn_output_providers(
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let playback = state.playback.clone();
+    let license = state.license.clone();
 
     tokio::spawn(async move {
         loop {
+            // Rebuilt every poll so a module bought (or refunded) mid-session
+            // takes effect at the next discovery pass, without a restart.
+            let ctx = tune_core::outputs::traits::ProviderContext {
+                licensed_modules: license.modules().await,
+            };
             for provider in &providers {
-                for output in provider.discover().await {
+                for output in provider.discover(&ctx).await {
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
                     let otype = output.output_type().to_string();

@@ -196,5 +196,30 @@ pub trait OutputProvider: Send + Sync {
     /// Discover the devices reachable right now and build one [`OutputTarget`]
     /// per device. Return every visible device on each call — the server skips
     /// device_ids that are already registered.
-    async fn discover(&self) -> Vec<Box<dyn OutputTarget>>;
+    ///
+    /// `ctx` carries the server-side runtime state a paid module needs —
+    /// today the module entitlements: a provider that is a paid SKU must
+    /// check [`ProviderContext::module_licensed`] and return an empty list
+    /// when its module is not owned. The server rebuilds the context on
+    /// every poll, so buying a module takes effect without a restart.
+    async fn discover(&self, ctx: &ProviderContext) -> Vec<Box<dyn OutputTarget>>;
+}
+
+/// Runtime context handed to [`OutputProvider::discover`] on every poll.
+///
+/// Deliberately a plain data snapshot (not a handle into tune-core) so that
+/// out-of-tree provider crates only ever depend on this contract crate.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderContext {
+    /// Stable ids of the paid modules the linked account owns (e.g.
+    /// "diretta"), as validated by the license layer. Empty when the account
+    /// owns none, is signed out, or the server runs unlicensed.
+    pub licensed_modules: Vec<String>,
+}
+
+impl ProviderContext {
+    /// Whether the account owns the paid module `id` (e.g. "diretta").
+    pub fn module_licensed(&self, id: &str) -> bool {
+        self.licensed_modules.iter().any(|m| m == id)
+    }
 }
