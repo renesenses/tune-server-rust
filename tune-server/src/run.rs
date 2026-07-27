@@ -330,6 +330,9 @@ async fn run(opts: RunOptions) {
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
     crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done);
 
+    // Daily scheduled scan (settings written by /scan/schedule).
+    crate::routes::system::scan::spawn_scan_scheduler(state.clone());
+
     // Register local audio outputs (USB DAC, headphones, speakers)
     #[cfg(feature = "local-audio")]
     crate::startup::register_local_outputs(&state).await;
