@@ -179,10 +179,14 @@ pub async fn fetch_device_description(location: &str) -> Result<DeviceDescriptio
         .get(location)
         .send()
         .await
-        .map_err(|e| format!("HTTP fetch {location}: {e}"))?
+        .map_err(|e| {
+            let rendered = crate::http::error::chain(&e);
+            crate::http::error::hint_if_local_network_denied(&rendered);
+            format!("HTTP fetch {location}: {rendered}")
+        })?
         .text()
         .await
-        .map_err(|e| format!("HTTP body {location}: {e}"))?;
+        .map_err(|e| format!("HTTP body {location}: {}", crate::http::error::chain(&e)))?;
 
     parse_device_description(&xml)
 }

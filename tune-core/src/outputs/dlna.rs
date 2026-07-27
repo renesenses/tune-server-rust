@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use crate::http::error as http_error;
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
@@ -127,7 +128,7 @@ impl DlnaOutput {
             .await
         {
             Ok(_) => Ok(()),
-            Err(e) => Err(format!("soap_fast: {e}")),
+            Err(e) => Err(format!("soap_fast: {}", http_error::chain(&e))),
         }
     }
 
@@ -170,15 +171,16 @@ impl DlnaOutput {
             {
                 Ok(resp) => match resp.text().await {
                     Ok(text) => return Ok(text),
-                    Err(e) => last_err = format!("soap read: {e}"),
+                    Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
                 },
                 Err(e) if e.is_connect() || e.is_timeout() => {
-                    last_err = format!("soap send: {e}");
+                    last_err = format!("soap send: {}", http_error::chain(&e));
                 }
-                Err(e) => return Err(format!("soap send: {e}")),
+                Err(e) => return Err(format!("soap send: {}", http_error::chain(&e))),
             }
         }
 
+        http_error::hint_if_local_network_denied(&last_err);
         warn!(device = %self.name, action, error = %last_err, "soap_all_retries_failed");
         Err(last_err)
     }
