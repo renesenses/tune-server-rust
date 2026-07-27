@@ -256,7 +256,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // stats and orphan cleanup.
         let album_repo = AlbumRepo::with_backend(db.clone());
 
-        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        // A DB read error must ABORT the scan, not degrade into an empty map:
+        // with an empty map every file on disk looks new, so a transient DB
+        // hiccup would re-insert the whole library as duplicates. (The
+        // ScanStatusGuard resets scan_status on this early return.)
+        let existing_tracks = match track_repo.get_all_local_file_info() {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
+                scan_done_clone.store(true, Ordering::Release);
+                return;
+            }
+        };
         let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
             .get_existing_audio_hash_album_pairs()
             .unwrap_or_default();
@@ -329,6 +340,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
         let mut inserted = 0u64;
         let mut updated = 0u64;
+        let mut db_insert_failed = 0u64;
+        let mut db_update_failed = 0u64;
         // `skipped` stays the aggregate the UI already shows; the per-cause
         // counters make the report actionable ("skipped 1200" alone doesn't
         // say whether the library is healthy or half the NAS failed to read).
@@ -424,8 +437,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     to_insert.push(track);
                 }
 
-                inserted += track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
-                updated += track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                // Per-row failures inside create_batch/update_batch are logged
+                // there and swallowed — count the shortfall so the report shows
+                // tracks that were scanned but never made it into the DB.
+                let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
+                let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                db_insert_failed += to_insert.len() as u64 - batch_inserted;
+                db_update_failed += to_update.len() as u64 - batch_updated;
+                inserted += batch_inserted;
+                updated += batch_updated;
 
                 // Extract extended metadata (ISRC, ReplayGain, MusicBrainz, lyrics, etc.)
                 {
@@ -564,6 +584,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             skipped_unchanged,
             skipped_duplicate,
             skipped_no_metadata,
+            db_insert_failed,
+            db_update_failed,
             artwork = artwork_extracted,
             orphan_albums,
             "auto_scan_complete"
@@ -582,6 +604,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "skipped_unchanged": skipped_unchanged,
             "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
+            "db_insert_failed": db_insert_failed,
+            "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
         });
