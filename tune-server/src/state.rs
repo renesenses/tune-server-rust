@@ -70,6 +70,12 @@ pub struct AppState {
     /// hang for as long as the slowest plugin, and would hold `plugins` while
     /// doing so — delaying shutdown too.
     pub plugin_info: Arc<OnceLock<Vec<tune_core::plugin_sdk::PluginInfo>>>,
+    /// Loaded WASM plugins (P2 of the plugin ABI). Published once by
+    /// [`crate::plugins_host::load_wasm_plugins`] at startup and read by the
+    /// `/api/v1/plugins/{id}/…` route mount. Gated behind `plugins-wasm`, so
+    /// the default server carries neither this field nor wasmtime.
+    #[cfg(feature = "plugins-wasm")]
+    pub wasm_plugins: Arc<OnceLock<crate::plugins_host::WasmRegistry>>,
     #[cfg(feature = "cloud-relay")]
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
@@ -221,6 +227,8 @@ impl AppState {
             skin_manager,
             plugins,
             plugin_info: Arc::new(OnceLock::new()),
+            #[cfg(feature = "plugins-wasm")]
+            wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })
