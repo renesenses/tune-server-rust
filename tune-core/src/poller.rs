@@ -3187,6 +3187,7 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        origin_url: None,
                     };
                     return match output.set_next_media(&media).await {
                         Ok(()) => {
@@ -3296,6 +3297,7 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        origin_url: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
