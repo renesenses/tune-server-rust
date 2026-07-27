@@ -148,6 +148,12 @@ pub struct LicenseState {
     /// first with the proxy as fallback. Absent on older servers → false.
     #[serde(default)]
     pub qobuz_proxy_first: bool,
+    /// Paid MODULE entitlements (stable ids, e.g. "diretta") owned by the
+    /// linked account. Separate SKUs — independent of `tier`/premium.
+    /// Persisted like the account premium so entitlements survive restarts
+    /// and offline starts; refreshed by the cloud validation loop.
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +245,14 @@ impl LicenseManager {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+        // Module entitlements — persisted like the account premium.
+        let modules: Vec<String> = settings
+            .get("mozaik_modules")
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+
         let state = LicenseState {
             tier,
             license_key,
@@ -249,6 +263,7 @@ impl LicenseManager {
             account_premium_expires,
             account_premium_checked,
             qobuz_proxy_first,
+            modules,
         };
 
         Self {
@@ -407,6 +422,39 @@ impl LicenseManager {
         self.state.read().await.qobuz_proxy_first
     }
 
+    /// Set the paid-module entitlements from the cloud license validation.
+    /// Persisted so entitlements survive restarts and offline starts,
+    /// mirroring `set_account_premium`. The cloud is authoritative: an empty
+    /// list clears previous entitlements (refund / transfer).
+    pub async fn set_modules(&self, modules: Vec<String>) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        settings
+            .set(
+                "mozaik_modules",
+                &serde_json::to_string(&modules).unwrap_or_else(|_| "[]".into()),
+            )
+            .ok();
+
+        let mut state = self.state.write().await;
+        let changed = state.modules != modules;
+        state.modules = modules;
+
+        if changed {
+            info!(modules = ?state.modules, "license_modules_updated");
+        }
+    }
+
+    /// Whether the account owns the paid module `id` (e.g. "diretta").
+    /// Module SKUs are independent of the premium tier.
+    pub async fn has_module(&self, id: &str) -> bool {
+        self.state.read().await.modules.iter().any(|m| m == id)
+    }
+
+    /// Snapshot of the owned module ids (for provider contexts / API responses).
+    pub async fn modules(&self) -> Vec<String> {
+        self.state.read().await.modules.clone()
+    }
+
     /// Clear the account premium (SSO logout / disconnect). The license-key path
     /// is untouched.
     pub async fn clear_account_premium(&self) {
@@ -415,10 +463,14 @@ impl LicenseManager {
         settings.delete("mozaik_premium_expires").ok();
         settings.delete("mozaik_premium_checked").ok();
 
+        settings.delete("mozaik_modules").ok();
+
         let mut state = self.state.write().await;
         state.account_premium = false;
         state.account_premium_expires = None;
         state.account_premium_checked = None;
+        // Module entitlements come from the account — they leave with it.
+        state.modules.clear();
 
         info!("license_account_premium_cleared");
     }
@@ -700,6 +752,7 @@ mod tests {
             account_premium_expires,
             account_premium_checked,
             qobuz_proxy_first: false,
+            modules: vec![],
         }
     }
 
@@ -718,6 +771,7 @@ mod tests {
             account_premium_expires: None,
             account_premium_checked: None,
             qobuz_proxy_first: false,
+            modules: vec![],
         }
     }
 

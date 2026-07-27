@@ -893,6 +893,9 @@ async fn refresh_account_premium(
         // up by a re-validation reaches the live QobuzService immediately.
         license.set_qobuz_proxy_first(user.qobuz_proxy_first).await;
         apply_qobuz_proxy_first(services, user.qobuz_proxy_first).await;
+        // Paid-module entitlements (separate SKUs, e.g. the Diretta output)
+        // travel with the account validation, like the premium flag above.
+        license.set_modules(user.modules.clone()).await;
         debug!(premium = user.premium, "mozaik_account_premium_refreshed");
     }
 }
