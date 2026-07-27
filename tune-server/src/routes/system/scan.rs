@@ -117,7 +117,7 @@ pub(super) async fn trigger_scan(
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
 /// folders stayed invisible until the app was restarted).
-pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
+pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
@@ -225,7 +225,14 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             json!({ "phase": "indexing", "scanned": 0i64, "added": 0i64, "total": 0i64 }),
         );
 
-        let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
+        let exclude_patterns = crate::auto_scan::scan_exclude_patterns(&db);
+        if !exclude_patterns.is_empty() {
+            tracing::info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
+        }
+        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+            &scan_dirs,
+            &exclude_patterns,
+        );
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
@@ -273,6 +280,16 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 return;
             }
         };
+
+        // Same audio-hash dedup as the auto/startup scan: without it, the
+        // manual scan (the "Scanner" button — the path users actually hit)
+        // happily inserted the same content twice when it exists under two
+        // paths, while the auto scan deduped. (hash, album_id) pairs already
+        // in the library are skipped for NEW inserts only; updates of an
+        // existing path are never affected.
+        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
+            .get_existing_audio_hash_album_pairs()
+            .unwrap_or_default();
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
         // Parallelised: each `path.metadata()` is a blocking stat that, over a
@@ -353,6 +370,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // which.
         let mut skipped = pre_skipped;
         let mut skipped_unchanged = pre_skipped;
+        let mut skipped_duplicate = 0i64;
         let mut skipped_no_metadata = 0i64;
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
@@ -456,6 +474,24 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                         track.id = Some(existing_id);
                         to_update.push(track);
                     } else {
+                        // Deduplicate by audio_hash + album_id (same rule as
+                        // the auto scan): identical content already present in
+                        // this album via another path is not inserted again.
+                        if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
+                            let key = (hash.clone(), aid);
+                            if known_hashes.contains(&key) {
+                                tracing::debug!(
+                                    audio_hash = %hash,
+                                    album_id = aid,
+                                    path = %sf.path,
+                                    "skip_duplicate_audio_hash"
+                                );
+                                skipped += 1;
+                                skipped_duplicate += 1;
+                                continue;
+                            }
+                            known_hashes.insert(key);
+                        }
                         to_insert.push(track);
                     }
                 }
@@ -879,6 +915,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             updated,
             skipped,
             skipped_unchanged,
+            skipped_duplicate,
             skipped_no_metadata,
             db_insert_failed,
             db_update_failed,
@@ -903,6 +940,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "updated": updated,
                     "skipped": skipped,
                     "skipped_unchanged": skipped_unchanged,
+                    "skipped_duplicate": skipped_duplicate,
                     "skipped_no_metadata": skipped_no_metadata,
                     "db_insert_failed": db_insert_failed,
                     "db_update_failed": db_update_failed,
@@ -927,6 +965,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 "updated": updated,
                 "skipped": skipped,
                 "skipped_unchanged": skipped_unchanged,
+                "skipped_duplicate": skipped_duplicate,
                 "skipped_no_metadata": skipped_no_metadata,
                 "db_insert_failed": db_insert_failed,
                 "db_update_failed": db_update_failed,
@@ -952,6 +991,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "updated": updated,
             "skipped": skipped,
             "skipped_unchanged": skipped_unchanged,
+            "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,

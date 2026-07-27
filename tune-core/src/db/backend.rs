@@ -83,6 +83,26 @@ pub trait DbBackend: Send + Sync {
     /// Returns `Ok(())` on success.
     fn execute_batch(&self, sql: &str) -> Result<(), String>;
 
+    /// Execute the same statement once per row, returning one result per row.
+    ///
+    /// Default: a plain loop over `execute` — identical behavior to the
+    /// caller-side loops it replaces (SQLite batch callers already wrap the
+    /// loop in one BEGIN IMMEDIATE/COMMIT). Postgres overrides this to run
+    /// the whole batch on a SINGLE pooled connection inside one async
+    /// context: one pool acquire and a server-side prepared statement reused
+    /// across rows, instead of per-row (runtime hop + pool acquire + parse +
+    /// autocommit) — the reason a PG scan imported at a fraction of the
+    /// SQLite speed. Per-row error semantics are preserved: a failed row
+    /// reports its error and the batch continues.
+    fn execute_many(&self, sql: &str, rows: &[Vec<SqlValue>]) -> Vec<Result<usize, String>> {
+        rows.iter()
+            .map(|row| {
+                let refs: Vec<&dyn ToSqlValue> = row.iter().map(|v| v as &dyn ToSqlValue).collect();
+                self.execute(sql, &refs)
+            })
+            .collect()
+    }
+
     /// Same as `query_many`, but reads through the write path so the
     /// query sees commits made by the write connection that haven't
     /// yet propagated to the read snapshot.
@@ -789,6 +809,40 @@ impl DbBackend for PostgresBackend {
                         .map_err(|e| format!("pg execute_batch: {e}"))?;
                 }
                 Ok(())
+            })
+        })
+    }
+
+    fn execute_many(&self, sql: &str, rows: &[Vec<SqlValue>]) -> Vec<Result<usize, String>> {
+        let sql_owned = Self::translate_placeholders(sql);
+        let pool = self.pool.clone();
+        let rows_owned: Vec<Vec<SqlValue>> = rows.to_vec();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                // One connection for the whole batch: sqlx caches prepared
+                // statements per connection, so every row after the first is
+                // bind+execute only. No explicit transaction — each row still
+                // autocommits so one bad row doesn't poison the rest (same
+                // semantics as the per-row loop this replaces).
+                let mut conn = match pool.acquire().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = format!("pg execute_many acquire: {e}");
+                        return rows_owned.iter().map(|_| Err(msg.clone())).collect();
+                    }
+                };
+                let mut results = Vec::with_capacity(rows_owned.len());
+                for row in &rows_owned {
+                    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned.clone()));
+                    for v in row {
+                        q = bind_sqlvalue(q, v);
+                    }
+                    match q.execute(&mut *conn).await {
+                        Ok(r) => results.push(Ok(r.rows_affected() as usize)),
+                        Err(e) => results.push(Err(format!("pg execute_many: {e}"))),
+                    }
+                }
+                results
             })
         })
     }

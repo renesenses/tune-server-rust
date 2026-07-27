@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -31,10 +31,12 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 // giving up, so the real duration/tags are recovered.
 const RETRY_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
-// The audio hash (duplicate detection) reads the whole file, separately from
-// the tags. Give it its own, larger budget so big Hi-Res files over a NAS still
-// get hashed — but it's best-effort: on timeout the track keeps its real tags
-// and only the hash is skipped (Progman: 23-min FLAC 24/88.2 exceeded 30s).
+// The audio hash (duplicate detection) does NOT read the whole file: it MD5s
+// a single 64 KB sample at the 25% offset (scanner/hasher.rs). Its real cost
+// is open + seek + one read — cheap even for huge files. The generous budget
+// exists because on a stalled NAS those three syscalls can hang like any
+// other I/O, and hashing is best-effort: on timeout the track keeps its real
+// tags and only the hash is skipped (Progman: stalled mount, not file size).
 const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Per-file metadata reads are I/O-bound: each rayon task blocks on the tag read
@@ -246,7 +248,24 @@ impl ListAudioResult {
 }
 
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
+    list_audio_files_with_excludes(dirs, &[])
+}
+
+/// Like [`list_audio_files`], but skips any entry (file or directory subtree)
+/// whose full path contains one of `exclude_patterns` (case-insensitive
+/// substring — deliberately simple, no glob engine). Patterns come from the
+/// `scan_exclude_paths` setting: staging/incoming folders, backup trees, a
+/// sibling's library on a shared NAS…
+pub fn list_audio_files_with_excludes(
+    dirs: &[String],
+    exclude_patterns: &[String],
+) -> ListAudioResult {
     let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
+    let excludes: Vec<String> = exclude_patterns
+        .iter()
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
     let skip_set: HashSet<&str> = SKIP_DIRS.iter().copied().collect();
 
     let mut files = Vec::new();
@@ -295,6 +314,13 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
             .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
+                if !excludes.is_empty() {
+                    let path_l = e.path().to_string_lossy().to_lowercase();
+                    if excludes.iter().any(|x| path_l.contains(x.as_str())) {
+                        debug!(path = %e.path().display(), "scan_excluded_by_pattern");
+                        return false;
+                    }
+                }
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
                     !skip_set.contains(name.as_ref())
@@ -433,12 +459,31 @@ pub fn scan_files_parallel(
             let path_str: String = path.to_string_lossy().nfc().collect();
 
             let file_meta = path.metadata().ok();
+            let stat_ok = file_meta.is_some();
             let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let mtime = file_meta
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+
+            // Zero-byte "audio" files are aborted copies/downloads, not
+            // tracks: don't index a tagless duration-0 ghost, surface them in
+            // failed_paths so the report shows what to clean.
+            if stat_ok && file_size == 0 {
+                warn!(path = %path_str, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
+                failed_files
+                    .lock()
+                    .unwrap()
+                    .push((path_str.clone(), "empty file (0 bytes)".into()));
+                return ScannedFile {
+                    path: path_str,
+                    metadata: None,
+                    audio_hash: None,
+                    file_size,
+                    mtime,
+                };
+            }
 
             let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                 Ok((meta, hash)) => {
@@ -581,12 +626,31 @@ pub fn scan_files_batched(
                     let path_str: String = path.to_string_lossy().nfc().collect();
 
                     let file_meta = path.metadata().ok();
+                    let stat_ok = file_meta.is_some();
                     let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
                     let mtime = file_meta
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
+
+                    // Zero-byte "audio" files are aborted copies/downloads, not
+                    // tracks: don't index a tagless duration-0 ghost, surface
+                    // them in failed_paths so the report shows what to clean.
+                    if stat_ok && file_size == 0 {
+                        warn!(path = %path_str, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
+                        failed_files
+                            .lock()
+                            .unwrap()
+                            .push((path_str.clone(), "empty file (0 bytes)".into()));
+                        return ScannedFile {
+                            path: path_str,
+                            metadata: None,
+                            audio_hash: None,
+                            file_size,
+                            mtime,
+                        };
+                    }
 
                     let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                         Ok((meta, hash)) => (meta, hash),
@@ -780,6 +844,28 @@ mod tests {
             "error_dirs = {:?}",
             result.error_dirs
         );
+    }
+
+    #[test]
+    fn exclude_patterns_prune_files_and_subtrees() {
+        // NOT under temp_dir(): is_tune_temp_file() skips everything there.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_excludes_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("keep")).unwrap();
+        std::fs::create_dir_all(base.join("Incoming")).unwrap();
+        std::fs::write(base.join("keep/a.flac"), b"x").unwrap();
+        std::fs::write(base.join("Incoming/b.flac"), b"x").unwrap();
+
+        let root = base.to_string_lossy().to_string();
+        let all = list_audio_files(&[root.clone()]);
+        assert_eq!(all.files.len(), 2);
+
+        // Case-insensitive substring match prunes the whole subtree.
+        let filtered = list_audio_files_with_excludes(&[root], &["incoming".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(filtered.files.len(), 1, "files = {:?}", filtered.files);
+        assert!(filtered.files[0].to_string_lossy().contains("keep"));
     }
 
     #[test]
