@@ -55,7 +55,7 @@ impl FileWatcher {
 
                     if let Some(ct) = change_type {
                         for path in &event.paths {
-                            if is_audio_file(path) {
+                            if is_audio_file(path) && !super::is_tune_temp_file(path) {
                                 let _ = event_tx.send(FileChange {
                                     change_type: ct.clone(),
                                     path: path.to_string_lossy().to_string(),
