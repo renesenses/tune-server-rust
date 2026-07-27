@@ -281,6 +281,16 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             }
         };
 
+        // Same audio-hash dedup as the auto/startup scan: without it, the
+        // manual scan (the "Scanner" button — the path users actually hit)
+        // happily inserted the same content twice when it exists under two
+        // paths, while the auto scan deduped. (hash, album_id) pairs already
+        // in the library are skipped for NEW inserts only; updates of an
+        // existing path are never affected.
+        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
+            .get_existing_audio_hash_album_pairs()
+            .unwrap_or_default();
+
         // Quick stat pass: skip files whose mtime+size haven't changed.
         // Parallelised: each `path.metadata()` is a blocking stat that, over a
         // NAS/SMB mount, carries real round-trip latency; doing 58k of them
@@ -360,6 +370,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // which.
         let mut skipped = pre_skipped;
         let mut skipped_unchanged = pre_skipped;
+        let mut skipped_duplicate = 0i64;
         let mut skipped_no_metadata = 0i64;
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
@@ -463,6 +474,24 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                         track.id = Some(existing_id);
                         to_update.push(track);
                     } else {
+                        // Deduplicate by audio_hash + album_id (same rule as
+                        // the auto scan): identical content already present in
+                        // this album via another path is not inserted again.
+                        if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
+                            let key = (hash.clone(), aid);
+                            if known_hashes.contains(&key) {
+                                tracing::debug!(
+                                    audio_hash = %hash,
+                                    album_id = aid,
+                                    path = %sf.path,
+                                    "skip_duplicate_audio_hash"
+                                );
+                                skipped += 1;
+                                skipped_duplicate += 1;
+                                continue;
+                            }
+                            known_hashes.insert(key);
+                        }
                         to_insert.push(track);
                     }
                 }
@@ -886,6 +915,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             updated,
             skipped,
             skipped_unchanged,
+            skipped_duplicate,
             skipped_no_metadata,
             db_insert_failed,
             db_update_failed,
@@ -910,6 +940,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "updated": updated,
                     "skipped": skipped,
                     "skipped_unchanged": skipped_unchanged,
+                    "skipped_duplicate": skipped_duplicate,
                     "skipped_no_metadata": skipped_no_metadata,
                     "db_insert_failed": db_insert_failed,
                     "db_update_failed": db_update_failed,
@@ -934,6 +965,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 "updated": updated,
                 "skipped": skipped,
                 "skipped_unchanged": skipped_unchanged,
+                "skipped_duplicate": skipped_duplicate,
                 "skipped_no_metadata": skipped_no_metadata,
                 "db_insert_failed": db_insert_failed,
                 "db_update_failed": db_update_failed,
@@ -959,6 +991,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "updated": updated,
             "skipped": skipped,
             "skipped_unchanged": skipped_unchanged,
+            "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
