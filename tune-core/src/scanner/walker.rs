@@ -228,6 +228,12 @@ pub struct ListAudioResult {
     /// though they are absent from `files` — the post-scan prune must treat
     /// them like `missing_dirs`, otherwise their tracks get silently deleted.
     pub error_dirs: Vec<String>,
+    /// One "path: kind — message" line per entry of `missing_dirs`, so the
+    /// scan report can tell the user WHY a root was skipped (NotFound = bad
+    /// UNC / NAS unmounted, PermissionDenied = no SMB credentials, mapped
+    /// drive invisible to a service token, …) instead of burying the reason
+    /// in the server log (Alain Bonnel, Windows NAS).
+    pub missing_dir_reasons: Vec<String>,
 }
 
 impl ListAudioResult {
@@ -242,6 +248,7 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
 
     let mut files = Vec::new();
     let mut missing_dirs = Vec::new();
+    let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
     // Above this many distinct error scopes the whole root is clearly in
     // trouble (NAS died mid-walk) — protect the entire root instead of
@@ -266,6 +273,7 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                 kind = ?e.kind(),
                 "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
+            missing_dir_reasons.push(format!("{}: {:?} — {}", normalized, e.kind(), e));
             missing_dirs.push(normalized);
             continue;
         }
@@ -391,6 +399,7 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
         files,
         missing_dirs,
         error_dirs,
+        missing_dir_reasons,
     }
 }
 
@@ -722,6 +731,12 @@ mod tests {
         // No audio files found; the missing directory is tracked separately.
         assert!(result.files.is_empty());
         assert_eq!(result.missing_dirs.len(), 1);
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+        assert!(
+            result.missing_dir_reasons[0].contains("NotFound"),
+            "reason = {:?}",
+            result.missing_dir_reasons[0]
+        );
         assert!(result.error_dirs.is_empty());
     }
 
