@@ -194,16 +194,26 @@ impl AudioStreamer {
     }
 
     pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
-        let notify = {
+        let session = {
             let sessions = self.sessions.lock().await;
-            sessions.get(stream_id).map(|s| s.data_ready.clone())
+            sessions.get(stream_id).cloned()
         };
-        let Some(notify) = notify else {
+        let Some(session) = session else {
             return false;
         };
+        // A proxy session (Qobuz/Tidal direct pass-through) serves on demand: it
+        // holds no buffered data until the renderer pulls the URL, so `data_ready`
+        // is never notified. Waiting the full `timeout_ms` therefore always times
+        // out and delays the gapless SetNext by that budget (5s). On short tracks
+        // — opera recitatives on an OpenHome renderer (Luxman NT-07) — the next
+        // track is armed too late and the renderer loops the current one. A proxy
+        // is "ready" the moment it exists, so don't wait.
+        if session.proxy_url.lock().await.is_some() {
+            return true;
+        }
         tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            notify.notified(),
+            session.data_ready.notified(),
         )
         .await
         .is_ok()
@@ -591,6 +601,48 @@ mod tests {
             .create_proxy_session(info, "https://cdn.tidal.com/track.flac".into(), false)
             .await;
         assert!(!id.is_empty());
+        streamer.remove_session(&id).await;
+    }
+
+    // A proxy session serves on demand and never notifies `data_ready`. The
+    // gapless poller must NOT block on it (a 5s wait per transition armed the
+    // next track too late → OpenHome/Luxman looped short opera tracks). It must
+    // report ready immediately.
+    #[tokio::test]
+    async fn wait_data_ready_returns_immediately_for_proxy() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let id = streamer
+            .create_proxy_session(info, "https://cdn.qobuz.com/track.flac".into(), false)
+            .await;
+        let t0 = std::time::Instant::now();
+        let ready = streamer.wait_data_ready(&id, 5000).await;
+        assert!(ready, "a proxy session must report data ready");
+        assert!(
+            t0.elapsed().as_millis() < 500,
+            "must not wait the full timeout for a proxy"
+        );
+        streamer.remove_session(&id).await;
+    }
+
+    // A non-proxy session that never produces data still times out (unchanged).
+    #[tokio::test]
+    async fn wait_data_ready_times_out_for_non_proxy_without_data() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let (id, _tx, _dr) = streamer.create_session(info, false, 128).await;
+        assert!(
+            !streamer.wait_data_ready(&id, 100).await,
+            "no data → times out"
+        );
         streamer.remove_session(&id).await;
     }
 
