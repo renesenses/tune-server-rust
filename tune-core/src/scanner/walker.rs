@@ -579,13 +579,18 @@ pub fn scan_files_batched(
                     let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                         Ok((meta, hash)) => (meta, hash),
                         Err(ref reason) if reason == "timeout" => {
+                            // Don't drop the file — same fallback as
+                            // scan_files_parallel: index it with filename-based
+                            // metadata so it still appears in the library.
+                            // audio_hash stays None so the next scan re-reads
+                            // full tags once storage is responsive.
                             warn!(
                                 path = %path_str,
                                 timeout_secs = FILE_TIMEOUT.as_secs(),
-                                "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                                "scan_file_timeout — tag read timed out, indexing with filename metadata"
                             );
                             batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                            (None, None)
+                            (Some(tagless_fallback_no_props(path)), None)
                         }
                         Err(err) => {
                             warn!(
