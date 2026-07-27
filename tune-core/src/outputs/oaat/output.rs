@@ -23,12 +23,28 @@ enum OaatCommand {
     },
     PrepareNext {
         url: String,
+        /// Local `.dsf` path for native-DSD gapless: when set (and format-
+        /// compatible) the native DSD loop opens it and swaps readers at EOF.
+        /// None on the PCM/HTTP path, which prefetches `url` instead.
+        file_path: Option<String>,
         title: String,
         artist: String,
         album: String,
         cover_url: Option<String>,
         duration_ms: u64,
     },
+}
+
+/// A native-DSD next track pre-opened during playback of the current track, so
+/// the loop can swap to it at EOF with no gap (Xavier / Zicmu native DSD album).
+#[cfg(feature = "oaat")]
+struct PreparedDsdNext {
+    reader: crate::audio::dsf::DsfStreamReader,
+    title: String,
+    artist: String,
+    album: String,
+    cover_url: Option<String>,
+    duration_ms: u64,
 }
 
 #[cfg(feature = "oaat")]
@@ -65,6 +81,16 @@ pub struct OaatOutput {
     stream_counter: Arc<AtomicU32>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    /// True while the output is streaming native DSD (raw DSF bits) to the
+    /// endpoint. That playback loop does NOT consume a staged next track
+    /// (`OaatCommand::PrepareNext` is a no-op on the DSD path), so the output
+    /// cannot chain internally in this mode — `supports_internal_gapless()`
+    /// reports false so the poller advances the queue at natural end instead of
+    /// waiting forever for a transition that never comes (Xavier, Zicmu, native
+    /// DSD album stall). Stays false for PCM/FLAC/HTTP playback, which keeps its
+    /// working internal gapless. Set when the native DSD path commits; reset by
+    /// `stop()` (called at the start of every `play_media`).
+    native_dsd_active: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -98,6 +124,7 @@ impl OaatOutput {
             stream_counter: Arc::new(AtomicU32::new(1)),
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            native_dsd_active: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(800)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
@@ -115,6 +142,13 @@ impl OaatOutput {
     /// Arm a start position for the next play_media (orchestrator seek path).
     pub fn set_pending_start_position_ms(&self, ms: u64) {
         self.pending_start_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Test-only: drive the native-DSD mode flag that gates
+    /// `supports_internal_gapless()`.
+    #[cfg(test)]
+    pub(crate) fn set_native_dsd_active_for_test(&self, active: bool) {
+        self.native_dsd_active.store(active, Ordering::SeqCst);
     }
 
     pub fn diagnostics_snapshot(&self) -> serde_json::Value {
@@ -164,6 +198,11 @@ const DSD_CHUNK_SIZE: usize = 4096;
 const PCM_SAMPLES_PER_PACKET: usize = 480;
 #[cfg(feature = "oaat")]
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
+/// Max HTTP Range-resume attempts after a mid-stream body-read error before the
+/// OAAT HTTP fetch loop gives up on the track (per-track budget; reset once the
+/// stream delivers data again).
+#[cfg(feature = "oaat")]
+const MAX_STREAM_RETRY_ATTEMPTS: u32 = 3;
 
 #[cfg(feature = "oaat")]
 async fn connect_and_setup(
@@ -253,6 +292,29 @@ impl OutputTarget for OaatOutput {
         "oaat"
     }
 
+    /// OAAT genuinely chains tracks internally in BOTH modes, so it always
+    /// reports true (the poller must arm gapless for the transition to fire):
+    /// - PCM/FLAC/HTTP: prefetch the next track's URL and swap streams (see
+    ///   `OaatCommand::PrepareNext` on the HTTP path, "oaat: gapless transition").
+    /// - native DSD: open the next track's local `.dsf` and swap `DsfStreamReader`
+    ///   at EOF without tearing the connection down ("oaat: gapless transition
+    ///   (native DSD)"). If the next track isn't a compatible native DSD file,
+    ///   the loop ends cleanly and the poller's natural-end fallback advances.
+    fn supports_internal_gapless(&self) -> bool {
+        true
+    }
+
+    /// While streaming native DSD, OAAT chains by opening the NEXT track's local
+    /// `.dsf` directly (raw DSD bits) — it cannot consume the orchestrator's
+    /// DSD->PCM transcode URL. Returning true tells the poller's `prepare_gapless`
+    /// to resolve the next track as a LOCAL FILE (no transcode session, so no
+    /// orphaned DSD decode / `dsd_streaming_send_timeout_10s`, the Xavier/Zicmu
+    /// stall) and stage it via `set_next_media(file_path=..)`. False for
+    /// PCM/FLAC/HTTP, which keeps the working URL-prefetch gapless.
+    fn prefers_local_file_gapless(&self) -> bool {
+        self.native_dsd_active.load(Ordering::Relaxed)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -288,6 +350,7 @@ impl OutputTarget for OaatOutput {
         let endpoint_addr = self.endpoint_addr();
         let playing = self.playing.clone();
         let paused = self.paused.clone();
+        let native_dsd_active = self.native_dsd_active.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_arc = self.duration_ms.clone();
         let current_title = self.current_title.clone();
@@ -442,6 +505,16 @@ impl OutputTarget for OaatOutput {
                             "oaat: native DSD streaming"
                         );
 
+                        // Mark native-DSD mode so supports_internal_gapless()
+                        // reports false: the poller then skips prepare_gapless
+                        // (no orphaned transcode) and advances the queue at
+                        // natural end instead of waiting for an internal
+                        // transition this path cannot perform. NOT cleared at
+                        // completion below — the poller reads it AFTER the track
+                        // stops to decide the end-of-track branch; stop() (called
+                        // at the start of the next play_media) resets it.
+                        native_dsd_active.store(true, Ordering::SeqCst);
+
                         if let Err(e) = endpoint
                             .send_message(&oaat_core::Message::FormatPropose(
                                 oaat_core::message::FormatPropose {
@@ -541,113 +614,43 @@ impl OutputTarget for OaatOutput {
                         let mut eof = false;
                         let mut stopped = false;
                         let ch_usize = ch.max(1) as usize;
+                        // Prepared-next for gapless: the next track's `.dsf` is
+                        // opened during the current track (on PrepareNext) and
+                        // swapped in at EOF with no teardown.
+                        let mut next_dsd: Option<PreparedDsdNext> = None;
 
-                        while playing.load(Ordering::Relaxed) && !stopped {
-                            if stop_rx.try_recv().is_ok() {
-                                stopped = true;
-                                break;
-                            }
-                            while let Ok(cmd) = command_rx.try_recv() {
-                                match cmd {
-                                    OaatCommand::SetVolume(level) => {
-                                        endpoint.send_volume(level).await.ok();
-                                    }
-                                    OaatCommand::Mute(muted) => {
-                                        endpoint.send_mute(muted).await.ok();
-                                    }
-                                    OaatCommand::Pause => {
-                                        paused.store(true, Ordering::SeqCst);
-                                        pause_offset = start.elapsed();
-                                        endpoint
-                                            .send_message(&oaat_core::Message::Pause(
-                                                oaat_core::message::Pause {
-                                                    stream_id: stream_id.clone(),
-                                                },
-                                            ))
-                                            .await
-                                            .ok();
-                                        info!(device = %device_name, "oaat: DSD paused");
-                                    }
-                                    OaatCommand::Resume => {
-                                        paused.store(false, Ordering::SeqCst);
-                                        start = std::time::Instant::now() - pause_offset;
-                                        endpoint.send_play(&stream_id).await.ok();
-                                        info!(device = %device_name, "oaat: DSD resumed");
-                                    }
-                                    OaatCommand::Seek {
-                                        position_ms: seek_pos,
-                                    } => {
-                                        endpoint
-                                            .send_message(&oaat_core::Message::Seek(
-                                                oaat_core::message::Seek {
-                                                    stream_id: stream_id.clone(),
-                                                    position_ms: seek_pos,
-                                                },
-                                            ))
-                                            .await
-                                            .ok();
-                                        // Bytes per channel at seek point (8 DSD bits / byte).
-                                        let target_bpc = (seek_pos as f64 * cur_sample_rate as f64
-                                            / 1000.0
-                                            / 8.0)
-                                            as usize;
-                                        match tokio::task::block_in_place(|| {
-                                            reader.seek_to_bytes_per_channel(target_bpc)
-                                        }) {
-                                            Ok(reached_bpc) => {
-                                                pending.clear();
-                                                eof = false;
-                                                sample_offset = reached_bpc as u64 * 8;
-                                                let elapsed_eq =
-                                                    std::time::Duration::from_millis(seek_pos);
-                                                start = std::time::Instant::now() - elapsed_eq;
-                                                pause_offset = std::time::Duration::ZERO;
-                                                position_ms.store(seek_pos, Ordering::SeqCst);
-                                                // Re-anchor PTS at the seek point:
-                                                // the endpoint disarmed its servo on
-                                                // the Seek message, so post-seek
-                                                // packets restart a fresh timeline.
-                                                pts_bits_base = sample_offset;
-                                                stream_start_ns =
-                                                    super::helpers::now_ns() + 200_000_000;
-                                                info!(
-                                                    device = %device_name,
-                                                    seek_pos,
-                                                    reached_bpc,
-                                                    "oaat: DSD seek complete"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(device = %device_name, error = %e, "oaat: DSD seek failed");
-                                            }
-                                        }
-                                    }
-                                    OaatCommand::PrepareNext { .. } => {}
-                                }
-                            }
-
-                            while paused.load(Ordering::Relaxed) && playing.load(Ordering::Relaxed)
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        'track: loop {
+                            while playing.load(Ordering::Relaxed) && !stopped {
                                 if stop_rx.try_recv().is_ok() {
                                     stopped = true;
                                     break;
                                 }
-                                // Drain commands so Resume/Seek/Stop arrive while paused.
                                 while let Ok(cmd) = command_rx.try_recv() {
                                     match cmd {
-                                        OaatCommand::Resume => {
-                                            paused.store(false, Ordering::SeqCst);
-                                            start = std::time::Instant::now() - pause_offset;
-                                            endpoint.send_play(&stream_id).await.ok();
-                                            info!(device = %device_name, "oaat: DSD resumed");
-                                        }
-                                        OaatCommand::Pause => {}
                                         OaatCommand::SetVolume(level) => {
                                             endpoint.send_volume(level).await.ok();
                                         }
                                         OaatCommand::Mute(muted) => {
                                             endpoint.send_mute(muted).await.ok();
+                                        }
+                                        OaatCommand::Pause => {
+                                            paused.store(true, Ordering::SeqCst);
+                                            pause_offset = start.elapsed();
+                                            endpoint
+                                                .send_message(&oaat_core::Message::Pause(
+                                                    oaat_core::message::Pause {
+                                                        stream_id: stream_id.clone(),
+                                                    },
+                                                ))
+                                                .await
+                                                .ok();
+                                            info!(device = %device_name, "oaat: DSD paused");
+                                        }
+                                        OaatCommand::Resume => {
+                                            paused.store(false, Ordering::SeqCst);
+                                            start = std::time::Instant::now() - pause_offset;
+                                            endpoint.send_play(&stream_id).await.ok();
+                                            info!(device = %device_name, "oaat: DSD resumed");
                                         }
                                         OaatCommand::Seek {
                                             position_ms: seek_pos,
@@ -661,123 +664,311 @@ impl OutputTarget for OaatOutput {
                                                 ))
                                                 .await
                                                 .ok();
+                                            // Bytes per channel at seek point (8 DSD bits / byte).
                                             let target_bpc = (seek_pos as f64
                                                 * cur_sample_rate as f64
                                                 / 1000.0
                                                 / 8.0)
                                                 as usize;
-                                            if let Ok(reached_bpc) =
-                                                tokio::task::block_in_place(|| {
-                                                    reader.seek_to_bytes_per_channel(target_bpc)
-                                                })
-                                            {
-                                                pending.clear();
-                                                eof = false;
-                                                sample_offset = reached_bpc as u64 * 8;
-                                                start = std::time::Instant::now()
-                                                    - std::time::Duration::from_millis(seek_pos);
-                                                pause_offset = std::time::Duration::ZERO;
-                                                position_ms.store(seek_pos, Ordering::SeqCst);
-                                                pts_bits_base = sample_offset;
-                                                stream_start_ns =
-                                                    super::helpers::now_ns() + 200_000_000;
+                                            match tokio::task::block_in_place(|| {
+                                                reader.seek_to_bytes_per_channel(target_bpc)
+                                            }) {
+                                                Ok(reached_bpc) => {
+                                                    pending.clear();
+                                                    eof = false;
+                                                    sample_offset = reached_bpc as u64 * 8;
+                                                    let elapsed_eq =
+                                                        std::time::Duration::from_millis(seek_pos);
+                                                    start = std::time::Instant::now() - elapsed_eq;
+                                                    pause_offset = std::time::Duration::ZERO;
+                                                    position_ms.store(seek_pos, Ordering::SeqCst);
+                                                    // Re-anchor PTS at the seek point:
+                                                    // the endpoint disarmed its servo on
+                                                    // the Seek message, so post-seek
+                                                    // packets restart a fresh timeline.
+                                                    pts_bits_base = sample_offset;
+                                                    stream_start_ns =
+                                                        super::helpers::now_ns() + 200_000_000;
+                                                    info!(
+                                                        device = %device_name,
+                                                        seek_pos,
+                                                        reached_bpc,
+                                                        "oaat: DSD seek complete"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(device = %device_name, error = %e, "oaat: DSD seek failed");
+                                                }
                                             }
                                         }
-                                        OaatCommand::PrepareNext { .. } => {}
+                                        OaatCommand::PrepareNext {
+                                            file_path,
+                                            title,
+                                            artist,
+                                            album,
+                                            cover_url,
+                                            duration_ms,
+                                            ..
+                                        } => {
+                                            // Pre-open the next `.dsf` for a gapless
+                                            // swap at EOF — only if it is a local
+                                            // file that is format-compatible with the
+                                            // current DSD stream (same rate/channels).
+                                            // Otherwise leave next_dsd None so the
+                                            // track ends cleanly and the poller
+                                            // advances (small gap across the boundary).
+                                            if next_dsd.is_none() {
+                                                if let Some(fp) = file_path {
+                                                    next_dsd = tokio::task::block_in_place(|| {
+                                                        open_next_dsd(
+                                                            &fp,
+                                                            cur_sample_rate,
+                                                            ch,
+                                                            title,
+                                                            artist,
+                                                            album,
+                                                            cover_url,
+                                                            duration_ms,
+                                                        )
+                                                    });
+                                                    match next_dsd {
+                                                        Some(_) => info!(
+                                                            device = %device_name,
+                                                            "oaat: native DSD next track prepared (gapless ready)"
+                                                        ),
+                                                        None => info!(
+                                                            device = %device_name,
+                                                            "oaat: native DSD next not gapless-compatible, will advance at end"
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                            if stopped || !playing.load(Ordering::Relaxed) {
-                                break;
-                            }
 
-                            while pending.len() < DSD_CHUNK_SIZE && !eof {
-                                let chunk = match tokio::task::block_in_place(|| {
-                                    reader.next_chunk()
-                                }) {
-                                    Ok(Some(c)) => c,
-                                    Ok(None) => {
-                                        eof = true;
+                                while paused.load(Ordering::Relaxed)
+                                    && playing.load(Ordering::Relaxed)
+                                {
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    if stop_rx.try_recv().is_ok() {
+                                        stopped = true;
                                         break;
                                     }
-                                    Err(e) => {
-                                        warn!(device = %device_name, error = %e, "oaat: DSD read error");
-                                        eof = true;
-                                        break;
+                                    // Drain commands so Resume/Seek/Stop arrive while paused.
+                                    while let Ok(cmd) = command_rx.try_recv() {
+                                        match cmd {
+                                            OaatCommand::Resume => {
+                                                paused.store(false, Ordering::SeqCst);
+                                                start = std::time::Instant::now() - pause_offset;
+                                                endpoint.send_play(&stream_id).await.ok();
+                                                info!(device = %device_name, "oaat: DSD resumed");
+                                            }
+                                            OaatCommand::Pause => {}
+                                            OaatCommand::SetVolume(level) => {
+                                                endpoint.send_volume(level).await.ok();
+                                            }
+                                            OaatCommand::Mute(muted) => {
+                                                endpoint.send_mute(muted).await.ok();
+                                            }
+                                            OaatCommand::Seek {
+                                                position_ms: seek_pos,
+                                            } => {
+                                                endpoint
+                                                    .send_message(&oaat_core::Message::Seek(
+                                                        oaat_core::message::Seek {
+                                                            stream_id: stream_id.clone(),
+                                                            position_ms: seek_pos,
+                                                        },
+                                                    ))
+                                                    .await
+                                                    .ok();
+                                                let target_bpc = (seek_pos as f64
+                                                    * cur_sample_rate as f64
+                                                    / 1000.0
+                                                    / 8.0)
+                                                    as usize;
+                                                if let Ok(reached_bpc) =
+                                                    tokio::task::block_in_place(|| {
+                                                        reader.seek_to_bytes_per_channel(target_bpc)
+                                                    })
+                                                {
+                                                    pending.clear();
+                                                    eof = false;
+                                                    sample_offset = reached_bpc as u64 * 8;
+                                                    start = std::time::Instant::now()
+                                                        - std::time::Duration::from_millis(
+                                                            seek_pos,
+                                                        );
+                                                    pause_offset = std::time::Duration::ZERO;
+                                                    position_ms.store(seek_pos, Ordering::SeqCst);
+                                                    pts_bits_base = sample_offset;
+                                                    stream_start_ns =
+                                                        super::helpers::now_ns() + 200_000_000;
+                                                }
+                                            }
+                                            OaatCommand::PrepareNext { .. } => {}
+                                        }
                                     }
+                                }
+                                if stopped || !playing.load(Ordering::Relaxed) {
+                                    break;
+                                }
+
+                                while pending.len() < DSD_CHUNK_SIZE && !eof {
+                                    let chunk = match tokio::task::block_in_place(|| {
+                                        reader.next_chunk()
+                                    }) {
+                                        Ok(Some(c)) => c,
+                                        Ok(None) => {
+                                            eof = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!(device = %device_name, error = %e, "oaat: DSD read error");
+                                            eof = true;
+                                            break;
+                                        }
+                                    };
+                                    pending.extend_from_slice(&chunk);
+                                }
+
+                                if pending.is_empty() {
+                                    break;
+                                }
+
+                                let mut take = DSD_CHUNK_SIZE.min(pending.len());
+                                take -= take % ch_usize;
+                                if take == 0 {
+                                    break;
+                                }
+                                let payload: Vec<u8> = pending.drain(..take).collect();
+                                let bits_this = (take / ch_usize) * 8;
+                                let pts_ns = stream_start_ns
+                                    + (sample_offset.saturating_sub(pts_bits_base) as f64
+                                        / cur_sample_rate as f64
+                                        * 1e9) as u64;
+                                let flags = if first {
+                                    first = false;
+                                    PacketFlags::FIRST_PACKET
+                                } else {
+                                    PacketFlags::empty()
                                 };
-                                pending.extend_from_slice(&chunk);
+
+                                if endpoint
+                                    .send_audio(
+                                        stream_num,
+                                        cur_format,
+                                        pts_ns,
+                                        sample_offset,
+                                        &payload,
+                                        flags,
+                                    )
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+
+                                sample_offset += bits_this as u64;
+                                diag.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                diag.bytes_sent
+                                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                                // Feed the stall watchdog: the supervisor restarts
+                                // the zone when last_packet_age_ms > 30 s, and this
+                                // field otherwise keeps the epoch of the previous
+                                // (HTTP) playback.
+                                diag.last_packet_epoch_ms.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                position_ms.store(
+                                    sample_offset * 1000 / cur_sample_rate.max(1) as u64,
+                                    Ordering::SeqCst,
+                                );
+
+                                let expected = std::time::Duration::from_nanos(
+                                    (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
+                                );
+                                let elapsed = start.elapsed();
+                                if expected > elapsed {
+                                    tokio::time::sleep(expected - elapsed).await;
+                                }
+
+                                if eof && pending.is_empty() {
+                                    break;
+                                }
                             }
 
-                            if pending.is_empty() {
-                                break;
-                            }
+                            // The current track's packet loop ended. If it ended
+                            // naturally (EOF, not a user stop / seek-recreate / send
+                            // failure) and a compatible next `.dsf` is staged, swap
+                            // readers and keep the SAME OAAT stream alive: send
+                            // LAST_PACKET to close the track, then continue streaming
+                            // the next track (FIRST_PACKET, offsets reset). The poller
+                            // sees the position reset to 0 while still Playing and
+                            // advances the queue metadata (gapless_position_reset), the
+                            // same mechanism the PCM/HTTP path relies on. No compatible
+                            // next → fall through to a clean stop and let the poller's
+                            // natural-end fallback advance.
+                            if !stopped && playing.load(Ordering::Relaxed) && eof {
+                                if let Some(next) = next_dsd.take() {
+                                    endpoint
+                                        .send_audio(
+                                            stream_num,
+                                            cur_format,
+                                            0,
+                                            sample_offset,
+                                            &[],
+                                            PacketFlags::LAST_PACKET,
+                                        )
+                                        .await
+                                        .ok();
 
-                            let mut take = DSD_CHUNK_SIZE.min(pending.len());
-                            take -= take % ch_usize;
-                            if take == 0 {
-                                break;
-                            }
-                            let payload: Vec<u8> = pending.drain(..take).collect();
-                            let bits_this = (take / ch_usize) * 8;
-                            let pts_ns = stream_start_ns
-                                + (sample_offset.saturating_sub(pts_bits_base) as f64
-                                    / cur_sample_rate as f64
-                                    * 1e9) as u64;
-                            let flags = if first {
-                                first = false;
-                                PacketFlags::FIRST_PACKET
-                            } else {
-                                PacketFlags::empty()
-                            };
+                                    info!(
+                                        device = %device_name,
+                                        title = %next.title,
+                                        "oaat: gapless transition (native DSD)"
+                                    );
 
-                            if endpoint
-                                .send_audio(
-                                    stream_num,
-                                    cur_format,
-                                    pts_ns,
-                                    sample_offset,
-                                    &payload,
-                                    flags,
-                                )
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
+                                    reader = next.reader;
+                                    sample_offset = 0;
+                                    pts_bits_base = 0;
+                                    pending.clear();
+                                    first = true;
+                                    eof = false;
+                                    pause_offset = std::time::Duration::ZERO;
+                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                    start = std::time::Instant::now();
+                                    position_ms.store(0, Ordering::SeqCst);
+                                    duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
 
-                            sample_offset += bits_this as u64;
-                            diag.packets_sent.fetch_add(1, Ordering::Relaxed);
-                            diag.bytes_sent
-                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                            // Feed the stall watchdog: the supervisor restarts
-                            // the zone when last_packet_age_ms > 30 s, and this
-                            // field otherwise keeps the epoch of the previous
-                            // (HTTP) playback.
-                            diag.last_packet_epoch_ms.store(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64,
-                                Ordering::Relaxed,
-                            );
-                            position_ms.store(
-                                sample_offset * 1000 / cur_sample_rate.max(1) as u64,
-                                Ordering::SeqCst,
-                            );
+                                    *current_title.lock().await = Some(next.title.clone());
+                                    *current_artist.lock().await = Some(next.artist.clone());
+                                    *current_uri.lock().await = Some(String::new());
 
-                            let expected = std::time::Duration::from_nanos(
-                                (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
-                            );
-                            let elapsed = start.elapsed();
-                            if expected > elapsed {
-                                tokio::time::sleep(expected - elapsed).await;
-                            }
+                                    let fmt_str =
+                                        format_rate_display(cur_sample_rate, 1, cur_format);
+                                    endpoint
+                                        .send_metadata(oaat_core::message::TrackMetadata {
+                                            title: next.title,
+                                            artist: next.artist,
+                                            album: next.album,
+                                            duration_ms: next.duration_ms,
+                                            artwork_url: next.cover_url,
+                                            format: Some(fmt_str),
+                                        })
+                                        .await
+                                        .ok();
 
-                            if eof && pending.is_empty() {
-                                break;
+                                    continue 'track;
+                                }
                             }
-                        }
+                            break 'track;
+                        } // end 'track loop
 
                         endpoint
                             .send_audio(
@@ -1378,6 +1569,14 @@ impl OutputTarget for OaatOutput {
             let mut start = std::time::Instant::now();
             let mut pause_offset = std::time::Duration::ZERO;
             let mut reconnect_attempts: u32 = 0;
+            // Mid-stream HTTP body-read errors (reqwest "error decoding response
+            // body") on Tune's own /stream endpoint were treated as end-of-track:
+            // the loop broke, reported "playback complete" a few seconds in, and
+            // the zone then sat in stopped_early_waiting ~30s before
+            // playback_failure_stopping_zone (Xavier / Zicmu, PCM HTTP fallback).
+            // Instead, resume from the current byte offset via an HTTP Range
+            // request, a bounded number of times, before giving up.
+            let mut stream_retry_attempts: u32 = 0;
 
             let mut next_track: Option<NextTrackPrefetch> = None;
             let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> =
@@ -1502,7 +1701,7 @@ impl OutputTarget for OaatOutput {
                                     }
                                 }
                             }
-                            OaatCommand::PrepareNext { url, title, artist, album, cover_url, duration_ms } => {
+                            OaatCommand::PrepareNext { url, title, artist, album, cover_url, duration_ms, file_path: _ } => {
                                 let client = http_client.clone();
                                 let dev = device_name.clone();
                                 let cur_fmt = cur_format;
@@ -1519,10 +1718,51 @@ impl OutputTarget for OaatOutput {
 
                     chunk = stream.next() => {
                         match chunk {
-                            Some(Ok(data)) => buf.extend_from_slice(&data),
+                            Some(Ok(data)) => {
+                                // Fresh data flowing again: clear the per-track
+                                // retry budget so isolated transient blips don't
+                                // accumulate toward the cap over a long track.
+                                stream_retry_attempts = 0;
+                                buf.extend_from_slice(&data);
+                            }
                             Some(Err(e)) => {
-                                error!(device = %device_name, error = %e, "oaat: stream error");
-                                break;
+                                // Mid-stream body-read error. Rather than ending
+                                // the track (and wedging the zone ~30s in
+                                // stopped_early_waiting), resume the fetch from
+                                // the byte we've streamed so far via HTTP Range.
+                                if stream_retry_attempts >= MAX_STREAM_RETRY_ATTEMPTS {
+                                    error!(device = %device_name, error = %e, attempts = stream_retry_attempts, "oaat: stream error, retries exhausted");
+                                    break;
+                                }
+                                stream_retry_attempts += 1;
+                                // Bytes already SENT define the resume point; drop
+                                // any received-but-unsent bytes (they'll be re-
+                                // fetched) so we neither duplicate nor lose audio.
+                                let data_bytes = if uses_byte_offset {
+                                    byte_offset
+                                } else {
+                                    sample_offset * bytes_per_frame as u64
+                                };
+                                let file_offset = data_bytes + cur_stream_info.data_offset as u64;
+                                let range = format!("bytes={file_offset}-");
+                                warn!(device = %device_name, error = %e, attempt = stream_retry_attempts, file_offset, "oaat: stream error, resuming via Range");
+                                // Brief backoff to let a transient upstream hiccup clear.
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                match http_client.get(&url).header("Range", &range).send().await {
+                                    Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
+                                        stream = Box::pin(resp.bytes_stream());
+                                        buf.clear();
+                                        info!(device = %device_name, file_offset, "oaat: stream resumed after body error");
+                                    }
+                                    Ok(resp) => {
+                                        error!(device = %device_name, status = %resp.status(), "oaat: stream resume Range rejected, ending track");
+                                        break;
+                                    }
+                                    Err(re) => {
+                                        error!(device = %device_name, error = %re, "oaat: stream resume request failed, ending track");
+                                        break;
+                                    }
+                                }
                             }
                             None => {
                                 // Flush remaining buffer
@@ -1743,6 +1983,10 @@ impl OutputTarget for OaatOutput {
         }
         self.playing.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        // Leave native-DSD mode. play_media() calls stop() before starting the
+        // next track, so this resets the flag between tracks; the native DSD
+        // path re-sets it if the next track is also native DSD.
+        self.native_dsd_active.store(false, Ordering::SeqCst);
         *self.current_uri.lock().await = None;
         info!(device = %self.name, "oaat: stop");
         Ok(())
@@ -1789,6 +2033,7 @@ impl OutputTarget for OaatOutput {
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
             tx.send(OaatCommand::PrepareNext {
                 url: url.to_owned(),
+                file_path: None,
                 title: title.unwrap_or("Unknown").to_owned(),
                 artist: artist.unwrap_or("Unknown").to_owned(),
                 album: String::new(),
@@ -1807,6 +2052,10 @@ impl OutputTarget for OaatOutput {
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
             tx.send(OaatCommand::PrepareNext {
                 url: media.url.to_owned(),
+                // Carry the local path so the native DSD loop can open the next
+                // `.dsf` directly (raw DSD gapless). The PCM/HTTP path leaves
+                // this None and prefetches the URL instead.
+                file_path: media.file_path.map(|s| s.to_owned()),
                 title: media.title.unwrap_or("Unknown").to_owned(),
                 artist: media.artist.unwrap_or("Unknown").to_owned(),
                 album: media.album.unwrap_or("").to_owned(),
@@ -1851,6 +2100,49 @@ impl OutputTarget for OaatOutput {
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
         Some(self.diagnostics_snapshot())
     }
+}
+
+/// Open the next track's local `.dsf` for a native-DSD gapless transition, but
+/// only if it is format-compatible with the currently streaming track (same DSD
+/// sample rate and channel count). Returns None for a non-`.dsf` file, a parse
+/// error, or any format mismatch — the caller then ends the current track
+/// cleanly and lets the poller's natural-end fallback advance the queue (a small
+/// gap across the format boundary, never a stall). Blocking file I/O: call from
+/// within `tokio::task::block_in_place`.
+#[cfg(feature = "oaat")]
+fn open_next_dsd(
+    file_path: &str,
+    expect_sample_rate: u32,
+    expect_channels: u8,
+    title: String,
+    artist: String,
+    album: String,
+    cover_url: Option<String>,
+    duration_ms: u64,
+) -> Option<PreparedDsdNext> {
+    let is_dsf = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("dsf"));
+    if !is_dsf {
+        return None;
+    }
+    let info = crate::audio::dsf::parse_dsf(file_path).ok()?;
+    if info.sample_rate != expect_sample_rate {
+        return None;
+    }
+    if (info.channels.min(8) as u8) != expect_channels {
+        return None;
+    }
+    let reader = crate::audio::dsf::DsfStreamReader::open(file_path, info.clone()).ok()?;
+    Some(PreparedDsdNext {
+        reader,
+        title,
+        artist,
+        album,
+        cover_url,
+        duration_ms,
+    })
 }
 
 #[cfg(feature = "oaat")]

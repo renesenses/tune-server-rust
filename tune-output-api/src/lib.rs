@@ -119,6 +119,19 @@ pub trait OutputTarget: Send + Sync {
         true
     }
 
+    /// Whether the poller should stage the gapless next track as a LOCAL FILE
+    /// (`set_next_media` with `file_path` set, resolved WITHOUT a transcode
+    /// session) rather than as a transcoded HTTP URL.
+    ///
+    /// OAAT returns true while it is streaming native DSD: that path reads the
+    /// raw `.dsf` from disk and cannot consume the orchestrator's DSD->PCM
+    /// transcode URL, so arming the URL path would spin up an unconsumed decode
+    /// that stalls (`dsd_streaming_send_timeout_10s`) and orphans the transition.
+    /// Default false: every other output stages the transcoded URL as today.
+    fn prefers_local_file_gapless(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: not dowcastable. Implementations that need downcast override this.
         &()

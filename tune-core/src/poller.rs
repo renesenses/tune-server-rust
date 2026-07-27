@@ -3144,6 +3144,77 @@ impl PositionPoller {
             return false;
         };
 
+        // Local-file gapless (OAAT native DSD): the output reads the next
+        // track's `.dsf` directly, so resolve it as a local file WITHOUT a
+        // transcode session (no orphaned DSD->PCM decode / send-timeout stall)
+        // and stage it via set_next_media(file_path=..). If the next item has no
+        // local file (streaming track), don't arm — the natural-end fallback
+        // advances the queue.
+        let prefers_local_file = {
+            let outputs = self.outputs.lock().await;
+            match outputs.get(device_id) {
+                Some(arc) => arc.lock().await.prefers_local_file_gapless(),
+                None => false,
+            }
+        };
+        if prefers_local_file {
+            let t0 = Instant::now();
+            match self
+                .orchestrator
+                .resolve_gapless_next_local_file(zone_id, next_pos)
+                .await
+            {
+                Ok(resolved) if resolved.file_path.is_some() => {
+                    let output_arc = {
+                        let outputs = self.outputs.lock().await;
+                        outputs.get(device_id).map(|a| a.clone())
+                    };
+                    let Some(output_arc) = output_arc else {
+                        return false;
+                    };
+                    let output = output_arc.lock().await;
+                    let media = crate::outputs::PlayMedia {
+                        url: &resolved.url,
+                        mime_type: &resolved.mime_type,
+                        title: Some(&resolved.title),
+                        artist: resolved.artist.as_deref(),
+                        album: resolved.album.as_deref(),
+                        cover_url: resolved.cover_url.as_deref(),
+                        duration_ms: resolved.duration_ms,
+                        file_size: resolved.file_size,
+                        file_path: resolved.file_path.as_deref(),
+                        sample_rate: resolved.sample_rate,
+                        bit_depth: resolved.bit_depth,
+                        channels: resolved.channels,
+                        live_stream: false,
+                    };
+                    return match output.set_next_media(&media).await {
+                        Ok(()) => {
+                            info!(
+                                zone_id,
+                                title = %resolved.title,
+                                resolve_ms = t0.elapsed().as_millis() as u64,
+                                "gapless_next_set_local_file"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
+                            false
+                        }
+                    };
+                }
+                Ok(_) => {
+                    info!(zone_id, "gapless_local_file_skipped_no_local_next");
+                    return false;
+                }
+                Err(e) => {
+                    warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
+                    return false;
+                }
+            }
+        }
+
         // v0.9 gapless characterization: time the next-track resolution and
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)

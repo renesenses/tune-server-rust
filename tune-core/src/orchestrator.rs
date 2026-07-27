@@ -190,6 +190,11 @@ pub struct ResolvedQueueItem {
     pub channels: Option<u32>,
     /// File size in bytes for the stream.
     pub file_size: Option<u64>,
+    /// Local on-disk path of the track, for outputs that read the file directly
+    /// instead of the transcoded URL (OAAT native DSD gapless). Only set for
+    /// local tracks resolved via the local-file gapless path; None for streaming
+    /// tracks and for the normal transcode/URL resolution.
+    pub file_path: Option<String>,
 }
 
 /// DIDL `res@duration` (ms) for a native passthrough stream served raw to a
@@ -5351,6 +5356,7 @@ impl PlaybackOrchestrator {
                 bit_depth: resolved.bit_depth,
                 channels: resolved.channels,
                 file_size: resolved.file_size,
+                file_path: None,
             });
         }
 
@@ -5421,6 +5427,55 @@ impl PlaybackOrchestrator {
             bit_depth: resolved.bit_depth,
             channels: resolved.channels,
             file_size: resolved.file_size,
+            file_path: None,
+        })
+    }
+
+    /// Resolve the next queue item as a LOCAL FILE — file path + metadata + native
+    /// format, read straight from the DB WITHOUT creating a transcode/stream
+    /// session. Used for OAAT native-DSD gapless: the output opens the `.dsf`
+    /// directly, so spinning up the usual DSD->PCM transcode (as the URL path
+    /// does) would only orphan an unconsumed decode (`dsd_streaming_send_timeout`)
+    /// and stall the transition. Returns Ok with `file_path: None` when the next
+    /// item is a streaming track or has no local file — the caller then declines
+    /// to arm and lets the natural-end fallback advance the queue.
+    pub async fn resolve_gapless_next_local_file(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<ResolvedQueueItem, String> {
+        // Drop any previously prepared gapless (URL) session for this zone so we
+        // don't leak a transcode session when switching to the local-file path.
+        self.cleanup_gapless_session(zone_id).await;
+
+        let entry = PlayQueueRepo::with_backend(self.db.clone())
+            .get_at(zone_id, position)?
+            .ok_or("no queue item at position (local or streaming)")?;
+
+        // A local file is present only for local library tracks; streaming
+        // items (track_id None / file_path None) return file_path: None so the
+        // caller declines to arm gapless and lets the natural end advance.
+        let file_path = entry.track_id.and(entry.file_path.clone());
+        let mime_type = entry
+            .format
+            .as_ref()
+            .map(|f| format!("audio/{}", f.to_lowercase()))
+            .unwrap_or_default();
+
+        Ok(ResolvedQueueItem {
+            url: String::new(),
+            mime_type,
+            title: entry.title.unwrap_or_default(),
+            artist: entry.artist_name,
+            album: entry.album_title,
+            cover_url: self.resolve_cover_url(entry.cover_path.as_deref()),
+            duration_ms: entry.duration_ms.map(|d| d as u64),
+            stream_id: None,
+            sample_rate: entry.sample_rate.map(|r| r as u32),
+            bit_depth: entry.bit_depth.map(|b| b as u32),
+            channels: None,
+            file_size: None,
+            file_path,
         })
     }
 
