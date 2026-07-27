@@ -88,7 +88,7 @@ impl FileWatcher {
     pub fn new(dirs: Vec<String>) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
 
-let watcher = notify::recommended_watcher(make_event_handler(tx.clone()))
+        let watcher = notify::recommended_watcher(make_event_handler(tx.clone()))
             .map_err(|e| format!("watcher init: {e}"))?;
 
         // Normalize like every other consumer of music_dirs (trailing slashes,
