@@ -170,8 +170,25 @@ jobs:
             echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
           fi
 
+      - name: Import signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm /tmp/certificate.p12
+
       - name: Package (unix)
         if: runner.os != 'Windows'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           mkdir -p package/web
           cp target/${{ matrix.target }}/release/tune-server package/
@@ -181,6 +198,35 @@ jobs:
           if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
             cp "$RUNNER_TEMP/apd/bin/airplay-daemon" package/
             DAEMON="airplay-daemon"
+          fi
+          # Sign the binaries that ship in the tarball (Homebrew installs these).
+          #
+          # Without this they keep the linker's ad-hoc signature, whose code
+          # identity is `tune_server-<hash of the binary>` — it changes on every
+          # build. macOS keys the Local Network permission to that identity, so
+          # every release silently revoked the user's grant and the kernel then
+          # dropped every connection to a DLNA/AirPlay device on the LAN
+          # (`tcp drop outgoing ... reason: NECP`, EHOSTUNREACH), surfacing as an
+          # unexplained "soap send: error sending request" with no way to recover
+          # short of restarting the server.
+          #
+          # A Developer ID signature with an explicit --identifier gives a
+          # designated requirement built from the identifier and the team, not
+          # from the binary's hash, so the grant survives upgrades. The .app/.dmg
+          # path already signed the same binary; only the tarball was left out.
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+            codesign --force --options runtime --timestamp \
+              --identifier fr.mozaiklabs.tune-server \
+              --sign "$IDENTITY" package/tune-server
+            if [ -n "$DAEMON" ]; then
+              codesign --force --options runtime --timestamp \
+                --identifier fr.mozaiklabs.airplay-daemon \
+                --sign "$IDENTITY" "package/$DAEMON"
+            fi
+            codesign --verify --strict --verbose=2 package/tune-server
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
           fi
           cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON web/
           cd ..
@@ -286,20 +332,8 @@ jobs:
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
 
-      - name: Import signing certificate
-        if: runner.os == 'macOS'
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
-          security create-keychain -p actions build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p actions build.keychain
-          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
-          rm /tmp/certificate.p12
+      # The keychain is set up before "Package (unix)" so the tarball binaries
+      # get signed too — the DMG below reuses it.
 
       - name: Create DMG (macOS)
         if: runner.os == 'macOS'
