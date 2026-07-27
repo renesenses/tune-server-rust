@@ -16,9 +16,14 @@ postgres = ["tune-core/postgres"]
 # registry of loaded wasm plugins, and the `/api/v1/plugins/{id}/…` route
 # mount. NOT in default: the stock server build must not pull in wasmtime.
 plugins-wasm = ["tune-core/plugins-wasm"]
+# P5 of the plugin ABI (#917): DJ mode extracted from the always-on core into a
+# native in-tree plugin. NOT in default: the stock server no longer serves /dj;
+# build `--features dj` to mount the plugin's routes at /api/v1/ext/dj.
+dj = ["dep:tune-dj"]
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-dj = { path = "../plugins/tune-dj", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }

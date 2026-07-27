@@ -1,0 +1,21 @@
+[package]
+name = "tune-dj"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# In-tree native plugin (#917). Extracted from tune-server's always-on core
+# (`routes/dj.rs`) into a `TunePlugin`, gated behind tune-server's `dj` feature.
+# A `path` dependency INSIDE this repo is fine — cargo only breaks on optional
+# path deps pointing *outside* the clone (see docs/plugins/README.md).
+#
+# DJ is a NATIVE plugin, not WASM: waveform/analyze need full audio access and
+# call `tune_core::audio::decode::decode_to_pcm` directly.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

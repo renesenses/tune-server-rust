@@ -17,7 +17,6 @@ pub mod developer_api;
 pub mod devices;
 pub mod digest;
 pub mod discogs;
-pub mod dj;
 pub mod eq_pro;
 pub mod export;
 pub mod graphql;
@@ -301,7 +300,8 @@ pub fn router_with_plugins(
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
         .nest("/marketplace", marketplace::router())
-        .nest("/dj", dj::router())
+        // DJ mode moved to the `dj` native plugin (P5, #917); with that feature
+        // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
         .nest("/playlist-transfer", playlist_transfer::router())
