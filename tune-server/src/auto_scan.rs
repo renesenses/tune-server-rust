@@ -225,6 +225,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
         let missing_dirs = list_result.missing_dirs;
+        let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -488,13 +489,22 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // SAFETY: skip tracks under a missing directory (unmounted NAS / a
         // Docker mount that isn't present) — deleting them would wipe the
         // library. Mirrors the manual-scan prune (routes/system/scan.rs).
-        {
+        // A cancelled scan never prunes: `discovered_paths` may be partial and
+        // Stop must never be destructive. Same subtree protection as the manual
+        // scan for `error_dirs` (walk errors mid-scan: files exist but never
+        // made it into the discovered set).
+        if crate::routes::system::scan::scan_cancel_requested() {
+            info!("auto_scan_prune_skipped_cancelled");
+        } else {
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
-                    if in_missing_dir {
+                    let in_unreadable_scope = missing_dirs
+                        .iter()
+                        .chain(error_dirs.iter())
+                        .any(|d| db_path.starts_with(d));
+                    if in_unreadable_scope {
                         protected += 1;
                         continue;
                     }
@@ -506,8 +516,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             if protected > 0 {
                 tracing::warn!(
                     protected,
-                    dirs = ?missing_dirs,
-                    "auto_scan_tracks_protected_missing_dirs"
+                    missing = ?missing_dirs,
+                    walk_errors = ?error_dirs,
+                    "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
             if pruned > 0 {
@@ -545,6 +556,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
+            "error_dirs": error_dirs.clone(),
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,
