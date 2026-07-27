@@ -31,10 +31,12 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 // giving up, so the real duration/tags are recovered.
 const RETRY_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
-// The audio hash (duplicate detection) reads the whole file, separately from
-// the tags. Give it its own, larger budget so big Hi-Res files over a NAS still
-// get hashed — but it's best-effort: on timeout the track keeps its real tags
-// and only the hash is skipped (Progman: 23-min FLAC 24/88.2 exceeded 30s).
+// The audio hash (duplicate detection) does NOT read the whole file: it MD5s
+// a single 64 KB sample at the 25% offset (scanner/hasher.rs). Its real cost
+// is open + seek + one read — cheap even for huge files. The generous budget
+// exists because on a stalled NAS those three syscalls can hang like any
+// other I/O, and hashing is best-effort: on timeout the track keeps its real
+// tags and only the hash is skipped (Progman: stalled mount, not file size).
 const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Per-file metadata reads are I/O-bound: each rayon task blocks on the tag read

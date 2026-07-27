@@ -923,6 +923,7 @@ impl TrackRepo {
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
             if track.title.to_lowercase().contains("personal jesus") {
                 tracing::warn!(
@@ -963,7 +964,16 @@ impl TrackRepo {
                 &track.musicbrainz_recording_id,
                 &track.comments,
             ];
-            match self.db.execute(&insert_sql, &params) {
+            row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+        }
+        // One backend call for the whole batch: on Postgres this reuses a
+        // single connection + prepared statement instead of a per-row
+        // runtime hop (see DbBackend::execute_many).
+        for (track, res) in tracks
+            .iter()
+            .zip(self.db.execute_many(&insert_sql, &row_params))
+        {
+            match res {
                 Ok(_) => count += 1,
                 // Previously this failure was swallowed silently: the scanner
                 // reported "files=N errors=0" while the tracks never landed in
@@ -992,6 +1002,9 @@ impl TrackRepo {
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let update_sql = self.dialect_sql(sql::update, sql::update);
         let mut count = 0usize;
+        // Rows without an id are skipped, so collect the params first and
+        // batch them through one execute_many call (see create_batch).
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
             let Some(id) = track.id else { continue };
             let params: [&dyn ToSqlValue; 25] = [
@@ -1021,8 +1034,12 @@ impl TrackRepo {
                 &track.comments,
                 &id,
             ];
-            if self.db.execute(&update_sql, &params).is_ok() {
-                count += 1;
+            row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+        }
+        for res in self.db.execute_many(&update_sql, &row_params) {
+            match res {
+                Ok(_) => count += 1,
+                Err(e) => tracing::warn!(error = %e, "track_update_failed_in_batch"),
             }
         }
         Ok(count)
