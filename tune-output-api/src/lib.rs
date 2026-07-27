@@ -76,6 +76,20 @@ pub struct PlayMedia<'a> {
     /// renderers (Yamaha R-N2000A) accept SetAVTransportURI + Play but never
     /// produce sound.
     pub live_stream: bool,
+    /// The upstream source `url` was derived from, when `url` is one of the
+    /// server's own proxy or transcode endpoints — an Icecast mount, a podcast
+    /// enclosure, a signed CDN link.
+    ///
+    /// `url` is what an output should *play*: it is proxied precisely because
+    /// renderers need a format they understand, and it can be read by several
+    /// consumers. This is what an output should read when it wants the bytes as
+    /// the source published them — a recorder keeping the original codec instead
+    /// of a PCM transcode, or anything that needs the stream's own metadata
+    /// (ICY titles do not survive the proxy). `None` when `url` already *is* the
+    /// upstream, so a consumer can fall back to it unconditionally.
+    ///
+    /// Reading it is opt-in: an output that ignores it behaves exactly as before.
+    pub origin_url: Option<&'a str>,
 }
 
 impl Default for PlayMedia<'_> {
@@ -94,6 +108,7 @@ impl Default for PlayMedia<'_> {
             bit_depth: None,
             channels: None,
             live_stream: false,
+            origin_url: None,
         }
     }
 }

@@ -161,6 +161,10 @@ pub struct ResolvedStream {
     pub bit_depth: Option<u32>,
     /// Number of audio channels.
     pub channels: Option<u32>,
+    /// The upstream URL, when `url` ended up being one of our own proxy
+    /// endpoints. Carried through to `PlayMedia::origin_url` so an output can
+    /// reach the source as it was published; see that field for the rationale.
+    pub origin_url: Option<String>,
 }
 
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
@@ -620,6 +624,7 @@ impl PlaybackOrchestrator {
                 // DLNA DIDL advertises live/senderPaced semantics instead of a
                 // seekable file (Yamaha R-N2000A stays silent otherwise).
                 live_stream: resolved.source == "radio",
+                origin_url: resolved.origin_url.as_deref(),
             };
             let result = self.send_to_output(device_id, &media, req.seek_ms).await;
             let total_ms = play_start.elapsed().as_millis();
@@ -984,6 +989,7 @@ impl PlaybackOrchestrator {
             sample_rate: sample_rate.map(|s| s as u32),
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
+            origin_url: None,
             cover_url: None,
             file_size,
         })
@@ -1211,6 +1217,13 @@ impl PlaybackOrchestrator {
                 )
             };
 
+        // Every branch above may have replaced the station/enclosure URL with one
+        // of our proxy endpoints (WAV transcode for renderers that need it, or a
+        // local decode session). Keep the original so an output that wants the
+        // bytes as published — and the ICY metadata the proxy drops — can ask
+        // for them. `None` when we are handing out the upstream URL unchanged.
+        let origin_url = (url != audio_url).then(|| audio_url.to_string());
+
         Ok(ResolvedStream {
             url,
             mime_type: out_mime,
@@ -1225,6 +1238,7 @@ impl PlaybackOrchestrator {
             sample_rate: out_sr,
             bit_depth: out_bd,
             channels: out_ch,
+            origin_url,
         })
     }
 
@@ -1385,6 +1399,7 @@ impl PlaybackOrchestrator {
                         sample_rate: Some(dop_rate),
                         bit_depth: Some(24),
                         channels: Some(dop_channels as u32),
+                        origin_url: None,
                         cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
                         file_size: None,
                     });
@@ -2292,6 +2307,7 @@ impl PlaybackOrchestrator {
             sample_rate: resolved_sr,
             bit_depth: resolved_bd,
             channels: resolved_ch,
+            origin_url: None,
         })
     }
 
@@ -2833,6 +2849,7 @@ impl PlaybackOrchestrator {
                             sample_rate: Some(stream_data.quality.sample_rate),
                             bit_depth: Some(stream_data.quality.bit_depth as u32),
                             channels: Some(2),
+                            origin_url: None,
                         });
                     }
                 }
@@ -2997,6 +3014,7 @@ impl PlaybackOrchestrator {
                     sample_rate: Some(sr),
                     bit_depth: Some(bd as u32),
                     channels: Some(2),
+                    origin_url: None,
                 });
             }
 
@@ -3642,6 +3660,7 @@ impl PlaybackOrchestrator {
             sample_rate: Some(stream_data.quality.sample_rate),
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
+            origin_url: None,
         })
     }
 
@@ -3870,6 +3889,7 @@ impl PlaybackOrchestrator {
                 sample_rate: Some(sr),
                 bit_depth: Some(out_bd as u32),
                 channels: Some(ch as u32),
+                origin_url: None,
                 cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
@@ -3940,6 +3960,7 @@ impl PlaybackOrchestrator {
             sample_rate: Some(sr),
             bit_depth: Some(out_bd as u32),
             channels: Some(ch as u32),
+            origin_url: None,
         })
     }
 
@@ -6250,6 +6271,13 @@ mod tests {
             "ambiguous .aac radio must be proxied to WAV"
         );
         assert_eq!(resolved.mime_type, "audio/wav");
+        // Because `url` is now ours and not the station's, the upstream has to
+        // travel with it: a recorder wanting the original AAC (or the ICY titles
+        // the proxy drops) has no other way back to the source.
+        assert_eq!(
+            resolved.origin_url.as_deref(),
+            Some("http://icecast.radiofrance.fr/fip-hifi.aac")
+        );
     }
 
     #[tokio::test]
@@ -6277,6 +6305,9 @@ mod tests {
         // proxy session, no transcode cost.
         assert!(resolved.stream_id.is_none());
         assert_eq!(resolved.url, "http://stream.example.com/station.mp3");
+        // Nothing was substituted, so there is no upstream to point at: `url`
+        // already is it.
+        assert!(resolved.origin_url.is_none());
     }
 
     #[tokio::test]
