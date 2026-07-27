@@ -4733,6 +4733,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-dj"
+version = "0.9.19"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-ffi"
 version = "0.9.20"
 dependencies = [
@@ -4788,6 +4800,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tune-core",
+ "tune-dj",
  "unicode-normalization",
  "urlencoding",
  "uuid",

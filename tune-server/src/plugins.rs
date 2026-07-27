@@ -90,7 +90,17 @@ fn plugins_data_root() -> std::path::PathBuf {
 /// bus and a data directory — so a plugin's real dependencies are visible at
 /// the wiring site.
 #[allow(unused_variables)]
-async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {}
+async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
+    // P5 (#917): DJ mode, extracted from the always-on core into a native
+    // in-tree plugin. Host services are passed explicitly at construction so
+    // DJ's real dependency (the DB backend) is visible here at the wiring site.
+    #[cfg(feature = "dj")]
+    loader
+        .register(Box::new(tune_dj::DjPlugin::new(tune_dj::HostServices {
+            backend: state.backend.clone(),
+        })))
+        .await;
+}
 
 /// Builds the plugins an out-of-tree binary wants registered.
 ///
