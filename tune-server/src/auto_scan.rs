@@ -220,6 +220,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            // Mark the scan "done" even on this early exit: the file watcher
+            // waits on this flag before it starts watching.
+            scan_done_clone.store(true, Ordering::Release);
             return;
         }
 
