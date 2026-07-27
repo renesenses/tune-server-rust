@@ -85,7 +85,10 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
+/// Audio extensions recognised by the scanner. Shared with the file watcher
+/// (which excludes "iso": ISO SACD needs the extraction step that only the
+/// full directory walk performs).
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
     "alac", "ape", "iso",
 ];

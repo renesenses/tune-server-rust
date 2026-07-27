@@ -7,11 +7,6 @@ use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
-    "alac", "ape",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeType {
     Added,
@@ -75,22 +70,43 @@ impl FileWatcher {
             })
             .map_err(|e| format!("watcher init: {e}"))?;
 
-        let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
-        for dir in &dirs {
-            if dir.exists() {
-                watcher
-                    .watch(dir, RecursiveMode::Recursive)
-                    .map_err(|e| format!("watch {}: {e}", dir.display()))?;
-                info!(dir = %dir.display(), "watching_directory");
-            } else {
-                warn!(dir = %dir.display(), "watch_dir_not_found");
+        // Normalize like every other consumer of music_dirs (trailing slashes,
+        // Windows separators) — the raw settings values were passed through
+        // before, so a dir stored as "D:/Musique/" was watched under a path
+        // spelling the rest of the pipeline never uses.
+        let requested: Vec<PathBuf> = dirs
+            .iter()
+            .map(|d| PathBuf::from(super::walker::normalize_path(d)))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+
+        // Watch per-directory, resiliently: one unreadable or unmounted dir
+        // must not kill watching for every other dir (it aborted the whole
+        // watcher before). Only fail if NOTHING could be watched.
+        let mut watched: Vec<PathBuf> = Vec::new();
+        for dir in &requested {
+            if !dir.exists() {
+                warn!(dir = %dir.display(), "watch_dir_not_found — skipping, other dirs still watched");
+                continue;
             }
+            match watcher.watch(dir, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    info!(dir = %dir.display(), "watching_directory");
+                    watched.push(dir.clone());
+                }
+                Err(e) => {
+                    warn!(dir = %dir.display(), error = %e, "watch_dir_failed — skipping, other dirs still watched");
+                }
+            }
+        }
+        if watched.is_empty() && !requested.is_empty() {
+            return Err("no music directory could be watched".to_string());
         }
 
         Ok(Self {
             watcher: Some(watcher),
             event_rx: std::sync::Mutex::new(rx),
-            dirs,
+            dirs: watched,
         })
     }
 
@@ -154,9 +170,15 @@ impl Drop for FileWatcher {
 }
 
 fn is_audio_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        let ext = e.to_lowercase();
+        // Single source of truth with the walker. "iso" is excluded here:
+        // ISO SACD requires the DSF-extraction step that only the full
+        // directory walk performs — a raw .iso fed to the watcher pipeline
+        // would just fail tag reading. (The old duplicated list had already
+        // drifted and was missing "iso" only by accident.)
+        ext != "iso" && super::walker::SUPPORTED_EXTENSIONS.contains(&ext.as_str())
+    })
 }
 
 #[cfg(test)]
