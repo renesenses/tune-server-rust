@@ -225,7 +225,14 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             json!({ "phase": "indexing", "scanned": 0i64, "added": 0i64, "total": 0i64 }),
         );
 
-        let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
+        let exclude_patterns = crate::auto_scan::scan_exclude_patterns(&db);
+        if !exclude_patterns.is_empty() {
+            tracing::info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
+        }
+        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+            &scan_dirs,
+            &exclude_patterns,
+        );
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
