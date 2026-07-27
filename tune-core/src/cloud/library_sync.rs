@@ -320,6 +320,15 @@ pub async fn push_changes(
                 }
                 Ok(resp) => {
                     let status = resp.status();
+                    // 429 (throttled) and 5xx are expected transient conditions
+                    // from the community cloud — not a failure. Stop this batch
+                    // and retry next cycle quietly instead of spamming a scary
+                    // "batch_failed" warning (Jean Valjean saw 429s in his log).
+                    // Mirrors the bio_sync throttle handling.
+                    if status.as_u16() == 429 || status.is_server_error() {
+                        debug!(status = %status, "cloud_library_sync_throttled — retry next cycle");
+                        break;
+                    }
                     let body = resp.text().await.unwrap_or_default();
                     let msg = format!("cloud sync HTTP {status}: {body}");
                     warn!(error = %msg, "cloud_library_sync_batch_failed");

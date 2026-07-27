@@ -56,6 +56,11 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], 
 # rustls version reqwest resolves (0.23).
 rustls = "0.23"
 webpki-roots = "0.26"
+# Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
+# behind the `plugins-wasm` feature so the default server build is unchanged.
+# default-features trimmed to compiler + runtime + WAT parsing; no async,
+# component-model, gc, threads, profiling, pooling, coredump, debug.
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # nice/ionice des threads du pool de scan (scanner/walker.rs)
@@ -82,6 +87,10 @@ local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.
 plugin-http = ["dep:axum"]
+# P0 of the plugin ABI: embed wasmtime to load/instantiate/call wasm plugins
+# with JSON-over-linear-memory marshalling under resource limits. NOT in
+# default — the default server build must not pull in wasmtime.
+plugins-wasm = ["dep:wasmtime"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]

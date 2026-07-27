@@ -11,6 +11,10 @@ pub mod discovery_setup;
 pub mod error;
 pub mod i18n;
 pub mod plugins;
+/// P2 of the plugin ABI: AppState-backed [`HostContext`] plus the registry of
+/// loaded wasm plugins. Gated behind `plugins-wasm`; absent from default builds.
+#[cfg(feature = "plugins-wasm")]
+pub mod plugins_host;
 pub mod premium_guard;
 pub mod routes;
 pub mod run;

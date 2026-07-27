@@ -305,6 +305,15 @@ async fn run(opts: RunOptions) {
             .unwrap_or_default()
             .as_secs();
         settings.set("server_last_alive_at", &now.to_string()).ok();
+
+        // A scan cannot be running at boot: a "scanning" status here is a
+        // leftover from a hard crash mid-scan. The startup auto-scan resets it
+        // via its guard, but auto_scan is off by default — without this the
+        // clients showed a scan banner forever and refused to start a new scan.
+        if settings.get("scan_status").ok().flatten().as_deref() == Some("scanning") {
+            tracing::warn!("scan_status_stale_scanning_reset — previous run crashed mid-scan");
+            settings.set("scan_status", "idle").ok();
+        }
     }
 
     // Auto-scan music directories at startup
@@ -340,6 +349,14 @@ async fn run(opts: RunOptions) {
         Vec::new(),
     )
     .await;
+
+    // P2 of the plugin ABI: load enabled wasm plugins and publish the registry
+    // into AppState so `/api/v1/plugins/{id}/…` can dispatch into them. A bad
+    // plugin is logged and skipped, never fatal. Feature-gated: absent from the
+    // default build. Runs before the router is built (below) so the mount finds
+    // the registry, though the OnceLock would resolve at request time anyway.
+    #[cfg(feature = "plugins-wasm")]
+    crate::plugins_host::load_wasm_plugins(&state).await;
 
     // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
     // bound (see below). Running it here fetched the local output's own

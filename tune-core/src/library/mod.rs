@@ -7,5 +7,6 @@ pub mod full_text_search;
 pub mod genre_tree;
 pub mod importer;
 pub mod m3u_parser;
+pub mod playlist_scan;
 pub mod smart_collections;
 pub mod track_matcher;

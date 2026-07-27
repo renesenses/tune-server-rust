@@ -220,11 +220,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            // Mark the scan "done" even on this early exit: the file watcher
+            // waits on this flag before it starts watching.
+            scan_done_clone.store(true, Ordering::Release);
             return;
         }
 
         let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
         let missing_dirs = list_result.missing_dirs;
+        let missing_dir_reasons = list_result.missing_dir_reasons;
+        let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -255,7 +260,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // stats and orphan cleanup.
         let album_repo = AlbumRepo::with_backend(db.clone());
 
-        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        // A DB read error must ABORT the scan, not degrade into an empty map:
+        // with an empty map every file on disk looks new, so a transient DB
+        // hiccup would re-insert the whole library as duplicates. (The
+        // ScanStatusGuard resets scan_status on this early return.)
+        let existing_tracks = match track_repo.get_all_local_file_info() {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
+                scan_done_clone.store(true, Ordering::Release);
+                return;
+            }
+        };
         let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
             .get_existing_audio_hash_album_pairs()
             .unwrap_or_default();
@@ -328,7 +344,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
         let mut inserted = 0u64;
         let mut updated = 0u64;
+        let mut db_insert_failed = 0u64;
+        let mut db_update_failed = 0u64;
+        // `skipped` stays the aggregate the UI already shows; the per-cause
+        // counters make the report actionable ("skipped 1200" alone doesn't
+        // say whether the library is healthy or half the NAS failed to read).
         let mut skipped = pre_skipped as u64;
+        let mut skipped_unchanged = pre_skipped as u64;
+        let mut skipped_duplicate = 0u64;
+        let mut skipped_no_metadata = 0u64;
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -361,6 +385,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 for sf in &batch {
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
+                        // Counted in the aggregate too, so `processed` can
+                        // actually reach `total` — before this, every failed
+                        // file made the progress bar stop short of 100%.
+                        skipped += 1;
+                        skipped_no_metadata += 1;
                         continue;
                     }
 
@@ -375,6 +404,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                             || (existing_size != Some(sf.file_size as i64));
                         if !file_changed {
                             skipped += 1;
+                            skipped_unchanged += 1;
                             continue;
                         }
                     }
@@ -402,6 +432,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
+                            skipped_duplicate += 1;
                             continue;
                         }
                         known_hashes.insert(key);
@@ -410,8 +441,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     to_insert.push(track);
                 }
 
-                inserted += track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
-                updated += track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                // Per-row failures inside create_batch/update_batch are logged
+                // there and swallowed — count the shortfall so the report shows
+                // tracks that were scanned but never made it into the DB.
+                let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
+                let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                db_insert_failed += to_insert.len() as u64 - batch_inserted;
+                db_update_failed += to_update.len() as u64 - batch_updated;
+                inserted += batch_inserted;
+                updated += batch_updated;
 
                 // Extract extended metadata (ISRC, ReplayGain, MusicBrainz, lyrics, etc.)
                 {
@@ -488,13 +526,22 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // SAFETY: skip tracks under a missing directory (unmounted NAS / a
         // Docker mount that isn't present) — deleting them would wipe the
         // library. Mirrors the manual-scan prune (routes/system/scan.rs).
-        {
+        // A cancelled scan never prunes: `discovered_paths` may be partial and
+        // Stop must never be destructive. Same subtree protection as the manual
+        // scan for `error_dirs` (walk errors mid-scan: files exist but never
+        // made it into the discovered set).
+        if crate::routes::system::scan::scan_cancel_requested() {
+            info!("auto_scan_prune_skipped_cancelled");
+        } else {
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
-                    if in_missing_dir {
+                    let in_unreadable_scope = missing_dirs
+                        .iter()
+                        .chain(error_dirs.iter())
+                        .any(|d| db_path.starts_with(d));
+                    if in_unreadable_scope {
                         protected += 1;
                         continue;
                     }
@@ -506,8 +553,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             if protected > 0 {
                 tracing::warn!(
                     protected,
-                    dirs = ?missing_dirs,
-                    "auto_scan_tracks_protected_missing_dirs"
+                    missing = ?missing_dirs,
+                    walk_errors = ?error_dirs,
+                    "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
             if pruned > 0 {
@@ -537,20 +585,43 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             inserted,
             updated,
             skipped,
+            skipped_unchanged,
+            skipped_duplicate,
+            skipped_no_metadata,
+            db_insert_failed,
+            db_update_failed,
             artwork = artwork_extracted,
             orphan_albums,
             "auto_scan_complete"
         );
 
+        // Import any playlist files (.m3u/.m3u8/.pls) found in the library as
+        // local playlists — same as the manual scan (Bertrand). Idempotent by
+        // playlist name, so the startup scan re-running never duplicates them.
+        let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &music_dirs);
+        if pl.playlists_created > 0 {
+            event_bus.emit(
+                "library.playlists.imported",
+                serde_json::json!({ "playlists": pl.playlists_created, "tracks": pl.tracks_added }),
+            );
+        }
+
         let report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
+            "missing_dir_reasons": missing_dir_reasons.clone(),
+            "error_dirs": error_dirs.clone(),
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
+            "skipped_unchanged": skipped_unchanged,
+            "skipped_duplicate": skipped_duplicate,
+            "skipped_no_metadata": skipped_no_metadata,
+            "db_insert_failed": db_insert_failed,
+            "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
         });

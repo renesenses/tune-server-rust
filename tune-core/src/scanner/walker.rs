@@ -85,7 +85,10 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
+/// Audio extensions recognised by the scanner. Shared with the file watcher
+/// (which excludes "iso": ISO SACD needs the extraction step that only the
+/// full directory walk performs).
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
     "alac", "ape", "iso",
 ];
@@ -222,6 +225,18 @@ fn read_file_with_timeout(
 pub struct ListAudioResult {
     pub files: Vec<PathBuf>,
     pub missing_dirs: Vec<String>,
+    /// Paths where the walk itself errored MID-scan (a subfolder that became
+    /// unreadable, a transient SMB stall, a nested mount that dropped, a
+    /// permission wall). Files below these paths may still exist on disk even
+    /// though they are absent from `files` — the post-scan prune must treat
+    /// them like `missing_dirs`, otherwise their tracks get silently deleted.
+    pub error_dirs: Vec<String>,
+    /// One "path: kind — message" line per entry of `missing_dirs`, so the
+    /// scan report can tell the user WHY a root was skipped (NotFound = bad
+    /// UNC / NAS unmounted, PermissionDenied = no SMB credentials, mapped
+    /// drive invisible to a service token, …) instead of burying the reason
+    /// in the server log (Alain Bonnel, Windows NAS).
+    pub missing_dir_reasons: Vec<String>,
 }
 
 impl ListAudioResult {
@@ -236,6 +251,12 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
 
     let mut files = Vec::new();
     let mut missing_dirs = Vec::new();
+    let mut missing_dir_reasons: Vec<String> = Vec::new();
+    let mut error_dirs: Vec<String> = Vec::new();
+    // Above this many distinct error scopes the whole root is clearly in
+    // trouble (NAS died mid-walk) — protect the entire root instead of
+    // accumulating an unbounded list.
+    const MAX_ERROR_SCOPES: usize = 50;
     for dir in dirs {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
@@ -255,6 +276,7 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                 kind = ?e.kind(),
                 "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
+            missing_dir_reasons.push(format!("{}: {:?} — {}", normalized, e.kind(), e));
             missing_dirs.push(normalized);
             continue;
         }
@@ -293,10 +315,10 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                     if entry.file_name().to_string_lossy().starts_with("._") {
                         continue;
                     }
-                    // Skip Tune's own streaming temp files (tune-stream-*.flac,
-                    // tune-prefetch-*.flac in %TEMP%): a library rooted above the
-                    // temp dir (Frédéric: whole user profile) otherwise indexes
-                    // every transcode as a ghost tagless track.
+                    // Skip Tune's own streaming/transcode temp files
+                    // (tune-stream-*, tune-prefetch-*, tune-tcache-* in %TEMP%):
+                    // a library rooted above the temp dir (Frédéric: whole user
+                    // profile) otherwise indexes every transcode as a ghost track.
                     if crate::scanner::is_tune_temp_file(entry.path()) {
                         continue;
                     }
@@ -326,6 +348,22 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                 }
                 Err(err) => {
                     dir_error_count += 1;
+                    // Record WHERE the walk failed so the prune can protect the
+                    // subtree: without this, files under an unreadable subfolder
+                    // of a perfectly reachable root drop out of the discovered
+                    // set and their tracks get deleted from the library. No
+                    // path on the error (rare) → protect the whole root.
+                    let err_scope = err
+                        .path()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| normalized.clone());
+                    if error_dirs.len() >= MAX_ERROR_SCOPES {
+                        if !error_dirs.contains(&normalized) {
+                            error_dirs.push(normalized.clone());
+                        }
+                    } else if !error_dirs.contains(&err_scope) {
+                        error_dirs.push(err_scope);
+                    }
                     if dir_error_count <= 5 {
                         warn!(
                             dir = %normalized,
@@ -357,11 +395,14 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
         count = files.len(),
         dirs = dirs.len(),
         missing = missing_dirs.len(),
+        walk_errors = error_dirs.len(),
         "audio_files_listed"
     );
     ListAudioResult {
         files,
         missing_dirs,
+        error_dirs,
+        missing_dir_reasons,
     }
 }
 
@@ -550,13 +591,18 @@ pub fn scan_files_batched(
                     let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                         Ok((meta, hash)) => (meta, hash),
                         Err(ref reason) if reason == "timeout" => {
+                            // Don't drop the file — same fallback as
+                            // scan_files_parallel: index it with filename-based
+                            // metadata so it still appears in the library.
+                            // audio_hash stays None so the next scan re-reads
+                            // full tags once storage is responsive.
                             warn!(
                                 path = %path_str,
                                 timeout_secs = FILE_TIMEOUT.as_secs(),
-                                "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                                "scan_file_timeout — tag read timed out, indexing with filename metadata"
                             );
                             batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                            (None, None)
+                            (Some(tagless_fallback_no_props(path)), None)
                         }
                         Err(err) => {
                             warn!(
@@ -688,6 +734,52 @@ mod tests {
         // No audio files found; the missing directory is tracked separately.
         assert!(result.files.is_empty());
         assert_eq!(result.missing_dirs.len(), 1);
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+        assert!(
+            result.missing_dir_reasons[0].contains("NotFound"),
+            "reason = {:?}",
+            result.missing_dir_reasons[0]
+        );
+        assert!(result.error_dirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_error_subdir_recorded_in_error_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        // NOT under temp_dir(): is_tune_temp_file() skips every file inside
+        // the system temp dir, which would empty the walk result.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_error_dirs_test");
+        let locked = base.join("locked");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("hidden.flac"), b"x").unwrap();
+        std::fs::write(base.join("visible.flac"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root (some CI containers): chmod 000 doesn't block the
+        // walk, the scenario can't be reproduced — skip.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+
+        // The reachable file is still scanned; the root is NOT "missing"; the
+        // unreadable subtree is reported so the prune can protect it instead
+        // of deleting its tracks.
+        assert_eq!(result.files.len(), 1);
+        assert!(result.missing_dirs.is_empty());
+        assert!(
+            result.error_dirs.iter().any(|d| d.contains("locked")),
+            "error_dirs = {:?}",
+            result.error_dirs
+        );
     }
 
     #[test]

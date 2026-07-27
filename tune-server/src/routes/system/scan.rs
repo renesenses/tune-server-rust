@@ -177,6 +177,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
 
         let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
         let missing_dirs = list_result.missing_dirs;
+        let missing_dir_reasons = list_result.missing_dir_reasons;
+        let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -198,8 +200,29 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
 
-        // Load existing tracks BEFORE scanning to skip unchanged files
-        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        // Load existing tracks BEFORE scanning to skip unchanged files.
+        // A DB read error must ABORT the scan, not degrade into an empty map:
+        // with an empty map every file on disk looks new, so a transient DB
+        // hiccup would re-insert the whole library as duplicates.
+        let existing_tracks = match track_repo.get_all_local_file_info() {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(error = %e, "scan_aborted_existing_tracks_read_failed");
+                let settings = SettingsRepo::with_backend(db.clone());
+                settings.set("scan_status", "idle").ok();
+                event_bus.emit(
+                    "library.scan.completed",
+                    json!({
+                        "total_files": 0,
+                        "inserted": 0,
+                        "updated": 0,
+                        "skipped": 0,
+                        "error": format!("database read failed: {e}"),
+                    }),
+                );
+                return;
+            }
+        };
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
         // Parallelised: each `path.metadata()` is a blocking stat that, over a
@@ -286,7 +309,16 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let cache_dir = crate::routes::library::artwork_cache_dir();
         let mut inserted = 0i64;
         let mut updated = 0i64;
+        let mut db_insert_failed = 0i64;
+        let mut db_update_failed = 0i64;
+        // `skipped` stays the aggregate the UI already shows. The manual scan
+        // never dedups by audio_hash (only the auto/watcher path does), so
+        // everything it skips is either an unchanged file or a file whose
+        // metadata could not be read — broken out below so the report says
+        // which.
         let mut skipped = pre_skipped;
+        let mut skipped_unchanged = pre_skipped;
+        let mut skipped_no_metadata = 0i64;
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
@@ -349,6 +381,12 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
 
                 for sf in &batch {
                     if sf.metadata.is_none() {
+                        tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
+                        // Counted in the aggregate too, so `processed` can
+                        // actually reach `total` — before this, every failed
+                        // file made the progress bar stop short of 100%.
+                        skipped += 1;
+                        skipped_no_metadata += 1;
                         continue;
                     }
 
@@ -366,6 +404,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                                 || existing_size.map_or(true, |s| s != sf.file_size as i64);
                             if !file_changed {
                                 skipped += 1;
+                                skipped_unchanged += 1;
                                 continue;
                             }
                         }
@@ -394,9 +433,14 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     }
                 }
 
-                // Batch insert + update using prepared statements
+                // Batch insert + update using prepared statements. Per-row
+                // failures inside create_batch/update_batch are logged there
+                // and swallowed — count the shortfall so the report shows
+                // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                db_insert_failed += to_insert.len() as i64 - batch_inserted;
+                db_update_failed += to_update.len() as i64 - batch_updated;
                 inserted += batch_inserted;
                 updated += batch_updated;
 
@@ -508,7 +552,13 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // Prune tracks whose files no longer exist on disk.
         // SAFETY: skip tracks in missing directories — the volume/NAS may
         // simply be unmounted. Deleting them would wipe the entire library.
-        {
+        // Same protection for `error_dirs`: a subtree where the WALK itself
+        // errored (unreadable subfolder, SMB stall mid-scan) has files that
+        // exist but never made it into `discovered_paths`.
+        // A cancelled scan never prunes: Stop must never be destructive.
+        if SCAN_CANCEL.load(Ordering::SeqCst) {
+            tracing::info!("post_scan_prune_skipped_cancelled");
+        } else {
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
@@ -522,8 +572,11 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     }
                 }
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
-                    if in_missing_dir {
+                    let in_unreadable_scope = missing_dirs
+                        .iter()
+                        .chain(error_dirs.iter())
+                        .any(|d| db_path.starts_with(d));
+                    if in_unreadable_scope {
                         protected += 1;
                         continue;
                     }
@@ -535,8 +588,9 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             if protected > 0 {
                 tracing::warn!(
                     protected,
-                    dirs = ?missing_dirs,
-                    "post_scan_tracks_protected_missing_dirs"
+                    missing = ?missing_dirs,
+                    walk_errors = ?error_dirs,
+                    "post_scan_tracks_protected_unreadable_dirs"
                 );
             }
             if pruned > 0 {
@@ -767,6 +821,17 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // Populate cloud sync changelog with all new/updated entities
         tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
 
+        // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
+        // playlists (Bertrand). Runs after import so every track is in the DB to
+        // match against; idempotent by playlist name so a re-scan never dupes.
+        let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
+        if pl.playlists_created > 0 {
+            event_bus.emit(
+                "library.playlists.imported",
+                json!({ "playlists": pl.playlists_created, "tracks": pl.tracks_added }),
+            );
+        }
+
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");
@@ -778,6 +843,10 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             inserted,
             updated,
             skipped,
+            skipped_unchanged,
+            skipped_no_metadata,
+            db_insert_failed,
+            db_update_failed,
             artwork = artwork_extracted,
             orphan_artists,
             "scan_and_import_complete"
@@ -789,6 +858,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 &json!({
                     "total_files": total_discovered,
                     "missing_dirs": missing_dirs.clone(),
+                    "missing_dir_reasons": missing_dir_reasons.clone(),
+                    "error_dirs": error_dirs.clone(),
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
@@ -796,6 +867,10 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "inserted": inserted,
                     "updated": updated,
                     "skipped": skipped,
+                    "skipped_unchanged": skipped_unchanged,
+                    "skipped_no_metadata": skipped_no_metadata,
+                    "db_insert_failed": db_insert_failed,
+                    "db_update_failed": db_update_failed,
                     "artwork_extracted": artwork_extracted,
                     "failed_paths": scan_stats.failed_paths,
                 })
@@ -808,12 +883,18 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             json!({
                 "total_files": total_discovered,
                 "missing_dirs": missing_dirs.clone(),
+                "missing_dir_reasons": missing_dir_reasons.clone(),
+                "error_dirs": error_dirs.clone(),
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "metadata_timeout": scan_stats.metadata_timeout,
                 "inserted": inserted,
                 "updated": updated,
                 "skipped": skipped,
+                "skipped_unchanged": skipped_unchanged,
+                "skipped_no_metadata": skipped_no_metadata,
+                "db_insert_failed": db_insert_failed,
+                "db_update_failed": db_update_failed,
                 "artwork_extracted": artwork_extracted,
                 "failed_paths": scan_stats.failed_paths,
             }),
@@ -826,6 +907,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let report = serde_json::json!({
             "total_files": total_discovered,
             "missing_dirs": missing_dirs.clone(),
+            "missing_dir_reasons": missing_dir_reasons.clone(),
+            "error_dirs": error_dirs.clone(),
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "metadata_failed": scan_stats.metadata_failed,
@@ -833,6 +916,10 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
+            "skipped_unchanged": skipped_unchanged,
+            "skipped_no_metadata": skipped_no_metadata,
+            "db_insert_failed": db_insert_failed,
+            "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": scan_stats.failed_paths,
         });
