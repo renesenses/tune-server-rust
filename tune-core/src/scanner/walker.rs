@@ -49,6 +49,24 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
 
+/// Resolve the scan I/O concurrency, honouring an optional `TUNE_SCAN_IO_CONCURRENCY`
+/// override. The fixed default (32) is a good fit for a fast SSD NAS, but the
+/// sweet spot is storage-specific: a weak 2-bay HDD NAS (Synology DS218Play,
+/// forum #1194) can be *slowed* by 32 concurrent reads scattered across the
+/// platters (each file needs a seek for the tags at the start + a seek to 25%
+/// for the dup-detection hash), while a high-latency share benefits from even
+/// more. Rather than guess, let the operator tune it against their own NAS —
+/// something we cannot benchmark centrally. Empty/invalid/zero → the default;
+/// clamped to 1..=256 so a typo can't spawn a pathological number of OS threads.
+fn scan_io_concurrency() -> usize {
+    std::env::var("TUNE_SCAN_IO_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.clamp(1, 256))
+        .unwrap_or(SCAN_IO_CONCURRENCY)
+}
+
 /// Lower CPU and I/O priority of the calling thread (Linux only, no-op
 /// elsewhere). Applied to the dedicated scan pool threads only — never to
 /// shared tokio pools — so a full scan stays in the background instead of
@@ -78,7 +96,7 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(SCAN_IO_CONCURRENCY)
+            .num_threads(scan_io_concurrency())
             .thread_name(|i| format!("scan-io-{i}"))
             .start_handler(|_| lower_scan_thread_priority())
             .build()
@@ -775,6 +793,35 @@ pub fn scan_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_io_concurrency_env_override() {
+        // Serialize env mutation and always restore, so this can't race or leak
+        // into other tests that read the same variable.
+        let key = "TUNE_SCAN_IO_CONCURRENCY";
+        let saved = std::env::var(key).ok();
+
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+
+        unsafe { std::env::set_var(key, "8") };
+        assert_eq!(scan_io_concurrency(), 8);
+
+        // Zero, garbage and empty all fall back to the default.
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+        unsafe { std::env::set_var(key, "abc") };
+        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+
+        // Over-large is clamped, not honoured verbatim.
+        unsafe { std::env::set_var(key, "100000") };
+        assert_eq!(scan_io_concurrency(), 256);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
 
     #[test]
     fn supported_extensions_list() {

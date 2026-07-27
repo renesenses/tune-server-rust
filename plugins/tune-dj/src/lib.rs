@@ -1,3 +1,24 @@
+//! DJ mode as a native [`TunePlugin`] (#917).
+//!
+//! Extracted verbatim from `tune-server`'s always-on core (`routes/dj.rs`) so
+//! the stock server no longer carries it: build `tune-server --features dj` to
+//! get these routes back, mounted by the plugin host at
+//! `/api/v1/ext/dj/…` (the host derives the prefix from `name()` — a plugin
+//! never chooses its own).
+//!
+//! DJ is **native**, not WASM: `waveform`/`analyze` need full audio access and
+//! call [`tune_core::audio::decode::decode_to_pcm`] directly.
+//!
+//! Host dependencies are passed explicitly at construction via [`HostServices`]
+//! — matching the wiring pattern documented in `tune-server/src/plugins.rs`, so
+//! a plugin's real dependencies are visible at the registration site. DJ only
+//! needs the DB backend (settings + track lookups); its router captures that
+//! backend in its own state rather than sharing the host's `AppState`, which
+//! keeps `tune-core` free of any `tune-server` type.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -7,12 +28,71 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::audio::decode::decode_to_pcm;
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::event_bus::TuneEvent;
+use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
-use crate::state::AppState;
+/// Host services handed to the DJ plugin at construction.
+///
+/// Passed explicitly (not pulled from [`PluginContext`]) so the plugin's real
+/// dependencies are visible where it is wired up in
+/// `register_builtin_plugins`. DJ needs only the DB backend.
+pub struct HostServices {
+    pub backend: Arc<dyn DbBackend>,
+}
 
-pub fn router() -> Router<AppState> {
+/// The DJ plugin. Owns the DB backend its router needs.
+pub struct DjPlugin {
+    backend: Arc<dyn DbBackend>,
+}
+
+impl DjPlugin {
+    pub fn new(services: HostServices) -> Self {
+        Self {
+            backend: services.backend,
+        }
+    }
+}
+
+#[async_trait]
+impl TunePlugin for DjPlugin {
+    fn name(&self) -> &str {
+        "dj"
+    }
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+    fn description(&self) -> &str {
+        "DJ mode: crossfade, decks, waveform and BPM analysis"
+    }
+
+    async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
+        ctx.register_router(router(self.backend.clone()));
+        Ok(())
+    }
+
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// DJ reacts to no events today — auto-crossfade is a client-driven poke at
+    /// `/auto-crossfade`, not a server-side hook. Left as a no-op override so the
+    /// plugin does not receive every event on the bus for nothing.
+    async fn on_event(&mut self, _event: &TuneEvent) {}
+}
+
+/// Plugin-owned router state. Captures the host's DB backend so the router can
+/// be a `Router<()>` (as the host requires) without leaking `AppState`.
+#[derive(Clone)]
+struct DjState {
+    backend: Arc<dyn DbBackend>,
+}
+
+/// The DJ router, `Router<()>` for the plugin host to mount under
+/// `/api/v1/ext/dj`. Routes are identical to the old `routes/dj.rs`.
+pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
     Router::new()
         .route("/enable/{zone_id}", post(enable_dj))
         .route("/disable/{zone_id}", post(disable_dj))
@@ -27,21 +107,22 @@ pub fn router() -> Router<AppState> {
         .route("/sync-tempo/{zone_id}", post(dj_sync_tempo))
         .route("/waveform/{track_id}", get(dj_waveform))
         .route("/analyze/{track_id}", post(dj_analyze))
+        .with_state(DjState { backend })
 }
 
-async fn enable_dj(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+async fn enable_dj(State(state): State<DjState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set(&format!("dj_enabled_{zone_id}"), "true").ok();
     Json(json!({"zone_id": zone_id, "dj_mode": true}))
 }
 
-async fn disable_dj(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+async fn disable_dj(State(state): State<DjState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set(&format!("dj_enabled_{zone_id}"), "false").ok();
     Json(json!({"zone_id": zone_id, "dj_mode": false}))
 }
 
-async fn dj_status(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+async fn dj_status(State(state): State<DjState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get(&format!("dj_enabled_{zone_id}"))
@@ -155,10 +236,7 @@ async fn dj_sync_tempo(Path(zone_id): Path<i64>) -> Json<Value> {
     }))
 }
 
-async fn dj_waveform(
-    State(state): State<AppState>,
-    Path(track_id): Path<i64>,
-) -> impl IntoResponse {
+async fn dj_waveform(State(state): State<DjState>, Path(track_id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let track = repo.get(track_id).ok().flatten();
     let Some(track) = track else {
@@ -219,7 +297,7 @@ async fn dj_waveform(
     }
 }
 
-async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) -> impl IntoResponse {
+async fn dj_analyze(State(state): State<DjState>, Path(track_id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let track = repo.get(track_id).ok().flatten();
     let Some(track) = track else {
