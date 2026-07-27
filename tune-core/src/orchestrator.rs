@@ -161,6 +161,10 @@ pub struct ResolvedStream {
     pub bit_depth: Option<u32>,
     /// Number of audio channels.
     pub channels: Option<u32>,
+    /// The upstream URL, when `url` ended up being one of our own proxy
+    /// endpoints. Carried through to `PlayMedia::origin_url` so an output can
+    /// reach the source as it was published; see that field for the rationale.
+    pub origin_url: Option<String>,
 }
 
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
@@ -620,6 +624,7 @@ impl PlaybackOrchestrator {
                 // DLNA DIDL advertises live/senderPaced semantics instead of a
                 // seekable file (Yamaha R-N2000A stays silent otherwise).
                 live_stream: resolved.source == "radio",
+                origin_url: resolved.origin_url.as_deref(),
             };
             let result = self.send_to_output(device_id, &media, req.seek_ms).await;
             let total_ms = play_start.elapsed().as_millis();
@@ -984,6 +989,7 @@ impl PlaybackOrchestrator {
             sample_rate: sample_rate.map(|s| s as u32),
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
+            origin_url: None,
             cover_url: None,
             file_size,
         })
@@ -1211,6 +1217,13 @@ impl PlaybackOrchestrator {
                 )
             };
 
+        // Every branch above may have replaced the station/enclosure URL with one
+        // of our proxy endpoints (WAV transcode for renderers that need it, or a
+        // local decode session). Keep the original so an output that wants the
+        // bytes as published — and the ICY metadata the proxy drops — can ask
+        // for them. `None` when we are handing out the upstream URL unchanged.
+        let origin_url = (url != audio_url).then(|| audio_url.to_string());
+
         Ok(ResolvedStream {
             url,
             mime_type: out_mime,
@@ -1225,6 +1238,7 @@ impl PlaybackOrchestrator {
             sample_rate: out_sr,
             bit_depth: out_bd,
             channels: out_ch,
+            origin_url,
         })
     }
 
@@ -1385,6 +1399,7 @@ impl PlaybackOrchestrator {
                         sample_rate: Some(dop_rate),
                         bit_depth: Some(24),
                         channels: Some(dop_channels as u32),
+                        origin_url: None,
                         cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
                         file_size: None,
                     });
@@ -1440,12 +1455,23 @@ impl PlaybackOrchestrator {
             && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
 
+        // Chromecast's Default Media Receiver decodes a narrower set than most
+        // DLNA renderers — notably it cannot play AIFF (which DLNA plays
+        // direct). Serving AIFF direct to a Cast device fails the LOAD, so the
+        // track never leaves position 0; auto-advance then skips to the next
+        // track every few seconds and the shuffle-all queue "resets" endlessly,
+        // never becoming audible (forum #1210, Mika, BeoPlay A9 via CAST).
+        let is_chromecast = zone_output_type.as_deref() == Some("chromecast");
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
             && !alac_passthrough
-            && source_format
-                .as_ref()
-                .is_some_and(|f| f.needs_transcode_for_dlna());
+            && source_format.as_ref().is_some_and(|f| {
+                if is_chromecast {
+                    f.needs_transcode_for_chromecast()
+                } else {
+                    f.needs_transcode_for_dlna()
+                }
+            });
 
         // DLNA format negotiation: if the output will be FLAC (either source
         // is FLAC, or source needs transcode and target is FLAC), check that
@@ -1525,6 +1551,35 @@ impl PlaybackOrchestrator {
             } else if needs_downsample && !needs_transcode_for_output {
                 // Only downsampling — keep the same lossless format
                 AudioFormat::Flac
+            } else if is_chromecast && src_fmt == AudioFormat::Aiff {
+                // AIFF → FLAC for Chromecast (Cast decodes FLAC up to
+                // 24-bit/96k, but not AIFF). dlna_transcode_target(Aiff) is a
+                // no-op (Aiff→Aiff) meant for DLNA, so it must be overridden
+                // here or the Cast device would be fed AIFF again (#1210).
+                AudioFormat::Flac
+            } else if src_fmt == AudioFormat::Dsd && is_network_output {
+                // DSD → network renderer: stream as progressive WAV/LPCM instead
+                // of a blocking pre-transcode to a FLAC file.
+                //
+                // DSD→FLAC is the slowest transcode (74–86s for a track). The
+                // FLAC path takes `use_file_transcode` below, which decodes AND
+                // encodes the WHOLE file to /tmp BEFORE serving a single byte —
+                // so a renderer that can't wait ~80s for its transport URI to
+                // become playable times out and plays SILENCE. Linn Klimax /
+                // OpenHome (Pierre Mack) never decodes DSD itself, so it always
+                // hit this ~80s stall.
+                //
+                // A WAV target routes through the streaming session instead: the
+                // decoder feeds PCM as it runs (first bytes in ~1s), and the HTTP
+                // layer still advertises an exact Content-Length
+                // (StreamInfo::wav_content_length, from the known duration) +
+                // Accept-Ranges + 206-on-`bytes=0-` — exactly what DLNA/OpenHome
+                // renderers require. This is the same streaming-WAV path the
+                // Eversolo DMP-A6/A8 already use. Renderers that need a 16-bit
+                // LPCM cap keep it via `dlna_needs_wav` above; this branch only
+                // catches FLAC-capable renderers (Linn) that were paying the full
+                // ~80s stall for nothing.
+                AudioFormat::Wav
             } else {
                 src_fmt.dlna_transcode_target()
             };
@@ -2275,6 +2330,7 @@ impl PlaybackOrchestrator {
             sample_rate: resolved_sr,
             bit_depth: resolved_bd,
             channels: resolved_ch,
+            origin_url: None,
         })
     }
 
@@ -2816,6 +2872,7 @@ impl PlaybackOrchestrator {
                             sample_rate: Some(stream_data.quality.sample_rate),
                             bit_depth: Some(stream_data.quality.bit_depth as u32),
                             channels: Some(2),
+                            origin_url: None,
                         });
                     }
                 }
@@ -2980,6 +3037,7 @@ impl PlaybackOrchestrator {
                     sample_rate: Some(sr),
                     bit_depth: Some(bd as u32),
                     channels: Some(2),
+                    origin_url: None,
                 });
             }
 
@@ -3625,6 +3683,7 @@ impl PlaybackOrchestrator {
             sample_rate: Some(stream_data.quality.sample_rate),
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
+            origin_url: None,
         })
     }
 
@@ -3853,6 +3912,7 @@ impl PlaybackOrchestrator {
                 sample_rate: Some(sr),
                 bit_depth: Some(out_bd as u32),
                 channels: Some(ch as u32),
+                origin_url: None,
                 cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
@@ -3923,6 +3983,7 @@ impl PlaybackOrchestrator {
             sample_rate: Some(sr),
             bit_depth: Some(out_bd as u32),
             channels: Some(ch as u32),
+            origin_url: None,
         })
     }
 
@@ -5763,6 +5824,12 @@ fn decode_radio_stream_to_pcm(
             }
         }
 
+        // When this connection started streaming. A healthy station streams for
+        // minutes between periodic upstream drops; only a permanently-dead
+        // station fails in rapid succession. Used below to reset the reconnect
+        // counter after a good stretch (see the drop handler).
+        let connected_at = std::time::Instant::now();
+
         // ---- Decode loop ----
         loop {
             if tx.is_closed() {
@@ -5832,6 +5899,17 @@ fn decode_radio_stream_to_pcm(
         // Reconnect and keep feeding the SAME session (pcm_buf carries over).
         if tx.is_closed() {
             return Ok(());
+        }
+        // MAX_RECONNECTS guards against a *permanently dead* station (rapid
+        // back-to-back failures) — not against a healthy station's periodic
+        // upstream drops. FIP-style streams drop the body roughly every ~6 min,
+        // so a cumulative counter hit 30 at ~3h and cut a good listen (Xavier
+        // #1212, a regression of #382). Reset the counter after any sustained
+        // good stretch so a normal long listen is never capped, while a dead
+        // station (each connection dies in <60s) still burns through
+        // MAX_RECONNECTS in seconds and correctly falls back to the poller.
+        if connected_at.elapsed() >= std::time::Duration::from_secs(60) {
+            reconnects = 0;
         }
         reconnects += 1;
         if reconnects > MAX_RECONNECTS {
@@ -6216,6 +6294,13 @@ mod tests {
             "ambiguous .aac radio must be proxied to WAV"
         );
         assert_eq!(resolved.mime_type, "audio/wav");
+        // Because `url` is now ours and not the station's, the upstream has to
+        // travel with it: a recorder wanting the original AAC (or the ICY titles
+        // the proxy drops) has no other way back to the source.
+        assert_eq!(
+            resolved.origin_url.as_deref(),
+            Some("http://icecast.radiofrance.fr/fip-hifi.aac")
+        );
     }
 
     #[tokio::test]
@@ -6243,6 +6328,9 @@ mod tests {
         // proxy session, no transcode cost.
         assert!(resolved.stream_id.is_none());
         assert_eq!(resolved.url, "http://stream.example.com/station.mp3");
+        // Nothing was substituted, so there is no upstream to point at: `url`
+        // already is it.
+        assert!(resolved.origin_url.is_none());
     }
 
     #[tokio::test]

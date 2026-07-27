@@ -284,6 +284,17 @@ impl AudioFormat {
         }
     }
 
+    /// Chromecast's Default Media Receiver supports a narrower codec set than
+    /// most DLNA/UPnP renderers: notably it CANNOT decode AIFF (which DLNA
+    /// renderers handle natively, so `needs_transcode_for_dlna` leaves AIFF
+    /// alone). Fed an AIFF URL, the Cast receiver fails the LOAD and sits at
+    /// position 0; the poller then re-issues play in a loop and the track
+    /// "resets" every few seconds, never audible (forum #1210 — Mika, BeoPlay
+    /// A9 via CAST). So Chromecast needs everything DLNA transcodes, plus AIFF.
+    pub fn needs_transcode_for_chromecast(&self) -> bool {
+        self.needs_transcode_for_dlna() || matches!(self, Self::Aiff)
+    }
+
     /// For DSD sources, compute the appropriate PCM output sample rate.
     /// DSD64 (2.8224 MHz) -> 176400 Hz (4x44100)
     /// DSD128 (5.6448 MHz) -> 352800 Hz (8x44100)
@@ -377,6 +388,42 @@ mod tests {
     #[test]
     fn aiff_no_transcode() {
         assert!(!AudioFormat::Aiff.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn aiff_transcodes_for_chromecast() {
+        // Chromecast cannot decode AIFF (forum #1210) — it must transcode,
+        // even though DLNA renderers play AIFF direct.
+        assert!(AudioFormat::Aiff.needs_transcode_for_chromecast());
+        assert!(!AudioFormat::Aiff.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn chromecast_native_formats_pass_through() {
+        // Formats Chromecast decodes natively must NOT be transcoded.
+        for f in [AudioFormat::Flac, AudioFormat::Wav, AudioFormat::Mp3] {
+            assert!(
+                !f.needs_transcode_for_chromecast(),
+                "{f:?} should pass through to Chromecast"
+            );
+        }
+    }
+
+    #[test]
+    fn chromecast_superset_of_dlna() {
+        // Chromecast transcodes everything DLNA does, plus AIFF.
+        for f in [
+            AudioFormat::Aac,
+            AudioFormat::WavPack,
+            AudioFormat::Ape,
+            AudioFormat::Alac,
+            AudioFormat::Wma,
+            AudioFormat::Dsd,
+            AudioFormat::Opus,
+            AudioFormat::Ogg,
+        ] {
+            assert!(f.needs_transcode_for_chromecast());
+        }
     }
 
     // --- needs_downsample_for_cap ---

@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "plugins/tune-dj"]
+members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "plugins/tune-dj", "plugins/tune-karaoke"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
@@ -8,7 +8,7 @@ exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.21"
+version = "0.9.22"
 edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]

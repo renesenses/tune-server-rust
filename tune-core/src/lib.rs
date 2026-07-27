@@ -55,7 +55,6 @@ pub mod radio_metadata;
 pub mod remote_discovery;
 pub mod remote_proxy;
 pub mod room_correction;
-pub mod scan_scheduler;
 pub mod scanner;
 pub mod scrobble;
 pub mod services_manager;
