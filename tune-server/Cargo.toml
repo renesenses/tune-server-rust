@@ -20,10 +20,15 @@ plugins-wasm = ["tune-core/plugins-wasm"]
 # native in-tree plugin. NOT in default: the stock server no longer serves /dj;
 # build `--features dj` to mount the plugin's routes at /api/v1/ext/dj.
 dj = ["dep:tune-dj"]
+# Karaoke: native synced-lyrics plugin (model B, sibling of `dj`). Reuses
+# `tune_core::lyrics` (no LRC parse/fetch reimplemented). NOT in default; build
+# `--features karaoke` to mount its routes at /api/v1/ext/karaoke.
+karaoke = ["dep:tune-karaoke"]
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
+tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }

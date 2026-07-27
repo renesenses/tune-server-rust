@@ -100,6 +100,21 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             backend: state.backend.clone(),
         })))
         .await;
+
+    // Karaoke: native synced-lyrics plugin (model B). Reuses
+    // `tune_core::lyrics` — no LRC parse/fetch reimplemented. Host services are
+    // passed explicitly so its real dependencies (DB backend, HTTP client, and
+    // the playback manager for `/now`) are visible here at the wiring site.
+    #[cfg(feature = "karaoke")]
+    loader
+        .register(Box::new(tune_karaoke::KaraokePlugin::new(
+            tune_karaoke::HostServices {
+                backend: state.backend.clone(),
+                client: state.http_client.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
+        .await;
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.
