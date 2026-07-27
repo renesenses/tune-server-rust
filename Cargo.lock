@@ -4758,6 +4758,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-karaoke"
+version = "0.9.21"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-output-api"
 version = "0.9.21"
 dependencies = [
@@ -4801,6 +4814,7 @@ dependencies = [
  "tracing-subscriber",
  "tune-core",
  "tune-dj",
+ "tune-karaoke",
  "unicode-normalization",
  "urlencoding",
  "uuid",
