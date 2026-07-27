@@ -1440,12 +1440,23 @@ impl PlaybackOrchestrator {
             && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
 
+        // Chromecast's Default Media Receiver decodes a narrower set than most
+        // DLNA renderers — notably it cannot play AIFF (which DLNA plays
+        // direct). Serving AIFF direct to a Cast device fails the LOAD, so the
+        // track never leaves position 0; auto-advance then skips to the next
+        // track every few seconds and the shuffle-all queue "resets" endlessly,
+        // never becoming audible (forum #1210, Mika, BeoPlay A9 via CAST).
+        let is_chromecast = zone_output_type.as_deref() == Some("chromecast");
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
             && !alac_passthrough
-            && source_format
-                .as_ref()
-                .is_some_and(|f| f.needs_transcode_for_dlna());
+            && source_format.as_ref().is_some_and(|f| {
+                if is_chromecast {
+                    f.needs_transcode_for_chromecast()
+                } else {
+                    f.needs_transcode_for_dlna()
+                }
+            });
 
         // DLNA format negotiation: if the output will be FLAC (either source
         // is FLAC, or source needs transcode and target is FLAC), check that
@@ -1524,6 +1535,12 @@ impl PlaybackOrchestrator {
                 AudioFormat::Wav
             } else if needs_downsample && !needs_transcode_for_output {
                 // Only downsampling — keep the same lossless format
+                AudioFormat::Flac
+            } else if is_chromecast && src_fmt == AudioFormat::Aiff {
+                // AIFF → FLAC for Chromecast (Cast decodes FLAC up to
+                // 24-bit/96k, but not AIFF). dlna_transcode_target(Aiff) is a
+                // no-op (Aiff→Aiff) meant for DLNA, so it must be overridden
+                // here or the Cast device would be fed AIFF again (#1210).
                 AudioFormat::Flac
             } else {
                 src_fmt.dlna_transcode_target()
