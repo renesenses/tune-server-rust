@@ -1091,6 +1091,76 @@ pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoRespo
     StatusCode::NO_CONTENT
 }
 
+/// Daily scheduled-scan loop. The `/scan/schedule` endpoint has stored
+/// `scan_schedule_enabled` / `scan_schedule_time` ("HH:MM") for ages, but
+/// nothing ever read them back — the clients' toggle was silently a no-op
+/// (the old tune-core ScanScheduler used different keys, an interval model
+/// and a SQLite-only handle, and was never spawned; it is deleted).
+///
+/// Checks every 30 s; fires at most once per matching minute; a scan already
+/// in progress skips that day's occurrence instead of stacking.
+pub(crate) fn spawn_scan_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        let mut last_fired: Option<String> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let enabled = settings
+                .get("scan_schedule_enabled")
+                .ok()
+                .flatten()
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            if !enabled {
+                continue;
+            }
+            let sched = settings
+                .get("scan_schedule_time")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "03:00".into());
+            let Some((sh, sm)) = parse_hhmm(&sched) else {
+                continue;
+            };
+            // Local time: the user sets "03:00" meaning THEIR 3am, and log
+            // timestamps are already local (see run.rs). Fall back to UTC if
+            // the local offset is unavailable (some hardened Linux setups).
+            let now = time::OffsetDateTime::now_local()
+                .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            if now.hour() != sh || now.minute() != sm {
+                continue;
+            }
+            let stamp = format!(
+                "{}-{:02}-{:02} {:02}:{:02}",
+                now.year(),
+                now.month() as u8,
+                now.day(),
+                sh,
+                sm
+            );
+            if last_fired.as_deref() == Some(stamp.as_str()) {
+                continue;
+            }
+            last_fired = Some(stamp);
+            let scanning =
+                settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
+            if scanning {
+                tracing::info!("scheduled_scan_skipped_already_scanning");
+                continue;
+            }
+            tracing::info!(time = %sched, "scheduled_scan_triggered");
+            spawn_library_scan(state.clone(), false, None).await;
+        }
+    });
+}
+
+fn parse_hhmm(s: &str) -> Option<(u8, u8)> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u8 = h.trim().parse().ok()?;
+    let m: u8 = m.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some((h, m))
+}
+
 pub(super) async fn scan_schedule(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let time = settings
@@ -1347,5 +1417,16 @@ mod tests {
         ]);
         assert!(!is_comp(&m, "/m/a/greatest", "Greatest Hits"));
         assert!(!is_comp(&m, "/m/b/greatest", "Greatest Hits"));
+    }
+
+    #[test]
+    fn parse_hhmm_accepts_valid_rejects_invalid() {
+        assert_eq!(super::parse_hhmm("03:00"), Some((3, 0)));
+        assert_eq!(super::parse_hhmm(" 23:59 "), Some((23, 59)));
+        assert_eq!(super::parse_hhmm("3:5"), Some((3, 5)));
+        assert_eq!(super::parse_hhmm("24:00"), None);
+        assert_eq!(super::parse_hhmm("12:60"), None);
+        assert_eq!(super::parse_hhmm("noon"), None);
+        assert_eq!(super::parse_hhmm(""), None);
     }
 }
