@@ -15,6 +15,11 @@ pub struct PluginManifest {
     pub entry_point: String,
     pub permissions: Vec<String>,
     pub min_server_version: Option<String>,
+    /// Whether this plugin's mounted HTTP routes are premium-gated. When true,
+    /// the host runs `premium_guard` before dispatching a request to the plugin
+    /// (RFC §3.5). Defaults to `false` so existing manifests parse unchanged.
+    #[serde(default)]
+    pub premium: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +324,7 @@ mod tests {
                     entry_point: String::new(),
                     permissions: vec![],
                     min_server_version: None,
+                    premium: false,
                 },
                 state: PluginState::Active,
                 path: String::new(),
@@ -337,6 +343,7 @@ mod tests {
                     entry_point: String::new(),
                     permissions: vec![],
                     min_server_version: None,
+                    premium: false,
                 },
                 state: PluginState::Disabled,
                 path: String::new(),

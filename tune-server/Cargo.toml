@@ -11,6 +11,11 @@ asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]
 postgres = ["tune-core/postgres"]
+# P2 of the plugin ABI: wire the embedded wasmtime runtime (tune-core's
+# `plugins-wasm`) into the real server — AppState-backed HostContext, a
+# registry of loaded wasm plugins, and the `/api/v1/plugins/{id}/…` route
+# mount. NOT in default: the stock server build must not pull in wasmtime.
+plugins-wasm = ["tune-core/plugins-wasm"]
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }

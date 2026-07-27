@@ -587,6 +587,19 @@ impl WasmPlugin {
         self.call_raw(json_in.as_bytes())
     }
 
+    /// Dispatch an HTTP route request to the plugin (RFC §3.5).
+    ///
+    /// The host mounts a single axum handler under `/api/v1/plugins/{id}/…`,
+    /// packages the request as `{method, path, query, body}` JSON, and calls
+    /// this; the plugin answers with a `{status, headers?, body}` JSON envelope.
+    /// This is a thin forwarder over [`dispatch`](WasmPlugin::dispatch) — the
+    /// route request/response is just the JSON payload the dispatch contract
+    /// already carries — named so the P2 route-mounting call site reads for
+    /// intent rather than as a bare `dispatch`.
+    pub fn handle_route(&mut self, req_json: &str) -> Result<String, String> {
+        self.dispatch(req_json)
+    }
+
     /// Dispatch with the Party crate's input framing:
     /// `[action_len: u32 LE][action bytes][payload bytes]`. The response is read
     /// with the same packed-`u64` / raw-JSON convention as [`dispatch`].

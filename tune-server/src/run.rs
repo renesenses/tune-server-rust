@@ -350,6 +350,14 @@ async fn run(opts: RunOptions) {
     )
     .await;
 
+    // P2 of the plugin ABI: load enabled wasm plugins and publish the registry
+    // into AppState so `/api/v1/plugins/{id}/…` can dispatch into them. A bad
+    // plugin is logged and skipped, never fatal. Feature-gated: absent from the
+    // default build. Runs before the router is built (below) so the mount finds
+    // the registry, though the OnceLock would resolve at request time anyway.
+    #[cfg(feature = "plugins-wasm")]
+    crate::plugins_host::load_wasm_plugins(&state).await;
+
     // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
     // bound (see below). Running it here fetched the local output's own
     // /stream/ URL before the server was accepting connections, which failed

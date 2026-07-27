@@ -325,6 +325,12 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     )
     .await;
 
+    // P2 of the plugin ABI: load enabled wasm plugins into AppState so the
+    // `/api/v1/plugins/{id}/…` mount can dispatch into them. Feature-gated and
+    // fail-safe (a bad plugin is skipped, never fatal). See run.rs.
+    #[cfg(feature = "plugins-wasm")]
+    crate::plugins_host::load_wasm_plugins(&state).await;
+
     // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
     // bound (see below). Running it here fetched the local output's own
     // /stream/ URL before the server was accepting connections, which failed
