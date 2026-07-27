@@ -96,10 +96,23 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
 
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
-    let auto_enrich_allowed = state
-        .license
-        .check_feature(tune_core::license::Feature::AutoEnrichment)
-        .await;
+    // Auto-enrichment after a scan needs BOTH premium AND the user's opt-in.
+    // It was previously forced on every Premium account, so a scan of a large
+    // library triggered ~20 min of artist-image downloads the user never asked
+    // for and could not turn off (JF Paquet: tags already complete, machine
+    // busy). Honour the `enrich_on_scan` setting (default on = unchanged
+    // behaviour) so it can be disabled from Settings.
+    let enrich_on_scan = SettingsRepo::with_backend(state.backend.clone())
+        .get("enrich_on_scan")
+        .ok()
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let auto_enrich_allowed = enrich_on_scan
+        && state
+            .license
+            .check_feature(tune_core::license::Feature::AutoEnrichment)
+            .await;
     tokio::spawn(async move {
         let db_for_panic = db.clone();
         let handle = tokio::runtime::Handle::current();
@@ -955,7 +968,10 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 tune_core::library::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
             });
         } else {
-            tracing::info!("auto_enrichment_after_scan_requires_premium");
+            tracing::info!(
+                enrich_on_scan,
+                "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
+            );
         }
         }).await;
         if let Err(e) = result {
