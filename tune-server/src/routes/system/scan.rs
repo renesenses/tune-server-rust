@@ -242,9 +242,18 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 if force {
                     return true;
                 }
-                let path_str = path.to_string_lossy();
+                // NFC-normalize the lookup key: the stored file_path (and the
+                // `discovered_paths` set above) are NFC, but a filename on disk
+                // may be NFD (a FR library ripped on macOS then copied to a
+                // Synology, read back over SMB). Without this the get() misses
+                // for every NFD-named file, so it fails the skip and lofty
+                // re-reads its tags (heavy embedded art over slow SMB) on EVERY
+                // manual scan → "scan interminable" (Xavier, DS214/18.5k FR).
+                // auto_scan.rs already normalizes here; this brings the manual
+                // scan into line (divergent copy that missed the fix).
+                let path_str: String = path.to_string_lossy().nfc().collect();
                 if let Some(&(_, existing_mtime, existing_size)) =
-                    existing_tracks.get(path_str.as_ref())
+                    existing_tracks.get(path_str.as_str())
                 {
                     if let Ok(file_meta) = path.metadata() {
                         let mtime = file_meta

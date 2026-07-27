@@ -218,12 +218,27 @@ pub(crate) mod decisions {
     /// position — reported 6s into a new start). That stale sample poisons the
     /// peak, triggers near-end gapless staging seconds into the track, and the
     /// snap back to the real position then reads as a phantom
-    /// `position_reset` advance. A real position can never exceed the wall
-    /// time actually elapsed (+15s margin for seek-restore/clock slack), so
-    /// during the first 30s of a track such a sample is provably stale and
-    /// must be discarded outright.
+    /// `position_reset` advance.
+    ///
+    /// A real position can never exceed the wall time actually elapsed (+15s
+    /// margin for seek-restore/clock slack): `track_started_at` is folded by
+    /// the seek/resume target (see the "Fold a NEW seek" baseline above), so
+    /// `wall_elapsed` tracks the true 1x play position at every point in the
+    /// track — not only the first few seconds. Any sample above that ceiling
+    /// is therefore provably impossible and must be discarded outright,
+    /// whenever it arrives.
+    ///
+    /// This used to be gated on `wall_elapsed_secs < 30`, which let a renderer
+    /// that keeps reporting a stale near-end position for LONGER than 30s
+    /// (Bertrand's DMP-A8, .18) poison the peak the instant the 30s grace
+    /// lapsed: peak jumped to the fake near-end value, `played_enough` flipped
+    /// true, and the very next honest snap-to-0 read as a `position_reset`
+    /// advance ~30s into track 1 — the queue pointer ran ahead of the renderer
+    /// and the Qobuz playlist appeared to "stop at the first track". Dropping
+    /// the window makes the invariant hold for the whole track and cures both
+    /// the poisoned-peak advance and the near-end gapless mis-staging.
     pub fn stale_start_position(wall_elapsed_secs: u64, position_ms: u64) -> bool {
-        wall_elapsed_secs < 30 && position_ms > wall_elapsed_secs * 1000 + 15_000
+        position_ms > wall_elapsed_secs * 1000 + 15_000
     }
 
     /// The peak position reached (near) the track's full duration, so the track
@@ -2212,6 +2227,12 @@ impl PositionPoller {
             // the renderer (forum #1019, Marantz ND8006). `gapless_sent` stays
             // true from SetNext until the transition is detected or the track
             // generation changes, so it covers the whole window.
+            // Snapshot the real previous position BEFORE it is overwritten
+            // below — the diagnostic `info!` further down must log the genuine
+            // prior sample, not the just-stored current one (the old code read
+            // `ps.last_position_ms` after the overwrite, so `prev_pos` was
+            // always mis-logged equal to `new_pos`).
+            let prev_position_ms = ps.last_position_ms;
             let position_reset =
                 decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
             ps.last_position_ms = status.position_ms;
@@ -2234,7 +2255,7 @@ impl PositionPoller {
                         .unwrap_or(0);
                     info!(
                         zone_id,
-                        prev_pos = ps.last_position_ms,
+                        prev_pos = prev_position_ms,
                         new_pos = status.position_ms,
                         arm_to_advance_ms,
                         "gapless_position_reset_detected"
@@ -3255,8 +3276,24 @@ mod tests {
         assert!(!decisions::stale_start_position(6, 6_500));
         // Seek-restore margin: resume at +14s while wall says 2s is tolerated.
         assert!(!decisions::stale_start_position(2, 14_000));
-        // Past the 30s grace the guard stands down entirely.
-        assert!(!decisions::stale_start_position(40, 374_000));
+    }
+
+    #[test]
+    fn stale_start_position_rejects_ghost_beyond_30s_window() {
+        // DMP-A8 (Bertrand, .18): the renderer keeps reporting a stale near-end
+        // position PAST the old 30s grace. `track_started_at` is folded on
+        // seek/resume so an honest 1x position can never exceed wall+15s at any
+        // point — a ~235s sample at 30-40s of wall time is provably impossible
+        // and must still be rejected (previously it was accepted the instant
+        // the 30s window lapsed, poisoning the peak and firing a phantom
+        // position_reset advance ~30s into track 1).
+        assert!(decisions::stale_start_position(30, 235_000));
+        assert!(decisions::stale_start_position(40, 374_000));
+        // Honest deep-into-track sample is still accepted: position ~= wall.
+        assert!(!decisions::stale_start_position(200, 200_000));
+        // Honest sample within the +15s clock/seek-restore slack, late in the
+        // track, is likewise fine.
+        assert!(!decisions::stale_start_position(200, 214_000));
     }
 
     #[test]
@@ -3816,6 +3853,43 @@ mod tests {
     fn position_reset_detects_gapless_advance() {
         // Position dropped from >30s to <5s while gapless was armed.
         assert!(decisions::position_reset(40_000, 2_000, true));
+    }
+
+    #[test]
+    fn dmpa8_stale_ghost_does_not_poison_peak_or_advance() {
+        // Reproduces the .18 DMP-A8 "playlist stops at track 1" chain at the
+        // pure-decision level. Track 1 is 240s; the renderer reports a stale
+        // ~235s near-end position for the whole first ~30s of a fresh play.
+        let track_duration_ms = 240_000;
+        let stale_pos_ms = 235_000;
+
+        // Every stale sample is provably impossible (position >> wall+15s) and
+        // is rejected — at 5s in AND once past the old 30s window — so it never
+        // becomes the peak.
+        assert!(decisions::stale_start_position(5, stale_pos_ms));
+        assert!(decisions::stale_start_position(30, stale_pos_ms));
+        assert!(decisions::stale_start_position(35, stale_pos_ms));
+
+        // With the ghost filtered, the peak only ever reflects honest samples
+        // (~a few seconds in this window), so the track is NOT "played enough".
+        let honest_peak_ms = 5_000;
+        assert!(!decisions::played_enough(
+            track_duration_ms,
+            honest_peak_ms,
+            35
+        ));
+
+        // Even if the renderer then snaps to 0 while gapless is armed, the
+        // caller gates the metadata advance on played_enough — which is false —
+        // so no phantom position_reset advance fires 30s into track 1. (The raw
+        // drop shape matches; the played_enough guard is what prevents it.)
+        let raw_drop_matches = decisions::position_reset(stale_pos_ms, 1_000, true);
+        assert!(raw_drop_matches);
+        let played_enough = decisions::played_enough(track_duration_ms, honest_peak_ms, 35);
+        assert!(
+            !(raw_drop_matches && played_enough),
+            "advance must be gated off while the ghost is filtered"
+        );
     }
 
     #[test]
