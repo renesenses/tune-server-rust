@@ -283,23 +283,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // thread pool oversubscribed well past the core count so the network
         // latency of many stats overlaps instead of running one at a time.
         use rayon::prelude::*;
-        let is_changed = |path: &std::path::Path| -> bool {
-            let path_str: String = path.to_string_lossy().nfc().collect();
-            if let Some(&(_, existing_mtime, existing_size)) =
-                existing_tracks.get(path_str.as_str())
-                && let Ok(file_meta) = path.metadata()
-            {
-                let mtime = file_meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let unchanged = existing_mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-                    && (existing_size == Some(file_meta.len() as i64));
-                return !unchanged;
-            }
-            true
+        // Shared with the manual scan (routes::system::scan) so the two pre-scan
+        // skip filters can't diverge on the NFC key again (the "scan
+        // interminable" bug: NFD-named files missing the map and re-read over SMB).
+        let is_changed = |path: &std::path::Path| {
+            crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
         };
         let stat_pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().ok();
         let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
