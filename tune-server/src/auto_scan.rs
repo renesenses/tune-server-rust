@@ -329,7 +329,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
         let mut inserted = 0u64;
         let mut updated = 0u64;
+        // `skipped` stays the aggregate the UI already shows; the per-cause
+        // counters make the report actionable ("skipped 1200" alone doesn't
+        // say whether the library is healthy or half the NAS failed to read).
         let mut skipped = pre_skipped as u64;
+        let mut skipped_unchanged = pre_skipped as u64;
+        let mut skipped_duplicate = 0u64;
+        let mut skipped_no_metadata = 0u64;
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -362,6 +368,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 for sf in &batch {
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
+                        // Counted in the aggregate too, so `processed` can
+                        // actually reach `total` — before this, every failed
+                        // file made the progress bar stop short of 100%.
+                        skipped += 1;
+                        skipped_no_metadata += 1;
                         continue;
                     }
 
@@ -376,6 +387,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                             || (existing_size != Some(sf.file_size as i64));
                         if !file_changed {
                             skipped += 1;
+                            skipped_unchanged += 1;
                             continue;
                         }
                     }
@@ -403,6 +415,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
+                            skipped_duplicate += 1;
                             continue;
                         }
                         known_hashes.insert(key);
@@ -548,6 +561,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             inserted,
             updated,
             skipped,
+            skipped_unchanged,
+            skipped_duplicate,
+            skipped_no_metadata,
             artwork = artwork_extracted,
             orphan_albums,
             "auto_scan_complete"
@@ -563,6 +579,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
+            "skipped_unchanged": skipped_unchanged,
+            "skipped_duplicate": skipped_duplicate,
+            "skipped_no_metadata": skipped_no_metadata,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
         });

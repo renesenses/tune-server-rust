@@ -287,7 +287,14 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let cache_dir = crate::routes::library::artwork_cache_dir();
         let mut inserted = 0i64;
         let mut updated = 0i64;
+        // `skipped` stays the aggregate the UI already shows. The manual scan
+        // never dedups by audio_hash (only the auto/watcher path does), so
+        // everything it skips is either an unchanged file or a file whose
+        // metadata could not be read — broken out below so the report says
+        // which.
         let mut skipped = pre_skipped;
+        let mut skipped_unchanged = pre_skipped;
+        let mut skipped_no_metadata = 0i64;
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
@@ -350,6 +357,12 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
 
                 for sf in &batch {
                     if sf.metadata.is_none() {
+                        tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
+                        // Counted in the aggregate too, so `processed` can
+                        // actually reach `total` — before this, every failed
+                        // file made the progress bar stop short of 100%.
+                        skipped += 1;
+                        skipped_no_metadata += 1;
                         continue;
                     }
 
@@ -367,6 +380,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                                 || existing_size.map_or(true, |s| s != sf.file_size as i64);
                             if !file_changed {
                                 skipped += 1;
+                                skipped_unchanged += 1;
                                 continue;
                             }
                         }
@@ -789,6 +803,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             inserted,
             updated,
             skipped,
+            skipped_unchanged,
+            skipped_no_metadata,
             artwork = artwork_extracted,
             orphan_artists,
             "scan_and_import_complete"
@@ -808,6 +824,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "inserted": inserted,
                     "updated": updated,
                     "skipped": skipped,
+                    "skipped_unchanged": skipped_unchanged,
+                    "skipped_no_metadata": skipped_no_metadata,
                     "artwork_extracted": artwork_extracted,
                     "failed_paths": scan_stats.failed_paths,
                 })
@@ -827,6 +845,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 "inserted": inserted,
                 "updated": updated,
                 "skipped": skipped,
+                "skipped_unchanged": skipped_unchanged,
+                "skipped_no_metadata": skipped_no_metadata,
                 "artwork_extracted": artwork_extracted,
                 "failed_paths": scan_stats.failed_paths,
             }),
@@ -847,6 +867,8 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
+            "skipped_unchanged": skipped_unchanged,
+            "skipped_no_metadata": skipped_no_metadata,
             "artwork_extracted": artwork_extracted,
             "failed_paths": scan_stats.failed_paths,
         });
