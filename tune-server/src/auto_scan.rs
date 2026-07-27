@@ -226,7 +226,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             return;
         }
 
-        let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let exclude_patterns = scan_exclude_patterns(&db);
+        if !exclude_patterns.is_empty() {
+            info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
+        }
+        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+            &music_dirs,
+            &exclude_patterns,
+        );
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
@@ -633,6 +640,20 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 /// completes before starting to monitor directories. This prevents the watcher
 /// from picking up stale FSEvents replayed on subscription and racing with the
 /// scanner (deleting tracks that the scanner just inserted).
+/// Parse the `scan_exclude_paths` setting: a JSON array of case-insensitive
+/// path substrings excluded from scanning and watching (staging folders,
+/// backup trees, a sibling's library on a shared NAS).
+pub(crate) fn scan_exclude_patterns(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Vec<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("scan_exclude_paths")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
 pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<AtomicBool>>) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let music_dirs: Vec<String> = settings
@@ -680,6 +701,11 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                 if !stale.is_empty() {
                     info!(count = stale.len(), "file_watcher_drained_stale_events");
                 }
+                let watcher_excludes: Vec<String> = scan_exclude_patterns(&db)
+                    .iter()
+                    .map(|p| p.trim().to_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .collect();
                 let watcher_quality_split =
                     tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
                         .get("quality_split")
@@ -703,6 +729,15 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                     );
                     let had_changes = !changes.is_empty();
                     for change in changes {
+                        // Same exclusions as the scans (re-read per event batch
+                        // so setting edits apply without a restart is overkill;
+                        // the list was read once at watcher start).
+                        if !watcher_excludes.is_empty() {
+                            let path_l = change.path.to_lowercase();
+                            if watcher_excludes.iter().any(|x| path_l.contains(x.as_str())) {
+                                continue;
+                            }
+                        }
                         // Tune's own streaming temp files (tune-stream-*/
                         // tune-prefetch-* in %TEMP%) fire watcher events on every
                         // transcode when the library root is a parent of the temp
