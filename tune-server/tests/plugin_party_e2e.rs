@@ -199,16 +199,16 @@ async fn real_party_plugin_round_trips_through_p2_wiring() {
         json_contains_track_id(&body, track_id),
         "GET /queue must reflect the track the plugin added via the host: {body}"
     );
-    let host_tracks = body
-        .pointer("/queue/tracks")
+    // The plugin unwraps the host `{…, tracks:[…]}` envelope and returns a flat
+    // array of tracks decorated with the plugin's per-track `votes`. No vote
+    // cast yet → `votes == 0`.
+    let queue = body
+        .pointer("/queue")
         .and_then(Value::as_array)
-        .expect("host queue_get returns a `tracks` array under queue");
-    assert_eq!(
-        host_tracks.len(),
-        1,
-        "the single queued track is visible through host_queue_get"
-    );
-    assert_eq!(host_tracks[0]["track_id"], json!(track_id));
+        .expect("GET /queue returns an array of annotated tracks under `queue`");
+    assert_eq!(queue.len(), 1, "the single queued track is visible");
+    assert_eq!(queue[0]["track_id"], json!(track_id));
+    assert_eq!(queue[0]["votes"], json!(0), "no vote cast yet");
 
     // ---- (d) POST /vote then /queue : plugin-local vote tally changes -----
     let (status, body) = call(
@@ -237,6 +237,25 @@ async fn real_party_plugin_round_trips_through_p2_wiring() {
         body["votes"][track_id.to_string()],
         json!(5),
         "the plugin's persisted vote tally survives across dispatches: {body}"
+    );
+
+    // ---- (e) GET /queue now carries the vote annotation, driven by the real
+    // host envelope (regression guard for the `tracks`-key unwrap fix) --------
+    let (_, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/plugins/party/queue?zone={zone_id}"),
+        Value::Null,
+    )
+    .await;
+    let queue = body
+        .pointer("/queue")
+        .and_then(Value::as_array)
+        .expect("queue array");
+    assert_eq!(
+        queue[0]["votes"],
+        json!(5),
+        "GET /queue is annotated with the plugin's vote tally: {body}"
     );
 }
 
