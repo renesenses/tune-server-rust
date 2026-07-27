@@ -177,6 +177,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
 
         let list_result = tune_core::scanner::walker::list_audio_files(&scan_dirs);
         let missing_dirs = list_result.missing_dirs;
+        let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
@@ -816,6 +817,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 &json!({
                     "total_files": total_discovered,
                     "missing_dirs": missing_dirs.clone(),
+                    "missing_dir_reasons": missing_dir_reasons.clone(),
                     "error_dirs": error_dirs.clone(),
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
@@ -838,6 +840,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             json!({
                 "total_files": total_discovered,
                 "missing_dirs": missing_dirs.clone(),
+                "missing_dir_reasons": missing_dir_reasons.clone(),
                 "error_dirs": error_dirs.clone(),
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
@@ -859,6 +862,7 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let report = serde_json::json!({
             "total_files": total_discovered,
             "missing_dirs": missing_dirs.clone(),
+            "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,

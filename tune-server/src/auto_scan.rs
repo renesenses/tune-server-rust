@@ -225,6 +225,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
         let missing_dirs = list_result.missing_dirs;
+        let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
@@ -572,6 +573,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
+            "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
