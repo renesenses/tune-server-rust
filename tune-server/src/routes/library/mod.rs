@@ -221,6 +221,7 @@ pub fn router() -> Router<AppState> {
             get(ingest::get_ingest_settings).put(ingest::put_ingest_settings),
         )
         .route("/ingest/analyze", post(ingest::analyze))
+        .route("/ingest/release-tracks", post(ingest::release_tracks))
         .route("/ingest/plan", post(ingest::plan))
         .route("/ingest/apply", post(ingest::apply))
         .route("/ingest/jobs", get(ingest::list_jobs))

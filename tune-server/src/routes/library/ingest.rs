@@ -12,6 +12,7 @@
 //! `apply` runs in the background and records an undo manifest, because a copy
 //! onto a NAS can outlast any sensible HTTP timeout.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
@@ -24,7 +25,7 @@ use serde_json::{Value, json};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::library::ingest::{
     self, AlbumOverrides, AlbumSummary, ConflictPolicy, FileMode, IngestPlan, IngestReport,
-    SourceTrack,
+    SourceTrack, TrackOverride,
 };
 
 use crate::error::AppError;
@@ -32,6 +33,11 @@ use crate::state::AppState;
 
 /// Newest-first cap on the job history we keep in `settings`.
 const MAX_JOB_HISTORY: usize = 25;
+
+/// How many candidate releases to offer. Enough to cover the usual
+/// standard / deluxe / regional spread without turning the step into a list to
+/// scroll through.
+const MAX_RELEASE_CANDIDATES: usize = 8;
 
 const KEY_MODE: &str = "ingest_file_mode";
 const KEY_TEMPLATE: &str = "ingest_template";
@@ -351,26 +357,20 @@ pub(super) async fn analyze(
     // mistake when a download sits in a folder you forgot you already ingested.
     let already_known = count_known_paths(&state, &tracks);
 
-    let mut musicbrainz: Option<Value> = None;
+    // Candidate releases, for the user to pick the right edition. Searched on
+    // title and artist only: the album artist may be missing from the tags, and
+    // an album title alone is usually enough to get the shortlist.
+    let mut candidates: Vec<tune_core::metadata::musicbrainz_release::MBReleaseMatch> = Vec::new();
     if body.identify.unwrap_or(false)
-        && let (Some(title), Some(artist)) = (album.album.as_deref(), album.album_artist.as_deref())
+        && let Some(title) = album.album.as_deref()
     {
-        let found = tune_core::metadata::musicbrainz_release::lookup_release(
+        candidates = tune_core::metadata::musicbrainz_release::lookup_release_candidates(
             title,
-            artist,
-            Some(album.track_count as i32),
-            album.year.map(|y| y as i32),
+            album.album_artist.as_deref().unwrap_or(""),
+            Some(album.track_count as u32),
+            MAX_RELEASE_CANDIDATES,
         )
         .await;
-        musicbrainz = found.map(|m| {
-            json!({
-                "release_id": m.release_id,
-                "release_group_id": m.release_group_id,
-                "title": m.title,
-                "artist": m.artist,
-                "score": m.score,
-            })
-        });
     }
 
     let settings = load_settings(&state);
@@ -380,13 +380,81 @@ pub(super) async fn analyze(
         "tracks": tracks,
         "extras": extras,
         "already_in_library": already_known,
-        "musicbrainz": musicbrainz,
+        "musicbrainz_candidates": candidates,
         "defaults": {
             "mode": settings.mode,
             "template": settings.template,
             "conflict_policy": settings.conflict_policy,
             "write_tags": settings.write_tags,
         },
+    })))
+}
+
+// -- Release track listing --
+
+#[derive(Deserialize)]
+pub(super) struct ReleaseTracksBody {
+    source_path: String,
+    /// MusicBrainz release id, as returned in `musicbrainz_candidates`.
+    release_id: String,
+}
+
+/// Fetch a chosen release's track listing and propose how it maps onto the
+/// files on disk.
+///
+/// The pairing is decided server-side and returned as before/after pairs: the
+/// client shows the difference and sends back only what the user accepted, as
+/// `track_overrides` on `plan`/`apply`. Nothing is written here.
+pub(super) async fn release_tracks(
+    Json(body): Json<ReleaseTracksBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let (tracks, _extras) = read_source(&body.source_path).await?;
+    if tracks.is_empty() {
+        return Err(AppError::bad_request(
+            "no supported audio files found in that folder",
+        ));
+    }
+
+    let detail = tune_core::metadata::musicbrainz_release::lookup_release_detail(&body.release_id)
+        .await
+        .ok_or_else(|| {
+            AppError::not_found(format!(
+                "MusicBrainz has no release {} (or it could not be reached)",
+                body.release_id
+            ))
+        })?;
+
+    let release: Vec<ingest::ReleaseTrack> = detail
+        .tracks
+        .iter()
+        .map(|t| ingest::ReleaseTrack {
+            disc: t.disc,
+            position: t.position,
+            title: t.title.clone(),
+        })
+        .collect();
+
+    let proposals = ingest::match_release_tracks(&tracks, &release);
+    let changed = proposals.iter().filter(|p| p.changes_anything()).count();
+    let unmatched = proposals.iter().filter(|p| !p.matched).count();
+
+    Ok(Json(json!({
+        "release": {
+            "release_id": detail.release_id,
+            "title": detail.title,
+            "artist": detail.artist,
+            "date": detail.date,
+            "year": detail.year,
+            "country": detail.country,
+            "label": detail.label,
+            "catalog_number": detail.catalog_number,
+            "disc_count": detail.disc_count,
+            "track_count": detail.tracks.len(),
+        },
+        "tracks": detail.tracks,
+        "proposals": proposals,
+        "changed": changed,
+        "unmatched": unmatched,
     })))
 }
 
@@ -411,46 +479,63 @@ fn count_known_paths(state: &AppState, tracks: &[SourceTrack]) -> usize {
 
 // -- Plan --
 
-#[derive(Deserialize)]
-pub(super) struct PlanBody {
+/// Everything that decides where the files land. Shared by `plan` and `apply`
+/// so the preview the user approved is byte-for-byte what gets executed.
+#[derive(Deserialize, Default)]
+pub(super) struct IngestParams {
     source_path: String,
     dest_root: Option<String>,
     template: Option<String>,
     mode: Option<String>,
+    /// Album-wide corrections.
     #[serde(default)]
     overrides: AlbumOverrides,
+    /// Per-file corrections, as accepted from a chosen release's listing.
+    /// These feed the destination paths too, not just the tags — a title fixed
+    /// here is the title in the filename.
+    #[serde(default)]
+    track_overrides: Vec<TrackOverride>,
 }
 
-/// Shared by `plan` and `apply` so the preview the user approved is exactly
-/// what gets executed.
-async fn build(
-    state: &AppState,
-    source_path: &str,
-    dest_root: Option<&str>,
-    template: Option<&str>,
-    mode: Option<&str>,
-    overrides: &AlbumOverrides,
-) -> Result<(IngestPlan, AlbumSummary), AppError> {
-    let settings = load_settings(state);
-    let root = resolve_dest_root(state, dest_root, &settings)?;
+/// The plan, the resolved album, and the source tracks *after* corrections —
+/// the last one is what `apply` needs to write per-file tags.
+struct Built {
+    plan: IngestPlan,
+    album: AlbumSummary,
+    tracks: Vec<SourceTrack>,
+}
 
-    let (tracks, extras) = read_source(source_path).await?;
+async fn build(state: &AppState, params: &IngestParams) -> Result<Built, AppError> {
+    let settings = load_settings(state);
+    let root = resolve_dest_root(state, params.dest_root.as_deref(), &settings)?;
+
+    let (mut tracks, extras) = read_source(&params.source_path).await?;
     if tracks.is_empty() {
         return Err(AppError::bad_request(
             "no supported audio files found in that folder",
         ));
     }
 
-    let album = ingest::apply_overrides(&ingest::summarize(&tracks), overrides);
-    let template = template
+    // Per-file corrections first: the album summary is derived from the tracks,
+    // so applying them afterwards would summarise stale titles and numbers.
+    ingest::apply_track_overrides(&mut tracks, &params.track_overrides);
+
+    let album = ingest::apply_overrides(&ingest::summarize(&tracks), &params.overrides);
+    let template = params
+        .template
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&settings.template)
         .to_string();
-    let mode = mode.and_then(FileMode::parse).unwrap_or(settings.mode);
+    let mode = params
+        .mode
+        .as_deref()
+        .and_then(FileMode::parse)
+        .unwrap_or(settings.mode);
 
     let plan = ingest::build_plan(
-        &tune_core::scanner::walker::normalize_path(source_path),
+        &tune_core::scanner::walker::normalize_path(&params.source_path),
         &tracks,
         &extras,
         &album,
@@ -458,22 +543,18 @@ async fn build(
         &|p: &Path| p.exists(),
     );
 
-    Ok((plan, album))
+    Ok(Built {
+        plan,
+        album,
+        tracks,
+    })
 }
 
 pub(super) async fn plan(
     State(state): State<AppState>,
-    Json(body): Json<PlanBody>,
+    Json(body): Json<IngestParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let (plan, album) = build(
-        &state,
-        &body.source_path,
-        body.dest_root.as_deref(),
-        body.template.as_deref(),
-        body.mode.as_deref(),
-        &body.overrides,
-    )
-    .await?;
+    let Built { plan, album, .. } = build(&state, &body).await?;
 
     Ok(Json(json!({
         "plan": plan,
@@ -487,30 +568,22 @@ pub(super) async fn plan(
 
 #[derive(Deserialize)]
 pub(super) struct ApplyBody {
-    source_path: String,
-    dest_root: Option<String>,
-    template: Option<String>,
-    mode: Option<String>,
+    #[serde(flatten)]
+    params: IngestParams,
     conflict_policy: Option<String>,
-    /// Write the (possibly corrected) album fields into the placed files.
+    /// Write the (possibly corrected) fields into the placed files.
     write_tags: Option<bool>,
-    #[serde(default)]
-    overrides: AlbumOverrides,
 }
 
 pub(super) async fn apply(
     State(state): State<AppState>,
     Json(body): Json<ApplyBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let (plan, album) = build(
-        &state,
-        &body.source_path,
-        body.dest_root.as_deref(),
-        body.template.as_deref(),
-        body.mode.as_deref(),
-        &body.overrides,
-    )
-    .await?;
+    let Built {
+        plan,
+        album,
+        tracks,
+    } = build(&state, &body.params).await?;
 
     let settings = load_settings(&state);
     let policy = match body.conflict_policy.as_deref() {
@@ -546,7 +619,7 @@ pub(super) async fn apply(
     let jid = job_id.clone();
     let album_bg = album.clone();
     tokio::spawn(async move {
-        run_job(state_bg, jid, plan, policy, write_tags, album_bg).await;
+        run_job(state_bg, jid, plan, policy, write_tags, album_bg, tracks).await;
     });
 
     Ok((
@@ -563,6 +636,7 @@ async fn run_job(
     policy: ConflictPolicy,
     write_tags: bool,
     album: AlbumSummary,
+    tracks: Vec<SourceTrack>,
 ) {
     let plan_for_exec = plan.clone();
     let report =
@@ -585,7 +659,7 @@ async fn run_job(
         };
 
     let tags_written = if write_tags {
-        write_album_tags(&report, &album).await
+        write_placed_tags(&report, &album, &tracks).await
     } else {
         0
     };
@@ -642,41 +716,65 @@ async fn run_job(
     );
 }
 
-/// Write the album-level fields onto the files that landed.
+/// Write the confirmed fields onto the files that landed.
 ///
-/// Only album-wide values are touched — never titles or track numbers, which
-/// are per-file and were not part of what the user confirmed.
-async fn write_album_tags(report: &IngestReport, album: &AlbumSummary) -> usize {
-    if album.album.is_none() && album.album_artist.is_none() && album.year.is_none() {
+/// Album-wide values go on every file; title, track and disc come from the
+/// matching source track, which carries whatever the user accepted from a
+/// chosen release listing. A file is only touched when there is something to
+/// write, so an already-correct album is not rewritten for nothing.
+///
+/// The per-file lookup is keyed on the *source* path, since `tracks` describes
+/// the files before the move — `report.moved` holds both ends of each pair.
+async fn write_placed_tags(
+    report: &IngestReport,
+    album: &AlbumSummary,
+    tracks: &[SourceTrack],
+) -> usize {
+    let by_source: HashMap<&str, &SourceTrack> =
+        tracks.iter().map(|t| (t.source_path.as_str(), t)).collect();
+
+    let mut jobs: Vec<(String, tune_core::metadata::MetadataUpdate)> = Vec::new();
+    for moved in &report.moved {
+        // Sidecars carry no tags.
+        if ingest::is_extra_file(Path::new(&moved.dest_path)) {
+            continue;
+        }
+        let source = by_source.get(moved.source_path.as_str());
+
+        let update = tune_core::metadata::MetadataUpdate {
+            album: album.album.clone(),
+            album_artist: album.album_artist.clone(),
+            artist: None,
+            title: source.and_then(|s| s.title.clone()),
+            genre: album.genre.clone(),
+            track_number: source.and_then(|s| s.track_number),
+            disc_number: source.and_then(|s| s.disc_number),
+            year: album.year,
+            composer: None,
+            label: None,
+        };
+
+        let nothing_to_write = update.album.is_none()
+            && update.album_artist.is_none()
+            && update.year.is_none()
+            && update.genre.is_none()
+            && update.title.is_none()
+            && update.track_number.is_none()
+            && update.disc_number.is_none();
+        if nothing_to_write {
+            continue;
+        }
+
+        jobs.push((moved.dest_path.clone(), update));
+    }
+
+    if jobs.is_empty() {
         return 0;
     }
 
-    let update = tune_core::metadata::MetadataUpdate {
-        album: album.album.clone(),
-        album_artist: album.album_artist.clone(),
-        artist: None,
-        title: None,
-        genre: album.genre.clone(),
-        track_number: None,
-        disc_number: None,
-        year: album.year,
-        composer: None,
-        label: None,
-    };
-
-    let paths: Vec<String> = report
-        .moved
-        .iter()
-        .map(|m| m.dest_path.clone())
-        .filter(|p| {
-            // Sidecars carry no tags.
-            !ingest::is_extra_file(Path::new(p))
-        })
-        .collect();
-
     tokio::task::spawn_blocking(move || {
         let mut written = 0usize;
-        for path in paths {
+        for (path, update) in jobs {
             match tune_core::metadata::write_metadata(Path::new(&path), &update) {
                 Ok(()) => written += 1,
                 Err(e) => tracing::warn!(path = %path, error = %e, "ingest_tag_write_failed"),

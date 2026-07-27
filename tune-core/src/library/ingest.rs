@@ -336,6 +336,190 @@ pub fn apply_overrides(summary: &AlbumSummary, overrides: &AlbumOverrides) -> Al
     s
 }
 
+// -- Pairing source files with a chosen release --
+
+/// A track of the release the user picked, reduced to what pairing needs.
+///
+/// Deliberately not the MusicBrainz type: the placement logic has no business
+/// knowing where the listing came from, and a plain struct keeps the matcher
+/// testable with three lines of setup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReleaseTrack {
+    pub disc: u32,
+    pub position: u32,
+    pub title: String,
+}
+
+/// Per-file correction chosen by the user, applied before planning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrackOverride {
+    pub source_path: String,
+    pub title: Option<String>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+}
+
+/// What a chosen release would change for one source file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackProposal {
+    pub source_path: String,
+    pub current_title: Option<String>,
+    pub current_track_number: Option<u32>,
+    pub current_disc_number: Option<u32>,
+    pub proposed_title: Option<String>,
+    pub proposed_track_number: Option<u32>,
+    pub proposed_disc_number: Option<u32>,
+    pub matched: bool,
+    /// How the pairing was made — `disc_and_number`, `title`, or `order`.
+    /// Shown to the user, because a positional guess deserves more suspicion
+    /// than a track-number hit.
+    pub method: Option<String>,
+}
+
+impl TrackProposal {
+    /// Would accepting this proposal actually change anything?
+    pub fn changes_anything(&self) -> bool {
+        let title_differs = match (&self.current_title, &self.proposed_title) {
+            (Some(cur), Some(new)) => cur != new,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let track_differs = self.proposed_track_number.is_some()
+            && self.proposed_track_number != self.current_track_number;
+        let disc_differs = self.proposed_disc_number.is_some()
+            && self.proposed_disc_number != self.current_disc_number;
+        title_differs || track_differs || disc_differs
+    }
+}
+
+/// Loose title comparison: case, punctuation and spacing all differ freely
+/// between a rip and MusicBrainz ("Dont Stop Me Now" vs "Don't Stop Me Now").
+fn norm_title(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Pair each source file with a track of the chosen release.
+///
+/// Three passes, each release track consumed at most once:
+///
+/// 1. disc + track number — the reliable signal when the rip is numbered
+/// 2. title — catches a rip whose numbering is wrong but whose titles are right
+/// 3. order — only when exactly as many files as tracks are left over, so an
+///    unnumbered, untitled rip still lines up; reported as `order` so the user
+///    knows it is a guess
+pub fn match_release_tracks(
+    sources: &[SourceTrack],
+    release: &[ReleaseTrack],
+) -> Vec<TrackProposal> {
+    let mut pairing: Vec<Option<usize>> = vec![None; sources.len()];
+    let mut used: Vec<bool> = vec![false; release.len()];
+    let mut method: Vec<Option<&'static str>> = vec![None; sources.len()];
+
+    // Pass 1 — disc + number.
+    for (si, source) in sources.iter().enumerate() {
+        let Some(number) = source.track_number else {
+            continue;
+        };
+        let disc = source.disc_number.unwrap_or(1);
+        let hit = release
+            .iter()
+            .enumerate()
+            .find(|(ri, r)| !used[*ri] && r.disc == disc && r.position == number)
+            .map(|(ri, _)| ri);
+        if let Some(ri) = hit {
+            pairing[si] = Some(ri);
+            method[si] = Some("disc_and_number");
+            used[ri] = true;
+        }
+    }
+
+    // Pass 2 — title.
+    for (si, source) in sources.iter().enumerate() {
+        if pairing[si].is_some() {
+            continue;
+        }
+        let Some(title) = source
+            .title
+            .as_deref()
+            .map(norm_title)
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        let hit = release
+            .iter()
+            .enumerate()
+            .find(|(ri, r)| !used[*ri] && norm_title(&r.title) == title)
+            .map(|(ri, _)| ri);
+        if let Some(ri) = hit {
+            pairing[si] = Some(ri);
+            method[si] = Some("title");
+            used[ri] = true;
+        }
+    }
+
+    // Pass 3 — order, but only if what is left lines up exactly.
+    let leftover_sources: Vec<usize> = (0..sources.len())
+        .filter(|i| pairing[*i].is_none())
+        .collect();
+    let leftover_tracks: Vec<usize> = (0..release.len()).filter(|i| !used[*i]).collect();
+    if !leftover_sources.is_empty() && leftover_sources.len() == leftover_tracks.len() {
+        for (si, ri) in leftover_sources.iter().zip(leftover_tracks.iter()) {
+            pairing[*si] = Some(*ri);
+            method[*si] = Some("order");
+        }
+    }
+
+    sources
+        .iter()
+        .enumerate()
+        .map(|(si, source)| {
+            let hit = pairing[si].map(|ri| &release[ri]);
+            TrackProposal {
+                source_path: source.source_path.clone(),
+                current_title: source.title.clone(),
+                current_track_number: source.track_number,
+                current_disc_number: source.disc_number,
+                proposed_title: hit.map(|r| r.title.clone()),
+                proposed_track_number: hit.map(|r| r.position),
+                proposed_disc_number: hit.map(|r| r.disc),
+                matched: hit.is_some(),
+                method: method[si].map(String::from),
+            }
+        })
+        .collect()
+}
+
+/// Apply the corrections the user accepted, matched on source path.
+///
+/// Only non-empty fields are written, so an override can fix a title without
+/// clearing a track number the tags already had right.
+pub fn apply_track_overrides(tracks: &mut [SourceTrack], overrides: &[TrackOverride]) {
+    for over in overrides {
+        let Some(track) = tracks
+            .iter_mut()
+            .find(|t| t.source_path == over.source_path)
+        else {
+            continue;
+        };
+        if let Some(title) = clean(over.title.as_deref()) {
+            track.title = Some(title);
+        }
+        if let Some(n) = over.track_number {
+            track.track_number = Some(n);
+        }
+        if let Some(d) = over.disc_number {
+            track.disc_number = Some(d);
+        }
+    }
+}
+
 // -- Filename safety --
 
 /// Make one path component safe on every platform we ship on.
@@ -1445,6 +1629,214 @@ mod tests {
         assert!(is_extra_file(Path::new("/a/rip.LOG")));
         assert!(!is_extra_file(Path::new("/a/track.flac")));
         assert!(!is_extra_file(Path::new("/a/noext")));
+    }
+
+    // -- Pairing with a chosen release --
+
+    fn rt(disc: u32, position: u32, title: &str) -> ReleaseTrack {
+        ReleaseTrack {
+            disc,
+            position,
+            title: title.into(),
+        }
+    }
+
+    #[test]
+    fn pairs_on_disc_and_track_number() {
+        let sources = vec![track("Wrong Title", 1), track("Also Wrong", 2)];
+        let release = vec![rt(1, 1, "Intro"), rt(1, 2, "Apocalypse Please")];
+
+        let out = match_release_tracks(&sources, &release);
+        assert!(out.iter().all(|p| p.matched));
+        assert_eq!(out[0].method.as_deref(), Some("disc_and_number"));
+        assert_eq!(out[0].proposed_title.as_deref(), Some("Intro"));
+        assert_eq!(out[1].proposed_title.as_deref(), Some("Apocalypse Please"));
+    }
+
+    #[test]
+    fn pairs_on_title_when_numbering_is_wrong() {
+        // Numbers all say 1; titles are right apart from punctuation.
+        let mut a = track("Apocalypse Please", 1);
+        a.source_path = "/dl/a.flac".into();
+        let mut b = track("Time Is Running Out", 1);
+        b.source_path = "/dl/b.flac".into();
+        let release = vec![
+            rt(1, 2, "Apocalypse Please"),
+            rt(1, 3, "Time Is Running Out!"),
+        ];
+
+        let out = match_release_tracks(&[a, b], &release);
+        // The first file takes position 1 by number; the second has no number
+        // hit left and falls to the title pass.
+        assert!(out.iter().all(|p| p.matched));
+        assert_eq!(out[1].method.as_deref(), Some("title"));
+        assert_eq!(out[1].proposed_track_number, Some(3));
+    }
+
+    #[test]
+    fn pairs_untagged_files_in_order() {
+        let mut a = SourceTrack {
+            source_path: "/dl/01.flac".into(),
+            ext: "flac".into(),
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.source_path = "/dl/02.flac".into();
+        a.title = None;
+        b.title = None;
+
+        let release = vec![rt(1, 1, "Intro"), rt(1, 2, "Apocalypse Please")];
+        let out = match_release_tracks(&[a, b], &release);
+
+        assert!(out.iter().all(|p| p.matched));
+        assert!(out.iter().all(|p| p.method.as_deref() == Some("order")));
+        assert_eq!(out[0].proposed_title.as_deref(), Some("Intro"));
+        assert_eq!(out[1].proposed_title.as_deref(), Some("Apocalypse Please"));
+    }
+
+    #[test]
+    fn refuses_to_guess_by_order_when_counts_disagree() {
+        // Two unmatched files, three spare tracks: pairing by order would be a
+        // coin toss, so nothing is proposed.
+        let a = SourceTrack {
+            source_path: "/dl/01.flac".into(),
+            ..Default::default()
+        };
+        let b = SourceTrack {
+            source_path: "/dl/02.flac".into(),
+            ..Default::default()
+        };
+        let release = vec![rt(1, 1, "One"), rt(1, 2, "Two"), rt(1, 3, "Three")];
+
+        let out = match_release_tracks(&[a, b], &release);
+        assert!(out.iter().all(|p| !p.matched));
+        assert!(out.iter().all(|p| p.proposed_title.is_none()));
+    }
+
+    #[test]
+    fn pairs_multi_disc_by_disc() {
+        let mut a = track("x", 1);
+        a.disc_number = Some(1);
+        let mut b = track("y", 1);
+        b.source_path = "/dl/d2-01.flac".into();
+        b.disc_number = Some(2);
+
+        let release = vec![rt(1, 1, "Disc one opener"), rt(2, 1, "Disc two opener")];
+        let out = match_release_tracks(&[a, b], &release);
+
+        assert_eq!(out[0].proposed_title.as_deref(), Some("Disc one opener"));
+        assert_eq!(out[0].proposed_disc_number, Some(1));
+        assert_eq!(out[1].proposed_title.as_deref(), Some("Disc two opener"));
+        assert_eq!(out[1].proposed_disc_number, Some(2));
+    }
+
+    #[test]
+    fn never_uses_one_release_track_twice() {
+        // Two files both claiming track 1.
+        let a = track("One", 1);
+        let mut b = track("One", 1);
+        b.source_path = "/dl/dup.flac".into();
+        let release = vec![rt(1, 1, "Intro")];
+
+        let out = match_release_tracks(&[a, b], &release);
+        assert_eq!(out.iter().filter(|p| p.matched).count(), 1);
+    }
+
+    #[test]
+    fn extra_local_files_stay_unmatched() {
+        // A 15-track rip against the 14-track standard edition.
+        let sources: Vec<SourceTrack> = (1..=15).map(|n| track(&format!("T{n}"), n)).collect();
+        let release: Vec<ReleaseTrack> = (1..=14).map(|n| rt(1, n, &format!("MB {n}"))).collect();
+
+        let out = match_release_tracks(&sources, &release);
+        assert_eq!(out.iter().filter(|p| p.matched).count(), 14);
+        assert!(!out[14].matched, "the bonus track has nothing to pair with");
+    }
+
+    #[test]
+    fn empty_release_proposes_nothing() {
+        let out = match_release_tracks(&[track("One", 1)], &[]);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].matched);
+    }
+
+    #[test]
+    fn proposal_detects_whether_anything_changes() {
+        let sources = vec![track("Intro", 1)];
+        let release = vec![rt(1, 1, "Intro")];
+        let out = match_release_tracks(&sources, &release);
+        assert!(
+            !out[0].changes_anything(),
+            "same title and number — nothing to apply"
+        );
+
+        let release2 = vec![rt(1, 1, "Intro (remastered)")];
+        let out2 = match_release_tracks(&sources, &release2);
+        assert!(out2[0].changes_anything());
+    }
+
+    #[test]
+    fn overrides_are_applied_by_source_path() {
+        let mut tracks = vec![track("Old", 1), track("Keep", 2)];
+        let overrides = vec![TrackOverride {
+            source_path: tracks[0].source_path.clone(),
+            title: Some("New".into()),
+            track_number: Some(7),
+            disc_number: None,
+        }];
+
+        apply_track_overrides(&mut tracks, &overrides);
+        assert_eq!(tracks[0].title.as_deref(), Some("New"));
+        assert_eq!(tracks[0].track_number, Some(7));
+        // Untouched fields and other files stay as they were.
+        assert_eq!(tracks[0].disc_number, Some(1));
+        assert_eq!(tracks[1].title.as_deref(), Some("Keep"));
+    }
+
+    #[test]
+    fn overrides_ignore_blank_values_and_unknown_paths() {
+        let mut tracks = vec![track("Keep", 1)];
+        let overrides = vec![
+            TrackOverride {
+                source_path: tracks[0].source_path.clone(),
+                title: Some("   ".into()),
+                ..Default::default()
+            },
+            TrackOverride {
+                source_path: "/nowhere.flac".into(),
+                title: Some("Ghost".into()),
+                ..Default::default()
+            },
+        ];
+
+        apply_track_overrides(&mut tracks, &overrides);
+        assert_eq!(tracks[0].title.as_deref(), Some("Keep"));
+    }
+
+    #[test]
+    fn overridden_titles_reach_the_destination_path() {
+        let mut tracks = vec![track("Untitled", 1)];
+        let overrides = [TrackOverride {
+            source_path: tracks[0].source_path.clone(),
+            title: Some("Apocalypse Please".into()),
+            track_number: Some(2),
+            disc_number: None,
+        }];
+        apply_track_overrides(&mut tracks, &overrides);
+
+        let album = summarize(&tracks);
+        let plan = build_plan(
+            "/dl",
+            &tracks,
+            &[],
+            &album,
+            &PlanOptions::new("/music", DEFAULT_TEMPLATE, FileMode::Move),
+            &never_exists,
+        );
+        assert_eq!(
+            plan.entries[0].relative_path,
+            "Muse/2003 - Absolution/02 - Apocalypse Please.flac"
+        );
     }
 
     // -- Execution tests (real filesystem, inside a temp dir) --

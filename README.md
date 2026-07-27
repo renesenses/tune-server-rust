@@ -99,6 +99,7 @@ GET  /api/v1/library/artists?limit=50
 GET  /api/v1/library/search?q=miles&limit=20
 
 POST /api/v1/library/ingest/analyze     # read a folder's tags, guess the album
+POST /api/v1/library/ingest/release-tracks  # a chosen edition's listing + pairing
 POST /api/v1/library/ingest/plan        # preview destination paths + conflicts
 POST /api/v1/library/ingest/apply       # move/copy into the library, then scan
 POST /api/v1/library/ingest/jobs/{id}/undo
