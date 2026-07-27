@@ -821,6 +821,17 @@ pub(super) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // Populate cloud sync changelog with all new/updated entities
         tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
 
+        // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
+        // playlists (Bertrand). Runs after import so every track is in the DB to
+        // match against; idempotent by playlist name so a re-scan never dupes.
+        let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
+        if pl.playlists_created > 0 {
+            event_bus.emit(
+                "library.playlists.imported",
+                json!({ "playlists": pl.playlists_created, "tracks": pl.tracks_added }),
+            );
+        }
+
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");
