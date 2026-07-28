@@ -370,14 +370,37 @@ pub(crate) mod decisions {
         queue_duration_ms: u64,
         position_ms: u64,
     ) -> bool {
-        let effective_duration_ms = if reported_duration_ms > 0 {
-            reported_duration_ms
-        } else {
-            queue_duration_ms
-        };
+        let effective_duration_ms = sane_current_duration(reported_duration_ms, queue_duration_ms);
         !gapless_sent
             && effective_duration_ms > GAPLESS_WINDOW_MS
             && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
+    }
+
+    /// The renderer-reported duration for the CURRENT track, sanitised against
+    /// the queue-known (DB) duration.
+    ///
+    /// The renderer's own reported duration is normally authoritative and is
+    /// trusted verbatim — a well-behaved renderer that reports a slightly (or
+    /// even a few times) different value than the scanned duration is kept as-is
+    /// on purpose. But some renderers report an *egregiously* wrong duration for
+    /// the playing track — the HiFi Rose RS130 reports e.g. 17000 ms for a track
+    /// that is really 174693 ms. Fed into the gapless-arming window that either
+    /// armed SetNextAVTransportURI near t=0 (far too small) or never at all (far
+    /// past the real end), cutting the album. Only when the reported value is
+    /// off by more than 4x (or under a quarter) of a known DB duration — a gap
+    /// no legitimate renderer/encoding difference produces — do we distrust it
+    /// and use the DB duration. A `0` reported (LMS UPnP bridge) falls back to
+    /// the DB as before; an unknown DB (0) means we can't judge, so keep the
+    /// reported value.
+    pub fn sane_current_duration(reported_ms: u64, db_ms: u64) -> u64 {
+        let reported_is_egregious = db_ms > 0
+            && reported_ms > 0
+            && (reported_ms > db_ms.saturating_mul(4) || reported_ms < db_ms / 4);
+        if reported_ms == 0 || reported_is_egregious {
+            db_ms
+        } else {
+            reported_ms
+        }
     }
 
     /// Position-based end-of-track: the output still reports Playing but the
@@ -4357,6 +4380,32 @@ mod tests {
         assert!(!decisions::should_arm_gapless(false, 0, 0, 275_000));
         // Queue duration known but position not yet in the final window.
         assert!(!decisions::should_arm_gapless(false, 0, 300_000, 100_000));
+    }
+
+    #[test]
+    fn should_arm_gapless_ignores_egregious_renderer_duration() {
+        use decisions::{sane_current_duration, should_arm_gapless};
+        // The HiFi Rose RS130 reports a duration far off the real track. Only
+        // an egregious (>4x / <1/4) mismatch with a known DB duration is
+        // distrusted — a merely-imprecise renderer duration is still trusted.
+        //
+        // (a) egregiously LARGE (800000 for a real 174693 ms track): without the
+        // guard the arm window sits past the real end so gapless never arms and
+        // the album cuts; with the guard the DB duration wins and it arms in time.
+        assert!(should_arm_gapless(false, 800_000, 174_693, 160_000));
+        // (b) egregiously SMALL (40000 for a real 174693 ms track): without the
+        // guard it would arm at ~t=10s; with the guard it waits for the real end.
+        assert!(!should_arm_gapless(false, 40_000, 174_693, 50_000));
+        // A merely-different (3.3x) reported value is STILL trusted — this is the
+        // deliberate "well-behaved renderer" design, unchanged.
+        assert!(should_arm_gapless(false, 300_000, 999_000, 275_000));
+        // Helper directly: egregious → DB; imprecise → reported; 0 → DB;
+        // unknown DB → keep reported (can't judge).
+        assert_eq!(sane_current_duration(800_000, 174_693), 174_693);
+        assert_eq!(sane_current_duration(40_000, 174_693), 174_693);
+        assert_eq!(sane_current_duration(300_000, 999_000), 300_000);
+        assert_eq!(sane_current_duration(0, 174_693), 174_693);
+        assert_eq!(sane_current_duration(800_000, 0), 800_000);
     }
 
     #[test]
