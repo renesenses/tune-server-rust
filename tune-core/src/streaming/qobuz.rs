@@ -25,6 +25,8 @@ pub struct QobuzService {
     stored_username: Option<String>,
     stored_password: Option<String>,
     enabled_override: Option<bool>,
+    /// Last auto-relogin attempt, successful or not — see `auto_relogin`.
+    last_relogin_attempt: Option<std::time::Instant>,
 }
 
 /// (primary, fallback) API bases for the given endpoint order.
@@ -104,6 +106,7 @@ impl QobuzService {
             stored_username: None,
             stored_password: None,
             enabled_override: None,
+            last_relogin_attempt: None,
         }
     }
 
@@ -445,6 +448,20 @@ impl QobuzService {
     }
 
     async fn auto_relogin(&mut self) -> bool {
+        // Cooldown : pendant une coupure (proxy mozaiklabs down + direct
+        // bloqué), chaque appel en échec relançait un login complet — une
+        // tempête de relogins toutes les ~2 s qui ressemble à du trafic de
+        // bot et fait rate-limiter l'IP par Akamai (403 en cascade, .18 le
+        // 28/07). Une tentative par minute suffit largement à récupérer dès
+        // que le réseau revient.
+        const RELOGIN_COOLDOWN: Duration = Duration::from_secs(60);
+        if let Some(t) = self.last_relogin_attempt
+            && t.elapsed() < RELOGIN_COOLDOWN
+        {
+            debug!("qobuz_auto_relogin_cooldown");
+            return false;
+        }
+        self.last_relogin_attempt = Some(std::time::Instant::now());
         if let (Some(u), Some(p)) = (self.stored_username.clone(), self.stored_password.clone()) {
             info!("qobuz_auto_relogin");
             self.login_internal(&u, &p).await.is_ok()
