@@ -116,6 +116,8 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         // Default on (unchanged behaviour); scan.rs treats unset as enabled.
         // The web toggle writes "false" to opt out (JF Paquet).
         ("enrich_on_scan", json!(true)),
+        // Folder → playlist discovery at scan time — opt-in (Frédéric).
+        ("scan_folder_playlists", json!(false)),
         ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),

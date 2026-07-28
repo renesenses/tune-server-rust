@@ -601,6 +601,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             );
         }
 
+        // Mirror hand-made compilation folders (tracks spanning several albums)
+        // into local playlists — opt-in via scan_folder_playlists (Frédéric).
+        if tune_core::library::folder_playlists::folder_playlists_enabled(&db) {
+            tune_core::library::folder_playlists::sync_folder_playlists(&db);
+        }
+
         let report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
