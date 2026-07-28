@@ -17,7 +17,14 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
 const MISS_GRACE_CYCLES: u32 = 3;
-const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Backoff (seconds) between SSDP probes at startup while NO device has been
+/// found yet. On a fresh boot the network interface and DLNA/USB renderers are
+/// often not ready for the first few seconds; probing quickly with this backoff
+/// (instead of a flat 30s wait) makes a renderer that appears a few seconds
+/// after boot surface within seconds — not after a minute (Pascal: "zone
+/// detection takes minutes"). Once any device is ever found we revert to the
+/// steady cadence (IDLE when present, SCAN_INTERVAL when empty).
+const STARTUP_FAST_RETRIES: &[u64] = &[2, 3, 5, 8, 13, 21];
 
 pub const MEDIA_RENDERER_URN: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
 pub const MEDIA_RENDERER_URN_V2: &str = "urn:schemas-upnp-org:device:MediaRenderer:2";
@@ -157,39 +164,37 @@ async fn scan_loop(
     targets: Vec<String>,
     event_tx: mpsc::Sender<SsdpEvent>,
 ) {
+    // Index into STARTUP_FAST_RETRIES while no device has EVER been found. Once
+    // `ever_found` flips true we drop back to the steady cadence, so the fast
+    // probing only ever applies to the cold-boot detection window.
+    let mut fast_retry = 0usize;
+    let mut ever_found = false;
     loop {
         let responses = search_all(&targets).await;
         process_responses(&state, &event_tx, responses).await;
 
-        {
+        let has_devices = {
             let mut st = state.lock().await;
-            if !st.initial_scan_done {
-                st.initial_scan_done = true;
-                if st.devices.is_empty() {
-                    drop(st);
-                    info!("ssdp_startup_retry: no devices found, retrying in 30s");
-                    tokio::time::sleep(STARTUP_RETRY_DELAY).await;
-                    let responses = search_all(&targets).await;
-                    process_responses(&state, &event_tx, responses).await;
-                } else {
-                    drop(st);
-                }
-            } else {
-                if st.last_periodic_rescan.elapsed() >= PERIODIC_RESCAN_INTERVAL {
-                    info!(devices = st.devices.len(), "ssdp_periodic_rescan");
-                    st.last_periodic_rescan = Instant::now();
-                }
-                drop(st);
+            st.initial_scan_done = true;
+            if st.last_periodic_rescan.elapsed() >= PERIODIC_RESCAN_INTERVAL {
+                info!(devices = st.devices.len(), "ssdp_periodic_rescan");
+                st.last_periodic_rescan = Instant::now();
             }
+            !st.devices.is_empty()
+        };
+        if has_devices {
+            ever_found = true;
         }
 
-        let interval = {
-            let st = state.lock().await;
-            if st.initial_scan_done && !st.devices.is_empty() {
-                IDLE_SCAN_INTERVAL
-            } else {
-                SCAN_INTERVAL
-            }
+        let interval = if has_devices {
+            IDLE_SCAN_INTERVAL
+        } else if !ever_found && fast_retry < STARTUP_FAST_RETRIES.len() {
+            let d = STARTUP_FAST_RETRIES[fast_retry];
+            fast_retry += 1;
+            info!(next_s = d, "ssdp_startup_fast_retry: no devices yet");
+            Duration::from_secs(d)
+        } else {
+            SCAN_INTERVAL
         };
         tokio::time::sleep(interval).await;
     }
