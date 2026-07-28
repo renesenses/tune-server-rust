@@ -477,6 +477,45 @@ pub(crate) mod decisions {
                 >= queue_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// Wall-clock end-of-track fallback for a **Chromecast** output.
+    ///
+    /// Cast tears down its media session the instant a track's byte stream ends
+    /// and broadcasts the `idle_reason = FINISHED` transition only ONCE. The
+    /// poller queries with a fresh-connect `GET_STATUS` every ~1 s and never
+    /// listens for that broadcast, so it routinely misses the FINISHED window
+    /// and then reads an EMPTY `entries` array — state=Stopped, position=0,
+    /// `ended_naturally = false` — which the Stopped arm cannot distinguish from
+    /// a mid-track blip. And if the receiver instead keeps claiming
+    /// Playing/Buffering with its position frozen a little short of the known
+    /// duration, the position paths (`reached_end_exclusive` needs position
+    /// within 250 ms of duration, `past_end_reached` needs it *beyond*) never
+    /// fire either. The album then stalls after track 1 on Chromecast while a
+    /// DLNA renderer — which has BOTH this fallback and `poll_failed_past_end` —
+    /// advances fine (Rhorn, Chromecast Audio, forum #1226; #648/#649 cured the
+    /// 30-60 s stall but left this never-advances gap).
+    ///
+    /// Unlike the DLNA LMS-bridge fallback this KEEPS the `played_enough` (peak
+    /// ≥ 80 %) guard: a Chromecast reports an honest advancing position while it
+    /// plays, so the peak is trustworthy and gating on it means a genuine
+    /// mid-track buffering stall (position frozen well before 80 %) can NOT
+    /// false-advance. Fires only once Tune's own wall clock has passed the
+    /// queue-known duration + margin, and the caller still requires
+    /// `POSITION_PAST_END_TICKS` consecutive hits. A well-behaved Chromecast
+    /// reaches the end via `reached_end_exclusive` a beat earlier, so this only
+    /// takes over when the device's own end-of-track signal never lands.
+    pub fn chromecast_wall_clock_past_end(
+        output_type: &str,
+        played_enough: bool,
+        track_duration_ms: u64,
+        wall_elapsed_secs: u64,
+    ) -> bool {
+        output_type == "chromecast"
+            && played_enough
+            && track_duration_ms > END_MARGIN_MS
+            && wall_elapsed_secs.saturating_mul(1000)
+                >= track_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+
     /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
     /// outright — the LMS UPnP bridge's `GetPositionInfo` SOAP call errors, so
     /// `get_status` returns `Err` and Tune gets NO transport state, position, or
@@ -2644,11 +2683,12 @@ impl PositionPoller {
                     // (pre-mutation). gapless_enabled is filled in the arm branch
                     // when it is actually read; default true matches the arm.
                     let fsm_has_next = Self::next_position(zone_state).is_some();
-                    let is_dlna = all_zones
+                    let output_type_str = all_zones
                         .iter()
                         .find(|z| z.id == Some(zone_id))
                         .and_then(|z| z.output_type.as_deref())
-                        == Some("dlna");
+                        .unwrap_or("");
+                    let is_dlna = output_type_str == "dlna";
                     let mut fsm_pin = fsm::PlayingInput {
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
@@ -2855,7 +2895,26 @@ impl PositionPoller {
                             track_duration_ms,
                             wall_elapsed,
                         );
-                    if past_end || reached_end_exclusive || wall_clock_past_end {
+                    // Chromecast has no reliable end-of-track signal on a 1 Hz
+                    // fresh-connect poll (FINISHED is a one-shot broadcast; a
+                    // frozen near-end position dodges the position paths), and —
+                    // unlike DLNA — no wall-clock fallback, so an album stalls
+                    // after track 1 (Rhorn, forum #1226). Advance on Tune's own
+                    // clock once the track's full duration has elapsed, still
+                    // gated by played_enough (peak ≥ 80 %, honest on Cast) so a
+                    // genuine mid-track buffering stall can't false-advance.
+                    let chromecast_wall_clock_past_end = !in_seek_grace
+                        && decisions::chromecast_wall_clock_past_end(
+                            output_type_str,
+                            played_enough,
+                            track_duration_ms,
+                            wall_elapsed,
+                        );
+                    if past_end
+                        || reached_end_exclusive
+                        || wall_clock_past_end
+                        || chromecast_wall_clock_past_end
+                    {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
                             info!(
@@ -2866,6 +2925,7 @@ impl PositionPoller {
                                 past_end_ticks = ps.past_end_ticks,
                                 exclusive_end = reached_end_exclusive,
                                 wall_clock_end = wall_clock_past_end,
+                                cast_wall_clock_end = chromecast_wall_clock_past_end,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
@@ -4114,6 +4174,45 @@ mod tests {
         assert!(!decisions::wall_clock_past_end(false, 0, 300_000, 304));
         // Queue duration unknown → no advance.
         assert!(!decisions::wall_clock_past_end(true, 0, 0, 304));
+    }
+
+    #[test]
+    fn chromecast_wall_clock_past_end_advances_after_full_duration() {
+        // Chromecast, played enough (peak ≥80%), wall clock passed dur+margin:
+        // Cast never surfaced a usable end-of-track signal → advance on our clock
+        // (Rhorn, forum #1226: album stalls after track 1 on Chromecast Audio).
+        assert!(decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            true,
+            300_000,
+            304
+        ));
+        // Not enough wall time elapsed yet → keep playing.
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            true,
+            300_000,
+            120
+        ));
+        // Peak below 80% (a genuine mid-track buffering stall) → must NOT advance
+        // even though the wall clock passed the duration.
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            false,
+            300_000,
+            304
+        ));
+        // Non-chromecast output → fallback disabled (DLNA/local keep their paths).
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "dlna", true, 300_000, 304
+        ));
+        // Unknown track duration → no advance (nothing to compare the clock to).
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            true,
+            0,
+            304
+        ));
     }
 
     #[test]
