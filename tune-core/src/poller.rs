@@ -104,6 +104,12 @@ const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
+/// After a stall-recovery restart (OAAT stall supervisor replays the current
+/// track from 0), suppress a gapless position-reset auto-advance for this many
+/// seconds. A genuine end-of-track transition cannot occur this soon after a
+/// from-zero replay, so the window only ever swallows the phantom advance; the
+/// natural-end fallback still advances tracks shorter than the window.
+const RESTART_ADVANCE_SUPPRESS_SECS: u64 = 20;
 /// Minimum fraction of track duration that must have been played before a
 /// gapless transition is accepted.  Prevents false transitions when a
 /// renderer (e.g. DMP-A8) reports state changes immediately after
@@ -2270,7 +2276,26 @@ impl PositionPoller {
                     ps.track_started_at = Some(Instant::now());
                     ps.gapless_advance_pending = false;
                     ps.gapless_stuck_ticks = 0;
-                    if let Some(next_pos) = Self::next_position(zone_state) {
+                    // A stall-recovery restart (OAAT stall supervisor) replays
+                    // the CURRENT track from 0. That from-zero position drop
+                    // trips `position_reset` exactly like a real gapless
+                    // transition — but the renderer is still on the SAME track,
+                    // so advancing would run now-playing one track ahead of the
+                    // audio ("ça avance mais joue le morceau précédent", Xavier,
+                    // OAAT Tune Endpoint). Suppress the advance for a brief
+                    // window after a restart; the state resets above still run,
+                    // so the next genuine transition re-arms and advances
+                    // normally.
+                    let recently_restarted = zone_state
+                        .last_restart_at
+                        .map(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(RESTART_ADVANCE_SUPPRESS_SECS)
+                        })
+                        .unwrap_or(false);
+                    if recently_restarted {
+                        info!(zone_id, "gapless_advance_suppressed_after_restart");
+                    } else if let Some(next_pos) = Self::next_position(zone_state) {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         if let Err(e) = self
                             .orchestrator

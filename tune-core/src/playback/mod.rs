@@ -120,6 +120,14 @@ pub struct ZoneState {
     /// the slider from bouncing back on slow DLNA renderers.
     #[serde(skip)]
     pub last_volume_set_at: Option<Instant>,
+    /// Timestamp of the last stall-recovery restart of this zone, stamped by
+    /// the OAAT stall supervisor. The supervisor replays the CURRENT track
+    /// from 0; the poller reads this to suppress a gapless position-reset
+    /// auto-advance for a brief window afterwards, so that from-zero replay is
+    /// not misread as a real track transition (which would run now-playing one
+    /// track ahead of the audio — Xavier, OAAT Tune Endpoint).
+    #[serde(skip)]
+    pub last_restart_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +157,7 @@ impl Default for ZoneState {
             play_seq: 0,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_restart_at: None,
         }
     }
 }
@@ -359,6 +368,18 @@ impl PlaybackManager {
             zone_id,
             data: serde_json::json!({}),
         });
+    }
+
+    /// Stamp a stall-recovery restart for this zone. Called by the OAAT stall
+    /// supervisor right after it replays the current track, so the poller can
+    /// suppress a phantom gapless auto-advance triggered by the from-zero
+    /// position drop (which would otherwise put now-playing one track ahead of
+    /// the audio).
+    pub async fn mark_restart(&self, zone_id: i64) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.last_restart_at = Some(Instant::now());
+        }
     }
 
     pub async fn seek(&self, zone_id: i64, position_ms: i64) {
@@ -578,6 +599,7 @@ mod tests {
             play_seq: 0,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_restart_at: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…

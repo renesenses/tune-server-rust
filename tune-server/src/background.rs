@@ -181,6 +181,12 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                     };
                     match orchestrator.play(req).await {
                         Ok(_) => {
+                            // Mark the restart so the poller suppresses a phantom
+                            // gapless auto-advance: this replay restarts the
+                            // CURRENT track from 0, and that position drop would
+                            // otherwise be read as a real transition, running
+                            // now-playing one track ahead of the audio.
+                            playback.mark_restart(zone_id).await;
                             // Restore the queue length from the DB so the poller
                             // keeps auto-advancing after the restart (mirrors the
                             // /zones/{id}/play handler; without it a mid-album stall
