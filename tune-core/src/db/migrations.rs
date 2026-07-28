@@ -1356,6 +1356,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "integer_id_columns",
         include_str!("../../migrations/postgres/012_integer_id_columns.sql"),
     ),
+    (
+        13,
+        "numeric_column_types_remaining",
+        include_str!("../../migrations/postgres/013_numeric_column_types_remaining.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -1622,5 +1627,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(jazz, 1, "re-seed must not duplicate an existing collection");
+    }
+
+    // The PG numeric-type heal chain (#1220): the migration list must stay
+    // contiguous and 1-based so run_pg_migrations applies every step, and the
+    // numeric-column-type heal migrations (010/011/013) must all be present — a
+    // gap or a missing heal would leave a data-migrated DB with TEXT numeric
+    // columns and re-break force-scan album resolution (`operator does not
+    // exist: text = bigint`). (012 heals integer id columns, a sibling fix.)
+    // Runs without a live PG.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_migrations_are_contiguous_and_include_numeric_heals() {
+        for (idx, &(version, _, _)) in PG_MIGRATIONS.iter().enumerate() {
+            assert_eq!(
+                version as usize,
+                idx + 1,
+                "PG_MIGRATIONS must be contiguous and 1-based"
+            );
+        }
+        assert_eq!(pg_latest_version(), 13, "latest PG migration must be 13");
+        for wanted in [10, 11, 13] {
+            assert!(
+                PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
+                "numeric-type heal migration {wanted} must be registered"
+            );
+        }
     }
 }

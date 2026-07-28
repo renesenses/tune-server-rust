@@ -164,8 +164,18 @@ const MIGRATION_TABLES: &[&str] = &[
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
-/// Uses simple types (TEXT/BIGINT/INTEGER/DOUBLE PRECISION) for maximum
-/// compatibility with the SQLite data being copied.
+///
+/// Numeric columns (year, track_number, duration_ms, sample_rate, …) are
+/// declared TEXT here ON PURPOSE: `insert_batch`/`bind_migration_value` bind
+/// every copied SQLite value as a TEXT parameter (SQLite is dynamically typed,
+/// so this is the only universally-safe binding), and PG has no implicit
+/// text→integer cast for an INSERT — a numeric column type here would make the
+/// data copy fail. The intended numeric types are restored AFTER the copy by
+/// the idempotent heal migrations run_pg_migrations() applies at PG startup
+/// (010 albums/tracks, 011 listen_history, 012 the rest). The forced restart
+/// into PostgreSQL after a migrate (routes/system/database.rs) guarantees that
+/// convergence runs before the first real query. Do NOT switch these columns to
+/// numeric types without also making the copy bind them natively.
 ///
 /// Every CREATE TABLE uses IF NOT EXISTS and every INSERT for seed data
 /// uses ON CONFLICT DO NOTHING, making this fully idempotent.

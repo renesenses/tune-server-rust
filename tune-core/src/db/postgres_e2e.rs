@@ -263,3 +263,62 @@ async fn pg_settings_round_trip() {
     repo.delete("music_dirs").unwrap();
     assert!(repo.get("music_dirs").unwrap().is_none());
 }
+
+/// Regression for forum #1220 (tester Jean-François, PostgreSQL backend): a
+/// SQLite→PG data-migrated database had its numeric columns created as TEXT,
+/// so the force-scan album lookup `... WHERE year = $int` threw
+/// `operator does not exist: text = bigint` and EVERY album write failed
+/// (22841 failures, +0 added). The heal chain (010 albums/tracks, 011
+/// listen_history, 013 the rest) converts those columns back to their numeric
+/// types at startup. This test asserts the post-migration schema is numeric and
+/// that the exact failing query pattern now runs cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_1220_numeric_columns_have_numeric_types() {
+    let db = pg_or_skip!();
+
+    // (table, column, acceptable PG data_type). Columns from later migrations
+    // may be absent on a partial schema — such rows are skipped, not failed.
+    let expected: &[(&str, &str, &[&str])] = &[
+        // 010 (albums/tracks)
+        ("albums", "year", &["integer"]),
+        ("albums", "disc_count", &["integer"]),
+        ("albums", "sample_rate", &["integer"]),
+        ("tracks", "duration_ms", &["bigint"]),
+        ("tracks", "track_number", &["integer"]),
+        ("tracks", "bpm", &["double precision"]),
+        // 011 (listen_history)
+        ("listen_history", "duration_ms", &["bigint"]),
+        // 013 (the rest)
+        ("zones", "volume", &["integer"]),
+        ("zones", "last_position_ms", &["bigint"]),
+        ("queue_items", "position", &["integer"]),
+        ("track_source_links", "confidence", &["double precision"]),
+        ("bookmarks", "position_ms", &["bigint"]),
+    ];
+
+    for (table, col, ok_types) in expected {
+        let t = table.to_string();
+        let cc = col.to_string();
+        let row = db
+            .query_one(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_name = $1 AND column_name = $2",
+                &[&t, &cc],
+            )
+            .unwrap();
+        let Some(cols) = row else {
+            continue; // table/column not present in this schema — skip
+        };
+        let dt = cols[0].as_str().unwrap_or("").to_string();
+        assert!(
+            ok_types.contains(&dt.as_str()),
+            "{table}.{col} is `{dt}`, expected one of {ok_types:?} — heal migration missing/incomplete"
+        );
+    }
+
+    // The exact #1220 failing pattern: `year` bound as an integer parameter.
+    // On a TEXT column this raised `operator does not exist: text = bigint`;
+    // after the heal it must execute without error.
+    db.query_many("SELECT id FROM albums WHERE year = $1 LIMIT 1", &[&2020i32])
+        .expect("WHERE year = $int must not raise `text = bigint` after the heal");
+}
