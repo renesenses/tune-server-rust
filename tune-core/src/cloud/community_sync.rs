@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -239,6 +240,120 @@ pub async fn resolve_missing_mbids(
     Ok(applied)
 }
 
+/// Pull the community "extra metadata" (Vademecum k/v — composer, lyricist,
+/// conductor, performer, …) for local tracks that already have an MBID, and
+/// store it in `track_metadata`. Only fills keys the track doesn't already have
+/// (never overwrites the user's own file tags). The `/extra` endpoint is served
+/// from Tune's own cloud, so there is no MusicBrainz rate limit to respect here.
+///
+/// Each processed track is marked with a `mb_extra_synced` sentinel so the run
+/// advances through the whole library instead of re-querying the same window.
+pub async fn pull_community_extra(
+    backend: &Arc<dyn DbBackend>,
+    http_client: &reqwest::Client,
+) -> Result<usize, String> {
+    // Tracks with an MBID that haven't been extra-synced yet.
+    let rows = backend
+        .query_many(
+            "SELECT t.id, t.musicbrainz_recording_id \
+             FROM tracks t \
+             WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'mb_extra_synced' \
+               ) \
+             LIMIT 100",
+            &[],
+        )
+        .map_err(|e| format!("query: {e}"))?;
+
+    if rows.is_empty() {
+        debug!("community_extra_no_candidates");
+        return Ok(0);
+    }
+
+    let candidates: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let mbid = r.get(1).and_then(|v| v.as_string())?;
+            Some((id, mbid))
+        })
+        .collect();
+
+    // De-duplicate MBIDs for the request.
+    let mut mbids: Vec<String> = candidates.iter().map(|(_, m)| m.clone()).collect();
+    mbids.sort();
+    mbids.dedup();
+    let csv = mbids.join(",");
+
+    let resp = http_client
+        .get(format!("{COMMUNITY_API}/extra"))
+        .query(&[("mbids", csv.as_str())])
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("community extra: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("community extra: HTTP {}", resp.status()));
+    }
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+
+    // Build mbid -> key -> [values]. `extra` is a JSON object when there are
+    // results, or an empty array `[]` when the pool has nothing for these MBIDs.
+    let mut by_mbid: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    if let Some(obj) = data["extra"].as_object() {
+        for (mbid, pairs) in obj {
+            if let Some(arr) = pairs.as_array() {
+                let map = by_mbid.entry(mbid.clone()).or_default();
+                for p in arr {
+                    let key = match p["key"].as_str() {
+                        Some(k) if !k.is_empty() => k.to_string(),
+                        _ => continue,
+                    };
+                    let value = match p["value"].as_str() {
+                        Some(v) if !v.is_empty() => v.to_string(),
+                        _ => continue,
+                    };
+                    map.entry(key).or_default().push(value);
+                }
+            }
+        }
+    }
+
+    let repo = crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone());
+    let mut enriched = 0usize;
+    for (track_id, mbid) in &candidates {
+        if let Some(keys) = by_mbid.get(mbid) {
+            // Don't overwrite the user's own tags: only set keys not present locally.
+            let existing = repo.get_all(*track_id).unwrap_or_default();
+            let mut wrote_any = false;
+            for (key, values) in keys {
+                if existing.contains_key(key) {
+                    continue;
+                }
+                let joined = values.join("; ");
+                if repo.set(*track_id, key, &joined).is_ok() {
+                    wrote_any = true;
+                }
+            }
+            if wrote_any {
+                enriched += 1;
+            }
+        }
+        // Mark as processed regardless, so the sweep advances across the library.
+        let _ = repo.set(*track_id, "mb_extra_synced", "1");
+    }
+
+    info!(
+        candidates = candidates.len(),
+        enriched, "community_extra_pulled"
+    );
+    Ok(enriched)
+}
+
 /// Spawn the periodic community sync task. Runs every 30 minutes,
 /// gated behind the `community_sync_enabled` setting.
 pub fn spawn(backend: Arc<dyn DbBackend>) {
@@ -289,6 +404,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     }
                 } else {
                     debug!("community_sync_skipped_no_instance_id");
+                }
+
+                // Pull Vademecum extra metadata (served from Tune's own cloud,
+                // no instance_id needed and no MusicBrainz rate limit involved).
+                if let Err(e) = pull_community_extra(&backend, &client).await {
+                    warn!(error = %e, "community_sync_extra_failed");
                 }
             }
 
