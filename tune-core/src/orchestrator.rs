@@ -4515,6 +4515,21 @@ impl PlaybackOrchestrator {
         channels: u16,
     ) -> Option<crate::audio::eq::EqProcessor> {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        // Audiophile ("PURE") mode: bypass ALL per-zone signal processing for a
+        // bit-perfect path — the equalizer and its room-correction gains. When
+        // the zone is in PURE mode we never build an EqProcessor, so the PCM is
+        // sent to the output untouched (Bertrand: "PURE doit désactiver toutes
+        // les modifs").
+        let audiophile = settings
+            .get(&format!("zone_{zone_id}_audiophile"))
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+            .unwrap_or(false);
+        if audiophile {
+            return None;
+        }
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
             .get(&key)
