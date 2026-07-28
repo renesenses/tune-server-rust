@@ -19,6 +19,72 @@ fn rows_to_json(rows: &[Vec<SqlValue>]) -> Vec<Value> {
         .collect()
 }
 
+/// Library tracks for a list of artist names (case-insensitive match), up to
+/// `per_artist` tracks each and `count` total, in the given name order so the
+/// most-similar artists come first. Same JSON shape as `generate_queue`.
+pub fn tracks_for_artist_names(
+    db: &std::sync::Arc<dyn DbBackend>,
+    names: &[String],
+    per_artist: usize,
+    count: usize,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for name in names {
+        if out.len() >= count {
+            break;
+        }
+        let lname = name.to_lowercase();
+        let limit = per_artist.min(count - out.len()) as i64;
+        let rows = db
+            .query_many(
+                "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
+                 FROM tracks t \
+                 JOIN artists ar ON t.artist_id = ar.id \
+                 LEFT JOIN albums al ON t.album_id = al.id \
+                 WHERE LOWER(ar.name) = ?1 \
+                 ORDER BY RANDOM() LIMIT ?2",
+                &[&lname, &limit],
+            )
+            .map(|r| rows_to_json(&r))
+            .unwrap_or_default();
+        out.extend(rows);
+    }
+    out.truncate(count);
+    out
+}
+
+/// « Radio artistes similaires » at queue end: the seed is an artist NAME (so
+/// a streaming now-playing works too, no local track id needed). Similar
+/// names come from the mozaiklabs enrichment API and are matched against the
+/// local library. Returns empty when offline or nothing matches — callers
+/// fall back to the genre/BPM `generate_queue` (cloud graceful degradation:
+/// Tune must work fully without mozaiklabs.fr).
+pub async fn generate_similar_artists_queue(
+    db: &std::sync::Arc<dyn DbBackend>,
+    seed_artist: &str,
+    count: usize,
+) -> Vec<Value> {
+    let api_base = crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("artist_enrichment_api")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
+    let mut client =
+        crate::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 5);
+    let mut names: Vec<String> = client
+        .get_similar(seed_artist)
+        .await
+        .iter()
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+        .filter(|n| !n.eq_ignore_ascii_case(seed_artist))
+        .collect();
+    names.truncate(20);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    tracks_for_artist_names(db, &names, 2, count)
+}
+
 pub fn generate_queue(
     db: &std::sync::Arc<dyn DbBackend>,
     seed_track_id: i64,
@@ -153,6 +219,40 @@ mod tests {
         let result = generate_queue(&db, 1, 5);
         assert_eq!(result.len(), 5);
         assert!(result.iter().all(|t| t["track_id"].as_i64().unwrap() != 1));
+    }
+
+    #[test]
+    fn tracks_for_artist_names_matches_case_insensitive_in_order() {
+        let db = test_db();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis'), (2, 'John Coltrane'), (3, 'Someone Else')",
+            &[],
+        )
+        .unwrap();
+        for (id, artist) in [(1i64, 1i64), (2, 1), (3, 2), (4, 2), (5, 3)] {
+            let title = format!("T{id}");
+            db.execute(
+                "INSERT INTO tracks (id, title, artist_id, duration_ms) VALUES (?, ?, ?, 200000)",
+                &[&id, &title.as_str(), &artist],
+            )
+            .unwrap();
+        }
+
+        let names = vec![
+            "john coltrane".to_string(),
+            "MILES DAVIS".to_string(),
+            "Unknown Guy".to_string(),
+        ];
+        let result = tracks_for_artist_names(&db, &names, 2, 10);
+        // Coltrane (2 tracks) first — similarity order preserved — then Davis (2).
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0]["artist"].as_str(), Some("John Coltrane"));
+        assert_eq!(result[1]["artist"].as_str(), Some("John Coltrane"));
+        assert_eq!(result[2]["artist"].as_str(), Some("Miles Davis"));
+
+        // per_artist and count caps hold.
+        let capped = tracks_for_artist_names(&db, &names, 1, 1);
+        assert_eq!(capped.len(), 1);
     }
 }
 
