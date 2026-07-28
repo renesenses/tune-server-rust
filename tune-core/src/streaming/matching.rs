@@ -48,9 +48,9 @@ pub fn best_stream_match<'a>(
             album_title: t.album.clone().unwrap_or_default(),
             source_id: i.to_string(),
             duration_ms: t.duration_ms as i64,
-            // StreamTrack carries no ISRC yet; when it does, populate this so the
-            // ISRC fast-path in find_best_match can fire.
-            isrc: String::new(),
+            // When the service exposed an ISRC, feed it so the exact ISRC fast-path
+            // in find_best_match can win before any fuzzy scoring.
+            isrc: t.isrc.clone().unwrap_or_default(),
             score: 0.0,
             match_method: String::new(),
             confidence: String::new(),
@@ -83,6 +83,7 @@ mod tests {
             track_number: None,
             disc_number: None,
             explicit: false,
+            isrc: None,
             quality: None,
         }
     }
@@ -124,5 +125,19 @@ mod tests {
         ];
         let m = best_stream_match("Imagine", "John Lennon", "", 187_000, &tracks);
         assert_eq!(m.map(|t| t.id.as_str()), Some("real"));
+    }
+
+    #[test]
+    fn isrc_match_wins_regardless_of_title() {
+        // The ISRC fast-path must pick the track carrying the source ISRC even when
+        // another result looks like a better title/artist match.
+        let mut with_isrc = track("isrc-hit", "Weirdly Tagged Title", "V.A.", 200_000);
+        with_isrc.isrc = Some("FRUM71600123".into());
+        let tracks = vec![
+            track("title-look-alike", "La Bohème", "Charles Aznavour", 210_000),
+            with_isrc,
+        ];
+        let m = best_stream_match("La Bohème", "Charles Aznavour", "FRUM71600123", 0, &tracks);
+        assert_eq!(m.map(|t| t.id.as_str()), Some("isrc-hit"));
     }
 }

@@ -299,6 +299,7 @@ impl QobuzService {
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["media_number"].as_u64().map(|n| n as u32),
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
+            isrc: item["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: item["maximum_sampling_rate"]

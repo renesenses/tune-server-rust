@@ -18,6 +18,11 @@ pub struct StreamTrack {
     pub disc_number: Option<u32>,
     pub explicit: bool,
     pub quality: Option<StreamQuality>,
+    /// International Standard Recording Code, when the service exposes it. Enables
+    /// exact cross-service matching (see `streaming::matching::best_stream_match`).
+    /// `#[serde(default)]` so older serialized results without the field still load.
+    #[serde(default)]
+    pub isrc: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -303,6 +308,7 @@ mod tests {
             track_number: Some(1),
             disc_number: Some(1),
             explicit: false,
+            isrc: Some("USSM19900001".into()),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: 96000,

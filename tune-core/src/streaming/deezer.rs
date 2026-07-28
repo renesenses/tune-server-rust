@@ -261,6 +261,7 @@ impl DeezerService {
             track_number: item["track_position"].as_u64().map(|n| n as u32),
             disc_number: item["disk_number"].as_u64().map(|n| n as u32),
             explicit: item["explicit_lyrics"].as_bool().unwrap_or(false),
+            isrc: item["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: "MP3".into(),
                 sample_rate: 44100,
