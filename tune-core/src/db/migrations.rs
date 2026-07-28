@@ -1346,6 +1346,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "numeric_column_types",
         include_str!("../../migrations/postgres/010_numeric_column_types.sql"),
     ),
+    (
+        11,
+        "history_numeric_column_types",
+        include_str!("../../migrations/postgres/011_history_numeric_column_types.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
