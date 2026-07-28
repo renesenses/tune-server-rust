@@ -977,7 +977,22 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
             Err(_) => (None, None, None, None),
         }
     } else {
-        (None, None, None, None)
+        // DFF (DSDIFF) has no fmt/ID3 chunk like DSF. Previously this arm
+        // returned all-None, so every DFF that reached this fallback (lofty
+        // couldn't decode it, or it had no/empty tag) landed with
+        // duration_ms = 0 — which downstream disables gapless, the wall-clock
+        // advance nets, prefetch and crossfade (poller), cutting the album on
+        // those tracks (DSD testers: Benjithom RS130, LANDES). Read the DSDIFF
+        // header for the real sample rate, channels and duration.
+        match path.to_str().map(crate::audio::dff::parse_dff) {
+            Some(Ok(info)) => (
+                Some(info.sample_rate),
+                Some(info.channels as u16),
+                info.duration_ms(),
+                None,
+            ),
+            _ => (None, None, None, None),
+        }
     };
 
     // Try to read ID3v2 tags from the DSF metadata chunk

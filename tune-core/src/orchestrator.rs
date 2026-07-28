@@ -235,21 +235,16 @@ async fn probe_local_duration_ms(
     if source_format == Some(AudioFormat::Dsd) {
         let p = file_path.to_string();
         return tokio::task::spawn_blocking(move || {
-            if p.to_ascii_lowercase().ends_with(".dff") {
-                // DSD is 1 bit/sample: samples-per-channel = data_size*8/channels.
-                crate::audio::dff::parse_dff(&p).ok().and_then(|i| {
-                    let denom = i.channels as u64 * i.sample_rate as u64;
-                    (denom > 0).then(|| {
-                        (i.data_size.saturating_mul(8).saturating_mul(1000) / denom) as i64
-                    })
-                })
+            let dur = if p.to_ascii_lowercase().ends_with(".dff") {
+                crate::audio::dff::parse_dff(&p)
+                    .ok()
+                    .and_then(|i| i.duration_ms())
             } else {
-                crate::audio::dsf::parse_dsf(&p).ok().and_then(|i| {
-                    (i.sample_rate > 0).then(|| {
-                        (i.total_samples.saturating_mul(1000) / i.sample_rate as u64) as i64
-                    })
-                })
-            }
+                crate::audio::dsf::parse_dsf(&p)
+                    .ok()
+                    .and_then(|i| i.duration_ms())
+            };
+            dur.map(|ms| ms as i64)
         })
         .await
         .ok()

@@ -24,6 +24,18 @@ pub struct DffInfo {
     pub data_size: u64,
 }
 
+impl DffInfo {
+    /// Track duration in milliseconds from the DSDIFF header. DSD is 1 bit per
+    /// sample, so samples-per-channel = data_size*8/channels, and
+    /// duration = samples-per-channel / sample_rate. `None` if the header can't
+    /// yield a positive value. Single source of truth for the scan-time
+    /// (metadata) and play-time (orchestrator) duration recovery.
+    pub fn duration_ms(&self) -> Option<u64> {
+        let denom = self.channels as u64 * self.sample_rate as u64;
+        (denom > 0).then(|| self.data_size.saturating_mul(8).saturating_mul(1000) / denom)
+    }
+}
+
 /// Read a big-endian u16 from a byte slice at the given offset.
 fn read_u16_be(buf: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([buf[offset], buf[offset + 1]])
@@ -544,6 +556,16 @@ mod tests {
         assert_eq!(info.sample_rate, 2_822_400);
         assert_eq!(info.compression, "DSD ");
         assert_eq!(info.data_size, 4096);
+    }
+
+    #[test]
+    fn dff_info_duration_ms_from_header() {
+        // Exactly 1 s of stereo DSD64: data_size = channels * (samples/ch) / 8
+        //                            = 2 * 2_822_400 / 8 = 705_600 bytes.
+        // Without this the scan left DFF tracks at duration_ms = 0.
+        let dsd_data = vec![0u8; 705_600];
+        let info = parse_dff_from_bytes(&build_dff_header(2, 2_822_400, &dsd_data)).unwrap();
+        assert_eq!(info.duration_ms(), Some(1000));
     }
 
     #[test]
