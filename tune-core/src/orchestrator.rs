@@ -223,6 +223,46 @@ fn passthrough_didl_duration_ms(probed_secs: Option<f64>, scanned_ms: i64) -> i6
         .unwrap_or(scanned_ms)
 }
 
+/// Recover a local file's real duration (ms) at play time when the DB row has
+/// none (`duration_ms <= 0`). DSD (`.dsf`/`.dff`) is computed from the header —
+/// lofty (which `get_duration` uses) reports 0 for most DSD files, which is how
+/// the 0 got into the DB in the first place — everything else falls back to
+/// lofty. Returns `None` when no positive duration can be determined.
+async fn probe_local_duration_ms(
+    file_path: &str,
+    source_format: Option<AudioFormat>,
+) -> Option<i64> {
+    if source_format == Some(AudioFormat::Dsd) {
+        let p = file_path.to_string();
+        return tokio::task::spawn_blocking(move || {
+            if p.to_ascii_lowercase().ends_with(".dff") {
+                // DSD is 1 bit/sample: samples-per-channel = data_size*8/channels.
+                crate::audio::dff::parse_dff(&p).ok().and_then(|i| {
+                    let denom = i.channels as u64 * i.sample_rate as u64;
+                    (denom > 0).then(|| {
+                        (i.data_size.saturating_mul(8).saturating_mul(1000) / denom) as i64
+                    })
+                })
+            } else {
+                crate::audio::dsf::parse_dsf(&p).ok().and_then(|i| {
+                    (i.sample_rate > 0).then(|| {
+                        (i.total_samples.saturating_mul(1000) / i.sample_rate as u64) as i64
+                    })
+                })
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|&ms| ms > 0);
+    }
+    crate::audio::analyzer::get_duration(file_path)
+        .await
+        .ok()
+        .map(|s| (s * 1000.0) as i64)
+        .filter(|&ms| ms > 0)
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -1299,7 +1339,7 @@ impl PlaybackOrchestrator {
     async fn resolve_local_track(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let repo = TrackRepo::with_backend(self.db.clone());
-        let track = repo
+        let mut track = repo
             .get(track_id)
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
@@ -1329,6 +1369,30 @@ impl PlaybackOrchestrator {
         // signal path / now-playing chip (Benjithom, HiFi Rose RS130), and the
         // DSD→PCM transcode-fallback rate math is fed the wrong input rate.
         let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+
+        // Play-time duration backfill. A scan that timed out on slow storage
+        // (NAS: Pierre M, Yacine) falls back to filename-only metadata with
+        // duration_ms = 0, and DSD/other files lofty can't read a duration for
+        // also land at 0 in the DB. A 0 is quietly corrosive: the poller reads
+        // now_playing.duration_ms (= the DB value) verbatim, and at 0 it loses
+        // gapless arming, the position-past-end fast advance, BOTH wall-clock
+        // advance nets, prefetch AND crossfade — so the queue stalls or cuts on
+        // that track. Recover the real duration now and persist it so the track
+        // self-heals for every later read. DSD is read from the header because
+        // lofty (which get_duration uses) is exactly what returned 0 for it.
+        if track.duration_ms <= 0 {
+            if let Some(ms) = probe_local_duration_ms(&file_path, source_format).await {
+                track.duration_ms = ms;
+                let repo2 = TrackRepo::with_backend(self.db.clone());
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = repo2.update_duration(track_id, ms) {
+                        warn!(track_id, error = %e, "play_time_duration_persist_failed");
+                    }
+                });
+                info!(track_id, duration_ms = ms, "play_time_duration_backfilled");
+            }
+        }
+
         let sample_rate = track
             .sample_rate
             .unwrap_or(if is_dsd_source { 2_822_400 } else { 44100 })

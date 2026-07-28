@@ -139,6 +139,14 @@ pub mod sql {
         )
     }
 
+    pub fn update_duration<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET duration_ms = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     // ─── Track metadata column helpers (see migration 003) ─────────
 
     pub fn get_synced_lyrics<D: SqlDialect>(d: &D) -> String {
@@ -682,6 +690,15 @@ impl TrackRepo {
     pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_audio_hash, sql::update_audio_hash);
         let params: [&dyn ToSqlValue; 2] = [&audio_hash, &file_path];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Persist a duration recovered at play time (see the orchestrator's
+    /// play-time backfill) so a track scanned with `duration_ms = 0` self-heals.
+    pub fn update_duration(&self, id: i64, duration_ms: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::update_duration, sql::update_duration);
+        let params: [&dyn ToSqlValue; 2] = [&duration_ms, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -1316,6 +1333,23 @@ mod tests {
         );
         // The retained "Time" is the first-seen path (album 1), not a copy.
         assert_eq!(out[0].file_path.as_deref(), Some("/nas/time.flac"));
+    }
+
+    #[test]
+    fn update_duration_backfills_a_zero_duration_track() {
+        // A track scanned with duration_ms = 0 (scan timeout / unreadable DSD)
+        // is what the play-time backfill repairs. Verify the persist path.
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut track = Track::new("Silent Length".into());
+        track.file_path = Some("/music/mystery.dsf".into());
+        track.duration_ms = 0;
+        let id = repo.create(&track).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().duration_ms, 0);
+
+        repo.update_duration(id, 207_000).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().duration_ms, 207_000);
     }
 
     #[test]
