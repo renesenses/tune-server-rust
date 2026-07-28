@@ -76,7 +76,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -84,11 +84,11 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,plugins-wasm
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -106,11 +106,11 @@ jobs:
 
       - name: ASIO feature compile-check (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres
+        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,plugins-wasm
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }}
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -180,7 +180,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit

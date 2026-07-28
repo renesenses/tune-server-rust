@@ -76,13 +76,22 @@ jobs:
           CARGO_TARGET_DIR: target-amd64
         run: |
           sudo apt-get update && sudo apt-get install -y libasound2-dev
-          cargo build --release --package tune-server --no-default-features --features oaat
+          cargo build --release --package tune-server --no-default-features --features oaat,dj,karaoke,plugins-wasm
           mkdir -p dist/amd64 && cp target-amd64/release/tune-server dist/amd64/tune-server
+
+      # Party (WASM) plugin — arch-independent, staged once and COPYied into the
+      # image next to /app/tune-server so the plugins-wasm runtime loads it.
+      # Sourced from the committed fixture; the wasm is not rebuilt.
+      - name: Stage Party plugin (WASM)
+        run: |
+          mkdir -p dist/plugins/party
+          cp tune-server/tests/fixtures/plugins/party/main.wasm dist/plugins/party/
+          cp tune-server/tests/fixtures/plugins/party/manifest.json dist/plugins/party/
 
       - name: Build tune-server (arm64, cross)
         run: |
           cross build --release --package tune-server \
-            --target aarch64-unknown-linux-gnu --no-default-features --features oaat
+            --target aarch64-unknown-linux-gnu --no-default-features --features oaat,dj,karaoke,plugins-wasm
           mkdir -p dist/arm64 && cp target/aarch64-unknown-linux-gnu/release/tune-server dist/arm64/tune-server
 
       # librespot (Spotify Connect): real binary on amd64, empty placeholder on
