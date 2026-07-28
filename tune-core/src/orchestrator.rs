@@ -2672,6 +2672,8 @@ impl PlaybackOrchestrator {
 
             let ev_bus = self.event_bus.clone();
             let zone_id = req.zone_id;
+            let streamer_for_eof = self.streamer.clone();
+            let session_id_for_eof = session_id.clone();
 
             // Detect file:// URLs from DASH multi-segment downloads — the fMP4
             // is already on disk, skip the HTTP download step.
@@ -2821,6 +2823,15 @@ impl PlaybackOrchestrator {
                         warn!(error = %e, "streaming_transcode_decode_task_panic");
                     }
                 }
+
+                // Fin d'entrée : sans ça, le keep-alive de la session garde le
+                // canal ouvert après la fin du décodage, le corps HTTP ne se
+                // termine jamais, et l'OAAT (gapless interne basé sur l'EOF)
+                // reste muet en fin de piste puis se fait relancer par le
+                // superviseur — silence + « le dernier morceau est rejoué ».
+                streamer_for_eof
+                    .end_session_input(&session_id_for_eof)
+                    .await;
             });
 
             let server_ip = self.server_ip();

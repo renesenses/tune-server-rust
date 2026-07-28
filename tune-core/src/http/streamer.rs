@@ -237,6 +237,22 @@ impl AudioStreamer {
         (id, tx, data_ready)
     }
 
+    /// End the session's INPUT: drop the keep-alive sender so readers drain
+    /// the buffered chunks and then see a real EOF. The keep-alive exists so
+    /// DLNA reconnects survive mid-track, but for FINITE programme content the
+    /// producer must call this when it is done writing — otherwise the HTTP
+    /// body never ends and a pull output that relies on EOF for its internal
+    /// gapless (OAAT) hangs at end of track: watchdog "stall", supervisor
+    /// restarts the SAME track (silence puis « le dernier repart », Bertrand,
+    /// .18, 28/07). Radio sessions are infinite by design and never call this.
+    pub async fn end_session_input(&self, stream_id: &str) {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() };
+        if let Some(s) = session {
+            s.close_sender().await;
+            info!(stream_id, "stream_session_input_ended");
+        }
+    }
+
     pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
         let session = {
             let sessions = self.sessions.lock().await;
