@@ -673,6 +673,10 @@ pub struct LocalOutput {
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
+    /// PURE (audiophile) bypass for the zone currently playing on this output.
+    /// When set, the playback loop skips the room-correction convolver so the
+    /// signal path stays bit-perfect. Set per-play by the orchestrator.
+    pure_bypass: Arc<AtomicBool>,
 }
 
 impl LocalOutput {
@@ -715,6 +719,7 @@ impl LocalOutput {
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            pure_bypass: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -728,6 +733,14 @@ impl LocalOutput {
     pub fn clear_convolver(&self) {
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
+    /// for the zone currently playing on this output. Set per-play by the
+    /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
+    /// zones on the same output keep it.
+    pub fn set_pure_bypass(&self, bypass: bool) {
+        self.pure_bypass.store(bypass, Ordering::Relaxed);
     }
 
     pub fn has_convolver(&self) -> bool {
@@ -1261,6 +1274,7 @@ impl OutputTarget for LocalOutput {
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
         let convolver = self.convolver.clone();
+        let pure_bypass = self.pure_bypass.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -1716,9 +1730,11 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
+                    if !pure_bypass.load(Ordering::Relaxed) {
+                        if let Ok(mut conv) = convolver.lock() {
+                            if let Some(ref mut c) = *conv {
+                                c.process_interleaved(&mut samples);
+                            }
                         }
                     }
 
@@ -2046,9 +2062,11 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
+                    if !pure_bypass.load(Ordering::Relaxed) {
+                        if let Ok(mut conv) = convolver.lock() {
+                            if let Some(ref mut c) = *conv {
+                                c.process_interleaved(&mut samples);
+                            }
                         }
                     }
 
@@ -2944,9 +2962,11 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                if let Ok(mut conv) = convolver.lock() {
-                    if let Some(ref mut c) = *conv {
-                        c.process_interleaved(&mut samples);
+                if !pure_bypass.load(Ordering::Relaxed) {
+                    if let Ok(mut conv) = convolver.lock() {
+                        if let Some(ref mut c) = *conv {
+                            c.process_interleaved(&mut samples);
+                        }
                     }
                 }
 
