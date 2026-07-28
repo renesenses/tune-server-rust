@@ -784,7 +784,22 @@ pub async fn migrate_sqlite_to_pg(
         }
     }
 
-    // No sequence reset needed — all PKs are TEXT in migration schema
+    // Bring the freshly-migrated database up to the latest schema right now —
+    // most importantly migration 012, which converts the TEXT `id` columns this
+    // schema creates back to auto-incrementing BIGINT with a sequence (a fresh
+    // install gets BIGSERIAL from 001). Without it the migrated DB inherits
+    // SQLite's dynamic typing and rejects every NEW insert that omits `id`
+    // ("null value in column \"id\" ... violates not-null constraint" — the
+    // scan sees the files but writes 0, JF). Startup runs the migrations too,
+    // but the migrate route only restarts when persisting the DATABASE_URL
+    // succeeds, so doing it here guarantees a usable database regardless.
+    // Idempotent: the startup pass then finds nothing to do.
+    if let Err(e) = crate::db::migrations::run_pg_migrations(&pool).await {
+        tracing::warn!(error = %e, "pg_migrate_post_migration_upgrade_failed");
+        result
+            .errors
+            .push(format!("post-migration schema upgrade failed: {e}"));
+    }
 
     let elapsed = start.elapsed();
     info!(
