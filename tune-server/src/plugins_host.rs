@@ -255,13 +255,39 @@ impl WasmRegistry {
     }
 }
 
-/// Directory the manifests live under: `{TUNE_PLUGINS_DIR}/{id}/manifest.json`,
-/// defaulting to `plugins/`. (`TUNE_PLUGINS_DATA_DIR` is the *data* root used by
-/// the SDK loader — a different concern.)
+/// Directory the manifests live under: `{TUNE_PLUGINS_DIR}/{id}/manifest.json`.
+/// (`TUNE_PLUGINS_DATA_DIR` is the *data* root used by the SDK loader — a
+/// different concern.)
+///
+/// Resolution order:
+/// 1. `TUNE_PLUGINS_DIR` if set (tests set it explicitly; ops can override it).
+/// 2. `plugins/` **next to the executable** if that dir exists — a shipped
+///    server (systemd/Homebrew/Docker) often runs with a CWD that is *not* the
+///    package dir, so a bare CWD-relative `plugins/` would silently never be
+///    found and the bundled Party plugin would never load.
+/// 3. CWD-relative `plugins/` otherwise (dev `cargo run` from the repo root).
 fn plugins_dir() -> PathBuf {
-    std::env::var("TUNE_PLUGINS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("plugins"))
+    resolve_plugins_dir(
+        std::env::var("TUNE_PLUGINS_DIR").ok(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf)),
+    )
+}
+
+/// Pure resolution logic behind [`plugins_dir`], split out so it is testable
+/// without touching process-global env or the real executable path.
+fn resolve_plugins_dir(env_override: Option<String>, exe_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = env_override {
+        return PathBuf::from(dir);
+    }
+    if let Some(exe_dir) = exe_dir {
+        let candidate = exe_dir.join("plugins");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    PathBuf::from("plugins")
 }
 
 /// Scan the plugins directory and load every **enabled** wasm plugin whose
@@ -469,7 +495,44 @@ pub fn spawn_wasm_event_forwarder(state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{any_subscription_matches, event_matches};
+    use super::{any_subscription_matches, event_matches, resolve_plugins_dir};
+    use std::path::PathBuf;
+
+    #[test]
+    fn plugins_dir_env_override_wins() {
+        // An explicit TUNE_PLUGINS_DIR always wins, even when an exe-relative
+        // `plugins/` exists — this is the contract the integration tests rely on.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("plugins")).unwrap();
+        let resolved = resolve_plugins_dir(
+            Some("/custom/plugins".to_string()),
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(resolved, PathBuf::from("/custom/plugins"));
+    }
+
+    #[test]
+    fn plugins_dir_resolves_next_to_executable() {
+        // With no override and an exe dir that HAS a `plugins/` subdir, resolve
+        // to that absolute path (the shipped-server case).
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins = tmp.path().join("plugins");
+        std::fs::create_dir(&plugins).unwrap();
+        let resolved = resolve_plugins_dir(None, Some(tmp.path().to_path_buf()));
+        assert_eq!(resolved, plugins);
+    }
+
+    #[test]
+    fn plugins_dir_falls_back_to_cwd_relative() {
+        // No override and no exe-relative `plugins/` → bare CWD-relative default,
+        // so `cargo run` from the repo root still finds `./plugins`.
+        let tmp = tempfile::tempdir().unwrap(); // exists but has no `plugins/` subdir
+        assert_eq!(
+            resolve_plugins_dir(None, Some(tmp.path().to_path_buf())),
+            PathBuf::from("plugins")
+        );
+        assert_eq!(resolve_plugins_dir(None, None), PathBuf::from("plugins"));
+    }
 
     #[test]
     fn glob_star_matches_everything() {
