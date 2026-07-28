@@ -903,6 +903,12 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             );
         }
 
+        // Mirror hand-made compilation folders (tracks spanning several albums)
+        // into local playlists — opt-in via scan_folder_playlists (Frédéric).
+        if tune_core::library::folder_playlists::folder_playlists_enabled(&db) {
+            tune_core::library::folder_playlists::sync_folder_playlists(&db);
+        }
+
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");

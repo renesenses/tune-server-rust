@@ -267,6 +267,25 @@ impl PlaylistRepo {
         Ok(())
     }
 
+    /// Replace the whole playlist contents with `track_ids`, in order,
+    /// atomically. This is the folder→playlist scan-sync path: the playlist
+    /// mirrors its source directory on every scan, so the operation must be
+    /// idempotent and never leave a half-replaced list on failure.
+    pub fn set_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
+        let delete_sql = self.dialect_sql(sql::delete_all_tracks, sql::delete_all_tracks);
+        let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
+        self.db.write_tx(&mut |tx| {
+            let dp: [&dyn ToSqlValue; 1] = [&playlist_id];
+            tx.execute(&delete_sql, &dp)?;
+            for (i, tid) in track_ids.iter().enumerate() {
+                let pos = i as i64;
+                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                tx.execute(&insert_sql, &p)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn get_track_ids(&self, playlist_id: i64) -> Result<Vec<i64>, String> {
         let sql = self.dialect_sql(sql::get_track_ids, sql::get_track_ids);
         let params: [&dyn ToSqlValue; 1] = [&playlist_id];
@@ -365,6 +384,40 @@ mod tests {
         repo.reorder_tracks(plid, &[tid2, tid1]).unwrap();
         let reordered = repo.get_track_ids(plid).unwrap();
         assert_eq!(reordered, vec![tid2, tid1]);
+    }
+
+    #[test]
+    fn set_tracks_replaces_contents_in_order() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let ids: Vec<i64> = ["/1.flac", "/2.flac", "/3.flac"]
+            .iter()
+            .map(|p| {
+                let mut t = TrackModel::new((*p).into());
+                t.file_path = Some((*p).into());
+                track_repo.create(&t).unwrap()
+            })
+            .collect();
+
+        let plid = repo.create("Dossier", Some("Dossier : /x"), 1).unwrap();
+        repo.add_tracks(plid, &[ids[0]], None).unwrap();
+
+        repo.set_tracks(plid, &[ids[2], ids[0], ids[1]]).unwrap();
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[2], ids[0], ids[1]]
+        );
+
+        // Idempotent: same input, same result; empty input empties the list.
+        repo.set_tracks(plid, &[ids[2], ids[0], ids[1]]).unwrap();
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[2], ids[0], ids[1]]
+        );
+        repo.set_tracks(plid, &[]).unwrap();
+        assert!(repo.get_track_ids(plid).unwrap().is_empty());
     }
 
     #[test]

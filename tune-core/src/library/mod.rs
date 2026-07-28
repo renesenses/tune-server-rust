@@ -3,6 +3,7 @@ pub mod artwork_cache;
 pub mod cover_fetcher;
 pub mod duplicate_detector;
 pub mod export;
+pub mod folder_playlists;
 pub mod full_text_search;
 pub mod genre_tree;
 pub mod importer;
