@@ -138,6 +138,107 @@ pub async fn pull_community_enrichments(
     Ok(applied)
 }
 
+/// Resolve MusicBrainz recording IDs for local tracks that don't have one, by
+/// asking the community pool (which aggregates MBIDs from many libraries). This
+/// breaks the chicken-and-egg where a client needs an MBID to benefit from
+/// community metadata but only has a handful. Fills `musicbrainz_recording_id`
+/// (and `genre` when empty); never overwrites an MBID that already exists.
+pub async fn resolve_missing_mbids(
+    backend: &Arc<dyn DbBackend>,
+    http_client: &reqwest::Client,
+) -> Result<usize, String> {
+    // Local tracks lacking an MBID but with an artist + title to match on.
+    let rows = backend
+        .query_many(
+            "SELECT t.id, ar.name, al.title, t.title \
+             FROM tracks t \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             WHERE (t.musicbrainz_recording_id IS NULL OR t.musicbrainz_recording_id = '') \
+               AND ar.name IS NOT NULL AND ar.name != '' \
+               AND t.title IS NOT NULL AND t.title != '' \
+             LIMIT 100",
+            &[],
+        )
+        .map_err(|e| format!("query: {e}"))?;
+
+    if rows.is_empty() {
+        debug!("community_resolve_no_candidates");
+        return Ok(0);
+    }
+
+    // Keep row order: the server echoes back an `index` into the items array,
+    // which we map to the corresponding track id.
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.get(0).and_then(|v| v.as_i64()))
+        .collect();
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "artist_name": r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "album_title": r.get(2).and_then(|v| v.as_string()),
+                "title": r.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    // ids and items are both built from `rows`, so they must line up.
+    if ids.len() != items.len() {
+        return Err("row/id length mismatch".into());
+    }
+
+    let body = serde_json::json!({ "items": items });
+    let resp = http_client
+        .post(format!("{COMMUNITY_API}/resolve"))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("community resolve: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("community resolve: HTTP {}", resp.status()));
+    }
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+
+    let mut applied = 0usize;
+    if let Some(arr) = data["resolved"].as_array() {
+        for r in arr {
+            let idx = match r["index"].as_i64() {
+                Some(i) if i >= 0 && (i as usize) < ids.len() => i as usize,
+                _ => continue,
+            };
+            let mbid = match r["musicbrainz_recording_id"].as_str() {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => continue,
+            };
+            let genre = r["genre"].as_str().map(|s| s.to_string());
+            let track_id = ids[idx];
+
+            let result = backend.execute(
+                "UPDATE tracks SET \
+                 musicbrainz_recording_id = ?, \
+                 genre = COALESCE(genre, ?) \
+                 WHERE id = ? AND (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '')",
+                &[
+                    &mbid as &dyn ToSqlValue,
+                    &genre as &dyn ToSqlValue,
+                    &track_id as &dyn ToSqlValue,
+                ],
+            );
+            if result.is_ok() {
+                applied += 1;
+            }
+        }
+    }
+
+    info!(candidates = ids.len(), applied, "community_mbids_resolved");
+    Ok(applied)
+}
+
 /// Spawn the periodic community sync task. Runs every 30 minutes,
 /// gated behind the `community_sync_enabled` setting.
 pub fn spawn(backend: Arc<dyn DbBackend>) {
@@ -167,6 +268,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 .unwrap_or(false);
 
             if enabled {
+                // Resolve MBIDs first (no instance_id required) so freshly
+                // resolved tracks can be pushed/enriched on this same cycle.
+                if let Err(e) = resolve_missing_mbids(&backend, &client).await {
+                    warn!(error = %e, "community_sync_resolve_failed");
+                }
+
                 let instance_id = settings
                     .get("instance_id")
                     .ok()
