@@ -661,7 +661,10 @@ impl PlaybackOrchestrator {
                 live_stream: resolved.source == "radio",
                 origin_url: resolved.origin_url.as_deref(),
             };
-            let result = self.send_to_output(device_id, &media, req.seek_ms).await;
+            let zone_audiophile = self.zone_audiophile(req.zone_id);
+            let result = self
+                .send_to_output(device_id, &media, req.seek_ms, zone_audiophile)
+                .await;
             let total_ms = play_start.elapsed().as_millis();
             info!(
                 zone_id = req.zone_id,
@@ -4189,6 +4192,7 @@ impl PlaybackOrchestrator {
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
         start_position_ms: Option<u64>,
+        zone_audiophile: bool,
     ) -> (bool, Option<String>) {
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
@@ -4251,6 +4255,22 @@ impl PlaybackOrchestrator {
                     }
                     drop(output);
                 }
+            }
+            // PURE (audiophile) mode: bypass the room-correction convolver on
+            // this local output for the zone about to play, so the signal path
+            // stays bit-perfect. Applied every play (not just on seek) so a zone
+            // toggled in/out of PURE takes effect on the next track; other zones
+            // on the same output keep their convolution.
+            #[cfg(feature = "local-audio")]
+            if device_id.starts_with("local:") {
+                let output = output_arc.lock().await;
+                if let Some(local_output) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    local_output.set_pure_bypass(zone_audiophile);
+                }
+                drop(output);
             }
             let output = output_arc.lock().await;
             match output.play_media(media).await {
@@ -4519,28 +4539,33 @@ impl PlaybackOrchestrator {
         });
     }
 
+    /// True when the zone is in PURE (audiophile) mode: bypass ALL per-zone
+    /// signal processing for a bit-perfect path — the equalizer, its
+    /// room-correction gains (in `load_eq_processor`) and the room-correction
+    /// convolver (in the local output). Bertrand: "PURE doit désactiver toutes
+    /// les modifs".
+    fn zone_audiophile(&self, zone_id: i64) -> bool {
+        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(&format!("zone_{zone_id}_audiophile"))
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+            .unwrap_or(false)
+    }
+
     fn load_eq_processor(
         &self,
         zone_id: i64,
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::eq::EqProcessor> {
-        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
-        // Audiophile ("PURE") mode: bypass ALL per-zone signal processing for a
-        // bit-perfect path — the equalizer and its room-correction gains. When
-        // the zone is in PURE mode we never build an EqProcessor, so the PCM is
-        // sent to the output untouched (Bertrand: "PURE doit désactiver toutes
-        // les modifs").
-        let audiophile = settings
-            .get(&format!("zone_{zone_id}_audiophile"))
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
-            .unwrap_or(false);
-        if audiophile {
+        // PURE mode: never build an EqProcessor (no EQ, no room-correction
+        // gains) so the PCM reaches the output untouched.
+        if self.zone_audiophile(zone_id) {
             return None;
         }
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
             .get(&key)
@@ -6586,7 +6611,7 @@ mod tests {
             mime_type: "audio/wav",
             ..Default::default()
         };
-        let (output_sent, output_error) = orch.send_to_output(device_id, &media, None).await;
+        let (output_sent, output_error) = orch.send_to_output(device_id, &media, None, false).await;
         assert!(
             !output_sent,
             "rejecting output must report output_sent=false"
