@@ -809,15 +809,16 @@ async fn save_current_as_favorite(
 struct CreatePlaylistFromFavBody {
     name: Option<String>,
     playlist_name: Option<String>,
-    #[allow(dead_code)]
-    service: Option<String>, // accepted for forward-compat; not used yet
+    /// Target: "local" (default) or a connected streaming service name
+    /// (e.g. "qobuz", "tidal", "deezer").
+    service: Option<String>,
     limit: Option<usize>,
 }
 
 async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let favorites: Vec<(String, String)> = state
         .backend
         .query_many(
@@ -842,7 +843,7 @@ async fn create_playlist_from_favorites(
             .into_response());
     }
 
-    let (name, limit) = match body {
+    let (name, limit, service) = match body {
         Some(Json(ref b)) => {
             let n = b
                 .playlist_name
@@ -850,9 +851,9 @@ async fn create_playlist_from_favorites(
                 .or(b.name.clone())
                 .unwrap_or_else(|| "Radio Favorites".into());
             let l = b.limit.unwrap_or(200);
-            (n, l)
+            (n, l, b.service.clone())
         }
-        None => ("Radio Favorites".into(), 200),
+        None => ("Radio Favorites".into(), 200, None),
     };
 
     let favorites: Vec<(String, String)> = if limit < favorites.len() {
@@ -861,6 +862,14 @@ async fn create_playlist_from_favorites(
         favorites
     };
 
+    // Streaming target: resolve each favorite onto the service (smart-matched,
+    // ISRC-aware) and build the playlist there — Hi-Res where the service offers it.
+    let target = service.unwrap_or_else(|| "local".into());
+    if target != "local" {
+        return create_streaming_playlist_from_favorites(&state, &target, &name, &favorites).await;
+    }
+
+    // Local target: match each favorite against the local library.
     let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
     let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     let playlist_id = match repo.create(&name, None, DEFAULT_PROFILE_ID) {
@@ -896,6 +905,118 @@ async fn create_playlist_from_favorites(
             "name": name,
             "favorites_count": favorites.len(),
             "matched_tracks": matched,
+        })),
+    )
+        .into_response())
+}
+
+/// Build the playlist on a streaming service: smart-match (ISRC-aware) each radio
+/// favorite onto the service catalogue via `best_stream_match`, then create the
+/// playlist on that service and add the matched tracks. Returns a per-favorite
+/// report so the client can show what matched and what didn't.
+async fn create_streaming_playlist_from_favorites(
+    state: &AppState,
+    service: &str,
+    name: &str,
+    favorites: &[(String, String)],
+) -> Result<axum::response::Response, AppError> {
+    let svc_arc = {
+        let reg = state.services.lock().await;
+        match reg.get(service) {
+            Some(a) => a,
+            None => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("service '{service}' not found or not connected")
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    };
+    let svc = svc_arc.lock().await;
+
+    let mut matched_ids: Vec<String> = Vec::new();
+    let mut details: Vec<Value> = Vec::new();
+    for (title, artist) in favorites {
+        let q = if artist.is_empty() {
+            title.clone()
+        } else {
+            format!("{artist} {title}")
+        };
+        // radio favorites carry no ISRC/duration, so match on normalized title+artist.
+        let best = match svc.search(&q, 10).await {
+            Ok(results) => tune_core::streaming::matching::best_stream_match(
+                title,
+                artist,
+                "",
+                0,
+                &results.tracks,
+            )
+            .cloned(),
+            Err(_) => None,
+        };
+        match best {
+            Some(t) => {
+                details.push(json!({
+                    "title": title,
+                    "artist": artist,
+                    "matched_title": t.title,
+                    "matched_artist": t.artist,
+                    "matched_id": t.id,
+                    "status": "matched",
+                }));
+                matched_ids.push(t.id);
+            }
+            None => details.push(json!({
+                "title": title,
+                "artist": artist,
+                "status": "not_found",
+            })),
+        }
+    }
+
+    let mut remote_playlist_id: Option<String> = None;
+    if !matched_ids.is_empty() {
+        match svc
+            .create_playlist(name, Some("Created by Tune from radio favorites"))
+            .await
+        {
+            Ok(pid) => {
+                if let Err(e) = svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                    tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                }
+                remote_playlist_id = Some(pid);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    service = %service,
+                    error = %e,
+                    "radio_fav_create_playlist_failed (service may not support write)"
+                );
+                return Ok((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("could not create playlist on '{service}': {e}"),
+                        "matched_tracks": matched_ids.len(),
+                        "details": details,
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "service": service,
+            "name": name,
+            "favorites_count": favorites.len(),
+            "matched_tracks": matched_ids.len(),
+            "remote_playlist_id": remote_playlist_id,
+            "details": details,
         })),
     )
         .into_response())
