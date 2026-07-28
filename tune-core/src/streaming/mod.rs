@@ -1,6 +1,7 @@
 pub mod amazon;
 pub mod deezer;
 pub mod deezer_decrypt;
+pub mod matching;
 pub mod podcasts;
 pub mod qobuz;
 pub mod radiofrance;

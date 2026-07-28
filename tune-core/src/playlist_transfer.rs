@@ -71,55 +71,30 @@ async fn resolve_service(
         .ok_or_else(|| format!("service not found: {name}"))
 }
 
-/// Search for a track on the target service. Returns the target track ID if
-/// found. We search by "title artist" and pick the first result whose title
-/// is close enough.
+/// Search for a track on the target service and return the best match's
+/// `(id, title, artist)`, or `None` when no result is close enough. Matching goes
+/// through the shared normalized+fuzzy matcher (accent folding, "(Remastered …)"
+/// stripping, acceptance threshold) instead of naive equality-then-first-result,
+/// so covers, live takes and same-title different songs are no longer accepted.
 async fn search_track_on_target(
     target: &Arc<Mutex<Box<dyn StreamingService>>>,
     title: &str,
     artist: &str,
 ) -> Option<(String, String, String)> {
     let query = format!("{title} {artist}");
-    let svc = target.lock().await;
-    let results = match svc.search(&query, 5).await {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(error = %e, query = %query, "transfer_search_failed");
-            return None;
+    let results = {
+        let svc = target.lock().await;
+        match svc.search(&query, 10).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, query = %query, "transfer_search_failed");
+                return None;
+            }
         }
     };
 
-    let title_lower = title.to_lowercase();
-    let artist_lower = artist.to_lowercase();
-
-    // Best match: exact title + artist
-    for track in &results.tracks {
-        if track.title.to_lowercase() == title_lower && track.artist.to_lowercase() == artist_lower
-        {
-            return Some((track.id.clone(), track.title.clone(), track.artist.clone()));
-        }
-    }
-
-    // Fallback: title contains the source title
-    for track in &results.tracks {
-        if track.title.to_lowercase().contains(&title_lower)
-            || title_lower.contains(&track.title.to_lowercase())
-        {
-            return Some((track.id.clone(), track.title.clone(), track.artist.clone()));
-        }
-    }
-
-    // Last resort: just take the first result if any
-    if let Some(track) = results.tracks.first() {
-        // Only accept if artist has some overlap
-        if track.artist.to_lowercase().contains(&artist_lower)
-            || artist_lower.contains(&track.artist.to_lowercase())
-        {
-            return Some((track.id.clone(), track.title.clone(), track.artist.clone()));
-        }
-    }
-
-    None
+    let m = crate::streaming::matching::best_stream_match(title, artist, "", 0, &results.tracks)?;
+    Some((m.id.clone(), m.title.clone(), m.artist.clone()))
 }
 
 // ---------------------------------------------------------------------------
