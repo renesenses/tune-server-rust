@@ -47,11 +47,109 @@ struct CreateRadio {
     bitrate: Option<i32>,
 }
 
+/// Backfill missing station logos from the mozaiklabs.fr radio directory.
+///
+/// The seeded default stations (migration `seed_default_radios`) and any station
+/// imported without art have no `logo_url`, so the radio list shows the
+/// placeholder mic icon (Pascal, v0.9.21). The public directory at
+/// `/api/v1/radios` carries a curated logo per station; match our local rows to
+/// it by stream URL (then name) and fill in the absolute logo URL. The web
+/// client proxies that URL through the LOCAL server (`artworkUrl` →
+/// `/library/artwork/proxy`), so it displays even behind a strict CSP.
+///
+/// Best-effort and cloud-graceful: any network/parse failure is a no-op (Tune
+/// works fully without mozaiklabs.fr). Never overwrites a logo already set.
+pub async fn refresh_radio_logos(state: &AppState) -> usize {
+    const DIRECTORY_URL: &str = "https://mozaiklabs.fr/api/v1/radios";
+    const BASE: &str = "https://mozaiklabs.fr";
+
+    let directory: Vec<Value> = match tune_core::http::client::shared()
+        .get(DIRECTORY_URL)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => return 0,
+    };
+
+    // Normalize a stream URL for matching: scheme-insensitive, no trailing slash.
+    let norm = |u: &str| {
+        u.trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string()
+    };
+
+    let mut by_url: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for item in &directory {
+        let Some(logo) = item
+            .get("logo_url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let abs = if logo.starts_with("http") {
+            logo.to_string()
+        } else {
+            format!("{BASE}{logo}")
+        };
+        if let Some(su) = item.get("stream_url").and_then(|v| v.as_str()) {
+            by_url.entry(norm(su)).or_insert_with(|| abs.clone());
+        }
+        if let Some(nm) = item.get("name").and_then(|v| v.as_str()) {
+            by_name
+                .entry(nm.trim().to_ascii_lowercase())
+                .or_insert_with(|| abs.clone());
+        }
+    }
+    if by_url.is_empty() && by_name.is_empty() {
+        return 0;
+    }
+
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let mut updated = 0usize;
+    for mut st in repo.list().unwrap_or_default() {
+        if st.logo_url.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            continue; // keep an existing / user-set logo
+        }
+        let logo = by_url
+            .get(&norm(&st.url))
+            .or_else(|| by_name.get(&st.name.trim().to_ascii_lowercase()))
+            .cloned();
+        if let Some(logo) = logo {
+            st.logo_url = Some(logo);
+            if repo.update(&st).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    if updated > 0 {
+        state.event_bus.emit(
+            "library.radios_changed",
+            json!({"action": "logos_refreshed", "updated": updated}),
+        );
+        tracing::info!(updated, "radio_logos_refreshed_from_directory");
+    }
+    updated
+}
+
+async fn refresh_logos_handler(State(state): State<AppState>) -> Json<Value> {
+    let updated = refresh_radio_logos(&state).await;
+    Json(json!({ "updated": updated }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_radios).post(create_radio))
         .route("/search", get(search_radios))
         .route("/favorites", get(list_favorites))
+        .route("/refresh-logos", post(refresh_logos_handler))
         .route("/add", get(add_from_web))
         .route(
             "/{id}",

@@ -26,6 +26,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_heartbeat(state);
     spawn_bio_sync(state);
     spawn_community_sync(state);
+    spawn_radio_logo_refresh(state);
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
@@ -987,6 +988,19 @@ fn spawn_bio_sync(state: &AppState) {
             return;
         }
         tune_core::cloud::bio_sync::spawn(db, rx);
+    });
+}
+
+/// Best-effort, once at boot: fill in missing station logos from the
+/// mozaiklabs.fr radio directory so the seeded default stations show a vignette
+/// instead of the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
+fn spawn_radio_logo_refresh(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let n = crate::routes::radios::refresh_radio_logos(&state).await;
+        if n > 0 {
+            tracing::info!(updated = n, "radio_logos_backfilled_at_startup");
+        }
     });
 }
 
