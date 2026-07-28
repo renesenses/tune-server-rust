@@ -7,6 +7,31 @@ use crate::db::backend::{DbBackend, ToSqlValue};
 
 const COMMUNITY_API: &str = "https://mozaiklabs.fr/api/v1/community/library";
 
+/// Vademecum "extra" keys shared with the cloud (composer, conductor, …).
+const EXTRA_KEYS: &[&str] = &[
+    "composer",
+    "lyricist",
+    "writer",
+    "arranger",
+    "conductor",
+    "performer",
+    "ensemble",
+    "remixer",
+    "producer",
+];
+
+/// Re-pull a track's extra metadata if its last sync is older than this, so
+/// values the cloud derived *after* we first synced a track get picked up.
+const EXTRA_RESWEEP_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Current Unix time in seconds, as a fixed-width string that sorts chronologically.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Push enriched tracks (those with a MusicBrainz recording ID) to
 /// mozaiklabs.fr so other Tune instances can benefit from the metadata.
 /// Returns the number of tracks stored server-side.
@@ -246,13 +271,19 @@ pub async fn resolve_missing_mbids(
 /// (never overwrites the user's own file tags). The `/extra` endpoint is served
 /// from Tune's own cloud, so there is no MusicBrainz rate limit to respect here.
 ///
-/// Each processed track is marked with a `mb_extra_synced` sentinel so the run
-/// advances through the whole library instead of re-querying the same window.
+/// Each processed track is stamped with a `mb_extra_synced` = <unix-seconds>
+/// sentinel so the sweep advances across the library; a track is re-pulled once
+/// its stamp is older than `EXTRA_RESWEEP_SECS`, catching extra the cloud derived
+/// after our first pass.
 pub async fn pull_community_extra(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
 ) -> Result<usize, String> {
-    // Tracks with an MBID that haven't been extra-synced yet.
+    // Tracks with an MBID whose extra hasn't been synced recently. The sentinel
+    // stores a fixed-width epoch string, so a lexical `>=` compare is chronological.
+    let cutoff = now_epoch_secs()
+        .saturating_sub(EXTRA_RESWEEP_SECS)
+        .to_string();
     let rows = backend
         .query_many(
             "SELECT t.id, t.musicbrainz_recording_id \
@@ -260,10 +291,10 @@ pub async fn pull_community_extra(
              WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
                AND NOT EXISTS ( \
                  SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'mb_extra_synced' \
+                 WHERE m.track_id = t.id AND m.key = 'mb_extra_synced' AND m.value >= ? \
                ) \
              LIMIT 100",
-            &[],
+            &[&cutoff as &dyn ToSqlValue],
         )
         .map_err(|e| format!("query: {e}"))?;
 
@@ -343,8 +374,8 @@ pub async fn pull_community_extra(
                 enriched += 1;
             }
         }
-        // Mark as processed regardless, so the sweep advances across the library.
-        let _ = repo.set(*track_id, "mb_extra_synced", "1");
+        // Stamp with the current epoch so the sweep advances and re-pulls later.
+        let _ = repo.set(*track_id, "mb_extra_synced", &now_epoch_secs().to_string());
     }
 
     info!(
@@ -352,6 +383,115 @@ pub async fn pull_community_extra(
         enriched, "community_extra_pulled"
     );
     Ok(enriched)
+}
+
+/// Contribute the user's hand-curated file-tag credits (composer, conductor,
+/// performer, …) to the community pool, so others can benefit. Only tracks whose
+/// extra is PRISTINE — an MBID present, but not yet pushed and not yet pulled —
+/// are sent, so we never echo back the MusicBrainz data we ourselves fetched.
+/// Values the server promotes to canonical require agreement from several users.
+pub async fn push_local_extra(
+    backend: &Arc<dyn DbBackend>,
+    http_client: &reqwest::Client,
+    instance_id: &str,
+) -> Result<usize, String> {
+    // Pristine candidates: MBID set, has at least one extra key, never pushed,
+    // never pulled (so its extra is 100% the user's own tags).
+    let key_list = EXTRA_KEYS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rows = backend
+        .query_many(
+            &format!(
+                "SELECT DISTINCT t.id, t.musicbrainz_recording_id \
+                 FROM tracks t \
+                 JOIN track_metadata mv ON mv.track_id = t.id AND mv.key IN ({key_list}) \
+                 WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
+                   AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                     WHERE m.track_id = t.id AND m.key = 'mb_extra_pushed') \
+                   AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                     WHERE m.track_id = t.id AND m.key = 'mb_extra_synced') \
+                 LIMIT 50"
+            ),
+            &[],
+        )
+        .map_err(|e| format!("query: {e}"))?;
+
+    if rows.is_empty() {
+        debug!("community_push_extra_no_candidates");
+        return Ok(0);
+    }
+
+    let candidates: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let mbid = r.get(1).and_then(|v| v.as_string())?;
+            Some((id, mbid))
+        })
+        .collect();
+
+    let repo = crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone());
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for (track_id, mbid) in &candidates {
+        let meta = repo.get_all(*track_id).unwrap_or_default();
+        for key in EXTRA_KEYS {
+            if let Some(value) = meta.get(*key) {
+                // A single stored value may hold several names joined with "; ".
+                for v in value.split("; ") {
+                    let v = v.trim();
+                    if !v.is_empty() && v.len() <= 500 {
+                        items.push(serde_json::json!({
+                            "musicbrainz_recording_id": mbid,
+                            "key": key,
+                            "value": v,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Mark every candidate as pushed even if it yielded no items, so the sweep
+    // advances and we don't re-scan the same tracks each cycle.
+    let stamp = now_epoch_secs().to_string();
+    let mark_pushed = |cands: &[(i64, String)]| {
+        for (track_id, _) in cands {
+            let _ = repo.set(*track_id, "mb_extra_pushed", &stamp);
+        }
+    };
+
+    if items.is_empty() {
+        mark_pushed(&candidates);
+        return Ok(0);
+    }
+
+    // The endpoint accepts up to 500 items; our 50-track window stays well under.
+    items.truncate(500);
+    let sent = items.len();
+    let body = serde_json::json!({ "instance_id": instance_id, "items": items });
+
+    let resp = http_client
+        .post(format!("{COMMUNITY_API}/extra"))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("community push extra: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("community push extra: HTTP {}", resp.status()));
+    }
+
+    mark_pushed(&candidates);
+    info!(
+        tracks = candidates.len(),
+        values = sent,
+        "community_extra_pushed"
+    );
+    Ok(sent)
 }
 
 /// Spawn the periodic community sync task. Runs every 30 minutes,
@@ -401,6 +541,11 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     }
                     if let Err(e) = pull_community_enrichments(&backend, &client).await {
                         warn!(error = %e, "community_sync_pull_failed");
+                    }
+                    // Contribute the user's own file-tag credits (needs instance_id),
+                    // before pulling so we only ever push pristine (un-pulled) extra.
+                    if let Err(e) = push_local_extra(&backend, &client, &instance_id).await {
+                        warn!(error = %e, "community_sync_push_extra_failed");
                     }
                 } else {
                     debug!("community_sync_skipped_no_instance_id");
