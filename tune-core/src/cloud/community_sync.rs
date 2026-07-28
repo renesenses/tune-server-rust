@@ -24,6 +24,13 @@ const EXTRA_KEYS: &[&str] = &[
 /// values the cloud derived *after* we first synced a track get picked up.
 const EXTRA_RESWEEP_SECS: u64 = 14 * 24 * 60 * 60;
 
+/// Re-attempt MBID resolution for a track the community pool couldn't resolve if
+/// its last attempt is older than this. Every attempted track is stamped so the
+/// sweep advances across the whole library instead of retrying the same first 100
+/// rows each cycle; unresolved tracks are re-tried later, by which time the cloud
+/// backfill has usually widened coverage.
+const RESOLVE_RETRY_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Current Unix time in seconds, as a fixed-width string that sorts chronologically.
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -169,11 +176,25 @@ pub async fn pull_community_enrichments(
 /// breaks the chicken-and-egg where a client needs an MBID to benefit from
 /// community metadata but only has a handful. Fills `musicbrainz_recording_id`
 /// (and `genre` when empty); never overwrites an MBID that already exists.
+///
+/// Each attempted track is stamped with a `mb_resolve_tried` = <unix-seconds>
+/// sentinel so the sweep advances across the whole library instead of retrying
+/// the same first 100 rows every cycle; an unresolved track is re-tried once its
+/// stamp is older than `RESOLVE_RETRY_SECS`, catching MBIDs the cloud backfill
+/// added after our first pass.
 pub async fn resolve_missing_mbids(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
 ) -> Result<usize, String> {
-    // Local tracks lacking an MBID but with an artist + title to match on.
+    // Local tracks lacking an MBID but with an artist + title to match on, that
+    // we haven't attempted recently. The `mb_resolve_tried` sentinel (stamped
+    // below for every attempted track) slides the window forward each cycle, so a
+    // batch that the cloud can't yet resolve doesn't wedge the sweep on the same
+    // first 100 rows. The stamp is a fixed-width epoch string, so a lexical `>=`
+    // compare is chronological.
+    let cutoff = now_epoch_secs()
+        .saturating_sub(RESOLVE_RETRY_SECS)
+        .to_string();
     let rows = backend
         .query_many(
             "SELECT t.id, ar.name, al.title, t.title \
@@ -183,8 +204,12 @@ pub async fn resolve_missing_mbids(
              WHERE (t.musicbrainz_recording_id IS NULL OR t.musicbrainz_recording_id = '') \
                AND ar.name IS NOT NULL AND ar.name != '' \
                AND t.title IS NOT NULL AND t.title != '' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'mb_resolve_tried' AND m.value >= ? \
+               ) \
              LIMIT 100",
-            &[],
+            &[&cutoff as &dyn ToSqlValue],
         )
         .map_err(|e| format!("query: {e}"))?;
 
@@ -259,6 +284,17 @@ pub async fn resolve_missing_mbids(
                 applied += 1;
             }
         }
+    }
+
+    // Stamp every attempted track (resolved or not) so the next cycle moves on to
+    // the following batch. Resolved tracks drop out of the candidate query anyway
+    // (they now have an MBID); the stamp is what lets the sweep skip past tracks
+    // the cloud couldn't resolve — until RESOLVE_RETRY_SECS elapses and they're
+    // re-tried against a by-then larger pool.
+    let repo = crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone());
+    let stamp = now_epoch_secs().to_string();
+    for track_id in &ids {
+        let _ = repo.set(*track_id, "mb_resolve_tried", &stamp);
     }
 
     info!(candidates = ids.len(), applied, "community_mbids_resolved");
