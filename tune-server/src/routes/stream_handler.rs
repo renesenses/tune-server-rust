@@ -25,6 +25,11 @@ struct RadioConsumerGuard {
     /// Set true when the channel closed cleanly (recv returned None), so the
     /// Drop path can tell a graceful end from a client disconnect.
     completed: bool,
+    /// Set true when a NEWER connection claimed the single-consumer channel and
+    /// this one handed it off (a DLNA renderer re-requesting without closing the
+    /// first). That is an expected, internal end — not a client disconnect — so
+    /// the Drop path stays quiet about it.
+    superseded: bool,
 }
 
 impl RadioConsumerGuard {
@@ -32,18 +37,23 @@ impl RadioConsumerGuard {
         use std::sync::atomic::Ordering::Relaxed;
         let n = session.active_consumers.fetch_add(1, Relaxed) + 1;
         if n > 1 {
-            warn!(
+            // Transient: a 2nd request briefly overlaps the first while the
+            // older connection is being handed off (see the supersede logic in
+            // handle_stream). It no longer splits the stream — the older
+            // consumer stops without pulling further chunks — so this is
+            // informational, not an error.
+            info!(
                 stream_id = %session.id,
                 consumers = n,
-                "radio_stream_concurrent_consumer — a 2nd request is racing the \
-                 single-consumer PCM channel; chunks will be split between \
-                 connections (renderer re-requested without closing the first)"
+                "radio_stream_reconnect — a newer request is taking over the \
+                 single-consumer PCM channel; the older connection is handed off"
             );
         }
         Self {
             session,
             started: std::time::Instant::now(),
             completed: false,
+            superseded: false,
         }
     }
 }
@@ -56,7 +66,7 @@ impl Drop for RadioConsumerGuard {
             .active_consumers
             .fetch_sub(1, Relaxed)
             .saturating_sub(1);
-        if !self.completed {
+        if !self.completed && !self.superseded {
             info!(
                 stream_id = %self.session.id,
                 connected_secs = self.started.elapsed().as_secs(),
@@ -322,19 +332,70 @@ pub async fn handle_stream(
             // The guard counts concurrent consumers and logs how the stream
             // ends (diagnostics for the FIP silent-after-reconnect case).
             let mut guard = RadioConsumerGuard::new(session.clone());
-            while let Some(chunk) = session.recv_chunk().await {
-                yield Ok(bytes::Bytes::from(chunk));
+
+            // Claim sole ownership of the single-consumer PCM channel. A DLNA
+            // renderer that re-requests the radio stream (buffer refill /
+            // reconnect) WITHOUT closing its first connection used to leave both
+            // connections calling recv_chunk(), so each PCM chunk went to
+            // whichever connection asked first — the audio was split between the
+            // two sockets and the renderer's live playback only got a fraction
+            // of the bytes → periodic dropouts (radio_stream_concurrent_consumer
+            // on .15). Bumping the epoch supersedes any older consumer; the loop
+            // below (subscribe-then-check + biased select) guarantees the older
+            // one stops without pulling a further chunk, so no chunk is split,
+            // lost, or duplicated at the hand-off.
+            let my_epoch = session.claim_radio_consumer();
+            loop {
+                // Subscribe to the supersede signal and register the waiter
+                // BEFORE checking the epoch. The epoch bump in
+                // claim_radio_consumer happens-before its notify, so a newer
+                // consumer is observed either as a wake here or as a stale epoch
+                // in the check below — never lost. See claim_radio_consumer.
+                let superseded = session.consumer_supersede.notified();
+                tokio::pin!(superseded);
+                superseded.as_mut().enable();
+
+                if !session.is_current_radio_consumer(my_epoch) {
+                    // A newer connection took over. Hand off WITHOUT consuming
+                    // another chunk (biased select never let recv win a race
+                    // against this check either).
+                    guard.superseded = true;
+                    info!(
+                        stream_id = %session.id,
+                        connected_secs = guard.started.elapsed().as_secs(),
+                        "radio_stream_superseded — handed the PCM channel to a \
+                         newer connection (renderer reconnected)"
+                    );
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+                    // Supersede wins ties: if a chunk is also ready we still
+                    // drop the recv future unread, leaving the chunk in the
+                    // channel for the new owner.
+                    _ = &mut superseded => continue,
+                    maybe_chunk = session.recv_chunk() => {
+                        match maybe_chunk {
+                            Some(chunk) => yield Ok(bytes::Bytes::from(chunk)),
+                            None => {
+                                // recv returned None → the PCM channel was closed
+                                // (all senders, incl. the keep-alive, dropped). A
+                                // radio session should stay open across upstream
+                                // reconnects, so this is worth surfacing.
+                                guard.completed = true;
+                                info!(
+                                    stream_id = %session.id,
+                                    connected_secs = guard.started.elapsed().as_secs(),
+                                    "radio_stream_channel_closed — PCM channel ended \
+                                     (senders dropped); renderer will see EOF"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
             }
-            // recv returned None → the PCM channel was closed (all senders,
-            // incl. the keep-alive, dropped). A radio session should stay open
-            // across upstream reconnects, so this is worth surfacing.
-            guard.completed = true;
-            info!(
-                stream_id = %session.id,
-                connected_secs = guard.started.elapsed().as_secs(),
-                "radio_stream_channel_closed — PCM channel ended (senders dropped); \
-                 renderer will see EOF"
-            );
         } else {
             // Coalesce small chunks into larger HTTP writes (target >=64 KB).
             // Network outputs like Squeezebox/LMS fetch audio from this HTTP
