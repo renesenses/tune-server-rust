@@ -936,6 +936,37 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// When `album_id` points at an album row that has NO tracks (a stale or
+    /// duplicate row), find another album with the SAME title + artist that DOES
+    /// have tracks — the row the Artists view reaches. Returns the sibling id
+    /// with the most tracks, or `None` if there is no populated sibling.
+    ///
+    /// This is why the same album could 400 ("no tracks to play") from the flat
+    /// Albums/Genres/Years grids (which can surface the empty row) yet play fine
+    /// from the Artists view (which reaches the populated row) — Pascal, v0.9.21.
+    pub fn find_populated_sibling(&self, album_id: i64) -> Result<Option<i64>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT a.id FROM albums a \
+             JOIN albums s ON s.id = {ph} \
+             WHERE a.id <> s.id \
+               AND LOWER(a.title) = LOWER(s.title) \
+               AND ((a.artist_id = s.artist_id) OR (a.artist_id IS NULL AND s.artist_id IS NULL)) \
+               AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id) \
+             ORDER BY (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) DESC \
+             LIMIT 1"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_i64()))
+    }
+
     /// Match albums where `genre` appears in either the legacy
     /// delimiter-separated text column or the structured `genres`
     /// JSON array (via `dialect.json_array_contains_lower`). Now
@@ -1177,6 +1208,43 @@ mod tests {
         let deleted = repo.delete_orphans().unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(repo.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn find_populated_sibling_resolves_duplicate_empty_album() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let aid = artist_repo
+            .create(&Artist::new("Muddy Waters".into()))
+            .unwrap();
+
+        // Two album rows for the same title+artist: one populated, one empty —
+        // the duplicate that makes "play album" 400 from the flat grids.
+        let mut populated = Album::new("Folk Singer".into());
+        populated.artist_id = Some(aid);
+        let populated_id = arepo.create(&populated).unwrap();
+        let mut empty = Album::new("Folk Singer".into());
+        empty.artist_id = Some(aid);
+        let empty_id = arepo.create(&empty).unwrap();
+
+        let mut t = Track::new("My Home Is in the Delta".into());
+        t.album_id = Some(populated_id);
+        t.artist_id = Some(aid);
+        t.file_path = Some("/blues/folk-singer/01.flac".into());
+        trepo.create(&t).unwrap();
+
+        // The empty duplicate resolves to the populated sibling.
+        assert_eq!(
+            arepo.find_populated_sibling(empty_id).unwrap(),
+            Some(populated_id)
+        );
+        // The populated album has no *other* populated sibling → None.
+        assert_eq!(arepo.find_populated_sibling(populated_id).unwrap(), None);
     }
 
     #[test]

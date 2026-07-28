@@ -1040,11 +1040,65 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Dereference an M3U/PLS *playlist* URL to its first real http(s) stream.
+    ///
+    /// Many stations are published as a small `.m3u`/`.pls` file whose body is
+    /// just the actual stream URL(s) — e.g. `radioswissjazz.ch/live/mp3.m3u`
+    /// contains a single line pointing at the Icecast stream. Playing the
+    /// playlist URL directly feeds the playlist *text* to the audio decoder, so
+    /// the level meter twitches on garbage but no sound comes out (Pascal,
+    /// v0.9.21).
+    ///
+    /// Returns `Some(stream_url)` only when `url` is a playlist that
+    /// dereferenced to a different http(s) URL; `None` for a direct media URL
+    /// (no network hit — cheap extension gate first), for HLS `.m3u8` (that
+    /// manifest IS the stream, consumed directly by the player), or on any
+    /// fetch/parse failure — so the caller keeps the original URL.
+    async fn resolve_playlist_url(&self, url: &str) -> Option<String> {
+        let path = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url)
+            .to_ascii_lowercase();
+        if !(path.ends_with(".m3u") || path.ends_with(".pls")) {
+            return None;
+        }
+        let body = crate::http::client::shared()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+        let inner = crate::library::m3u_parser::parse_m3u_content(&body, true)
+            .into_iter()
+            .map(|e| e.path)
+            .find(|p| {
+                let p = p.trim();
+                p.starts_with("http://") || p.starts_with("https://")
+            })?;
+        let inner = inner.trim().to_string();
+        if inner == url.trim() {
+            return None; // playlist pointed back at itself — nothing gained
+        }
+        info!(playlist = %url, stream = %inner, "radio_playlist_dereferenced");
+        Some(inner)
+    }
+
     async fn resolve_direct_url(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
-        let audio_url = req
+        let raw_url = req
             .source_id
             .as_deref()
             .ok_or("source_id (audio URL) required for podcast/radio playback")?;
+        // A station is often published as an .m3u/.pls PLAYLIST file rather than a
+        // direct stream. Dereference it to the real stream first, otherwise the
+        // decoder is fed the playlist text and no sound plays (Pascal). Cheap for
+        // a direct URL (extension gate, no network hit); keeps `raw_url` on any
+        // failure. Applies to every downstream radio path (local and network).
+        let resolved_playlist = self.resolve_playlist_url(raw_url).await;
+        let audio_url: &str = resolved_playlist.as_deref().unwrap_or(raw_url);
         let title = req.title.clone().unwrap_or_else(|| "Episode".into());
         let artist = req.artist_name.clone();
         let album = req.album_title.clone();

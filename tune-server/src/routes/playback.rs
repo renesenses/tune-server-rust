@@ -902,12 +902,41 @@ async fn play(
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
-        track_repo
+        let mut ids: Vec<i64> = track_repo
             .list_by_album(album_id)
             .unwrap_or_default()
             .iter()
             .filter_map(|t| t.id)
-            .collect()
+            .collect();
+        if ids.is_empty() {
+            // The clicked album row has no tracks. This happens when the flat
+            // Albums/Genres/Years grids surface a stale/duplicate album row whose
+            // tracks actually live under a sibling row of the same title+artist —
+            // the row the Artists view reaches. That mismatch is exactly why the
+            // same album played from Artists but returned 400 "no tracks to play"
+            // from those grids (Pascal, Totaldac, v0.9.21). Recover by resolving
+            // the populated sibling instead of hard-failing.
+            if let Some(sibling) =
+                tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+                    .find_populated_sibling(album_id)
+                    .ok()
+                    .flatten()
+            {
+                ids = track_repo
+                    .list_by_album(sibling)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t.id)
+                    .collect();
+                if !ids.is_empty() {
+                    info!(
+                        zone_id,
+                        album_id, sibling, "album_play_recovered_via_populated_sibling"
+                    );
+                }
+            }
+        }
+        ids
     } else if let Some(playlist_id) = body.playlist_id {
         tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
             .get_track_ids(playlist_id)
