@@ -3094,70 +3094,83 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                // Try to generate similar tracks based on the last played track
                 let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let seed_artist = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.artist_name.clone());
 
-                if let Some(seed_id) = seed_track_id {
+                // « Radio artistes similaires » : la graine est le NOM d'artiste,
+                // donc une écoute streaming (pas de track_id local) alimente
+                // aussi l'autoplay. Repli sur le générateur genre/BPM local si
+                // l'API d'enrichissement est injoignable ou ne matche rien dans
+                // la bibliothèque (Tune doit marcher sans mozaiklabs.fr).
+                let mut generated = Vec::new();
+                if let Some(ref artist) = seed_artist {
+                    info!(zone_id, artist = %artist, "autoplay_similar_artists_radio");
+                    generated = crate::playback::auto_dj::generate_similar_artists_queue(
+                        &self.db, artist, 10,
+                    )
+                    .await;
+                }
+                if generated.is_empty() {
+                    if let Some(seed_id) = seed_track_id {
+                        info!(
+                            zone_id,
+                            seed_track_id = seed_id,
+                            "autoplay_generating_tracks"
+                        );
+                        generated = crate::playback::auto_dj::generate_queue(&self.db, seed_id, 10);
+                    } else if seed_artist.is_none() {
+                        debug!(zone_id, "autoplay_skipped_no_seed");
+                    }
+                }
+
+                let track_ids: Vec<i64> = generated
+                    .iter()
+                    .filter_map(|t| t["track_id"].as_i64())
+                    .collect();
+
+                if !track_ids.is_empty() {
                     info!(
                         zone_id,
-                        seed_track_id = seed_id,
-                        "autoplay_generating_tracks"
+                        count = track_ids.len(),
+                        "autoplay_tracks_generated"
                     );
-                    let generated = crate::playback::auto_dj::generate_queue(&self.db, seed_id, 10);
 
-                    if !generated.is_empty() {
-                        let track_ids: Vec<i64> = generated
-                            .iter()
-                            .filter_map(|t| t["track_id"].as_i64())
-                            .collect();
-
-                        if !track_ids.is_empty() {
-                            info!(
-                                zone_id,
-                                count = track_ids.len(),
-                                "autoplay_tracks_generated"
-                            );
-
-                            // Append generated tracks to the play queue
-                            let queue_repo =
-                                crate::db::play_queue_repo::PlayQueueRepo::with_backend(
-                                    self.db.clone(),
-                                );
-                            if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
-                                warn!(zone_id, error = %e, "autoplay_append_queue_failed");
-                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-                                return;
-                            }
-
-                            // Emit autoplay_tracks_added event for UI updates
-                            if let Some(ref bus) = self.event_bus {
-                                bus.emit(
-                                    "playback.autoplay_tracks_added",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "track_ids": track_ids,
-                                        "tracks": generated,
-                                        "seed_track_id": seed_id,
-                                    }),
-                                );
-                            }
-
-                            // Play the first generated track (next position after current)
-                            let new_pos = zone_state.queue_position + 1;
-                            info!(zone_id, new_pos, "autoplay_starting_generated_track");
-                            if let Err(e) =
-                                self.orchestrator.play_from_queue(zone_id, new_pos).await
-                            {
-                                warn!(zone_id, error = %e, "autoplay_play_failed");
-                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-                            }
-                            return;
-                        }
+                    // Append generated tracks to the play queue
+                    let queue_repo =
+                        crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+                    if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
+                        warn!(zone_id, error = %e, "autoplay_append_queue_failed");
+                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        return;
                     }
-                    info!(zone_id, "autoplay_no_similar_tracks_found");
-                } else {
-                    debug!(zone_id, "autoplay_skipped_no_local_seed_track");
+
+                    // Emit autoplay_tracks_added event for UI updates
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "playback.autoplay_tracks_added",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "track_ids": track_ids,
+                                "tracks": generated,
+                                "seed_track_id": seed_track_id,
+                                "seed_artist": seed_artist,
+                            }),
+                        );
+                    }
+
+                    // Play the first generated track (next position after current)
+                    let new_pos = zone_state.queue_position + 1;
+                    info!(zone_id, new_pos, "autoplay_starting_generated_track");
+                    if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                        warn!(zone_id, error = %e, "autoplay_play_failed");
+                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                    }
+                    return;
                 }
+                info!(zone_id, "autoplay_no_similar_tracks_found");
             }
 
             // Log the queue geometry so a "doesn't advance to next track" report
