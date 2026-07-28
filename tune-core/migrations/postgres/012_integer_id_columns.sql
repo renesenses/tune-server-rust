@@ -77,7 +77,38 @@ DECLARE
   bad      BIGINT;
   seq      TEXT;
   maxid    BIGINT;
+  target_tables TEXT[];
+  trg      RECORD;
+  trg_defs TEXT[] := ARRAY[]::TEXT[];
+  tdef     TEXT;
 BEGIN
+  -- Build the set of tables this migration alters (pk ids + fk columns).
+  target_tables := pk_tables;
+  FOREACH c SLICE 1 IN ARRAY fk_cols LOOP
+    IF NOT (c[1] = ANY(target_tables)) THEN
+      target_tables := array_append(target_tables, c[1]);
+    END IF;
+  END LOOP;
+
+  -- PG refuses `ALTER COLUMN ... TYPE` on a column referenced by a trigger
+  -- definition. The FTS `*_search_tsv_trg` triggers (migration 002) list
+  -- id/artist_id/album_id in their `UPDATE OF` column set, so the very first
+  -- ALTER aborts the whole migration -> transactional rollback -> it re-runs
+  -- forever, bricking startup on EVERY SQLite->PG migrated database (JF,
+  -- v0.9.26). Capture every non-internal trigger on the target tables, drop
+  -- them, run the conversions, then recreate them verbatim from
+  -- pg_get_triggerdef so their behaviour is byte-for-byte unchanged.
+  FOR trg IN
+    SELECT cl.relname AS tbl, t.tgname AS name, pg_get_triggerdef(t.oid) AS def
+      FROM pg_trigger t
+      JOIN pg_class cl ON cl.oid = t.tgrelid
+     WHERE NOT t.tgisinternal
+       AND cl.relname = ANY(target_tables)
+  LOOP
+    trg_defs := array_append(trg_defs, trg.def);
+    EXECUTE format('DROP TRIGGER %I ON %I', trg.name, trg.tbl);
+  END LOOP;
+
   -- 1) Integer FK columns: cast text -> bigint (no sequence).
   FOREACH c SLICE 1 IN ARRAY fk_cols LOOP
     SELECT data_type, column_default INTO cur_type, col_def
@@ -137,6 +168,11 @@ BEGIN
         RAISE NOTICE 'migration 012: SKIP %.id (% non-integer values)', t, bad;
       END IF;
     END IF;
+  END LOOP;
+
+  -- Recreate the triggers now the columns are bigint (dependency re-attaches).
+  FOREACH tdef IN ARRAY trg_defs LOOP
+    EXECUTE tdef;
   END LOOP;
 END
 $migration$;
