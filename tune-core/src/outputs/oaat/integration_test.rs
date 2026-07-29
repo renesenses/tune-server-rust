@@ -233,10 +233,22 @@ mod tests {
         // Native DSD streaming: stage the next track as a local .dsf file.
         output.set_native_dsd_active_for_test(true);
         assert!(output.supports_internal_gapless());
+
         assert!(
             output.prefers_local_file_gapless(),
             "native DSD must use the local-file gapless path (no transcode session)"
         );
+
+        // PCM direct-file playback: PrepareNext is ignored on that loop, so
+        // NO internal gapless — the poller must advance at natural end
+        // (local→local sur zone OAAT : silence + piste rejouée, 29/07).
+        output.set_direct_pcm_active_for_test(true);
+        assert!(
+            !output.supports_internal_gapless(),
+            "direct PCM playback cannot chain internally — poller must advance"
+        );
+        output.set_direct_pcm_active_for_test(false);
+        assert!(output.supports_internal_gapless());
 
         // stop() leaves native-DSD mode (runs before the next play_media).
         output.stop().await.ok();
