@@ -80,6 +80,13 @@ impl RatingRepo {
         }
     }
 
+    /// Sets an album rating. `rating == 0` clears it.
+    ///
+    /// Zero is how the UI asks for removal: clicking the star that is already
+    /// lit toggles the rating off. It was rejected as out of range, so taking
+    /// a rating back failed with "rating must be 1-5" while the interface
+    /// reported a generic error. The rating row cannot hold a 0 anyway — the
+    /// schema constrains it to 1..=5 — so removal means deleting the row.
     pub fn rate_album(
         &self,
         album_id: i64,
@@ -87,8 +94,11 @@ impl RatingRepo {
         rating: i32,
         note: Option<&str>,
     ) -> Result<(), String> {
+        if rating == 0 {
+            return self.delete_rating(album_id, profile_id);
+        }
         if !(1..=5).contains(&rating) {
-            return Err("rating must be 1-5".into());
+            return Err("rating must be 0 (remove) or 1-5".into());
         }
         let sql = self.dialect_sql(sql::upsert_rating, sql::upsert_rating);
         let params: [&dyn ToSqlValue; 4] = [&album_id, &profile_id, &rating, &note];
@@ -168,7 +178,6 @@ mod tests {
 
         let repo = RatingRepo::new(db);
 
-        assert!(repo.rate_album(id1, 1, 0, None).is_err());
         assert!(repo.rate_album(id1, 1, 6, None).is_err());
 
         repo.rate_album(id1, 1, 5, Some("Chef-d'oeuvre")).unwrap();
@@ -221,9 +230,36 @@ mod tests {
         repo.rate_album(aid, 1, 5, None).unwrap();
         assert_eq!(repo.get_rating(aid, 1).unwrap().unwrap().rating, 5);
 
-        assert!(repo.rate_album(aid, 1, 0, None).is_err());
         assert!(repo.rate_album(aid, 1, 6, None).is_err());
         assert!(repo.rate_album(aid, 1, -1, None).is_err());
+    }
+
+    /// Zero means "take the rating back", which is what the star already lit
+    /// does in the interface. It used to be refused like 6 or -1.
+    #[test]
+    fn rating_zero_removes_the_rating() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let album_repo = AlbumRepo::new(db.clone());
+        let aid = album_repo.create(&Album::new("Test".into())).unwrap();
+
+        let repo = RatingRepo::new(db);
+        repo.rate_album(aid, 1, 4, Some("a revoir")).unwrap();
+        assert!(repo.get_rating(aid, 1).unwrap().is_some());
+
+        repo.rate_album(aid, 1, 0, None).unwrap();
+        assert!(repo.get_rating(aid, 1).unwrap().is_none());
+
+        // Retirer une note absente reste sans effet, et sans erreur : l'UI
+        // envoie ce cas des qu'un champ de commentaire vide perd le focus.
+        repo.rate_album(aid, 1, 0, None).unwrap();
+        assert!(repo.get_rating(aid, 1).unwrap().is_none());
+
+        // Et l'album reste notable ensuite.
+        repo.rate_album(aid, 1, 2, None).unwrap();
+        assert_eq!(repo.get_rating(aid, 1).unwrap().unwrap().rating, 2);
     }
 
     #[test]
