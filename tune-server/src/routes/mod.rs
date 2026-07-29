@@ -72,6 +72,7 @@ pub mod spotify_connect;
 pub mod squeezebox;
 pub mod stream_handler;
 pub mod streaming;
+pub mod support;
 pub mod system;
 pub mod tagger;
 pub mod tags;
@@ -349,6 +350,7 @@ pub fn router_with_plugins(
         .nest("/upnp", upnp::router())
         .nest("/auth", crate::auth::router())
         .nest("/cloud", cloud::router())
+        .nest("/support", support::router())
         .nest("/multi-server", multi_server::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
