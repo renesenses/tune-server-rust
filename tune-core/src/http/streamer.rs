@@ -427,6 +427,27 @@ impl AudioStreamer {
         self.sessions.clone()
     }
 
+    /// Taille totale du flux d'une session **fichier**, en octets.
+    ///
+    /// `info.file_size` s'il est renseigné, sinon la taille du fichier sur
+    /// disque — la même source que l'en-tête `Content-Length` servi au renderer.
+    /// Renvoie `None` pour une session sans fichier (radio, flux décodé à la
+    /// volée) : on ne peut alors rien conclure sur ce qui a été consommé.
+    ///
+    /// Sert à distinguer « le renderer a fini le morceau » de « le renderer a
+    /// calé » : on ne peut pas finir de jouer un fichier qu'on n'a pas reçu.
+    pub async fn stream_total_bytes(&self, stream_id: &str) -> Option<u64> {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() }?;
+        if session.is_radio {
+            return None;
+        }
+        if let Some(sz) = session.info.file_size {
+            return Some(sz);
+        }
+        let path = session.file_path.lock().await.clone()?;
+        tokio::fs::metadata(path).await.ok().map(|m| m.len())
+    }
+
     pub async fn stream_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         let sessions = self.sessions.lock().await;
         sessions
