@@ -384,6 +384,10 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
             let args: Vec<String> = std::env::args().skip(1).collect();
             // Let the final status-poll response flush before we swap the image.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Le lanceur pose TUNE_OPEN_BROWSER=1 ; l'image relancée l'hérite et
+            // ROUVRAIT un onglet alors que l'ancien se reconnecte déjà → deux
+            // onglets Tune à chaque mise à jour (Jean, forum #1236).
+            unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
             info!(exe = %exe.display(), "update_reexec");
             // exec() replaces this process on success and never returns.
             let err = std::process::Command::new(&exe).args(&args).exec();
@@ -567,6 +571,7 @@ fn install_windows(
          if exist \"{exe}\" goto swap_failed\r\n\
          rename \"{new}\" \"{exe_name}\"\r\n\
          echo Starting updated server...\r\n\
+         set \"TUNE_OPEN_BROWSER=0\"\r\n\
          start \"\" \"{exe}\"\r\n\
          del \"%~f0\"\r\n\
          goto :eof\r\n\
@@ -576,6 +581,7 @@ fn install_windows(
          echo The new version is staged next to it as {exe_name_new} — close Tune>> \"{err_file}\"\r\n\
          echo completely, delete {exe_name}, then rename {exe_name_new} to {exe_name}.>> \"{err_file}\"\r\n\
          echo Update failed - old binary locked. Details written to {err_file}\r\n\
+         set \"TUNE_OPEN_BROWSER=0\"\r\n\
          start \"\" \"{exe}\"\r\n",
         exe = current_exe.display(),
         new = new_staging.display(),

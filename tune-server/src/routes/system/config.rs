@@ -631,6 +631,9 @@ pub(super) async fn restart() -> impl IntoResponse {
             use std::os::unix::process::CommandExt;
             if let Ok(exe) = std::env::current_exe() {
                 let args: Vec<String> = std::env::args().skip(1).collect();
+                // Ne pas rouvrir le navigateur au redémarrage : l'onglet existant
+                // se reconnecte tout seul (Jean, forum #1236 — deux onglets).
+                unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
                 tracing::info!(exe = %exe.display(), "restart_reexec");
                 let err = std::process::Command::new(&exe).args(&args).exec();
                 // exec() only returns on failure → fall back to spawn+exit so a
@@ -665,6 +668,8 @@ pub(super) async fn restart() -> impl IntoResponse {
                 tracing::info!(exe = %exe.display(), "restart_windows_spawn");
                 match std::process::Command::new(&exe)
                     .args(&args)
+                    // Onglet existant déjà connecté — pas de nouvel onglet (#1236).
+                    .env_remove("TUNE_OPEN_BROWSER")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
