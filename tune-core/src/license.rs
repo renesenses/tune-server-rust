@@ -124,6 +124,20 @@ impl Feature {
 // License state
 // ---------------------------------------------------------------------------
 
+/// Live signal that the premium license is currently held by ANOTHER server
+/// (floating-license single-session model, à la Roon). Set by the heartbeat when
+/// the cloud answers `session_conflict:true`; runtime-only (never persisted) —
+/// the next heartbeat re-establishes the truth. While present it suppresses
+/// premium *here* regardless of the key/account being otherwise valid, and it
+/// carries just enough context for the UI to explain why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConflict {
+    /// Label (or server_id) of the server currently holding the session.
+    pub active_server: Option<String>,
+    /// ISO-8601 timestamp of that server's last heartbeat.
+    pub active_since: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LicenseState {
     pub tier: Tier,
@@ -154,6 +168,11 @@ pub struct LicenseState {
     /// and offline starts; refreshed by the cloud validation loop.
     #[serde(default)]
     pub modules: Vec<String>,
+    /// Live single-session conflict: `Some` while another server holds the
+    /// floating license. Runtime-only — never loaded from settings, so a restart
+    /// starts clean and the next heartbeat restores it if still in conflict.
+    #[serde(default)]
+    pub session_conflict: Option<SessionConflict>,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +288,7 @@ impl LicenseManager {
             account_premium_checked,
             qobuz_proxy_first,
             modules,
+            session_conflict: None,
         };
 
         Self {
@@ -473,6 +493,41 @@ impl LicenseManager {
         self.state.read().await.modules.clone()
     }
 
+    /// Record that the floating license is currently held by ANOTHER server
+    /// (the cloud answered `session_conflict:true`). This gates the effective
+    /// tier down to Free here — an authoritative "not now" — WITHOUT touching the
+    /// key or `last_validated`, so premium snaps back the moment the other server
+    /// stops pinging and the conflict clears. Runtime-only; not persisted.
+    pub async fn set_session_conflict(
+        &self,
+        active_server: Option<String>,
+        active_since: Option<String>,
+    ) {
+        let mut state = self.state.write().await;
+        let was_clear = state.session_conflict.is_none();
+        state.session_conflict = Some(SessionConflict {
+            active_server,
+            active_since,
+        });
+        if was_clear {
+            warn!("license_session_conflict_set (premium suppressed: held by another server)");
+        }
+    }
+
+    /// Clear a previously recorded session conflict (this server (re)took the
+    /// session, or the cloud no longer reports a conflict). No-op if none set.
+    pub async fn clear_session_conflict(&self) {
+        let mut state = self.state.write().await;
+        if state.session_conflict.take().is_some() {
+            info!("license_session_conflict_cleared (session reclaimed here)");
+        }
+    }
+
+    /// Current session conflict, if the license is held elsewhere right now.
+    pub async fn session_conflict(&self) -> Option<SessionConflict> {
+        self.state.read().await.session_conflict.clone()
+    }
+
     /// Clear the account premium (SSO logout / disconnect). The license-key path
     /// is untouched.
     pub async fn clear_account_premium(&self) {
@@ -649,7 +704,16 @@ fn key_premium_active(state: &LicenseState) -> bool {
 
 /// Effective tier = Premium if the license key is premium OR the account premium
 /// (SSO) is active. Otherwise Free.
+///
+/// A live single-session conflict overrides everything: while another server
+/// holds the floating license, premium is suppressed here even though the key /
+/// account are otherwise valid. This is what enforces "one active session at a
+/// time" — and, unlike a transient `license_valid:false`, it is authoritative,
+/// so it is NOT softened by the offline grace window.
 fn effective_tier(state: &LicenseState) -> Tier {
+    if state.session_conflict.is_some() {
+        return Tier::Free;
+    }
     if key_premium_active(state) || account_premium_active(state) {
         Tier::Premium
     } else {
@@ -771,6 +835,7 @@ mod tests {
             account_premium_checked,
             qobuz_proxy_first: false,
             modules: vec![],
+            session_conflict: None,
         }
     }
 
@@ -790,6 +855,7 @@ mod tests {
             account_premium_checked: None,
             qobuz_proxy_first: false,
             modules: vec![],
+            session_conflict: None,
         }
     }
 
@@ -934,6 +1000,88 @@ mod tests {
             )),
             Tier::Premium
         );
+    }
+
+    // ---- effective_tier / single-session conflict (floating license) ----
+
+    #[test]
+    fn effective_free_during_session_conflict_even_with_valid_key() {
+        // The key is otherwise premium (validated now, no expiry) but another
+        // server holds the session → suppressed to Free here. This is the whole
+        // point of the floating-license single-session rule.
+        let mut s = key_state(Tier::Premium, None, Some(now_iso()));
+        s.session_conflict = Some(SessionConflict {
+            active_server: Some("Maison Paris".into()),
+            active_since: Some(now_iso()),
+        });
+        assert_eq!(effective_tier(&s), Tier::Free);
+    }
+
+    #[test]
+    fn effective_free_during_session_conflict_even_with_account_premium() {
+        // Account (SSO) premium is likewise gated off while another server holds
+        // the session — the conflict overrides both premium sources.
+        let mut s = state(Tier::Free, true, None, Some(now_iso()));
+        s.session_conflict = Some(SessionConflict {
+            active_server: None,
+            active_since: None,
+        });
+        assert_eq!(effective_tier(&s), Tier::Free);
+    }
+
+    #[test]
+    fn effective_premium_restored_when_conflict_clears() {
+        // Clearing the conflict brings premium straight back — the key/account
+        // were never touched, only gated.
+        let mut s = key_state(Tier::Premium, None, Some(now_iso()));
+        s.session_conflict = Some(SessionConflict {
+            active_server: None,
+            active_since: None,
+        });
+        assert_eq!(effective_tier(&s), Tier::Free);
+        s.session_conflict = None;
+        assert_eq!(effective_tier(&s), Tier::Premium);
+    }
+
+    #[tokio::test]
+    async fn set_and_clear_session_conflict_gates_the_manager() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new(backend);
+
+        mgr.set_license_key("TUNE-TEST-1234").await.unwrap();
+        assert!(mgr.is_premium().await, "premium after activation");
+
+        mgr.set_session_conflict(Some("Maison 2".into()), None)
+            .await;
+        assert!(
+            !mgr.is_premium().await,
+            "premium suppressed while held elsewhere"
+        );
+        assert!(mgr.session_conflict().await.is_some());
+        // The key itself is untouched — the tier snapshot is Free but the key
+        // survives underneath.
+        assert!(mgr.license_state().await.license_key.is_some());
+
+        mgr.clear_session_conflict().await;
+        assert!(mgr.is_premium().await, "premium restored once reclaimed");
+        assert!(mgr.session_conflict().await.is_none());
+    }
+
+    #[test]
+    fn license_state_parses_without_session_conflict() {
+        // Retro-compat: a cached/legacy state blob without the field → None.
+        let json = r#"{
+            "tier": "premium",
+            "license_key": "TUNE-X",
+            "expires_at": null,
+            "last_validated": null,
+            "hardware_fingerprint": "test"
+        }"#;
+        let state: LicenseState = serde_json::from_str(json).unwrap();
+        assert!(state.session_conflict.is_none());
     }
 
     #[test]

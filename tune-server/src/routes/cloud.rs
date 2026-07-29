@@ -850,6 +850,16 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         Some(state.license.free_zone_limit())
     };
 
+    // Floating-license single-session model: when set, `tier` above is already
+    // Free (premium is gated off here) and this object tells the UI WHY — the
+    // license is currently active on another of the user's servers.
+    let session_conflict = ls.session_conflict.as_ref().map(|c| {
+        json!({
+            "active_server": c.active_server,
+            "active_since": c.active_since,
+        })
+    });
+
     Json(json!({
         "tier": ls.tier,
         "license_key": ls.license_key,
@@ -858,6 +868,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         "hardware_fingerprint": ls.hardware_fingerprint,
         "features": features,
         "zone_limit": zone_limit,
+        "session_conflict": session_conflict,
     }))
 }
 
