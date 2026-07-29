@@ -177,7 +177,15 @@ pub fn match_fuzzy(
         let title_sim = similarity(&norm_title, &ct);
         let artist_sim = similarity(&norm_artist, &ca);
 
-        let mut score = title_sim * 0.5 + artist_sim * 0.4;
+        // Artiste inconnu côté requête (favoris radio ICY, tags pauvres) : le
+        // 0.4 d'artiste est mathématiquement perdu et le score plafonne à 0.5,
+        // sous TOUT seuil utile — même un titre parfait était rejeté (forum
+        // #1234). Sans artiste, le titre porte l'essentiel du score.
+        let mut score = if norm_artist.is_empty() {
+            title_sim * 0.9
+        } else {
+            title_sim * 0.5 + artist_sim * 0.4
+        };
 
         if duration_ms > 0 && c.duration_ms > 0 {
             let dur_diff = (duration_ms - c.duration_ms).unsigned_abs() as f64;
@@ -283,6 +291,31 @@ mod tests {
     fn similarity_similar() {
         let s = similarity("bohemian rhapsody", "bohemian rapsody");
         assert!(s > 0.8);
+    }
+
+    #[test]
+    fn fuzzy_empty_artist_title_carries_the_score() {
+        // Favori radio sans artiste : un titre quasi exact doit matcher (le
+        // score plafonnait à 0.5 < 0.7 et TOUT était rejeté, forum #1234).
+        let cand = |title: &str, artist: &str| MatchCandidate {
+            title: title.into(),
+            artist_name: artist.into(),
+            album_title: String::new(),
+            source_id: "1".into(),
+            duration_ms: 200_000,
+            isrc: String::new(),
+            score: 0.0,
+            match_method: String::new(),
+            confidence: String::new(),
+        };
+
+        let good = vec![cand("Summertime", "Ella Fitzgerald")];
+        let m = match_fuzzy("Summertime", "", 0, &good, 0.6).expect("titre exact doit matcher");
+        assert!(m.score >= 0.85, "score = {}", m.score);
+
+        // Un titre franchement différent reste rejeté même sans artiste.
+        let bad = vec![cand("Complètement autre chose", "Ella Fitzgerald")];
+        assert!(match_fuzzy("Summertime", "", 0, &bad, 0.6).is_none());
     }
 
     #[test]

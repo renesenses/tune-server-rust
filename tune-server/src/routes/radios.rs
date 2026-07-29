@@ -862,6 +862,25 @@ async fn create_playlist_from_favorites(
         favorites
     };
 
+    // Beaucoup de radios livrent tout dans le StreamTitle ICY : le favori
+    // arrive alors avec artist vide et title « Artiste - Titre ». Découper
+    // avant matching, sinon le titre composite ne ressemble à aucun vrai
+    // titre et rien ne matche (forum #1234, Xavier).
+    let favorites: Vec<(String, String)> = favorites
+        .into_iter()
+        .map(|(title, artist)| {
+            if artist.trim().is_empty() {
+                if let Some((a, t)) = title.split_once(" - ") {
+                    let (a, t) = (a.trim(), t.trim());
+                    if !a.is_empty() && !t.is_empty() {
+                        return (t.to_string(), a.to_string());
+                    }
+                }
+            }
+            (title, artist)
+        })
+        .collect();
+
     // Streaming target: resolve each favorite onto the service (smart-matched,
     // ISRC-aware) and build the playlist there — Hi-Res where the service offers it.
     let target = service.unwrap_or_else(|| "local".into());
