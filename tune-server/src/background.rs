@@ -1267,6 +1267,13 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 Ok((zid, false)) => {
                     let _ = zone_repo.set_online_by_device(device_id, true);
                     debug!(zone_id = zid, device_id = %device_id, "local_audio_zone_set_online");
+                    // Même soin d'étiquette générique qu'au démarrage (#1233).
+                    if !is_default
+                        && let Ok(n) = zone_repo.rename_generic_local_label(zid, dev_name)
+                        && n > 0
+                    {
+                        info!(zone_id = zid, name = %dev_name, "local_zone_generic_label_healed");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(name = %zone_name, device_id = %device_id, error = %e, "local_audio_hotplug_zone_create_failed");

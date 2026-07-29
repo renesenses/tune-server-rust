@@ -71,6 +71,15 @@ pub mod sql {
         )
     }
 
+    pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET name = {} \
+             WHERE id = {} AND name IN ('This Computer', 'Cet ordinateur')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET is_hidden = 1 WHERE id = {}",
@@ -645,6 +654,24 @@ impl ZoneRepo {
         let val: String = if online { "1".into() } else { "0".into() };
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
+        self.db.execute(&sql, &params)
+    }
+
+    /// Rename a LOCAL zone stuck on the generic default label ("This
+    /// Computer" / "Cet ordinateur") to its device name. Older versions named
+    /// EVERY local zone with the generic label, so a machine with several
+    /// DACs showed indistinguishable twins (forum #1233, Alain Bonnel). Only
+    /// the exact generic labels are touched — a user-renamed zone never is.
+    pub fn rename_generic_local_label(
+        &self,
+        zone_id: i64,
+        device_name: &str,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::rename_generic_local_label,
+            sql::rename_generic_local_label,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&device_name, &zone_id];
         self.db.execute(&sql, &params)
     }
 
