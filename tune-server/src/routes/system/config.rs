@@ -952,21 +952,30 @@ pub(super) async fn set_license(
     State(state): State<AppState>,
     Json(body): Json<LicenseBody>,
 ) -> impl IntoResponse {
-    match state.license.set_license_key(&body.key).await {
-        Ok(()) => Json(json!({
-            "status": "ok",
-            "tier": "premium",
-        }))
-        .into_response(),
-        Err(e) => (
+    // Store the key as "pending" (no Premium granted yet), then confirm it with
+    // the licensing server before unlocking anything. A fake key therefore never
+    // unlocks Premium, while a genuine key is activated in this same round-trip.
+    if let Err(e) = state.license.set_license_key(&body.key).await {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "status": "error",
-                "message": e,
-            })),
+            Json(json!({"status": "error", "message": e})),
         )
-            .into_response(),
+            .into_response();
     }
+
+    let tier = crate::routes::cloud::validate_stored_license(&state).await;
+    let premium = tier == tune_core::license::Tier::Premium;
+    let ls = state.license.license_state().await;
+    Json(json!({
+        "status": if premium { "ok" } else { "pending" },
+        "tier": ls.tier,
+        "message": if premium {
+            "Licence validée : Premium activé."
+        } else {
+            "Clé enregistrée. Premium s'activera dès qu'elle sera validée en ligne (vérifiez votre connexion et la clé)."
+        },
+    }))
+    .into_response()
 }
 
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
