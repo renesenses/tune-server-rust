@@ -203,6 +203,40 @@ fn read_file_with_retry(
     }
 }
 
+/// Best-effort DSD (DSF/DFF) duration from the file header, bounded so a stalled
+/// mount can't re-hang the scan. Used only in the timeout fallback: even when
+/// lofty's full tag read timed out (big embedded art over slow storage), the
+/// ~92-byte DSD header usually still reads fine, so the track gets a real
+/// duration in the library instead of 0 — a 0 disables gapless/advance/prefetch
+/// downstream (the DSD testers' slow-storage libraries: Philippe Landes' 20k
+/// DSD tracks). Play-time backfill (resolve_local_track) already repairs it on
+/// first play; this fixes the library display up front. `None` for non-DSD, on
+/// any parse error, or if even the header read times out.
+fn probe_dsd_header_duration_bounded(path: &std::path::Path) -> Option<u64> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "dsf" && ext != "dff" {
+        return None;
+    }
+    let p = path.to_string_lossy().to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let dur = if p.to_ascii_lowercase().ends_with(".dff") {
+            crate::audio::dff::parse_dff(&p)
+                .ok()
+                .and_then(|i| i.duration_ms())
+        } else {
+            crate::audio::dsf::parse_dsf(&p)
+                .ok()
+                .and_then(|i| i.duration_ms())
+        };
+        let _ = tx.send(dur);
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .ok()
+        .flatten()
+        .filter(|&d| d > 0)
+}
+
 fn read_file_with_timeout(
     path: &PathBuf,
     with_hash: bool,
@@ -523,7 +557,18 @@ pub fn scan_files_parallel(
                         "scan_file_timeout — tag read timed out, indexing with filename metadata"
                     );
                     timeout_counter.fetch_add(1, Ordering::Relaxed);
-                    (Some(tagless_fallback_no_props(path)), None)
+                    let mut meta = tagless_fallback_no_props(path);
+                    // The full tag read timed out, but the tiny DSD header
+                    // usually still reads — recover the duration so a slow-storage
+                    // DSD track isn't left at 0 in the library (a 0 breaks
+                    // gapless/advance/prefetch). Bounded; non-DSD relies on the
+                    // play-time backfill.
+                    if meta.duration_ms.is_none_or(|d| d == 0) {
+                        if let Some(d) = probe_dsd_header_duration_bounded(path) {
+                            meta.duration_ms = Some(d);
+                        }
+                    }
+                    (Some(meta), None)
                 }
                 Err(ref err) => {
                     warn!(
