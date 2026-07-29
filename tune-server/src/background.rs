@@ -741,7 +741,49 @@ fn spawn_heartbeat(state: &AppState) {
                     // absent (old server, 204, empty body, etc.) we keep the
                     // cached state unchanged.
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        if let Some(tier_str) = body.get("license_tier").and_then(|v| v.as_str()) {
+                        // Floating-license single-session model: the cloud tells
+                        // us when this key is currently held by ANOTHER server.
+                        // Unlike a bare `license_valid:false` (which can be a
+                        // transient re-binding and is softened by the offline
+                        // grace), a session conflict is authoritative "not now":
+                        // suppress premium here immediately, but keep the key and
+                        // `last_validated` intact so premium snaps back once the
+                        // other server stops pinging and the conflict clears.
+                        let session_conflict = body
+                            .get("session_conflict")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+
+                        if session_conflict {
+                            let active_server = body
+                                .get("active_server")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let active_since = body
+                                .get("active_since")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            license
+                                .set_session_conflict(active_server.clone(), active_since.clone())
+                                .await;
+                            warn!(
+                                active_server = ?active_server,
+                                "license_session_conflict_held_elsewhere"
+                            );
+                            event_bus.emit(
+                                "license.session_conflict",
+                                serde_json::json!({
+                                    "active_server": active_server,
+                                    "active_since": active_since,
+                                }),
+                            );
+                        } else if let Some(tier_str) =
+                            body.get("license_tier").and_then(|v| v.as_str())
+                        {
+                            // No conflict reported → make sure any prior conflict
+                            // is cleared before applying the normal verdict.
+                            license.clear_session_conflict().await;
+
                             let valid = body
                                 .get("license_valid")
                                 .and_then(|v| v.as_bool())
