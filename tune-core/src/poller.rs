@@ -681,6 +681,13 @@ pub mod fsm {
         pub stopped_ticks: u8,
         pub natural_end: bool,
         pub gapless_sent: bool,
+        /// Whether the output can transition internally (live probe). For an
+        /// exclusive local output or the OAAT direct-file loop, `gapless_sent`
+        /// is only a re-arm suppressor — no internal transition ever comes, so
+        /// the natural end must advance instead of waiting (the actual branch
+        /// already probes this; without it the shadow predicted
+        /// NaturalEndGaplessWaiting on every OAAT direct-path track end).
+        pub can_internal_gapless: bool,
         pub stream_consuming: bool,
         /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
         /// DSD track on a DLNA renderer whose peak position reached the end.
@@ -737,7 +744,7 @@ pub mod fsm {
         let stopped_ticks = i.stopped_ticks.saturating_add(1);
         if stopped_ticks >= STOPPED_TICKS_THRESHOLD {
             if i.natural_end {
-                return if i.gapless_sent {
+                return if i.gapless_sent && i.can_internal_gapless {
                     NaturalEndGaplessWaiting
                 } else {
                     NaturalEndAdvance
@@ -862,6 +869,7 @@ pub mod fsm {
                 stopped_ticks: 0,
                 natural_end: false,
                 gapless_sent: false,
+                can_internal_gapless: true,
                 stream_consuming: false,
                 dlna_dsd_reached_end: false,
             }
@@ -922,6 +930,32 @@ pub mod fsm {
                     ..base()
                 }),
                 StoppedOutcome::Ignore
+            );
+        }
+
+        #[test]
+        fn natural_end_advances_when_output_cannot_chain_internally() {
+            // gapless_sent posé par le chemin « skip » (sortie exclusive ou
+            // boucle directe OAAT) : pas de transition interne possible — la
+            // fin naturelle doit avancer, pas attendre (divergence shadow-FSM
+            // observée à chaque fin de piste locale OAAT, 29/07).
+            let i = StoppedInput {
+                natural_end: true,
+                gapless_sent: true,
+                can_internal_gapless: false,
+                stopped_ticks: STOPPED_TICKS_THRESHOLD,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::NaturalEndAdvance);
+
+            // Avec transition interne possible, le comportement historique reste.
+            let i2 = StoppedInput {
+                can_internal_gapless: true,
+                ..i
+            };
+            assert_eq!(
+                classify_stopped(&i2),
+                StoppedOutcome::NaturalEndGaplessWaiting
             );
         }
 
@@ -2458,6 +2492,9 @@ impl PositionPoller {
                             track_duration_ms,
                         ),
                         gapless_sent: ps.gapless_sent,
+                        // Refined by the natural-end branch below (live probe),
+                        // same late-update pattern as stream_consuming.
+                        can_internal_gapless: true,
                         stream_consuming: false,
                         dlna_dsd_reached_end,
                     };
@@ -2619,13 +2656,16 @@ impl PositionPoller {
                                 // (DEvir: repeat fails on clean ASIO playback).
                                 // Only wait when the output can actually
                                 // transition internally; otherwise end normally.
-                                let awaiting_dlna_transition = ps.gapless_sent && {
+                                let can_internal_gapless = {
                                     let outputs = self.outputs.lock().await;
                                     match outputs.get(&device_id) {
                                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                                         None => false,
                                     }
                                 };
+                                fsm_in.can_internal_gapless = can_internal_gapless;
+                                let awaiting_dlna_transition =
+                                    ps.gapless_sent && can_internal_gapless;
                                 if awaiting_dlna_transition {
                                     fsm_actual =
                                         Some(fsm::StoppedOutcome::NaturalEndGaplessWaiting);
