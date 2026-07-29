@@ -551,8 +551,19 @@ pub async fn register_local_outputs(state: &AppState) {
                         "local_audio_zone_auto_created"
                     );
                 }
-                Ok((_zid, false)) => {
+                Ok((zid, false)) => {
                     let _ = zone_repo.set_online_by_device(&device_id, true);
+                    // Zones héritées : les anciennes versions nommaient TOUTES
+                    // les zones locales « This Computer » — deux DAC devenaient
+                    // des jumelles indiscernables (forum #1233, Alain). Un DAC
+                    // non-défaut coincé sur l'étiquette générique prend le nom
+                    // du périphérique ; un nom personnalisé n'est jamais touché.
+                    if !dev.is_default
+                        && let Ok(n) = zone_repo.rename_generic_local_label(zid, &dev.name)
+                        && n > 0
+                    {
+                        info!(zone_id = zid, name = %dev.name, "local_zone_generic_label_healed");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(

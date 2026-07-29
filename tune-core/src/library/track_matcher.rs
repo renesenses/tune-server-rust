@@ -74,6 +74,20 @@ fn strip_suffixes(text: &str) -> String {
         "(mono)",
         "(stereo)",
         "- remastered",
+        // Featured-artist markers: radios and streaming services disagree wildly
+        // on these (FIP says "Title (feat. X)", Qobuz says "Title"), so a real
+        // match scored too low on the title and was rejected (forum #1235). Drop
+        // the marker on both sides so the core titles line up. `find` is
+        // lowercased upstream, and the space/paren prefixes avoid clipping a word
+        // that merely starts with "ft"/"feat".
+        "(feat",
+        "[feat",
+        " feat.",
+        " feat ",
+        " featuring ",
+        "(ft",
+        " ft.",
+        " ft ",
     ];
     for pat in patterns {
         if let Some(pos) = result.find(pat) {
@@ -267,6 +281,45 @@ mod tests {
     #[test]
     fn normalize_accents() {
         assert_eq!(normalize("Café résumé"), "cafe resume");
+    }
+
+    #[test]
+    fn normalize_strips_featured_artist() {
+        // forum #1235: FIP tags "Title (feat. X)", Qobuz returns "Title".
+        assert_eq!(
+            normalize("Under the strikes (feat. Tony Allen)"),
+            "under the strikes"
+        );
+        assert_eq!(normalize("So What feat. Someone"), "so what");
+        assert_eq!(normalize("Song ft. Guest"), "song");
+    }
+
+    #[test]
+    fn fuzzy_matches_across_featured_artist_marker() {
+        // Reivax's exact case (forum #1235): favorite title carries "(feat. …)",
+        // Qobuz's does not; artist is present. Before stripping feat, the title
+        // similarity dragged the score to ~0.63 < 0.7 and the correct track was
+        // rejected. Now the core titles line up → an exact match.
+        let cand = MatchCandidate {
+            title: "Under The Strikes".into(),
+            artist_name: "Yannis & The Yaw".into(),
+            album_title: String::new(),
+            source_id: "1".into(),
+            duration_ms: 0,
+            isrc: String::new(),
+            score: 0.0,
+            match_method: String::new(),
+            confidence: String::new(),
+        };
+        let m = find_best_match(
+            "Under the strikes (feat. Tony Allen)",
+            "Yannis & The Yaw",
+            "",
+            0,
+            &[cand],
+        );
+        assert_eq!(m.status, "matched", "score should clear the bar");
+        assert!(m.best_match.is_some());
     }
 
     #[test]
