@@ -163,7 +163,12 @@ pub struct LicenseState {
 /// Free-tier zone cap when not overridden. Configurable at runtime via
 /// `TUNE_FREE_MAX_ZONES` (see `TuneConfig`); premium is always unlimited.
 const DEFAULT_FREE_MAX_ZONES: i64 = 3;
-const GRACE_PERIOD_DAYS: i64 = 30;
+// Offline grace once a key HAS been validated online at least once. Shortened
+// from 30 to 14 days: enough tolerance for an intermittently-connected server,
+// but a revoked or lapsed key falls back to Free sooner. The initial online
+// validation is now mandatory (see `set_license_key`), so this only governs
+// re-validation, never first activation.
+const GRACE_PERIOD_DAYS: i64 = 14;
 
 // ---------------------------------------------------------------------------
 // LicenseManager
@@ -308,22 +313,35 @@ impl LicenseManager {
         snapshot
     }
 
-    /// Store a license key and set tier to Premium.
-    /// Actual server-side validation happens via heartbeat later.
+    /// Store a license key **without** granting Premium.
+    ///
+    /// The tier is only promoted to Premium once the licensing server confirms
+    /// the key — via `update_from_server`, called by the heartbeat or an
+    /// immediate `/cloud/license/validate` right after this. Previously this
+    /// stamped `license_tier=premium` + `last_validated=now`, which let ANY
+    /// string unlock Premium locally for the whole 30-day offline grace with no
+    /// server round-trip (a free-ride that survived even a `license_valid:false`
+    /// verdict). Now a key stays "pending" (Free) until a genuine online
+    /// validation succeeds, so a fake key never unlocks anything. Legit users
+    /// are promoted within one validation round-trip.
     pub async fn set_license_key(&self, key: &str) -> Result<(), String> {
         let settings = SettingsRepo::with_backend(self.db.clone());
         settings.set("license_key", key)?;
-        settings.set("license_tier", "premium")?;
-
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        settings.set("license_last_validated", &now)?;
+        // Pending until validated: do NOT set premium or stamp a validation.
+        // Clear any stale timestamp so a re-entered key can't ride a previous
+        // key's grace window.
+        settings.set("license_tier", "free")?;
+        settings.delete("license_last_validated").ok();
 
         let mut state = self.state.write().await;
         state.license_key = Some(key.to_string());
-        state.tier = Tier::Premium;
-        state.last_validated = Some(now);
+        state.tier = Tier::Free;
+        state.last_validated = None;
 
-        info!(key_prefix = &key[..key.len().min(8)], "license_key_set");
+        info!(
+            key_prefix = &key[..key.len().min(8)],
+            "license_key_stored_pending_validation"
+        );
         Ok(())
     }
 
@@ -952,14 +970,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_and_clear_license() {
+    async fn set_key_is_pending_until_validated_then_clear() {
         let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let mgr = LicenseManager::new(backend);
 
+        // Storing a key must NOT grant Premium on its own: any string would
+        // otherwise unlock Premium locally for the whole grace window with no
+        // server round-trip. It stays Free ("pending") until validated online.
         mgr.set_license_key("TUNE-TEST-1234").await.unwrap();
+        assert_eq!(mgr.tier().await, Tier::Free, "pending key must stay Free");
+        assert!(!mgr.is_premium().await);
+        assert!(!mgr.check_feature(Feature::CloudRelay).await);
+
+        // A genuine server confirmation (heartbeat / on-demand validate) promotes it.
+        mgr.update_from_server(Tier::Premium, None).await;
         assert_eq!(mgr.tier().await, Tier::Premium);
         assert!(mgr.is_premium().await);
         assert!(mgr.check_feature(Feature::CloudRelay).await);
@@ -967,6 +994,28 @@ mod tests {
 
         mgr.clear_license().await;
         assert_eq!(mgr.tier().await, Tier::Free);
+        assert!(!mgr.is_premium().await);
+    }
+
+    #[tokio::test]
+    async fn premium_tier_without_validation_is_inactive_across_restart() {
+        // Simulate a stale/forged state: tier=premium persisted but no validation
+        // timestamp. On (re)load the effective tier must be Free, not Premium.
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings.set("license_key", "TUNE-FORGED-0000").unwrap();
+        settings.set("license_tier", "premium").unwrap();
+        // Note: deliberately NO license_last_validated.
+
+        let mgr = LicenseManager::new(backend);
+        assert_eq!(
+            mgr.tier().await,
+            Tier::Free,
+            "premium without a validation timestamp must degrade to Free"
+        );
         assert!(!mgr.is_premium().await);
     }
 

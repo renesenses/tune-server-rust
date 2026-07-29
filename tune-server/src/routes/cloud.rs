@@ -898,6 +898,74 @@ async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"status": "deactivated", "tier": "free"}))
 }
 
+/// Validate the currently-stored license key against mozaiklabs.fr and apply
+/// the authoritative tier via `update_from_server`. Returns the effective tier
+/// afterwards. On an unreachable/erroring server it leaves the cached tier
+/// untouched (a freshly-entered, still-pending key therefore stays Free until a
+/// genuine online confirmation). Shared by the on-demand validate route and the
+/// "set key" route so a newly-entered key is confirmed immediately instead of
+/// unlocking Premium locally with no server round-trip.
+pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::license::Tier {
+    let ls = state.license.license_state().await;
+    let Some(key) = ls.license_key.clone() else {
+        return tune_core::license::Tier::Free;
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+    let payload = json!({
+        "license_key": key,
+        "hardware_fingerprint": ls.hardware_fingerprint,
+        "server_id": server_id,
+        "version": tune_core::version(),
+    });
+
+    let resp = state
+        .http_client
+        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload)
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return state.license.tier().await;
+    };
+    if !resp.status().is_success() {
+        return state.license.tier().await;
+    }
+    let Ok(body) = resp.json::<Value>().await else {
+        return state.license.tier().await;
+    };
+
+    // Default false: a missing verdict must NOT unlock a pending key.
+    let valid = body
+        .get("license_valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !valid {
+        // Server rejects it → keep the (Free/pending) cached tier; do not grant.
+        return state.license.tier().await;
+    }
+
+    let tier = match body.get("license_tier").and_then(|v| v.as_str()) {
+        Some("premium") => tune_core::license::Tier::Premium,
+        _ => tune_core::license::Tier::Free,
+    };
+    let expires_at = body
+        .get("license_expires_at")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    state
+        .license
+        .update_from_server(tier, expires_at.clone())
+        .await;
+    state.event_bus.emit(
+        "license.updated",
+        json!({"tier": tier, "expires_at": expires_at}),
+    );
+    tier
+}
+
 /// POST /cloud/license/validate
 ///
 /// Triggers an immediate license validation against mozaiklabs.fr.
