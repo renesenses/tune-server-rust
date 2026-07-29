@@ -2677,6 +2677,12 @@ impl PlaybackOrchestrator {
             let zone_id = req.zone_id;
             let streamer_for_eof = self.streamer.clone();
             let session_id_for_eof = session_id.clone();
+            // Seek d'une piste streaming (Qobuz/Tidal) sur sortie locale/OAAT :
+            // le chemin local passait déjà l'offset au décodeur, celui-ci
+            // repartait TOUJOURS de zéro — l'audio recommençait au début alors
+            // que l'UI affichait la position demandée (repros Hard To Say
+            // Goodbye 405s et Bina 1015s, .18, 28/07).
+            let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
 
             // Detect file:// URLs from DASH multi-segment downloads — the fMP4
             // is already on disk, skip the HTTP download step.
@@ -2782,7 +2788,7 @@ impl PlaybackOrchestrator {
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
                 let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                    crate::audio::decode::decode_to_pcm_streaming_seeked(
                         &tmp_file_clone,
                         Some(sr),
                         Some(2),
@@ -2791,6 +2797,7 @@ impl PlaybackOrchestrator {
                         32768,
                         data_ready,
                         levels_tx,
+                        seek_s,
                     )
                 })
                 .await;
