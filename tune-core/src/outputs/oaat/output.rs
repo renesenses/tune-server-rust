@@ -91,6 +91,16 @@ pub struct OaatOutput {
     /// working internal gapless. Set when the native DSD path commits; reset by
     /// `stop()` (called at the start of every `play_media`).
     native_dsd_active: Arc<AtomicBool>,
+    /// True while the PCM/FLAC direct-file playback loop runs. That loop
+    /// explicitly ignores `OaatCommand::PrepareNext` ("Seek/PrepareNext/etc.
+    /// are not handled on the direct path") and ends with LAST_PACKET + Stop
+    /// + return — no internal transition is possible there. While set,
+    /// `supports_internal_gapless()` reports false so the poller advances the
+    /// queue itself at natural end instead of waiting forever for a
+    /// transition that never comes (« le morceau suivant ne démarre pas, le
+    /// dernier est rejoué » — local→local sur zone OAAT, .18, 29/07). Reset
+    /// by `stop()` (called at the start of every `play_media`).
+    direct_pcm_active: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -125,6 +135,7 @@ impl OaatOutput {
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             native_dsd_active: Arc::new(AtomicBool::new(false)),
+            direct_pcm_active: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(800)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
@@ -149,6 +160,11 @@ impl OaatOutput {
     #[cfg(test)]
     pub(crate) fn set_native_dsd_active_for_test(&self, active: bool) {
         self.native_dsd_active.store(active, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_direct_pcm_active_for_test(&self, active: bool) {
+        self.direct_pcm_active.store(active, Ordering::SeqCst);
     }
 
     pub fn diagnostics_snapshot(&self) -> serde_json::Value {
@@ -301,7 +317,11 @@ impl OutputTarget for OaatOutput {
     ///   (native DSD)"). If the next track isn't a compatible native DSD file,
     ///   the loop ends cleanly and the poller's natural-end fallback advances.
     fn supports_internal_gapless(&self) -> bool {
-        true
+        // The PCM/FLAC direct-file loop cannot chain internally (PrepareNext
+        // ignored, ends with Stop + return): the poller must advance at
+        // natural end. Every other path (HTTP stream, native DSD dsf-swap)
+        // transitions internally.
+        !self.direct_pcm_active.load(Ordering::Relaxed)
     }
 
     /// While streaming native DSD, OAAT chains by opening the NEXT track's local
@@ -351,6 +371,7 @@ impl OutputTarget for OaatOutput {
         let playing = self.playing.clone();
         let paused = self.paused.clone();
         let native_dsd_active = self.native_dsd_active.clone();
+        let direct_pcm_active = self.direct_pcm_active.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_arc = self.duration_ms.clone();
         let current_title = self.current_title.clone();
@@ -1121,7 +1142,10 @@ impl OutputTarget for OaatOutput {
                     }
 
                     diag.connected.store(true, Ordering::SeqCst);
-                    debug!("OAAT-DEBUG: streaming {} bytes directly", pcm_data.len());
+                    // Direct PCM playback: no internal gapless — the poller
+                    // takes over at natural end (see `direct_pcm_active`).
+                    direct_pcm_active.store(true, Ordering::SeqCst);
+                    info!(device = %device_name, bytes = pcm_data.len(), "oaat: direct file playback (poller advances at end)");
 
                     let mut offset = 0usize;
                     let mut sample_offset: u64 = 0;
@@ -1228,9 +1252,10 @@ impl OutputTarget for OaatOutput {
                     endpoint.send_stop(&stream_id).await.ok();
                     playing.store(false, Ordering::SeqCst);
                     diag.connected.store(false, Ordering::SeqCst);
-                    debug!(
-                        "OAAT-DEBUG: direct file playback complete, {} samples",
-                        sample_offset
+                    info!(
+                        device = %device_name,
+                        samples = sample_offset,
+                        "oaat: direct file playback complete"
                     );
                     true
                 };
@@ -1987,6 +2012,7 @@ impl OutputTarget for OaatOutput {
         // next track, so this resets the flag between tracks; the native DSD
         // path re-sets it if the next track is also native DSD.
         self.native_dsd_active.store(false, Ordering::SeqCst);
+        self.direct_pcm_active.store(false, Ordering::SeqCst);
         *self.current_uri.lock().await = None;
         info!(device = %self.name, "oaat: stop");
         Ok(())
