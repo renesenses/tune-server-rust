@@ -1665,16 +1665,32 @@ impl PlaybackOrchestrator {
             zone_max_sample_rate,
             dsd_passthrough,
         );
+        // Un égaliseur ACTIVÉ sur la zone doit s'entendre : en passthrough
+        // réseau (FLAC servi brut à la Beoplay A9), l'EqProcessor n'était
+        // jamais appliqué — profil « appliqué » côté UI, zéro effet audible
+        // (Mika, forum #1216). Activer l'EQ est un choix explicite de
+        // traitement (les puristes ont le mode PURE, qui désactive ceci via
+        // load_eq_processor→None) : on force alors le chemin transcodé, où
+        // l'EQ est déjà branché. Jamais sur un passthrough DSD/ALAC voulu.
+        let eq_forces_transcode = is_network_output
+            && !dsd_passthrough
+            && !alac_passthrough
+            && self.zone_has_active_eq(req.zone_id);
+
         let needs_transcode = needs_transcode_for_output
             || oaat_needs_wav
             || local_needs_wav
             || needs_downsample
             || dlna_needs_wav
+            || eq_forces_transcode
             // 16-bit cap on a FLAC-direct renderer: force a transcode so the
             // hi-res FLAC is re-encoded at 16-bit instead of served direct
             // (silent on the Ruark R3, #1137). ALAC already transcodes because
             // the cap disables alac_passthrough above.
             || (dlna_cap_16bit && will_be_flac);
+        if eq_forces_transcode && !needs_transcode_for_output && !dlna_needs_wav {
+            info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
+        }
 
         let (
             session_id,
@@ -4587,6 +4603,16 @@ impl PlaybackOrchestrator {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
             .unwrap_or(false)
+    }
+
+    /// True when the zone has an ENABLED equalizer profile with an audible
+    /// effect (and is not in PURE mode). Cheap settings read used to decide
+    /// routing BEFORE the sample rate is known — the actual EqProcessor is
+    /// built later by the transcode path at the real rate.
+    fn zone_has_active_eq(&self, zone_id: i64) -> bool {
+        // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
+        // gains, not the rate.
+        self.load_eq_processor(zone_id, 44100, 2).is_some()
     }
 
     fn load_eq_processor(
