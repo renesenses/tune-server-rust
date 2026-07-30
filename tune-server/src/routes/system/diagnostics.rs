@@ -768,6 +768,85 @@ pub(super) async fn bug_report_markdown(
     )
 }
 
+/// POST /system/bug-report/submit — generate the local bug report and forward it
+/// to the mozaiklabs.fr community bug endpoint, creating a moderated `bug` forum
+/// thread. Done server-to-server (this Rust process, not the browser) so it dodges
+/// the cloud's CORS origin allow-list and can attach the instance id / version /
+/// OS the browser doesn't have. Returns the created thread's public URL.
+pub(super) async fn submit_bug_report(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+
+    let backend = state.backend.clone();
+    let Json(report) = generate_bug_report(State(state)).await;
+    let markdown = report["markdown"].as_str().unwrap_or("").to_string();
+    if markdown.trim().is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "empty bug report"})),
+        );
+    }
+
+    let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let payload = json!({
+        "body": markdown,
+        "os": std::env::consts::OS,
+        "version": env!("CARGO_PKG_VERSION"),
+        "instance_id": instance_id,
+    });
+
+    let client = match tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("http client: {e}")})),
+            );
+        }
+    };
+
+    match client
+        .post("https://mozaiklabs.fr/api/v1/community/bug-report")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            let status = resp.status().as_u16();
+            let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            if ok {
+                (
+                    StatusCode::OK,
+                    Json(json!({"status": "submitted", "thread": data.get("thread")})),
+                )
+            } else {
+                tracing::warn!(status, "bug_report_submit_rejected");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "cloud rejected the report", "status": status})),
+                )
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "bug_report_submit_failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("could not reach the bug service: {e}")})),
+            )
+        }
+    }
+}
+
 pub(super) async fn audio_check() -> Json<Value> {
     let formats = vec![
         "flac", "wav", "aiff", "mp3", "aac", "ogg", "opus", "alac", "dsd", "wavpack", "ape",
