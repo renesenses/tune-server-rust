@@ -296,10 +296,12 @@ async fn scan_host(
                 Ok(Ok(out)) => {
                     output = String::from_utf8_lossy(&out.stdout).to_string();
                 }
-                Ok(Err(_)) => {
+                Ok(Err(e)) => {
                     // smbclient not available — use last_error from previous tools
+                    tracing::warn!(host = %host, error = %e, "network_smb_smbclient_spawn_failed (smbclient not installed?)");
                 }
                 Err(_) => {
+                    tracing::warn!(host = %host, "network_smb_scan_timed_out (smbclient -L)");
                     return (
                         StatusCode::GATEWAY_TIMEOUT,
                         Json(json!({ "error": "scan timed out" })),
@@ -310,6 +312,7 @@ async fn scan_host(
         }
 
         if output.trim().is_empty() && !last_error.is_empty() {
+            tracing::warn!(host = %host, error = %last_error.trim(), "network_smb_scan_failed");
             let msg = if last_error.contains("Authentication")
                 || last_error.contains("auth")
                 || last_error.contains("STATUS_ACCESS_DENIED")
@@ -334,6 +337,7 @@ async fn scan_host(
         match result {
             Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
             Ok(Err(e)) => {
+                tracing::warn!(host = %host, error = %e, "network_nfs_showmount_spawn_failed (showmount not installed?)");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("scan failed: {e}") })),
@@ -341,6 +345,7 @@ async fn scan_host(
                     .into_response();
             }
             Err(_) => {
+                tracing::warn!(host = %host, "network_nfs_scan_timed_out (showmount -e)");
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     Json(json!({ "error": "scan timed out" })),
@@ -350,31 +355,72 @@ async fn scan_host(
         }
     };
 
-    // Parse share names from command output
-    let shares: Vec<Value> = raw_output
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty()
-                && !trimmed.starts_with("Sharing")
-                && !trimmed.starts_with("---")
-                && !trimmed.starts_with("Export")
-        })
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                return None;
-            }
-            Some(json!({
-                "name": parts[0],
-                "type": if parts.len() > 1 { parts[1] } else { "Disk" },
-                "host": host,
-                "protocol": protocol,
-                "path": format!("//{host}/{}", parts[0]),
-            }))
-        })
-        .collect();
+    // Parse share names from command output.
+    let shares: Vec<Value> = if protocol == "smb" {
+        // smbclient -L / smbutil view / net view all print a "Sharename Type
+        // Comment" table where column 2 is the share TYPE (Disk / Printer /
+        // IPC). Keying on that type is far more robust than a prefix filter:
+        // the previous filter tested "Sharing" (typo — the header word is
+        // "Sharename") so the header was never dropped, and every non-empty
+        // line — the header, the `----` rule, client-side Kerberos warnings,
+        // `mkdir failed on /var/lib/samba/lock`, `SMB1 disabled…`, the second
+        // Server/Workgroup table — was emitted as a bogus "share" (Dominique,
+        // Fedora). Only rows whose 2nd column is a real file/printer share type
+        // survive; IPC$ (admin share, never a music source) is dropped too.
+        raw_output
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    return None;
+                }
+                let name = parts[0];
+                let stype = parts[1];
+                let is_share_type = stype.eq_ignore_ascii_case("Disk")
+                    || stype.eq_ignore_ascii_case("Printer")
+                    || stype.eq_ignore_ascii_case("Print");
+                // Skip admin/hidden shares ($-suffixed: IPC$, ADMIN$, C$, …).
+                if !is_share_type || name.ends_with('$') {
+                    return None;
+                }
+                Some(json!({
+                    "name": name,
+                    "type": stype,
+                    "host": host,
+                    "protocol": protocol,
+                    "path": format!("//{host}/{name}"),
+                }))
+            })
+            .collect()
+    } else {
+        // NFS `showmount -e host`: "Export list for host:" header then
+        // "/export/path  clients" rows — the export path is column 1.
+        raw_output
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                !t.is_empty() && !t.starts_with("Export") && !t.starts_with("---")
+            })
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let name = *parts.first()?;
+                Some(json!({
+                    "name": name,
+                    "type": "NFS",
+                    "host": host,
+                    "protocol": protocol,
+                    "path": format!("{host}:{name}"),
+                }))
+            })
+            .collect()
+    };
 
+    tracing::info!(
+        host = %host,
+        protocol,
+        shares = shares.len(),
+        "network_scan_host_complete"
+    );
     Json(json!(shares)).into_response()
 }
 

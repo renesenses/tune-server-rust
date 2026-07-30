@@ -68,6 +68,18 @@ pub async fn list(
     let svc_mgr = ServicesManager::with_backend(state.backend.clone());
     let discogs_payload = svc_mgr.load_token("discogs").ok().flatten();
     let lastfm_payload = svc_mgr.load_token("lastfm").ok().flatten();
+    let lb_configured = settings
+        .get("listenbrainz_token")
+        .ok()
+        .flatten()
+        .filter(|t| !t.is_empty())
+        .is_some();
+    let lb_username = settings
+        .get("listenbrainz_username")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty());
+    let lb_payload = svc_mgr.load_token("listenbrainz").ok().flatten();
     let genius_payload = svc_mgr.load_token("genius").ok().flatten();
 
     let discogs_db_configured = settings.get("discogs_token").ok().flatten().is_some()
@@ -120,6 +132,22 @@ pub async fn list(
             ],
             "help_url": "https://www.last.fm/api/account/create",
             "help_steps": [tr("svctok.lastfm.step1"), tr("svctok.lastfm.step2"), tr("svctok.lastfm.step3"), tr("svctok.lastfm.step4")],
+        }),
+        json!({
+            "id": "listenbrainz", "name": "ListenBrainz", "kind": "personal_token",
+            "purpose": tr("svctok.listenbrainz.purpose"),
+            "pricing": "free", "pricing_note": tr("svctok.listenbrainz.pricing"),
+            "configured": lb_configured || lb_payload.is_some(),
+            "source": if lb_payload.is_some() { json!("db") } else if lb_configured { json!("env") } else { serde_json::Value::Null },
+            "valid": lb_payload.as_ref().and_then(|p| p.valid),
+            "validated_at": lb_payload.as_ref().and_then(|p| p.validated_at),
+            "validation_message": lb_payload.as_ref().and_then(|p| p.validation_message.clone()),
+            "scrobble_authenticated": lb_configured,
+            "scrobble_enabled": lb_configured,
+            "listenbrainz_username": lb_username,
+            "fields": [{"key": "token", "label": "User Token", "type": "password"}],
+            "help_url": "https://listenbrainz.org/settings/",
+            "help_steps": [tr("svctok.listenbrainz.step1"), tr("svctok.listenbrainz.step2"), tr("svctok.listenbrainz.step3")],
         }),
         json!({
             "id": "genius", "name": "Genius", "kind": "api_key",
@@ -274,6 +302,21 @@ pub async fn test(
                 }
                 None => Json(
                     json!({ "valid": false, "validation_message": tr("svctok.err.discogsNotConfigured") }),
+                ),
+            }
+        }
+        "listenbrainz" => {
+            let token = svc_mgr
+                .get_credential("listenbrainz", "token")
+                .or_else(|| settings.get("listenbrainz_token").ok().flatten())
+                .filter(|t| !t.is_empty());
+            match token {
+                Some(t) => {
+                    let (valid, msg) = svc_mgr.validate_listenbrainz(&t).await;
+                    Json(json!({ "valid": valid, "validation_message": msg }))
+                }
+                None => Json(
+                    json!({ "valid": false, "validation_message": tr("svctok.err.generic").replace("{error}", "token non configuré") }),
                 ),
             }
         }

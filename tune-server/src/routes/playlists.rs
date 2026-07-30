@@ -427,6 +427,14 @@ async fn import_m3u_file(
     }
 
     if file_content.is_empty() {
+        // No importable field arrived. Common causes: the multipart body
+        // exceeded axum's DefaultBodyLimit (a large .m3u), a field-decode error
+        // (the `while let Ok(Some(field))` loop then exits early), or no "file"
+        // part was sent. An M3U import that produced nothing otherwise left no
+        // server-side trace at all (JP / Dominique, v0.9.28).
+        tracing::warn!(
+            "m3u_import_file_empty — no importable 'file' field (body too large, or decode error)"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no file provided"})),
@@ -437,6 +445,8 @@ async fn import_m3u_file(
     let name = playlist_name
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Imported Playlist".into());
+
+    tracing::info!(name = %name, bytes = file_content.len(), "m3u_import_file_received");
 
     // Parse M3U and match tracks
     let mut track_ids: Vec<i64> = Vec::new();
@@ -488,6 +498,14 @@ async fn import_m3u_file(
             if !track_ids.is_empty() {
                 repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
             }
+            tracing::info!(
+                playlist_id,
+                name = %name,
+                total_entries,
+                matched,
+                not_found = not_found_paths.len(),
+                "m3u_import_file_complete"
+            );
             (
                 StatusCode::CREATED,
                 Json(json!({
@@ -502,7 +520,10 @@ async fn import_m3u_file(
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "m3u_import_file_create_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
