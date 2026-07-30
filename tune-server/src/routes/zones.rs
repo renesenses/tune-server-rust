@@ -458,7 +458,12 @@ fn build_signal_path(
 
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if needs_transcode_for_output || dlna_cap_16bit {
+            if dlna_lpcm {
+                // Zone forced to WAV/LPCM: the wire carries WAV, not FLAC — the
+                // signal path must say so (a renderer that shows "WAV/PCM"
+                // otherwise contradicted Tune's "→ FLAC" label, LHC).
+                (false, "DLNA/UPnP", "WAV")
+            } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
                 // an otherwise-direct FLAC source (Ruark R3, #1137).
                 let target = source_format
@@ -563,16 +568,39 @@ fn build_signal_path(
         }));
     }
 
-    // Transcoding step (only if transcoding occurs)
-    let transcode_active =
-        needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
+    // Transcoding step (only if transcoding occurs). Include the zone-forced
+    // WAV/LPCM and 16-bit-cap paths: both re-encode the stream, so the step must
+    // appear even when the source format itself wouldn't need transcoding for
+    // DLNA (a FLAC source with LPCM or cap-16 on) — otherwise the path claimed a
+    // bit-perfect passthrough that isn't happening (LHC: renderer shows WAV 16/44
+    // while Tune showed ALAC→FLAC).
+    let transcode_active = needs_transcode_for_output
+        || oaat_transcodes
+        || output_type == "airplay"
+        || dlna_lpcm
+        || dlna_cap_16bit;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
         // lossy domain conversion (see the "oaat" transport arm above).
         let transcode_lossless = is_oaat && is_lossless && !is_dsd;
+        // Reflect the OUTPUT resolution the renderer actually receives: 16-bit
+        // when the zone caps to 16-bit, and the max-sample-rate cap when set.
+        let out_bit_depth = if dlna_cap_16bit { 16 } else { bit_depth };
+        let out_sample_rate = zone
+            .max_sample_rate
+            .map(|m| (sample_rate as u32).min(m) as i32)
+            .unwrap_or(sample_rate);
+        let out_desc = if out_sample_rate >= 1000 {
+            format!(
+                "{output_format_name} {sr}kHz/{out_bit_depth}bit",
+                sr = out_sample_rate / 1000
+            )
+        } else {
+            format!("{output_format_name} {out_sample_rate}Hz/{out_bit_depth}bit")
+        };
         steps.push(json!({
             "name": "Transcoder",
-            "description": format!("{format_name} \u{2192} {output_format_name}"),
+            "description": format!("{source_desc} \u{2192} {out_desc}"),
             "bit_perfect": transcode_lossless,
         }));
     }
