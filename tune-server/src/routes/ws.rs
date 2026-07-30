@@ -51,12 +51,21 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             .output_device_id
             .as_deref()
             .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+        let output_container = match ps
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => state.streamer.stream_output_container(sid).await,
+            None => None,
+        };
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &ps,
             z,
             &state.backend,
             renderer_label,
             audio_backend,
+            output_container.as_deref(),
         );
         zone_snaps.push(serde_json::json!({
             "zone_id": zid,
