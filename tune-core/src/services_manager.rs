@@ -117,6 +117,25 @@ pub fn service_catalog() -> Vec<ServiceInfo> {
             ],
         },
         ServiceInfo {
+            id: "listenbrainz".into(),
+            name: "ListenBrainz".into(),
+            kind: "personal_token".into(),
+            purpose: "Scrobbling libre (MetaBrainz) — seul ou en plus de Last.fm (Premium).".into(),
+            pricing: "free".into(),
+            pricing_note: "100 % gratuit et open source (MetaBrainz).".into(),
+            fields: vec![ServiceField {
+                key: "token".into(),
+                label: "User Token".into(),
+                field_type: "password".into(),
+            }],
+            help_url: "https://listenbrainz.org/settings/".into(),
+            help_steps: vec![
+                "Crée un compte gratuit sur listenbrainz.org.".into(),
+                "Va dans Settings (icône profil).".into(),
+                "Copie le « User token » et colle-le ici.".into(),
+            ],
+        },
+        ServiceInfo {
             id: "tidal".into(),
             name: "Tidal".into(),
             kind: "oauth".into(),
@@ -313,6 +332,44 @@ impl ServicesManager {
         }
     }
 
+    /// ListenBrainz : GET /1/validate-token (Authorization: Token …) →
+    /// { valid, user_name }. Persiste aussi listenbrainz_username pour
+    /// l'affichage (même clé que lit routes/listenbrainz.rs).
+    pub async fn validate_listenbrainz(&self, token: &str) -> (bool, String) {
+        if token.is_empty() {
+            return (false, "Token vide.".into());
+        }
+        let client = crate::http::client::shared();
+        let resp = client
+            .get("https://api.listenbrainz.org/1/validate-token")
+            .header("Authorization", format!("Token {token}"))
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let data: serde_json::Value = r.json().await.unwrap_or_default();
+                if data.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let user = data
+                        .get("user_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !user.is_empty() {
+                        let settings =
+                            crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+                        settings.set("listenbrainz_username", &user).ok();
+                    }
+                    (true, format!("Token valide ({user})."))
+                } else {
+                    (false, "Token invalide.".into())
+                }
+            }
+            Ok(r) => (false, format!("HTTP {}", r.status())),
+            Err(e) => (false, format!("Réseau : {e}")),
+        }
+    }
+
     pub async fn validate_and_save(
         &self,
         service: &str,
@@ -335,6 +392,14 @@ impl ServicesManager {
                     .unwrap_or("");
                 self.validate_lastfm(key).await
             }
+            "listenbrainz" => {
+                let token = payload
+                    .fields
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                self.validate_listenbrainz(token).await
+            }
             _ => (true, "Pas de validation disponible.".into()),
         };
         payload.valid = Some(valid);
@@ -350,11 +415,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_seven_services() {
+    fn catalog_has_eight_services() {
         let catalog = service_catalog();
-        assert_eq!(catalog.len(), 7);
+        assert_eq!(catalog.len(), 8);
         assert_eq!(catalog[0].id, "musicbrainz");
-        assert_eq!(catalog[6].id, "deezer");
+        assert!(catalog.iter().any(|s| s.id == "listenbrainz"));
+        assert_eq!(catalog[7].id, "deezer");
     }
 
     #[test]
