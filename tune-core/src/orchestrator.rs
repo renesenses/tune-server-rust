@@ -5777,6 +5777,11 @@ impl PlaybackOrchestrator {
         self.streamer.stream_bytes_sent(stream_id).await
     }
 
+    /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
+    pub async fn streamer_total_bytes(&self, stream_id: &str) -> Option<u64> {
+        self.streamer.stream_total_bytes(stream_id).await
+    }
+
     async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {
