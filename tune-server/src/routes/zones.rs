@@ -292,8 +292,16 @@ pub fn build_signal_path_pub(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
+    output_container: Option<&str>,
 ) -> Option<Value> {
-    build_signal_path(ps, zone, backend, renderer_label, audio_backend)
+    build_signal_path(
+        ps,
+        zone,
+        backend,
+        renderer_label,
+        audio_backend,
+        output_container,
+    )
 }
 
 /// Build the `signal_path` object for a zone's current playback.
@@ -301,12 +309,20 @@ pub fn build_signal_path_pub(
 ///
 /// `audio_backend` is the active audio backend name ("ASIO", "WASAPI",
 /// "CoreAudio", "ALSA") used for local zones' signal path display.
+///
+/// `output_container` is the REAL container currently served on the wire for
+/// this zone's active stream session (`AudioStreamer::stream_output_container`,
+/// e.g. "wav" / "flac"), or `None` when there is no live session. It lets the
+/// DLNA arm show the negotiated WAV/LPCM fallback (`dlna_needs_wav`, decided
+/// async) instead of the statically-guessed FLAC transcode target — Sevy's
+/// LHC-52 was served WAV yet the path claimed "ALAC → FLAC".
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
+    output_container: Option<&str>,
 ) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
@@ -456,9 +472,30 @@ fn build_signal_path(
             .as_ref()
             .is_some_and(|f| *f != AudioFormat::Wav);
 
+    // The renderer may be served WAV/LPCM even for a FLAC/ALAC source when it
+    // does not advertise `audio/flac` (`orchestrator::dlna_needs_wav`, decided
+    // by async SOAP negotiation this synchronous builder cannot replay). Trust
+    // the live session's real container over the static transcode-target guess
+    // so the path shows "ALAC → WAV" instead of a phantom "ALAC → FLAC" (Sevy,
+    // LHC-52). Only "wav" changes the verdict; anything else keeps prior logic.
+    let wire_wav = output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if needs_transcode_for_output || dlna_cap_16bit {
+            if wire_wav || dlna_lpcm {
+                // Renderer served WAV/LPCM, not FLAC — the signal path must say
+                // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
+                // "→ FLAC" label, LHC). Two causes, same wire: the zone forces it
+                // (`dlna_lpcm`), or the renderer doesn't advertise `audio/flac`
+                // and the orchestrator fell back to WAV (`dlna_needs_wav`) —
+                // detected here from the live session's real container
+                // (`wire_wav`), which the synchronous builder cannot renegotiate.
+                // The DLNA WAV is 16-bit LPCM (audio/L16), so it is bit-perfect
+                // only when the lossless source already fits 16 bits (Sevy,
+                // #1137: a hi-res source is truncated).
+                let wav_bit_perfect = is_lossless && bit_depth <= 16;
+                (wav_bit_perfect, "DLNA/UPnP", "WAV")
+            } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
                 // an otherwise-direct FLAC source (Ruark R3, #1137).
                 let target = source_format
@@ -563,16 +600,52 @@ fn build_signal_path(
         }));
     }
 
-    // Transcoding step (only if transcoding occurs)
-    let transcode_active =
-        needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
+    // Transcoding step (only if transcoding occurs). Include the zone-forced
+    // WAV/LPCM (dlna_lpcm), 16-bit-cap (dlna_cap_16bit) and async WAV-fallback
+    // (wire_wav) paths: all re-encode the stream, so the step must appear even
+    // when the source format itself wouldn't need transcoding for DLNA (a FLAC
+    // source with LPCM/cap-16, or an ALAC/FLAC source to a renderer that fell
+    // back to WAV) — otherwise the path claimed a bit-perfect passthrough that
+    // isn't happening (LHC: renderer shows WAV 16/44 while Tune showed ALAC→FLAC;
+    // Sevy: LHC-52 served WAV while Tune showed ALAC→FLAC).
+    let wire_transcode = wire_wav && !matches!(format_name, "WAV");
+    let transcode_active = needs_transcode_for_output
+        || oaat_transcodes
+        || output_type == "airplay"
+        || dlna_lpcm
+        || dlna_cap_16bit
+        || wire_transcode;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
-        // lossy domain conversion (see the "oaat" transport arm above).
-        let transcode_lossless = is_oaat && is_lossless && !is_dsd;
+        // lossy domain conversion (see the "oaat" transport arm above). A DLNA
+        // WAV/LPCM output likewise preserves the samples only when the source
+        // already fits the 16-bit LPCM cap.
+        let wav_output = wire_wav || dlna_lpcm;
+        let transcode_lossless =
+            (is_oaat && is_lossless && !is_dsd) || (wav_output && is_lossless && bit_depth <= 16);
+        // Reflect the OUTPUT resolution the renderer actually receives: 16-bit
+        // when the zone caps to 16-bit OR serves WAV/LPCM (audio/L16 is 16-bit),
+        // and the max-sample-rate cap when set.
+        let out_bit_depth = if dlna_cap_16bit || wav_output {
+            bit_depth.min(16)
+        } else {
+            bit_depth
+        };
+        let out_sample_rate = zone
+            .max_sample_rate
+            .map(|m| (sample_rate as u32).min(m) as i32)
+            .unwrap_or(sample_rate);
+        let out_desc = if out_sample_rate >= 1000 {
+            format!(
+                "{output_format_name} {sr}kHz/{out_bit_depth}bit",
+                sr = out_sample_rate / 1000
+            )
+        } else {
+            format!("{output_format_name} {out_sample_rate}Hz/{out_bit_depth}bit")
+        };
         steps.push(json!({
             "name": "Transcoder",
-            "description": format!("{format_name} \u{2192} {output_format_name}"),
+            "description": format!("{source_desc} \u{2192} {out_desc}"),
             "bit_perfect": transcode_lossless,
         }));
     }
@@ -695,8 +768,22 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-            let signal_path =
-                build_signal_path(&ps, z, &state.backend, renderer_label, audio_backend);
+            let output_container = match ps
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref())
+            {
+                Some(sid) => state.streamer.stream_output_container(sid).await,
+                None => None,
+            };
+            let signal_path = build_signal_path(
+                &ps,
+                z,
+                &state.backend,
+                renderer_label,
+                audio_backend,
+                output_container.as_deref(),
+            );
             obj.insert("signal_path".into(), json!(signal_path));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
@@ -790,8 +877,22 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .output_device_id
                     .as_deref()
                     .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-                let signal_path =
-                    build_signal_path(&ps, &zone, &state.backend, renderer_label, audio_backend);
+                let output_container = match ps
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.as_deref())
+                {
+                    Some(sid) => state.streamer.stream_output_container(sid).await,
+                    None => None,
+                };
+                let signal_path = build_signal_path(
+                    &ps,
+                    &zone,
+                    &state.backend,
+                    renderer_label,
+                    audio_backend,
+                    output_container.as_deref(),
+                );
                 obj.insert("signal_path".into(), json!(signal_path));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
                 obj.insert(
@@ -1640,4 +1741,96 @@ async fn set_group_delay(
         )
         .ok();
     Json(json!(delays))
+}
+
+#[cfg(test)]
+mod signal_path_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::playback::NowPlaying;
+
+    fn dlna_zone() -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    // Hi-res ALAC source, currently playing, with a live stream session.
+    fn alac_hires_playing() -> ZoneState {
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("alac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn transcoder_desc(v: &Value) -> Option<String> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Transcoder"))
+            .and_then(|s| s.get("description").and_then(|d| d.as_str()))
+            .map(String::from)
+    }
+
+    // Sevy, LHC-52: the renderer is served WAV/LPCM (it does not advertise
+    // audio/flac), so the path must show the REAL wire container, not the
+    // static ALAC→FLAC transcode guess. The output is 16-bit LPCM, so the
+    // hi-res 24-bit source reads as downconverted (not bit-perfect).
+    #[test]
+    fn dlna_wav_wire_shows_alac_to_wav() {
+        let (backend, zone) = dlna_zone();
+        let ps = alac_hires_playing();
+        let sp =
+            build_signal_path(&ps, &zone, &backend, Some("LHC-52"), "none", Some("wav")).unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} WAV 96kHz/16bit")
+        );
+        // Hi-res source truncated to the 16-bit LPCM cap → not bit-perfect,
+        // but still a lossless source.
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Regression guard: with no live session container (None) the display keeps
+    // its prior behaviour — ALAC transcodes to FLAC for DLNA.
+    #[test]
+    fn dlna_without_session_keeps_flac_target() {
+        let (backend, zone) = dlna_zone();
+        let ps = alac_hires_playing();
+        let sp = build_signal_path(&ps, &zone, &backend, Some("LHC-52"), "none", None).unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
+        );
+    }
+
+    // A FLAC-advertising renderer (wire = flac) is unaffected by the override.
+    #[test]
+    fn dlna_flac_wire_keeps_flac_target() {
+        let (backend, zone) = dlna_zone();
+        let ps = alac_hires_playing();
+        let sp =
+            build_signal_path(&ps, &zone, &backend, Some("Node"), "none", Some("flac")).unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
+        );
+    }
 }

@@ -423,6 +423,22 @@ impl AudioStreamer {
         format!("http://{server_ip}:{}/stream/{stream_id}.{ext}", self.port)
     }
 
+    /// Real output container actually served for a live session
+    /// (`StreamInfo.format`, e.g. "wav" / "flac"). The signal-path display uses
+    /// it to show the TRANSCODED wire container instead of a statically-guessed
+    /// transcode target: a DLNA renderer that does not advertise `audio/flac`
+    /// is served WAV/LPCM even for a FLAC/ALAC source (negotiated async via
+    /// `dlna_needs_wav`), which the synchronous `build_signal_path` cannot
+    /// replay (Sevy, forum affichage-chemin-du-signal — showed "ALAC → FLAC"
+    /// while the wire was WAV). Returns `None` for an unknown session.
+    pub async fn stream_output_container(&self, stream_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(stream_id)
+            .map(|s| s.info.format.clone())
+    }
+
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
     }

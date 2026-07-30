@@ -211,12 +211,21 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
+        let output_container = match zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => state.streamer.stream_output_container(sid).await,
+            None => None,
+        };
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &zone_state,
             zone,
             &state.backend,
             renderer_label,
             audio_backend,
+            output_container.as_deref(),
         );
         v.as_object_mut()
             .unwrap()

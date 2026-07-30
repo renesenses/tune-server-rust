@@ -271,6 +271,19 @@ pub(crate) mod decisions {
         last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
     }
 
+    /// The `position_reset` fallback advances metadata only, assuming the
+    /// renderer auto-transitioned internally — its position dropped to 0 because
+    /// it is already playing the next track. That premise holds only for outputs
+    /// that do internal gapless (DLNA). For a Chromecast / slimproto /
+    /// exclusive-local output, a drop to 0 means the track ENDED (device went
+    /// IDLE/FINISHED), not that it advanced — advancing metadata sends no `play`
+    /// and steals the event from the natural-end path (Stopped branch →
+    /// play_from_queue = real load), causing the endless 1-2s-then-zero loop
+    /// (Rhorn, #1072). So the fallback only fires for internal-gapless outputs.
+    pub fn position_reset_fires(raw_position_reset: bool, can_internal_gapless: bool) -> bool {
+        raw_position_reset && can_internal_gapless
+    }
+
     /// A renderer can report the PREVIOUS session's position for the first
     /// seconds after a fresh Play (Villerio's DMP-A6: ~374s — yesterday's end
     /// position — reported 6s into a new start). That stale sample poisons the
@@ -2469,8 +2482,30 @@ impl PositionPoller {
             // `ps.last_position_ms` after the overwrite, so `prev_pos` was
             // always mis-logged equal to `new_pos`).
             let prev_position_ms = ps.last_position_ms;
-            let position_reset =
+            let mut position_reset =
                 decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+            // Suppress this metadata-only advance fallback for outputs that don't
+            // do internal gapless (Chromecast, slimproto, exclusive local): for
+            // them a position drop to 0 means the track ENDED (device IDLE /
+            // FINISHED), not that it auto-advanced. Firing here sends no `play`
+            // and steals the event from the natural-end path (Stopped branch →
+            // play_from_queue = real load), causing Rhorn's 1-2s-then-zero loop
+            // (#1072). Compute can_internal_gapless only when a raw reset fires
+            // (rare: end of track). Env-guarded for rollback.
+            if position_reset && std::env::var("TUNE_DISABLE_CAST_ADVANCE_FIX").is_err() {
+                let can_internal_gapless = {
+                    let outputs = self.outputs.lock().await;
+                    match outputs.get(&device_id) {
+                        Some(arc) => arc.lock().await.supports_internal_gapless(),
+                        None => false,
+                    }
+                };
+                position_reset =
+                    decisions::position_reset_fires(position_reset, can_internal_gapless);
+                if !position_reset {
+                    info!(zone_id, "position_reset_deferred_to_natural_end");
+                }
+            }
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
@@ -4329,6 +4364,26 @@ mod tests {
         assert!(!decisions::position_reset(40_000, 8_000, true));
         // Previous position not above the 30s ceiling → not a reset.
         assert!(!decisions::position_reset(20_000, 2_000, true));
+    }
+
+    #[test]
+    fn position_reset_fallback_only_fires_for_internal_gapless_outputs() {
+        // A raw position drop to 0 fires the metadata-only advance fallback ONLY
+        // for renderers that auto-transition internally (DLNA). For a Chromecast
+        // / slimproto / exclusive-local output the drop means the track ENDED
+        // (device IDLE/FINISHED) — the fallback must NOT fire; the natural-end
+        // path (Stopped branch → play_from_queue) then does a real load.
+        // Regression for Rhorn's Chromecast end-of-track loop (#1072).
+        let raw = decisions::position_reset(40_000, 2_000, true);
+        assert!(raw, "the drop shape matches on both output kinds");
+
+        // Chromecast (can_internal_gapless == false) → suppressed.
+        assert!(!decisions::position_reset_fires(raw, false));
+        // DLNA (can_internal_gapless == true) → fires as before.
+        assert!(decisions::position_reset_fires(raw, true));
+        // No raw reset → never, regardless of output kind.
+        assert!(!decisions::position_reset_fires(false, true));
+        assert!(!decisions::position_reset_fires(false, false));
     }
 
     #[test]
