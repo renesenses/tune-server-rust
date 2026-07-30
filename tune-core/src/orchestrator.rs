@@ -812,9 +812,7 @@ impl PlaybackOrchestrator {
             // un 404 en allant le chercher, et affiche « chanson non trouvée ».
             // On la laisse vivre — la GC des sessions périmées la ramassera si
             // personne ne la consomme.
-            let may_have_landed = output_error
-                .as_deref()
-                .is_some_and(command_may_have_landed);
+            let may_have_landed = output_error.as_deref().is_some_and(command_may_have_landed);
             if let Some(ref sid) = resolved.stream_id {
                 if may_have_landed {
                     info!(

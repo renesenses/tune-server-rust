@@ -76,6 +76,10 @@ pub struct ZonePollerMetrics {
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
+/// Plafond du recul sur une zone arrêtée : 2^5 = 32 ticks, soit ~32 s entre
+/// deux tentatives quand l'appareil ne répond plus. Assez pour cesser de le
+/// noyer, assez court pour repérer une lecture démarrée depuis sa façade.
+const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
 const GAPLESS_WINDOW_MS: u64 = 30_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
@@ -1435,6 +1439,51 @@ pub mod fsm {
     }
 }
 
+/// Backoff des sondages sur une zone **arrêtée**.
+///
+/// Le chemin « zone en lecture » recule déjà après un échec
+/// (`ZonePollState::backoff_remaining`), mais celui des zones arrêtées — qui
+/// sert à détecter une lecture démarrée hors de Tune — faisait `continue` sans
+/// rien mémoriser : un appareil lent ou injoignable était donc re-sondé chaque
+/// seconde, indéfiniment. Or `get_status_bounded` abandonne au bout de 5 s
+/// pendant que la requête SOAP dessous garde son propre timeout de 10 s et ses
+/// deux réessais — les appels s'empilaient sur un renderer qui les traite un par
+/// un, jusqu'à ce qu'il ne réponde plus à rien, commande de lecture comprise
+/// (Cyrus Stream X2 de JP : 1372 `GetPositionInfo` en échec, contre 3
+/// `SetAVTransportURI`).
+///
+/// `poll_states` ne peut pas porter cet état : il est purgé à chaque tick pour
+/// ne garder que les zones en lecture.
+#[derive(Debug, Default, Clone)]
+struct IdlePollBackoff {
+    consecutive_errors: u8,
+    remaining: u8,
+}
+
+impl IdlePollBackoff {
+    /// Faut-il sauter ce tick ? Consomme un tick de recul le cas échéant.
+    fn should_skip(&mut self) -> bool {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sondage réussi : on repart à plein rythme.
+    fn record_success(&mut self) {
+        self.consecutive_errors = 0;
+        self.remaining = 0;
+    }
+
+    /// Sondage en échec : recul exponentiel, plafonné.
+    fn record_failure(&mut self) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        self.remaining = 1u8 << self.consecutive_errors.min(IDLE_BACKOFF_MAX_SHIFT);
+    }
+}
+
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
@@ -1571,6 +1620,7 @@ impl PositionPoller {
             let mut ticker = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
             let notify = TRACK_END_NOTIFY.clone();
             let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
+            let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
 
             loop {
                 // Wake on either the regular 1-second tick OR an immediate
@@ -1579,12 +1629,18 @@ impl PositionPoller {
                     _ = ticker.tick() => {},
                     _ = notify.notified() => {},
                 }
-                self.tick(&mut poll_states, &startup_at).await;
+                self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                    .await;
             }
         })
     }
 
-    async fn tick(&self, poll_states: &mut HashMap<i64, ZonePollState>, startup_at: &Instant) {
+    async fn tick(
+        &self,
+        poll_states: &mut HashMap<i64, ZonePollState>,
+        idle_backoff: &mut HashMap<i64, IdlePollBackoff>,
+        startup_at: &Instant,
+    ) {
         let states = self.playback.all_states().await;
 
         poll_states.retain(|zone_id, _| {
@@ -1597,6 +1653,9 @@ impl PositionPoller {
         let all_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .list()
             .unwrap_or_default();
+
+        // Ne pas laisser l'état de recul survivre à une zone supprimée.
+        idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
 
         for zone in &all_zones {
             let zone_id = zone.id.unwrap_or(0);
@@ -1615,6 +1674,12 @@ impl PositionPoller {
                 continue;
             } // already handled below
 
+            // Recul après échec : sans cela un appareil injoignable était sondé
+            // chaque seconde sans fin (voir IdlePollBackoff).
+            if idle_backoff.entry(zone_id).or_default().should_skip() {
+                continue;
+            }
+
             let status = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
@@ -1624,8 +1689,23 @@ impl PositionPoller {
                     }
                 };
                 match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                    Ok(s) => {
+                        idle_backoff.entry(zone_id).or_default().record_success();
+                        s
+                    }
+                    Err(e) => {
+                        let b = idle_backoff.entry(zone_id).or_default();
+                        b.record_failure();
+                        debug!(
+                            zone_id,
+                            device = %device_id,
+                            error = %e,
+                            consecutive_errors = b.consecutive_errors,
+                            skip_ticks = b.remaining,
+                            "idle_poll_failed_backing_off"
+                        );
+                        continue;
+                    }
                 }
             };
 
@@ -2762,19 +2842,16 @@ impl PositionPoller {
                                         None => (0, None),
                                     };
                                     let seeked = zone_state.last_seek_at.is_some();
-                                    if decisions::renderer_could_have_finished(
-                                        sent, total, seeked,
-                                    ) {
-                                        fsm_actual =
-                                            Some(fsm::StoppedOutcome::NaturalEndAdvance);
+                                    if decisions::renderer_could_have_finished(sent, total, seeked)
+                                    {
+                                        fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
                                         track_ended = true;
                                     } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
                                         // On laisse au renderer le temps de
                                         // reprendre : s'il repart, il repassera
                                         // Playing et cette branche disparaît.
-                                        ps.stall_declines =
-                                            ps.stall_declines.saturating_add(1);
+                                        ps.stall_declines = ps.stall_declines.saturating_add(1);
                                         if ps.stall_declines == 1 {
                                             warn!(
                                                 zone_id,
@@ -2969,7 +3046,7 @@ impl PositionPoller {
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.last_bytes_sent = 0;
-                    ps.stall_declines = 0;
+                        ps.stall_declines = 0;
                         ps.track_started_at = Some(Instant::now());
                         ps.stopped_ticks = 0;
                         ps.past_end_ticks = 0;
@@ -4675,6 +4752,75 @@ mod tests {
     }
 
     #[test]
+    fn idle_backoff_skips_then_retries() {
+        let mut b = super::IdlePollBackoff::default();
+        // Sans échec, on sonde à chaque tick.
+        assert!(!b.should_skip());
+
+        // Premier échec : 2 ticks sautés, puis on retente.
+        b.record_failure();
+        assert_eq!(b.remaining, 2);
+        assert!(b.should_skip());
+        assert!(b.should_skip());
+        assert!(!b.should_skip(), "après le recul, un sondage doit repartir");
+    }
+
+    #[test]
+    fn idle_backoff_grows_and_is_capped() {
+        let mut b = super::IdlePollBackoff::default();
+        for expected in [2u8, 4, 8, 16, 32] {
+            b.record_failure();
+            assert_eq!(b.remaining, expected);
+            while b.should_skip() {}
+        }
+        // Plafond : 20 échecs de plus ne dépassent pas 2^IDLE_BACKOFF_MAX_SHIFT.
+        for _ in 0..20 {
+            b.record_failure();
+            assert_eq!(b.remaining, 1u8 << super::IDLE_BACKOFF_MAX_SHIFT);
+            while b.should_skip() {}
+        }
+    }
+
+    #[test]
+    fn idle_backoff_resets_on_success() {
+        let mut b = super::IdlePollBackoff::default();
+        b.record_failure();
+        b.record_failure();
+        assert!(b.remaining > 0);
+        b.record_success();
+        assert_eq!(b.consecutive_errors, 0);
+        assert!(
+            !b.should_skip(),
+            "un appareil qui répond doit être sondé à plein rythme"
+        );
+    }
+
+    /// Quantifie le gain : sur une minute face à un appareil qui ne répond
+    /// jamais, l'ancien chemin sondait à chaque tick (60 fois). Avec le recul,
+    /// on compte les sondages réellement tentés — c'est le flux que le renderer
+    /// subissait et qui finissait par le figer.
+    #[test]
+    fn idle_backoff_collapses_poll_rate_on_a_dead_device() {
+        let mut b = super::IdlePollBackoff::default();
+        let mut polls = 0;
+        for _ in 0..60 {
+            if b.should_skip() {
+                continue;
+            }
+            polls += 1;
+            b.record_failure(); // l'appareil ne répond jamais
+        }
+        assert!(
+            polls <= 8,
+            "60 ticks devraient donner une poignée de sondages, pas {polls}"
+        );
+        assert!(
+            polls >= 4,
+            "il faut quand même retenter régulièrement, or {polls}"
+        );
+    }
+
+    #[test]
     fn a_fully_served_stream_may_have_finished() {
         // Tout servi, ou la marge de 10 % : le renderer a pu finir.
         assert!(super::decisions::renderer_could_have_finished(
@@ -4698,23 +4844,41 @@ mod tests {
             Some(39_838_610),
             false
         ));
-        assert!(!super::decisions::renderer_could_have_finished(0, Some(1_000), false));
+        assert!(!super::decisions::renderer_could_have_finished(
+            0,
+            Some(1_000),
+            false
+        ));
     }
 
     #[test]
     fn an_unknown_total_is_never_judged() {
         // Radio, flux décodé à la volée : aucune conclusion possible, on garde
         // le comportement d'avant plutôt que de bloquer une lecture saine.
-        assert!(super::decisions::renderer_could_have_finished(0, None, false));
-        assert!(super::decisions::renderer_could_have_finished(0, Some(0), false));
+        assert!(super::decisions::renderer_could_have_finished(
+            0, None, false
+        ));
+        assert!(super::decisions::renderer_could_have_finished(
+            0,
+            Some(0),
+            false
+        ));
     }
 
     #[test]
     fn the_served_threshold_matches_the_documented_percentage() {
         let total = 1_000_u64;
         let pile = total * super::MIN_SERVED_PERCENT_FOR_NATURAL_END / 100;
-        assert!(super::decisions::renderer_could_have_finished(pile, Some(total), false));
-        assert!(!super::decisions::renderer_could_have_finished(pile - 1, Some(total), false));
+        assert!(super::decisions::renderer_could_have_finished(
+            pile,
+            Some(total),
+            false
+        ));
+        assert!(!super::decisions::renderer_could_have_finished(
+            pile - 1,
+            Some(total),
+            false
+        ));
     }
 
     #[test]
