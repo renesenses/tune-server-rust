@@ -82,6 +82,18 @@ const POLL_INTERVAL_MS: u64 = 1000;
 const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
 const GAPLESS_WINDOW_MS: u64 = 30_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
+/// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
+/// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
+/// finir de jouer ce qu'il n'a pas reçu — il a calé.
+///
+/// Marge volontairement large : un FLAC est à débit variable, la dernière
+/// fraction de temps ne correspond pas exactement à la même fraction d'octets.
+const MIN_SERVED_PERCENT_FOR_NATURAL_END: u64 = 90;
+/// Nombre de ticks (~1 s) pendant lesquels on refuse de conclure à une fin
+/// naturelle sur un flux manifestement incomplet, laissant au renderer le temps
+/// de reprendre sa lecture. Passé ce délai, la lecture a réellement échoué : on
+/// arrête la zone bruyamment au lieu d'avancer en silence.
+const STALL_DECLINE_MAX_TICKS: u8 = 10;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
 /// This prevents the progress bar from snapping back to the pre-seek
@@ -187,6 +199,42 @@ pub(crate) mod decisions {
     ///   (guards slow renderers that report duration 0 while buffering).
     ///
     /// Both branches additionally require `wall_elapsed >= MIN_TRACK_WALL_SECS`.
+    /// Le renderer peut-il réellement avoir terminé le morceau ?
+    ///
+    /// Un `Stopped` au-delà de [`MIN_PLAYED_FRACTION`] est accepté comme une fin
+    /// naturelle, en se fiant à la position qu'annonce le renderer. Or sur un
+    /// réseau qui hoquette, il cale, cesse de récupérer le flux et annonce
+    /// `Stopped` — Tune enchaînait alors sur la piste suivante, amputant la fin
+    /// du morceau **sans laisser la moindre trace** (« Us And Them » de JP :
+    /// 6:36 jouées sur 7:49).
+    ///
+    /// Les octets servis tranchent, indépendamment de ce que le renderer
+    /// raconte : on ne finit pas de jouer un fichier qu'on n'a pas reçu.
+    /// `total_bytes` à `None` (radio, flux décodé) ⇒ on ne juge pas.
+    ///
+    /// `seeked` neutralise le critère : après un saut dans le morceau, le
+    /// renderer ne récupère que la portion restante, les octets servis sont donc
+    /// légitimement incomplets et vetoraient une fin parfaitement normale.
+    /// (`ZoneState::last_seek_at` est remis à zéro par `play()` à chaque
+    /// changement de piste, il vaut donc bien « un saut a eu lieu sur CETTE
+    /// piste ».)
+    pub fn renderer_could_have_finished(
+        bytes_sent: u64,
+        total_bytes: Option<u64>,
+        seeked: bool,
+    ) -> bool {
+        if seeked {
+            return true;
+        }
+        match total_bytes {
+            None | Some(0) => true,
+            Some(total) => {
+                bytes_sent.saturating_mul(100)
+                    >= total.saturating_mul(super::MIN_SERVED_PERCENT_FOR_NATURAL_END)
+            }
+        }
+    }
+
     pub fn played_enough(track_duration_ms: u64, peak_position_ms: u64, wall_elapsed: u64) -> bool {
         if track_duration_ms == 0 {
             peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS && wall_elapsed >= MIN_TRACK_WALL_SECS
@@ -685,6 +733,13 @@ pub mod fsm {
         pub stopped_ticks: u8,
         pub natural_end: bool,
         pub gapless_sent: bool,
+        /// Whether the output can transition internally (live probe). For an
+        /// exclusive local output or the OAAT direct-file loop, `gapless_sent`
+        /// is only a re-arm suppressor — no internal transition ever comes, so
+        /// the natural end must advance instead of waiting (the actual branch
+        /// already probes this; without it the shadow predicted
+        /// NaturalEndGaplessWaiting on every OAAT direct-path track end).
+        pub can_internal_gapless: bool,
         pub stream_consuming: bool,
         /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
         /// DSD track on a DLNA renderer whose peak position reached the end.
@@ -741,7 +796,7 @@ pub mod fsm {
         let stopped_ticks = i.stopped_ticks.saturating_add(1);
         if stopped_ticks >= STOPPED_TICKS_THRESHOLD {
             if i.natural_end {
-                return if i.gapless_sent {
+                return if i.gapless_sent && i.can_internal_gapless {
                     NaturalEndGaplessWaiting
                 } else {
                     NaturalEndAdvance
@@ -866,6 +921,7 @@ pub mod fsm {
                 stopped_ticks: 0,
                 natural_end: false,
                 gapless_sent: false,
+                can_internal_gapless: true,
                 stream_consuming: false,
                 dlna_dsd_reached_end: false,
             }
@@ -926,6 +982,32 @@ pub mod fsm {
                     ..base()
                 }),
                 StoppedOutcome::Ignore
+            );
+        }
+
+        #[test]
+        fn natural_end_advances_when_output_cannot_chain_internally() {
+            // gapless_sent posé par le chemin « skip » (sortie exclusive ou
+            // boucle directe OAAT) : pas de transition interne possible — la
+            // fin naturelle doit avancer, pas attendre (divergence shadow-FSM
+            // observée à chaque fin de piste locale OAAT, 29/07).
+            let i = StoppedInput {
+                natural_end: true,
+                gapless_sent: true,
+                can_internal_gapless: false,
+                stopped_ticks: STOPPED_TICKS_THRESHOLD,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::NaturalEndAdvance);
+
+            // Avec transition interne possible, le comportement historique reste.
+            let i2 = StoppedInput {
+                can_internal_gapless: true,
+                ..i
+            };
+            assert_eq!(
+                classify_stopped(&i2),
+                StoppedOutcome::NaturalEndGaplessWaiting
             );
         }
 
@@ -1477,6 +1559,10 @@ struct ZonePollState {
     /// transition and forces play_from_queue.
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
+    /// Ticks pendant lesquels on a refusé de conclure à une fin naturelle parce
+    /// que le flux servi était manifestement incomplet (voir
+    /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
+    stall_declines: u8,
     radio_stopped_ticks: u8,
     /// Last position (ms) the renderer reported on the previous radio poll.
     /// An advancing position means the renderer is actually streaming even
@@ -1543,7 +1629,8 @@ impl PositionPoller {
                     _ = ticker.tick() => {},
                     _ = notify.notified() => {},
                 }
-                self.tick(&mut poll_states, &mut idle_backoff, &startup_at).await;
+                self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                    .await;
             }
         })
     }
@@ -1786,6 +1873,7 @@ impl PositionPoller {
                 gapless_advance_pending: false,
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
+                stall_declines: 0,
                 radio_stopped_ticks: 0,
                 last_radio_position_ms: 0,
                 last_device_volume: None,
@@ -1827,6 +1915,7 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.scrobbled_key = None;
                     ps.last_bytes_sent = 0;
+                    ps.stall_declines = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
                 }
@@ -2414,6 +2503,7 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.last_position_ms = 0;
                     ps.last_bytes_sent = 0;
+                    ps.stall_declines = 0;
                     ps.track_started_at = Some(Instant::now());
                     ps.gapless_advance_pending = false;
                     ps.gapless_stuck_ticks = 0;
@@ -2537,6 +2627,9 @@ impl PositionPoller {
                             track_duration_ms,
                         ),
                         gapless_sent: ps.gapless_sent,
+                        // Refined by the natural-end branch below (live probe),
+                        // same late-update pattern as stream_consuming.
+                        can_internal_gapless: true,
                         stream_consuming: false,
                         dlna_dsd_reached_end,
                     };
@@ -2698,13 +2791,16 @@ impl PositionPoller {
                                 // (DEvir: repeat fails on clean ASIO playback).
                                 // Only wait when the output can actually
                                 // transition internally; otherwise end normally.
-                                let awaiting_dlna_transition = ps.gapless_sent && {
+                                let can_internal_gapless = {
                                     let outputs = self.outputs.lock().await;
                                     match outputs.get(&device_id) {
                                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                                         None => false,
                                     }
                                 };
+                                fsm_in.can_internal_gapless = can_internal_gapless;
+                                let awaiting_dlna_transition =
+                                    ps.gapless_sent && can_internal_gapless;
                                 if awaiting_dlna_transition {
                                     fsm_actual =
                                         Some(fsm::StoppedOutcome::NaturalEndGaplessWaiting);
@@ -2726,9 +2822,61 @@ impl PositionPoller {
                                     ps.gapless_stuck_ticks = 0;
                                     ps.gapless_cooldown = 4;
                                 } else {
-                                    fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
-                                    ps.gapless_sent = false;
-                                    track_ended = true;
+                                    // Avant d'accepter cette fin : le renderer
+                                    // a-t-il vraiment reçu le morceau ? Sur un
+                                    // réseau qui hoquette il cale, annonce
+                                    // Stopped, et on tronquait la fin en
+                                    // silence. Les octets servis tranchent.
+                                    let sid = zone_state
+                                        .now_playing
+                                        .as_ref()
+                                        .and_then(|np| np.stream_id.clone());
+                                    let (sent, total) = match sid.as_deref() {
+                                        Some(sid) => (
+                                            self.orchestrator
+                                                .streamer_bytes_sent(sid)
+                                                .await
+                                                .unwrap_or(0),
+                                            self.orchestrator.streamer_total_bytes(sid).await,
+                                        ),
+                                        None => (0, None),
+                                    };
+                                    let seeked = zone_state.last_seek_at.is_some();
+                                    if decisions::renderer_could_have_finished(sent, total, seeked)
+                                    {
+                                        fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
+                                        ps.gapless_sent = false;
+                                        track_ended = true;
+                                    } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
+                                        // On laisse au renderer le temps de
+                                        // reprendre : s'il repart, il repassera
+                                        // Playing et cette branche disparaît.
+                                        ps.stall_declines = ps.stall_declines.saturating_add(1);
+                                        if ps.stall_declines == 1 {
+                                            warn!(
+                                                zone_id,
+                                                peak_pos = ps.peak_position_ms,
+                                                track_dur = track_duration_ms,
+                                                bytes_sent = sent,
+                                                bytes_total = total.unwrap_or(0),
+                                                "renderer_stopped_on_incomplete_stream_waiting"
+                                            );
+                                        }
+                                    } else {
+                                        // La lecture a échoué : on arrête la
+                                        // zone bruyamment plutôt que d'avancer
+                                        // en faisant croire à une fin normale.
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            bytes_sent = sent,
+                                            bytes_total = total.unwrap_or(0),
+                                            "renderer_stalled_not_advancing_stopping_zone"
+                                        );
+                                        track_ended = false;
+                                        force_stop = true;
+                                    }
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
                                 // Check if the stream is still being consumed
@@ -2898,6 +3046,7 @@ impl PositionPoller {
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.last_bytes_sent = 0;
+                        ps.stall_declines = 0;
                         ps.track_started_at = Some(Instant::now());
                         ps.stopped_ticks = 0;
                         ps.past_end_ticks = 0;
@@ -3737,6 +3886,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -3788,6 +3938,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -3994,6 +4145,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -4568,6 +4720,7 @@ mod tests {
             gapless_advance_pending: true, // metadata was advanced
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -4636,7 +4789,10 @@ mod tests {
         assert!(b.remaining > 0);
         b.record_success();
         assert_eq!(b.consecutive_errors, 0);
-        assert!(!b.should_skip(), "un appareil qui répond doit être sondé à plein rythme");
+        assert!(
+            !b.should_skip(),
+            "un appareil qui répond doit être sondé à plein rythme"
+        );
     }
 
     /// Quantifie le gain : sur une minute face à un appareil qui ne répond
@@ -4658,7 +4814,83 @@ mod tests {
             polls <= 8,
             "60 ticks devraient donner une poignée de sondages, pas {polls}"
         );
-        assert!(polls >= 4, "il faut quand même retenter régulièrement, or {polls}");
+        assert!(
+            polls >= 4,
+            "il faut quand même retenter régulièrement, or {polls}"
+        );
+    }
+
+    #[test]
+    fn a_fully_served_stream_may_have_finished() {
+        // Tout servi, ou la marge de 10 % : le renderer a pu finir.
+        assert!(super::decisions::renderer_could_have_finished(
+            39_838_610,
+            Some(39_838_610),
+            false
+        ));
+        assert!(super::decisions::renderer_could_have_finished(
+            36_000_000,
+            Some(39_838_610),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_clearly_short_stream_cannot_have_finished() {
+        // Le cas de JP : 16 Mo servis sur 39,8 Mo, et le renderer annonce
+        // Stopped. Il n'a pas pu finir de jouer ce qu'il n'a pas reçu.
+        assert!(!super::decisions::renderer_could_have_finished(
+            16_121_856,
+            Some(39_838_610),
+            false
+        ));
+        assert!(!super::decisions::renderer_could_have_finished(
+            0,
+            Some(1_000),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_unknown_total_is_never_judged() {
+        // Radio, flux décodé à la volée : aucune conclusion possible, on garde
+        // le comportement d'avant plutôt que de bloquer une lecture saine.
+        assert!(super::decisions::renderer_could_have_finished(
+            0, None, false
+        ));
+        assert!(super::decisions::renderer_could_have_finished(
+            0,
+            Some(0),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_served_threshold_matches_the_documented_percentage() {
+        let total = 1_000_u64;
+        let pile = total * super::MIN_SERVED_PERCENT_FOR_NATURAL_END / 100;
+        assert!(super::decisions::renderer_could_have_finished(
+            pile,
+            Some(total),
+            false
+        ));
+        assert!(!super::decisions::renderer_could_have_finished(
+            pile - 1,
+            Some(total),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_seek_neutralises_the_served_bytes_criterion() {
+        // Après un saut, le renderer ne récupère que la portion restante : les
+        // octets servis sont légitimement partiels et ne doivent pas vetoer une
+        // fin normale (régression DEvir, v0.9.0-rc4).
+        assert!(super::decisions::renderer_could_have_finished(
+            1_000,
+            Some(39_838_610),
+            true
+        ));
     }
 
     #[test]
@@ -4689,6 +4921,7 @@ mod tests {
             gapless_advance_pending: true,
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,

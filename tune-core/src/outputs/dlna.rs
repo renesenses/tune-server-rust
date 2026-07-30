@@ -12,6 +12,20 @@ use crate::http::error as http_error;
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const SOAP_MAX_RETRIES: usize = 2;
+
+/// Préfixe des erreurs SOAP dues à un **timeout**, par opposition à un refus de
+/// connexion.
+///
+/// La distinction porte une information que l'orchestrateur exploite : un
+/// timeout ne prouve pas que la commande a été rejetée. La requête a très bien
+/// pu atteindre un renderer lent et être exécutée — nous n'avons simplement pas
+/// eu la réponse à temps. Détruire la session de flux dans ce cas garantit que
+/// le renderer, lorsqu'il ira chercher l'URL, tombera sur un 404 et affichera
+/// « chanson non trouvée » (Cyrus Stream X2 de JP).
+///
+/// Toute modification de cette chaîne doit suivre dans
+/// `orchestrator::command_may_have_landed`.
+pub const SOAP_TIMEOUT_PREFIX: &str = "soap timeout:";
 /// Timeout for the fire-and-forget Stop sent before SetAVTransportURI.
 /// Kept short (2s) because we don't need the response — SetAVTransportURI
 /// implicitly stops the current track on compliant renderers.
@@ -152,6 +166,7 @@ impl DlnaOutput {
 
         let soap_action = format!("{service}#{action}");
         let mut last_err = String::new();
+        let mut last_was_timeout = false;
 
         for attempt in 0..=SOAP_MAX_RETRIES {
             if attempt > 0 {
@@ -174,6 +189,7 @@ impl DlnaOutput {
                     Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
                 },
                 Err(e) if e.is_connect() || e.is_timeout() => {
+                    last_was_timeout = e.is_timeout();
                     last_err = format!("soap send: {}", http_error::chain(&e));
                 }
                 Err(e) => return Err(format!("soap send: {}", http_error::chain(&e))),
@@ -182,7 +198,13 @@ impl DlnaOutput {
 
         http_error::hint_if_local_network_denied(&last_err);
         warn!(device = %self.name, action, error = %last_err, "soap_all_retries_failed");
-        Err(last_err)
+        // Voir SOAP_TIMEOUT_PREFIX : un timeout laisse la commande peut-être
+        // exécutée, un refus de connexion non.
+        if last_was_timeout {
+            Err(format!("{SOAP_TIMEOUT_PREFIX} {last_err}"))
+        } else {
+            Err(last_err)
+        }
     }
 
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {

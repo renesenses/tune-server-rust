@@ -1052,7 +1052,11 @@ mod tests {
         let mgr = LicenseManager::new(backend);
 
         mgr.set_license_key("TUNE-TEST-1234").await.unwrap();
-        assert!(mgr.is_premium().await, "premium after activation");
+        // A stored key is pending (Free) until the licensing server confirms it;
+        // mirror that online validation so the tier is genuinely Premium before
+        // we exercise the session-conflict gating.
+        mgr.update_from_server(Tier::Premium, None).await;
+        assert!(mgr.is_premium().await, "premium after validated activation");
 
         mgr.set_session_conflict(Some("Maison 2".into()), None)
             .await;

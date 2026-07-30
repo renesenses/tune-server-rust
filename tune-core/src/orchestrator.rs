@@ -258,6 +258,20 @@ async fn probe_local_duration_ms(
         .filter(|&ms| ms > 0)
 }
 
+/// La commande de transport a-t-elle pu être exécutée malgré l'erreur remontée ?
+///
+/// Un timeout SOAP (voir [`crate::outputs::dlna::SOAP_TIMEOUT_PREFIX`]) ne prouve
+/// rien : la requête a pu atteindre un renderer lent et être honorée, seule la
+/// réponse a manqué. Un refus de connexion, lui, est concluant — rien n'est
+/// parti. Ce prédicat décide si l'on conserve la session de flux.
+pub(crate) fn command_may_have_landed(err: &str) -> bool {
+    // `contains` et non `starts_with` : send_to_output enveloppe l'erreur de la
+    // sortie dans « Output device error: {e} », le marqueur n'est donc jamais en
+    // tête. Un test couvre précisément ce chemin — s'y fier plutôt qu'à la forme
+    // supposée de la chaîne.
+    err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -792,9 +806,23 @@ impl PlaybackOrchestrator {
                 error = output_error.as_deref().unwrap_or(""),
                 "output_send_failed_stopping_zone_immediately"
             );
-            // Drop the stream we just created — nothing is consuming it.
+            // La session de flux ne se détruit que si la commande n'a
+            // certainement PAS été exécutée. Sur un timeout, elle a pu atteindre
+            // un renderer lent : détruire le flux garantit alors qu'il tombe sur
+            // un 404 en allant le chercher, et affiche « chanson non trouvée ».
+            // On la laisse vivre — la GC des sessions périmées la ramassera si
+            // personne ne la consomme.
+            let may_have_landed = output_error.as_deref().is_some_and(command_may_have_landed);
             if let Some(ref sid) = resolved.stream_id {
-                self.streamer.remove_session(sid).await;
+                if may_have_landed {
+                    info!(
+                        zone_id = req.zone_id,
+                        stream_id = %sid,
+                        "output_send_timed_out_keeping_stream_session"
+                    );
+                } else {
+                    self.streamer.remove_session(sid).await;
+                }
             }
             // Surface the failure now: flip the zone to Stopped so the poller's
             // load-grace path never runs and the UI reflects the error within a
@@ -2677,6 +2705,12 @@ impl PlaybackOrchestrator {
             let zone_id = req.zone_id;
             let streamer_for_eof = self.streamer.clone();
             let session_id_for_eof = session_id.clone();
+            // Seek d'une piste streaming (Qobuz/Tidal) sur sortie locale/OAAT :
+            // le chemin local passait déjà l'offset au décodeur, celui-ci
+            // repartait TOUJOURS de zéro — l'audio recommençait au début alors
+            // que l'UI affichait la position demandée (repros Hard To Say
+            // Goodbye 405s et Bina 1015s, .18, 28/07).
+            let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
 
             // Detect file:// URLs from DASH multi-segment downloads — the fMP4
             // is already on disk, skip the HTTP download step.
@@ -2782,7 +2816,7 @@ impl PlaybackOrchestrator {
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
                 let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                    crate::audio::decode::decode_to_pcm_streaming_seeked(
                         &tmp_file_clone,
                         Some(sr),
                         Some(2),
@@ -2791,6 +2825,7 @@ impl PlaybackOrchestrator {
                         32768,
                         data_ready,
                         levels_tx,
+                        seek_s,
                     )
                 })
                 .await;
@@ -5740,6 +5775,11 @@ impl PlaybackOrchestrator {
         self.streamer.stream_bytes_sent(stream_id).await
     }
 
+    /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
+    pub async fn streamer_total_bytes(&self, stream_id: &str) -> Option<u64> {
+        self.streamer.stream_total_bytes(stream_id).await
+    }
+
     async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {
@@ -6148,6 +6188,163 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    #[test]
+    fn timeout_means_the_command_may_have_landed() {
+        let err = format!(
+            "{} soap send: error sending request for url (http://192.168.1.92:8080/AVTransport/ctrl): operation timed out",
+            crate::outputs::dlna::SOAP_TIMEOUT_PREFIX
+        );
+        assert!(super::command_may_have_landed(&err));
+    }
+
+    #[test]
+    fn connection_refused_is_conclusive() {
+        // Refus de connexion : rien n'a pu partir, la session doit être détruite.
+        assert!(!super::command_may_have_landed(
+            "soap send: error sending request: connection refused"
+        ));
+        assert!(!super::command_may_have_landed("soap read: body error"));
+        assert!(!super::command_may_have_landed(""));
+    }
+
+    #[test]
+    fn timeout_marker_survives_the_send_to_output_wrapper() {
+        // send_to_output enveloppe : « Output device error: {e} ». Le marqueur
+        // n'est donc pas en tête de chaîne.
+        let err = format!(
+            "Output device error: {} soap send: operation timed out",
+            crate::outputs::dlna::SOAP_TIMEOUT_PREFIX
+        );
+        assert!(
+            super::command_may_have_landed(&err),
+            "le marqueur doit être reconnu même enveloppé"
+        );
+    }
+
+    /// Sortie dont `play_media` expire — le renderer lent qui reçoit peut-être la
+    /// commande, mais dont la réponse n'arrive pas (Cyrus Stream X2 de JP).
+    struct TimingOutOutput {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outputs::traits::OutputTarget for TimingOutOutput {
+        fn name(&self) -> &str {
+            "TimingOut"
+        }
+        fn device_id(&self) -> &str {
+            &self.id
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        async fn play_media(
+            &self,
+            _media: &crate::outputs::traits::PlayMedia<'_>,
+        ) -> Result<(), String> {
+            Err(format!(
+                "{} soap send: error sending request for url \
+                 (http://192.168.1.92:8080/AVTransport/ctrl): operation timed out",
+                crate::outputs::dlna::SOAP_TIMEOUT_PREFIX
+            ))
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _pos_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_volume(&self, _vol: f64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_status(&self) -> Result<crate::outputs::traits::OutputStatus, String> {
+            Ok(Default::default())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Un timeout de transport ne doit PAS détruire la session de flux : la
+    /// commande a pu atteindre le renderer, qui ira chercher l'URL. La détruire
+    /// lui fait afficher « chanson non trouvée ». Un refus, lui, est concluant.
+    #[tokio::test]
+    async fn transport_timeout_keeps_the_stream_session_but_refusal_drops_it() {
+        let orch = test_orchestrator();
+        let f = std::env::temp_dir().join("tune-timeout-session-test.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+
+        for (device_id, output, doit_survivre) in [
+            (
+                "timeout-dev",
+                Box::new(TimingOutOutput {
+                    id: "timeout-dev".into(),
+                }) as Box<dyn crate::outputs::traits::OutputTarget>,
+                true,
+            ),
+            (
+                "reject-dev",
+                Box::new(RejectingOutput {
+                    id: "reject-dev".into(),
+                }) as Box<dyn crate::outputs::traits::OutputTarget>,
+                false,
+            ),
+        ] {
+            orch.outputs.lock().await.register(output);
+
+            let sid = orch
+                .streamer
+                .create_file_session(
+                    crate::http::streamer::StreamInfo {
+                        format: "flac".into(),
+                        mime_type: "audio/flac".into(),
+                        ..Default::default()
+                    },
+                    f.to_string_lossy().into_owned(),
+                    false,
+                )
+                .await;
+
+            assert!(
+                orch.streamer.stream_bytes_sent(&sid).await.is_some(),
+                "{device_id} : la session doit exister juste après sa création"
+            );
+
+            let media = crate::outputs::traits::PlayMedia {
+                url: "http://server/stream",
+                mime_type: "audio/flac",
+                ..Default::default()
+            };
+            let (output_sent, output_error) =
+                orch.send_to_output(device_id, &media, None, false).await;
+            assert!(!output_sent, "{device_id} : l'envoi doit échouer");
+            let err = output_error.expect("une erreur doit être remontée");
+
+            // Même décision que la branche d'échec de play().
+            if super::command_may_have_landed(&err) {
+                // on conserve
+            } else {
+                orch.streamer.remove_session(&sid).await;
+            }
+
+            let encore_la = orch.streamer.stream_bytes_sent(&sid).await.is_some();
+            assert_eq!(
+                encore_la, doit_survivre,
+                "{device_id} : session présente={encore_la}, attendu={doit_survivre}"
+            );
+        }
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]
