@@ -26,6 +26,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_heartbeat(state);
     spawn_bio_sync(state);
     spawn_community_sync(state);
+    spawn_replaygain_analysis(state);
     spawn_radio_logo_refresh(state);
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
@@ -1054,6 +1055,14 @@ fn spawn_radio_logo_refresh(state: &AppState) {
 
 fn spawn_community_sync(state: &AppState) {
     tune_core::cloud::community_sync::spawn(state.backend.clone());
+}
+
+/// Background ReplayGain analysis: fills `rg_track_gain`/`rg_track_peak` (+ album)
+/// for local tracks whose files carry no ReplayGain tags, by measuring EBU R128
+/// loudness. Throttled and fully separate from the scan (which stays tag-only) so
+/// it never slows indexing. Gated by the `replaygain_analysis_enabled` setting.
+fn spawn_replaygain_analysis(state: &AppState) {
+    tune_core::audio::replaygain::spawn(state.backend.clone());
 }
 
 fn spawn_concert_alerts(state: &AppState) {
