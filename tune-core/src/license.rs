@@ -217,7 +217,7 @@ impl LicenseManager {
         let expires_at = settings.get("license_expires_at").ok().flatten();
         let last_validated = settings.get("license_last_validated").ok().flatten();
 
-        let hardware_fingerprint = Self::hardware_fingerprint();
+        let hardware_fingerprint = Self::persistent_fingerprint(&settings);
 
         let mut tier = match tier_str.as_deref() {
             Some("premium") => Tier::Premium,
@@ -558,6 +558,28 @@ impl LicenseManager {
         let mut hasher = Sha256::new();
         hasher.update(input.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    /// Stable hardware fingerprint, persisted in `settings` on first use.
+    ///
+    /// The raw [`hardware_fingerprint`] derives from hostname + machine-id, both
+    /// VOLATILE on containerised / NAS installs: a container's `HOSTNAME` is
+    /// often its recreatable id and `/etc/machine-id` can regenerate, so the
+    /// fingerprint changed on every reinstall/restart. The server then rejected
+    /// the (mono-device) license and testers were bounced into the grace/login
+    /// loop and had to be reset by hand (Yacine, Synology; recurring). Anchoring
+    /// it to the settings table — which lives in the library DB the user keeps —
+    /// makes it stable across restarts and reinstalls: computed once, reused
+    /// forever after.
+    fn persistent_fingerprint(settings: &SettingsRepo) -> String {
+        if let Some(fp) = settings.get("hardware_fingerprint").ok().flatten() {
+            if fp.len() == 64 {
+                return fp;
+            }
+        }
+        let fp = Self::hardware_fingerprint();
+        let _ = settings.set("hardware_fingerprint", &fp);
+        fp
     }
 
     /// Zone limit for the free tier (exposed for UI display).
