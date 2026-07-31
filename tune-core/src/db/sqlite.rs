@@ -432,7 +432,8 @@ CREATE TABLE IF NOT EXISTS zones (
     last_play_state TEXT DEFAULT 'stopped',
     dsd_mode TEXT DEFAULT 'auto',
     dlna_native_flac INTEGER DEFAULT 0,
-    host TEXT
+    host TEXT,
+    mac TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both

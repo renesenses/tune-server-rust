@@ -140,7 +140,8 @@ pub async fn push_changes(
             let placeholders = track_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT t.id, t.title, ar.name, al.title, t.format, t.sample_rate, t.bit_depth, \
-                 t.duration_ms, t.genre, t.track_number, t.disc_number, t.source, t.source_id \
+                 t.duration_ms, t.genre, t.track_number, t.disc_number, t.source, t.source_id, \
+                 t.isrc \
                  FROM tracks t \
                  LEFT JOIN artists ar ON t.artist_id = ar.id \
                  LEFT JOIN albums al ON t.album_id = al.id \
@@ -173,6 +174,10 @@ pub async fn push_changes(
                             "disc_number": r.get(10).and_then(|v| v.as_i64()),
                             "source": r.get(11).and_then(|v| v.as_string()),
                             "source_id": r.get(12).and_then(|v| v.as_string()),
+                            // ISRC — an exact recording code the cloud resolves
+                            // against MusicBrainz (metadata:resolve-isrc). Already
+                            // extracted from local tags + Tidal/Qobuz.
+                            "isrc": r.get(13).and_then(|v| v.as_string()),
                         }
                     }));
                     report.tracks_synced += 1;
