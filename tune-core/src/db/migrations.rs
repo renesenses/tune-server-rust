@@ -1182,6 +1182,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // N12 after a restart) must reconnect to its existing zone instead of
     // spawning a duplicate (forum #942).
     add_column_if_missing(db, "zones", "host", "TEXT");
+    // MAC of the renderer (Phase B of the MAC-identity chantier): the durable
+    // cross-protocol key. A Bluesound Node discovered as BluOS + DLNA +
+    // OpenHome must end up with ONE zone even when names and UUIDs all
+    // differ and the IP changes (forum #1239, Bilou: 3 « Node » zones).
+    add_column_if_missing(db, "zones", "mac", "TEXT");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");

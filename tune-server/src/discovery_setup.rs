@@ -330,10 +330,37 @@ async fn handle_ssdp_discovered(
         } else {
             "dlna"
         };
+
+        // Cross-protocol duplicate guard (Phase B, #1239) — the SSDP path
+        // never had one: a Node already owning a BluOS zone (created by the
+        // mDNS handler) would still get DLNA/OpenHome zones here whenever
+        // the names differed. No live registry on this path; the persisted
+        // host/MAC identity does the matching.
+        if let Some(conflict) = physical_zone_conflict(
+            &zone_repo,
+            &existing_zones,
+            |_| None,
+            &dev.name,
+            &dev.host,
+            dev.mac_address.as_deref(),
+            type_str,
+        ) {
+            info!(
+                name = %dev.name,
+                id = %dev.id,
+                host = %dev.host,
+                r#type = type_str,
+                conflicting_zone = %conflict,
+                "ssdp_zone_skipped_conflicting_protocol"
+            );
+            return;
+        }
+
         match zone_repo.get_or_create(&zone_name, Some(type_str), &dev.id) {
             Ok((zid, true)) => {
-                // Persist the host so a later UUID change reconnects here (#942).
-                let _ = zone_repo.set_host(zid, &dev.host);
+                // Persist host + MAC so a later UUID change, protocol change
+                // or DHCP renumbering reconnects here (#942, #1239).
+                let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
                     serde_json::json!({
@@ -346,7 +373,7 @@ async fn handle_ssdp_discovered(
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "ssdp_zone_auto_created");
             }
             Ok((zid, false)) => {
-                let _ = zone_repo.set_host(zid, &dev.host);
+                let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
                 set_zone_online(event_bus, db, &dev.id, true);
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, "ssdp_zone_already_existed");
             }
@@ -642,11 +669,13 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                         output_type_str,
                                         &dev.host,
                                     );
-                                    let zone_conflict = find_cross_protocol_zone_conflict(
+                                    let zone_conflict = physical_zone_conflict(
+                                        &zone_repo,
                                         &existing,
                                         |id| reg.host_of(id),
                                         &dev.name,
                                         &dev.host,
+                                        dev.mac_address.as_deref(),
                                         output_type_str,
                                     );
                                     if !registry_conflicts.is_empty() || zone_conflict.is_some() {
@@ -656,7 +685,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                             host = %dev.host,
                                             r#type = output_type_str,
                                             registry_conflicts = ?registry_conflicts,
-                                            conflicting_zone = ?zone_conflict.map(|z| z.name.as_str()),
+                                            conflicting_zone = ?zone_conflict,
                                             "mdns_zone_skipped_conflicting_protocol"
                                         );
                                     } else {
@@ -682,6 +711,14 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                                     &dev.id,
                                                 ) {
                                                     Ok((zid, true)) => {
+                                                        // Persist the physical identity so later
+                                                        // discoveries of the SAME device under
+                                                        // another protocol/UUID find this zone.
+                                                        let _ = zone_repo.set_identity(
+                                                            zid,
+                                                            &dev.host,
+                                                            dev.mac_address.as_deref(),
+                                                        );
                                                         event_bus.emit_typed(
                                                             EventType::ZoneCreated,
                                                             serde_json::json!({
@@ -694,6 +731,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                                         info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                                                     }
                                                     Ok((zid, false)) => {
+                                                        let _ = zone_repo.set_identity(
+                                                            zid,
+                                                            &dev.host,
+                                                            dev.mac_address.as_deref(),
+                                                        );
                                                         set_zone_online(
                                                             &event_bus, &db, &dev.id, true,
                                                         );
@@ -841,6 +883,40 @@ async fn probe_airplay_for_bluos(
 ///   zone of another protocol, even if its output isn't registered yet).
 ///
 /// [`OutputRegistry::host_of`]: tune_core::outputs::registry::OutputRegistry::host_of
+/// Phase B of the MAC-identity chantier: the full cross-protocol duplicate
+/// guard. Combines the in-memory check ([`find_cross_protocol_zone_conflict`]:
+/// live registry host + exact name) with the **persisted** identity stored on
+/// zones (host + MAC, [`ZoneRepo::find_visible_zone_by_identity`]). The
+/// persisted side is what the in-memory check kept missing: it works when the
+/// other protocol's output is not currently registered, when names differ
+/// (BluOS vs UPnP friendly name), and across restarts and DHCP renumbering —
+/// Bilou's Node ended up with three zones exactly through those gaps (#1239).
+/// Returns the conflicting zone's name.
+fn physical_zone_conflict(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    zones: &[tune_core::db::zone_repo::Zone],
+    resolve_host: impl Fn(&str) -> Option<String>,
+    dev_name: &str,
+    dev_host: &str,
+    dev_mac: Option<&str>,
+    new_type: &str,
+) -> Option<String> {
+    if let Some(z) =
+        find_cross_protocol_zone_conflict(zones, resolve_host, dev_name, dev_host, new_type)
+    {
+        return Some(z.name.clone());
+    }
+    if let Some((_, name, ztype)) = zone_repo.find_visible_zone_by_identity(dev_host, dev_mac) {
+        // Same-type matches are the reconnect path (get_by_device_id /
+        // zone_id_by_host handle those); only a DIFFERENT protocol on the
+        // same physical device is a duplicate.
+        if !ztype.is_empty() && !ztype.eq_ignore_ascii_case(new_type) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 fn find_cross_protocol_zone_conflict<'a>(
     zones: &'a [tune_core::db::zone_repo::Zone],
     resolve_host: impl Fn(&str) -> Option<String>,

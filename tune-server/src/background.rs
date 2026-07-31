@@ -297,14 +297,38 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     continue;
                 }
 
+                // Cross-protocol duplicate guard (Phase B, #1239): the startup
+                // batch had NO dedup at all — a device already owning a zone
+                // under another protocol (BluOS via mDNS) gained a second
+                // "dlna" zone here on every fresh boot. Match on the persisted
+                // host/MAC identity of visible zones.
+                if let Some((zid, zname, ztype)) =
+                    zone_repo.find_visible_zone_by_identity(&d.host, d.mac_address.as_deref())
+                {
+                    if !ztype.is_empty() && !ztype.eq_ignore_ascii_case("dlna") {
+                        info!(
+                            name = %d.name,
+                            device_id = %d.id,
+                            host = %d.host,
+                            conflicting_zone = %zname,
+                            conflicting_zone_id = zid,
+                            conflicting_type = %ztype,
+                            "ssdp_startup_zone_skipped_conflicting_protocol"
+                        );
+                        continue;
+                    }
+                }
+
                 // Auto-created zones start dormant and don't count against the
                 // free tier; the cap is enforced at first play in
                 // orchestrator.play(). So discovery may always register a device.
                 match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
                     Ok((zid, true)) => {
+                        let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
                     }
-                    Ok((_, false)) => {
+                    Ok((zid, false)) => {
+                        let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         let _ = zone_repo.set_online_by_device(&d.id, true);
                     }
                     Err(e) => {
@@ -666,6 +690,14 @@ fn spawn_heartbeat(state: &AppState) {
                 .into_iter()
                 .filter_map(|z| z.output_device_id.map(|did| (did, z.name)))
                 .collect();
+            // Physical identity persisted on zones (Phase B): lets the
+            // mozaiklabs admin identify renderer brands by MAC OUI instead
+            // of guessing from device names.
+            let zone_identities: std::collections::HashMap<String, (String, String)> = zone_repo
+                .device_identities()
+                .into_iter()
+                .map(|(did, host, mac)| (did, (host, mac)))
+                .collect();
 
             let devices: Vec<serde_json::Value> = match outputs.try_lock() {
                 Ok(registry) => registry
@@ -690,7 +722,23 @@ fn spawn_heartbeat(state: &AppState) {
                                 .or_else(|| id.strip_prefix("uuid:"))
                                 .unwrap_or(&id)
                         });
-                        serde_json::json!({ "name": name, "type": dev_type })
+                        let (mac, manufacturer) = zone_identities
+                            .get(&id)
+                            .map(|(_, mac)| {
+                                (
+                                    mac.clone(),
+                                    tune_core::discovery::mac::vendor_for_mac(mac)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "name": name,
+                            "type": dev_type,
+                            "mac": mac,
+                            "manufacturer": manufacturer,
+                        })
                     })
                     .collect(),
                 Err(_) => Vec::new(),
