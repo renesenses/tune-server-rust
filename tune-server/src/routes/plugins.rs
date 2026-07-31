@@ -329,19 +329,29 @@ async fn delete_plugin(
 ) -> impl IntoResponse {
     // A wasm plugin lives on disk: uninstalling means removing its directory
     // (the flags alone would leave it re-loaded at every startup).
-    if let Err(e) = crate::plugins::remove_wasm_dir(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "uninstall_failed", "detail": e })),
-        )
-            .into_response();
-    }
+    let removed_dir = match crate::plugins::remove_wasm_dir(&name) {
+        Ok(removed) => removed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "uninstall_failed", "detail": e })),
+            )
+                .into_response();
+        }
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.delete(&enabled_key).ok();
-    StatusCode::NO_CONTENT.into_response()
+    // 200 + JSON rather than 204: the web client's fetchJSON treats an empty
+    // body as an error, and it needs restart_required for its banner.
+    Json(json!({
+        "status": "uninstalled",
+        "name": name,
+        "restart_required": removed_dir,
+    }))
+    .into_response()
 }
 
 async fn plugin_docs() -> Json<Value> {
