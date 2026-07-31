@@ -76,7 +76,10 @@ struct PatchZone {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_zones).post(create_zone))
+        .route(
+            "/",
+            get(list_zones).post(create_zone).delete(delete_all_zones),
+        )
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
@@ -1275,6 +1278,31 @@ async fn register_dlna_output_from_device(
     }
 
     false
+}
+
+/// DELETE /zones — soft-delete every zone and clear the free-tier
+/// activation markers, so a Free user whose 3-zone quota is consumed by
+/// stale renderers can start over and explicitly re-create the zones he
+/// wants (discovery never resurrects hidden zones, only POST /zones does).
+async fn delete_all_zones(State(state): State<AppState>) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let ids: Vec<i64> = repo
+        .list()
+        .map(|zs| zs.iter().filter_map(|z| z.id).collect())
+        .unwrap_or_default();
+    match repo.delete_all() {
+        Ok(_) => {
+            info!(count = ids.len(), "all_zones_deleted_quota_reset");
+            for id in ids {
+                state.event_bus.emit_typed(
+                    tune_core::event_types::EventType::ZoneDeleted,
+                    json!({"id": id}),
+                );
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn delete_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
