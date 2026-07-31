@@ -3847,6 +3847,14 @@ impl PlaybackOrchestrator {
             duration_ms = Some(track.duration_ms as i64);
         }
 
+        // Same contract as the radio branch: every path above may have replaced
+        // the service's signed CDN URL with one of our own proxy or transcode
+        // endpoints. Keep the upstream so an output that wants the bytes as the
+        // service published them — a recorder keeping the original FLAC instead
+        // of the proxy's re-stream or a WAV transcode — can ask for them. `None`
+        // when we are handing out the upstream unchanged.
+        let origin_url = (stream_url != stream_data.url).then(|| stream_data.url.clone());
+
         Ok(ResolvedStream {
             url: stream_url,
             mime_type: out_mime,
@@ -3861,7 +3869,7 @@ impl PlaybackOrchestrator {
             sample_rate: Some(stream_data.quality.sample_rate),
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
-            origin_url: None,
+            origin_url,
         })
     }
 
@@ -4090,7 +4098,13 @@ impl PlaybackOrchestrator {
                 sample_rate: Some(sr),
                 bit_depth: Some(out_bd as u32),
                 channels: Some(ch as u32),
-                origin_url: None,
+                // What we serve here is a local session over the decoded buffer;
+                // the service's own URL travels on `PrefetchedTrack` so a
+                // recorder still gets the published bytes rather than our
+                // re-encode. A track shorter than the prefetch window is served
+                // from this path, so without it short tracks were the only ones
+                // captured through the proxy — and filed under `Stream/`.
+                origin_url: prefetched.upstream_url,
                 cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
@@ -4161,7 +4175,10 @@ impl PlaybackOrchestrator {
             sample_rate: Some(sr),
             bit_depth: Some(out_bd as u32),
             channels: Some(ch as u32),
-            origin_url: None,
+            // Same as the FLAC-session branch above: this is a WAV session over
+            // the decoded buffer, so an output that wants the source container
+            // needs the service's own URL, not ours.
+            origin_url: prefetched.upstream_url,
         })
     }
 
