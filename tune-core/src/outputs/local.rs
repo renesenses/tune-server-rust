@@ -3567,6 +3567,8 @@ impl OutputTarget for LocalOutput {
                 track_title: self.track_title.lock().unwrap().clone(),
                 track_artist: self.track_artist.lock().unwrap().clone(),
                 ended_naturally: true,
+                // A renderer plays at 1x: keep the poller's wall-clock guards.
+                realtime: true,
             });
         }
 
@@ -3590,6 +3592,8 @@ impl OutputTarget for LocalOutput {
             track_title: self.track_title.lock().unwrap().clone(),
             track_artist: self.track_artist.lock().unwrap().clone(),
             ended_naturally: self.track_ended_naturally.load(Ordering::Relaxed),
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

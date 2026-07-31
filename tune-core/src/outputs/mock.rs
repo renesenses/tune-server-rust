@@ -179,6 +179,8 @@ impl OutputTarget for MockOutput {
             track_title: None,
             track_artist: None,
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

@@ -188,6 +188,8 @@ impl OutputTarget for BluosOutput {
             track_title: extract_tag(&xml, "title1"),
             track_artist: extract_tag(&xml, "artist"),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

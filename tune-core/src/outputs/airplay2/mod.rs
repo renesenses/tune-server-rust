@@ -385,6 +385,8 @@ impl OutputTarget for Airplay2Output {
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

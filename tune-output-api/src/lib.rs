@@ -34,6 +34,20 @@ pub struct OutputStatus {
     /// (not via stop/skip). When true + state==Stopped, this is a definitive
     /// end-of-track that should trigger auto_next regardless of played_enough.
     pub ended_naturally: bool,
+    /// Whether this output consumes the track at 1x, in real time.
+    ///
+    /// `true` for every renderer, and the default: a speaker, a DLNA device or
+    /// a Chromecast cannot finish a five-minute track in under five minutes, so
+    /// the poller treats an early `ended_naturally` as a device bug (an Eversolo
+    /// DMP-A8 reporting a phantom end mid-track) and holds the queue back until
+    /// enough wall-clock time has passed.
+    ///
+    /// `false` for an output that legitimately finishes faster than 1x — a
+    /// recorder writing the container to disk at network speed. Those
+    /// wall-clock plausibility guards do not apply to it: its
+    /// `ended_naturally` + `Stopped` means the track really is done, one second
+    /// into a five-minute piece.
+    pub realtime: bool,
 }
 
 impl Default for OutputStatus {
@@ -48,6 +62,7 @@ impl Default for OutputStatus {
             track_title: None,
             track_artist: None,
             ended_naturally: false,
+            realtime: true,
         }
     }
 }
