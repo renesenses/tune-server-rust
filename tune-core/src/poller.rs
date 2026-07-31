@@ -4484,17 +4484,21 @@ mod tests {
 
     #[test]
     fn natural_end_when_played_enough() {
-        assert!(decisions::natural_end(true, false, 0, false, 0, 300_000, true));
+        assert!(decisions::natural_end(
+            true, false, 0, false, 0, 300_000, true
+        ));
     }
 
     #[test]
     fn natural_end_repeat_active_with_meaningful_playback() {
         // Repeat on + peak > 5s → treat as natural end (DEvir QA B-05).
         assert!(decisions::natural_end(
-            false, true, 6_000, false, 0, 300_000, true));
+            false, true, 6_000, false, 0, 300_000, true
+        ));
         // Repeat on but peak <= 5s → not enough.
         assert!(!decisions::natural_end(
-            false, true, 4_000, false, 0, 300_000, true));
+            false, true, 4_000, false, 0, 300_000, true
+        ));
     }
 
     #[test]
@@ -4502,9 +4506,15 @@ mod tests {
         // ended_naturally is trusted only once >= MIN_WALL_FRACTION of the known
         // duration has elapsed in wall time — a 5:00 track cannot end at 5s
         // (DMP-A8 spurious ended_naturally). 50% of 300s = 150s.
-        assert!(!decisions::natural_end(false, false, 0, true, 5, 300_000, true));
-        assert!(!decisions::natural_end(false, false, 0, true, 149, 300_000, true));
-        assert!(decisions::natural_end(false, false, 0, true, 150, 300_000, true));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 5, 300_000, true
+        ));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 149, 300_000, true
+        ));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 150, 300_000, true
+        ));
         // Unknown duration (0) keeps the original modest 5s floor.
         assert!(decisions::natural_end(false, false, 0, true, 5, 0, true));
         assert!(!decisions::natural_end(false, false, 0, true, 4, 0, true));
@@ -4517,8 +4527,12 @@ mod tests {
     #[test]
     fn natural_end_non_realtime_output_skips_the_wall_guard() {
         // Same inputs the DMP-A8 guard rejects above — accepted here.
-        assert!(decisions::natural_end(false, false, 0, true, 1, 300_000, false));
-        assert!(decisions::natural_end(false, false, 0, true, 0, 300_000, false));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 1, 300_000, false
+        ));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 0, 300_000, false
+        ));
 
         // The exemption is not a blanket "always end": without ended_naturally
         // there is still nothing to act on.
@@ -4527,22 +4541,28 @@ mod tests {
         ));
 
         // And it changes nothing for a renderer.
-        assert!(!decisions::natural_end(false, false, 0, true, 1, 300_000, true));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 1, 300_000, true
+        ));
     }
 
     #[test]
     fn natural_end_short_track_half_played() {
         // Short track (< 30s) with >= 50% peak → natural end.
         assert!(decisions::natural_end(
-            false, false, 6_000, false, 0, 10_000, true));
+            false, false, 6_000, false, 0, 10_000, true
+        ));
         // Short track but < 50% peak → not yet.
         assert!(!decisions::natural_end(
-            false, false, 4_000, false, 0, 10_000, true));
+            false, false, 4_000, false, 0, 10_000, true
+        ));
     }
 
     #[test]
     fn natural_end_all_guards_false() {
-        assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000, true));
+        assert!(!decisions::natural_end(
+            false, false, 0, false, 0, 300_000, true
+        ));
     }
 
     // DSD-over-DLNA end-of-track fast path (Benjithom, RS130: ~5s gap between DSD
