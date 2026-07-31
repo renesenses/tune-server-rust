@@ -290,6 +290,63 @@ fn resolve_plugins_dir(env_override: Option<String>, exe_dir: Option<PathBuf>) -
     PathBuf::from("plugins")
 }
 
+/// Env var that puts the process in probe-child mode (value = wasm path).
+const WASM_PROBE_ENV: &str = "TUNE_WASM_PROBE";
+
+/// Kill-switch: set to `1`/`true` to skip wasm plugin loading entirely.
+const WASM_DISABLE_ENV: &str = "TUNE_DISABLE_WASM_PLUGINS";
+
+/// Probe-child mode: attempt the wasmtime load of `$TUNE_WASM_PROBE`, then
+/// exit 0. Survival is the whole point — a clean `Err` exits 0 too, because
+/// the in-process loader handles load errors gracefully; only a process
+/// *death* (SIGILL & co) tells the parent to skip wasm plugins. Must be
+/// called before any server state is built; no-op outside probe mode.
+pub(crate) fn maybe_run_wasm_probe() {
+    if let Ok(path) = std::env::var(WASM_PROBE_ENV) {
+        let _ = WasmPlugin::load(Path::new(&path), Limits::default());
+        std::process::exit(0);
+    }
+}
+
+/// Try compiling `entry` in a throwaway child process first.
+///
+/// wasmtime's codegen can die at the machine level — SIGILL on a CPU older
+/// than cranelift's baseline (#1249, Cyrille's Intel Mac mini: the server
+/// vanished mid-startup, log ending at `plugins_scanned`, nothing to catch
+/// in-process). A child that dies proves it at zero cost; the parent skips
+/// the plugin and the server lives.
+fn probe_wasm_load(entry: &Path) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let child = std::process::Command::new(exe)
+        .env(WASM_PROBE_ENV, entry)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    // Bounded wait: a hung probe must not hang startup either. Generous
+    // deadline: a DEBUG build compiles party's wasm in ~12 s (cranelift
+    // unoptimised); release builds take well under a second.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// Scan the plugins directory and load every **enabled** wasm plugin whose
 /// `entry_point` file exists, wiring each to an [`AppStateHost`] and its
 /// manifest permissions, then publish the registry into `state.wasm_plugins`.
@@ -297,9 +354,22 @@ fn resolve_plugins_dir(env_override: Option<String>, exe_dir: Option<PathBuf>) -
 /// A plugin is enabled unless its `plugin_{id}_enabled` setting is explicitly
 /// `"false"` (the same key the REST enable/disable handlers write). A plugin
 /// that fails to load is logged and skipped — a bad plugin must never crash
-/// startup (RFC §3.7). Idempotent-ish: safe to call once; a second call is a
-/// no-op because the `OnceLock` is already set.
+/// startup (RFC §3.7); each load is probed in a child process first, so even
+/// a machine-level death (SIGILL) skips the plugin instead of killing the
+/// server. Idempotent-ish: safe to call once; a second call is a no-op
+/// because the `OnceLock` is already set.
 pub async fn load_wasm_plugins(state: &AppState) {
+    if std::env::var(WASM_DISABLE_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        info!("wasm_plugins_disabled_by_env");
+        let _ = state.wasm_plugins.set(WasmRegistry {
+            plugins: HashMap::new(),
+        });
+        return;
+    }
+
     let dir = plugins_dir();
     let manager = PluginManager::new(dir.clone());
     let infos = match manager.scan().await {
@@ -335,6 +405,17 @@ pub async fn load_wasm_plugins(state: &AppState) {
         let entry = Path::new(&info.path).join(&info.manifest.entry_point);
         if !entry.exists() {
             warn!(id = %id, entry = %entry.display(), "wasm_plugin_entry_missing");
+            continue;
+        }
+
+        if !probe_wasm_load(&entry) {
+            warn!(
+                id = %id,
+                entry = %entry.display(),
+                "wasm_plugin_probe_failed — wasmtime died loading this module \
+                 on this machine (CPU below cranelift's baseline?); plugin \
+                 skipped, server continues"
+            );
             continue;
         }
 
