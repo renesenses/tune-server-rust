@@ -235,6 +235,7 @@ pub fn router() -> Router<AppState> {
         .route("/browse/dir", get(browse::browse_directory))
         .route("/folders", get(browse::browse_folders))
         .route("/genres", get(genres::list_genres))
+        .route("/genres/rename", post(genres::rename_genre))
         .route("/genres/{name}/albums", get(genres::genre_albums))
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))
