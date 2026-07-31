@@ -266,13 +266,102 @@ impl WasmRegistry {
 ///    package dir, so a bare CWD-relative `plugins/` would silently never be
 ///    found and the bundled Party plugin would never load.
 /// 3. CWD-relative `plugins/` otherwise (dev `cargo run` from the repo root).
-fn plugins_dir() -> PathBuf {
+pub(crate) fn plugins_dir() -> PathBuf {
     resolve_plugins_dir(
         std::env::var("TUNE_PLUGINS_DIR").ok(),
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf)),
     )
+}
+
+/// Persist a downloaded marketplace archive (a zip holding at least
+/// `manifest.json` + the manifest's `entry_point` wasm) into
+/// `{plugins_dir}/{manifest.id}/`, where [`load_wasm_plugins`] picks it up at
+/// next startup. Returns the manifest id. The manifest inside the archive is
+/// authoritative — the store slug or package name never names the directory.
+pub(crate) fn persist_plugin_archive(data: &[u8]) -> Result<String, String> {
+    persist_plugin_archive_in(&plugins_dir(), data)
+}
+
+/// [`persist_plugin_archive`] with an explicit destination root, split out so
+/// tests never depend on process-global env or the executable's location.
+fn persist_plugin_archive_in(root: &Path, data: &[u8]) -> Result<String, String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data))
+        .map_err(|e| format!("invalid plugin archive: {e}"))?;
+
+    let manifest: PluginManifest = {
+        let file = zip
+            .by_name("manifest.json")
+            .map_err(|_| "archive has no manifest.json".to_string())?;
+        serde_json::from_reader(file).map_err(|e| format!("invalid manifest.json: {e}"))?
+    };
+    // The id becomes a directory name AND a URL path segment (`/plugins/{id}/…`).
+    if manifest.id.is_empty()
+        || !manifest
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("unsafe plugin id in manifest: {:?}", manifest.id));
+    }
+
+    let dest = root.join(&manifest.id);
+    std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+
+    for i in 0..zip.len() {
+        let mut file = zip
+            .by_index(i)
+            .map_err(|e| format!("read archive entry {i}: {e}"))?;
+        if !file.is_file() {
+            continue;
+        }
+        // enclosed_name refuses absolute paths and `..` traversal.
+        let Some(rel) = file.enclosed_name() else {
+            return Err(format!("unsafe path in archive: {:?}", file.name()));
+        };
+        let out_path = dest.join(rel);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&out_path)
+            .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+        std::io::copy(&mut file, &mut out)
+            .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    }
+
+    let entry = dest.join(&manifest.entry_point);
+    if !entry.exists() {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(format!(
+            "archive is missing its entry point {:?}",
+            manifest.entry_point
+        ));
+    }
+
+    info!(id = %manifest.id, dir = %dest.display(), "plugin_archive_persisted");
+    Ok(manifest.id)
+}
+
+/// Remove an installed wasm plugin's directory, if present. Returns whether a
+/// directory was actually removed. The same id sanitation as install applies —
+/// the id comes back from HTTP here, so it must never traverse.
+pub(crate) fn remove_plugin_dir(id: &str) -> Result<bool, String> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("unsafe plugin id: {id:?}"));
+    }
+    let dir = plugins_dir().join(id);
+    if !dir.join("manifest.json").exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {e}", dir.display()))?;
+    info!(id = %id, dir = %dir.display(), "plugin_dir_removed");
+    Ok(true)
 }
 
 /// Pure resolution logic behind [`plugins_dir`], split out so it is testable
@@ -495,8 +584,80 @@ pub fn spawn_wasm_event_forwarder(state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{any_subscription_matches, event_matches, resolve_plugins_dir};
+    use super::{
+        any_subscription_matches, event_matches, persist_plugin_archive_in, resolve_plugins_dir,
+    };
+    use std::io::Write;
     use std::path::PathBuf;
+
+    /// Build an in-memory zip holding the given (name, contents) entries.
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn manifest_json(id: &str) -> Vec<u8> {
+        serde_json::json!({
+            "id": id,
+            "name": "Party Mode",
+            "version": "0.1.0",
+            "description": "test",
+            "author": "MozAIk Labs",
+            "entry_point": "main.wasm",
+            "permissions": ["queue"],
+            "min_server_version": "0.9.0",
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn persist_archive_writes_plugin_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = make_zip(&[
+            ("manifest.json", &manifest_json("party")),
+            ("main.wasm", b"\0asm"),
+        ]);
+        let id = persist_plugin_archive_in(tmp.path(), &data).unwrap();
+        assert_eq!(id, "party");
+        assert!(tmp.path().join("party/manifest.json").exists());
+        assert!(tmp.path().join("party/main.wasm").exists());
+    }
+
+    #[test]
+    fn persist_archive_rejects_missing_entry_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = make_zip(&[("manifest.json", &manifest_json("party"))]);
+        let err = persist_plugin_archive_in(tmp.path(), &data).unwrap_err();
+        assert!(err.contains("entry point"), "{err}");
+        // The half-written directory must not survive: load_wasm_plugins would
+        // warn about it at every startup.
+        assert!(!tmp.path().join("party").exists());
+    }
+
+    #[test]
+    fn persist_archive_rejects_unsafe_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = make_zip(&[
+            ("manifest.json", &manifest_json("../evil")),
+            ("main.wasm", b"\0asm"),
+        ]);
+        let err = persist_plugin_archive_in(tmp.path(), &data).unwrap_err();
+        assert!(err.contains("unsafe plugin id"), "{err}");
+    }
+
+    #[test]
+    fn persist_archive_rejects_missing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = make_zip(&[("main.wasm", b"\0asm")]);
+        let err = persist_plugin_archive_in(tmp.path(), &data).unwrap_err();
+        assert!(err.contains("manifest.json"), "{err}");
+    }
 
     #[test]
     fn plugins_dir_env_override_wins() {

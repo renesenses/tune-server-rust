@@ -188,6 +188,46 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         }));
     }
 
+    // Wasm plugins installed on disk (marketplace installs or bundled).
+    // Scanned from the plugins dir rather than the loaded registry so a
+    // disabled plugin — or one installed since the last restart — still shows
+    // up and can be toggled. `loaded` distinguishes running from
+    // pending-restart.
+    if let Some(dir) = crate::plugins::wasm_plugins_dir() {
+        let manager = tune_core::plugins::PluginManager::new(dir);
+        if let Ok(infos) = manager.scan().await {
+            for info in infos {
+                let id = info.manifest.id.clone();
+                let enabled = settings
+                    .get(&format!("plugin_{id}_enabled"))
+                    .ok()
+                    .flatten()
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                #[cfg(feature = "plugins-wasm")]
+                let loaded = state
+                    .wasm_plugins
+                    .get()
+                    .is_some_and(|reg| reg.get(&id).is_some());
+                #[cfg(not(feature = "plugins-wasm"))]
+                let loaded = false;
+                plugins.push(serde_json::json!({
+                    "name": id,
+                    "display_name": info.manifest.name,
+                    "description": info.manifest.description,
+                    "version": info.manifest.version,
+                    "author": info.manifest.author,
+                    "type": "wasm",
+                    "installed": true,
+                    "enabled": enabled,
+                    "loaded": loaded,
+                    "restart_required": enabled && !loaded,
+                    "url": format!("/api/v1/plugins/{id}/"),
+                }));
+            }
+        }
+    }
+
     Json(json!(plugins))
 }
 
@@ -287,12 +327,21 @@ async fn delete_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // A wasm plugin lives on disk: uninstalling means removing its directory
+    // (the flags alone would leave it re-loaded at every startup).
+    if let Err(e) = crate::plugins::remove_wasm_dir(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "uninstall_failed", "detail": e })),
+        )
+            .into_response();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.delete(&enabled_key).ok();
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn plugin_docs() -> Json<Value> {
