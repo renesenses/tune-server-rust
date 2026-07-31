@@ -42,6 +42,10 @@ pub struct RunOptions {
 /// Build the tokio runtime and run the server to completion.
 /// This is `fn main()` in a callable form; it never returns in normal use.
 pub fn main_blocking(opts: RunOptions) {
+    // Probe-child dispatch FIRST: when spawned as a wasm-load probe, do the
+    // one dangerous thing and exit before any server state exists (#1249).
+    crate::plugins::maybe_run_wasm_probe();
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]

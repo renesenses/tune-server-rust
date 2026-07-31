@@ -309,3 +309,15 @@ pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
 pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
     None
 }
+
+/// Probe-child dispatch for the wasm runtime (see
+/// `plugins_host::maybe_run_wasm_probe`). Always-compiled facade so the
+/// binary entry points can call it without feature cfgs; a build without
+/// `plugins-wasm` has nothing to probe.
+#[cfg(feature = "plugins-wasm")]
+pub fn maybe_run_wasm_probe() {
+    crate::plugins_host::maybe_run_wasm_probe();
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+pub fn maybe_run_wasm_probe() {}

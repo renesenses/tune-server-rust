@@ -147,6 +147,9 @@ async fn wasm_plugin_receives_subscribed_events_only() {
     // into the default integration.rs run.
     unsafe {
         std::env::set_var("TUNE_PLUGINS_DIR", dir.path());
+        // Skip the child-process probe: from a libtest binary, spawning
+        // current_exe re-runs the whole suite instead of probing.
+        std::env::set_var("TUNE_WASM_PROBE_SKIP", "1");
     }
 
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
