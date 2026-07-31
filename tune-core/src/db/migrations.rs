@@ -1848,7 +1848,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 13, "latest PG migration must be 13");
+        assert_eq!(pg_latest_version(), 14, "latest PG migration must be 14");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
