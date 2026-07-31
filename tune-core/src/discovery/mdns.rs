@@ -494,6 +494,10 @@ fn service_to_device(
     }
 
     device.capabilities = caps;
+    // Normalise whatever landed in mac_address (AirPlay deviceid, opaque
+    // Chromecast id → ARP fallback) and derive the brand from the OUI when
+    // the TXT record carried no manufacturer.
+    super::mac::enrich_identity(&mut device);
     device
 }
 
