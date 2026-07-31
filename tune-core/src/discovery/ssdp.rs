@@ -714,6 +714,10 @@ async fn process_responses(
                     "event_sub_urls".into(),
                     serde_json::to_value(desc.event_sub_urls()).unwrap_or_default(),
                 );
+                // We just fetched the description over TCP, so the ARP cache
+                // has this host: recover the MAC (stable identity + brand
+                // display) while it is warm.
+                super::mac::enrich_identity(&mut device);
                 if desc.is_openhome() {
                     device
                         .capabilities
@@ -773,6 +777,7 @@ async fn process_responses(
                         device
                             .capabilities
                             .insert("minimal_dmr".into(), serde_json::Value::Bool(true));
+                        super::mac::enrich_identity(&mut device);
 
                         let mut st = state.lock().await;
                         st.known_locations.insert(dev_id.clone(), resp.location);
