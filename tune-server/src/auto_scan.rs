@@ -142,26 +142,33 @@ pub fn build_track_from_metadata_opts(
             file = %sf.path,
             "DIAG_album_resolution"
         );
-        // Quality-based album splitting: append suffix when sample_rate or
-        // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
-        // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
-        let suffix = if quality_split {
-            tune_core::scanner::quality::quality_suffix(meta.sample_rate, meta.bit_depth)
+        // The album's folder identifies the release — see
+        // `scanner::album_folder` and `AlbumRepo::get_or_create_for_folder`.
+        //
+        // The quality tier used to be appended to the TITLE ("Album
+        // (96kHz/24bit)") to keep a hi-res copy from merging with a CD rip. It
+        // separated far more than intended: an edition whose discs differ in
+        // sample rate — a box set at 24/192, 16/44.1 and 24/48 — showed up as
+        // three albums under three near-identical titles. The folder separates
+        // exactly what should be separate, and the client already renders the
+        // real quality as a badge from `sample_rate`/`bit_depth`, so the title
+        // never needed to carry it.
+        //
+        // Disambiguation by MusicBrainz release id and by (title, artist_id,
+        // year) is unchanged, inside `get_or_create_for_folder`.
+        // `quality_split` keeps its meaning — "if the same album exists in CD and
+        // Hi-Res, create two separate entries" — and the folder is what now
+        // delivers it. Off ⇒ empty folder ⇒ `get_or_create_for_folder` falls
+        // straight through to the title+artist identity, merging both copies.
+        let folder = if quality_split {
+            tune_core::scanner::album_folder::album_folder(&sf.path).unwrap_or_default()
         } else {
             String::new()
         };
-        let album_title = if suffix.is_empty() {
-            title.clone()
-        } else {
-            format!("{title} ({suffix})")
-        };
-        // Disambiguate by (title, artist_id, year) AND the MusicBrainz release
-        // id, so two distinct editions sharing title+artist+year stay separate
-        // (Dominique). Compilations use the "Various Artists" artist_id, so
-        // same-title albums by different artists are already kept apart.
         album_repo
-            .get_or_create_with_mbid(
-                &album_title,
+            .get_or_create_for_folder(
+                &folder,
+                title,
                 aid,
                 meta.year.map(|y| y as i32),
                 meta.musicbrainz_release_id.as_deref(),

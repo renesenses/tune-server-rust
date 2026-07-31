@@ -225,7 +225,10 @@ CREATE TABLE IF NOT EXISTS albums (
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,
-    original_date TEXT
+    original_date TEXT,
+    -- The folder on disk holding this release. What identifies an album: see
+    -- `scanner::album_folder`.
+    folder_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (

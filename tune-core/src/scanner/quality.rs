@@ -32,6 +32,74 @@ pub fn quality_suffix(sample_rate: Option<u32>, bit_depth: Option<u16>) -> Strin
     }
 }
 
+/// Remove a quality suffix from an album title — the inverse of
+/// [`quality_suffix`].
+///
+/// The scanner used to append the tier to the title (`"Album (96kHz/24bit)"`) to
+/// keep a hi-res copy apart from a CD rip; the album's folder does that now, and
+/// clients render the real quality from `sample_rate`/`bit_depth`. This undoes
+/// what was written into titles by that scheme.
+///
+/// Only parenthesised groups that are *entirely* a quality descriptor are
+/// dropped, so "Live (Remastered)" and "Symphony No. 5 (1962)" are untouched.
+pub fn strip_quality_suffix(title: &str) -> String {
+    let mut result = String::with_capacity(title.len());
+    let mut depth = 0i32;
+    let mut paren_start = 0;
+    for (i, c) in title.char_indices() {
+        if c == '(' {
+            if depth == 0 {
+                paren_start = i;
+            }
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth <= 0 {
+                depth = 0;
+                let inner = &title[paren_start + 1..i];
+                if is_quality_descriptor(inner) {
+                    while result.ends_with(' ') {
+                        result.pop();
+                    }
+                } else {
+                    result.push_str(&title[paren_start..=i]);
+                }
+            }
+        } else if depth == 0 {
+            result.push(c);
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Whether a parenthesised group is nothing but a rate and/or bit depth:
+/// `96kHz/24bit`, `192kHz`, `24bit`, `2822kHz`, `44.1kHz 16bit`.
+fn is_quality_descriptor(inner: &str) -> bool {
+    let lower = inner.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let mut saw_unit = false;
+    for part in lower.split(['/', ' ', ',']).filter(|p| !p.is_empty()) {
+        let Some(number) = part
+            .strip_suffix("khz")
+            .or_else(|| part.strip_suffix("hz"))
+            .or_else(|| part.strip_suffix("bit"))
+        else {
+            return false;
+        };
+        if number.is_empty()
+            || !number
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+        {
+            return false;
+        }
+        saw_unit = true;
+    }
+    saw_unit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +141,58 @@ mod tests {
     #[test]
     fn suffix_depth_only() {
         assert_eq!(quality_suffix(Some(44100), Some(24)), "24bit");
+    }
+
+    #[test]
+    fn strip_undoes_what_suffix_wrote() {
+        // Every shape `quality_suffix` can produce, round-tripped.
+        for (sr, bd) in [
+            (Some(96000), Some(24)),
+            (Some(192000), Some(24)),
+            (Some(96000), Some(16)),
+            (Some(44100), Some(24)),
+        ] {
+            let suffix = quality_suffix(sr, bd);
+            assert!(!suffix.is_empty());
+            assert_eq!(strip_quality_suffix(&format!("Album ({suffix})")), "Album");
+        }
+    }
+
+    #[test]
+    fn strip_handles_the_titles_found_in_the_wild() {
+        assert_eq!(strip_quality_suffix("Jolene (96kHz/24bit)"), "Jolene");
+        assert_eq!(
+            strip_quality_suffix("Wish You Were Here (2822kHz)"),
+            "Wish You Were Here"
+        );
+        assert_eq!(strip_quality_suffix("Consolidate (24bit)"), "Consolidate");
+        // Double space before the suffix, as one library had it.
+        assert_eq!(
+            strip_quality_suffix("The Division Bell  (192kHz/24bit)"),
+            "The Division Bell"
+        );
+        assert_eq!(strip_quality_suffix("American Idiot"), "American Idiot");
+    }
+
+    #[test]
+    fn strip_leaves_real_parentheses_alone() {
+        for title in [
+            "Live (Remastered)",
+            "Symphony No. 5 (1962)",
+            "Tommy (Deluxe Edition)",
+            "Songs (For Drella)",
+            "1999 (2019 Remaster)",
+        ] {
+            assert_eq!(strip_quality_suffix(title), title, "{title} must survive");
+        }
+    }
+
+    #[test]
+    fn strip_keeps_a_quality_group_that_is_not_the_whole_parenthesis() {
+        // "24bit Remaster" is a description, not a machine-written tier.
+        assert_eq!(
+            strip_quality_suffix("Album (24bit Remaster)"),
+            "Album (24bit Remaster)"
+        );
     }
 }
