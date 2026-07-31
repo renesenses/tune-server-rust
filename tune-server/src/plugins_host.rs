@@ -296,6 +296,14 @@ const WASM_PROBE_ENV: &str = "TUNE_WASM_PROBE";
 /// Kill-switch: set to `1`/`true` to skip wasm plugin loading entirely.
 const WASM_DISABLE_ENV: &str = "TUNE_DISABLE_WASM_PLUGINS";
 
+/// Set to `1` to load wasm plugins WITHOUT the child-process probe.
+///
+/// For the integration tests, which call [`load_wasm_plugins`] from a libtest
+/// binary: spawning `current_exe` there re-runs the whole test suite instead
+/// of probing (libtest has no probe hook), so the probe times out and every
+/// plugin is wrongly skipped. Their modules are known-good WAT anyway.
+const WASM_PROBE_SKIP_ENV: &str = "TUNE_WASM_PROBE_SKIP";
+
 /// Probe-child mode: attempt the wasmtime load of `$TUNE_WASM_PROBE`, then
 /// exit 0. Survival is the whole point — a clean `Err` exits 0 too, because
 /// the in-process loader handles load errors gracefully; only a process
@@ -408,7 +416,10 @@ pub async fn load_wasm_plugins(state: &AppState) {
             continue;
         }
 
-        if !probe_wasm_load(&entry) {
+        let skip_probe = std::env::var(WASM_PROBE_SKIP_ENV)
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !skip_probe && !probe_wasm_load(&entry) {
             warn!(
                 id = %id,
                 entry = %entry.display(),
