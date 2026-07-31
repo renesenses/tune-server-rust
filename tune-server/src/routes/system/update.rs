@@ -5,9 +5,45 @@ use axum::response::IntoResponse;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChecker};
 
 use crate::state::AppState;
+
+/// An in-progress library scan older than this is treated as stale (a scan
+/// killed by a crash/restart leaves `scan_status = "scanning"` persisted), so
+/// it can never block updates forever. A full cold scan of a large catalogue on
+/// modest hardware (Synology ARM, ~49k files — Yacine) can legitimately run for
+/// hours, so the window is generous.
+const SCAN_GUARD_STALE_SECS: u64 = 12 * 3600;
+
+/// Whether a library scan is genuinely in progress right now: `scan_status` is
+/// "scanning" AND it started within [`SCAN_GUARD_STALE_SECS`]. Used to defer an
+/// update restart that would otherwise kill a long scan mid-import (the batches
+/// never persist, so the library stays empty and the scan looks "stuck" — the
+/// user re-triggers it and the next auto-update kills it again).
+fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> bool {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let scanning = settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
+    if !scanning {
+        return false;
+    }
+    let started = settings
+        .get("scan_started_at")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match started {
+        Some(t) => now.saturating_sub(t) < SCAN_GUARD_STALE_SECS,
+        // No/invalid start time recorded: treat as fresh so we err on the side
+        // of protecting the scan rather than killing it.
+        None => true,
+    }
+}
 
 /// Find the extractable archive asset (tar.gz or zip) for the current platform.
 /// Excludes .dmg and .exe installers — we want the raw archive containing the binary + web/.
@@ -124,6 +160,27 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
             )
                 .into_response();
         }
+    }
+
+    // Guard: don't restart while a library scan is running. A full cold scan of
+    // a large catalogue on modest hardware (Synology ARM, ~49k files — Yacine)
+    // takes hours; the update restart kills it mid-import before any batch
+    // persists, so the library never fills and the scan looks permanently
+    // "stuck" — the user re-triggers it and the next auto-update kills it again.
+    // Defer instead: the client's periodic auto-update simply retries and lands
+    // once the scan finishes. Manual updates get the same clear message. Bounded
+    // by a staleness window so a crashed scan can never block updates forever.
+    if scan_in_progress(&state.backend) {
+        warn!("update_deferred_scan_in_progress");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "blocked",
+                "reason": "scan_in_progress",
+                "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
+            })),
+        )
+            .into_response();
     }
 
     // Guard: refuse update if current binary has postgres but we might lose it
@@ -1044,4 +1101,73 @@ fn changelog_hardcoded() -> Json<Value> {
             },
         ]
     }))
+}
+
+#[cfg(test)]
+mod scan_guard_tests {
+    use super::scan_in_progress;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::sqlite::SqliteDb;
+
+    fn backend() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn idle_allows_update() {
+        let b = backend();
+        SettingsRepo::with_backend(b.clone())
+            .set("scan_status", "idle")
+            .unwrap();
+        assert!(!scan_in_progress(&b));
+    }
+
+    #[test]
+    fn no_status_allows_update() {
+        // Fresh DB, no scan_status key at all.
+        assert!(!scan_in_progress(&backend()));
+    }
+
+    #[test]
+    fn fresh_scan_blocks_update() {
+        let b = backend();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("scan_status", "scanning").unwrap();
+        s.set("scan_started_at", &now_secs().to_string()).unwrap();
+        assert!(scan_in_progress(&b));
+    }
+
+    #[test]
+    fn scanning_without_start_time_blocks_update() {
+        // Err on the side of protecting the scan when no start time is recorded.
+        let b = backend();
+        SettingsRepo::with_backend(b.clone())
+            .set("scan_status", "scanning")
+            .unwrap();
+        assert!(scan_in_progress(&b));
+    }
+
+    #[test]
+    fn stale_scan_does_not_block_update() {
+        // A scan_status left "scanning" by a crash/restart must never block
+        // updates forever — past the staleness window it is ignored.
+        let b = backend();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("scan_status", "scanning").unwrap();
+        let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
+        s.set("scan_started_at", &stale.to_string()).unwrap();
+        assert!(!scan_in_progress(&b));
+    }
 }
