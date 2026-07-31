@@ -266,6 +266,50 @@ pub async fn shutdown(plugins: &Arc<Mutex<PluginLoader>>) {
     loader.teardown_all().await;
 }
 
+// ---------------------------------------------------------------------------
+// Wasm-plugin facade for the REST routes.
+//
+// `plugins_host` only exists under `plugins-wasm` (release builds all enable
+// it); these always-compiled wrappers let `routes/{plugins,marketplace}.rs`
+// call install/uninstall without sprinkling feature cfgs through handlers. In
+// a build without the runtime, install honestly fails instead of pretending
+// (the old stub set a settings flag and called that "installed").
+// ---------------------------------------------------------------------------
+
+/// Persist a downloaded marketplace archive on disk. Returns the manifest id.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn persist_wasm_archive(data: &[u8]) -> Result<String, String> {
+    crate::plugins_host::persist_plugin_archive(data)
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+pub(crate) fn persist_wasm_archive(_data: &[u8]) -> Result<String, String> {
+    Err("plugin runtime not built (plugins-wasm feature disabled)".to_string())
+}
+
+/// Remove an installed wasm plugin's directory. `Ok(false)` when nothing was
+/// on disk (including builds without the runtime).
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn remove_wasm_dir(id: &str) -> Result<bool, String> {
+    crate::plugins_host::remove_plugin_dir(id)
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+pub(crate) fn remove_wasm_dir(_id: &str) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// The on-disk wasm plugins directory, when the runtime is built.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
+    Some(crate::plugins_host::plugins_dir())
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Probe-child dispatch for the wasm runtime (see
 /// `plugins_host::maybe_run_wasm_probe`). Always-compiled facade so the
 /// binary entry points can call it without feature cfgs; a build without
