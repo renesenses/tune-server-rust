@@ -581,6 +581,8 @@ impl OutputTarget for DlnaOutput {
             track_title: extract_tag(&position_resp, "dc:title"),
             track_artist: extract_tag(&position_resp, "dc:creator"),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

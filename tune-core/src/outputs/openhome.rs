@@ -518,6 +518,8 @@ impl OutputTarget for OpenHomeOutput {
             track_title,
             track_artist,
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

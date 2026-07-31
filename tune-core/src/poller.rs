@@ -256,6 +256,10 @@ pub(crate) mod decisions {
     /// least `MIN_WALL_FRACTION_FOR_NATURAL_END` of its duration (you cannot end
     /// a 4-minute track in 35 seconds at 1x). Unknown duration keeps the original
     /// modest 5-second floor. Rejects the DMP-A8's spurious early ended_naturally.
+    ///
+    /// The premise — nothing finishes a track faster than 1x — only holds for a
+    /// renderer. An output that reports `realtime: false` is exempt; see
+    /// [`natural_end`], which is where that exemption is applied.
     pub fn ended_naturally_wall_ok(wall_elapsed: u64, track_duration_ms: u64) -> bool {
         if track_duration_ms == 0 {
             wall_elapsed >= 5
@@ -360,6 +364,16 @@ pub(crate) mod decisions {
     /// After `STOPPED_TICKS_THRESHOLD` consecutive Stopped ticks, should this be
     /// treated as a natural track end (re-trigger play) rather than a playback
     /// failure (stop the zone)?
+    ///
+    /// `realtime` is [`OutputStatus::realtime`](tune_output_api::OutputStatus):
+    /// `false` means the output does not consume the track at 1x — a recorder
+    /// that writes the container to disk at network speed finishes a 5-minute
+    /// track in a second or two. Every wall-clock plausibility guard here
+    /// (`played_enough`'s floor, `ended_naturally_wall_ok`) assumes 1x playback,
+    /// so for such an output `ended_naturally` + Stopped is taken at face value.
+    /// Without this the queue advanced only after half of each track's DURATION
+    /// had elapsed, and a rip ran at half of listening speed instead of network
+    /// speed.
     pub fn natural_end(
         played_enough: bool,
         repeat_active: bool,
@@ -367,13 +381,15 @@ pub(crate) mod decisions {
         ended_naturally: bool,
         wall_elapsed: u64,
         track_duration_ms: u64,
+        realtime: bool,
     ) -> bool {
         let is_short_track =
             track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
         let repeat_end = repeat_active && peak_position_ms > 5_000;
         played_enough
             || repeat_end
-            || (ended_naturally && ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
+            || (ended_naturally
+                && (!realtime || ended_naturally_wall_ok(wall_elapsed, track_duration_ms)))
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
     }
 
@@ -746,6 +762,10 @@ pub mod fsm {
         pub stopped_ticks: u8,
         pub natural_end: bool,
         pub gapless_sent: bool,
+        /// `OutputStatus::realtime` — `false` for an output that finishes a
+        /// track faster than 1x (a recorder), which exempts it from the
+        /// wall-clock plausibility guard on `ended_naturally`.
+        pub realtime: bool,
         /// Whether the output can transition internally (live probe). For an
         /// exclusive local output or the OAAT direct-file loop, `gapless_sent`
         /// is only a re-arm suppressor — no internal transition ever comes, so
@@ -794,6 +814,7 @@ pub mod fsm {
         }
         if i.ended_naturally
             && (i.played_enough
+                || !i.realtime
                 || decisions::ended_naturally_wall_ok(i.wall_elapsed, i.track_duration_ms))
         {
             return LocalEndedNaturally;
@@ -929,6 +950,7 @@ pub mod fsm {
                 gapless_advance_pending: false,
                 gapless_stuck_ticks: 0,
                 ended_naturally: false,
+                realtime: true,
                 wall_elapsed: 0,
                 track_duration_ms: 0,
                 stopped_ticks: 0,
@@ -1126,6 +1148,37 @@ pub mod fsm {
                 classify_stopped(&StoppedInput {
                     ended_naturally: true,
                     wall_elapsed: 4,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+        }
+
+        /// The recorder case, mirroring
+        /// `natural_end_non_realtime_output_skips_the_wall_guard`: a
+        /// `realtime: false` output that says the track is done is believed
+        /// immediately, at the same inputs the DMP-A8 guard rejects.
+        #[test]
+        fn non_realtime_ended_naturally_is_immediate() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 1,
+                    track_duration_ms: 300_000,
+                    realtime: false,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // Identical inputs from a renderer: still rejected.
+            assert_ne!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 1,
+                    track_duration_ms: 300_000,
+                    realtime: true,
                     ..base()
                 }),
                 StoppedOutcome::LocalEndedNaturally
@@ -2421,7 +2474,14 @@ impl PositionPoller {
                 .track_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            if decisions::stale_start_position(wall_elapsed_now, status.position_ms) {
+            // A non-realtime output is exempt: "position far ahead of the wall
+            // clock" is a ghost only if playback runs at 1x. A recorder that
+            // finished the capture reports position = duration straight away, so
+            // this `continue` skipped the whole end-of-track path on every tick
+            // until the wall clock caught up with the track's length.
+            if status.realtime
+                && decisions::stale_start_position(wall_elapsed_now, status.position_ms)
+            {
                 debug!(
                     zone_id,
                     pos_ms = status.position_ms,
@@ -2613,8 +2673,14 @@ impl PositionPoller {
                     // Stopped while it buffers the new stream (especially for
                     // streaming seeks that recreate the session).  Suppress
                     // stopped_ticks to prevent false track-end detection.
-                    let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
-                        < TRACK_LOAD_GRACE_SECS
+                    // Not for a non-realtime output. The grace exists to let a
+                    // renderer buffer, and its `peak < 5s` condition reads "no
+                    // audio has come out yet" — but a recorder that finished the
+                    // whole capture in two seconds legitimately never reports a
+                    // position past 5s, so the grace held every track back for
+                    // its full 45s and a rip crawled at ~46s per track.
+                    let in_track_load_grace = status.realtime
+                        && ps.track_loaded_at.elapsed().as_secs() < TRACK_LOAD_GRACE_SECS
                         && ps.peak_position_ms < 5_000;
                     // A DSD track on a DLNA renderer whose peak reached the end.
                     // Gapless is intentionally not armed for a DSD next on DLNA
@@ -2660,8 +2726,10 @@ impl PositionPoller {
                             status.ended_naturally,
                             wall_elapsed,
                             track_duration_ms,
+                            status.realtime,
                         ),
                         gapless_sent: ps.gapless_sent,
+                        realtime: status.realtime,
                         // Refined by the natural-end branch below (live probe),
                         // same late-update pattern as stream_consuming.
                         can_internal_gapless: true,
@@ -2805,8 +2873,16 @@ impl PositionPoller {
                                 status.ended_naturally,
                                 wall_elapsed,
                                 track_duration_ms,
+                                status.realtime,
                             );
-                            if status.ended_naturally && wall_elapsed < 5 && !played_enough {
+                            // Not a warning for a non-realtime output: finishing
+                            // a track in under 5s is its normal mode, not a
+                            // renderer misreporting the end.
+                            if status.ended_naturally
+                                && status.realtime
+                                && wall_elapsed < 5
+                                && !played_enough
+                            {
                                 warn!(
                                     zone_id,
                                     wall_elapsed,
@@ -4408,18 +4484,20 @@ mod tests {
 
     #[test]
     fn natural_end_when_played_enough() {
-        assert!(decisions::natural_end(true, false, 0, false, 0, 300_000));
+        assert!(decisions::natural_end(
+            true, false, 0, false, 0, 300_000, true
+        ));
     }
 
     #[test]
     fn natural_end_repeat_active_with_meaningful_playback() {
         // Repeat on + peak > 5s → treat as natural end (DEvir QA B-05).
         assert!(decisions::natural_end(
-            false, true, 6_000, false, 0, 300_000
+            false, true, 6_000, false, 0, 300_000, true
         ));
         // Repeat on but peak <= 5s → not enough.
         assert!(!decisions::natural_end(
-            false, true, 4_000, false, 0, 300_000
+            false, true, 4_000, false, 0, 300_000, true
         ));
     }
 
@@ -4428,29 +4506,63 @@ mod tests {
         // ended_naturally is trusted only once >= MIN_WALL_FRACTION of the known
         // duration has elapsed in wall time — a 5:00 track cannot end at 5s
         // (DMP-A8 spurious ended_naturally). 50% of 300s = 150s.
-        assert!(!decisions::natural_end(false, false, 0, true, 5, 300_000));
-        assert!(!decisions::natural_end(false, false, 0, true, 149, 300_000));
-        assert!(decisions::natural_end(false, false, 0, true, 150, 300_000));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 5, 300_000, true
+        ));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 149, 300_000, true
+        ));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 150, 300_000, true
+        ));
         // Unknown duration (0) keeps the original modest 5s floor.
-        assert!(decisions::natural_end(false, false, 0, true, 5, 0));
-        assert!(!decisions::natural_end(false, false, 0, true, 4, 0));
+        assert!(decisions::natural_end(false, false, 0, true, 5, 0, true));
+        assert!(!decisions::natural_end(false, false, 0, true, 4, 0, true));
+    }
+
+    /// A non-realtime output (a recorder writing the container to disk) is
+    /// exempt from the wall-clock floor: it finishes a 5:00 track in a second or
+    /// two, and holding the queue back until 150s had elapsed pinned a rip at
+    /// half of listening speed instead of network speed.
+    #[test]
+    fn natural_end_non_realtime_output_skips_the_wall_guard() {
+        // Same inputs the DMP-A8 guard rejects above — accepted here.
+        assert!(decisions::natural_end(
+            false, false, 0, true, 1, 300_000, false
+        ));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 0, 300_000, false
+        ));
+
+        // The exemption is not a blanket "always end": without ended_naturally
+        // there is still nothing to act on.
+        assert!(!decisions::natural_end(
+            false, false, 0, false, 0, 300_000, false
+        ));
+
+        // And it changes nothing for a renderer.
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 1, 300_000, true
+        ));
     }
 
     #[test]
     fn natural_end_short_track_half_played() {
         // Short track (< 30s) with >= 50% peak → natural end.
         assert!(decisions::natural_end(
-            false, false, 6_000, false, 0, 10_000
+            false, false, 6_000, false, 0, 10_000, true
         ));
         // Short track but < 50% peak → not yet.
         assert!(!decisions::natural_end(
-            false, false, 4_000, false, 0, 10_000
+            false, false, 4_000, false, 0, 10_000, true
         ));
     }
 
     #[test]
     fn natural_end_all_guards_false() {
-        assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
+        assert!(!decisions::natural_end(
+            false, false, 0, false, 0, 300_000, true
+        ));
     }
 
     // DSD-over-DLNA end-of-track fast path (Benjithom, RS130: ~5s gap between DSD
