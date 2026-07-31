@@ -392,6 +392,25 @@ impl OutputTarget for OaatOutput {
         paused.store(false, Ordering::SeqCst);
         position_ms.store(start_position_ms, Ordering::SeqCst);
 
+        // Anchor the stall clock to this play's start. The stall supervisor
+        // flags a zone stalled when `last_packet_age_ms > 30s`, but that field
+        // otherwise keeps the PREVIOUS track's packet timestamp until the first
+        // packet of THIS play flows. A zone idle > 30s (e.g. starting a radio
+        // after a pause) was therefore flagged stalled on the very first
+        // supervisor tick and restarted mid-startup — tearing down the
+        // freshly-created stream session before the endpoint had finished
+        // connecting and fetched it (404), which is the audible cut (FIP on
+        // .18). Resetting here starts the 30s budget from play, giving the
+        // endpoint the full window to deliver its first packet; a genuinely
+        // dead startup still trips the supervisor 30s later.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.diag
+            .last_packet_epoch_ms
+            .store(now_ms, Ordering::SeqCst);
+
         tokio::spawn(async move {
             use futures_util::StreamExt;
 
