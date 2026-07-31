@@ -87,6 +87,13 @@ pub mod sql {
         )
     }
 
+    pub fn delete_all() -> &'static str {
+        // last_track_id is the permanent free-tier activation marker: a
+        // resurrected zone would otherwise keep consuming a quota slot on
+        // its first play, defeating the whole point of the reset.
+        "UPDATE zones SET is_hidden = 1, last_track_id = NULL"
+    }
+
     pub fn unhide_by_device_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET is_hidden = 0 WHERE output_device_id = {} AND COALESCE(is_hidden, 0) = 1",
@@ -675,6 +682,14 @@ impl ZoneRepo {
         self.db.execute(&sql, &params)
     }
 
+    /// Soft-delete EVERY zone and clear the free-tier activation markers.
+    /// A Free user whose 3-zone quota is consumed by stale renderers can
+    /// wipe the slate and explicitly re-create the zones he wants: discovery
+    /// never resurrects a hidden zone, only POST /zones does.
+    pub fn delete_all(&self) -> Result<usize, String> {
+        self.db.execute(sql::delete_all(), &[])
+    }
+
     pub fn delete(&self, id: i64) -> Result<(), String> {
         let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
@@ -929,6 +944,30 @@ mod tests {
         // An offline (but previously played) zone no longer counts.
         repo.update_online(b, false).unwrap();
         assert_eq!(repo.count_active().unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_all_frees_quota_durably() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let a = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+        repo.update_online(a, true).unwrap();
+        repo.save_playback_position(a, 0, Some(42), Some("local"), None)
+            .unwrap();
+        assert_eq!(repo.count_active().unwrap(), 1);
+
+        repo.delete_all().unwrap();
+        assert!(repo.list().unwrap().is_empty());
+        assert_eq!(repo.count_active().unwrap(), 0);
+
+        // Resurrect the same device (explicit POST /zones path): the
+        // activation marker must be gone, so the zone is dormant again and
+        // does not silently re-consume a free-tier slot.
+        repo.unhide(a).unwrap();
+        let zone = repo.get(a).unwrap().unwrap();
+        assert_eq!(zone.last_track_id, None);
+        assert_eq!(repo.count_active().unwrap(), 0);
     }
 
     #[test]
