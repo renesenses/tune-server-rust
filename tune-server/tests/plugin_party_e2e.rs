@@ -77,6 +77,9 @@ async fn real_party_plugin_round_trips_through_p2_wiring() {
     // the default integration test run.
     unsafe {
         std::env::set_var("TUNE_PLUGINS_DIR", fixtures_plugins_dir());
+        // Skip the child-process probe: from a libtest binary, spawning
+        // current_exe re-runs the whole suite instead of probing.
+        std::env::set_var("TUNE_WASM_PROBE_SKIP", "1");
     }
 
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();

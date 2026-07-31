@@ -35,6 +35,10 @@ use crate::state::AppState;
 /// outputs are registered, to produce plugins to register alongside the
 /// compiled-in ones. Pass `None` for the plain server.
 pub async fn run(build_plugins: Option<PluginBuilder>) {
+    // Probe-child dispatch FIRST: when spawned as a wasm-load probe, do the
+    // one dangerous thing and exit before any server state exists (#1249).
+    crate::plugins::maybe_run_wasm_probe();
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]
