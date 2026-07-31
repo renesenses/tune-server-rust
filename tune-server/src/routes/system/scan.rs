@@ -244,6 +244,31 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             .map(|p| p.to_string_lossy().nfc().collect::<String>())
             .collect();
 
+        // Warn loudly for any CONFIGURED root (full scan only) that is reachable
+        // yet yielded zero audio files — a mis-pointed or wrong-level music
+        // folder. Yacine's real files live under /volume1/daphile_remote/HDD, but
+        // /volume1/daphile_remote/Music and the Freebox mount were configured and
+        // are empty, so the scan reported discovered=0 and the library looked
+        // permanently "stuck". `missing_dirs` (unreachable/unmounted, reported
+        // separately with a reason) are excluded here: this flags only roots that
+        // ARE reachable but contain nothing.
+        if targeted.is_none() {
+            for dir in &scan_dirs {
+                if missing_dirs.iter().any(|m| m == dir) {
+                    continue;
+                }
+                let prefix: String =
+                    format!("{}/", dir.trim_end_matches('/')).nfc().collect();
+                let has_audio = discovered_paths.iter().any(|p| p.starts_with(&prefix));
+                if !has_audio {
+                    tracing::warn!(
+                        dir = %dir,
+                        "scan_root_no_audio_files — configured music folder is reachable but contains no audio files (wrong path or empty). Check that it points at the folder holding your music."
+                    );
+                }
+            }
+        }
+
         let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(db.clone());
 
         // "Separate albums by quality" — when on (default), a quality suffix is
