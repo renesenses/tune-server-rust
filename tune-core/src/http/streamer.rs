@@ -192,6 +192,24 @@ impl StreamSession {
         self.tx.lock().await.take();
         self._keep_alive_tx.lock().await.take();
     }
+
+    /// Current fill of the mpsc channel backing this session as
+    /// `(buffered_messages, max_messages)`, or `None` once the channel has been
+    /// closed (its keep-alive sender was dropped by `close_sender`) — the caller
+    /// can no longer measure fill and should stop waiting on it.
+    ///
+    /// `buffered_messages = max_capacity - capacity`: the chunks a producer has
+    /// pushed that no HTTP reader has consumed yet. Used ONLY by the initial
+    /// DLNA prebuffer barrier (#1259) to tell how much audio has accumulated in
+    /// a transcode/radio channel before `Play` is sent. Read-only — it never
+    /// touches the stream itself.
+    pub async fn channel_fill(&self) -> Option<(usize, usize)> {
+        let guard = self._keep_alive_tx.lock().await;
+        guard.as_ref().map(|tx| {
+            let max = tx.max_capacity();
+            (max.saturating_sub(tx.capacity()), max)
+        })
+    }
 }
 
 /// Type alias for the shared sessions map, used by both core and server.
@@ -277,6 +295,79 @@ impl AudioStreamer {
         )
         .await
         .is_ok()
+    }
+
+    /// Initial-play prebuffer barrier for DLNA (#1259).
+    ///
+    /// Block until roughly `target_bytes` of audio has accumulated in the
+    /// session's mpsc channel, so a DLNA renderer's clock does not start against
+    /// a still-cold decode pipeline (~5s of micro-dropouts at track start —
+    /// biblio/Qobuz/radio, macOS). Local/USB output already prefills its ring
+    /// buffer before starting the DAC (`outputs/local.rs`); this reproduces that
+    /// for the network path, which had NO server-side prebuffer.
+    ///
+    /// Returns `true` as soon as the target is reached, and `true` immediately
+    /// for sessions that must NOT be waited on:
+    ///   - proxy sessions (direct CDN passthrough, served on demand — never fill
+    ///     the mpsc channel, so waiting would hang),
+    ///   - file sessions (`serve_file`, already on disk, Range-seekable),
+    ///   - unknown or already-closed sessions.
+    /// Only genuine transcode/radio channel sessions are actually awaited.
+    ///
+    /// Returns `false` when `timeout` elapses first — the hard cap so a slow or
+    /// very short source never freezes the start of playback. The caller sends
+    /// `Play` regardless; a `false` just means "started with less than the full
+    /// target buffered".
+    pub async fn wait_prefill_ready(
+        &self,
+        stream_id: &str,
+        target_bytes: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() };
+        let Some(session) = session else {
+            return true;
+        };
+        // serve_file / proxy passthrough: no mpsc channel to prefill. Blocking
+        // here would wait the full timeout for data that never flows through the
+        // channel — so treat them as ready immediately (this is the channel-only
+        // gate that excludes the serve_file passthrough).
+        if session.proxy_url.lock().await.is_some() || session.file_path.lock().await.is_some() {
+            return true;
+        }
+        if target_bytes == 0 {
+            return true;
+        }
+        // Chunk size used by the transcode / prefetch producers (exact for the
+        // dominant WAV transcode path). Radio chunks may be smaller, so the byte
+        // target is reached with fewer messages → a slightly shorter, still-safe
+        // prebuffer. Only used to translate the byte target into channel
+        // messages, the unit tokio's mpsc exposes.
+        const ASSUMED_CHUNK_BYTES: u64 = 32768;
+        let mut target_chunks = (target_bytes / ASSUMED_CHUNK_BYTES).max(1);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match session.channel_fill().await {
+                // Channel closed (producer done / gone): nothing more will be
+                // buffered, so stop waiting rather than burn the whole timeout.
+                None => return true,
+                Some((buffered, max)) => {
+                    // Clamp so a full channel always satisfies the target: a
+                    // source with less than `target_bytes` total simply fills
+                    // what it can; the timeout then caps the wait.
+                    if max > 0 {
+                        target_chunks = target_chunks.min(max as u64);
+                    }
+                    if buffered as u64 >= target_chunks {
+                        return true;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     pub async fn create_file_session(
@@ -863,6 +954,107 @@ mod tests {
             vec![vec![2u8], vec![3u8]],
             "the new consumer must receive every post-handoff chunk, in order"
         );
+    }
+
+    // #1259 prebuffer barrier: a proxy session has no mpsc channel to fill, so
+    // waiting must return ready IMMEDIATELY (blocking would hang for the whole
+    // timeout — and on a live proxy, forever).
+    #[tokio::test]
+    async fn wait_prefill_ready_returns_immediately_for_proxy() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let id = streamer
+            .create_proxy_session(info, "https://cdn.qobuz.com/track.flac".into(), false)
+            .await;
+        let t0 = std::time::Instant::now();
+        assert!(
+            streamer
+                .wait_prefill_ready(&id, 1_000_000, std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(t0.elapsed().as_millis() < 500, "must not wait for a proxy");
+        streamer.remove_session(&id).await;
+    }
+
+    // A file (serve_file) session is already on disk — excluded from prebuffer,
+    // returns ready immediately.
+    #[tokio::test]
+    async fn wait_prefill_ready_returns_immediately_for_file() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let id = streamer
+            .create_file_session(info, "/music/test.flac".into(), false)
+            .await;
+        let t0 = std::time::Instant::now();
+        assert!(
+            streamer
+                .wait_prefill_ready(&id, 1_000_000, std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(t0.elapsed().as_millis() < 500, "must not wait for a file");
+        streamer.remove_session(&id).await;
+    }
+
+    // A channel session returns ready as soon as enough chunks are buffered.
+    #[tokio::test]
+    async fn wait_prefill_ready_reached_once_buffered() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (id, tx, _dr) = streamer.create_session(info, false, 256).await;
+        // Target = 1 chunk (32768 bytes). Push two 32KB chunks; nobody consumes.
+        tx.send(vec![0u8; 32768]).await.unwrap();
+        tx.send(vec![0u8; 32768]).await.unwrap();
+        assert!(
+            streamer
+                .wait_prefill_ready(&id, 32768, std::time::Duration::from_secs(2))
+                .await,
+            "target reached once >= 1 chunk is buffered"
+        );
+        drop(tx);
+        streamer.remove_session(&id).await;
+    }
+
+    // A channel session that never buffers enough must time out (return false)
+    // rather than block forever — the cap that keeps a slow/short source from
+    // freezing the start of playback. The keep-alive sender holds the channel
+    // open so channel_fill keeps reporting (never None) for the whole wait.
+    #[tokio::test]
+    async fn wait_prefill_ready_times_out_when_underfilled() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (id, _tx, _dr) = streamer.create_session(info, false, 256).await;
+        // Never send anything; target needs many chunks → must time out.
+        let t0 = std::time::Instant::now();
+        assert!(
+            !streamer
+                .wait_prefill_ready(&id, 10_000_000, std::time::Duration::from_millis(150))
+                .await,
+            "underfilled channel must time out, not hang"
+        );
+        assert!(t0.elapsed().as_millis() >= 150);
+        streamer.remove_session(&id).await;
     }
 
     #[test]
