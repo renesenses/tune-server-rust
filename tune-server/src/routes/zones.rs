@@ -1,7 +1,7 @@
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -72,6 +72,10 @@ struct PatchZone {
     /// that advertise `audio/flac` but only decode 16-bit (Ruark R3, #1137):
     /// downconverts hi-res to 16-bit FLAC instead of serving silent 24-bit direct.
     dlna_cap_16bit: Option<bool>,
+    /// When enabled, serve genuine 24-bit WAV (instead of the 16-bit LPCM
+    /// fallback) to a DLNA renderer that advertises `audio/L24`. The UI only
+    /// offers this after the capability probe reports 24-bit LPCM support.
+    dlna_wav24: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -84,6 +88,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
@@ -458,9 +463,16 @@ fn build_signal_path(
     let dlna_cap_16bit = is_network_output
         && bit_depth > 16
         && ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id);
+    // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
+    // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
+    // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
+    let dlna_wav24 = is_network_output
+        && bit_depth > 16
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
     let alac_passthrough = source_format == Some(AudioFormat::Alac)
         && is_network_output
         && !dlna_lpcm
+        && !dlna_wav24
         && !dlna_cap_16bit
         && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
     let needs_transcode_for_output = is_network_output
@@ -485,18 +497,19 @@ fn build_signal_path(
 
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if wire_wav || dlna_lpcm {
+            if wire_wav || dlna_lpcm || dlna_wav24 {
                 // Renderer served WAV/LPCM, not FLAC — the signal path must say
                 // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
-                // "→ FLAC" label, LHC). Two causes, same wire: the zone forces it
-                // (`dlna_lpcm`), or the renderer doesn't advertise `audio/flac`
-                // and the orchestrator fell back to WAV (`dlna_needs_wav`) —
-                // detected here from the live session's real container
-                // (`wire_wav`), which the synchronous builder cannot renegotiate.
-                // The DLNA WAV is 16-bit LPCM (audio/L16), so it is bit-perfect
-                // only when the lossless source already fits 16 bits (Sevy,
-                // #1137: a hi-res source is truncated).
-                let wav_bit_perfect = is_lossless && bit_depth <= 16;
+                // "→ FLAC" label, LHC). Three causes, same wire: the zone forces
+                // 16-bit LPCM (`dlna_lpcm`) or genuine 24-bit WAV (`dlna_wav24`),
+                // or the renderer doesn't advertise `audio/flac` and the
+                // orchestrator fell back to WAV (`dlna_needs_wav`) — detected here
+                // from the live session's real container (`wire_wav`), which the
+                // synchronous builder cannot renegotiate. The plain LPCM fallback
+                // is 16-bit (audio/L16), bit-perfect only when the lossless source
+                // already fits 16 bits (Sevy, #1137). The opt-in `dlna_wav24` path
+                // preserves the full 24-bit source, so it stays bit-perfect.
+                let wav_bit_perfect = is_lossless && (dlna_wav24 || bit_depth <= 16);
                 (wav_bit_perfect, "DLNA/UPnP", "WAV")
             } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
@@ -616,20 +629,25 @@ fn build_signal_path(
         || oaat_transcodes
         || output_type == "airplay"
         || dlna_lpcm
+        || dlna_wav24
         || dlna_cap_16bit
         || wire_transcode;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
         // lossy domain conversion (see the "oaat" transport arm above). A DLNA
         // WAV/LPCM output likewise preserves the samples only when the source
-        // already fits the 16-bit LPCM cap.
-        let wav_output = wire_wav || dlna_lpcm;
-        let transcode_lossless =
-            (is_oaat && is_lossless && !is_dsd) || (wav_output && is_lossless && bit_depth <= 16);
-        // Reflect the OUTPUT resolution the renderer actually receives: 16-bit
-        // when the zone caps to 16-bit OR serves WAV/LPCM (audio/L16 is 16-bit),
-        // and the max-sample-rate cap when set.
-        let out_bit_depth = if dlna_cap_16bit || wav_output {
+        // already fits the 16-bit LPCM cap — unless the zone opted into genuine
+        // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
+        let wav_output = wire_wav || dlna_lpcm || dlna_wav24;
+        let transcode_lossless = (is_oaat && is_lossless && !is_dsd)
+            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16));
+        // Reflect the OUTPUT resolution the renderer actually receives: 24-bit
+        // for the opt-in 24-bit WAV path, 16-bit when the zone caps to 16-bit OR
+        // serves the plain LPCM fallback (audio/L16 is 16-bit), and the
+        // max-sample-rate cap when set.
+        let out_bit_depth = if dlna_wav24 {
+            bit_depth.min(24)
+        } else if dlna_cap_16bit || wav_output {
             bit_depth.min(16)
         } else {
             bit_depth
@@ -804,6 +822,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_cap_16bit".into(),
                 json!(zone_repo.get_dlna_cap_16bit(zone_id)),
             );
+            obj.insert(
+                "dlna_wav24".into(),
+                json!(zone_repo.get_dlna_wav24(zone_id)),
+            );
             let online = match z.output_type.as_deref() {
                 // Browser zones have no output device by design (the web
                 // client pulls stream_url itself) — always online.
@@ -908,6 +930,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 );
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
+                obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
                 let online = match zone.output_type.as_deref() {
                     // Same rules as list_zones: browser zones need no device;
                     // a local zone without output_device_id is an orphan that
@@ -1031,6 +1054,11 @@ async fn patch_zone(
     }
     if let Some(cap) = body.dlna_cap_16bit {
         if let Err(e) = repo.update_dlna_cap_16bit(id, cap) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(wav24) = body.dlna_wav24 {
+        if let Err(e) = repo.update_dlna_wav24(id, wav24) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
@@ -1192,6 +1220,94 @@ async fn create_zone(
         )
             .into_response(),
     }
+}
+
+/// POST /zones/{id}/renderer-capabilities — on-demand "discovery check" for the
+/// renderer-config UI. Probes the zone's DLNA renderer via GetProtocolInfo and
+/// returns which audio formats its `Sink` advertises (FLAC, WAV/LPCM 16 & 24,
+/// ALAC/AAC, MP3, DSD), so the user can pick a sensible output override with
+/// evidence. Only meaningful for dlna/openhome zones with a live renderer.
+async fn renderer_capabilities(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zone = match repo.get(id) {
+        Ok(Some(z)) => z,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "zone_not_found" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !matches!(zone.output_type.as_deref(), Some("dlna") | Some("openhome")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "not_a_dlna_renderer",
+                "message": "Renderer capability discovery is only available for DLNA/OpenHome zones.",
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(device_id) = zone.output_device_id.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no_output_device" })),
+        )
+            .into_response();
+    };
+
+    // The GetProtocolInfo probe needs the registered DlnaOutput (it holds the
+    // ConnectionManager URL). If the renderer hasn't been played yet it may not
+    // be registered — try to register it from the discovered device first, same
+    // as create_zone does, so the check works without playing a track first.
+    let mut output = { state.outputs.lock().await.get(device_id) };
+    if output.is_none() {
+        let disc = {
+            let scanner = state.scanner.lock().await;
+            let devices = scanner.devices().await;
+            devices.iter().find(|d| d.id == device_id).cloned()
+        };
+        if let Some(dev) = disc {
+            register_dlna_output_from_device(&dev, &state).await;
+            output = { state.outputs.lock().await.get(device_id) };
+        }
+    }
+
+    let Some(output) = output else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "probed": false,
+                "reason": "renderer_offline",
+                "message": "The renderer is not currently online/discovered. Make sure it is powered on and on the same network, then try again.",
+            })),
+        )
+            .into_response();
+    };
+
+    // Hold the output lock for the SOAP round-trip (on-demand, user-initiated,
+    // rare) — same pattern the orchestrator uses for its per-track probe.
+    let caps = {
+        let guard = output.lock().await;
+        match guard.as_any().downcast_ref::<DlnaOutput>() {
+            Some(dlna) => dlna.probe_capabilities().await,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "not_a_dlna_output" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    Json(json!(caps)).into_response()
 }
 
 /// Register a DLNA output from a discovered device.
