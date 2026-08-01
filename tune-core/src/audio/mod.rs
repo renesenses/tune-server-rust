@@ -9,6 +9,10 @@ pub mod dff;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+#[cfg(feature = "audio-embedding")]
+pub mod embedding;
+/// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
+pub mod embedding_store;
 pub mod encoder;
 pub mod eq;
 pub mod faststart;

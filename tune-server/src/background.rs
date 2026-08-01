@@ -27,6 +27,8 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_bio_sync(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
+    #[cfg(feature = "audio-embedding")]
+    spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
@@ -1111,6 +1113,14 @@ fn spawn_community_sync(state: &AppState) {
 /// it never slows indexing. Gated by the `replaygain_analysis_enabled` setting.
 fn spawn_replaygain_analysis(state: &AppState) {
     tune_core::audio::replaygain::spawn(state.backend.clone());
+}
+
+/// Background CLAP audio-embedding sweep for the acoustic Smart Radio. Opt-in
+/// build (feature-gated) AND opt-in at runtime (`audio_embedding_enabled`); the
+/// loop no-ops cheaply until enabled and a model is present.
+#[cfg(feature = "audio-embedding")]
+fn spawn_audio_embedding(state: &AppState) {
+    tune_core::audio::embedding::spawn(state.backend.clone());
 }
 
 fn spawn_concert_alerts(state: &AppState) {
