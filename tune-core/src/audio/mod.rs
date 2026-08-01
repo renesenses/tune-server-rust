@@ -9,6 +9,8 @@ pub mod dff;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+#[cfg(feature = "audio-embedding")]
+pub mod embedding;
 pub mod encoder;
 pub mod eq;
 pub mod faststart;

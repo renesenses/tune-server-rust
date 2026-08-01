@@ -61,6 +61,11 @@ webpki-roots = "0.26"
 # default-features trimmed to compiler + runtime + WAT parsing; no async,
 # component-model, gc, threads, profiling, pooling, coredump, debug.
 wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
+# ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
+# keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
+# compile time — and the shared lib is loaded at runtime next to the model
+# (downloaded on activation). Feature-gated so the default build never pulls it.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Linux : nice/ionice des threads du pool de scan (scanner/walker.rs).
@@ -96,3 +101,7 @@ asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]
 postgres = ["dep:sqlx"]
+# Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
+# only builds that opt in pull `ort`, so the standard 6-target matrix is
+# untouched. The onnxruntime shared lib + model are provided at runtime.
+audio-embedding = ["dep:ort"]
