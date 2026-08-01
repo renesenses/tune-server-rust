@@ -48,13 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # --features est ADDITIF : les features par defaut (local-audio -> cpal
-      # -> alsa-sys) restent actives, donc le job exige les en-tetes ALSA
-      # comme les jobs de build. Sans ce paquet, le check est passe au vert
-      # tant que l'arbre teste ne tirait pas cpal, puis a rougi sur la ligne
-      # complete (sync #1095).
-      - name: Install ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # `audio-embedding` pulls audio crates (via ort/cpal deps) that link ALSA;
+      # install it like the main build job does, or the compile-check fails on
+      # `Package alsa was not found in the pkg-config`.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo check -p tune-server --features audio-embedding
 
   build:

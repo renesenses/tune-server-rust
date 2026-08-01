@@ -635,7 +635,7 @@ pub fn radio_favorites_router() -> Router<AppState> {
             "/",
             get(list_radio_favorites)
                 .post(save_radio_favorite)
-                .delete(clear_all_radio_favorites),
+                .delete(delete_all_radio_favorites),
         )
         .route("/count", get(radio_favorites_count))
         .route("/is-favorite", get(is_radio_favorite))
@@ -748,6 +748,17 @@ async fn save_radio_favorite(
     }
 }
 
+// Clear the entire radio favorites list (DELETE /radio-favorites).
+// `DELETE FROM radio_favorites` (no WHERE) is portable across SQLite and
+// Postgres. Returns a JSON body (not 204) because the web client does
+// `JSON.parse` on the response and chokes on an empty body.
+async fn delete_all_radio_favorites(State(state): State<AppState>) -> impl IntoResponse {
+    match state.backend.execute("DELETE FROM radio_favorites", &[]) {
+        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 async fn delete_radio_favorite(
     State(state): State<AppState>,
     Path(fav_id): Path<i64>,
@@ -759,17 +770,6 @@ async fn delete_radio_favorite(
             "DELETE FROM radio_favorites WHERE id = ?",
             &[&fav_id as &dyn ToSqlValue],
         )
-        .ok();
-    StatusCode::NO_CONTENT
-}
-
-/// Bulk clear: DELETE /radio-favorites removes every saved radio favorite.
-/// The web client's "Tout supprimer" fired DELETE on the collection root, which
-/// had no handler (405) — the button looked dead. Mirrors delete_radio_favorite.
-async fn clear_all_radio_favorites(State(state): State<AppState>) -> impl IntoResponse {
-    state
-        .backend
-        .execute("DELETE FROM radio_favorites", &[])
         .ok();
     StatusCode::NO_CONTENT
 }
