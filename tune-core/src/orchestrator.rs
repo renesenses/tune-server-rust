@@ -676,6 +676,47 @@ impl PlaybackOrchestrator {
                 origin_url: resolved.origin_url.as_deref(),
             };
             let zone_audiophile = self.zone_audiophile(req.zone_id);
+
+            // #1259: prebuffer ~2s before `Play` on network (DLNA) playback.
+            //
+            // A DLNA renderer starts its clock on the first byte it pulls. On
+            // the initial play the decode pipeline is cold, so the first ~5s
+            // trickle out and the renderer under-runs → micro-dropouts
+            // (biblio/Qobuz/radio, macOS). Local/USB output has no such glitch:
+            // LocalOutput prefills its ring buffer before it starts the DAC
+            // (outputs/local.rs). We reproduce that server-side for DLNA here.
+            //
+            // Gating (kept tight for zero regression on the read path):
+            //   - ONLY DLNA outputs (network push renderers with the cold-start
+            //     clock). Local/USB and OAAT pull outputs already prefill.
+            //   - ONLY channel sessions (WAV transcode / radio). Proxy passthrough
+            //     and on-disk serve_file sessions are excluded INSIDE
+            //     wait_prefill_ready (they have no channel to fill; blocking on
+            //     them would hang).
+            //   - Capped by a timeout so a slow or very short source never
+            //     freezes the start of playback; `Play` is sent regardless.
+            // The poller FSM is untouched: its 45s track-load grace already
+            // tolerates the few extra seconds before Play.
+            if let Some(ref sid) = resolved.stream_id {
+                if self.output_type_of(device_id).await.as_deref() == Some("dlna") {
+                    let sr = resolved.sample_rate.unwrap_or(44100) as u64;
+                    let ch = (resolved.channels.unwrap_or(2) as u64).max(1);
+                    let bytes_per_sample = ((resolved.bit_depth.unwrap_or(16) as u64) / 8).max(1);
+                    let target_bytes = sr * ch * bytes_per_sample * 2; // ~2s of audio
+                    let reached = self
+                        .streamer
+                        .wait_prefill_ready(sid, target_bytes, std::time::Duration::from_secs(4))
+                        .await;
+                    info!(
+                        zone_id = req.zone_id,
+                        stream_id = %sid,
+                        target_bytes,
+                        reached,
+                        "dlna_initial_prebuffer_done"
+                    );
+                }
+            }
+
             let result = self
                 .send_to_output(device_id, &media, req.seek_ms, zone_audiophile)
                 .await;
@@ -4253,6 +4294,17 @@ impl PlaybackOrchestrator {
         _start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         (false, Some(format!("Device not found: {device_id}")))
+    }
+
+    /// `output_type()` of the registered output for `device_id` (e.g. "dlna",
+    /// "local", "openhome"), or `None` when the device is not registered. Used
+    /// to gate the initial DLNA prebuffer barrier (#1259) to DLNA outputs only.
+    async fn output_type_of(&self, device_id: &str) -> Option<String> {
+        let arc = { self.outputs.lock().await.get(device_id) };
+        match arc {
+            Some(arc) => Some(arc.lock().await.output_type().to_string()),
+            None => None,
+        }
     }
 
     async fn send_to_output(

@@ -3322,6 +3322,7 @@ impl OutputTarget for LocalOutput {
                         }
                         Err(e) => {
                             warn!(error = %e, "local_audio_gapless_read_error");
+                            http_eof = true;
                             break;
                         }
                     }
