@@ -35,6 +35,12 @@ pub(super) struct FacetQuery {
     country: Option<String>,
     mood: Option<String>,
     source_media: Option<String>,
+    /// Album rating (1-5, profile 1) — tracks inherit their album's rating.
+    pub(super) rating: Option<i32>,
+    /// Manual collection name — tracks whose album is in that collection. The
+    /// album membership lives as a JSON `album_ids` array in the `collections`
+    /// setting, resolved to ids by the handler (not a joinable table).
+    pub(super) collection: Option<String>,
     q: Option<String>,
 }
 
@@ -45,6 +51,9 @@ pub(super) fn build_conditions(
     q: &FacetQuery,
     engine: Engine,
     exclude: &str,
+    // Resolved album ids for the active `collection` selection (from settings
+    // JSON — the handler resolves the name so this stays a pure SQL builder).
+    collection_ids: Option<&[i64]>,
 ) -> (Vec<String>, Vec<SqlValue>) {
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
@@ -158,6 +167,36 @@ pub(super) fn build_conditions(
             idx += 1;
         }
     }
+    // Album rating (profile 1). Tracks inherit their album's rating via a join
+    // to `album_ratings`; EXISTS keeps it self-contained on alias `t`.
+    if exclude != "rating" {
+        if let Some(r) = q.rating {
+            conds.push(format!(
+                "EXISTS (SELECT 1 FROM album_ratings arr \
+                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND arr.rating = {})",
+                ph(idx)
+            ));
+            params.push(SqlValue::Int(r as i64));
+            idx += 1;
+        }
+    }
+    // Manual collection: the resolved album ids are our own i64s (parsed from the
+    // settings JSON), so inlining them in the IN list is injection-safe. An empty
+    // set matches nothing (an empty collection has zero tracks).
+    if exclude != "collection" {
+        if let Some(ids) = collection_ids {
+            if ids.is_empty() {
+                conds.push("1 = 0".to_string());
+            } else {
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conds.push(format!("t.album_id IN ({list})"));
+            }
+        }
+    }
     if let Some(query) = q.q.as_deref().filter(|s| !s.is_empty()) {
         // Artist match via subquery — no artist_name column / no join here (#1189).
         conds.push(format!(
@@ -171,6 +210,29 @@ pub(super) fn build_conditions(
         params.push(SqlValue::Text(like));
     }
     (conds, params)
+}
+
+/// Resolve a manual collection's name to its album ids, read from the JSON
+/// `collections` setting (each entry is `{ name, album_ids: [..] }`). Returns an
+/// empty vec if the setting is absent or the name isn't found. Case-insensitive
+/// on the name (the facet value is the stored name, so an exact match normally).
+pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let Some(raw) = settings.get("collections").ok().flatten() else {
+        return Vec::new();
+    };
+    let Ok(cols) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        return Vec::new();
+    };
+    cols.iter()
+        .find(|c| {
+            c.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .and_then(|c| c.get("album_ids").and_then(|v| v.as_array()))
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default()
 }
 
 /// GET /api/v1/library/facets?fields=genre,label,year,artist,country,mood,source
@@ -201,10 +263,17 @@ pub(super) async fn library_facets(
         .collect();
 
     let engine = state.backend.engine();
+    // Resolve the active collection selection once (name → album ids) for the
+    // cumulative narrowing of every facet.
+    let coll_ids: Option<Vec<i64>> = q
+        .collection
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|name| collection_album_ids(&state, name));
     let mut out = serde_json::Map::new();
     for field in requested {
         // Conditions narrow the count by the OTHER active facets (cumulative).
-        let (conds, params) = build_conditions(&q, engine, &field);
+        let (conds, params) = build_conditions(&q, engine, &field, coll_ids.as_deref());
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
@@ -220,6 +289,8 @@ pub(super) async fn library_facets(
             "country" => kv_facet(&state, "release_country", limit, &conds, &params),
             "mood" => kv_facet(&state, "mood", limit, &conds, &params),
             "source" => kv_facet(&state, "source_media", limit, &conds, &params),
+            "rating" => rating_facet(&state, limit, &conds, &params),
+            "collection" => collection_facet(&state, &q, engine),
             _ => continue,
         };
         let arr: Vec<Value> = rows
@@ -270,6 +341,106 @@ fn column_facet(
             Some((value, c.as_i64().unwrap_or(0)))
         })
         .collect()
+}
+
+/// Count tracks by their album's rating (profile 1). Tracks inherit the rating
+/// via a join to `album_ratings`; unrated tracks are naturally excluded. The
+/// `conds` reference alias `t`, so the join is additive.
+fn rating_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT arr.rating, COUNT(*) AS n FROM tracks t \
+         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = 1{where_clause} \
+         GROUP BY arr.rating ORDER BY arr.rating DESC{limit_clause}"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let rating = it.next()?.as_i64()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((rating.to_string(), count))
+        })
+        .collect()
+}
+
+/// Count tracks per manual collection. Collections aren't a SQL table — they
+/// live as a JSON `album_ids` array in the `collections` setting — so this
+/// resolves each collection's album ids and counts tracks in that set, narrowed
+/// by the OTHER active facets (collection self-excluded, cumulative). Empty
+/// collections are omitted (they'd read as 0, like other facets skip empties).
+fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(String, i64)> {
+    let (conds, params) = build_conditions(q, engine, "collection", None);
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let raw = settings
+        .get("collections")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let cols: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for c in &cols {
+        let name = c
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let ids: Vec<i64> = c
+            .get("album_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            continue;
+        }
+        let id_list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT COUNT(*) FROM tracks t WHERE t.album_id IN ({id_list}){extra}");
+        let count = state
+            .backend
+            .query_one(&sql, &bound)
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if count > 0 {
+            out.push((name, count));
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// Count tracks per artist. Unlike other facets, the artist name is NOT a column
