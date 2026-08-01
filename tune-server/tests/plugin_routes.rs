@@ -370,3 +370,108 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
     assert_eq!(sdk[0]["version"], "1.2.3");
     assert_eq!(sdk[0]["url"], "/api/v1/ext/loads");
 }
+
+/// An opt-in plugin (like DJ/Karaoke): compiled in but dormant until the user
+/// installs it from the plugin manager.
+struct OptIn;
+
+#[async_trait]
+impl TunePlugin for OptIn {
+    fn name(&self) -> &str {
+        "optin"
+    }
+    fn version(&self) -> &str {
+        "2.0.0"
+    }
+    fn description(&self) -> &str {
+        "Dormant until installed"
+    }
+    fn default_enabled(&self) -> bool {
+        false
+    }
+    async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// An opt-in plugin does not run by default, but `/api/v1/plugins` still lists
+/// it as `installed:false` so the manager renders an "Install" button.
+#[tokio::test]
+async fn opt_in_plugin_is_listed_as_installable_not_loaded() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+
+    // Not among the loaded plugins…
+    assert_eq!(
+        state.plugin_info.get().map(|v| v.len()).unwrap_or_default(),
+        0,
+        "an opt-in plugin must not load by default"
+    );
+    // …but surfaced as available so the manager can still offer "Install".
+    let available = state.plugin_available.get().expect("init publishes it");
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].name, "optin");
+    assert!(available[0].opt_in);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "optin")
+        .expect("the opt-in plugin is listed even while dormant");
+    assert_eq!(entry["type"], "sdk");
+    assert_eq!(entry["installed"], false, "not installed → Install button");
+    assert_eq!(entry["enabled"], false);
+    assert_eq!(entry["url"], "/api/v1/ext/optin");
+}
+
+/// Once installed (`plugin_{name}_installed=true`), the same opt-in plugin
+/// loads on the next boot and reports as installed + enabled.
+#[tokio::test]
+async fn opt_in_plugin_loads_after_install() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_optin_installed", "true")
+        .unwrap();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+
+    let names: Vec<&str> = state
+        .plugin_info
+        .get()
+        .expect("init publishes the snapshot")
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["optin"], "an installed opt-in plugin loads");
+    assert!(
+        state
+            .plugin_available
+            .get()
+            .map(|v| v.is_empty())
+            .unwrap_or(true),
+        "nothing left dormant once installed"
+    );
+
+    let app = tune_server::routes::router(state.clone());
+    let (_status, body) = body_of(&app, "/api/v1/plugins").await;
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "optin")
+        .expect("listed");
+    assert_eq!(entry["installed"], true);
+    assert_eq!(entry["enabled"], true);
+}
