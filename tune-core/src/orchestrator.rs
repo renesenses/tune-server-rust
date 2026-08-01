@@ -151,6 +151,13 @@ fn spawn_paced_levels_forwarder(
                     }
                 }
             }
+            // Une première fenêtre tardive (téléchargement, transcode) ne doit
+            // pas déclencher un rattrapage en rafale de tout le retard
+            // accumulé : un instrument vit au présent. On recale l'horloge.
+            let now = tokio::time::Instant::now();
+            if next_emit < now {
+                next_emit = now;
+            }
             tokio::time::sleep_until(next_emit).await;
             bus.emit(
                 "playback.audio_levels",
