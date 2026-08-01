@@ -189,3 +189,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
+        with:
+          # Low-severity wasmtime advisories in the WASM plugin engine (only
+          # first-party plugins are loaded; no drop-in bump today). Kept in sync
+          # with deny.toml's [advisories] ignore. Revisit at the next wasmtime bump.
+          ignore: RUSTSEC-2026-0222,RUSTSEC-2026-0223
