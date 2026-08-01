@@ -302,14 +302,15 @@ fn read_log_tail(
 }
 
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    collect_recent_logs(q.lines.unwrap_or(1000))
+    collect_recent_logs(q.lines.unwrap_or(1000)).await
 }
 
 /// Collect the most recent server logs (tail): log file first, then
 /// journalctl/syslog (Linux) or stderr files / unified log (macOS). Returns a
 /// `Json<Value>` with `logs`/`lines`/`source`. Shared by the `/logs` endpoint
-/// and the bug report so both surface identical output.
-pub(super) fn collect_recent_logs(max_lines: usize) -> Json<Value> {
+/// and the bug report so both surface identical output. Async because the tail
+/// read runs on a blocking pool (spawn_blocking) to keep off the Tokio runtime.
+pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // Try the server's own log file first — same path the writer uses (main),
     // resolved via the shared helper so reader and writer always agree. This is
     // what makes "Export logs" work on Linux under Docker / a bare terminal,
@@ -736,7 +737,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
     // "Export logs" button shows.
-    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_LINES);
+    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_LINES).await;
     let log_text = logs_json["logs"].as_str().unwrap_or("").trim();
     let log_source = logs_json["source"].as_str().unwrap_or("none");
     md.push_str(&format!(
