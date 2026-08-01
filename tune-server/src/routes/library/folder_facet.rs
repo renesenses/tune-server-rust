@@ -157,50 +157,13 @@ fn effective_roots(state: &AppState) -> Vec<String> {
         })
         .collect();
     if roots.is_empty() {
-        if let Some(r) = derive_data_root(state) {
+        // music_dirs stale/misconfigured → fall back to the real root derived
+        // from the data (shared with browse.rs so both folder views agree).
+        if let Some(r) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref()) {
             roots.push(r);
         }
     }
     roots
-}
-
-/// Longest common directory prefix of all track paths — the real library root
-/// inferred from the data when `music_dirs` can't be trusted. For sorted strings
-/// LCP(all) == LCP(min, max), so two aggregates suffice (no full scan).
-fn derive_data_root(state: &AppState) -> Option<String> {
-    let agg = |f: &str| -> Option<String> {
-        state
-            .backend
-            .query_one(
-                &format!(
-                    "SELECT {f}(file_path) FROM tracks \
-                     WHERE file_path IS NOT NULL AND file_path <> ''"
-                ),
-                &[],
-            )
-            .ok()
-            .flatten()
-            .and_then(|r| r.first().and_then(|v| v.as_string()))
-    };
-    let (min, max) = (agg("MIN")?, agg("MAX")?);
-    let sep = std::path::MAIN_SEPARATOR;
-    let lcp = common_prefix(&min, &max);
-    // Trim back to the last separator → a directory (drop the trailing sep).
-    let idx = lcp.rfind(sep)?;
-    let root = &lcp[..idx];
-    (!root.is_empty()).then(|| root.to_string())
-}
-
-/// Longest common (byte-safe, char-boundary) prefix of two strings.
-fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
-    let mut end = 0;
-    for ((i, ca), cb) in a.char_indices().zip(b.chars()) {
-        if ca != cb {
-            break;
-        }
-        end = i + ca.len_utf8();
-    }
-    &a[..end]
 }
 
 /// Breadcrumb from the containing library root down to `base` (inclusive), each
@@ -311,21 +274,7 @@ fn folder_children(
 
 #[cfg(test)]
 mod tests {
-    use super::{common_prefix, split_child};
-
-    #[test]
-    fn common_prefix_is_the_shared_directory() {
-        // The real .18 case: min/max of the library share "/data/music/".
-        assert_eq!(
-            common_prefix("/data/music/10. x.flac", "/data/music/V_DSF/y.dsf"),
-            "/data/music/"
-        );
-        assert_eq!(common_prefix("/a/b", "/a/c"), "/a/");
-        assert_eq!(common_prefix("/x", "/y"), "/");
-        assert_eq!(common_prefix("same", "same"), "same");
-        // Multibyte: must cut on a char boundary, never mid-codepoint.
-        assert_eq!(common_prefix("/muské/a", "/muskà/b"), "/musk");
-    }
+    use super::split_child;
 
     // plen = number of characters in "<folder><sep>".
     const SEP: char = '/';

@@ -27,7 +27,7 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
-    let roots: Vec<Value> = dirs
+    let mut roots: Vec<Value> = dirs
         .iter()
         .map(|d| {
             let norm = tune_core::scanner::walker::normalize_path(d);
@@ -83,6 +83,52 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             json!({ "path": norm, "name": name, "track_count": count, "exists": exists })
         })
         .collect();
+
+    // Fallback: if no configured music_dir matches any stored path (the
+    // browse_root_zero_tracks drift — e.g. .18 set to /mnt/music while files
+    // live under /data/music), the Répertoires view would show only empty roots
+    // and browsing would go nowhere. Surface the real root inferred from the
+    // data so it still works — the same fallback the Oxygen folder facet uses.
+    let none_populated = roots
+        .iter()
+        .all(|r| r.get("track_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0);
+    if none_populated {
+        if let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref()) {
+            let pattern = tune_core::db::track_repo::folder_like_pattern(&base);
+            let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                "$1"
+            } else {
+                "?1"
+            };
+            let count: i64 = state
+                .backend
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}"),
+                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+            let dup = roots
+                .iter()
+                .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
+            if count > 0 && !dup {
+                let name = std::path::Path::new(&base)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&base)
+                    .to_string();
+                let exists = std::path::Path::new(&base).is_dir();
+                warn!(root = %base, count, "browse_roots_data_derived_fallback");
+                roots.push(json!({
+                    "path": base, "name": name, "track_count": count,
+                    "exists": exists, "derived": true
+                }));
+            }
+        }
+    }
+
     Ok(Json(json!({ "roots": roots })))
 }
 
