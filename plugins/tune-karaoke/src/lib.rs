@@ -85,6 +85,11 @@ impl TunePlugin for KaraokePlugin {
     fn description(&self) -> &str {
         "Paroles synchronisées façon karaoké (réutilise tune-core::lyrics)"
     }
+    // Opt-in: dormant until the user installs it from the plugin manager,
+    // rather than running for everyone by default.
+    fn default_enabled(&self) -> bool {
+        false
+    }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
         ctx.register_router(router(

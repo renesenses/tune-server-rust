@@ -188,6 +188,36 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         }));
     }
 
+    // Compiled-in plugins that did not load: opt-in ones the user has not
+    // installed (DJ/Karaoke), or default-on ones they disabled. Listed from
+    // the snapshot `plugins::init` published so they stay visible in the
+    // manager — an opt-in one as `installed:false` (→ "Install"), a disabled
+    // one as `installed:true, enabled:false` (→ "Enable").
+    for info in plugin_available_snapshot(&state) {
+        let installed = if info.opt_in {
+            settings
+                .get(&format!("plugin_{}_installed", info.name))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("true")
+        } else {
+            true
+        };
+        plugins.push(serde_json::json!({
+            "name": info.name,
+            "display_name": info.name,
+            "description": info.description,
+            "version": info.version,
+            "type": "sdk",
+            "installed": installed,
+            "enabled": false,
+            "loaded": false,
+            "url": format!("/api/v1/ext/{}", info.name),
+            "config_schema": info.config_schema,
+        }));
+    }
+
     // Wasm plugins installed on disk (marketplace installs or bundled).
     // Scanned from the plugins dir rather than the loaded registry so a
     // disabled plugin — or one installed since the last restart — still shows
@@ -235,6 +265,16 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
 fn plugin_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::PluginInfo] {
     state
         .plugin_info
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or_default()
+}
+
+/// Compiled-in plugins `plugins::init` skipped (opt-in-not-installed or
+/// disabled), or an empty slice before it has run.
+fn plugin_available_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::AvailablePluginInfo] {
+    state
+        .plugin_available
         .get()
         .map(|v| v.as_slice())
         .unwrap_or_default()
@@ -306,13 +346,16 @@ async fn install_plugin(
     State(state): State<AppState>,
     Json(_body): Json<InstallRequest>,
 ) -> Json<Value> {
-    // Stub: Rust server doesn't use pip. Track state in settings.
+    // No download for compiled-in plugins (DJ/Karaoke) — installing just flips
+    // the settings the startup gate reads. Wasm marketplace installs go through
+    // a separate route. `restart_required` because the gate only runs at
+    // startup, so the plugin loads on the next boot, not this request.
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.set(&key, "true").ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.set(&enabled_key, "true").ok();
-    Json(json!({ "name": name, "status": "installed" }))
+    Json(json!({ "name": name, "status": "installed", "restart_required": true }))
 }
 
 async fn update_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
@@ -341,6 +384,10 @@ async fn delete_plugin(
     };
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
+    // A compiled-in plugin (DJ/Karaoke) has no dir to remove, but if it was
+    // installed it is loaded and running now — the startup gate only drops it
+    // next boot, so a restart is still required.
+    let was_installed = settings.get(&key).ok().flatten().as_deref() == Some("true");
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.delete(&enabled_key).ok();
@@ -349,7 +396,7 @@ async fn delete_plugin(
     Json(json!({
         "status": "uninstalled",
         "name": name,
-        "restart_required": removed_dir,
+        "restart_required": removed_dir || was_installed,
     }))
     .into_response()
 }

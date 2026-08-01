@@ -79,6 +79,23 @@ pub struct PluginInfo {
     pub config_schema: serde_json::Value,
 }
 
+/// A compiled-in plugin that `setup_all` did not load — either an opt-in
+/// plugin the user has not installed yet, or a default-on one they disabled.
+///
+/// Captured before the resident set is pruned so the plugin manager can still
+/// list it (and offer "Install" / "Enable") instead of it vanishing entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvailablePluginInfo {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub config_schema: serde_json::Value,
+    /// `true` = dormant because it is opt-in and not yet installed (offer
+    /// "Install"); `false` = a default-on plugin the user disabled (offer
+    /// "Enable").
+    pub opt_in: bool,
+}
+
 pub struct PluginContext {
     /// Base URL of this server's own HTTP API, e.g. `http://127.0.0.1:8080`.
     ///
@@ -249,6 +266,19 @@ pub trait TunePlugin: Send + Sync {
         serde_json::json!({})
     }
 
+    /// Whether this plugin runs unless explicitly turned off (`true`, the
+    /// default) or stays dormant until the user installs it on demand
+    /// (`false`, "opt-in").
+    ///
+    /// An opt-in plugin is still compiled into the binary, but `setup_all`
+    /// skips it until `plugin_{name}_installed == "true"` — so it surfaces in
+    /// the plugin manager as an available, not-yet-installed entry rather than
+    /// running by default. DJ and Karaoke override this to `false` (#917
+    /// follow-up): niche modes users shouldn't pay for unless they ask.
+    fn default_enabled(&self) -> bool {
+        true
+    }
+
     /// The [`PLUGIN_PROTOCOL_VERSION`] this plugin was built against.
     ///
     /// Defaults to the version compiled into the SDK the plugin links, which
@@ -299,6 +329,9 @@ pub struct PluginLoader {
     /// Registrations accumulated across every plugin's `setup`, awaiting
     /// collection by the host.
     registrations: StdMutex<PluginRegistrations>,
+    /// Compiled-in plugins `setup_all` skipped (opt-in-not-installed or
+    /// disabled), kept so the plugin manager can still surface them.
+    unloaded: StdMutex<Vec<AvailablePluginInfo>>,
 }
 
 impl PluginLoader {
@@ -310,6 +343,7 @@ impl PluginLoader {
             db: None,
             event_dispatch_handle: None,
             registrations: StdMutex::new(PluginRegistrations::default()),
+            unloaded: StdMutex::new(Vec::new()),
         }
     }
 
@@ -329,22 +363,44 @@ impl PluginLoader {
 
     pub async fn setup_all(&self, api_base_url: &str) -> Vec<String> {
         let mut loaded = Vec::new();
+        let mut unloaded: Vec<AvailablePluginInfo> = Vec::new();
         std::fs::create_dir_all(&self.data_root).ok();
 
         let mut plugins = self.plugins.lock().await;
         for plugin in plugins.iter_mut() {
             let name = plugin.name().to_string();
 
-            // Runtime kill switch written by the REST routes
-            // (`plugin_{name}_enabled`): a compiled-in plugin can be disabled
-            // without recompiling (review #907).
+            // Enable / install gate. A compiled-in plugin can be turned off
+            // without recompiling (`plugin_{name}_enabled=false`, review #907).
+            // An opt-in plugin (`default_enabled()==false`, e.g. DJ/Karaoke)
+            // additionally stays dormant until the user installs it
+            // (`plugin_{name}_installed=true`) — so it surfaces in the plugin
+            // manager as an available entry rather than running by default
+            // (#917 follow-up). Skipped plugins are captured for the manager.
             if let Some(db) = &self.db {
-                let key = format!("plugin_{name}_enabled");
-                if let Ok(Some(v)) = SettingsRepo::with_backend(Arc::clone(db)).get(&key) {
-                    if v == "false" {
-                        info!(plugin_name = %name, "plugin_disabled_by_setting");
-                        continue;
-                    }
+                let settings = SettingsRepo::with_backend(Arc::clone(db));
+                let enabled = settings
+                    .get(&format!("plugin_{name}_enabled"))
+                    .ok()
+                    .flatten();
+                let installed = settings
+                    .get(&format!("plugin_{name}_installed"))
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("true");
+                let opt_in = !plugin.default_enabled();
+                let dormant = enabled.as_deref() == Some("false") || (opt_in && !installed);
+                if dormant {
+                    info!(plugin_name = %name, opt_in, "plugin_dormant_not_loaded");
+                    unloaded.push(AvailablePluginInfo {
+                        name: name.clone(),
+                        version: plugin.version().to_string(),
+                        description: plugin.description().to_string(),
+                        config_schema: plugin.config_schema(),
+                        opt_in,
+                    });
+                    continue;
                 }
             }
 
@@ -418,7 +474,18 @@ impl PluginLoader {
         // hazard setup registrations are dropped for (review #907).
         plugins.retain(|p| loaded.iter().any(|n| n == p.name()));
 
+        if let Ok(mut slot) = self.unloaded.lock() {
+            *slot = unloaded;
+        }
+
         loaded
+    }
+
+    /// Compiled-in plugins `setup_all` skipped (opt-in-not-installed or
+    /// disabled). The plugin manager lists these alongside the loaded ones so
+    /// a dormant plugin stays installable/enable-able instead of vanishing.
+    pub fn unloaded_plugins(&self) -> Vec<AvailablePluginInfo> {
+        self.unloaded.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
     /// Take everything the loaded plugins asked the host to install.
@@ -633,6 +700,98 @@ mod tests {
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "test-plugin");
         assert_eq!(loader.plugin_count().await, 1);
+    }
+
+    /// Opt-in plugin: dormant until explicitly installed (like DJ/Karaoke).
+    struct OptInPlugin;
+
+    #[async_trait]
+    impl TunePlugin for OptInPlugin {
+        fn name(&self) -> &str {
+            "opt-in"
+        }
+        fn version(&self) -> &str {
+            "0.1.0"
+        }
+        fn description(&self) -> &str {
+            "Dormant until installed"
+        }
+        fn default_enabled(&self) -> bool {
+            false
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn memory_db() -> Arc<dyn DbBackend> {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn opt_in_plugin_dormant_until_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = memory_db();
+        let loader = PluginLoader::new(dir.path().to_path_buf()).with_db(Arc::clone(&db));
+        loader.register(Box::new(OptInPlugin)).await;
+
+        // Not installed → not loaded, but still surfaced as available/opt-in.
+        let loaded = loader.setup_all("http://localhost:8888").await;
+        assert!(loaded.is_empty(), "opt-in plugin must not load by default");
+        assert!(loader.loaded_plugins().await.is_empty());
+        let available = loader.unloaded_plugins();
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].name, "opt-in");
+        assert!(
+            available[0].opt_in,
+            "must be flagged opt-in, not just disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn opt_in_plugin_loads_once_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = memory_db();
+        SettingsRepo::with_backend(Arc::clone(&db))
+            .set("plugin_opt-in_installed", "true")
+            .unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf()).with_db(Arc::clone(&db));
+        loader.register(Box::new(OptInPlugin)).await;
+
+        let loaded = loader.setup_all("http://localhost:8888").await;
+        assert_eq!(loaded, vec!["opt-in"]);
+        assert!(loader.unloaded_plugins().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_on_plugin_disabled_is_available_not_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = memory_db();
+        SettingsRepo::with_backend(Arc::clone(&db))
+            .set("plugin_test-plugin_enabled", "false")
+            .unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf()).with_db(Arc::clone(&db));
+        loader.register(Box::new(TestPlugin::new())).await;
+
+        let loaded = loader.setup_all("http://localhost:8888").await;
+        assert!(
+            loaded.is_empty(),
+            "explicitly disabled plugin must not load"
+        );
+        let available = loader.unloaded_plugins();
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].name, "test-plugin");
+        assert!(
+            !available[0].opt_in,
+            "a disabled default-on plugin is not opt-in"
+        );
     }
 
     #[test]
