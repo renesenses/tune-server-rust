@@ -186,26 +186,66 @@ pub async fn analyze_embedding_batch(
 const IDLE_SLEEP_SECS: u64 = 900;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
 const ENABLED_KEY: &str = "audio_embedding_enabled";
-/// Optional explicit model path; falls back to `TUNE_AUDIO_EMBED_MODEL`.
+/// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
 const MODEL_PATH_KEY: &str = "audio_embedding_model_path";
+/// Published CLAP audio tower (ONNX, mel in-graph, 512-d). Fetched on first
+/// activation and cached at the configured path.
+const MODEL_URL: &str = "https://github.com/renesenses/tune-server-rust/releases/download/models/clap-audio-2023/clap-audio-2023.onnx";
+/// SHA-256 of the model above — a corrupt/partial download is rejected.
+const MODEL_SHA256: &str = "31c37def7ff2a9a36da07667bc7412dfb5ca16e081673055e45d3ac26de387d9";
 
 fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
     settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
 }
 
-fn resolve_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
+/// The configured model destination (setting → env). Not required to exist —
+/// [`ensure_model`] downloads it there on first run.
+fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
     settings
         .get(MODEL_PATH_KEY)
         .ok()
         .flatten()
         .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
         .map(PathBuf::from)
-        .filter(|p| p.exists())
+}
+
+/// Make sure the model exists at `dest`, downloading + checksum-verifying it if
+/// absent. Idempotent: an already-present file is trusted (verified on the run
+/// that wrote it). Written atomically via a temp file so a killed download
+/// never leaves a truncated model in place.
+async fn ensure_model(dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    info!(url = MODEL_URL, dest = %dest.display(), "audio_model_downloading");
+    let bytes = reqwest::get(MODEL_URL)
+        .await
+        .map_err(|e| format!("download: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("download status: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("download body: {e}"))?;
+
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::new_with_prefix(&bytes).finalize());
+    if got != MODEL_SHA256 {
+        return Err(format!("checksum mismatch: got {got}, want {MODEL_SHA256}"));
+    }
+
+    let tmp = dest.with_extension("onnx.part");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
+    info!(dest = %dest.display(), bytes = bytes.len(), "audio_model_ready");
+    Ok(())
 }
 
 /// Spawn the background audio-embedding sweep. Mirrors `replaygain::spawn`:
-/// opt-in via `audio_embedding_enabled`, lazy-loads the CLAP model once it is
-/// present (downloaded on activation — not yet wired), and chips away at the
+/// opt-in via `audio_embedding_enabled`, downloads + checksum-verifies the CLAP
+/// model on first activation (to the configured path), then chips away at the
 /// library in bounded batches. No-ops cheaply while disabled or model-less.
 pub fn spawn(backend: Arc<dyn DbBackend>) {
     use crate::db::settings_repo::SettingsRepo;
@@ -217,13 +257,17 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
                 if embedder.is_none() {
-                    if let Some(p) = resolve_model_path(&settings) {
-                        match AudioEmbedder::load(&p) {
-                            Ok(e) => {
-                                info!(model = %p.display(), "audio_embedder_loaded");
-                                embedder = Some(e);
+                    if let Some(p) = configured_model_path(&settings) {
+                        if let Err(e) = ensure_model(&p).await {
+                            warn!(error = %e, "audio_model_unavailable");
+                        } else {
+                            match AudioEmbedder::load(&p) {
+                                Ok(e) => {
+                                    info!(model = %p.display(), "audio_embedder_loaded");
+                                    embedder = Some(e);
+                                }
+                                Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                             }
-                            Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                         }
                     }
                 }
