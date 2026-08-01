@@ -8,7 +8,7 @@
 //!
 //! Feature-gated behind `audio-embedding`: the default build does not link ort.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -209,4 +209,63 @@ pub async fn analyze_embedding_batch(
 
     info!(embedded = done, "audio_embedding_batch");
     done
+}
+
+/// Idle wait when disabled or the sweep is drained.
+const IDLE_SLEEP_SECS: u64 = 900;
+/// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
+const ENABLED_KEY: &str = "audio_embedding_enabled";
+/// Optional explicit model path; falls back to `TUNE_AUDIO_EMBED_MODEL`.
+const MODEL_PATH_KEY: &str = "audio_embedding_model_path";
+
+fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
+    settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
+}
+
+fn resolve_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
+    settings
+        .get(MODEL_PATH_KEY)
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+}
+
+/// Spawn the background audio-embedding sweep. Mirrors `replaygain::spawn`:
+/// opt-in via `audio_embedding_enabled`, lazy-loads the CLAP model once it is
+/// present (downloaded on activation — not yet wired), and chips away at the
+/// library in bounded batches. No-ops cheaply while disabled or model-less.
+pub fn spawn(backend: Arc<dyn DbBackend>) {
+    use crate::db::settings_repo::SettingsRepo;
+    tokio::spawn(async move {
+        // Let startup/scan settle before touching the disk hard.
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        let mut embedder: Option<AudioEmbedder> = None;
+        loop {
+            let settings = SettingsRepo::with_backend(backend.clone());
+            if enabled(&settings) {
+                if embedder.is_none() {
+                    if let Some(p) = resolve_model_path(&settings) {
+                        match AudioEmbedder::load(&p) {
+                            Ok(e) => {
+                                info!(model = %p.display(), "audio_embedder_loaded");
+                                embedder = Some(e);
+                            }
+                            Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
+                        }
+                    }
+                }
+                if let Some(emb) = embedder.as_mut() {
+                    let did = analyze_embedding_batch(&backend, emb).await;
+                    if did > 0 {
+                        // More to do — loop promptly; the per-file pauses throttle.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+        }
+    });
 }
