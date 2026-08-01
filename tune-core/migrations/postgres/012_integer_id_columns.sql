@@ -162,7 +162,26 @@ BEGIN
         EXECUTE format('SELECT setval(%L, GREATEST(%s, 1), %s)',
           seq, maxid, CASE WHEN maxid > 0 THEN 'true' ELSE 'false' END);
         EXECUTE format('ALTER TABLE %I ALTER COLUMN id SET DEFAULT nextval(%L)', t, seq);
-        EXECUTE format('ALTER SEQUENCE %I OWNED BY %I.id', seq, t);
+        -- Link the id column to its sequence. On installs whose schema ownership
+        -- has drifted (some tables owned by a different role than the migration's
+        -- connection role — e.g. tuneserver- vs tune-owned tables on prod .15),
+        -- Postgres rejects OWNED BY with "sequence must have same owner as table
+        -- it is linked to", which used to abort the whole migration and crash-loop
+        -- the server on boot. Align the sequence owner to the table's first, and
+        -- make the link best-effort: OWNED BY only governs cascade-drop (which
+        -- never happens for these core id columns), while the column DEFAULT set
+        -- just above is what actually matters. A residual mismatch is skipped, not
+        -- fatal.
+        BEGIN
+          EXECUTE (
+            SELECT format('ALTER SEQUENCE %I OWNER TO %I', seq, tableowner)
+              FROM pg_tables
+             WHERE schemaname = current_schema() AND tablename = t
+          );
+          EXECUTE format('ALTER SEQUENCE %I OWNED BY %I.id', seq, t);
+        EXCEPTION WHEN OTHERS THEN
+          RAISE NOTICE 'migration 012: OWNED BY skipped for %.id (%)', t, SQLERRM;
+        END;
         RAISE NOTICE 'migration 012: %.id text->bigint + seq (next %)', t, maxid + 1;
       ELSE
         RAISE NOTICE 'migration 012: SKIP %.id (% non-integer values)', t, bad;
