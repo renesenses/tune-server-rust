@@ -30,6 +30,10 @@ const SENTINEL: &str = "audio_embed_analyzed";
 /// Samples fed to the model: 10 s @ 48 kHz mono, matching CLAP's fixed window.
 const WINDOW_SAMPLES: usize = 480_000;
 
+/// Hard cap on decoding one track. A 10 s window decodes in well under a second
+/// even for hi-res PCM; anything past this is a stuck decoder, not slowness.
+const DECODE_TIMEOUT_SECS: u64 = 30;
+
 // Storage layout, constants and cosine live in the always-compiled read side.
 use super::embedding_store::{self, EMBED_DIM, MODEL_ID};
 
@@ -98,9 +102,17 @@ pub async fn analyze_embedding_batch(
     backend: &Arc<dyn DbBackend>,
     embedder: &mut AudioEmbedder,
 ) -> usize {
+    // Skip DSD/DSF/DFF: the DSD→PCM resampler can spin on some SACD rips,
+    // hanging the (non-cancellable) decode thread forever and freezing the whole
+    // sweep. DSD is a small slice of a library and the decoder is fragile, so we
+    // leave those without an acoustic embedding (smart_radio falls back to
+    // metadata for them) rather than risk the stall. The timeout below is the
+    // belt to this suspenders for any other format that misbehaves.
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+           AND (t.format IS NULL OR \
+                lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')) \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed') \
          LIMIT ?",
@@ -135,13 +147,23 @@ pub async fn analyze_embedding_batch(
 
         // Decode the first 10 s at 48 kHz mono (CLAP's window) off the async
         // runtime; the returned samples carry the source bit depth for scaling.
+        // A hard timeout guards against a decoder that spins on a pathological
+        // file: on elapse we abandon the await (the blocking thread cannot be
+        // cancelled, but one leaked thread is survivable) and move on, stamping
+        // the sentinel below so the file is not retried.
         let p = path.clone();
-        let decoded = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm(&p, Some(48_000), Some(1), 0.0, 10.0)
-        })
+        let decoded = tokio::time::timeout(
+            std::time::Duration::from_secs(DECODE_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                crate::audio::decode::decode_to_pcm(&p, Some(48_000), Some(1), 0.0, 10.0)
+            }),
+        )
         .await;
+        if decoded.is_err() {
+            warn!(track_id, path = %path, "audio_embed_decode_timeout");
+        }
 
-        if let Ok(Ok(d)) = decoded {
+        if let Ok(Ok(Ok(d))) = decoded {
             // i32 samples → f32 in [-1, 1], the same full-scale rule the loudness
             // pass uses (sample / 2^(bits-1)); librosa normalises identically.
             let scale = (1i64 << (d.bit_depth.saturating_sub(1)).min(31)) as f32;
