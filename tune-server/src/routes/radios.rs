@@ -631,7 +631,12 @@ async fn import_radios_m3u(
 
 pub fn radio_favorites_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_radio_favorites).post(save_radio_favorite))
+        .route(
+            "/",
+            get(list_radio_favorites)
+                .post(save_radio_favorite)
+                .delete(delete_all_radio_favorites),
+        )
         .route("/count", get(radio_favorites_count))
         .route("/is-favorite", get(is_radio_favorite))
         .route("/save-current", post(save_current_as_favorite))
@@ -739,6 +744,17 @@ async fn save_radio_favorite(
             let id = state.backend.last_insert_rowid();
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// Clear the entire radio favorites list (DELETE /radio-favorites).
+// `DELETE FROM radio_favorites` (no WHERE) is portable across SQLite and
+// Postgres. Returns a JSON body (not 204) because the web client does
+// `JSON.parse` on the response and chokes on an empty body.
+async fn delete_all_radio_favorites(State(state): State<AppState>) -> impl IntoResponse {
+    match state.backend.execute("DELETE FROM radio_favorites", &[]) {
+        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
