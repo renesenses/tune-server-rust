@@ -107,17 +107,25 @@ const LEVELS_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
 /// zone est en pause, et s'arrête quand la lecture est stoppée ou remplacée
 /// (le `play_seq` capturé ne correspond plus) : sans cela, deux pistes
 /// successives émettraient en parallèle pendant toute leur durée.
+///
+/// Chaque événement est estampillé de la position de piste qu'il décrit
+/// (`position_ms`, début de la fenêtre analysée) : les clients peuvent
+/// s'aligner sur la position rapportée par le renderer, ce qui compense le
+/// tampon de sortie (plusieurs secondes sur un renderer DLNA/OpenHome).
+/// `start_position_ms` est le point de départ du décodage (0, ou le seek).
 fn spawn_paced_levels_forwarder(
     bus: Arc<EventBus>,
     playback: Arc<PlaybackManager>,
     zone_id: i64,
     play_seq: u64,
+    start_position_ms: i64,
 ) -> tokio::sync::mpsc::UnboundedSender<crate::audio::levels::AudioLevels> {
     let (tx, mut rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
     tokio::spawn(async move {
         let mut next_emit = tokio::time::Instant::now();
         let mut started = false;
+        let mut position = std::time::Duration::from_millis(start_position_ms.max(0) as u64);
         // Un pré-transcode DASH peut retarder le démarrage de 30 s ; au-delà
         // de cette borne on abandonne pour ne pas fuiter la tâche.
         let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -148,6 +156,10 @@ fn spawn_paced_levels_forwarder(
                 "playback.audio_levels",
                 serde_json::json!({
                     "zone_id": zone_id,
+                    // Début de la fenêtre analysée, dans le référentiel de la
+                    // piste — les clients s'alignent sur la position rapportée
+                    // par le renderer pour compenser son tampon de sortie.
+                    "position_ms": position.as_millis() as i64,
                     "rms_left_db": lvl.rms_left_db(),
                     "rms_right_db": lvl.rms_right_db(),
                     "peak_left_db": lvl.peak_left_db(),
@@ -157,6 +169,7 @@ fn spawn_paced_levels_forwarder(
                     "spectrum": lvl.spectrum,
                 }),
             );
+            position += lvl.window;
             next_emit += lvl.window;
         }
     });
@@ -2167,8 +2180,10 @@ impl PlaybackOrchestrator {
                                 tokio::spawn(async move {
                                     let play_seq =
                                         playback.current_play_seq(zone_id).await;
+                                    // Temp-file : le PCM décodé part du début
+                                    // du fichier (un seek passe par Range HTTP).
                                     let levels_tx = spawn_paced_levels_forwarder(
-                                        bus, playback, zone_id, play_seq,
+                                        bus, playback, zone_id, play_seq, 0,
                                     );
                                     tokio::task::spawn_blocking(move || {
                                         crate::audio::levels::send_windowed_levels(
@@ -2277,7 +2292,13 @@ impl PlaybackOrchestrator {
                     let levels_tx = match ev_bus {
                         Some(bus) => {
                             let play_seq = playback.current_play_seq(zone_id).await;
-                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq)
+                            spawn_paced_levels_forwarder(
+                                bus,
+                                playback,
+                                zone_id,
+                                play_seq,
+                                (seek_s * 1000.0) as i64,
+                            )
                         }
                         None => {
                             tokio::sync::mpsc::unbounded_channel::<
@@ -2457,8 +2478,9 @@ impl PlaybackOrchestrator {
                     let ch = channels as u32;
                     tokio::spawn(async move {
                         let play_seq = playback.current_play_seq(zone_id).await;
+                        // Passthrough : le décodage pour niveaux part de 0.
                         let levels_tx =
-                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq);
+                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
                         // Decode the file to PCM in the background — output is
                         // discarded, only levels are forwarded via levels_tx.
                         let result = tokio::task::spawn_blocking(move || {
@@ -2828,7 +2850,13 @@ impl PlaybackOrchestrator {
                 let levels_tx = match ev_bus {
                     Some(bus) => {
                         let play_seq = playback.current_play_seq(zone_id).await;
-                        spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq)
+                        spawn_paced_levels_forwarder(
+                            bus,
+                            playback,
+                            zone_id,
+                            play_seq,
+                            (seek_s * 1000.0) as i64,
+                        )
                     }
                     None => {
                         tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>()
