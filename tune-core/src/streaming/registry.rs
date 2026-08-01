@@ -163,6 +163,13 @@ impl ServiceRegistry {
                         warn!(service = %name, "tokens_rewritten_dropping_stale_fields");
                     }
                     svc.post_restore().await;
+                    // `post_restore` probes the token. If the provider refused
+                    // it, the row cannot be used again — drop it rather than
+                    // reload it on every boot.
+                    if svc.session_expired() {
+                        settings.delete(&key).ok();
+                        warn!(service = %name, "expired_session_row_deleted");
+                    }
                 }
             }
         }
