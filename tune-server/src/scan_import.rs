@@ -156,7 +156,10 @@ pub struct TrackImporter {
     // don't collapse into one via the cache before the DB is even consulted
     // (Dominique). Tracks of one album that are only partially MB-tagged still
     // reconcile at the DB layer (see get_or_create_with_mbid).
-    album_cache: HashMap<(String, i64, Option<i32>, Option<String>), Arc<Album>>,
+    // The album's FOLDER leads the key: it is what identifies a release (see
+    // `scanner::album_folder`), so two rips of the same album in two folders
+    // never share a cache entry even though title+artist+year match.
+    album_cache: HashMap<(String, String, i64, Option<i32>, Option<String>), Arc<Album>>,
     albums_with_cover: HashSet<i64>,
     /// First track-artist seen per folder, used to pin the album artist when a
     /// track has no `album_artist` tag (classical soloists / features).
@@ -323,20 +326,25 @@ impl TrackImporter {
             }
         }
 
+        // The quality tier used to be appended to the title here ("Album
+        // (96kHz/24bit)") so a hi-res copy would not merge with a CD rip. It
+        // split far more than intended — an edition whose discs differ in sample
+        // rate became several albums under near-identical titles — and the
+        // client already shows the real quality as a badge from
+        // `sample_rate`/`bit_depth`. The folder does the separating now.
+        // `quality_split` keeps its meaning — "if the same album exists in CD and
+        // Hi-Res, create two separate entries" — and the folder is what now
+        // delivers it. Off ⇒ empty folder, so every copy shares one cache key and
+        // one album row.
+        let album_folder = if self.quality_split {
+            tune_core::scanner::album_folder::album_folder(&sf.path).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let album_key = meta.album.as_ref().map(|t| {
-            let title = if self.quality_split {
-                let suffix =
-                    tune_core::scanner::quality::quality_suffix(meta.sample_rate, meta.bit_depth);
-                if suffix.is_empty() {
-                    t.clone()
-                } else {
-                    format!("{t} ({suffix})")
-                }
-            } else {
-                t.clone()
-            };
             (
-                title,
+                album_folder.clone(),
+                t.clone(),
                 album_artist_id.unwrap_or(0),
                 meta.year.map(|y| y as i32),
                 meta.musicbrainz_release_id.clone(),
@@ -346,10 +354,10 @@ impl TrackImporter {
         let album = if let Some(ref key) = album_key {
             if let Some(cached) = self.album_cache.get(key) {
                 let c = Arc::clone(cached);
-                if c.artist_id != Some(key.1) {
+                if c.artist_id != Some(key.2) {
                     tracing::warn!(
-                        album = %key.0,
-                        cache_key_artist_id = key.1,
+                        album = %key.1,
+                        cache_key_artist_id = key.2,
                         cached_album_id = ?c.id,
                         cached_album_artist_id = ?c.artist_id,
                         file = %sf.path,
@@ -358,17 +366,18 @@ impl TrackImporter {
                 }
                 Some(c)
             } else {
-                let result = self.album_repo.get_or_create_with_mbid(
+                let result = self.album_repo.get_or_create_for_folder(
                     &key.0,
-                    key.1,
+                    &key.1,
                     key.2,
+                    key.3,
                     meta.musicbrainz_release_id.as_deref(),
                 );
                 if let Err(ref e) = result {
                     tracing::warn!(
-                        album = %key.0,
-                        artist_id = key.1,
-                        year = ?key.2,
+                        album = %key.1,
+                        artist_id = key.2,
+                        year = ?key.3,
                         error = %e,
                         file = %sf.path,
                         "BUG_album_create_failed"
@@ -376,10 +385,10 @@ impl TrackImporter {
                 }
                 let result = result.ok().map(Arc::new);
                 if let Some(ref a) = result {
-                    if a.artist_id != Some(key.1) {
+                    if a.artist_id != Some(key.2) {
                         tracing::warn!(
-                            album = %key.0,
-                            requested_artist_id = key.1,
+                            album = %key.1,
+                            requested_artist_id = key.2,
                             returned_album_id = ?a.id,
                             returned_artist_id = ?a.artist_id,
                             mb_release_id = ?meta.musicbrainz_release_id,

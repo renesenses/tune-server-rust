@@ -735,6 +735,42 @@ CREATE INDEX IF NOT EXISTS idx_streaming_favorites_profile ON streaming_favorite
         name: "add_source_id_to_podcast_subscriptions",
         up: "", // Applied programmatically via add_column_if_missing
     },
+    // A folder on disk is what says "these files are one release". Storing it
+    // makes album identity explicit instead of inferred from title + quality:
+    // an edition whose discs differ in sample rate stays one album, and two
+    // separate rips of the same album stay two. NULL on every pre-existing row
+    // until a rescan, and the lookup falls back to title+artist then, so an
+    // un-rescanned library keeps working exactly as before.
+    Migration {
+        version: 60,
+        name: "add_folder_path_to_albums",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
+    // The quality tier the old scanner appended to album TITLES ("Album
+    // (96kHz/24bit)") is machine-written noise: clients render the real quality
+    // from sample_rate/bit_depth, and the folder now decides identity. Strip it
+    // once, here, rather than on every scan — rewriting titles at scan time
+    // would fight a user's own metadata edits.
+    //
+    // A rescan alone does not clean these: an album matched by its MusicBrainz
+    // release id keeps the row it already had, suffix and all.
+    Migration {
+        version: 61,
+        name: "strip_quality_suffix_from_album_titles",
+        up: "", // Applied programmatically: needs the parser, not SQL.
+    },
+    // Stripping the suffixes leaves behind the rows the split had created: one
+    // release showing up as several same-titled albums. Fold them back together
+    // by the rule that now decides identity — the folder on disk — so an upgrade
+    // fixes the library it finds instead of waiting for a full rescan (expensive
+    // on a NAS, and it would not clean an album matched by MusicBrainz id
+    // anyway). Albums in DIFFERENT folders are never folded: a CD rip and a
+    // hi-res copy are meant to stay two entries.
+    Migration {
+        version: 62,
+        name: "merge_albums_split_by_quality",
+        up: "", // Applied programmatically: needs the folder rule, not SQL.
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -811,6 +847,152 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
             "ALTER TABLE {table} ADD COLUMN {column} {col_type};"
         ))
         .ok();
+    }
+}
+
+/// Undo the quality tier the old scanner wrote into album titles.
+///
+/// Reads the candidates, strips with
+/// [`crate::scanner::quality::strip_quality_suffix`] — a parser, so titles whose
+/// parentheses hold something real ("Remastered", a year) are left alone — and
+/// writes back only what actually changed. The `albums_fts` update trigger keeps
+/// search in step.
+///
+/// Not merged with any same-titled album that may now exist: two rows sharing a
+/// title are legitimate once the folder decides identity (a CD rip and a hi-res
+/// copy), and the client tells them apart by their quality badge.
+fn strip_quality_suffixes_from_album_titles(db: &SqliteDb) {
+    let candidates: Vec<(i64, String)> = {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, title FROM albums \
+             WHERE title LIKE '%Hz)%' OR title LIKE '%bit)%' \
+                OR title LIKE '%Hz/%' OR title LIKE '%Hz %'",
+        ) else {
+            return;
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => return,
+        }
+    };
+
+    let mut renamed = 0usize;
+    for (id, title) in candidates {
+        let stripped = crate::scanner::quality::strip_quality_suffix(&title);
+        if stripped.is_empty() || stripped == title {
+            continue;
+        }
+        let params: [&dyn rusqlite::types::ToSql; 2] = [&stripped, &id];
+        if db
+            .execute("UPDATE albums SET title = ? WHERE id = ?", &params)
+            .is_ok()
+        {
+            renamed += 1;
+        }
+    }
+    if renamed > 0 {
+        info!(renamed, "album_quality_suffixes_stripped");
+    }
+}
+
+/// Fold same-titled albums that share a folder back into one row.
+///
+/// The old quality split turned one release into several albums, one per tier.
+/// Grouping by (artist, title, album folder) puts those back together while
+/// leaving apart what should be: two rips in two folders keep their own rows.
+///
+/// The surviving row is the lowest id — the one the library has had longest, so
+/// its cover, biography and rating are the ones kept. Rows referencing the
+/// absorbed albums (`tracks`, `listen_history`, `album_ratings`,
+/// `metadata_suggestions`) are repointed first; a rating already present on the
+/// survivor wins, since `album_ratings` is unique per (album, profile).
+fn merge_albums_split_by_quality(db: &SqliteDb) {
+    use std::collections::HashMap;
+
+    // (artist_id, title, album folder) -> album ids, ascending.
+    let mut groups: HashMap<(i64, String, String), Vec<i64>> = HashMap::new();
+    {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT a.id, COALESCE(a.artist_id, 0), a.title, \
+                    (SELECT t.file_path FROM tracks t WHERE t.album_id = a.id ORDER BY t.id LIMIT 1) \
+             FROM albums a ORDER BY a.id",
+        ) else {
+            return;
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        });
+        let Ok(rows) = rows else { return };
+        for (id, artist_id, title, first_path) in rows.filter_map(Result::ok) {
+            // No track, no folder, nothing to merge on.
+            let Some(folder) = first_path
+                .as_deref()
+                .and_then(crate::scanner::album_folder::album_folder)
+                .filter(|f| !f.is_empty())
+            else {
+                continue;
+            };
+            groups
+                .entry((artist_id, title.trim().to_lowercase(), folder))
+                .or_default()
+                .push(id);
+        }
+    }
+
+    let mut merged = 0usize;
+    for ((_, _, folder), ids) in groups {
+        let Some((keep, absorbed)) = ids.split_first() else {
+            continue;
+        };
+        if absorbed.is_empty() {
+            // Single row: still record its folder so the scanner recognises it
+            // without a rescan.
+            let params: [&dyn rusqlite::types::ToSql; 2] = [&folder, keep];
+            db.execute(
+                "UPDATE albums SET folder_path = ? WHERE id = ? AND folder_path IS NULL",
+                &params,
+            )
+            .ok();
+            continue;
+        }
+        for drop_id in absorbed {
+            for sql in [
+                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                "UPDATE listen_history SET album_id = ? WHERE album_id = ?",
+                "UPDATE OR IGNORE album_ratings SET album_id = ? WHERE album_id = ?",
+                "UPDATE OR IGNORE metadata_suggestions SET album_id = ? WHERE album_id = ?",
+            ] {
+                let params: [&dyn rusqlite::types::ToSql; 2] = [keep, drop_id];
+                // A table may not exist on an old database — ignore and go on.
+                db.execute(sql, &params).ok();
+            }
+            let params: [&dyn rusqlite::types::ToSql; 1] = [drop_id];
+            db.execute("DELETE FROM albums WHERE id = ?", &params).ok();
+            merged += 1;
+        }
+        let params: [&dyn rusqlite::types::ToSql; 2] = [&folder, keep];
+        db.execute("UPDATE albums SET folder_path = ? WHERE id = ?", &params)
+            .ok();
+        let params: [&dyn rusqlite::types::ToSql; 1] = [keep];
+        db.execute(
+            "UPDATE albums SET track_count = \
+             (SELECT COUNT(*) FROM tracks WHERE album_id = albums.id) WHERE id = ?",
+            &params,
+        )
+        .ok();
+    }
+    if merged > 0 {
+        info!(merged, "albums_split_by_quality_merged");
     }
 }
 
@@ -1123,6 +1305,21 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // just feed_url — keeps the browse "S'abonner" button in sync (Fabien).
             add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");
         }
+        if migration.version == 60 {
+            // The album's folder on disk — see the migration's comment.
+            add_column_if_missing(db, "albums", "folder_path", "TEXT");
+            db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_albums_folder_path \
+                 ON albums(folder_path) WHERE folder_path IS NOT NULL",
+            )
+            .ok();
+        }
+        if migration.version == 61 {
+            strip_quality_suffixes_from_album_titles(db);
+        }
+        if migration.version == 62 {
+            merge_albums_split_by_quality(db);
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -1365,6 +1562,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         13,
         "numeric_column_types_remaining",
         include_str!("../../migrations/postgres/013_numeric_column_types_remaining.sql"),
+    ),
+    (
+        14,
+        "album_folder_path",
+        include_str!("../../migrations/postgres/014_album_folder_path.sql"),
     ),
 ];
 
@@ -1651,7 +1853,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 13, "latest PG migration must be 13");
+        assert_eq!(pg_latest_version(), 14, "latest PG migration must be 14");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
