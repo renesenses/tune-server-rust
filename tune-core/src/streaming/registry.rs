@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::traits::StreamingService;
 use crate::db::backend::DbBackend;
@@ -152,6 +152,16 @@ impl ServiceRegistry {
                 let mut svc = svc.lock().await;
                 if svc.restore_tokens(&tokens) {
                     info!(service = %name, "tokens_restored");
+                    // A row in a superseded shape (today: the Qobuz plaintext
+                    // password) is rewritten here rather than waiting for the
+                    // next refresh — a token that never expires would leave the
+                    // secret on disk indefinitely.
+                    if svc.tokens_need_rewrite()
+                        && let Some(clean) = svc.save_tokens()
+                    {
+                        settings.set(&key, &clean.to_string()).ok();
+                        warn!(service = %name, "tokens_rewritten_dropping_stale_fields");
+                    }
                     svc.post_restore().await;
                 }
             }
