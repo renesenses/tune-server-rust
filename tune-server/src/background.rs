@@ -1141,8 +1141,21 @@ fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
     });
 }
 
-/// Periodically re-enumerate local audio devices (every 120s) to detect USB DACs
-/// that were plugged in after startup or took time to initialize.
+/// Periodically re-enumerate local audio devices to detect USB DACs that were
+/// plugged in after startup or took time to initialize.
+///
+/// Cadence is platform-dependent. On Windows/macOS we poll every 120s so a
+/// freshly-plugged USB DAC appears quickly. On Linux, PipeWire already handles
+/// device hotplug dynamically and each cpal re-enumeration re-probes *every*
+/// PipeWire/ALSA node; doing that every 2 minutes for hours has been linked to
+/// runaway pipewire/wireplumber memory growth → OOM (JeromeQ, #1257, Ubuntu
+/// 24.04, 8GB). So poll far less often there — a USB DAC is merely detected a
+/// little later.
+#[cfg(target_os = "linux")]
+const LOCAL_AUDIO_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+#[cfg(not(target_os = "linux"))]
+const LOCAL_AUDIO_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[cfg(feature = "local-audio")]
 fn spawn_local_audio_rescan(state: &AppState) {
     let state = state.clone();
@@ -1151,7 +1164,7 @@ fn spawn_local_audio_rescan(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
             rescan_local_audio_devices(&state).await;
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            tokio::time::sleep(LOCAL_AUDIO_RESCAN_INTERVAL).await;
         }
     });
 }
@@ -1179,6 +1192,22 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
         }
     }
     false
+}
+
+/// Whether ANY zone (local or network) is currently playing, read from the
+/// in-memory playback state — no device or network probing. Used on Linux to
+/// suppress the periodic audio re-enumeration during a listening session:
+/// re-probing PipeWire while music plays for hours drives runaway pipewire
+/// memory growth (JeromeQ, #1257). Network renderers don't use PipeWire, but a
+/// long radio session to one is exactly when the useless re-probing piles up.
+#[cfg(all(feature = "local-audio", target_os = "linux"))]
+async fn any_zone_playing(state: &AppState) -> bool {
+    state
+        .playback
+        .all_states()
+        .await
+        .iter()
+        .any(|z| z.state == tune_core::playback::PlayState::Playing)
 }
 
 /// Re-enumerate local audio devices and register any new ones.
@@ -1220,6 +1249,17 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // cycle once playback stops. This also protects any active ASIO output.
     if any_local_output_playing(state).await {
         debug!("local_audio_rescan_skipped_active_playback");
+        return;
+    }
+
+    // On Linux, also skip while ANY zone is playing (even a network renderer).
+    // Re-probing PipeWire every cycle during a long listening session is the
+    // exact pattern that grows pipewire/wireplumber memory unbounded → OOM
+    // (JeromeQ, #1257, radio to a Volumio zone). A USB DAC plugged in mid-
+    // session is simply picked up on the next idle cycle.
+    #[cfg(target_os = "linux")]
+    if any_zone_playing(state).await {
+        debug!("local_audio_rescan_skipped_zone_playing");
         return;
     }
 
