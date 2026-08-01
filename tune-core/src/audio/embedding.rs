@@ -30,13 +30,8 @@ const SENTINEL: &str = "audio_embed_analyzed";
 /// Samples fed to the model: 10 s @ 48 kHz mono, matching CLAP's fixed window.
 const WINDOW_SAMPLES: usize = 480_000;
 
-/// Dimensionality of the CLAP audio embedding.
-pub const EMBED_DIM: usize = 512;
-
-/// The model identifier stored alongside each embedding (see
-/// `track_audio_embedding.model`), so a future model can re-embed without
-/// invalidating rows produced by this one.
-pub const MODEL_ID: &str = "clap-audio-2023";
+// Storage layout, constants and cosine live in the always-compiled read side.
+use super::embedding_store::{self, EMBED_DIM, MODEL_ID};
 
 /// A loaded CLAP audio embedder. Cheap to reuse across many tracks in the
 /// background analysis pass; `embed` is the per-track hot path.
@@ -93,30 +88,6 @@ impl AudioEmbedder {
         }
         Ok(v)
     }
-}
-
-/// Cosine similarity of two already-normalised embeddings (dot product).
-/// Used by `smart_radio` to rank acoustic neighbours.
-pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// Pack a normalised embedding into the `BLOB`/`BYTEA` stored in
-/// `track_audio_embedding.embedding` (little-endian f32).
-pub fn to_bytes(embedding: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(embedding.len() * 4);
-    for x in embedding {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out
-}
-
-/// Reverse of [`to_bytes`].
-pub fn from_bytes(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 /// Embed up to `TRACK_BATCH` local tracks that have no audio embedding yet.
@@ -180,7 +151,7 @@ pub async fn analyze_embedding_batch(
                     let row = vec![
                         SqlValue::Int(track_id),
                         SqlValue::Text(MODEL_ID.to_string()),
-                        SqlValue::Blob(to_bytes(&emb)),
+                        SqlValue::Blob(embedding_store::to_bytes(&emb)),
                         SqlValue::Int(now),
                     ];
                     // Portable upsert (SQLite ≥ 3.24 + PG): track_id is the PK.

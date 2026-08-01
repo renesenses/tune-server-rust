@@ -369,6 +369,37 @@ pub fn smart_radio(
 
     debug!(seed_genre = ?genre, seed_artist = ?artist, "smart_radio_seed");
 
+    // --- Acoustic neighbours: tracks that SOUND like the seed, ranked by CLAP
+    // cosine. This is the strongest continuity signal, so it goes first. Empty
+    // when the seed has no embedding (un-analysed library), leaving the metadata
+    // paths below as the fallback — zero regression.
+    if let Some(tid) = seed_track_id {
+        let neigh = crate::audio::embedding_store::acoustic_neighbors(backend, tid, count);
+        if !neigh.is_empty() {
+            let ids: Vec<i64> = neigh.iter().map(|(id, _)| *id).collect();
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT {TRACK_COLS} \
+                 FROM tracks t \
+                 LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
+                 LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+                 WHERE t.id IN ({placeholders})"
+            );
+            let params: Vec<&dyn ToSqlValue> = ids.iter().map(|id| id as &dyn ToSqlValue).collect();
+            if let Ok(rows) = backend.query_many(&sql, &params) {
+                // SQL `IN` loses ordering; re-emit in descending-cosine order.
+                for (id, _) in &neigh {
+                    if let Some(r) = rows
+                        .iter()
+                        .find(|r| r.first().and_then(|v| v.as_i64()) == Some(*id))
+                    {
+                        results.push(row_to_track(r, "acoustic"));
+                    }
+                }
+            }
+        }
+    }
+
     // --- Same genre tracks ---
     if let Some(ref g) = genre {
         let half = (count_i64 / 2).max(5);
@@ -521,6 +552,12 @@ pub fn smart_radio(
             }
         }
     }
+
+    // Acoustic, genre and co-occurrence sources can surface the same track;
+    // keep the first (highest-priority) occurrence and cap at the request.
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|t| seen.insert(t.track_id));
+    results.truncate(count);
 
     info!(count = results.len(), "smart_radio_generated");
     results
