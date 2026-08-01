@@ -7,6 +7,18 @@ use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
 
+/// Build the `LIKE` pattern that matches every track whose file lives under
+/// `prefix` (recursively). Trailing separators are trimmed so a library pointed
+/// at a share/drive root doesn't produce a doubled separator that matches
+/// nothing (same trap handled in `browse.rs`). The server's `MAIN_SEPARATOR` is
+/// the separator stored in `tracks.file_path` (paths are absolute local paths on
+/// the scanning host), so both the flat filter and the folder facet agree.
+pub fn folder_like_pattern(prefix: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let base = prefix.trim_end_matches(['/', '\\']);
+    format!("{base}{sep}%")
+}
+
 /// Engine-agnostic SQL builders for track_repo.
 ///
 /// Complex dynamic queries (search() FTS5, list_doubtful() aggregate,
@@ -520,6 +532,7 @@ impl TrackRepo {
         country: Option<&str>,
         mood: Option<&str>,
         source_media: Option<&str>,
+        folder: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -614,6 +627,15 @@ impl TrackRepo {
                 owned_params.push(SqlValue::Text(v.to_string()));
                 idx += 1;
             }
+        }
+
+        // Folder facet (Oxygen drill-down): restrict to tracks whose file lives
+        // under the selected directory subtree. The current breadcrumb path IS
+        // the filter — recursive so a parent folder includes its sub-folders.
+        if let Some(fld) = folder.filter(|s| !s.is_empty()) {
+            conditions.push(format!("t.file_path LIKE {}", make_ph(idx)));
+            owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
+            idx += 1;
         }
 
         if let Some(query) = q {
