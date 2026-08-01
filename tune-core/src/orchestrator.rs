@@ -1625,6 +1625,19 @@ impl PlaybackOrchestrator {
         // takes precedence over ALAC passthrough.
         let dlna_lpcm =
             is_network_output && ZoneRepo::with_backend(self.db.clone()).get_dlna_lpcm(req.zone_id);
+        // Opt-in per zone: serve genuine 24-bit WAV instead of the 16-bit LPCM
+        // fallback. Only offered in the UI for renderers that advertise
+        // `audio/L24` (capability probe). Forces the WAV path exactly like
+        // `dlna_lpcm`, but the DIDL drops the 16-bit-only `DLNA.ORG_PN=LPCM`
+        // profile (see didl::dlna_flags_for_mime_bd) so a strict renderer no
+        // longer maps the stream back to 16-bit and reads misaligned samples
+        // (the #1137 silence class). Only meaningful when the source is deeper
+        // than 16-bit; a 16-bit source keeps the plain LPCM path.
+        let dlna_wav24 = is_network_output
+            && bit_depth > 16
+            && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
+        // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
+        let dlna_force_wav = dlna_lpcm || dlna_wav24;
         // Opt-in per zone: cap output to 16-bit. Some renderers advertise
         // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode
         // 16-bit internally — 24-bit direct plays SILENCE (Ruark R3, Yves #1137).
@@ -1636,7 +1649,7 @@ impl PlaybackOrchestrator {
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id);
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
-            && !dlna_lpcm
+            && !dlna_force_wav
             && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
 
@@ -1673,8 +1686,9 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
                 .unwrap_or("");
-            if dlna_lpcm {
-                // User forces WAV/LPCM for this zone: skips the slow native FLAC
+            if dlna_force_wav {
+                // User forces WAV for this zone (16-bit LPCM via `dlna_lpcm`, or
+                // genuine 24-bit via `dlna_wav24`): skips the slow native FLAC
                 // encoder for hi-res AND avoids a renderer whose ALAC decoder
                 // pops at start (Yves, LHC-56). Takes precedence over the FLAC
                 // override below.
@@ -1818,6 +1832,15 @@ impl PlaybackOrchestrator {
                 // OAAT endpoints (Tune's own RPi renderers) parse the WAV fmt
                 // chunk and handle true 24-bit PCM: cap at 24-bit.
                 bit_depth.max(16).min(24)
+            } else if dlna_wav24 {
+                // Zone opt-in: serve genuine 24-bit WAV to a renderer that
+                // advertises `audio/L24`. The DIDL drops the 16-bit-only
+                // `DLNA.ORG_PN=LPCM` profile (didl::dlna_flags_for_mime_bd keyed
+                // on this bit_depth), so the renderer parses the real 24-bit WAV
+                // header instead of mapping a false profile back to 16-bit and
+                // reading misaligned samples (#1137). `dlna_wav24` is already
+                // gated on `bit_depth > 16` above; cap at 24 (FLAC/WAV ceiling).
+                bit_depth.min(24)
             } else if dlna_needs_wav {
                 // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
                 // 16-bit.
