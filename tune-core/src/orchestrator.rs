@@ -88,9 +88,80 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::event_bus::EventBus;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
-use crate::playback::{NowPlaying, PlaybackManager};
+use crate::playback::{NowPlaying, PlaybackManager, PlayState};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
+
+/// Pas d'attente pendant les phases pause / pré-démarrage du forwarder de
+/// niveaux : assez court pour réagir vite, assez long pour ne pas marteler
+/// le mutex des zones.
+const LEVELS_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Publie les niveaux audio (`playback.audio_levels`) sur le bus, cadencés
+/// sur l'horloge de lecture via la fenêtre temporelle portée par chaque
+/// [`crate::audio::levels::AudioLevels`].
+///
+/// Les décodeurs produisent les niveaux à la vitesse du décodage — bien plus
+/// vite que le temps réel — et sans cadencement les clients recevaient la
+/// piste entière en rafale au début de la lecture. La tâche se fige quand la
+/// zone est en pause, et s'arrête quand la lecture est stoppée ou remplacée
+/// (le `play_seq` capturé ne correspond plus) : sans cela, deux pistes
+/// successives émettraient en parallèle pendant toute leur durée.
+fn spawn_paced_levels_forwarder(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+) -> tokio::sync::mpsc::UnboundedSender<crate::audio::levels::AudioLevels> {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+    tokio::spawn(async move {
+        let mut next_emit = tokio::time::Instant::now();
+        let mut started = false;
+        // Un pré-transcode DASH peut retarder le démarrage de 30 s ; au-delà
+        // de cette borne on abandonne pour ne pas fuiter la tâche.
+        let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        while let Some(lvl) = rx.recv().await {
+            loop {
+                if playback.current_play_seq(zone_id).await != play_seq {
+                    return;
+                }
+                match playback.get_state(zone_id).await.state {
+                    PlayState::Playing => {
+                        started = true;
+                        break;
+                    }
+                    PlayState::Stopped if started => return,
+                    // Pause, ou lecture pas encore démarrée (résolution /
+                    // transcode en cours) : on gèle l'horloge d'émission.
+                    _ => {
+                        if !started && tokio::time::Instant::now() > startup_deadline {
+                            return;
+                        }
+                        tokio::time::sleep(LEVELS_HOLD).await;
+                        next_emit += LEVELS_HOLD;
+                    }
+                }
+            }
+            tokio::time::sleep_until(next_emit).await;
+            bus.emit(
+                "playback.audio_levels",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "rms_left_db": lvl.rms_left_db(),
+                    "rms_right_db": lvl.rms_right_db(),
+                    "peak_left_db": lvl.peak_left_db(),
+                    "peak_right_db": lvl.peak_right_db(),
+                    "rms_left": lvl.rms_left,
+                    "rms_right": lvl.rms_right,
+                    "spectrum": lvl.spectrum,
+                }),
+            );
+            next_emit += lvl.window;
+        }
+    });
+    tx
+}
 
 pub struct PlaybackOrchestrator {
     pub db: Arc<dyn crate::db::backend::DbBackend>,
@@ -1930,6 +2001,7 @@ impl PlaybackOrchestrator {
                 // and Range support, which DLNA renderers require.
                 let fp = file_path.clone();
                 let ev_bus = self.event_bus.clone();
+                let playback = self.playback.clone();
                 let zone_id = req.zone_id;
                 // EQ alters the encoded bytes and is not part of the cache key,
                 // so a zone with an active EQ never uses the cache (always fresh).
@@ -2085,45 +2157,23 @@ impl PlaybackOrchestrator {
                                 "transcode_to_temp_file_complete"
                             );
 
-                            // Emit audio levels in the background
+                            // Emit audio levels in the background, paced to
+                            // the playback clock by the forwarder.
                             if let Some(ref bus) = ev_bus {
                                 let bus = bus.clone();
+                                let playback = playback.clone();
                                 let actual_ch = channels;
                                 let sr = out_sr;
                                 tokio::spawn(async move {
-                                    let (levels_tx, mut levels_rx) =
-                                        tokio::sync::mpsc::unbounded_channel::<
-                                            crate::audio::levels::AudioLevels,
-                                        >();
-                                    let bus_clone = bus.clone();
-                                    tokio::spawn(async move {
-                                        while let Some(lvl) = levels_rx.recv().await {
-                                            bus_clone.emit(
-                                                "playback.audio_levels",
-                                                serde_json::json!({
-                                                    "zone_id": zone_id,
-                                                    "rms_left_db": lvl.rms_left_db(),
-                                                    "rms_right_db": lvl.rms_right_db(),
-                                                    "peak_left_db": lvl.peak_left_db(),
-                                                    "peak_right_db": lvl.peak_right_db(),
-                                                    "rms_left": lvl.rms_left,
-                                                    "rms_right": lvl.rms_right,
-                                                    "spectrum": lvl.spectrum,
-                                                }),
-                                            );
-                                        }
-                                    });
+                                    let play_seq =
+                                        playback.current_play_seq(zone_id).await;
+                                    let levels_tx = spawn_paced_levels_forwarder(
+                                        bus, playback, zone_id, play_seq,
+                                    );
                                     tokio::task::spawn_blocking(move || {
-                                        for chunk in pcm_bytes.chunks(32768) {
-                                            if levels_tx
-                                                .send(crate::audio::levels::compute_levels(
-                                                    chunk, actual_bd, actual_ch, sr,
-                                                ))
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
+                                        crate::audio::levels::send_windowed_levels(
+                                            &levels_tx, &pcm_bytes, actual_bd, actual_ch, sr,
+                                        );
                                     })
                                     .await
                                     .ok();
@@ -2213,6 +2263,7 @@ impl PlaybackOrchestrator {
 
                 let fp = file_path.clone();
                 let ev_bus = self.event_bus.clone();
+                let playback = self.playback.clone();
                 let zone_id = req.zone_id;
                 let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
                 let streamer_sessions = self.streamer.sessions_state();
@@ -2220,28 +2271,21 @@ impl PlaybackOrchestrator {
                 tokio::spawn(async move {
                     debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
-                    let (levels_tx, mut levels_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
-                    if let Some(ref bus) = ev_bus {
-                        let bus = bus.clone();
-                        tokio::spawn(async move {
-                            while let Some(lvl) = levels_rx.recv().await {
-                                bus.emit(
-                                    "playback.audio_levels",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "rms_left_db": lvl.rms_left_db(),
-                                        "rms_right_db": lvl.rms_right_db(),
-                                        "peak_left_db": lvl.peak_left_db(),
-                                        "peak_right_db": lvl.peak_right_db(),
-                                        "rms_left": lvl.rms_left,
-                                        "rms_right": lvl.rms_right,
-                                        "spectrum": lvl.spectrum,
-                                    }),
-                                );
-                            }
-                        });
-                    }
+                    // Forwarder cadencé si le bus existe ; sinon un canal dont
+                    // le récepteur est aussitôt abandonné (le décodeur ignore
+                    // les erreurs d'envoi).
+                    let levels_tx = match ev_bus {
+                        Some(bus) => {
+                            let play_seq = playback.current_play_seq(zone_id).await;
+                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq)
+                        }
+                        None => {
+                            tokio::sync::mpsc::unbounded_channel::<
+                                crate::audio::levels::AudioLevels,
+                            >()
+                            .0
+                        }
+                    };
 
                     let fp_clone = fp.clone();
                     let tx_clone = tx.clone();
@@ -2406,31 +2450,15 @@ impl PlaybackOrchestrator {
             if !skip_passthrough_levels {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();
+                    let playback = self.playback.clone();
                     let fp = file_path.clone();
                     let zone_id = req.zone_id;
                     let sr = sample_rate;
                     let ch = channels as u32;
                     tokio::spawn(async move {
-                        let (levels_tx, mut levels_rx) = tokio::sync::mpsc::unbounded_channel::<
-                            crate::audio::levels::AudioLevels,
-                        >();
-                        let bus_clone = bus.clone();
-                        tokio::spawn(async move {
-                            while let Some(lvl) = levels_rx.recv().await {
-                                bus_clone.emit(
-                                    "playback.audio_levels",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "rms_left_db": lvl.rms_left_db(),
-                                        "rms_right_db": lvl.rms_right_db(),
-                                        "peak_left_db": lvl.peak_left_db(),
-                                        "peak_right_db": lvl.peak_right_db(),
-                                        "rms_left": lvl.rms_left,
-                                        "rms_right": lvl.rms_right,
-                                    }),
-                                );
-                            }
-                        });
+                        let play_seq = playback.current_play_seq(zone_id).await;
+                        let levels_tx =
+                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq);
                         // Decode the file to PCM in the background — output is
                         // discarded, only levels are forwarded via levels_tx.
                         let result = tokio::task::spawn_blocking(move || {
@@ -2442,19 +2470,13 @@ impl PlaybackOrchestrator {
                                 0.0,
                             );
                             if let Ok(ref dec) = decoded {
-                                let pcm = dec.pcm_bytes();
-                                let bd = dec.bit_depth;
-                                let c = dec.channels as u16;
-                                for chunk in pcm.chunks(32768) {
-                                    if levels_tx
-                                        .send(crate::audio::levels::compute_levels(
-                                            chunk, bd, c, sr,
-                                        ))
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
+                                crate::audio::levels::send_windowed_levels(
+                                    &levels_tx,
+                                    &dec.pcm_bytes(),
+                                    dec.bit_depth,
+                                    dec.channels as u16,
+                                    sr,
+                                );
                             }
                         })
                         .await;
@@ -2782,6 +2804,7 @@ impl PlaybackOrchestrator {
             );
 
             let ev_bus = self.event_bus.clone();
+            let playback = self.playback.clone();
             let zone_id = req.zone_id;
             let streamer_for_eof = self.streamer.clone();
             let session_id_for_eof = session_id.clone();
@@ -2800,28 +2823,18 @@ impl PlaybackOrchestrator {
             tokio::spawn(async move {
                 // Audio-levels channel so the web client VU-meter works for
                 // streaming-service content played through local/OAAT outputs.
-                let (levels_tx, mut levels_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
-                if let Some(ref bus) = ev_bus {
-                    let bus = bus.clone();
-                    tokio::spawn(async move {
-                        while let Some(lvl) = levels_rx.recv().await {
-                            bus.emit(
-                                "playback.audio_levels",
-                                serde_json::json!({
-                                    "zone_id": zone_id,
-                                    "rms_left_db": lvl.rms_left_db(),
-                                    "rms_right_db": lvl.rms_right_db(),
-                                    "peak_left_db": lvl.peak_left_db(),
-                                    "peak_right_db": lvl.peak_right_db(),
-                                    "rms_left": lvl.rms_left,
-                                    "rms_right": lvl.rms_right,
-                                    "spectrum": lvl.spectrum,
-                                }),
-                            );
-                        }
-                    });
-                }
+                // Paced to the playback clock by the forwarder; without a bus,
+                // the receiver is dropped and the decoder's sends are no-ops.
+                let levels_tx = match ev_bus {
+                    Some(bus) => {
+                        let play_seq = playback.current_play_seq(zone_id).await;
+                        spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq)
+                    }
+                    None => {
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>()
+                            .0
+                    }
+                };
 
                 // For DASH file:// URLs the fMP4 is already on disk — use it
                 // directly instead of downloading via HTTP.

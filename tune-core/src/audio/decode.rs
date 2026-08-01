@@ -603,7 +603,7 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch, sr));
+                super::levels::send_windowed_levels(ltx, chunk, output_bd, ch, sr);
             }
         }
         return Ok((output_bd, source_rate));
@@ -821,12 +821,13 @@ fn decode_to_pcm_streaming_inner(
             // The unbounded channel never blocks; the clone above is cheap
             // compared to the latency savings for network outputs.
             if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(
+                super::levels::send_windowed_levels(
+                    ltx,
                     &chunk,
                     output_bd,
                     source_channels as u16,
                     source_rate,
-                ));
+                );
             }
         }
     }
@@ -1567,12 +1568,7 @@ fn decode_dsd_streaming(
                     }
                 }
                 if let Some(ltx) = levels_tx {
-                    let _ = ltx.send(super::levels::compute_levels(
-                        &chunk,
-                        output_bd,
-                        ch,
-                        output_rate,
-                    ));
+                    super::levels::send_windowed_levels(ltx, &chunk, output_bd, ch, output_rate);
                 }
             }
             Ok(false)
@@ -1651,12 +1647,7 @@ fn decode_dsd_streaming(
         };
         if send_ok {
             if let Some(ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(
-                    &pcm_buf,
-                    output_bd,
-                    ch,
-                    output_rate,
-                ));
+                super::levels::send_windowed_levels(ltx, &pcm_buf, output_bd, ch, output_rate);
             }
         }
     }
