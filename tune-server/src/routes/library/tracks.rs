@@ -91,6 +91,10 @@ pub(super) struct TrackFilterQuery {
     pub source_media: Option<String>,
     /// Oxygen folder facet: absolute directory prefix; matches its whole subtree.
     pub folder: Option<String>,
+    /// Oxygen rating facet: album rating 1-5 (profile 1).
+    pub rating: Option<i32>,
+    /// Oxygen collection facet: manual collection name (resolved to album ids).
+    pub collection: Option<String>,
 }
 
 pub(super) async fn list_tracks(
@@ -114,7 +118,17 @@ pub(super) async fn list_tracks(
         || p.country.is_some()
         || p.mood.is_some()
         || p.source_media.is_some()
-        || p.folder.as_deref().is_some_and(|s| !s.is_empty());
+        || p.folder.as_deref().is_some_and(|s| !s.is_empty())
+        || p.rating.is_some()
+        || p.collection.as_deref().is_some_and(|s| !s.is_empty());
+
+    // Resolve the collection name → album ids (JSON settings), like the facet
+    // endpoint, so /library/tracks?collection=<name> filters to its albums.
+    let collection_ids: Option<Vec<i64>> = p
+        .collection
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|name| super::facets::collection_album_ids(&state, name));
 
     if has_filters {
         match repo.list_filtered(
@@ -132,6 +146,8 @@ pub(super) async fn list_tracks(
             p.mood.as_deref(),
             p.source_media.as_deref(),
             p.folder.as_deref(),
+            p.rating,
+            collection_ids.as_deref(),
             limit,
             offset,
         ) {

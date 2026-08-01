@@ -603,6 +603,8 @@ impl TrackRepo {
         mood: Option<&str>,
         source_media: Option<&str>,
         folder: Option<&str>,
+        rating: Option<i32>,
+        collection_ids: Option<&[i64]>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -706,6 +708,33 @@ impl TrackRepo {
             conditions.push(format!("t.file_path LIKE {}", make_ph(idx)));
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
             idx += 1;
+        }
+
+        // Album rating (profile 1): tracks inherit their album's rating.
+        if let Some(r) = rating {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM album_ratings arr \
+                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND arr.rating = {})",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Int(r as i64));
+            idx += 1;
+        }
+
+        // Manual collection: album ids are our own i64s (parsed from the
+        // collections setting JSON by the caller), so inlining the IN list is
+        // injection-safe. An empty set matches nothing.
+        if let Some(ids) = collection_ids {
+            if ids.is_empty() {
+                conditions.push("1 = 0".to_string());
+            } else {
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conditions.push(format!("t.album_id IN ({list})"));
+            }
         }
 
         if let Some(query) = q {
