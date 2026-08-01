@@ -965,16 +965,41 @@ async fn create_streaming_playlist_from_favorites(
             format!("{artist} {title}")
         };
         // radio favorites carry no ISRC/duration, so match on normalized title+artist.
+        //
+        // Instrumentation for #1235 (Reivax66: "aucun résultat trouvé" on Qobuz
+        // even though a manual Qobuz search finds the track). Without logging we
+        // cannot tell three very different failure modes apart: the service
+        // search erroring (previously swallowed by `Err(_) => None`), the search
+        // returning zero candidates, or the matcher rejecting every candidate.
+        // Log the query, result count, the top candidate the service returned,
+        // and the accept/reject decision so the next tester log pinpoints it.
         let best = match svc.search(&q, 10).await {
-            Ok(results) => tune_core::streaming::matching::best_stream_match(
-                title,
-                artist,
-                "",
-                0,
-                &results.tracks,
-            )
-            .cloned(),
-            Err(_) => None,
+            Ok(results) => {
+                let n = results.tracks.len();
+                let top = results
+                    .tracks
+                    .first()
+                    .map(|t| format!("{} — {}", t.artist, t.title))
+                    .unwrap_or_else(|| "<none>".into());
+                let m = tune_core::streaming::matching::best_stream_match(
+                    title,
+                    artist,
+                    "",
+                    0,
+                    &results.tracks,
+                )
+                .cloned();
+                if m.is_some() {
+                    tracing::info!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_ok");
+                } else {
+                    tracing::warn!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_rejected");
+                }
+                m
+            }
+            Err(e) => {
+                tracing::warn!(service = %service, query = %q, error = %e, "radio_fav_search_failed");
+                None
+            }
         };
         match best {
             Some(t) => {
@@ -995,6 +1020,13 @@ async fn create_streaming_playlist_from_favorites(
             })),
         }
     }
+
+    tracing::info!(
+        service = %service,
+        favorites = favorites.len(),
+        matched = matched_ids.len(),
+        "radio_fav_playlist_matching_done"
+    );
 
     let mut remote_playlist_id: Option<String> = None;
     if !matched_ids.is_empty() {
