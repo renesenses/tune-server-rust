@@ -15,6 +15,10 @@ pub(super) struct FacetQuery {
     fields: Option<String>,
     /// Max values per facet (default 200).
     limit: Option<i64>,
+    /// Oxygen folder facet: absolute directory prefix. Not a facet field itself,
+    /// but an active selection that narrows every other facet's counts (the
+    /// folder-facet endpoint owns the drill-down; here it only filters).
+    pub(super) folder: Option<String>,
     // Optional active filters — when present, each facet is counted over the
     // narrowed track set (cumulative faceting, Dominique: "le genre filtre les
     // labels"). Same names as /library/tracks. A facet never filters on its own
@@ -37,7 +41,11 @@ pub(super) struct FacetQuery {
 /// Build the WHERE conditions (over alias `t` = tracks) for the active filters,
 /// skipping the facet's own field so its alternatives remain countable. Values
 /// are always bound parameters; column/key names come from fixed literals only.
-fn build_conditions(q: &FacetQuery, engine: Engine, exclude: &str) -> (Vec<String>, Vec<SqlValue>) {
+pub(super) fn build_conditions(
+    q: &FacetQuery,
+    engine: Engine,
+    exclude: &str,
+) -> (Vec<String>, Vec<SqlValue>) {
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
     let mut idx = 1usize;
@@ -134,6 +142,19 @@ fn build_conditions(q: &FacetQuery, engine: Engine, exclude: &str) -> (Vec<Strin
                 ph(idx)
             ));
             params.push(SqlValue::Text(v.to_string()));
+            idx += 1;
+        }
+    }
+    // Folder selection (Oxygen drill-down) narrows every facet's counts. The
+    // folder-facet endpoint scopes by path prefix on its own, so it passes
+    // exclude="folder" to skip this redundant predicate; the flat /facets
+    // endpoint (exclude = a real field name) always applies it.
+    if exclude != "folder" {
+        if let Some(fld) = q.folder.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!("t.file_path LIKE {}", ph(idx)));
+            params.push(SqlValue::Text(
+                tune_core::db::track_repo::folder_like_pattern(fld),
+            ));
             idx += 1;
         }
     }
