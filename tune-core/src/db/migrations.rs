@@ -771,6 +771,22 @@ CREATE INDEX IF NOT EXISTS idx_streaming_favorites_profile ON streaming_favorite
         name: "merge_albums_split_by_quality",
         up: "", // Applied programmatically: needs the folder rule, not SQL.
     },
+    // Audio embeddings (CLAP) for acoustic "sounds-like" radio. One 512-d vector
+    // per track, computed in the background analysis pass (piggybacks the
+    // ReplayGain decode) and stored as a BLOB; smart_radio ranks candidates by
+    // cosine similarity. Empty until the opt-in pass runs — nothing else changes.
+    Migration {
+        version: 63,
+        name: "track_audio_embedding",
+        up: "
+CREATE TABLE IF NOT EXISTS track_audio_embedding (
+    track_id    INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    model       TEXT    NOT NULL,
+    embedding   BLOB    NOT NULL,
+    analyzed_at INTEGER
+);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1568,6 +1584,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "album_folder_path",
         include_str!("../../migrations/postgres/014_album_folder_path.sql"),
     ),
+    (
+        15,
+        "track_audio_embedding",
+        include_str!("../../migrations/postgres/015_track_audio_embedding.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -1853,7 +1874,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 14, "latest PG migration must be 14");
+        assert_eq!(pg_latest_version(), 15, "latest PG migration must be 15");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
