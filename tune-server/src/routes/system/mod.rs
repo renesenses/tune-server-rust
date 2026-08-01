@@ -97,6 +97,7 @@ pub fn router() -> Router<AppState> {
             "/bug-report/markdown",
             get(diagnostics::bug_report_markdown),
         )
+        .route("/bug-report/submit", post(diagnostics::submit_bug_report))
         .route("/health/monitor", get(diagnostics::health_monitor))
         .route("/health/alerts", get(diagnostics::health_alerts))
         .route("/clear-cache", post(config::clear_cache))

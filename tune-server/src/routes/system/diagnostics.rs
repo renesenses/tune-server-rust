@@ -11,6 +11,19 @@ use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
 
+/// Number of recent log lines embedded in a bug report (kept modest so the
+/// forum thread stays readable; the "Export logs" button has the full tail).
+const BUG_REPORT_LOG_LINES: usize = 200;
+
+/// Public bug-intake endpoint on the community site. It creates a *moderated*
+/// (pending) forum thread server-side with the site's own credentials — the
+/// distributed Tune server never holds a forum admin token. Same
+/// `/api/v1/community/*` family as the DAC-profile / covers endpoints.
+const BUG_REPORT_SUBMIT_URL: &str = "https://mozaiklabs.fr/api/v1/community/bug-report";
+
+/// The community endpoint caps the thread body at 50k chars; keep headroom.
+const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
+
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::with_backend(state.backend.clone())
         .count()
@@ -243,8 +256,14 @@ pub(super) struct LogsQuery {
 }
 
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    let max_lines = q.lines.unwrap_or(1000);
+    collect_recent_logs(q.lines.unwrap_or(1000))
+}
 
+/// Collect the most recent server logs (tail): log file first, then
+/// journalctl/syslog (Linux) or stderr files / unified log (macOS). Returns a
+/// `Json<Value>` with `logs`/`lines`/`source`. Shared by the `/logs` endpoint
+/// and the bug report so both surface identical output.
+pub(super) fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // Try the server's own log file first — same path the writer uses (main),
     // resolved via the shared helper so reader and writer always agree. This is
     // what makes "Export logs" work on Linux under Docker / a bare terminal,
@@ -647,6 +666,23 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Engine: sqlite\n"));
     md.push_str(&format!("- Migration version: {db_version}\n"));
 
+    // Recent logs (tail) — the single most useful part of a bug report. Reuses
+    // the same collector as the /logs endpoint so the report matches what the
+    // "Export logs" button shows.
+    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_LINES);
+    let log_text = logs_json["logs"].as_str().unwrap_or("").trim();
+    let log_source = logs_json["source"].as_str().unwrap_or("none");
+    md.push_str(&format!(
+        "\n## Recent Logs (last {BUG_REPORT_LOG_LINES} lines, source: {log_source})\n"
+    ));
+    if log_text.is_empty() {
+        md.push_str("_No logs available._\n");
+    } else {
+        md.push_str("```\n");
+        md.push_str(log_text);
+        md.push_str("\n```\n");
+    }
+
     Json(json!({
         "version": tune_core::version(),
         "engine": "rust",
@@ -699,6 +735,115 @@ pub(super) async fn bug_report_markdown(
         )],
         md,
     )
+}
+
+#[derive(Deserialize)]
+pub(super) struct BugReportSubmitBody {
+    #[serde(default)]
+    description: String,
+}
+
+/// Submit a bug report to the community bug-intake endpoint. Builds the full
+/// diagnostics + logs report, prepends the user's free-text description, and
+/// forwards it to the site, which creates a *moderated* (pending) forum thread
+/// with its own credentials and returns the public URL. The distributed server
+/// never holds a forum admin token.
+pub(super) async fn submit_bug_report(
+    State(state): State<AppState>,
+    Json(body): Json<BugReportSubmitBody>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+
+    let description = body.description.trim().to_string();
+
+    // Build the diagnostics + logs report (same content as the preview/markdown).
+    let Json(report) = generate_bug_report(State(state)).await;
+    let report_md = report["markdown"].as_str().unwrap_or("").to_string();
+
+    // Compose the thread body: the user's own words first, then diagnostics.
+    let full_markdown = if description.is_empty() {
+        report_md
+    } else {
+        format!("{description}\n\n---\n\n{report_md}")
+    };
+
+    let version = tune_core::version();
+    let platform = std::env::consts::OS;
+
+    // Title: first non-empty line of the description, else a generic one.
+    let title = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| format!("Bug: {}", l.chars().take(80).collect::<String>()))
+        .unwrap_or_else(|| format!("Bug report — Tune {version} ({platform})"));
+
+    // The site caps the body at 50k chars — truncate the tail (oldest logs) if
+    // the report runs long rather than getting rejected wholesale.
+    let body_md = if full_markdown.chars().count() > BUG_REPORT_MAX_BODY_CHARS {
+        let kept: String = full_markdown
+            .chars()
+            .take(BUG_REPORT_MAX_BODY_CHARS)
+            .collect();
+        format!("{kept}\n\n_…report truncated…_")
+    } else {
+        full_markdown
+    };
+
+    // Contract of the community bug-report endpoint: { title?, body, os?, version? }.
+    let payload = json!({
+        "title": title,
+        "body": body_md,
+        "os": platform,
+        "version": version,
+    });
+
+    let client = match reqwest::Client::builder()
+        .user_agent(format!("Tune/{version} (+https://mozaiklabs.fr)"))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("client_build_failed: {e}") })),
+            );
+        }
+    };
+
+    match client
+        .post(BUG_REPORT_SUBMIT_URL)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            // Site responds { status, thread: { id, slug, url } }.
+            let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            let thread = &data["thread"];
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "url": thread.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                    "slug": thread.get("slug").and_then(|v| v.as_str()).unwrap_or(""),
+                })),
+            )
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("submit_failed: {status} {text}") })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("submit_error: {e}") })),
+        ),
+    }
 }
 
 pub(super) async fn audio_check() -> Json<Value> {
