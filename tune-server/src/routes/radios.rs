@@ -631,7 +631,12 @@ async fn import_radios_m3u(
 
 pub fn radio_favorites_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_radio_favorites).post(save_radio_favorite))
+        .route(
+            "/",
+            get(list_radio_favorites)
+                .post(save_radio_favorite)
+                .delete(clear_all_radio_favorites),
+        )
         .route("/count", get(radio_favorites_count))
         .route("/is-favorite", get(is_radio_favorite))
         .route("/save-current", post(save_current_as_favorite))
@@ -754,6 +759,17 @@ async fn delete_radio_favorite(
             "DELETE FROM radio_favorites WHERE id = ?",
             &[&fav_id as &dyn ToSqlValue],
         )
+        .ok();
+    StatusCode::NO_CONTENT
+}
+
+/// Bulk clear: DELETE /radio-favorites removes every saved radio favorite.
+/// The web client's "Tout supprimer" fired DELETE on the collection root, which
+/// had no handler (405) — the button looked dead. Mirrors delete_radio_favorite.
+async fn clear_all_radio_favorites(State(state): State<AppState>) -> impl IntoResponse {
+    state
+        .backend
+        .execute("DELETE FROM radio_favorites", &[])
         .ok();
     StatusCode::NO_CONTENT
 }
