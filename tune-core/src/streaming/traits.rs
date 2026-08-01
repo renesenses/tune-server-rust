@@ -296,6 +296,18 @@ pub trait StreamingService: Send + Sync {
         false
     }
 
+    /// Whether the service has established that its session is over and the
+    /// persisted row is worthless — the token was rejected and could not be
+    /// renewed. The caller deletes the row so a restart does not reload a
+    /// credential the provider has already refused.
+    ///
+    /// Distinct from `save_tokens() == None`, which means "nothing to save
+    /// right now" and must leave any existing row alone — `TidalService`
+    /// returns exactly that when its mutex is held.
+    fn session_expired(&self) -> bool {
+        false
+    }
+
     async fn post_restore(&mut self) {}
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
