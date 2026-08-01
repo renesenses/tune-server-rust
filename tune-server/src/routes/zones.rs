@@ -324,6 +324,24 @@ pub fn build_signal_path_pub(
 /// DLNA arm show the negotiated WAV/LPCM fallback (`dlna_needs_wav`, decided
 /// async) instead of the statically-guessed FLAC transcode target — Sevy's
 /// LHC-52 was served WAV yet the path claimed "ALAC → FLAC".
+/// Is a WAV/LPCM wire feed to a DLNA/OpenHome renderer bit-perfect?
+///
+/// Three cases share the WAV wire: a native WAV source (passthrough), the
+/// zone forcing 16-bit LPCM (`dlna_lpcm`), or a FLAC/ALAC source that the
+/// orchestrator fell back to WAV for. A **native WAV** source is sent
+/// byte-for-byte at any bit depth, so it is always bit-perfect. The FLAC/ALAC→WAV
+/// fallback is plain 16-bit LPCM unless `dlna_wav24` preserves the full 24 bits,
+/// so it is bit-perfect only when the source already fits 16 bits or the 24-bit
+/// override is on.
+fn wav_wire_bit_perfect(
+    is_lossless: bool,
+    source_is_wav: bool,
+    dlna_wav24: bool,
+    bit_depth: i32,
+) -> bool {
+    is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
+}
+
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
@@ -509,7 +527,16 @@ fn build_signal_path(
                 // is 16-bit (audio/L16), bit-perfect only when the lossless source
                 // already fits 16 bits (Sevy, #1137). The opt-in `dlna_wav24` path
                 // preserves the full 24-bit source, so it stays bit-perfect.
-                let wav_bit_perfect = is_lossless && (dlna_wav24 || bit_depth <= 16);
+                // A *native* WAV source is served byte-for-byte (WAV never
+                // transcodes for DLNA), so it is bit-perfect at any depth
+                // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
+                // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
+                let wav_bit_perfect = wav_wire_bit_perfect(
+                    is_lossless,
+                    matches!(source_format, Some(AudioFormat::Wav)),
+                    dlna_wav24,
+                    bit_depth,
+                );
                 (wav_bit_perfect, "DLNA/UPnP", "WAV")
             } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
@@ -1976,5 +2003,55 @@ mod signal_path_tests {
             transcoder_desc(&sp).as_deref(),
             Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
         );
+    }
+
+    // Native WAV 24-bit source, served byte-for-byte over the WAV wire.
+    fn wav24_playing() -> ZoneState {
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    // Sandro/Progman: a NATIVE WAV 24-bit source is passthrough (WAV never
+    // transcodes for DLNA), so it must read bit-perfect even with dlna_wav24 off
+    // — the badge previously showed red for WAV 24-bit direct.
+    #[test]
+    fn dlna_native_wav24_is_bit_perfect() {
+        let (backend, zone) = dlna_zone();
+        let ps = wav24_playing();
+        let sp =
+            build_signal_path(&ps, &zone, &backend, Some("Diretta"), "none", Some("wav")).unwrap();
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn wav_wire_native_wav_is_bit_perfect_any_depth() {
+        assert!(wav_wire_bit_perfect(true, true, false, 24)); // native WAV 24-bit, flag off
+        assert!(wav_wire_bit_perfect(true, true, false, 16));
+    }
+
+    #[test]
+    fn wav_wire_flac_fallback_capped_at_16_bit() {
+        // FLAC/ALAC → WAV fallback (source not WAV): 24-bit needs the override.
+        assert!(!wav_wire_bit_perfect(true, false, false, 24));
+        assert!(wav_wire_bit_perfect(true, false, false, 16)); // fits plain 16-bit LPCM
+        assert!(wav_wire_bit_perfect(true, false, true, 24)); // dlna_wav24 preserves 24-bit
+    }
+
+    #[test]
+    fn wav_wire_lossy_source_never_bit_perfect() {
+        assert!(!wav_wire_bit_perfect(false, true, true, 16));
     }
 }
