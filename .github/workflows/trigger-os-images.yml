@@ -1,0 +1,50 @@
+name: Trigger OS image builds
+
+# When a Tune release is published, tell the downstream OS-image repos to bake
+# an ISO/image for that version (repository_dispatch → their build workflows).
+# Deliberately separate from release.yml so the release pipeline is untouched.
+#
+# Requires a fine-grained PAT with `contents: write` (or `repo`) on the target
+# repos, stored as the secret TUNE_OS_DISPATCH_TOKEN — the default GITHUB_TOKEN
+# cannot dispatch events to another repository. Without the secret the job just
+# warns and exits (never blocks a release; this workflow is independent of it).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tune version (X.Y.Z, no leading v) — empty = the release tag"
+        required: false
+        default: ""
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: v
+        run: |
+          V="${{ inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          test -n "$V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch to OS-image repos
+        env:
+          TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::TUNE_OS_DISPATCH_TOKEN not set — skipping OS-image dispatch (add the secret to enable auto ISO/image builds)."
+            exit 0
+          fi
+          # Add tune-os-rpi (and any future image repo) to this list once created.
+          for repo in tune-os; do
+            echo "→ repository_dispatch tune-release to renesenses/$repo for v$VERSION"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/renesenses/$repo/dispatches" \
+              -d "{\"event_type\":\"tune-release\",\"client_payload\":{\"version\":\"$VERSION\"}}"
+          done
