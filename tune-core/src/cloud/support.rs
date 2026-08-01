@@ -1,10 +1,12 @@
 //! Support premium : proxy authentifié vers l'API tickets de mozaiklabs.
 //!
-//! Le token OAuth premium (`mozaik_access_token`) vit côté serveur (settings) ;
-//! le client web ne l'a jamais. Ces fonctions sont appelées par les handlers
-//! `routes/support.rs`, sur le modèle de [`super::library_sync::push_changes`].
-//! Le vrai gate premium est côté mozaiklabs (`auth.premium`) : un compte non
-//! premium reçoit 403, propagé tel quel au client via [`SupportResult`].
+//! Deux façons de s'authentifier (voir [`SupportAuth`]) : le token OAuth premium
+//! (`mozaik_access_token`, login SSO dans Tune) OU la clé de licence (premium par
+//! clé, sans SSO — mozaiklabs résout le compte par l'e-mail de la licence). Le
+//! client web n'a ni l'un ni l'autre → tout passe par le serveur, sur le modèle
+//! de [`super::library_sync::push_changes`]. Le vrai gate premium est côté
+//! mozaiklabs (`auth.premium`) : un compte non premium reçoit 403, propagé tel
+//! quel au client via [`SupportResult`].
 
 use std::time::Duration;
 
@@ -17,11 +19,37 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// mozaiklabs (401/403/422…) est préservé pour être renvoyé au client.
 pub type SupportResult = Result<Value, (u16, Value)>;
 
+/// Authentification vers l'API support de mozaiklabs.
+///
+/// La plupart des testeurs premium le sont par CLÉ de licence et n'ont jamais
+/// fait de login SSO : sans le chemin `License`, le support renvoyait 412 et
+/// « ne fonctionnait pas » pour eux. mozaiklabs accepte les deux (voir
+/// `PremiumApiAuth`) ; pour la clé il résout/crée le compte par l'e-mail de la
+/// licence.
+pub enum SupportAuth {
+    /// Token OAuth premium (login SSO dans Tune).
+    Bearer(String),
+    /// Clé de licence + empreinte machine (informative).
+    License { key: String, fingerprint: String },
+}
+
+impl SupportAuth {
+    /// Applique l'auth à une requête sortante vers mozaiklabs.
+    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            SupportAuth::Bearer(token) => req.bearer_auth(token),
+            SupportAuth::License { key, fingerprint } => req
+                .header("X-License-Key", key)
+                .header("X-Hardware-Fingerprint", fingerprint),
+        }
+    }
+}
+
 /// Ouvre un ticket. Injecte automatiquement la version de Tune et l'OS —
 /// le SAV voit la config sans la demander.
 pub async fn create_ticket(
     http_client: &reqwest::Client,
-    access_token: &str,
+    auth: &SupportAuth,
     subject: &str,
     body: &str,
     category: Option<&str>,
@@ -34,9 +62,8 @@ pub async fn create_ticket(
         "platform": std::env::consts::OS,
     });
 
-    let resp = http_client
-        .post(SUPPORT_API)
-        .bearer_auth(access_token)
+    let resp = auth
+        .apply(http_client.post(SUPPORT_API))
         .json(&payload)
         .timeout(TIMEOUT)
         .send()
@@ -47,10 +74,9 @@ pub async fn create_ticket(
 }
 
 /// Liste les tickets du compte premium.
-pub async fn list_tickets(http_client: &reqwest::Client, access_token: &str) -> SupportResult {
-    let resp = http_client
-        .get(SUPPORT_API)
-        .bearer_auth(access_token)
+pub async fn list_tickets(http_client: &reqwest::Client, auth: &SupportAuth) -> SupportResult {
+    let resp = auth
+        .apply(http_client.get(SUPPORT_API))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -62,12 +88,11 @@ pub async fn list_tickets(http_client: &reqwest::Client, access_token: &str) -> 
 /// Détail d'un ticket (fil de messages inclus).
 pub async fn get_ticket(
     http_client: &reqwest::Client,
-    access_token: &str,
+    auth: &SupportAuth,
     id: i64,
 ) -> SupportResult {
-    let resp = http_client
-        .get(format!("{SUPPORT_API}/{id}"))
-        .bearer_auth(access_token)
+    let resp = auth
+        .apply(http_client.get(format!("{SUPPORT_API}/{id}")))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -79,13 +104,12 @@ pub async fn get_ticket(
 /// Ajoute une réponse client à un ticket (le rouvre côté SAV).
 pub async fn reply(
     http_client: &reqwest::Client,
-    access_token: &str,
+    auth: &SupportAuth,
     id: i64,
     body: &str,
 ) -> SupportResult {
-    let resp = http_client
-        .post(format!("{SUPPORT_API}/{id}/reply"))
-        .bearer_auth(access_token)
+    let resp = auth
+        .apply(http_client.post(format!("{SUPPORT_API}/{id}/reply")))
         .json(&json!({ "body": body }))
         .timeout(TIMEOUT)
         .send()

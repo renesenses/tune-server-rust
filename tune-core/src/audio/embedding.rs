@@ -30,6 +30,10 @@ const SENTINEL: &str = "audio_embed_analyzed";
 /// Samples fed to the model: 10 s @ 48 kHz mono, matching CLAP's fixed window.
 const WINDOW_SAMPLES: usize = 480_000;
 
+/// Hard cap on decoding one track. A 10 s window decodes in well under a second
+/// even for hi-res PCM; anything past this is a stuck decoder, not slowness.
+const DECODE_TIMEOUT_SECS: u64 = 30;
+
 // Storage layout, constants and cosine live in the always-compiled read side.
 use super::embedding_store::{self, EMBED_DIM, MODEL_ID};
 
@@ -98,9 +102,17 @@ pub async fn analyze_embedding_batch(
     backend: &Arc<dyn DbBackend>,
     embedder: &mut AudioEmbedder,
 ) -> usize {
+    // Skip DSD/DSF/DFF: the DSD→PCM resampler can spin on some SACD rips,
+    // hanging the (non-cancellable) decode thread forever and freezing the whole
+    // sweep. DSD is a small slice of a library and the decoder is fragile, so we
+    // leave those without an acoustic embedding (smart_radio falls back to
+    // metadata for them) rather than risk the stall. The timeout below is the
+    // belt to this suspenders for any other format that misbehaves.
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+           AND (t.format IS NULL OR \
+                lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')) \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed') \
          LIMIT ?",
@@ -135,13 +147,23 @@ pub async fn analyze_embedding_batch(
 
         // Decode the first 10 s at 48 kHz mono (CLAP's window) off the async
         // runtime; the returned samples carry the source bit depth for scaling.
+        // A hard timeout guards against a decoder that spins on a pathological
+        // file: on elapse we abandon the await (the blocking thread cannot be
+        // cancelled, but one leaked thread is survivable) and move on, stamping
+        // the sentinel below so the file is not retried.
         let p = path.clone();
-        let decoded = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm(&p, Some(48_000), Some(1), 0.0, 10.0)
-        })
+        let decoded = tokio::time::timeout(
+            std::time::Duration::from_secs(DECODE_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                crate::audio::decode::decode_to_pcm(&p, Some(48_000), Some(1), 0.0, 10.0)
+            }),
+        )
         .await;
+        if decoded.is_err() {
+            warn!(track_id, path = %path, "audio_embed_decode_timeout");
+        }
 
-        if let Ok(Ok(d)) = decoded {
+        if let Ok(Ok(Ok(d))) = decoded {
             // i32 samples → f32 in [-1, 1], the same full-scale rule the loudness
             // pass uses (sample / 2^(bits-1)); librosa normalises identically.
             let scale = (1i64 << (d.bit_depth.saturating_sub(1)).min(31)) as f32;
@@ -186,26 +208,84 @@ pub async fn analyze_embedding_batch(
 const IDLE_SLEEP_SECS: u64 = 900;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
 const ENABLED_KEY: &str = "audio_embedding_enabled";
-/// Optional explicit model path; falls back to `TUNE_AUDIO_EMBED_MODEL`.
+/// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
 const MODEL_PATH_KEY: &str = "audio_embedding_model_path";
+/// Published CLAP audio tower (ONNX, mel in-graph, 512-d). Fetched on first
+/// activation and cached at the configured path.
+const MODEL_URL: &str = "https://github.com/renesenses/tune-server-rust/releases/download/models/clap-audio-2023/clap-audio-2023.onnx";
+/// SHA-256 of the model above — a corrupt/partial download is rejected.
+const MODEL_SHA256: &str = "31c37def7ff2a9a36da07667bc7412dfb5ca16e081673055e45d3ac26de387d9";
 
 fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
     settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
 }
 
-fn resolve_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
+/// The configured model destination (setting → env). Not required to exist —
+/// [`ensure_model`] downloads it there on first run.
+fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
     settings
         .get(MODEL_PATH_KEY)
         .ok()
         .flatten()
         .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
         .map(PathBuf::from)
-        .filter(|p| p.exists())
+}
+
+/// Make sure the model exists at `dest`, downloading + checksum-verifying it if
+/// absent. Idempotent: an already-present file is trusted (verified on the run
+/// that wrote it). Written atomically via a temp file so a killed download
+/// never leaves a truncated model in place.
+async fn ensure_model(dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    info!(url = MODEL_URL, dest = %dest.display(), "audio_model_downloading");
+    let bytes = reqwest::get(MODEL_URL)
+        .await
+        .map_err(|e| format!("download: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("download status: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("download body: {e}"))?;
+
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::new_with_prefix(&bytes).finalize());
+    if got != MODEL_SHA256 {
+        return Err(format!("checksum mismatch: got {got}, want {MODEL_SHA256}"));
+    }
+
+    let tmp = dest.with_extension("onnx.part");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
+    info!(dest = %dest.display(), bytes = bytes.len(), "audio_model_ready");
+    Ok(())
+}
+
+/// Provision the onnxruntime shared lib next to the model and load it into `ort`
+/// exactly once (`ort::init_from` must run before the first `Session`). The
+/// dylib is cached under the model's directory, so it is fetched only on the
+/// first activation. Once `*ready` is set the runtime is live for the process.
+async fn ensure_runtime_loaded(model_path: &Path, ready: &mut bool) -> Result<(), String> {
+    if *ready {
+        return Ok(());
+    }
+    let cache_root = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let dylib = super::runtime::ensure_runtime(cache_root).await?;
+    ort::init_from(&dylib)
+        .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
+        .commit();
+    info!(dylib = %dylib.display(), "audio_runtime_loaded");
+    *ready = true;
+    Ok(())
 }
 
 /// Spawn the background audio-embedding sweep. Mirrors `replaygain::spawn`:
-/// opt-in via `audio_embedding_enabled`, lazy-loads the CLAP model once it is
-/// present (downloaded on activation — not yet wired), and chips away at the
+/// opt-in via `audio_embedding_enabled`, downloads + checksum-verifies the CLAP
+/// model on first activation (to the configured path), then chips away at the
 /// library in bounded batches. No-ops cheaply while disabled or model-less.
 pub fn spawn(backend: Arc<dyn DbBackend>) {
     use crate::db::settings_repo::SettingsRepo;
@@ -213,17 +293,25 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         let mut embedder: Option<AudioEmbedder> = None;
+        // The onnxruntime dylib is loaded once, globally, before any Session.
+        let mut runtime_ready = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
                 if embedder.is_none() {
-                    if let Some(p) = resolve_model_path(&settings) {
-                        match AudioEmbedder::load(&p) {
-                            Ok(e) => {
-                                info!(model = %p.display(), "audio_embedder_loaded");
-                                embedder = Some(e);
+                    if let Some(p) = configured_model_path(&settings) {
+                        if let Err(e) = ensure_model(&p).await {
+                            warn!(error = %e, "audio_model_unavailable");
+                        } else if let Err(e) = ensure_runtime_loaded(&p, &mut runtime_ready).await {
+                            warn!(error = %e, "audio_runtime_unavailable");
+                        } else {
+                            match AudioEmbedder::load(&p) {
+                                Ok(e) => {
+                                    info!(model = %p.display(), "audio_embedder_loaded");
+                                    embedder = Some(e);
+                                }
+                                Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                             }
-                            Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                         }
                     }
                 }
@@ -239,4 +327,43 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
             tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end provisioning proof: fetch the real pyke onnxruntime archive for
+    /// THIS platform, LZMA2-decompress + untar it, load it into `ort`, download
+    /// the published CLAP model, and embed a buffer — asserting a normalised 512-d
+    /// vector comes out. Ignored by default (network + ~120 MB model + ~40 MB
+    /// runtime). Run explicitly to validate the activation path on a new platform:
+    ///   cargo test -p tune-core --features audio-embedding \
+    ///     provision_and_embed -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn provision_and_embed() {
+        let dir = std::env::temp_dir().join("tune-audio-embed-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("clap-audio-2023.onnx");
+
+        ensure_model(&model).await.expect("download model");
+        let mut ready = false;
+        ensure_runtime_loaded(&model, &mut ready)
+            .await
+            .expect("provision onnxruntime");
+        assert!(ready);
+
+        let mut embedder = AudioEmbedder::load(&model).expect("load embedder");
+        // 1 s of quiet noise → a valid, finite, unit-norm embedding.
+        let wav: Vec<f32> = (0..48_000)
+            .map(|i| ((i % 97) as f32 / 97.0 - 0.5) * 0.01)
+            .collect();
+        let emb = embedder.embed(&wav).expect("embed");
+        assert_eq!(emb.len(), EMBED_DIM);
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "embedding not unit-norm: {norm}");
+        assert!(emb.iter().all(|x| x.is_finite()));
+    }
 }

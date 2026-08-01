@@ -11,10 +11,26 @@ use quick_xml::escape::{escape, partial_escape};
 /// Returns `protocolInfo` 4th-field with DLNA profile name, operation flags,
 /// transcoding indicator and streaming flags.
 pub fn dlna_flags_for_mime(mime: &str) -> &'static str {
+    dlna_flags_for_mime_bd(mime, None)
+}
+
+/// Like [`dlna_flags_for_mime`] but bit-depth aware for LPCM/WAV.
+///
+/// The standard DLNA `LPCM` profile (`DLNA.ORG_PN=LPCM`) is defined for 16-bit
+/// only. Advertising it on a genuine 24-bit WAV makes strict renderers map the
+/// stream back to 16-bit and read misaligned samples → SILENCE (#1137). So for
+/// a WAV/LPCM MIME served at >16-bit we emit NO `PN` (just OP/CI/FLAGS): the
+/// renderer parses the real WAV header instead of a false profile claim. This
+/// path is only ever reached for the opt-in `dlna_wav24` zones; every existing
+/// LPCM fallback stays 16-bit and keeps the `PN=LPCM` profile unchanged.
+pub fn dlna_flags_for_mime_bd(mime: &str, bit_depth: Option<u32>) -> &'static str {
     // DLNA.ORG_OP=01 : byte-range seek supported
     // DLNA.ORG_CI=0  : no transcoding
     // DLNA.ORG_FLAGS : streaming + interactive + background + v1.5
+    const NO_PN: &str =
+        "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
     match mime {
+        "audio/L16" | "audio/wav" | "audio/x-wav" if bit_depth.is_some_and(|bd| bd > 16) => NO_PN,
         "audio/L16" | "audio/wav" | "audio/x-wav" => {
             "DLNA.ORG_PN=LPCM;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
         }
@@ -336,7 +352,7 @@ impl DidlBuilder {
                 let flags = if self.live_stream {
                     dlna_flags_for_mime_live(&self.mime_type)
                 } else {
-                    dlna_flags_for_mime(&self.mime_type)
+                    dlna_flags_for_mime_bd(&self.mime_type, self.bit_depth)
                 };
                 format!("http-get:*:{}:{}", self.mime_type, flags)
             }
@@ -594,6 +610,25 @@ mod tests {
         assert!(dlna_flags_for_mime("audio/wav").contains("DLNA.ORG_PN=LPCM"));
         assert!(dlna_flags_for_mime("audio/x-wav").contains("DLNA.ORG_PN=LPCM"));
         assert!(dlna_flags_for_mime("audio/L16").contains("DLNA.ORG_PN=LPCM"));
+    }
+
+    #[test]
+    fn dlna_flags_wav_16bit_keeps_lpcm_profile() {
+        // 16-bit WAV is genuine LPCM — keep the PN so lax renderers accept it.
+        assert!(dlna_flags_for_mime_bd("audio/wav", Some(16)).contains("DLNA.ORG_PN=LPCM"));
+        assert!(dlna_flags_for_mime_bd("audio/L16", None).contains("DLNA.ORG_PN=LPCM"));
+    }
+
+    #[test]
+    fn dlna_flags_wav_24bit_drops_lpcm_profile() {
+        // 24-bit WAV must NOT claim the 16-bit-only LPCM profile (#1137 silence).
+        let f = dlna_flags_for_mime_bd("audio/wav", Some(24));
+        assert!(
+            !f.contains("DLNA.ORG_PN"),
+            "24-bit WAV must not advertise a PN: {f}"
+        );
+        assert!(f.contains("DLNA.ORG_OP=01"), "still seekable: {f}");
+        assert!(!dlna_flags_for_mime_bd("audio/L16", Some(24)).contains("DLNA.ORG_PN"));
     }
 
     #[test]

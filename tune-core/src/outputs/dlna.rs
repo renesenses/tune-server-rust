@@ -708,6 +708,88 @@ impl DlnaOutput {
         info!(device = %self.name, mime, protocols_count = protocols.len(), "dlna_mime_not_supported_by_renderer");
         Some(false)
     }
+
+    /// One-shot capability probe for the renderer-config UI: reads the
+    /// GetProtocolInfo `Sink` ONCE and summarises which audio formats it
+    /// advertises, so the user can pick a sensible output override (native FLAC,
+    /// native ALAC, forced WAV/LPCM…) with evidence rather than by trial. A
+    /// failed/empty probe returns `probed: false` (inconclusive — the renderer
+    /// may still decode more than it advertises; the negotiation fallbacks stay
+    /// in charge).
+    pub async fn probe_capabilities(&self) -> RendererCapabilities {
+        match self.get_protocol_info().await {
+            Ok(sink) if !sink.is_empty() => renderer_caps_from_sink(sink),
+            _ => RendererCapabilities::default(),
+        }
+    }
+}
+
+/// What a DLNA renderer advertises in its GetProtocolInfo `Sink`. `probed` is
+/// false when the Sink could not be read (empty/timeout) — everything else is
+/// then meaningless and the UI should say "couldn't read capabilities".
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RendererCapabilities {
+    pub probed: bool,
+    pub flac: bool,
+    /// Plain `audio/wav` / `audio/x-wav`.
+    pub wav: bool,
+    /// 16-bit LPCM (`audio/L16`) — the standard DLNA WAV profile.
+    pub lpcm16: bool,
+    /// 24-bit LPCM (`audio/L24`) — gates the "WAV 24-bit" override.
+    pub lpcm24: bool,
+    pub alac: bool,
+    pub aac: bool,
+    pub mp3: bool,
+    pub dsd: bool,
+    /// Raw Sink entries, for an advanced/debug view.
+    pub sink: Vec<String>,
+}
+
+/// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
+/// around the SOAP call).
+fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
+    // Param-aware match: LPCM entries carry `;rate=…;channels=…` after the MIME
+    // (`audio/L16;rate=44100;channels=2`), so we compare the base MIME only.
+    // Also accepts the `audio/x-…` legacy variant and the `*` wildcard, like
+    // `protocol_sink_supports_mime` (which only handles the param-less case).
+    let has = |want: &str| -> bool {
+        let want = want.to_lowercase();
+        let alt = want
+            .strip_prefix("audio/x-")
+            .map(|r| format!("audio/{r}"))
+            .or_else(|| want.strip_prefix("audio/").map(|r| format!("audio/x-{r}")));
+        sink.iter().any(|p| {
+            let Some(field) = p.split(':').nth(2) else {
+                return false;
+            };
+            let mime = field.trim().to_lowercase();
+            let base = mime.split(';').next().unwrap_or(&mime).trim();
+            base == want || base == "*" || alt.as_deref() == Some(base)
+        })
+    };
+    let dsd = sink.iter().any(|p| {
+        let l = p.to_lowercase();
+        l.contains("x-dsd")
+            || l.contains("audio/dsf")
+            || l.contains("audio/dff")
+            || l.contains("audio/x-dsf")
+            || l.contains("audio/x-dff")
+            || l.contains("audio/vnd.dsd")
+            || l.contains("application/x-dsd")
+    });
+    RendererCapabilities {
+        probed: true,
+        flac: has("audio/flac"),
+        wav: has("audio/wav"),
+        lpcm16: has("audio/l16"),
+        lpcm24: has("audio/l24"),
+        // ALAC is rarely advertised distinctly; renderers expose it as m4a/mp4.
+        alac: has("audio/x-m4a") || has("audio/alac") || has("audio/mp4"),
+        aac: has("audio/aac") || has("audio/mp4"),
+        mp3: has("audio/mpeg"),
+        dsd,
+        sink,
+    }
 }
 
 /// Whether a renderer's GetProtocolInfo `Sink` entries advertise support for
@@ -750,6 +832,33 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caps_from_sink_maps_advertised_formats() {
+        // A typical hi-fi renderer Sink: FLAC (x- variant), 16-bit LPCM, MP3,
+        // AAC/MP4, and DSF — but NOT 24-bit LPCM.
+        let sink = vec![
+            "http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM".to_string(),
+            "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3".to_string(),
+            "http-get:*:audio/mp4:*".to_string(),
+            "http-get:*:audio/x-dsf:*".to_string(),
+        ];
+        let c = renderer_caps_from_sink(sink);
+        assert!(c.probed);
+        assert!(c.flac, "x-flac must count as FLAC");
+        assert!(c.lpcm16, "audio/L16 present");
+        assert!(!c.lpcm24, "no audio/L24 advertised");
+        assert!(c.mp3 && c.aac && c.dsd);
+    }
+
+    #[test]
+    fn caps_from_sink_flags_l24_when_present() {
+        let sink = vec!["http-get:*:audio/L24;rate=96000;channels=2:*".to_string()];
+        let c = renderer_caps_from_sink(sink);
+        assert!(c.lpcm24, "audio/L24 gates the WAV 24-bit override");
+        assert!(!c.flac);
+    }
 
     #[test]
     fn protocol_sink_matches_x_flac_variant() {

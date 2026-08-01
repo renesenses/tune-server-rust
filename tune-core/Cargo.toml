@@ -66,6 +66,13 @@ wasmtime = { version = "47", default-features = false, features = ["cranelift", 
 # compile time — and the shared lib is loaded at runtime next to the model
 # (downloaded on activation). Feature-gated so the default build never pulls it.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+# Runtime provisioning of the onnxruntime shared lib for `load-dynamic`: we fetch
+# Microsoft's official onnxruntime release archives (which ship real shared libs,
+# unlike ort's static-link dists) and unpack them — `.tgz` via flate2+tar,
+# Windows `.zip` via the `zip` crate already in deps. Gated behind
+# `audio-embedding`, so the default build pulls none of this.
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Linux : nice/ionice des threads du pool de scan (scanner/walker.rs).
@@ -104,4 +111,4 @@ postgres = ["dep:sqlx"]
 # Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
-audio-embedding = ["dep:ort"]
+audio-embedding = ["dep:ort", "dep:flate2", "dep:tar"]

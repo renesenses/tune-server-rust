@@ -1390,6 +1390,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // forces a 16-bit downconvert (kept as FLAC) instead of direct passthrough,
     // without regressing renderers that genuinely play 24-bit.
     add_column_if_missing(db, "zones", "dlna_cap_16bit", "INTEGER DEFAULT 0");
+    // Opt-in: serve genuine 24-bit WAV to this DLNA renderer (instead of the
+    // 16-bit LPCM fallback). Only safe on renderers that advertise `audio/L24`
+    // in their GetProtocolInfo Sink — the UI only offers the toggle when the
+    // capability probe reports `lpcm24`. The 24-bit WAV is advertised WITHOUT
+    // the 16-bit-only `DLNA.ORG_PN=LPCM` profile so a strict renderer no longer
+    // maps it back to 16-bit and reads misaligned samples (the #1137 silence
+    // class). Off by default; overrides dlna_lpcm/dlna_cap_16bit when set.
+    add_column_if_missing(db, "zones", "dlna_wav24", "INTEGER DEFAULT 0");
     // Physical host (IP) of the renderer, used to dedup DLNA zones across
     // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
     // N12 after a restart) must reconnect to its existing zone instead of
