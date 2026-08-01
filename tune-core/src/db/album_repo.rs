@@ -731,13 +731,22 @@ impl AlbumRepo {
             })
             .collect::<Vec<_>>();
         let _ = p;
+        // genre/genres are fill-only (COALESCE) but must heal the empty-string
+        // case: `create_minimal` leaves genre NULL, yet a track can carry
+        // genre = '' (an empty tag frame), which the old `t.genre IS NOT NULL`
+        // subquery would happily pick and COALESCE into the album — pinning it
+        // to '' forever (COALESCE(albums.genre='' , …) never re-fills, and the
+        // completeness card counts genre != '' so it read as "without genre" for
+        // the whole catalogue, identical to the cover card — #3 Fabien). NULLIF
+        // treats a stored '' as re-fillable and the `!= ''` guard only ever
+        // sources a real, non-empty genre. Valid on SQLite and PostgreSQL.
         let sql = format!(
             "UPDATE albums SET
                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = {} AND t.format IS NOT NULL LIMIT 1)),
                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = {})),
                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = {})),
-                genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL LIMIT 1)),
-                genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL LIMIT 1)),
+                genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)),
+                genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)),
                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = {}))
             WHERE id = {}",
             plist[0], plist[1], plist[2], plist[3], plist[4], plist[5], plist[6]
@@ -1297,6 +1306,55 @@ mod tests {
 
         repo.delete(id).unwrap();
         assert!(repo.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_quality_backfills_genre_ignoring_empty_string_tracks() {
+        // Regression for #3 (Fabien): `create_minimal` leaves albums.genre NULL,
+        // and one of the album's tracks carries genre = '' (an empty tag frame).
+        // The old backfill (`t.genre IS NOT NULL LIMIT 1` + `COALESCE(albums.genre,…)`)
+        // could pick the empty track and pin albums.genre to '' — which the
+        // completeness card counts as "without genre", making the genre card
+        // read the whole catalogue as missing (identical to the cover card).
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+
+        let artist_id = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let album = repo
+            .get_or_create("Kind of Blue", artist_id, Some(1959))
+            .unwrap();
+        let album_id = album.id.unwrap();
+        // Album row created minimally: genre is NULL.
+        assert_eq!(repo.get(album_id).unwrap().unwrap().genre, None);
+
+        // Two tracks: one with an empty-string genre, one with a real genre.
+        db.execute_batch(&format!(
+            "INSERT INTO tracks (title, album_id, artist_id, genre) VALUES ('So What', {album_id}, {artist_id}, '');
+             INSERT INTO tracks (title, album_id, artist_id, genre) VALUES ('Blue in Green', {album_id}, {artist_id}, 'Jazz');"
+        ))
+        .unwrap();
+
+        repo.update_quality_from_tracks(album_id).unwrap();
+        assert_eq!(
+            repo.get(album_id).unwrap().unwrap().genre.as_deref(),
+            Some("Jazz"),
+            "backfill must skip the empty-string track and pick the real genre"
+        );
+
+        // Now poison the album with '' directly and confirm NULLIF heals it.
+        db.execute_batch(&format!(
+            "UPDATE albums SET genre = '' WHERE id = {album_id};"
+        ))
+        .unwrap();
+        repo.update_quality_from_tracks(album_id).unwrap();
+        assert_eq!(
+            repo.get(album_id).unwrap().unwrap().genre.as_deref(),
+            Some("Jazz"),
+            "an already-empty album genre must be re-filled from a real track genre"
+        );
     }
 
     #[test]
