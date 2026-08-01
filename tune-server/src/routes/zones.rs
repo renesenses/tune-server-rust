@@ -1,7 +1,7 @@
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -84,6 +84,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
@@ -1192,6 +1193,94 @@ async fn create_zone(
         )
             .into_response(),
     }
+}
+
+/// POST /zones/{id}/renderer-capabilities — on-demand "discovery check" for the
+/// renderer-config UI. Probes the zone's DLNA renderer via GetProtocolInfo and
+/// returns which audio formats its `Sink` advertises (FLAC, WAV/LPCM 16 & 24,
+/// ALAC/AAC, MP3, DSD), so the user can pick a sensible output override with
+/// evidence. Only meaningful for dlna/openhome zones with a live renderer.
+async fn renderer_capabilities(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zone = match repo.get(id) {
+        Ok(Some(z)) => z,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "zone_not_found" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !matches!(zone.output_type.as_deref(), Some("dlna") | Some("openhome")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "not_a_dlna_renderer",
+                "message": "Renderer capability discovery is only available for DLNA/OpenHome zones.",
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(device_id) = zone.output_device_id.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no_output_device" })),
+        )
+            .into_response();
+    };
+
+    // The GetProtocolInfo probe needs the registered DlnaOutput (it holds the
+    // ConnectionManager URL). If the renderer hasn't been played yet it may not
+    // be registered — try to register it from the discovered device first, same
+    // as create_zone does, so the check works without playing a track first.
+    let mut output = { state.outputs.lock().await.get(device_id) };
+    if output.is_none() {
+        let disc = {
+            let scanner = state.scanner.lock().await;
+            let devices = scanner.devices().await;
+            devices.iter().find(|d| d.id == device_id).cloned()
+        };
+        if let Some(dev) = disc {
+            register_dlna_output_from_device(&dev, &state).await;
+            output = { state.outputs.lock().await.get(device_id) };
+        }
+    }
+
+    let Some(output) = output else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "probed": false,
+                "reason": "renderer_offline",
+                "message": "The renderer is not currently online/discovered. Make sure it is powered on and on the same network, then try again.",
+            })),
+        )
+            .into_response();
+    };
+
+    // Hold the output lock for the SOAP round-trip (on-demand, user-initiated,
+    // rare) — same pattern the orchestrator uses for its per-track probe.
+    let caps = {
+        let guard = output.lock().await;
+        match guard.as_any().downcast_ref::<DlnaOutput>() {
+            Some(dlna) => dlna.probe_capabilities().await,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "not_a_dlna_output" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    Json(json!(caps)).into_response()
 }
 
 /// Register a DLNA output from a discovered device.
