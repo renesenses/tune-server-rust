@@ -34,6 +34,20 @@ pub struct OutputStatus {
     /// (not via stop/skip). When true + state==Stopped, this is a definitive
     /// end-of-track that should trigger auto_next regardless of played_enough.
     pub ended_naturally: bool,
+    /// Whether this output consumes the track at 1x, in real time.
+    ///
+    /// `true` for every renderer, and the default: a speaker, a DLNA device or
+    /// a Chromecast cannot finish a five-minute track in under five minutes, so
+    /// the poller treats an early `ended_naturally` as a device bug (an Eversolo
+    /// DMP-A8 reporting a phantom end mid-track) and holds the queue back until
+    /// enough wall-clock time has passed.
+    ///
+    /// `false` for an output that legitimately finishes faster than 1x — a
+    /// recorder writing the container to disk at network speed. Those
+    /// wall-clock plausibility guards do not apply to it: its
+    /// `ended_naturally` + `Stopped` means the track really is done, one second
+    /// into a five-minute piece.
+    pub realtime: bool,
 }
 
 impl Default for OutputStatus {
@@ -48,6 +62,7 @@ impl Default for OutputStatus {
             track_title: None,
             track_artist: None,
             ended_naturally: false,
+            realtime: true,
         }
     }
 }
@@ -76,6 +91,20 @@ pub struct PlayMedia<'a> {
     /// renderers (Yamaha R-N2000A) accept SetAVTransportURI + Play but never
     /// produce sound.
     pub live_stream: bool,
+    /// The upstream source `url` was derived from, when `url` is one of the
+    /// server's own proxy or transcode endpoints — an Icecast mount, a podcast
+    /// enclosure, a signed CDN link.
+    ///
+    /// `url` is what an output should *play*: it is proxied precisely because
+    /// renderers need a format they understand, and it can be read by several
+    /// consumers. This is what an output should read when it wants the bytes as
+    /// the source published them — a recorder keeping the original codec instead
+    /// of a PCM transcode, or anything that needs the stream's own metadata
+    /// (ICY titles do not survive the proxy). `None` when `url` already *is* the
+    /// upstream, so a consumer can fall back to it unconditionally.
+    ///
+    /// Reading it is opt-in: an output that ignores it behaves exactly as before.
+    pub origin_url: Option<&'a str>,
 }
 
 impl Default for PlayMedia<'_> {
@@ -94,6 +123,7 @@ impl Default for PlayMedia<'_> {
             bit_depth: None,
             channels: None,
             live_stream: false,
+            origin_url: None,
         }
     }
 }
@@ -117,6 +147,19 @@ pub trait OutputTarget: Send + Sync {
     /// that never consumes `next_media`, so they return false.
     fn supports_internal_gapless(&self) -> bool {
         true
+    }
+
+    /// Whether the poller should stage the gapless next track as a LOCAL FILE
+    /// (`set_next_media` with `file_path` set, resolved WITHOUT a transcode
+    /// session) rather than as a transcoded HTTP URL.
+    ///
+    /// OAAT returns true while it is streaming native DSD: that path reads the
+    /// raw `.dsf` from disk and cannot consume the orchestrator's DSD->PCM
+    /// transcode URL, so arming the URL path would spin up an unconsumed decode
+    /// that stalls (`dsd_streaming_send_timeout_10s`) and orphans the transition.
+    /// Default false: every other output stages the transcoded URL as today.
+    fn prefers_local_file_gapless(&self) -> bool {
+        false
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -175,5 +218,51 @@ pub trait OutputTarget: Send + Sync {
 
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
         None
+    }
+}
+
+/// A source of out-of-tree outputs, handed to the server at startup.
+///
+/// This is the seam that lets a *private* output crate (e.g. tune-diretta —
+/// the Diretta Host SDK cannot ship in a public build) plug into the public
+/// server without the public workspace ever referencing it: the private repo
+/// builds its own composer binary that calls
+/// `tune_server::run::main_blocking(RunOptions { output_providers, .. })`.
+/// The server polls `discover()` at startup and then periodically, registers
+/// each returned output in the output registry, and gives it the same zone
+/// lifecycle as built-in discovery (reconnect, auto-create, hidden zones).
+#[async_trait::async_trait]
+pub trait OutputProvider: Send + Sync {
+    /// Short provider name for logs (e.g. "diretta").
+    fn provider_name(&self) -> &str;
+
+    /// Discover the devices reachable right now and build one [`OutputTarget`]
+    /// per device. Return every visible device on each call — the server skips
+    /// device_ids that are already registered.
+    ///
+    /// `ctx` carries the server-side runtime state a paid module needs —
+    /// today the module entitlements: a provider that is a paid SKU must
+    /// check [`ProviderContext::module_licensed`] and return an empty list
+    /// when its module is not owned. The server rebuilds the context on
+    /// every poll, so buying a module takes effect without a restart.
+    async fn discover(&self, ctx: &ProviderContext) -> Vec<Box<dyn OutputTarget>>;
+}
+
+/// Runtime context handed to [`OutputProvider::discover`] on every poll.
+///
+/// Deliberately a plain data snapshot (not a handle into tune-core) so that
+/// out-of-tree provider crates only ever depend on this contract crate.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderContext {
+    /// Stable ids of the paid modules the linked account owns (e.g.
+    /// "diretta"), as validated by the license layer. Empty when the account
+    /// owns none, is signed out, or the server runs unlicensed.
+    pub licensed_modules: Vec<String>,
+}
+
+impl ProviderContext {
+    /// Whether the account owns the paid module `id` (e.g. "diretta").
+    pub fn module_licensed(&self, id: &str) -> bool {
+        self.licensed_modules.iter().any(|m| m == id)
     }
 }

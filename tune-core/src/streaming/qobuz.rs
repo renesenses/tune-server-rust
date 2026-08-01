@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::traits::*;
 use crate::TuneError;
@@ -23,8 +23,15 @@ pub struct QobuzService {
     /// optional `qobuz_proxy_first` field).
     proxy_first: bool,
     stored_username: Option<String>,
+    /// Password from the interactive login, kept for `auto_relogin` — **memory
+    /// only, never persisted**. `save_tokens` deliberately omits it; see the
+    /// note there.
     stored_password: Option<String>,
     enabled_override: Option<bool>,
+    /// Last auto-relogin attempt, successful or not — see `auto_relogin`.
+    last_relogin_attempt: Option<std::time::Instant>,
+    /// Set when `restore_tokens` read a pre-fix row carrying `stored_password`.
+    needs_token_rewrite: bool,
 }
 
 /// (primary, fallback) API bases for the given endpoint order.
@@ -104,6 +111,8 @@ impl QobuzService {
             stored_username: None,
             stored_password: None,
             enabled_override: None,
+            last_relogin_attempt: None,
+            needs_token_rewrite: false,
         }
     }
 
@@ -239,6 +248,32 @@ impl QobuzService {
                 "qobuz_paginate"
             );
 
+            // Diagnostic for the "favorites empty while playlists load" reports
+            // (Stéphane): on the FIRST page, surface at INFO the counts so a normal
+            // tester log tells us whether Qobuz returned nothing (total==0 → an
+            // API/account issue) or returned rows we then dropped (total>0 but
+            // count==0 → a response-shape/mapping mismatch on our side). When the
+            // items_key sub-object is entirely absent we log the top-level keys
+            // the response DID carry, to catch Qobuz nesting the data elsewhere.
+            if offset == 0 {
+                let key_present = data.get(items_key).map(|v| !v.is_null()).unwrap_or(false);
+                if total == 0 && count == 0 {
+                    let top_keys: Vec<&str> = data
+                        .as_object()
+                        .map(|m| m.keys().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    warn!(
+                        path,
+                        items_key,
+                        key_present,
+                        response_keys = ?top_keys,
+                        "qobuz_favorites_empty"
+                    );
+                } else {
+                    info!(path, items_key, count, total, "qobuz_favorites_first_page");
+                }
+            }
+
             offset += count;
 
             // Stop when we got fewer items than a full page, or we've reached the total
@@ -270,6 +305,7 @@ impl QobuzService {
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["media_number"].as_u64().map(|n| n as u32),
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
+            isrc: item["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: item["maximum_sampling_rate"]
@@ -419,6 +455,20 @@ impl QobuzService {
     }
 
     async fn auto_relogin(&mut self) -> bool {
+        // Cooldown : pendant une coupure (proxy mozaiklabs down + direct
+        // bloqué), chaque appel en échec relançait un login complet — une
+        // tempête de relogins toutes les ~2 s qui ressemble à du trafic de
+        // bot et fait rate-limiter l'IP par Akamai (403 en cascade, .18 le
+        // 28/07). Une tentative par minute suffit largement à récupérer dès
+        // que le réseau revient.
+        const RELOGIN_COOLDOWN: Duration = Duration::from_secs(60);
+        if let Some(t) = self.last_relogin_attempt
+            && t.elapsed() < RELOGIN_COOLDOWN
+        {
+            debug!("qobuz_auto_relogin_cooldown");
+            return false;
+        }
+        self.last_relogin_attempt = Some(std::time::Instant::now());
         if let (Some(u), Some(p)) = (self.stored_username.clone(), self.stored_password.clone()) {
             info!("qobuz_auto_relogin");
             self.login_internal(&u, &p).await.is_ok()
@@ -1307,6 +1357,19 @@ impl StreamingService for QobuzService {
         Ok(false)
     }
 
+    /// The persisted blob deliberately carries **no password**.
+    ///
+    /// It used to. `settings.auth_tokens_qobuz` held `stored_password` in the
+    /// clear next to the token, so anyone who could read `tune.db` — a backup,
+    /// a copied WAL, a support bundle — walked away with the account password
+    /// itself, not a revocable session. The API responses were already redacted
+    /// (`is_secret_key` in `routes/system/config.rs`); the file on disk was not.
+    ///
+    /// The password now lives in memory only, for the lifetime of the process,
+    /// so `auto_relogin` still recovers from an expired token without a round
+    /// trip to the user. Across a restart it is gone: if the stored token has
+    /// expired by then, the user re-authenticates once. That is the trade —
+    /// a rare re-login against a password that is never written down.
     fn save_tokens(&self) -> Option<serde_json::Value> {
         let token = self.user_auth_token.as_ref()?;
         Some(serde_json::json!({
@@ -1316,7 +1379,6 @@ impl StreamingService for QobuzService {
             "app_id": self.app_id,
             "app_secret": self.app_secret,
             "stored_username": self.stored_username,
-            "stored_password": self.stored_password,
         }))
     }
 
@@ -1332,11 +1394,22 @@ impl StreamingService for QobuzService {
                 self.app_secret = secret.into();
             }
             self.stored_username = tokens["stored_username"].as_str().map(Into::into);
-            self.stored_password = tokens["stored_password"].as_str().map(Into::into);
+            // A row written before this field was dropped still carries the
+            // plaintext password. Do not load it into the session — flag the row
+            // so the registry rewrites it without the field, which is what
+            // actually removes the secret from disk.
+            if tokens.get("stored_password").is_some_and(|v| !v.is_null()) {
+                warn!("qobuz_legacy_plaintext_password_purged");
+                self.needs_token_rewrite = true;
+            }
             true
         } else {
             false
         }
+    }
+
+    fn tokens_need_rewrite(&self) -> bool {
+        self.needs_token_rewrite
     }
 
     async fn post_restore(&mut self) {
@@ -1650,6 +1723,81 @@ mod tests {
         let mut svc = QobuzService::new("app".into(), "secret".into());
         let tokens = json!({"nothing": "here"});
         assert!(!svc.restore_tokens(&tokens));
+    }
+
+    #[test]
+    fn qobuz_save_tokens_never_persists_the_password() {
+        // The whole point of the fix: an authenticated session writes a blob
+        // that a reader of tune.db cannot turn into account credentials.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.user_auth_token = Some("token123".into());
+        svc.stored_username = Some("testuser".into());
+        svc.stored_password = Some("hunter2".into());
+
+        let tokens = svc
+            .save_tokens()
+            .expect("authenticated, so a blob is written");
+
+        assert!(tokens.get("stored_password").is_none());
+        assert_eq!(tokens["stored_username"], "testuser");
+        assert_eq!(tokens["user_auth_token"], "token123");
+        assert!(
+            !tokens.to_string().contains("hunter2"),
+            "the password must not reach disk under any key"
+        );
+    }
+
+    #[test]
+    fn qobuz_restore_drops_legacy_password_and_asks_for_a_rewrite() {
+        // A row written by a pre-fix build. The password must not be loaded into
+        // the session, and the service must ask for the row to be rewritten.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        let tokens = json!({
+            "user_auth_token": "token123",
+            "username": "testuser",
+            "stored_username": "testuser",
+            "stored_password": "hunter2",
+        });
+
+        assert!(svc.restore_tokens(&tokens));
+        assert_eq!(svc.stored_password, None);
+        assert!(svc.tokens_need_rewrite());
+
+        // And what gets written back is clean.
+        let rewritten = svc.save_tokens().expect("token restored");
+        assert!(!rewritten.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn qobuz_restore_clean_row_needs_no_rewrite() {
+        // No stale field, no write: startup must not churn the settings row on
+        // every boot once the DB has been migrated.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        let tokens = json!({
+            "user_auth_token": "token123",
+            "stored_username": "testuser",
+        });
+
+        assert!(svc.restore_tokens(&tokens));
+        assert!(!svc.tokens_need_rewrite());
+    }
+
+    #[test]
+    fn qobuz_auto_relogin_still_works_within_the_session() {
+        // The password stays in memory after an interactive login, so an expired
+        // token is recovered without prompting. Only a restart forces a re-login.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.stored_username = Some("testuser".into());
+        svc.stored_password = Some("hunter2".into());
+        assert!(svc.stored_password.is_some());
+
+        // Restoring from disk is the case that cannot: nothing to relogin with.
+        let mut restored = QobuzService::new("app".into(), "secret".into());
+        restored.restore_tokens(&json!({
+            "user_auth_token": "token123",
+            "stored_username": "testuser",
+        }));
+        assert_eq!(restored.stored_password, None);
     }
 
     #[test]

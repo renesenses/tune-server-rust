@@ -11,7 +11,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
         .route("/", get(list_plugins))
         .route("/docs", get(plugin_docs))
         .route("/{name}", get(get_plugin))
@@ -19,7 +19,128 @@ pub fn router() -> Router<AppState> {
         .route("/{name}/enable", post(enable_plugin))
         .route("/{name}/disable", post(disable_plugin))
         .route("/{name}/install", post(install_plugin))
-        .route("/{name}/update", post(update_plugin))
+        .route("/{name}/update", post(update_plugin));
+
+    // P2 of the plugin ABI (RFC §3.5): a single catch-all that dispatches
+    // `/api/v1/plugins/{id}/{*path}` into the loaded wasm plugin. Gated behind
+    // `plugins-wasm`, so the default server never mounts it. The param is named
+    // `name` to match the routes above (matchit rejects two differently-named
+    // params at the same position); the static `/{name}/enable` etc. still win
+    // over this catch-all for their exact paths.
+    #[cfg(feature = "plugins-wasm")]
+    let router = router.route("/{name}/{*path}", get(wasm_dispatch).post(wasm_dispatch));
+
+    router
+}
+
+/// Dispatch an HTTP request to a loaded wasm plugin (P2, RFC §3.5).
+///
+/// Packages the request as `{method, path, query, body}` JSON, runs the plugin
+/// off the async runtime (its wasmtime `Store` is not `Sync`, and any
+/// host-function it triggers must block on the runtime from a non-worker
+/// thread), and returns the plugin's `{status, headers?, body}` envelope. A
+/// premium-marked plugin is gated with the existing `premium_guard` first.
+#[cfg(feature = "plugins-wasm")]
+async fn wasm_dispatch(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    Path((id, subpath)): Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let Some(registry) = state.wasm_plugins.get() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "wasm plugins not loaded" })),
+        )
+            .into_response();
+    };
+
+    let Some(loaded) = registry.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "plugin not found", "id": id })),
+        )
+            .into_response();
+    };
+
+    // Premium gate BEFORE dispatch: the host owns licensing, not the plugin
+    // (RFC §3.5). Reuse the same guard the native premium routes use.
+    if loaded.manifest.premium {
+        if let Err(resp) = crate::premium_guard::require_premium(
+            &state.license,
+            tune_core::license::Feature::PluginMarketplace,
+        )
+        .await
+        {
+            return resp;
+        }
+    }
+
+    let body_json: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(Value::Null)
+    };
+    let req = json!({
+        "method": method.as_str(),
+        "path": format!("/{subpath}"),
+        "query": query.unwrap_or_default(),
+        "body": body_json,
+    });
+    let req_str = req.to_string();
+
+    // The wasm call (and every host-function it triggers) runs on a blocking
+    // thread: the Store isn't Sync — serialise per plugin via its Mutex — and
+    // the host's async capabilities `block_on` the runtime, which is only sound
+    // off a runtime worker.
+    let wasm_plugins = state.wasm_plugins.clone();
+    let plugin_id = id.clone();
+    let call = tokio::task::spawn_blocking(move || {
+        let registry = wasm_plugins.get().expect("registry present");
+        let loaded = registry.get(&plugin_id).expect("plugin present");
+        let mut plugin = loaded.plugin.blocking_lock();
+        plugin.handle_route(&req_str)
+    })
+    .await;
+
+    let resp_str = match call {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "plugin_error", "message": e })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "plugin_task_failed", "message": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&resp_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "plugin_bad_response", "message": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|c| u16::try_from(c).ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::OK);
+    let out_body = parsed.get("body").cloned().unwrap_or(Value::Null);
+    (status, Json(out_body)).into_response()
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
@@ -49,7 +170,11 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.
-    for info in state.plugins.lock().await.loaded_plugins().await {
+    //
+    // Read from the snapshot `plugins::init` published, never from the loader:
+    // event dispatch holds the loader's lock across every plugin's `on_event`,
+    // so reaching for it here would let one slow plugin hang this endpoint.
+    for info in plugin_snapshot(&state) {
         plugins.push(serde_json::json!({
             "name": info.name,
             "display_name": info.name,
@@ -63,21 +188,62 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         }));
     }
 
+    // Wasm plugins installed on disk (marketplace installs or bundled).
+    // Scanned from the plugins dir rather than the loaded registry so a
+    // disabled plugin — or one installed since the last restart — still shows
+    // up and can be toggled. `loaded` distinguishes running from
+    // pending-restart.
+    if let Some(dir) = crate::plugins::wasm_plugins_dir() {
+        let manager = tune_core::plugins::PluginManager::new(dir);
+        if let Ok(infos) = manager.scan().await {
+            for info in infos {
+                let id = info.manifest.id.clone();
+                let enabled = settings
+                    .get(&format!("plugin_{id}_enabled"))
+                    .ok()
+                    .flatten()
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                #[cfg(feature = "plugins-wasm")]
+                let loaded = state
+                    .wasm_plugins
+                    .get()
+                    .is_some_and(|reg| reg.get(&id).is_some());
+                #[cfg(not(feature = "plugins-wasm"))]
+                let loaded = false;
+                plugins.push(serde_json::json!({
+                    "name": id,
+                    "display_name": info.manifest.name,
+                    "description": info.manifest.description,
+                    "version": info.manifest.version,
+                    "author": info.manifest.author,
+                    "type": "wasm",
+                    "installed": true,
+                    "enabled": enabled,
+                    "loaded": loaded,
+                    "restart_required": enabled && !loaded,
+                    "url": format!("/api/v1/plugins/{id}/"),
+                }));
+            }
+        }
+    }
+
     Json(json!(plugins))
+}
+
+/// The plugins `plugins::init` loaded, or an empty slice before it has run.
+fn plugin_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::PluginInfo] {
+    state
+        .plugin_info
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or_default()
 }
 
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
-    if let Some(info) = state
-        .plugins
-        .lock()
-        .await
-        .loaded_plugins()
-        .await
-        .into_iter()
-        .find(|p| p.name == name)
-    {
+    if let Some(info) = plugin_snapshot(&state).iter().find(|p| p.name == name) {
         return Json(json!({
             "name": info.name,
             "description": info.description,
@@ -161,12 +327,31 @@ async fn delete_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // A wasm plugin lives on disk: uninstalling means removing its directory
+    // (the flags alone would leave it re-loaded at every startup).
+    let removed_dir = match crate::plugins::remove_wasm_dir(&name) {
+        Ok(removed) => removed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "uninstall_failed", "detail": e })),
+            )
+                .into_response();
+        }
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.delete(&enabled_key).ok();
-    StatusCode::NO_CONTENT
+    // 200 + JSON rather than 204: the web client's fetchJSON treats an empty
+    // body as an error, and it needs restart_required for its banner.
+    Json(json!({
+        "status": "uninstalled",
+        "name": name,
+        "restart_required": removed_dir,
+    }))
+    .into_response()
 }
 
 async fn plugin_docs() -> Json<Value> {

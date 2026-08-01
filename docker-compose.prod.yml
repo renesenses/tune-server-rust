@@ -8,6 +8,13 @@
 ##
 ## For DLNA/SSDP/mDNS discovery, add network_mode: host to the tune service
 ## and remove the ports mapping (host mode exposes all ports directly).
+##
+## AirPlay REQUIRES network_mode: host on a native Linux host: it pushes RTP/UDP
+## streams back to the server, which the default bridge NAT drops (DLNA still
+## works because the speaker pulls audio over HTTP). Docker Desktop (macOS/
+## Windows) has no host mode → AirPlay cannot work from Docker there. AirPlay 2
+## receivers (e.g. Devialet Phantom) also need the embedded airplay-daemon,
+## shipped for x86_64/amd64 only; arm64 falls back to legacy AirPlay 1.
 
 services:
   tune:

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -31,10 +31,12 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 // giving up, so the real duration/tags are recovered.
 const RETRY_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
-// The audio hash (duplicate detection) reads the whole file, separately from
-// the tags. Give it its own, larger budget so big Hi-Res files over a NAS still
-// get hashed — but it's best-effort: on timeout the track keeps its real tags
-// and only the hash is skipped (Progman: 23-min FLAC 24/88.2 exceeded 30s).
+// The audio hash (duplicate detection) does NOT read the whole file: it MD5s
+// a single 64 KB sample at the 25% offset (scanner/hasher.rs). Its real cost
+// is open + seek + one read — cheap even for huge files. The generous budget
+// exists because on a stalled NAS those three syscalls can hang like any
+// other I/O, and hashing is best-effort: on timeout the track keeps its real
+// tags and only the hash is skipped (Progman: stalled mount, not file size).
 const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Per-file metadata reads are I/O-bound: each rayon task blocks on the tag read
@@ -46,6 +48,24 @@ const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 // more per-file latencies overlap. Mirrors the 32-thread stat pool already used
 // for the mtime pre-check (#619).
 const SCAN_IO_CONCURRENCY: usize = 32;
+
+/// Resolve the scan I/O concurrency, honouring an optional `TUNE_SCAN_IO_CONCURRENCY`
+/// override. The fixed default (32) is a good fit for a fast SSD NAS, but the
+/// sweet spot is storage-specific: a weak 2-bay HDD NAS (Synology DS218Play,
+/// forum #1194) can be *slowed* by 32 concurrent reads scattered across the
+/// platters (each file needs a seek for the tags at the start + a seek to 25%
+/// for the dup-detection hash), while a high-latency share benefits from even
+/// more. Rather than guess, let the operator tune it against their own NAS —
+/// something we cannot benchmark centrally. Empty/invalid/zero → the default;
+/// clamped to 1..=256 so a typo can't spawn a pathological number of OS threads.
+fn scan_io_concurrency() -> usize {
+    std::env::var("TUNE_SCAN_IO_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.clamp(1, 256))
+        .unwrap_or(SCAN_IO_CONCURRENCY)
+}
 
 /// Lower CPU and I/O priority of the calling thread (Linux only, no-op
 /// elsewhere). Applied to the dedicated scan pool threads only — never to
@@ -76,7 +96,7 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(SCAN_IO_CONCURRENCY)
+            .num_threads(scan_io_concurrency())
             .thread_name(|i| format!("scan-io-{i}"))
             .start_handler(|_| lower_scan_thread_priority())
             .build()
@@ -85,7 +105,10 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-const SUPPORTED_EXTENSIONS: &[&str] = &[
+/// Audio extensions recognised by the scanner. Shared with the file watcher
+/// (which excludes "iso": ISO SACD needs the extraction step that only the
+/// full directory walk performs).
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
     "alac", "ape", "iso",
 ];
@@ -180,6 +203,40 @@ fn read_file_with_retry(
     }
 }
 
+/// Best-effort DSD (DSF/DFF) duration from the file header, bounded so a stalled
+/// mount can't re-hang the scan. Used only in the timeout fallback: even when
+/// lofty's full tag read timed out (big embedded art over slow storage), the
+/// ~92-byte DSD header usually still reads fine, so the track gets a real
+/// duration in the library instead of 0 — a 0 disables gapless/advance/prefetch
+/// downstream (the DSD testers' slow-storage libraries: Philippe Landes' 20k
+/// DSD tracks). Play-time backfill (resolve_local_track) already repairs it on
+/// first play; this fixes the library display up front. `None` for non-DSD, on
+/// any parse error, or if even the header read times out.
+fn probe_dsd_header_duration_bounded(path: &std::path::Path) -> Option<u64> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "dsf" && ext != "dff" {
+        return None;
+    }
+    let p = path.to_string_lossy().to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let dur = if p.to_ascii_lowercase().ends_with(".dff") {
+            crate::audio::dff::parse_dff(&p)
+                .ok()
+                .and_then(|i| i.duration_ms())
+        } else {
+            crate::audio::dsf::parse_dsf(&p)
+                .ok()
+                .and_then(|i| i.duration_ms())
+        };
+        let _ = tx.send(dur);
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .ok()
+        .flatten()
+        .filter(|&d| d > 0)
+}
+
 fn read_file_with_timeout(
     path: &PathBuf,
     with_hash: bool,
@@ -222,6 +279,18 @@ fn read_file_with_timeout(
 pub struct ListAudioResult {
     pub files: Vec<PathBuf>,
     pub missing_dirs: Vec<String>,
+    /// Paths where the walk itself errored MID-scan (a subfolder that became
+    /// unreadable, a transient SMB stall, a nested mount that dropped, a
+    /// permission wall). Files below these paths may still exist on disk even
+    /// though they are absent from `files` — the post-scan prune must treat
+    /// them like `missing_dirs`, otherwise their tracks get silently deleted.
+    pub error_dirs: Vec<String>,
+    /// One "path: kind — message" line per entry of `missing_dirs`, so the
+    /// scan report can tell the user WHY a root was skipped (NotFound = bad
+    /// UNC / NAS unmounted, PermissionDenied = no SMB credentials, mapped
+    /// drive invisible to a service token, …) instead of burying the reason
+    /// in the server log (Alain Bonnel, Windows NAS).
+    pub missing_dir_reasons: Vec<String>,
 }
 
 impl ListAudioResult {
@@ -231,11 +300,34 @@ impl ListAudioResult {
 }
 
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
+    list_audio_files_with_excludes(dirs, &[])
+}
+
+/// Like [`list_audio_files`], but skips any entry (file or directory subtree)
+/// whose full path contains one of `exclude_patterns` (case-insensitive
+/// substring — deliberately simple, no glob engine). Patterns come from the
+/// `scan_exclude_paths` setting: staging/incoming folders, backup trees, a
+/// sibling's library on a shared NAS…
+pub fn list_audio_files_with_excludes(
+    dirs: &[String],
+    exclude_patterns: &[String],
+) -> ListAudioResult {
     let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
+    let excludes: Vec<String> = exclude_patterns
+        .iter()
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
     let skip_set: HashSet<&str> = SKIP_DIRS.iter().copied().collect();
 
     let mut files = Vec::new();
     let mut missing_dirs = Vec::new();
+    let mut missing_dir_reasons: Vec<String> = Vec::new();
+    let mut error_dirs: Vec<String> = Vec::new();
+    // Above this many distinct error scopes the whole root is clearly in
+    // trouble (NAS died mid-walk) — protect the entire root instead of
+    // accumulating an unbounded list.
+    const MAX_ERROR_SCOPES: usize = 50;
     for dir in dirs {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
@@ -255,6 +347,7 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                 kind = ?e.kind(),
                 "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
+            missing_dir_reasons.push(format!("{}: {:?} — {}", normalized, e.kind(), e));
             missing_dirs.push(normalized);
             continue;
         }
@@ -273,6 +366,13 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
             .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
+                if !excludes.is_empty() {
+                    let path_l = e.path().to_string_lossy().to_lowercase();
+                    if excludes.iter().any(|x| path_l.contains(x.as_str())) {
+                        debug!(path = %e.path().display(), "scan_excluded_by_pattern");
+                        return false;
+                    }
+                }
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
                     !skip_set.contains(name.as_ref())
@@ -293,10 +393,10 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                     if entry.file_name().to_string_lossy().starts_with("._") {
                         continue;
                     }
-                    // Skip Tune's own streaming temp files (tune-stream-*.flac,
-                    // tune-prefetch-*.flac in %TEMP%): a library rooted above the
-                    // temp dir (Frédéric: whole user profile) otherwise indexes
-                    // every transcode as a ghost tagless track.
+                    // Skip Tune's own streaming/transcode temp files
+                    // (tune-stream-*, tune-prefetch-*, tune-tcache-* in %TEMP%):
+                    // a library rooted above the temp dir (Frédéric: whole user
+                    // profile) otherwise indexes every transcode as a ghost track.
                     if crate::scanner::is_tune_temp_file(entry.path()) {
                         continue;
                     }
@@ -326,6 +426,22 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                 }
                 Err(err) => {
                     dir_error_count += 1;
+                    // Record WHERE the walk failed so the prune can protect the
+                    // subtree: without this, files under an unreadable subfolder
+                    // of a perfectly reachable root drop out of the discovered
+                    // set and their tracks get deleted from the library. No
+                    // path on the error (rare) → protect the whole root.
+                    let err_scope = err
+                        .path()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| normalized.clone());
+                    if error_dirs.len() >= MAX_ERROR_SCOPES {
+                        if !error_dirs.contains(&normalized) {
+                            error_dirs.push(normalized.clone());
+                        }
+                    } else if !error_dirs.contains(&err_scope) {
+                        error_dirs.push(err_scope);
+                    }
                     if dir_error_count <= 5 {
                         warn!(
                             dir = %normalized,
@@ -357,11 +473,14 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
         count = files.len(),
         dirs = dirs.len(),
         missing = missing_dirs.len(),
+        walk_errors = error_dirs.len(),
         "audio_files_listed"
     );
     ListAudioResult {
         files,
         missing_dirs,
+        error_dirs,
+        missing_dir_reasons,
     }
 }
 
@@ -392,12 +511,31 @@ pub fn scan_files_parallel(
             let path_str: String = path.to_string_lossy().nfc().collect();
 
             let file_meta = path.metadata().ok();
+            let stat_ok = file_meta.is_some();
             let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let mtime = file_meta
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+
+            // Zero-byte "audio" files are aborted copies/downloads, not
+            // tracks: don't index a tagless duration-0 ghost, surface them in
+            // failed_paths so the report shows what to clean.
+            if stat_ok && file_size == 0 {
+                warn!(path = %path_str, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
+                failed_files
+                    .lock()
+                    .unwrap()
+                    .push((path_str.clone(), "empty file (0 bytes)".into()));
+                return ScannedFile {
+                    path: path_str,
+                    metadata: None,
+                    audio_hash: None,
+                    file_size,
+                    mtime,
+                };
+            }
 
             let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                 Ok((meta, hash)) => {
@@ -419,7 +557,18 @@ pub fn scan_files_parallel(
                         "scan_file_timeout — tag read timed out, indexing with filename metadata"
                     );
                     timeout_counter.fetch_add(1, Ordering::Relaxed);
-                    (Some(tagless_fallback_no_props(path)), None)
+                    let mut meta = tagless_fallback_no_props(path);
+                    // The full tag read timed out, but the tiny DSD header
+                    // usually still reads — recover the duration so a slow-storage
+                    // DSD track isn't left at 0 in the library (a 0 breaks
+                    // gapless/advance/prefetch). Bounded; non-DSD relies on the
+                    // play-time backfill.
+                    if meta.duration_ms.is_none_or(|d| d == 0) {
+                        if let Some(d) = probe_dsd_header_duration_bounded(path) {
+                            meta.duration_ms = Some(d);
+                        }
+                    }
+                    (Some(meta), None)
                 }
                 Err(ref err) => {
                     warn!(
@@ -540,6 +689,7 @@ pub fn scan_files_batched(
                     let path_str: String = path.to_string_lossy().nfc().collect();
 
                     let file_meta = path.metadata().ok();
+                    let stat_ok = file_meta.is_some();
                     let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
                     let mtime = file_meta
                         .and_then(|m| m.modified().ok())
@@ -547,16 +697,39 @@ pub fn scan_files_batched(
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
 
+                    // Zero-byte "audio" files are aborted copies/downloads, not
+                    // tracks: don't index a tagless duration-0 ghost, surface
+                    // them in failed_paths so the report shows what to clean.
+                    if stat_ok && file_size == 0 {
+                        warn!(path = %path_str, "scan_file_empty_skipped — zero-byte file (aborted copy?)");
+                        failed_files
+                            .lock()
+                            .unwrap()
+                            .push((path_str.clone(), "empty file (0 bytes)".into()));
+                        return ScannedFile {
+                            path: path_str,
+                            metadata: None,
+                            audio_hash: None,
+                            file_size,
+                            mtime,
+                        };
+                    }
+
                     let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                         Ok((meta, hash)) => (meta, hash),
                         Err(ref reason) if reason == "timeout" => {
+                            // Don't drop the file — same fallback as
+                            // scan_files_parallel: index it with filename-based
+                            // metadata so it still appears in the library.
+                            // audio_hash stays None so the next scan re-reads
+                            // full tags once storage is responsive.
                             warn!(
                                 path = %path_str,
                                 timeout_secs = FILE_TIMEOUT.as_secs(),
-                                "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                                "scan_file_timeout — tag read timed out, indexing with filename metadata"
                             );
                             batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                            (None, None)
+                            (Some(tagless_fallback_no_props(path)), None)
                         }
                         Err(err) => {
                             warn!(
@@ -667,6 +840,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scan_io_concurrency_env_override() {
+        // Serialize env mutation and always restore, so this can't race or leak
+        // into other tests that read the same variable.
+        let key = "TUNE_SCAN_IO_CONCURRENCY";
+        let saved = std::env::var(key).ok();
+
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+
+        unsafe { std::env::set_var(key, "8") };
+        assert_eq!(scan_io_concurrency(), 8);
+
+        // Zero, garbage and empty all fall back to the default.
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+        unsafe { std::env::set_var(key, "abc") };
+        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+
+        // Over-large is clamped, not honoured verbatim.
+        unsafe { std::env::set_var(key, "100000") };
+        assert_eq!(scan_io_concurrency(), 256);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
     fn supported_extensions_list() {
         assert!(SUPPORTED_EXTENSIONS.contains(&"flac"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"mp3"));
@@ -688,6 +890,74 @@ mod tests {
         // No audio files found; the missing directory is tracked separately.
         assert!(result.files.is_empty());
         assert_eq!(result.missing_dirs.len(), 1);
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+        assert!(
+            result.missing_dir_reasons[0].contains("NotFound"),
+            "reason = {:?}",
+            result.missing_dir_reasons[0]
+        );
+        assert!(result.error_dirs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_error_subdir_recorded_in_error_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        // NOT under temp_dir(): is_tune_temp_file() skips every file inside
+        // the system temp dir, which would empty the walk result.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_error_dirs_test");
+        let locked = base.join("locked");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("hidden.flac"), b"x").unwrap();
+        std::fs::write(base.join("visible.flac"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root (some CI containers): chmod 000 doesn't block the
+        // walk, the scenario can't be reproduced — skip.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+
+        // The reachable file is still scanned; the root is NOT "missing"; the
+        // unreadable subtree is reported so the prune can protect it instead
+        // of deleting its tracks.
+        assert_eq!(result.files.len(), 1);
+        assert!(result.missing_dirs.is_empty());
+        assert!(
+            result.error_dirs.iter().any(|d| d.contains("locked")),
+            "error_dirs = {:?}",
+            result.error_dirs
+        );
+    }
+
+    #[test]
+    fn exclude_patterns_prune_files_and_subtrees() {
+        // NOT under temp_dir(): is_tune_temp_file() skips everything there.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_excludes_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("keep")).unwrap();
+        std::fs::create_dir_all(base.join("Incoming")).unwrap();
+        std::fs::write(base.join("keep/a.flac"), b"x").unwrap();
+        std::fs::write(base.join("Incoming/b.flac"), b"x").unwrap();
+
+        let root = base.to_string_lossy().to_string();
+        let all = list_audio_files(&[root.clone()]);
+        assert_eq!(all.files.len(), 2);
+
+        // Case-insensitive substring match prunes the whole subtree.
+        let filtered = list_audio_files_with_excludes(&[root], &["incoming".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(filtered.files.len(), 1, "files = {:?}", filtered.files);
+        assert!(filtered.files[0].to_string_lossy().contains("keep"));
     }
 
     #[test]

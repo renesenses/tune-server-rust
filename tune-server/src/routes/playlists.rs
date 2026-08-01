@@ -427,6 +427,14 @@ async fn import_m3u_file(
     }
 
     if file_content.is_empty() {
+        // No importable field arrived. Common causes: the multipart body
+        // exceeded axum's DefaultBodyLimit (a large .m3u), a field-decode error
+        // (the `while let Ok(Some(field))` loop then exits early), or no "file"
+        // part was sent. An M3U import that produced nothing otherwise left no
+        // server-side trace at all (JP / Dominique, v0.9.28).
+        tracing::warn!(
+            "m3u_import_file_empty — no importable 'file' field (body too large, or decode error)"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no file provided"})),
@@ -438,13 +446,37 @@ async fn import_m3u_file(
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Imported Playlist".into());
 
+    tracing::info!(name = %name, bytes = file_content.len(), "m3u_import_file_received");
+
     // Parse M3U and match tracks
     let mut track_ids: Vec<i64> = Vec::new();
     let mut total_entries = 0u32;
     let mut matched = 0u32;
+    // Keep only a small SAMPLE of not-found paths for the response; count the
+    // rest. A giant playlist (e.g. a 909k-entry radio dump, Dominique) would
+    // otherwise return ~80 MB of JSON and freeze the browser.
+    let mut not_found_count = 0u32;
     let mut not_found_paths: Vec<String> = Vec::new();
+    const MAX_NOT_FOUND_SAMPLE: usize = 100;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
+
+    // Load every local file_path → id ONCE (single query) for O(1) exact-path
+    // matching. The old loop ran one get_by_path AND one FTS search() PER line;
+    // on a large .m3u whose paths don't match the library layout exactly, every
+    // line fell through to the (expensive, unaccent+LIKE+joins) search, so
+    // thousands of sequential FTS queries hung the request for minutes and the
+    // UI stayed stuck on "loading" until a refresh (Dominique: large M3U
+    // freezes). One map lookup replaces the N point queries.
+    let path_to_id = track_repo.get_all_local_file_info().unwrap_or_default();
+
+    // The FTS fallback (filename→search) stays for paths that don't match
+    // exactly, but is BOUNDED: a fully-mismatched huge playlist can't run an
+    // unbounded number of costly searches. Beyond the cap, unmatched lines are
+    // recorded as not-found without searching (logged once).
+    const MAX_SEARCH_FALLBACKS: u32 = 500;
+    let mut search_fallbacks = 0u32;
+    let mut fallback_capped = false;
 
     for line in file_content.lines() {
         let line = line.trim();
@@ -454,31 +486,47 @@ async fn import_m3u_file(
 
         total_entries += 1;
 
-        // Try exact path match first
-        if let Ok(Some(track)) = track_repo.get_by_path(line) {
-            if let Some(id) = track.id {
-                track_ids.push(id);
-                matched += 1;
-                continue;
-            }
+        // Exact path match (O(1) map lookup).
+        if let Some((id, _, _)) = path_to_id.get(line) {
+            track_ids.push(*id);
+            matched += 1;
+            continue;
         }
 
-        // Try matching by filename (stem) via search
-        let filename = std::path::Path::new(line)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(line);
-        if let Ok(results) = track_repo.search(filename, 1) {
-            if let Some(track) = results.first() {
-                if let Some(id) = track.id {
-                    track_ids.push(id);
-                    matched += 1;
-                    continue;
+        // Filename-stem FTS fallback, bounded.
+        if search_fallbacks < MAX_SEARCH_FALLBACKS {
+            search_fallbacks += 1;
+            let filename = std::path::Path::new(line)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(line);
+            if let Ok(results) = track_repo.search(filename, 1) {
+                if let Some(track) = results.first() {
+                    if let Some(id) = track.id {
+                        track_ids.push(id);
+                        matched += 1;
+                        continue;
+                    }
                 }
             }
+        } else {
+            fallback_capped = true;
         }
 
-        not_found_paths.push(line.to_string());
+        not_found_count += 1;
+        if not_found_paths.len() < MAX_NOT_FOUND_SAMPLE {
+            not_found_paths.push(line.to_string());
+        }
+    }
+
+    if fallback_capped {
+        tracing::warn!(
+            total_entries,
+            matched,
+            search_cap = MAX_SEARCH_FALLBACKS,
+            "m3u_import_search_fallback_capped — many entries don't match library paths; \
+             fuzzy search skipped past the cap to avoid a long-running import"
+        );
     }
 
     // Create playlist and add tracks
@@ -488,6 +536,14 @@ async fn import_m3u_file(
             if !track_ids.is_empty() {
                 repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
             }
+            tracing::info!(
+                playlist_id,
+                name = %name,
+                total_entries,
+                matched,
+                not_found = not_found_count,
+                "m3u_import_file_complete"
+            );
             (
                 StatusCode::CREATED,
                 Json(json!({
@@ -495,14 +551,19 @@ async fn import_m3u_file(
                     "name": name,
                     "total_entries": total_entries,
                     "matched": matched,
-                    "not_found": not_found_paths.len(),
+                    "not_found": not_found_count,
+                    // Sample only (capped) — full count is in `not_found`.
                     "not_found_paths": not_found_paths,
+                    "not_found_truncated": (not_found_count as usize) > not_found_paths.len(),
                     "track_count": track_ids.len(),
                 })),
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "m3u_import_file_create_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 

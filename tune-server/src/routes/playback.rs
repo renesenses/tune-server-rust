@@ -211,12 +211,21 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
+        let output_container = match zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => state.streamer.stream_output_container(sid).await,
+            None => None,
+        };
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &zone_state,
             zone,
             &state.backend,
             renderer_label,
             audio_backend,
+            output_container.as_deref(),
         );
         v.as_object_mut()
             .unwrap()
@@ -811,11 +820,20 @@ async fn play(
     {
         let source_id_val = body.source_id.clone().unwrap_or_default();
         let source_for_q = body.source.clone();
-        let title_val = body.title.clone().unwrap_or_default();
-        let artist_val = body.artist_name.clone().unwrap_or_default();
-        let album_val = body.album_title.clone();
-        let cover_val = body.cover_path.clone();
-        let duration_val = body.duration_ms.unwrap_or(0);
+        // Same empty-title backfill as the queue_add sites: don't persist a blank
+        // title for the row we're about to make the queue (DEvir 0.9.22).
+        let (title_val, artist_val, album_val, cover_val, duration_val) =
+            resolve_streaming_queue_meta(
+                &state,
+                source_for_q.as_deref().unwrap_or_default(),
+                &source_id_val,
+                body.title.as_deref(),
+                body.artist_name.as_deref(),
+                body.album_title.as_deref(),
+                body.cover_path.as_deref(),
+                body.duration_ms,
+            )
+            .await;
 
         let output_device_id = body.output_device_id.or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -893,12 +911,41 @@ async fn play(
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
-        track_repo
+        let mut ids: Vec<i64> = track_repo
             .list_by_album(album_id)
             .unwrap_or_default()
             .iter()
             .filter_map(|t| t.id)
-            .collect()
+            .collect();
+        if ids.is_empty() {
+            // The clicked album row has no tracks. This happens when the flat
+            // Albums/Genres/Years grids surface a stale/duplicate album row whose
+            // tracks actually live under a sibling row of the same title+artist —
+            // the row the Artists view reaches. That mismatch is exactly why the
+            // same album played from Artists but returned 400 "no tracks to play"
+            // from those grids (Pascal, Totaldac, v0.9.21). Recover by resolving
+            // the populated sibling instead of hard-failing.
+            if let Some(sibling) =
+                tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+                    .find_populated_sibling(album_id)
+                    .ok()
+                    .flatten()
+            {
+                ids = track_repo
+                    .list_by_album(sibling)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t.id)
+                    .collect();
+                if !ids.is_empty() {
+                    info!(
+                        zone_id,
+                        album_id, sibling, "album_play_recovered_via_populated_sibling"
+                    );
+                }
+            }
+        }
+        ids
     } else if let Some(playlist_id) = body.playlist_id {
         tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
             .get_track_ids(playlist_id)
@@ -966,8 +1013,17 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    if let Err(e) = set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
-        warn!(zone_id, error = %e, "set_queue_failed");
+    match set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
+        Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
+        Err(e) => {
+            // Never proceed on the STALE queue: track 1 would play now and the
+            // natural-end advance would then resurrect whatever the DB still
+            // holds from yesterday (Villerio: album play drifting into old
+            // Qobuz autoplay leftovers). An emptied queue stops cleanly at the
+            // end of track 1 instead — the lesser evil, and diagnosable.
+            warn!(zone_id, error = %e, "set_queue_failed_clearing");
+            let _ = queue_repo.clear(zone_id);
+        }
     }
 
     // When a container (album/playlist) is requested alongside a track_id,
@@ -1381,6 +1437,67 @@ async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> J
     Json(json!({ "tracks": tracks, "position": position, "length": length }))
 }
 
+/// A client-supplied streaming title is usable only if it is present AND
+/// non-empty. An empty string means the metadata wasn't resolved yet (the
+/// enqueue race that produced `title: Some("")`), and must fall through to a
+/// `get_track()` backfill rather than being persisted as a blank title.
+fn client_title_is_usable(title: Option<&str>) -> bool {
+    title.is_some_and(|s| !s.is_empty())
+}
+
+/// Resolve display metadata for a streaming queue entry, returning
+/// `(title, artist, album, cover_url, duration_ms)`.
+///
+/// Mirrors the play-time guard in the orchestrator (`resolve_streaming_url`):
+/// a title that is absent OR empty triggers a `get_track()` backfill. The
+/// three enqueue sites used to guard on `title.is_some()` only, so a payload
+/// of `title: Some("")` — an upcoming track enqueued before the streaming
+/// service had resolved its metadata — was persisted with a blank title. The
+/// queue-list path does no backfill, so that blank reached the clients, which
+/// render an empty title as "Unknown Track" (DEvir, 0.9.22 — intermittent, only
+/// while the track waits in line; it self-corrected once it became current
+/// because the play path *did* backfill). Same asymmetry as the duration bug
+/// (#944), on the title. Folding the three copies into one helper also removes
+/// the divergence that caused this.
+///
+/// The client payload wins whenever it carries a real (non-empty) title, so the
+/// network call only happens in the degraded empty-title case.
+async fn resolve_streaming_queue_meta(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+    title: Option<&str>,
+    artist: Option<&str>,
+    album: Option<&str>,
+    cover: Option<&str>,
+    duration_ms: Option<i64>,
+) -> (String, String, Option<String>, Option<String>, i64) {
+    if client_title_is_usable(title) {
+        return (
+            title.unwrap_or_default().to_string(),
+            artist.unwrap_or_default().to_string(),
+            album.map(str::to_string),
+            cover.map(str::to_string),
+            duration_ms.unwrap_or(0),
+        );
+    }
+
+    let registry = state.services.lock().await;
+    if let Some(svc) = registry.get(source) {
+        let svc = svc.lock().await;
+        if let Ok(t) = svc.get_track(source_id).await {
+            return (
+                t.title,
+                t.artist,
+                t.album,
+                t.cover_path,
+                t.duration_ms as i64,
+            );
+        }
+    }
+    ("Unknown".into(), String::new(), None, None, 0)
+}
+
 async fn queue_add(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -1397,32 +1514,17 @@ async fn queue_add(
 
     // Single streaming track.
     if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
-        let (title, artist, album, cover, duration) = if body.title.is_some() {
-            (
-                body.title.clone().unwrap_or_default(),
-                body.artist_name.clone().unwrap_or_default(),
-                body.album_title.clone(),
-                body.cover_path.clone(),
-                body.duration_ms.unwrap_or(0),
-            )
-        } else {
-            let registry = state.services.lock().await;
-            if let Some(svc) = registry.get(source) {
-                let svc = svc.lock().await;
-                match svc.get_track(source_id).await {
-                    Ok(t) => (
-                        t.title,
-                        t.artist,
-                        t.album,
-                        t.cover_path,
-                        t.duration_ms as i64,
-                    ),
-                    Err(_) => ("Unknown".into(), String::new(), None, None, 0),
-                }
-            } else {
-                ("Unknown".into(), String::new(), None, None, 0)
-            }
-        };
+        let (title, artist, album, cover, duration) = resolve_streaming_queue_meta(
+            &state,
+            source,
+            source_id,
+            body.title.as_deref(),
+            body.artist_name.as_deref(),
+            body.album_title.as_deref(),
+            body.cover_path.as_deref(),
+            body.duration_ms,
+        )
+        .await;
         inputs.push(QueueInput::Streaming {
             source: source.clone(),
             source_id: source_id.clone(),
@@ -1436,32 +1538,17 @@ async fn queue_add(
 
     // Batch streaming tracks: [{source, source_id, ...}]
     for item in &body.tracks {
-        let (title, artist, album, cover, duration) = if item.title.is_some() {
-            (
-                item.title.clone().unwrap_or_default(),
-                item.artist_name.clone().unwrap_or_default(),
-                item.album_title.clone(),
-                item.cover_path.clone(),
-                item.duration_ms.unwrap_or(0),
-            )
-        } else {
-            let registry = state.services.lock().await;
-            if let Some(svc) = registry.get(&item.source) {
-                let svc = svc.lock().await;
-                match svc.get_track(&item.source_id).await {
-                    Ok(t) => (
-                        t.title,
-                        t.artist,
-                        t.album,
-                        t.cover_path,
-                        t.duration_ms as i64,
-                    ),
-                    Err(_) => ("Unknown".into(), String::new(), None, None, 0),
-                }
-            } else {
-                ("Unknown".into(), String::new(), None, None, 0)
-            }
-        };
+        let (title, artist, album, cover, duration) = resolve_streaming_queue_meta(
+            &state,
+            &item.source,
+            &item.source_id,
+            item.title.as_deref(),
+            item.artist_name.as_deref(),
+            item.album_title.as_deref(),
+            item.cover_path.as_deref(),
+            item.duration_ms,
+        )
+        .await;
         inputs.push(QueueInput::Streaming {
             source: item.source.clone(),
             source_id: item.source_id.clone(),
@@ -2387,7 +2474,17 @@ pub async fn shuffle_all(
     all_ids.truncate(SHUFFLE_MAX_TRACKS as usize);
 
     let zone_id = q.zone_id.unwrap_or(1);
-    queue_repo.set_queue(zone_id, &all_ids).ok();
+    // Was `.ok()` — the only call site that swallowed a set_queue failure
+    // with no trace: track 1 played while the STALE queue stayed in the DB,
+    // and the natural-end advance then resurrected yesterday's entries
+    // (Villerio: album play continued into old Qobuz autoplay leftovers).
+    match queue_repo.set_queue(zone_id, &all_ids) {
+        Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
+        Err(e) => {
+            warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
+            let _ = queue_repo.clear(zone_id);
+        }
+    }
 
     let first_id = all_ids[0];
     let track = track_repo.get(first_id).ok().flatten();
@@ -2507,8 +2604,22 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
 
 #[cfg(test)]
 mod tests {
+    use super::client_title_is_usable;
     use super::play_error_response;
     use axum::http::StatusCode;
+
+    #[test]
+    fn empty_title_is_not_usable_and_triggers_backfill() {
+        // The regression: a present-but-empty title must be treated as
+        // unresolved, so the enqueue path backfills via get_track instead of
+        // persisting a blank that clients render as "Unknown Track" (DEvir).
+        assert!(!client_title_is_usable(Some("")));
+        assert!(!client_title_is_usable(None));
+        // A real title from the client wins — no network call.
+        assert!(client_title_is_usable(Some("Beat It")));
+        // A single space is a real (if odd) title, not the empty-race sentinel.
+        assert!(client_title_is_usable(Some(" ")));
+    }
 
     async fn parts(e: &str) -> (StatusCode, serde_json::Value) {
         let resp = play_error_response(e.to_string());

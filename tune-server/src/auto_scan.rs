@@ -142,26 +142,33 @@ pub fn build_track_from_metadata_opts(
             file = %sf.path,
             "DIAG_album_resolution"
         );
-        // Quality-based album splitting: append suffix when sample_rate or
-        // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
-        // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
-        let suffix = if quality_split {
-            tune_core::scanner::quality::quality_suffix(meta.sample_rate, meta.bit_depth)
+        // The album's folder identifies the release — see
+        // `scanner::album_folder` and `AlbumRepo::get_or_create_for_folder`.
+        //
+        // The quality tier used to be appended to the TITLE ("Album
+        // (96kHz/24bit)") to keep a hi-res copy from merging with a CD rip. It
+        // separated far more than intended: an edition whose discs differ in
+        // sample rate — a box set at 24/192, 16/44.1 and 24/48 — showed up as
+        // three albums under three near-identical titles. The folder separates
+        // exactly what should be separate, and the client already renders the
+        // real quality as a badge from `sample_rate`/`bit_depth`, so the title
+        // never needed to carry it.
+        //
+        // Disambiguation by MusicBrainz release id and by (title, artist_id,
+        // year) is unchanged, inside `get_or_create_for_folder`.
+        // `quality_split` keeps its meaning — "if the same album exists in CD and
+        // Hi-Res, create two separate entries" — and the folder is what now
+        // delivers it. Off ⇒ empty folder ⇒ `get_or_create_for_folder` falls
+        // straight through to the title+artist identity, merging both copies.
+        let folder = if quality_split {
+            tune_core::scanner::album_folder::album_folder(&sf.path).unwrap_or_default()
         } else {
             String::new()
         };
-        let album_title = if suffix.is_empty() {
-            title.clone()
-        } else {
-            format!("{title} ({suffix})")
-        };
-        // Disambiguate by (title, artist_id, year) AND the MusicBrainz release
-        // id, so two distinct editions sharing title+artist+year stay separate
-        // (Dominique). Compilations use the "Various Artists" artist_id, so
-        // same-title albums by different artists are already kept apart.
         album_repo
-            .get_or_create_with_mbid(
-                &album_title,
+            .get_or_create_for_folder(
+                &folder,
+                title,
                 aid,
                 meta.year.map(|y| y as i32),
                 meta.musicbrainz_release_id.as_deref(),
@@ -220,11 +227,23 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            // Mark the scan "done" even on this early exit: the file watcher
+            // waits on this flag before it starts watching.
+            scan_done_clone.store(true, Ordering::Release);
             return;
         }
 
-        let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let exclude_patterns = scan_exclude_patterns(&db);
+        if !exclude_patterns.is_empty() {
+            info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
+        }
+        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+            &music_dirs,
+            &exclude_patterns,
+        );
         let missing_dirs = list_result.missing_dirs;
+        let missing_dir_reasons = list_result.missing_dir_reasons;
+        let error_dirs = list_result.error_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -255,7 +274,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // stats and orphan cleanup.
         let album_repo = AlbumRepo::with_backend(db.clone());
 
-        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        // A DB read error must ABORT the scan, not degrade into an empty map:
+        // with an empty map every file on disk looks new, so a transient DB
+        // hiccup would re-insert the whole library as duplicates. (The
+        // ScanStatusGuard resets scan_status on this early return.)
+        let existing_tracks = match track_repo.get_all_local_file_info() {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
+                scan_done_clone.store(true, Ordering::Release);
+                return;
+            }
+        };
         let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
             .get_existing_audio_hash_album_pairs()
             .unwrap_or_default();
@@ -267,23 +297,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // thread pool oversubscribed well past the core count so the network
         // latency of many stats overlaps instead of running one at a time.
         use rayon::prelude::*;
-        let is_changed = |path: &std::path::Path| -> bool {
-            let path_str: String = path.to_string_lossy().nfc().collect();
-            if let Some(&(_, existing_mtime, existing_size)) =
-                existing_tracks.get(path_str.as_str())
-                && let Ok(file_meta) = path.metadata()
-            {
-                let mtime = file_meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let unchanged = existing_mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-                    && (existing_size == Some(file_meta.len() as i64));
-                return !unchanged;
-            }
-            true
+        // Shared with the manual scan (routes::system::scan) so the two pre-scan
+        // skip filters can't diverge on the NFC key again (the "scan
+        // interminable" bug: NFD-named files missing the map and re-read over SMB).
+        let is_changed = |path: &std::path::Path| {
+            crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
         };
         let stat_pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().ok();
         let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
@@ -328,7 +346,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
         let mut inserted = 0u64;
         let mut updated = 0u64;
+        let mut db_insert_failed = 0u64;
+        let mut db_update_failed = 0u64;
+        // `skipped` stays the aggregate the UI already shows; the per-cause
+        // counters make the report actionable ("skipped 1200" alone doesn't
+        // say whether the library is healthy or half the NAS failed to read).
         let mut skipped = pre_skipped as u64;
+        let mut skipped_unchanged = pre_skipped as u64;
+        let mut skipped_duplicate = 0u64;
+        let mut skipped_no_metadata = 0u64;
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -361,6 +387,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 for sf in &batch {
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
+                        // Counted in the aggregate too, so `processed` can
+                        // actually reach `total` — before this, every failed
+                        // file made the progress bar stop short of 100%.
+                        skipped += 1;
+                        skipped_no_metadata += 1;
                         continue;
                     }
 
@@ -375,6 +406,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                             || (existing_size != Some(sf.file_size as i64));
                         if !file_changed {
                             skipped += 1;
+                            skipped_unchanged += 1;
                             continue;
                         }
                     }
@@ -402,6 +434,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
+                            skipped_duplicate += 1;
                             continue;
                         }
                         known_hashes.insert(key);
@@ -410,8 +443,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     to_insert.push(track);
                 }
 
-                inserted += track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
-                updated += track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                // Per-row failures inside create_batch/update_batch are logged
+                // there and swallowed — count the shortfall so the report shows
+                // tracks that were scanned but never made it into the DB.
+                let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
+                let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                db_insert_failed += to_insert.len() as u64 - batch_inserted;
+                db_update_failed += to_update.len() as u64 - batch_updated;
+                inserted += batch_inserted;
+                updated += batch_updated;
 
                 // Extract extended metadata (ISRC, ReplayGain, MusicBrainz, lyrics, etc.)
                 {
@@ -488,13 +528,22 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // SAFETY: skip tracks under a missing directory (unmounted NAS / a
         // Docker mount that isn't present) — deleting them would wipe the
         // library. Mirrors the manual-scan prune (routes/system/scan.rs).
-        {
+        // A cancelled scan never prunes: `discovered_paths` may be partial and
+        // Stop must never be destructive. Same subtree protection as the manual
+        // scan for `error_dirs` (walk errors mid-scan: files exist but never
+        // made it into the discovered set).
+        if crate::routes::system::scan::scan_cancel_requested() {
+            info!("auto_scan_prune_skipped_cancelled");
+        } else {
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
-                    if in_missing_dir {
+                    let in_unreadable_scope = missing_dirs
+                        .iter()
+                        .chain(error_dirs.iter())
+                        .any(|d| db_path.starts_with(d));
+                    if in_unreadable_scope {
                         protected += 1;
                         continue;
                     }
@@ -506,8 +555,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             if protected > 0 {
                 tracing::warn!(
                     protected,
-                    dirs = ?missing_dirs,
-                    "auto_scan_tracks_protected_missing_dirs"
+                    missing = ?missing_dirs,
+                    walk_errors = ?error_dirs,
+                    "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
             if pruned > 0 {
@@ -537,20 +587,49 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             inserted,
             updated,
             skipped,
+            skipped_unchanged,
+            skipped_duplicate,
+            skipped_no_metadata,
+            db_insert_failed,
+            db_update_failed,
             artwork = artwork_extracted,
             orphan_albums,
             "auto_scan_complete"
         );
 
+        // Import any playlist files (.m3u/.m3u8/.pls) found in the library as
+        // local playlists — same as the manual scan (Bertrand). Idempotent by
+        // playlist name, so the startup scan re-running never duplicates them.
+        let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &music_dirs);
+        if pl.playlists_created > 0 {
+            event_bus.emit(
+                "library.playlists.imported",
+                serde_json::json!({ "playlists": pl.playlists_created, "tracks": pl.tracks_added }),
+            );
+        }
+
+        // Mirror hand-made compilation folders (tracks spanning several albums)
+        // into local playlists — opt-in via scan_folder_playlists (Frédéric).
+        if tune_core::library::folder_playlists::folder_playlists_enabled(&db) {
+            tune_core::library::folder_playlists::sync_folder_playlists(&db);
+        }
+
         let report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
+            "missing_dir_reasons": missing_dir_reasons.clone(),
+            "error_dirs": error_dirs.clone(),
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,
             "inserted": inserted,
             "updated": updated,
             "skipped": skipped,
+            "skipped_unchanged": skipped_unchanged,
+            "skipped_duplicate": skipped_duplicate,
+            "skipped_no_metadata": skipped_no_metadata,
+            "db_insert_failed": db_insert_failed,
+            "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
         });
@@ -574,6 +653,20 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 /// completes before starting to monitor directories. This prevents the watcher
 /// from picking up stale FSEvents replayed on subscription and racing with the
 /// scanner (deleting tracks that the scanner just inserted).
+/// Parse the `scan_exclude_paths` setting: a JSON array of case-insensitive
+/// path substrings excluded from scanning and watching (staging folders,
+/// backup trees, a sibling's library on a shared NAS).
+pub(crate) fn scan_exclude_patterns(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Vec<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("scan_exclude_paths")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
 pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<AtomicBool>>) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let music_dirs: Vec<String> = settings
@@ -587,227 +680,284 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
         return;
     }
 
-    match tune_core::scanner::watcher::FileWatcher::new(music_dirs) {
-        Ok(watcher) => {
-            info!("file_watcher_started");
-            tokio::task::spawn_blocking(move || {
-                // Wait for the initial auto-scan to complete before processing
-                // watcher events. On macOS, FSEvents replays recent events when
-                // a new watcher subscribes, which can cause the watcher to
-                // delete+reinsert tracks that the scanner just added.
-                if let Some(ref flag) = wait_for_scan {
-                    info!("file_watcher_waiting_for_scan");
-                    while !flag.load(Ordering::Acquire) {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    info!("file_watcher_scan_complete_starting_watch");
+    // Normalized roots for the delete guard below — same normalization the
+    // watcher applies internally.
+    let guard_roots: Vec<String> = music_dirs
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .filter(|d| !d.is_empty())
+        .collect();
+
+    tokio::task::spawn_blocking(move || {
+        // Wait for the initial auto-scan to complete before creating the
+        // watcher. On macOS, FSEvents replays recent events when a new
+        // watcher subscribes, which can cause the watcher to delete+reinsert
+        // tracks that the scanner just added.
+        if let Some(ref flag) = wait_for_scan {
+            info!("file_watcher_waiting_for_scan");
+            while !flag.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            info!("file_watcher_scan_complete_starting_watch");
+        }
+        // FileWatcher::new can take MINUTES: for a network mount the poll
+        // watcher's initial watch() walks the whole tree synchronously to
+        // build its baseline (Pierre M: 6 min 43 for K:\ over SMB, the
+        // server looked hung after sqlite_cache_warmed). It must run here,
+        // on the blocking thread AFTER the startup scan — never on the
+        // startup path.
+        let mut watcher = match tune_core::scanner::watcher::FileWatcher::new(music_dirs) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "file_watcher_init_failed");
+                return;
+            }
+        };
+        info!("file_watcher_started");
+        {
+            // Always drain stale events before entering the watch loop.
+            // On macOS, FSEvents replays recent events from the persistent
+            // journal when a new stream is created, even with
+            // kFSEventStreamEventIdSinceNow.  Give it 2 seconds to flush
+            // (the default FSEvents coalescing latency) to avoid
+            // reprocessing events that already happened before startup.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let stale = watcher.poll_changes(std::time::Duration::from_millis(200));
+            if !stale.is_empty() {
+                info!(count = stale.len(), "file_watcher_drained_stale_events");
+            }
+            let watcher_excludes: Vec<String> = scan_exclude_patterns(&db)
+                .iter()
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect();
+            let watcher_quality_split =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+                    .get("quality_split")
+                    .ok()
+                    .flatten()
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(true);
+            let mut liveness_tick: u32 = 0;
+            loop {
+                // Every ~2 min (each idle iteration blocks ~2s): re-watch
+                // roots that appeared or came back after an unmount, and
+                // drop dead watches. A NAS mounted after boot used to stay
+                // invisible to live updates until a server restart.
+                liveness_tick = liveness_tick.wrapping_add(1);
+                if liveness_tick % 60 == 0 {
+                    watcher.ensure_watches();
                 }
-                // Always drain stale events before entering the watch loop.
-                // On macOS, FSEvents replays recent events from the persistent
-                // journal when a new stream is created, even with
-                // kFSEventStreamEventIdSinceNow.  Give it 2 seconds to flush
-                // (the default FSEvents coalescing latency) to avoid
-                // reprocessing events that already happened before startup.
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let stale = watcher.poll_changes(std::time::Duration::from_millis(200));
-                if !stale.is_empty() {
-                    info!(count = stale.len(), "file_watcher_drained_stale_events");
-                }
-                let watcher_quality_split =
-                    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
-                        .get("quality_split")
-                        .ok()
-                        .flatten()
-                        .map(|v| v != "false" && v != "0")
-                        .unwrap_or(true);
-                loop {
-                    let changes = watcher.poll_debounced(
-                        std::time::Duration::from_secs(2),
-                        std::time::Duration::from_millis(500),
-                    );
-                    let had_changes = !changes.is_empty();
-                    for change in changes {
-                        // Tune's own streaming temp files (tune-stream-*/
-                        // tune-prefetch-* in %TEMP%) fire watcher events on every
-                        // transcode when the library root is a parent of the temp
-                        // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
-                        // degrading the first seconds of each streaming play.
-                        if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path))
-                        {
+                let changes = watcher.poll_debounced(
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_millis(500),
+                );
+                let had_changes = !changes.is_empty();
+                for change in changes {
+                    // Same exclusions as the scans (re-read per event batch
+                    // so setting edits apply without a restart is overkill;
+                    // the list was read once at watcher start).
+                    if !watcher_excludes.is_empty() {
+                        let path_l = change.path.to_lowercase();
+                        if watcher_excludes.iter().any(|x| path_l.contains(x.as_str())) {
                             continue;
                         }
-                        match change.change_type {
-                            tune_core::scanner::watcher::ChangeType::Added
-                            | tune_core::scanner::watcher::ChangeType::Modified => {
-                                // Unchanged-file guard (Jean Marie: "le scan tourne
-                                // en boucle", macOS Ventura). A Modified event whose
-                                // on-disk mtime+size still match the stored row is a
-                                // self-induced event: reading a file to import it
-                                // makes macOS write an extended attribute, which
-                                // fires another Modify event → re-read → infinite
-                                // loop. Detect it with a cheap stat and skip —
-                                // crucially WITHOUT reading the content (scan_files_
-                                // parallel), since the read is what re-triggers it.
-                                if change.change_type
-                                    == tune_core::scanner::watcher::ChangeType::Modified
+                    }
+                    // Tune's own streaming temp files (tune-stream-*/
+                    // tune-prefetch-* in %TEMP%) fire watcher events on every
+                    // transcode when the library root is a parent of the temp
+                    // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
+                    // degrading the first seconds of each streaming play.
+                    if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
+                        continue;
+                    }
+                    match change.change_type {
+                        tune_core::scanner::watcher::ChangeType::Added
+                        | tune_core::scanner::watcher::ChangeType::Modified => {
+                            // Unchanged-file guard (Jean Marie: "le scan tourne
+                            // en boucle", macOS Ventura). A Modified event whose
+                            // on-disk mtime+size still match the stored row is a
+                            // self-induced event: reading a file to import it
+                            // makes macOS write an extended attribute, which
+                            // fires another Modify event → re-read → infinite
+                            // loop. Detect it with a cheap stat and skip —
+                            // crucially WITHOUT reading the content (scan_files_
+                            // parallel), since the read is what re-triggers it.
+                            if change.change_type
+                                == tune_core::scanner::watcher::ChangeType::Modified
+                            {
+                                if let Ok(Some(existing)) =
+                                    TrackRepo::with_backend(db.clone()).get_by_path(&change.path)
                                 {
-                                    if let Ok(Some(existing)) = TrackRepo::with_backend(db.clone())
-                                        .get_by_path(&change.path)
-                                    {
-                                        if let Ok(fs_meta) = std::fs::metadata(&change.path) {
-                                            let fs_size = fs_meta.len() as i64;
-                                            let fs_mtime = fs_meta
-                                                .modified()
-                                                .ok()
-                                                .and_then(|t| {
-                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
-                                                })
-                                                .map(|d| d.as_secs() as f64);
-                                            let unchanged =
-                                                existing.file_size.map_or(false, |s| s == fs_size)
-                                                    && match (existing.file_mtime, fs_mtime) {
-                                                        (Some(a), Some(b)) => (a - b).abs() <= 0.5,
-                                                        _ => false,
-                                                    };
-                                            if unchanged {
-                                                tracing::debug!(path = %change.path, "watcher_skip_unchanged");
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                let files: Vec<std::path::PathBuf> =
-                                    vec![std::path::PathBuf::from(&change.path)];
-                                let (scanned, _) = tune_core::scanner::walker::scan_files_parallel(
-                                    &files, true, None,
-                                );
-                                let track_repo = TrackRepo::with_backend(db.clone());
-                                let artist_repo = ArtistRepo::with_backend(db.clone());
-                                let album_repo = AlbumRepo::with_backend(db.clone());
-
-                                for sf in &scanned {
-                                    if sf.metadata.is_none() {
-                                        continue;
-                                    }
-
-                                    if change.change_type
-                                        == tune_core::scanner::watcher::ChangeType::Modified
-                                    {
-                                        track_repo.delete_by_path(&sf.path).ok();
-                                    }
-
-                                    // Decide compilation over the whole folder from
-                                    // the siblings already in the DB, so re-importing
-                                    // a single file (MP3tag save → Modified event)
-                                    // doesn't split a various-artists album tagged
-                                    // with per-track album_artist into one album per
-                                    // artist (JP Borderies). The manual/batch scan
-                                    // sees the whole album at once; the watcher sees
-                                    // one file, so it reconstructs the folder view
-                                    // from the DB. Any doubt → None → per-file
-                                    // self-decide (previous behaviour, no regression).
-                                    let comp_override: Option<bool> =
-                                        sf.metadata.as_ref().and_then(|meta| {
-                                            let dir = std::path::Path::new(&sf.path).parent()?;
-                                            let mut comp = meta.compilation;
-                                            let mut artists: std::collections::HashSet<String> =
-                                                std::collections::HashSet::new();
-                                            let mut note = |aa: Option<&str>| {
-                                                if let Some(a) =
-                                                    aa.map(str::trim).filter(|s| !s.is_empty())
-                                                {
-                                                    if crate::scan_import::is_various_artists(a) {
-                                                        comp = true;
-                                                    }
-                                                    artists.insert(a.to_lowercase());
-                                                }
-                                            };
-                                            note(meta.album_artist.as_deref());
-                                            let siblings = track_repo
-                                                .siblings_album_artists(&dir.to_string_lossy())
-                                                .ok()?;
-                                            for (fp, aa) in &siblings {
-                                                // Direct children only (exclude
-                                                // sub-folders sharing the prefix).
-                                                if std::path::Path::new(fp).parent() != Some(dir) {
-                                                    continue;
-                                                }
-                                                note(aa.as_deref());
-                                            }
-                                            Some(comp || artists.len() >= 2)
-                                        });
-                                    let Some((track, album_id)) = build_track_from_metadata_opts(
-                                        sf,
-                                        &artist_repo,
-                                        &album_repo,
-                                        watcher_quality_split,
-                                        comp_override,
-                                    ) else {
-                                        tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
-                                        continue;
-                                    };
-
-                                    // Skip duplicate: same audio content already in this album
-                                    if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
-                                        if track_repo
-                                            .exists_by_audio_hash_and_album(hash, aid)
-                                            .unwrap_or(false)
-                                        {
-                                            tracing::debug!(
-                                                audio_hash = %hash,
-                                                album_id = aid,
-                                                path = %sf.path,
-                                                "watcher_skip_duplicate_audio_hash"
-                                            );
+                                    if let Ok(fs_meta) = std::fs::metadata(&change.path) {
+                                        let fs_size = fs_meta.len() as i64;
+                                        let fs_mtime = fs_meta
+                                            .modified()
+                                            .ok()
+                                            .and_then(|t| {
+                                                t.duration_since(std::time::UNIX_EPOCH).ok()
+                                            })
+                                            .map(|d| d.as_secs() as f64);
+                                        let unchanged =
+                                            existing.file_size.map_or(false, |s| s == fs_size)
+                                                && match (existing.file_mtime, fs_mtime) {
+                                                    (Some(a), Some(b)) => (a - b).abs() <= 0.5,
+                                                    _ => false,
+                                                };
+                                        if unchanged {
+                                            tracing::debug!(path = %change.path, "watcher_skip_unchanged");
                                             continue;
                                         }
                                     }
-
-                                    if let Some(aid) = album_id {
-                                        let cache_dir = crate::routes::library::artwork_cache_dir();
-                                        if let Some(hash) =
-                                            tune_core::library::artwork::get_or_extract(
-                                                std::path::Path::new(&sf.path),
-                                                &cache_dir,
-                                            )
-                                        {
-                                            album_repo.update_cover_path(aid, &hash).ok();
-                                        }
-                                        album_repo.update_track_count(aid).ok();
-                                        album_repo.update_quality_from_tracks(aid).ok();
-                                    }
-
-                                    if track_repo.create(&track).is_ok() {
-                                        info!(path = %sf.path, "watcher_track_added");
-                                    }
                                 }
                             }
-                            tune_core::scanner::watcher::ChangeType::Deleted => {
-                                let track_repo = TrackRepo::with_backend(db.clone());
-                                if track_repo.delete_by_path(&change.path).is_ok() {
-                                    info!(path = %change.path, "watcher_track_removed");
+                            let files: Vec<std::path::PathBuf> =
+                                vec![std::path::PathBuf::from(&change.path)];
+                            let (scanned, _) =
+                                tune_core::scanner::walker::scan_files_parallel(&files, true, None);
+                            let track_repo = TrackRepo::with_backend(db.clone());
+                            let artist_repo = ArtistRepo::with_backend(db.clone());
+                            let album_repo = AlbumRepo::with_backend(db.clone());
+
+                            for sf in &scanned {
+                                if sf.metadata.is_none() {
+                                    continue;
+                                }
+
+                                if change.change_type
+                                    == tune_core::scanner::watcher::ChangeType::Modified
+                                {
+                                    track_repo.delete_by_path(&sf.path).ok();
+                                }
+
+                                // Decide compilation over the whole folder from
+                                // the siblings already in the DB, so re-importing
+                                // a single file (MP3tag save → Modified event)
+                                // doesn't split a various-artists album tagged
+                                // with per-track album_artist into one album per
+                                // artist (JP Borderies). The manual/batch scan
+                                // sees the whole album at once; the watcher sees
+                                // one file, so it reconstructs the folder view
+                                // from the DB. Any doubt → None → per-file
+                                // self-decide (previous behaviour, no regression).
+                                let comp_override: Option<bool> =
+                                    sf.metadata.as_ref().and_then(|meta| {
+                                        let dir = std::path::Path::new(&sf.path).parent()?;
+                                        let mut comp = meta.compilation;
+                                        let mut artists: std::collections::HashSet<String> =
+                                            std::collections::HashSet::new();
+                                        let mut note = |aa: Option<&str>| {
+                                            if let Some(a) =
+                                                aa.map(str::trim).filter(|s| !s.is_empty())
+                                            {
+                                                if crate::scan_import::is_various_artists(a) {
+                                                    comp = true;
+                                                }
+                                                artists.insert(a.to_lowercase());
+                                            }
+                                        };
+                                        note(meta.album_artist.as_deref());
+                                        let siblings = track_repo
+                                            .siblings_album_artists(&dir.to_string_lossy())
+                                            .ok()?;
+                                        for (fp, aa) in &siblings {
+                                            // Direct children only (exclude
+                                            // sub-folders sharing the prefix).
+                                            if std::path::Path::new(fp).parent() != Some(dir) {
+                                                continue;
+                                            }
+                                            note(aa.as_deref());
+                                        }
+                                        Some(comp || artists.len() >= 2)
+                                    });
+                                let Some((track, album_id)) = build_track_from_metadata_opts(
+                                    sf,
+                                    &artist_repo,
+                                    &album_repo,
+                                    watcher_quality_split,
+                                    comp_override,
+                                ) else {
+                                    tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
+                                    continue;
+                                };
+
+                                // Skip duplicate: same audio content already in this album
+                                if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
+                                    if track_repo
+                                        .exists_by_audio_hash_and_album(hash, aid)
+                                        .unwrap_or(false)
+                                    {
+                                        tracing::debug!(
+                                            audio_hash = %hash,
+                                            album_id = aid,
+                                            path = %sf.path,
+                                            "watcher_skip_duplicate_audio_hash"
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(aid) = album_id {
+                                    let cache_dir = crate::routes::library::artwork_cache_dir();
+                                    if let Some(hash) = tune_core::library::artwork::get_or_extract(
+                                        std::path::Path::new(&sf.path),
+                                        &cache_dir,
+                                    ) {
+                                        album_repo.update_cover_path(aid, &hash).ok();
+                                    }
+                                    album_repo.update_track_count(aid).ok();
+                                    album_repo.update_quality_from_tracks(aid).ok();
+                                }
+
+                                if track_repo.create(&track).is_ok() {
+                                    info!(path = %sf.path, "watcher_track_added");
                                 }
                             }
                         }
-                    }
-                    // After a batch, remove any album left with 0 tracks. An
-                    // incremental re-import can re-point a track to a new album
-                    // row (album_artist tag drift) and leave the old row as a
-                    // cover-only ghost — eric: "une fois avec les pistes, une
-                    // autre fois juste la pochette". The manual scan cleans
-                    // these; the watcher never did.
-                    if had_changes {
-                        let album_repo = AlbumRepo::with_backend(db.clone());
-                        let cleaned = album_repo.delete_orphans().unwrap_or(0);
-                        if cleaned > 0 {
-                            info!(cleaned, "watcher_orphan_albums_cleaned");
+                        tune_core::scanner::watcher::ChangeType::Deleted => {
+                            // NEVER delete tracks because a mount dropped:
+                            // when a NAS goes away, the whole subtree fires
+                            // Remove events (and the poll watcher for
+                            // network mounts sees every file "vanish").
+                            // If the owning music root is unreadable, the
+                            // files are unreachable — not deleted.
+                            if std::path::Path::new(&change.path).exists() {
+                                tracing::debug!(path = %change.path, "watcher_delete_ignored_file_still_present");
+                                continue;
+                            }
+                            if let Some(root) = guard_roots
+                                .iter()
+                                .find(|r| change.path.starts_with(r.as_str()))
+                                && std::fs::read_dir(root).is_err()
+                            {
+                                tracing::warn!(
+                                    path = %change.path,
+                                    root = %root,
+                                    "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
+                                );
+                                continue;
+                            }
+                            let track_repo = TrackRepo::with_backend(db.clone());
+                            if track_repo.delete_by_path(&change.path).is_ok() {
+                                info!(path = %change.path, "watcher_track_removed");
+                            }
                         }
                     }
                 }
-            });
+                // After a batch, remove any album left with 0 tracks. An
+                // incremental re-import can re-point a track to a new album
+                // row (album_artist tag drift) and leave the old row as a
+                // cover-only ghost — eric: "une fois avec les pistes, une
+                // autre fois juste la pochette". The manual scan cleans
+                // these; the watcher never did.
+                if had_changes {
+                    let album_repo = AlbumRepo::with_backend(db.clone());
+                    let cleaned = album_repo.delete_orphans().unwrap_or(0);
+                    if cleaned > 0 {
+                        info!(cleaned, "watcher_orphan_albums_cleaned");
+                    }
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "file_watcher_init_failed");
-        }
-    }
+    });
 }

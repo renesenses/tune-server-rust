@@ -210,6 +210,54 @@ mod tests {
         assert!(output.is_available().await);
     }
 
+    /// Xavier / Zicmu native-DSD album gapless: OAAT always supports internal
+    /// gapless (both PCM/HTTP url-swap and native-DSD reader-swap), so the poller
+    /// arms the transition in both modes. While streaming native DSD it ALSO
+    /// prefers the local-file gapless path (so prepare_gapless stages the next
+    /// `.dsf` directly, with no orphaned DSD->PCM transcode). stop() (run before
+    /// every play_media) clears native-DSD mode so a following PCM track goes
+    /// back to the url-prefetch path.
+    #[tokio::test]
+    async fn oaat_gapless_capabilities_reflect_native_dsd() {
+        let output = OaatOutput::new("Test".into(), "127.0.0.1".into(), 9999, "id".into());
+
+        // OAAT always reports internal gapless (the poller must arm it).
+        assert!(output.supports_internal_gapless());
+
+        // Default (PCM/HTTP mode): stage the next track as a transcoded URL.
+        assert!(
+            !output.prefers_local_file_gapless(),
+            "PCM/HTTP mode must use the url-prefetch gapless path"
+        );
+
+        // Native DSD streaming: stage the next track as a local .dsf file.
+        output.set_native_dsd_active_for_test(true);
+        assert!(output.supports_internal_gapless());
+
+        assert!(
+            output.prefers_local_file_gapless(),
+            "native DSD must use the local-file gapless path (no transcode session)"
+        );
+
+        // PCM direct-file playback: PrepareNext is ignored on that loop, so
+        // NO internal gapless — the poller must advance at natural end
+        // (local→local sur zone OAAT : silence + piste rejouée, 29/07).
+        output.set_direct_pcm_active_for_test(true);
+        assert!(
+            !output.supports_internal_gapless(),
+            "direct PCM playback cannot chain internally — poller must advance"
+        );
+        output.set_direct_pcm_active_for_test(false);
+        assert!(output.supports_internal_gapless());
+
+        // stop() leaves native-DSD mode (runs before the next play_media).
+        output.stop().await.ok();
+        assert!(
+            !output.prefers_local_file_gapless(),
+            "after stop(), the next (PCM) track must return to url-prefetch gapless"
+        );
+    }
+
     fn make_test_wav() -> Vec<u8> {
         let sr = 44100u32;
         let ch = 2u16;

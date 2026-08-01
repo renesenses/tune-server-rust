@@ -673,6 +673,10 @@ pub struct LocalOutput {
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
+    /// PURE (audiophile) bypass for the zone currently playing on this output.
+    /// When set, the playback loop skips the room-correction convolver so the
+    /// signal path stays bit-perfect. Set per-play by the orchestrator.
+    pure_bypass: Arc<AtomicBool>,
 }
 
 impl LocalOutput {
@@ -715,6 +719,7 @@ impl LocalOutput {
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            pure_bypass: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -728,6 +733,14 @@ impl LocalOutput {
     pub fn clear_convolver(&self) {
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
+    /// for the zone currently playing on this output. Set per-play by the
+    /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
+    /// zones on the same output keep it.
+    pub fn set_pure_bypass(&self, bypass: bool) {
+        self.pure_bypass.store(bypass, Ordering::Relaxed);
     }
 
     pub fn has_convolver(&self) -> bool {
@@ -1261,6 +1274,7 @@ impl OutputTarget for LocalOutput {
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
         let convolver = self.convolver.clone();
+        let pure_bypass = self.pure_bypass.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -1716,9 +1730,11 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
+                    if !pure_bypass.load(Ordering::Relaxed) {
+                        if let Ok(mut conv) = convolver.lock() {
+                            if let Some(ref mut c) = *conv {
+                                c.process_interleaved(&mut samples);
+                            }
                         }
                     }
 
@@ -2046,9 +2062,11 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
+                    if !pure_bypass.load(Ordering::Relaxed) {
+                        if let Ok(mut conv) = convolver.lock() {
+                            if let Some(ref mut c) = *conv {
+                                c.process_interleaved(&mut samples);
+                            }
                         }
                     }
 
@@ -2470,6 +2488,62 @@ impl OutputTarget for LocalOutput {
                 )
             };
 
+            // Bit-perfect USB DACs (XMOS/Totaldac, Nagra, …) frequently reject
+            // float and only accept integer PCM: cpal's f32 build_output_stream
+            // then fails with "Sample format 'f32' is not supported by hardware".
+            // This builds the same stream in an integer format instead, converting
+            // the f32 ring-buffer samples on the fly (reuses symphonia's IntoSample,
+            // as orchestrator.rs already does). Only used as a fallback after both
+            // f32 attempts fail, so the f32 happy path is untouched (Pascal, XMOS
+            // USB Audio 2.0 → Totaldac).
+            fn build_int_stream<T>(
+                device: &cpal::Device,
+                cfg: &cpal::StreamConfig,
+                ring_cb: Arc<RingBuf>,
+                vol_cb: Arc<AtomicU32>,
+                paused_cb: Arc<AtomicBool>,
+                silent_cb: Arc<AtomicBool>,
+                ds_cb: Arc<AtomicBool>,
+                min_buf: usize,
+            ) -> Result<cpal::Stream, cpal::BuildStreamError>
+            where
+                T: cpal::SizedSample + Send + 'static,
+                f32: symphonia::core::audio::conv::IntoSample<T>,
+            {
+                use symphonia::core::audio::conv::IntoSample;
+                let zero: T = 0.0f32.into_sample();
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_output_stream(
+                    cfg,
+                    move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                        let n = data.len();
+                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                            data.fill(zero);
+                            return;
+                        }
+                        if !ds_cb.load(Ordering::Acquire) {
+                            if ring_cb.available() < min_buf {
+                                data.fill(zero);
+                                return;
+                            }
+                            ds_cb.store(true, Ordering::Release);
+                        }
+                        if scratch.len() < n {
+                            scratch.resize(n, 0.0);
+                        }
+                        let buf = &mut scratch[..n];
+                        let read = ring_cb.pop(buf);
+                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
+                            *o = (*s * v).into_sample();
+                        }
+                        data[read..].fill(zero);
+                    },
+                    |e| warn!(error = %e, "audio_stream_error"),
+                    None,
+                )
+            }
+
             let finished_flag = Arc::new(AtomicBool::new(false));
 
             let ring_cap =
@@ -2526,13 +2600,77 @@ impl OutputTarget for LocalOutput {
                             (s, source_cfg, ring_fb)
                         }
                         Err(second_err) => {
-                            warn!(
-                                first_error = %first_err,
-                                second_error = %second_err,
-                                "audio_stream_build_failed_both_configs"
-                            );
-                            playing.store(false, Ordering::SeqCst);
-                            return;
+                            // Both f32 attempts failed. The hardware likely rejects
+                            // float (bit-perfect integer-only DAC). Cascade integer
+                            // formats — i32 then i16 — at the chosen rate, then the
+                            // source rate. First one the device accepts wins.
+                            let mut candidates: Vec<cpal::StreamConfig> =
+                                vec![output_config.clone()];
+                            if source_cfg.sample_rate != output_config.sample_rate
+                                || source_cfg.channels != output_config.channels
+                            {
+                                candidates.push(source_cfg.clone());
+                            }
+                            let mut built: Option<(
+                                cpal::Stream,
+                                cpal::StreamConfig,
+                                Arc<RingBuf>,
+                            )> = None;
+                            'int_cascade: for cand in &candidates {
+                                let cap =
+                                    (cand.sample_rate as usize) * (cand.channels as usize) * 2;
+                                let min_buf =
+                                    (cand.sample_rate as usize) * (cand.channels as usize) / 5;
+                                for is_i32 in [true, false] {
+                                    let r = Arc::new(RingBuf::new(cap));
+                                    r.clear();
+                                    data_started_shared.store(false, Ordering::SeqCst);
+                                    let res = if is_i32 {
+                                        build_int_stream::<i32>(
+                                            &device,
+                                            cand,
+                                            r.clone(),
+                                            volume.clone(),
+                                            paused.clone(),
+                                            silent_cb_outer.clone(),
+                                            data_started_shared.clone(),
+                                            min_buf,
+                                        )
+                                    } else {
+                                        build_int_stream::<i16>(
+                                            &device,
+                                            cand,
+                                            r.clone(),
+                                            volume.clone(),
+                                            paused.clone(),
+                                            silent_cb_outer.clone(),
+                                            data_started_shared.clone(),
+                                            min_buf,
+                                        )
+                                    };
+                                    if let Ok(s) = res {
+                                        info!(
+                                            format = if is_i32 { "i32" } else { "i16" },
+                                            sample_rate = cand.sample_rate,
+                                            "local_audio_fallback_to_integer_format"
+                                        );
+                                        built = Some((s, cand.clone(), r));
+                                        break 'int_cascade;
+                                    }
+                                }
+                            }
+                            match built {
+                                Some(t) => t,
+                                None => {
+                                    warn!(
+                                        first_error = %first_err,
+                                        second_error = %second_err,
+                                        "audio_stream_build_failed_all_formats"
+                                    );
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -2824,9 +2962,11 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                if let Ok(mut conv) = convolver.lock() {
-                    if let Some(ref mut c) = *conv {
-                        c.process_interleaved(&mut samples);
+                if !pure_bypass.load(Ordering::Relaxed) {
+                    if let Ok(mut conv) = convolver.lock() {
+                        if let Some(ref mut c) = *conv {
+                            c.process_interleaved(&mut samples);
+                        }
                     }
                 }
 
@@ -3427,6 +3567,8 @@ impl OutputTarget for LocalOutput {
                 track_title: self.track_title.lock().unwrap().clone(),
                 track_artist: self.track_artist.lock().unwrap().clone(),
                 ended_naturally: true,
+                // A renderer plays at 1x: keep the poller's wall-clock guards.
+                realtime: true,
             });
         }
 
@@ -3450,6 +3592,8 @@ impl OutputTarget for LocalOutput {
             track_title: self.track_title.lock().unwrap().clone(),
             track_artist: self.track_artist.lock().unwrap().clone(),
             ended_naturally: self.track_ended_naturally.load(Ordering::Relaxed),
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

@@ -66,7 +66,7 @@ jobs:
             platform: linux-aarch64
             ext: tar.gz
             cross: true
-            features: oaat,postgres
+            features: oaat,postgres,dj,karaoke,plugins-wasm
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -76,7 +76,7 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            features: oaat
+            features: oaat,dj,karaoke,plugins-wasm
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -126,7 +126,7 @@ jobs:
 
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres,dj,karaoke,plugins-wasm
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -139,11 +139,11 @@ jobs:
 
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,plugins-wasm
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,plugins-wasm
 
       # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
       # tune-server so AirPlay 2 works on native installs, not just Docker
@@ -170,19 +170,72 @@ jobs:
             echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
           fi
 
+      - name: Import signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm /tmp/certificate.p12
+
       - name: Package (unix)
         if: runner.os != 'Windows'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           mkdir -p package/web
           cp target/${{ matrix.target }}/release/tune-server package/
           cp -r web/* package/web/
+          # Bundle the Party (WASM) plugin next to the tune-server binary so the
+          # plugins-wasm runtime discovers it at startup (plugins/ resolves
+          # exe-relative first). Sourced from the committed test fixture — the
+          # wasm is NOT rebuilt here.
+          mkdir -p package/plugins/party
+          cp tune-server/tests/fixtures/plugins/party/main.wasm package/plugins/party/
+          cp tune-server/tests/fixtures/plugins/party/manifest.json package/plugins/party/
           # Bundle airplay-daemon next to tune-server if it built for this target.
           DAEMON=""
           if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
             cp "$RUNNER_TEMP/apd/bin/airplay-daemon" package/
             DAEMON="airplay-daemon"
           fi
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON web/
+          # Sign the binaries that ship in the tarball (Homebrew installs these).
+          #
+          # Without this they keep the linker's ad-hoc signature, whose code
+          # identity is `tune_server-<hash of the binary>` — it changes on every
+          # build. macOS keys the Local Network permission to that identity, so
+          # every release silently revoked the user's grant and the kernel then
+          # dropped every connection to a DLNA/AirPlay device on the LAN
+          # (`tcp drop outgoing ... reason: NECP`, EHOSTUNREACH), surfacing as an
+          # unexplained "soap send: error sending request" with no way to recover
+          # short of restarting the server.
+          #
+          # A Developer ID signature with an explicit --identifier gives a
+          # designated requirement built from the identifier and the team, not
+          # from the binary's hash, so the grant survives upgrades. The .app/.dmg
+          # path already signed the same binary; only the tarball was left out.
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+            codesign --force --options runtime --timestamp \
+              --identifier fr.mozaiklabs.tune-server \
+              --sign "$IDENTITY" package/tune-server
+            if [ -n "$DAEMON" ]; then
+              codesign --force --options runtime --timestamp \
+                --identifier fr.mozaiklabs.airplay-daemon \
+                --sign "$IDENTITY" "package/$DAEMON"
+            fi
+            codesign --verify --strict --verbose=2 package/tune-server
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
+          fi
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON web/ plugins/
           cd ..
 
       - name: Package (windows zip)
@@ -196,8 +249,12 @@ jobs:
             copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" package\
           }
           xcopy web\* package\web\ /E /I /Q
+          # Bundle the Party (WASM) plugin next to tune-server.exe (see unix step).
+          mkdir package\plugins\party
+          copy tune-server\tests\fixtures\plugins\party\main.wasm package\plugins\party\
+          copy tune-server\tests\fixtures\plugins\party\manifest.json package\plugins\party\
           cd package
-          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           cd ..
 
@@ -218,6 +275,11 @@ jobs:
             copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" "target\${{ matrix.target }}\release\airplay-daemon.exe"
             $daemonFile = 'File "target\${{ matrix.target }}\release\airplay-daemon.exe"'
           }
+          # Stage the Party (WASM) plugin so the installer ships it next to
+          # tune-server.exe (plugins\ resolves exe-relative at runtime).
+          New-Item -ItemType Directory -Force -Path "plugins\party" | Out-Null
+          copy "tune-server\tests\fixtures\plugins\party\main.wasm" "plugins\party\"
+          copy "tune-server\tests\fixtures\plugins\party\manifest.json" "plugins\party\"
           @"
           !include "MUI2.nsh"
           Name "Tune Server"
@@ -237,8 +299,9 @@ jobs:
             nsExec::ExecToLog 'taskkill /F /IM tune-server.exe'
             Sleep 1500
 
-            ; Remove stale web client files from previous version
+            ; Remove stale web client files and bundled plugins from previous version
             RMDir /r "`$INSTDIR\web"
+            RMDir /r "`$INSTDIR\plugins"
 
             SetOverwrite on
             SetOutPath "`$INSTDIR"
@@ -246,6 +309,10 @@ jobs:
             $daemonFile
             SetOutPath "`$INSTDIR\web"
             File /r "web\*.*"
+            ; Bundled Party (WASM) plugin, next to tune-server.exe
+            SetOutPath "`$INSTDIR\plugins\party"
+            File "plugins\party\main.wasm"
+            File "plugins\party\manifest.json"
 
             ; Launcher script
             SetOutPath "`$INSTDIR"
@@ -286,20 +353,8 @@ jobs:
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
 
-      - name: Import signing certificate
-        if: runner.os == 'macOS'
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
-          security create-keychain -p actions build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p actions build.keychain
-          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
-          rm /tmp/certificate.p12
+      # The keychain is set up before "Package (unix)" so the tarball binaries
+      # get signed too — the DMG below reuses it.
 
       - name: Create DMG (macOS)
         if: runner.os == 'macOS'
@@ -323,6 +378,14 @@ jobs:
             cp "$RUNNER_TEMP/apd/bin/airplay-daemon" "$APP/Contents/Resources/"
           fi
           cp -r web/* "$APP/Contents/Resources/web/"
+          # Bundle the Party (WASM) plugin beside tune-server inside the .app so
+          # the plugins-wasm runtime discovers it (plugins/ resolves exe-relative,
+          # i.e. Contents/Resources/plugins/). Without this, DMG installs would
+          # ship the runtime but never load Party. Sourced from the committed
+          # fixture; the wasm is not rebuilt.
+          mkdir -p "$APP/Contents/Resources/plugins/party"
+          cp tune-server/tests/fixtures/plugins/party/main.wasm "$APP/Contents/Resources/plugins/party/"
+          cp tune-server/tests/fixtures/plugins/party/manifest.json "$APP/Contents/Resources/plugins/party/"
           # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
           on run

@@ -6,6 +6,56 @@ Tune supports plugins that react to server events, read/write configuration,
 and extend behaviour without modifying core code.  Plugins are implemented as
 Rust types that satisfy the `TunePlugin` trait.
 
+### Loading model
+
+Plugins are **compiled into the server** behind cargo features.  There is no
+`libloading` and no wasm runtime — `docs/ARCHITECTURE-CIBLE-v0.9.md` lists
+dynamic loading as a target, not the current state.  Adding a plugin is three
+lines in `tune-server`: a feature, an optional dependency, and an arm in
+`register_builtin_plugins` (`tune-server/src/plugins.rs`).
+
+One cargo constraint to know before you reference an out-of-tree plugin by
+path: **cargo resolves optional path dependencies while writing the lockfile**,
+so a `path` dependency pointing at a directory that is not in the clone breaks
+`cargo check` for everyone, feature enabled or not.  That is why no concrete
+plugin is referenced in this repository.
+
+### Plugins that live outside this repository
+
+Which is the case for anything closed-source.  Rather than referencing it from
+here, invert the dependency: `tune-server` is a library whose `run` *is* the
+whole server startup, so a binary in its own workspace composes the two.
+
+```toml
+# ~/tune-dist/Cargo.toml — its own workspace, not a member of this one
+[workspace]
+
+[dependencies]
+tune-server = { path = "../tune-server-rust/tune-server" }
+tune-core   = { path = "../tune-server-rust/tune-core", default-features = false, features = ["plugin-http"] }
+tokio       = { version = "1", features = ["full"] }
+```
+
+```rust,ignore
+#[tokio::main]
+async fn main() {
+    tune_server::run(Some(Box::new(|state: &AppState| {
+        vec![Box::new(MyPlugin::new(state.backend.clone())) as Box<dyn TunePlugin>]
+    })))
+    .await;
+}
+```
+
+The closure receives `&AppState` because host services — `backend`,
+`services`, `http_client` — only exist once state is built.  It runs after
+local outputs are registered and before the router is built, the same point as
+`register_builtin_plugins`, and what it returns is registered on **equal
+terms**: same protocol gate, same `plugin_{name}_enabled` switch, same
+registration draining, same `/api/v1/ext/{name}` mount.
+
+This repository never learns the plugin's name, so a plain clone keeps
+building, and there is no cargo feature to add here.
+
 ## Creating a Plugin
 
 ### 1. manifest.json
@@ -20,11 +70,18 @@ contain a `manifest.json`:
   "version": "1.0.0",
   "description": "Short description of what the plugin does",
   "author": "Your Name",
-  "entry_point": "main.wasm",
+  "entry_point": "my-plugin",
   "permissions": ["playback", "library"],
-  "min_server_version": "0.8.0"
+  "min_server_version": "0.9.13"
 }
 ```
+
+> **The server does not read this file yet.** Plugins are compiled in (see
+> *Loading model* below), so the loader never scans manifests: `permissions` is
+> not enforced and `min_server_version` is not compared to anything. Ship a
+> manifest anyway — it is the forward-compatible shape — but do not rely on it
+> for anything today. The version check that *is* enforced is
+> `protocol_version` on the trait.
 
 | Field                | Required | Description                                        |
 |----------------------|----------|----------------------------------------------------|
@@ -65,9 +122,13 @@ impl TunePlugin for MyPlugin {
 
     async fn on_event(&mut self, event: &TuneEvent) {
         // Called for every event emitted on the event bus.
+        //
+        // Must return promptly: dispatch is sequential and holds the loader
+        // lock, so blocking here delays every other plugin. Queue the work
+        // and hand it to a task you own.
         match event.event_type.as_str() {
             "playback.started" => { /* react */ }
-            "library.scan.complete" => { /* react */ }
+            "library.scan.completed" => { /* react */ }
             _ => {}
         }
     }
@@ -95,6 +156,79 @@ loader.start_event_dispatch(); // wires EventBus -> on_event
 | `setup`       | `async fn setup(&mut self, ctx: &PluginContext)`          | Once, when the plugin is loaded      |
 | `teardown`    | `async fn teardown(&mut self)`                            | Once, on unload or server shutdown   |
 | `on_event`    | `async fn on_event(&mut self, event: &TuneEvent)`        | For every event on the event bus     |
+
+## Optional declarations
+
+| Method             | Default            | Purpose                                     |
+|--------------------|--------------------|---------------------------------------------|
+| `config_schema`    | `{}`               | JSON schema surfaced by `GET /api/v1/plugins` |
+| `protocol_version` | the SDK's constant | ABI generation this plugin was built against |
+
+`PLUGIN_PROTOCOL_VERSION` is **enforced**: `setup_all` refuses a plugin whose
+major differs, or whose minor is newer than the server's.  With plugins
+compiled in the default can never disagree — there is one `tune-core` in the
+graph — so the gate only fires on a deliberate override.  It exists for the day
+`libloading` lets two generations coexist.
+
+## Registration surface
+
+Everything below is **collected** during `setup` and applied by the host once
+`setup` returns.  A plugin therefore never holds the output-registry lock, and a
+plugin whose `setup` returns `Err` has its registrations dropped rather than
+installed — a broken plugin leaves no half-built device behind.
+
+```rust
+async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
+    // 1. An audio output. Keyed by `device_id()`; refused if something
+    //    already owns that id. Call once per output.
+    ctx.register_output(Box::new(MyOutput::new("myplugin:1", "My Output")));
+
+    // 2. HTTP routes. Mounted at /api/v1/ext/{plugin_name} — you do not
+    //    choose the prefix. Requires the `plugin-http` feature on tune-core.
+    ctx.register_router(axum::Router::new().route("/status", get(status)));
+
+    // 3. A zone bound to one of your outputs, so it is selectable in the UI.
+    ctx.register_zone("My Output", "myplugin", "myplugin:1");
+    Ok(())
+}
+```
+
+| Method            | Applied to                          | Notes |
+|-------------------|-------------------------------------|-------|
+| `register_output` | `OutputRegistry`, keyed on `device_id()` | Refused on id conflict, with a warning |
+| `register_router` | `/api/v1/ext/{plugin_name}`         | `Router<()>`; the host derives the prefix |
+| `register_zone`   | `zones` table, via `get_or_create`  | Only if one of *your* outputs claimed that `device_id` |
+
+Two deliberate constraints:
+
+- **You do not choose your mount prefix.**  Letting a plugin mount anywhere
+  lets it shadow a core route, or another plugin's, with no diagnostic.  The
+  namespace comes from `name()`.
+- **Plugin routes sit inside the `/api/v1` tree**, so they inherit its auth,
+  analytics and body-limit layers.  A plugin endpoint is *not* public.
+
+The router is `Router<()>`: capture your own state in closures rather than
+sharing the host's `AppState`, which keeps `tune-core` independent of
+`tune-server`'s types.
+
+## Database access
+
+```rust
+// The same backend the server uses — SQLite or PostgreSQL.
+if let Some(db) = ctx.db() {
+    let tracks = tune_core::db::track_repo::TrackRepo::with_backend(db);
+    // ...
+}
+```
+
+There is no sandbox: a plugin gets the host's `Arc<dyn DbBackend>` and can read
+or write anything, including creating its own tables.  There is also **no
+per-plugin migration framework** — if you need a table, issue a
+`CREATE TABLE IF NOT EXISTS` in `setup` and version it yourself, e.g. under a
+`ctx.get_config("schema_version")` key.
+
+Prefer `ctx.db()` over calling your own server's REST API, and note the
+`api_base_url` caveat below.
 
 ## PluginContext Methods
 
@@ -132,84 +266,92 @@ ctx.emit_event("my_plugin.something_happened", serde_json::json!({
 
 | Field          | Type             | Description                                |
 |----------------|------------------|--------------------------------------------|
-| `api_base_url` | `String`         | Base URL of the Tune HTTP API              |
+| `api_base_url` | `String`         | Base URL of the Tune HTTP API — see caveat |
 | `data_dir`     | `PathBuf`        | Plugin-specific writable data directory    |
 | `event_bus`    | `Option<EventBus>` | Direct access to the event bus (if set) |
+
+> **`api_base_url` is unusable during `setup`.**  Plugins are set up while the
+> HTTP listener is bound but not yet accepting, so a request to this URL from
+> `setup` sits in the accept backlog until it times out.  Read the library
+> through `ctx.db()` during setup, and keep `api_base_url` for later.
 
 ## Event Types
 
 Events use a dotted namespace convention.  The full list of typed events is
 defined in `tune-core/src/event_types.rs`:
 
+These are the wire names — the strings `EventType::as_str` produces and that
+`event.event_type` carries.  They are part of the client contract; match on them
+verbatim.
+
 ### Playback
 
-| Event                | Data fields                                      |
-|----------------------|--------------------------------------------------|
-| `playback_started`   | `zone_id`, `track_id`, `title`, `artist_name`    |
-| `playback_stopped`   | `zone_id`                                        |
-| `playback_paused`    | (generic)                                        |
-| `playback_resumed`   | (generic)                                        |
-| `track_changed`      | `zone_id`, `track_id`, `title`, `artist_name`, `album_title`, `cover_url` |
-| `volume_changed`     | `zone_id`, `volume`, `muted`                     |
-| `seek_changed`       | (generic)                                        |
-| `shuffle_changed`    | (generic)                                        |
-| `repeat_changed`     | (generic)                                        |
-
-### Queue
-
-| Event           | Data fields |
-|-----------------|-------------|
-| `queue_changed` | (generic)   |
+| Event                     | Data fields                                      |
+|---------------------------|--------------------------------------------------|
+| `playback.started`        | `zone_id`, `track_id`, `title`, `artist_name`    |
+| `playback.stopped`        | `zone_id`                                        |
+| `playback.paused`         | (generic)                                        |
+| `playback.resumed`        | (generic)                                        |
+| `playback.track_changed`  | `zone_id`, `track_id`, `title`, `artist_name`, `album_title`, `cover_url` |
+| `playback.volume`         | `zone_id`, `volume`, `muted`                     |
+| `playback.seek`           | (generic)                                        |
+| `playback.shuffle`        | (generic)                                        |
+| `playback.repeat`         | (generic)                                        |
+| `playback.queue.changed`  | (generic)                                        |
 
 ### Library
 
-| Event                  | Data fields                           |
-|------------------------|---------------------------------------|
-| `scan_started`         | (generic)                             |
-| `scan_progress`        | `scanned`, `total`, `current_path`    |
-| `scan_complete`        | (generic)                             |
-| `library_track_added`  | (generic)                             |
-| `library_track_removed`| (generic)                             |
-| `library_track_updated`| (generic)                             |
+| Event                     | Data fields                           |
+|---------------------------|---------------------------------------|
+| `library.scan.started`    | (generic)                             |
+| `library.scan.progress`   | `scanned`, `total`, `current_path`    |
+| `library.scan.completed`  | (generic)                             |
+| `library.track.added`     | (generic)                             |
+| `library.track.removed`   | (generic)                             |
+| `library.track.updated`   | (generic)                             |
 
 ### Devices
 
-| Event               | Data fields                               |
+| Event                | Data fields                               |
 |----------------------|-------------------------------------------|
-| `device_discovered`  | `device_id`, `name`, `device_type`, `host`|
-| `device_lost`        | (generic)                                 |
+| `device.discovered`  | `device_id`, `name`, `device_type`, `host`|
+| `device.lost`        | (generic)                                 |
 
-### Zones
+### Zones and groups
 
-| Event           | Data fields |
-|-----------------|-------------|
-| `zone_created`  | (generic)   |
-| `zone_deleted`  | (generic)   |
-| `zone_updated`  | (generic)   |
+| Event            | Data fields |
+|------------------|-------------|
+| `zone.created`   | (generic)   |
+| `zone.deleted`   | (generic)   |
+| `zone.updated`   | (generic)   |
+| `group.created`  | (generic)   |
+| `group.updated`  | (generic)   |
+| `group.deleted`  | (generic)   |
 
 ### Services
 
-| Event                  | Data fields |
-|------------------------|-------------|
-| `service_connected`    | (generic)   |
-| `service_disconnected` | (generic)   |
+| Event                   | Data fields |
+|-------------------------|-------------|
+| `service.connected`     | (generic)   |
+| `service.disconnected`  | (generic)   |
 
 ### Social / Party
 
-| Event              | Data fields |
-|--------------------|-------------|
-| `party_track_added`| (generic)   |
-| `party_vote`       | (generic)   |
+| Event                | Data fields |
+|----------------------|-------------|
+| `party.track_added`  | (generic)   |
+| `party.vote`         | (generic)   |
 
 ### System
 
 | Event              | Data fields |
 |--------------------|-------------|
-| `profile_switched` | (generic)   |
+| `profile.switched` | (generic)   |
 | `error`            | (generic)   |
 
-The `EventBus` also supports free-form dotted events such as
-`library.scan.started`, `zone.created`, `system.restart`, etc.
+The `EventBus` also carries free-form dotted events that have no `EventType`
+variant, such as `system.restart` — and anything a plugin emits itself through
+`ctx.emit_event`.
 
 ## Permission Scopes
 
@@ -220,30 +362,42 @@ Declared in `manifest.json` under `permissions`:
 - `settings` -- read/write server settings
 - `network` -- discover and interact with network devices
 
+**Not enforced.**  The loader never reads the manifest, so these are
+documentation of intent, not a sandbox — a plugin runs in-process with the
+server's own database handle.  Use the four scopes above rather than inventing
+finer-grained names, so declarations stay comparable when enforcement lands
+(`docs/ARCHITECTURE-CIBLE-v0.9.md` puts sandboxing after v1).
+
 ## Installation
 
-### From the REST API
+A plugin is installed by **compiling it in**; there is no runtime install step.
+
+1. Add a cargo feature and an optional dependency in `tune-server/Cargo.toml`.
+2. Add an arm to `register_builtin_plugins` in `tune-server/src/plugins.rs`.
+3. Rebuild with `--features your-plugin`.
+
+### REST endpoints
 
 ```bash
-# Install a plugin
-POST /api/plugins/{name}/install
+# List plugins. SDK-backed entries carry "type": "sdk" and are the only ones
+# reflecting running code — the rest is settings-table bookkeeping.
+GET /api/v1/plugins
 
-# Enable / disable
-POST /api/plugins/{name}/enable
-POST /api/plugins/{name}/disable
+# Details for one plugin.
+GET /api/v1/plugins/{name}
 
-# Uninstall
-DELETE /api/plugins/{name}
-
-# List all plugins
-GET /api/plugins
+# Enable / disable / install / uninstall.
+POST   /api/v1/plugins/{name}/enable
+POST   /api/v1/plugins/{name}/disable
+POST   /api/v1/plugins/{name}/install
+DELETE /api/v1/plugins/{name}
 ```
 
-### Manual installation
-
-1. Create a directory under `plugins/` named after your plugin ID.
-2. Place `manifest.json` and your entry point file inside.
-3. Restart the server or call `POST /api/plugins/{name}/install`.
+`install` and `DELETE` only flip keys in the `settings` table — they cannot load
+or unload a compiled-in plugin.  `disable` is different: it writes
+`plugin_{name}_enabled = false`, which `setup_all` honours, so a compiled-in
+plugin can be kept out **at the next start** without recompiling.  It is a boot
+switch, not a hot unload.
 
 ## Architecture
 

@@ -11,9 +11,24 @@ asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]
 postgres = ["tune-core/postgres"]
+# P2 of the plugin ABI: wire the embedded wasmtime runtime (tune-core's
+# `plugins-wasm`) into the real server — AppState-backed HostContext, a
+# registry of loaded wasm plugins, and the `/api/v1/plugins/{id}/…` route
+# mount. NOT in default: the stock server build must not pull in wasmtime.
+plugins-wasm = ["tune-core/plugins-wasm"]
+# P5 of the plugin ABI (#917): DJ mode extracted from the always-on core into a
+# native in-tree plugin. NOT in default: the stock server no longer serves /dj;
+# build `--features dj` to mount the plugin's routes at /api/v1/ext/dj.
+dj = ["dep:tune-dj"]
+# Karaoke: native synced-lyrics plugin (model B, sibling of `dj`). Reuses
+# `tune_core::lyrics` (no LRC parse/fetch reimplemented). NOT in default; build
+# `--features karaoke` to mount its routes at /api/v1/ext/karaoke.
+karaoke = ["dep:tune-karaoke"]
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-dj = { path = "../plugins/tune-dj", optional = true }
+tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -47,3 +62,7 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only: implementing `TunePlugin` and giving it a scratch data dir in
+# tests/plugin_routes.rs.
+async-trait = { workspace = true }
+tempfile = "3"

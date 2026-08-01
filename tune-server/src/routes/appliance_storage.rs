@@ -471,9 +471,15 @@ async fn mount_volume(Json(body): Json<MountVolumeBody>) -> Result<Json<Value>, 
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
+    // Mount under /mnt (a systemd ReadWritePaths root, like /media) — NOT /srv.
+    // tune.service runs with ProtectSystem=strict; /srv is read-only in its
+    // private mount namespace and host mounts made there after boot are not
+    // propagated in, so the server saw an empty/absent dir and add_music_dir +
+    // the scan silently found nothing (Pascal, internal SATA SSD via "use as
+    // music folder"). /mnt propagates just like the working /media USB path.
     let mount_point = format!(
         "{}/{}",
-        env_or("TUNE_MUSIC_MOUNT_BASE", "/srv/tune-music"),
+        env_or("TUNE_MUSIC_MOUNT_BASE", "/mnt/tune-music"),
         short
     );
     let unit_dir = env_or("TUNE_MOUNT_UNIT_DIR", "/etc/systemd/system");

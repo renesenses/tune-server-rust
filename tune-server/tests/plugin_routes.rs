@@ -1,0 +1,372 @@
+//! Plugin runtime, from the outside: what a plugin's routes look like once the
+//! host has mounted them, and what `/api/v1/plugins` says about them.
+//!
+//! The interesting assertions here are the security ones. `register_router`
+//! hands a plugin control over a path segment inside `/api/v1`, and the auth
+//! middleware's public-path allowlist is built from *substring* matches — so
+//! "plugin routes inherit auth" is a claim that has to be tested, not assumed.
+
+use async_trait::async_trait;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::routing::get;
+use serde_json::Value;
+use tower::ServiceExt;
+
+use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::plugin_sdk::{PluginContext, TunePlugin};
+use tune_server::state::AppState;
+
+const SECRET: &str = "test-jwt-secret";
+
+/// Point plugin data dirs at a scratch directory instead of `plugins/data`
+/// under the repo. Shared across tests and set to the *same* value every time,
+/// so the tests that call `plugins::init` concurrently cannot race each other
+/// through the environment. Kept alive for the whole process.
+static PLUGIN_DATA_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+fn use_scratch_plugin_data_dir() {
+    let dir = PLUGIN_DATA_DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    // Safety: always the same value, so a concurrent write is a no-op.
+    unsafe {
+        std::env::set_var("TUNE_PLUGINS_DATA_DIR", dir.path());
+    }
+}
+
+fn new_state() -> AppState {
+    AppState::new(":memory:", 0, Default::default()).unwrap()
+}
+
+/// A plugin router with a plain route and one whose path deliberately collides
+/// with the auth middleware's allowlist.
+fn victim_router() -> axum::Router<()> {
+    axum::Router::new()
+        .route("/ping", get(|| async { "pong" }))
+        .route("/auth/login", get(|| async { "secret" }))
+        .route("/system/health", get(|| async { "secret" }))
+}
+
+fn app_with_plugin(state: &AppState, name: &str) -> axum::Router {
+    tune_server::routes::router_with_plugins(
+        state.clone(),
+        vec![(name.to_string(), victim_router())],
+    )
+}
+
+fn enable_auth(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("auth_enabled", "true").unwrap();
+    settings.set("jwt_secret", SECRET).unwrap();
+}
+
+async fn status_of(app: &axum::Router, path: &str, token: Option<&str>) -> StatusCode {
+    let mut req = Request::get(path);
+    if let Some(tok) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {tok}"));
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn body_of(app: &axum::Router, path: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Mounting
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn plugin_router_is_mounted_under_ext_plugin_name() {
+    let state = new_state();
+    let app = app_with_plugin(&state, "demo");
+
+    let (status, body) = body_of(&app, "/api/v1/ext/demo/ping").await;
+    assert_eq!(status, StatusCode::OK, "plugin route should serve");
+    assert_eq!(body, "pong");
+}
+
+#[tokio::test]
+async fn plugin_namespace_is_derived_from_the_name_not_chosen() {
+    let state = new_state();
+    let app = app_with_plugin(&state, "demo");
+
+    // The same router mounted under a different name must not answer.
+    assert_eq!(
+        status_of(&app, "/api/v1/ext/other/ping", None).await,
+        StatusCode::NOT_FOUND
+    );
+    // Nor outside the /ext namespace.
+    assert_eq!(
+        status_of(&app, "/api/v1/ping", None).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn unknown_subpath_under_a_plugin_is_not_found() {
+    let state = new_state();
+    let app = app_with_plugin(&state, "demo");
+
+    // Documents the `nest_service` consequence: the plugin router owns
+    // everything under its prefix, so this is its 404, not `api_fallback`'s.
+    assert_eq!(
+        status_of(&app, "/api/v1/ext/demo/nope", None).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auth — the reason plugin routes are nested inside /api/v1 at all
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn plugin_routes_inherit_auth() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app_with_plugin(&state, "demo");
+
+    assert_eq!(
+        status_of(&app, "/api/v1/ext/demo/ping", None).await,
+        StatusCode::UNAUTHORIZED,
+        "a plugin route must not be reachable without a token"
+    );
+
+    let token = tune_server::auth::sign_jwt(1, "admin", SECRET).unwrap();
+    assert_eq!(
+        status_of(&app, "/api/v1/ext/demo/ping", Some(&token)).await,
+        StatusCode::OK,
+        "a valid token must reach the plugin route"
+    );
+}
+
+/// A plugin route whose path contains one of the middleware's public
+/// substrings must still require a token. Without the `/ext/` guard in
+/// `auth_middleware`, every assertion below returns 200 and any plugin — or
+/// anyone who can name one — has an unauthenticated hole inside /api/v1.
+#[tokio::test]
+async fn plugin_routes_cannot_smuggle_past_the_public_path_allowlist() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app_with_plugin(&state, "demo");
+
+    for path in [
+        "/api/v1/ext/demo/auth/login",
+        "/api/v1/ext/demo/system/health",
+    ] {
+        assert_eq!(
+            status_of(&app, path, None).await,
+            StatusCode::UNAUTHORIZED,
+            "{path} must not be treated as a public path"
+        );
+    }
+}
+
+/// Same hole reached through the plugin *name* rather than its routes.
+#[tokio::test]
+async fn a_plugin_named_auth_does_not_become_public() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app_with_plugin(&state, "auth");
+
+    assert_eq!(
+        status_of(&app, "/api/v1/ext/auth/ping", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// The guard must not have broken the allowlist it sits in front of.
+#[tokio::test]
+async fn core_public_paths_are_still_public() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app_with_plugin(&state, "demo");
+
+    assert_eq!(
+        status_of(&app, "/api/v1/system/health", None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(&app, "/api/v1/system/version", None).await,
+        StatusCode::OK
+    );
+    // And a normal core route is still protected.
+    assert_eq!(
+        status_of(&app, "/api/v1/zones", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Introspection — /api/v1/plugins must report reality
+// ---------------------------------------------------------------------------
+
+struct Loads;
+
+#[async_trait]
+impl TunePlugin for Loads {
+    fn name(&self) -> &str {
+        "loads"
+    }
+    fn version(&self) -> &str {
+        "1.2.3"
+    }
+    fn description(&self) -> &str {
+        "Sets up fine"
+    }
+    async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Registers a router, so the injection path can be checked end to end.
+struct ServesRoutes;
+
+#[async_trait]
+impl TunePlugin for ServesRoutes {
+    fn name(&self) -> &str {
+        "injected"
+    }
+    fn version(&self) -> &str {
+        "0.1.0"
+    }
+    fn description(&self) -> &str {
+        "Built outside the tree and handed to init"
+    }
+    async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
+        ctx.register_router(axum::Router::new().route("/ping", get(|| async { "pong" })));
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct FailsSetup;
+
+#[async_trait]
+impl TunePlugin for FailsSetup {
+    fn name(&self) -> &str {
+        "fails"
+    }
+    fn version(&self) -> &str {
+        "0.0.1"
+    }
+    fn description(&self) -> &str {
+        "Never finishes setup"
+    }
+    async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+        Err("nope".into())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// `plugin_{name}_enabled = false` keeps a plugin out at boot, and it must not
+/// linger in the REST view either.
+///
+/// Injected through `init`'s `extra` — the path an out-of-tree binary uses — to
+/// pin down that such a plugin is governed by the same switch as a compiled-in
+/// one rather than slipping past it.
+#[tokio::test]
+async fn the_enabled_setting_keeps_a_plugin_out() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_loads_enabled", "false")
+        .unwrap();
+
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
+
+    let reported = state.plugin_info.get().map(|v| v.len()).unwrap_or_default();
+    assert_eq!(reported, 0, "a disabled plugin must not be reported");
+}
+
+/// A plugin handed to `init` from outside the tree loads on equal terms with a
+/// compiled-in one: same setup, same snapshot, same mount.
+#[tokio::test]
+async fn an_injected_plugin_loads_and_mounts_its_router() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    let routers =
+        tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(ServesRoutes)])
+            .await;
+
+    assert_eq!(routers.len(), 1, "the injected plugin contributed a router");
+    assert_eq!(routers[0].0, "injected", "mount name comes from the plugin");
+
+    let names: Vec<&str> = state
+        .plugin_info
+        .get()
+        .expect("init publishes the snapshot")
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["injected"]);
+
+    // End to end: the router it registered actually serves, under its own name.
+    let app = tune_server::routes::router_with_plugins(state.clone(), routers);
+    let (status, body) = body_of(&app, "/api/v1/ext/injected/ping").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "pong");
+}
+
+/// A plugin whose setup failed must not be advertised as installed and enabled.
+/// `setup_all` drops it from the loader, and the snapshot `plugins::init`
+/// publishes inherits that — this pins both halves down together.
+#[tokio::test]
+async fn rest_reports_only_plugins_that_actually_loaded() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    let routers = tune_server::plugins::init(
+        &state,
+        "http://127.0.0.1:0",
+        vec![Box::new(Loads), Box::new(FailsSetup)],
+    )
+    .await;
+    assert!(routers.is_empty(), "neither plugin registers a router");
+
+    let names: Vec<&str> = state
+        .plugin_info
+        .get()
+        .expect("init publishes the snapshot")
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["loads"], "a failed setup must not be reported");
+
+    // And the REST view agrees.
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let sdk: Vec<&Value> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["type"] == "sdk")
+        .collect();
+    assert_eq!(sdk.len(), 1);
+    assert_eq!(sdk[0]["name"], "loads");
+    assert_eq!(sdk[0]["version"], "1.2.3");
+    assert_eq!(sdk[0]["url"], "/api/v1/ext/loads");
+}

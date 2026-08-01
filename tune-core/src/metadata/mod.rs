@@ -977,7 +977,22 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
             Err(_) => (None, None, None, None),
         }
     } else {
-        (None, None, None, None)
+        // DFF (DSDIFF) has no fmt/ID3 chunk like DSF. Previously this arm
+        // returned all-None, so every DFF that reached this fallback (lofty
+        // couldn't decode it, or it had no/empty tag) landed with
+        // duration_ms = 0 — which downstream disables gapless, the wall-clock
+        // advance nets, prefetch and crossfade (poller), cutting the album on
+        // those tracks (DSD testers: Benjithom RS130, LANDES). Read the DSDIFF
+        // header for the real sample rate, channels and duration.
+        match path.to_str().map(crate::audio::dff::parse_dff) {
+            Some(Ok(info)) => (
+                Some(info.sample_rate),
+                Some(info.channels as u16),
+                info.duration_ms(),
+                None,
+            ),
+            _ => (None, None, None, None),
+        }
     };
 
     // Try to read ID3v2 tags from the DSF metadata chunk
@@ -1744,13 +1759,34 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         }
     }
 
+    // Partial-tag fallback: a file can carry SOME tags (artist, a title…) yet be
+    // missing others. lofty leaves those empty, and because the file *is* tagged
+    // the whole-file filename fallback (tagless_fallback) never runs — so a FLAC
+    // with no TRACKNUMBER shows track 0 and one with no ALBUM shows "Album
+    // inconnu", even though the filename ("09.Stuffy") and folder carry the
+    // answer (JP Robbe; confirmed on real libraries: Jazz at the Pawnshop /
+    // Montreux Alexander FLACs have TITLE+ALBUM but no TRACKNUMBER). Fill each
+    // MISSING field individually — never override a value the tag already has.
+    let (fname_track, fname_title) = extract_title_from_filename(path);
+    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
+        title = fname_title;
+    }
+    if album.as_deref().map_or(true, |a| a.trim().is_empty()) {
+        album = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+    }
+    let track_number = tag.track().or(fname_track);
+
     Ok(TrackMetadata {
         title,
         artist,
         album,
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
-        track_number: tag.track(),
+        track_number,
         disc_number: tag.disk(),
         total_tracks,
         total_discs,
@@ -2877,6 +2913,27 @@ mod tests {
         let g = mp3_first_tag_genre_if_dual(&tmp);
         std::fs::remove_file(&tmp).ok();
         assert_eq!(g, None);
+    }
+
+    #[test]
+    fn filename_track_and_title_extraction() {
+        // Powers the partial-tag fallback (JP Robbe / Jazz at the Pawnshop): a
+        // FLAC missing TRACKNUMBER still gets its number + title from the filename.
+        let cases = [
+            ("09.Stuffy.flac", Some(9), "Stuffy"),
+            ("01 Expresso love.flac", Some(1), "Expresso love"),
+            (
+                "13 Going home (with Hank Marvin).flac",
+                Some(13),
+                "Going home (with Hank Marvin)",
+            ),
+            ("Sultans of Swing.flac", None, "Sultans of Swing"), // no leading number
+        ];
+        for (name, want_num, want_title) in cases {
+            let (num, title) = extract_title_from_filename(Path::new(name));
+            assert_eq!(num, want_num, "track number for {name}");
+            assert_eq!(title.as_deref(), Some(want_title), "title for {name}");
+        }
     }
 
     #[test]

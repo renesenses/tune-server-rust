@@ -187,6 +187,7 @@ impl AmazonMusicService {
             track_number: data["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: data["discNumber"].as_u64().map(|n| n as u32),
             explicit: data["explicit"].as_bool().unwrap_or(false),
+            isrc: data["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: if self.quality == "SD" {
                     "AAC".into()

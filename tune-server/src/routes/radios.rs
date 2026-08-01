@@ -47,11 +47,109 @@ struct CreateRadio {
     bitrate: Option<i32>,
 }
 
+/// Backfill missing station logos from the mozaiklabs.fr radio directory.
+///
+/// The seeded default stations (migration `seed_default_radios`) and any station
+/// imported without art have no `logo_url`, so the radio list shows the
+/// placeholder mic icon (Pascal, v0.9.21). The public directory at
+/// `/api/v1/radios` carries a curated logo per station; match our local rows to
+/// it by stream URL (then name) and fill in the absolute logo URL. The web
+/// client proxies that URL through the LOCAL server (`artworkUrl` →
+/// `/library/artwork/proxy`), so it displays even behind a strict CSP.
+///
+/// Best-effort and cloud-graceful: any network/parse failure is a no-op (Tune
+/// works fully without mozaiklabs.fr). Never overwrites a logo already set.
+pub async fn refresh_radio_logos(state: &AppState) -> usize {
+    const DIRECTORY_URL: &str = "https://mozaiklabs.fr/api/v1/radios";
+    const BASE: &str = "https://mozaiklabs.fr";
+
+    let directory: Vec<Value> = match tune_core::http::client::shared()
+        .get(DIRECTORY_URL)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => return 0,
+    };
+
+    // Normalize a stream URL for matching: scheme-insensitive, no trailing slash.
+    let norm = |u: &str| {
+        u.trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string()
+    };
+
+    let mut by_url: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for item in &directory {
+        let Some(logo) = item
+            .get("logo_url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let abs = if logo.starts_with("http") {
+            logo.to_string()
+        } else {
+            format!("{BASE}{logo}")
+        };
+        if let Some(su) = item.get("stream_url").and_then(|v| v.as_str()) {
+            by_url.entry(norm(su)).or_insert_with(|| abs.clone());
+        }
+        if let Some(nm) = item.get("name").and_then(|v| v.as_str()) {
+            by_name
+                .entry(nm.trim().to_ascii_lowercase())
+                .or_insert_with(|| abs.clone());
+        }
+    }
+    if by_url.is_empty() && by_name.is_empty() {
+        return 0;
+    }
+
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let mut updated = 0usize;
+    for mut st in repo.list().unwrap_or_default() {
+        if st.logo_url.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            continue; // keep an existing / user-set logo
+        }
+        let logo = by_url
+            .get(&norm(&st.url))
+            .or_else(|| by_name.get(&st.name.trim().to_ascii_lowercase()))
+            .cloned();
+        if let Some(logo) = logo {
+            st.logo_url = Some(logo);
+            if repo.update(&st).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    if updated > 0 {
+        state.event_bus.emit(
+            "library.radios_changed",
+            json!({"action": "logos_refreshed", "updated": updated}),
+        );
+        tracing::info!(updated, "radio_logos_refreshed_from_directory");
+    }
+    updated
+}
+
+async fn refresh_logos_handler(State(state): State<AppState>) -> Json<Value> {
+    let updated = refresh_radio_logos(&state).await;
+    Json(json!({ "updated": updated }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_radios).post(create_radio))
         .route("/search", get(search_radios))
         .route("/favorites", get(list_favorites))
+        .route("/refresh-logos", post(refresh_logos_handler))
         .route("/add", get(add_from_web))
         .route(
             "/{id}",
@@ -711,15 +809,16 @@ async fn save_current_as_favorite(
 struct CreatePlaylistFromFavBody {
     name: Option<String>,
     playlist_name: Option<String>,
-    #[allow(dead_code)]
-    service: Option<String>, // accepted for forward-compat; not used yet
+    /// Target: "local" (default) or a connected streaming service name
+    /// (e.g. "qobuz", "tidal", "deezer").
+    service: Option<String>,
     limit: Option<usize>,
 }
 
 async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let favorites: Vec<(String, String)> = state
         .backend
         .query_many(
@@ -744,7 +843,7 @@ async fn create_playlist_from_favorites(
             .into_response());
     }
 
-    let (name, limit) = match body {
+    let (name, limit, service) = match body {
         Some(Json(ref b)) => {
             let n = b
                 .playlist_name
@@ -752,9 +851,9 @@ async fn create_playlist_from_favorites(
                 .or(b.name.clone())
                 .unwrap_or_else(|| "Radio Favorites".into());
             let l = b.limit.unwrap_or(200);
-            (n, l)
+            (n, l, b.service.clone())
         }
-        None => ("Radio Favorites".into(), 200),
+        None => ("Radio Favorites".into(), 200, None),
     };
 
     let favorites: Vec<(String, String)> = if limit < favorites.len() {
@@ -763,6 +862,33 @@ async fn create_playlist_from_favorites(
         favorites
     };
 
+    // Beaucoup de radios livrent tout dans le StreamTitle ICY : le favori
+    // arrive alors avec artist vide et title « Artiste - Titre ». Découper
+    // avant matching, sinon le titre composite ne ressemble à aucun vrai
+    // titre et rien ne matche (forum #1234, Xavier).
+    let favorites: Vec<(String, String)> = favorites
+        .into_iter()
+        .map(|(title, artist)| {
+            if artist.trim().is_empty() {
+                if let Some((a, t)) = title.split_once(" - ") {
+                    let (a, t) = (a.trim(), t.trim());
+                    if !a.is_empty() && !t.is_empty() {
+                        return (t.to_string(), a.to_string());
+                    }
+                }
+            }
+            (title, artist)
+        })
+        .collect();
+
+    // Streaming target: resolve each favorite onto the service (smart-matched,
+    // ISRC-aware) and build the playlist there — Hi-Res where the service offers it.
+    let target = service.unwrap_or_else(|| "local".into());
+    if target != "local" {
+        return create_streaming_playlist_from_favorites(&state, &target, &name, &favorites).await;
+    }
+
+    // Local target: match each favorite against the local library.
     let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
     let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     let playlist_id = match repo.create(&name, None, DEFAULT_PROFILE_ID) {
@@ -798,6 +924,118 @@ async fn create_playlist_from_favorites(
             "name": name,
             "favorites_count": favorites.len(),
             "matched_tracks": matched,
+        })),
+    )
+        .into_response())
+}
+
+/// Build the playlist on a streaming service: smart-match (ISRC-aware) each radio
+/// favorite onto the service catalogue via `best_stream_match`, then create the
+/// playlist on that service and add the matched tracks. Returns a per-favorite
+/// report so the client can show what matched and what didn't.
+async fn create_streaming_playlist_from_favorites(
+    state: &AppState,
+    service: &str,
+    name: &str,
+    favorites: &[(String, String)],
+) -> Result<axum::response::Response, AppError> {
+    let svc_arc = {
+        let reg = state.services.lock().await;
+        match reg.get(service) {
+            Some(a) => a,
+            None => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("service '{service}' not found or not connected")
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    };
+    let svc = svc_arc.lock().await;
+
+    let mut matched_ids: Vec<String> = Vec::new();
+    let mut details: Vec<Value> = Vec::new();
+    for (title, artist) in favorites {
+        let q = if artist.is_empty() {
+            title.clone()
+        } else {
+            format!("{artist} {title}")
+        };
+        // radio favorites carry no ISRC/duration, so match on normalized title+artist.
+        let best = match svc.search(&q, 10).await {
+            Ok(results) => tune_core::streaming::matching::best_stream_match(
+                title,
+                artist,
+                "",
+                0,
+                &results.tracks,
+            )
+            .cloned(),
+            Err(_) => None,
+        };
+        match best {
+            Some(t) => {
+                details.push(json!({
+                    "title": title,
+                    "artist": artist,
+                    "matched_title": t.title,
+                    "matched_artist": t.artist,
+                    "matched_id": t.id,
+                    "status": "matched",
+                }));
+                matched_ids.push(t.id);
+            }
+            None => details.push(json!({
+                "title": title,
+                "artist": artist,
+                "status": "not_found",
+            })),
+        }
+    }
+
+    let mut remote_playlist_id: Option<String> = None;
+    if !matched_ids.is_empty() {
+        match svc
+            .create_playlist(name, Some("Created by Tune from radio favorites"))
+            .await
+        {
+            Ok(pid) => {
+                if let Err(e) = svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                    tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                }
+                remote_playlist_id = Some(pid);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    service = %service,
+                    error = %e,
+                    "radio_fav_create_playlist_failed (service may not support write)"
+                );
+                return Ok((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("could not create playlist on '{service}': {e}"),
+                        "matched_tracks": matched_ids.len(),
+                        "details": details,
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "service": service,
+            "name": name,
+            "favorites_count": favorites.len(),
+            "matched_tracks": matched_ids.len(),
+            "remote_playlist_id": remote_playlist_id,
+            "details": details,
         })),
     )
         .into_response())

@@ -108,6 +108,28 @@ pub mod sql {
         )
     }
 
+    pub fn get_id_by_folder<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id FROM albums WHERE folder_path = {} LIMIT 1",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_folder_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT folder_path FROM albums WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_folder_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET folder_path = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {}, release_date = {}, original_date = {} WHERE id = {}",
@@ -482,6 +504,103 @@ impl AlbumRepo {
         album.year = year;
         album.musicbrainz_release_id = mbid.map(String::from);
         Ok(album)
+    }
+
+    /// The album a folder holds, creating it if this is the folder's first track.
+    ///
+    /// The folder on disk is what identifies a release, so it is tried first.
+    /// That is what keeps an edition together when its discs differ in sample
+    /// rate — a box set mixing 24/192, 16/44.1 and 24/48 is one album, not three
+    /// — and what keeps two separate rips of the same album apart without
+    /// resorting to a "(96kHz/24bit)" suffix on the title.
+    ///
+    /// Falling back to [`Self::get_or_create_with_mbid`] keeps every existing
+    /// rule intact (MusicBrainz release id, title + artist + year), with one
+    /// added condition: a candidate already claimed by a *different* folder is
+    /// not reused, or the second rip would be merged into the first. A candidate
+    /// with no folder yet — every album indexed before this column existed —
+    /// adopts this one, so a library converts as it is rescanned rather than
+    /// duplicating.
+    pub fn get_or_create_for_folder(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+    ) -> Result<Album, TuneError> {
+        if folder.is_empty() {
+            return self.get_or_create_with_mbid(title, artist_id, year, mbid);
+        }
+
+        if let Some(id) = self.find_id_by_folder(folder)? {
+            // `_strong` like every other read on this path: the scanner runs
+            // inside a `BEGIN IMMEDIATE`, so a pooled reader would not see rows
+            // written moments ago by this same transaction.
+            let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+            let params: [&dyn ToSqlValue; 1] = [&id];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                return Ok(row_to_album(&row));
+            }
+        }
+
+        let candidate = self.get_or_create_with_mbid(title, artist_id, year, mbid)?;
+        let Some(id) = candidate.id else {
+            return Ok(candidate);
+        };
+
+        match self.folder_path_of(id)? {
+            // Already ours, or freshly created by the call above.
+            Some(existing) if existing == folder => Ok(candidate),
+            // Another folder owns it: this is a distinct release that merely
+            // shares title, artist and year. Give it its own row.
+            Some(_) => {
+                let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
+                let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
+                self.db.execute(&create_sql, &params)?;
+                let new_id = self.db.last_insert_rowid();
+                self.set_folder_path(new_id, folder)?;
+                let mut album = Album::new(title.to_string());
+                album.id = Some(new_id);
+                album.artist_id = Some(artist_id);
+                album.year = year;
+                album.musicbrainz_release_id = mbid.map(String::from);
+                Ok(album)
+            }
+            // Indexed before folders were recorded (or just created): claim it.
+            None => {
+                self.set_folder_path(id, folder)?;
+                Ok(candidate)
+            }
+        }
+    }
+
+    /// The id of the album a folder holds, if one is recorded.
+    pub fn find_id_by_folder(&self, folder: &str) -> Result<Option<i64>, TuneError> {
+        let sql = self.dialect_sql(sql::get_id_by_folder, sql::get_id_by_folder);
+        let params: [&dyn ToSqlValue; 1] = [&folder];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .and_then(|row| row.first()?.as_i64()))
+    }
+
+    /// The folder recorded for an album, `None` when it predates the column.
+    pub fn folder_path_of(&self, album_id: i64) -> Result<Option<String>, TuneError> {
+        let sql = self.dialect_sql(sql::get_folder_path, sql::get_folder_path);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .and_then(|row| row.first()?.as_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    pub fn set_folder_path(&self, album_id: i64, folder: &str) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_folder_path, sql::set_folder_path);
+        let params: [&dyn ToSqlValue; 2] = [&folder, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
     }
 
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
@@ -936,6 +1055,37 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// When `album_id` points at an album row that has NO tracks (a stale or
+    /// duplicate row), find another album with the SAME title + artist that DOES
+    /// have tracks — the row the Artists view reaches. Returns the sibling id
+    /// with the most tracks, or `None` if there is no populated sibling.
+    ///
+    /// This is why the same album could 400 ("no tracks to play") from the flat
+    /// Albums/Genres/Years grids (which can surface the empty row) yet play fine
+    /// from the Artists view (which reaches the populated row) — Pascal, v0.9.21.
+    pub fn find_populated_sibling(&self, album_id: i64) -> Result<Option<i64>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT a.id FROM albums a \
+             JOIN albums s ON s.id = {ph} \
+             WHERE a.id <> s.id \
+               AND LOWER(a.title) = LOWER(s.title) \
+               AND ((a.artist_id = s.artist_id) OR (a.artist_id IS NULL AND s.artist_id IS NULL)) \
+               AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id) \
+             ORDER BY (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) DESC \
+             LIMIT 1"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_i64()))
+    }
+
     /// Match albums where `genre` appears in either the legacy
     /// delimiter-separated text column or the structured `genres`
     /// JSON array (via `dialect.json_array_contains_lower`). Now
@@ -1177,6 +1327,43 @@ mod tests {
         let deleted = repo.delete_orphans().unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(repo.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn find_populated_sibling_resolves_duplicate_empty_album() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let aid = artist_repo
+            .create(&Artist::new("Muddy Waters".into()))
+            .unwrap();
+
+        // Two album rows for the same title+artist: one populated, one empty —
+        // the duplicate that makes "play album" 400 from the flat grids.
+        let mut populated = Album::new("Folk Singer".into());
+        populated.artist_id = Some(aid);
+        let populated_id = arepo.create(&populated).unwrap();
+        let mut empty = Album::new("Folk Singer".into());
+        empty.artist_id = Some(aid);
+        let empty_id = arepo.create(&empty).unwrap();
+
+        let mut t = Track::new("My Home Is in the Delta".into());
+        t.album_id = Some(populated_id);
+        t.artist_id = Some(aid);
+        t.file_path = Some("/blues/folk-singer/01.flac".into());
+        trepo.create(&t).unwrap();
+
+        // The empty duplicate resolves to the populated sibling.
+        assert_eq!(
+            arepo.find_populated_sibling(empty_id).unwrap(),
+            Some(populated_id)
+        );
+        // The populated album has no *other* populated sibling → None.
+        assert_eq!(arepo.find_populated_sibling(populated_id).unwrap(), None);
     }
 
     #[test]
@@ -1945,5 +2132,136 @@ mod tests {
         assert_eq!(a.id, a2.id);
         // list_by_genre returns an empty list rather than erroring.
         assert!(repo.list_by_genre("Jazz").unwrap().is_empty());
+    }
+
+    /// One folder is one album, whatever the tracks' sample rates.
+    ///
+    /// The case that motivated this: a box set whose discs are 24/192, 16/44.1
+    /// and 24/48 used to become three albums titled "X", "X (192kHz/24bit)" and
+    /// "X (48kHz/24bit)" because the quality tier was appended to the title.
+    #[test]
+    fn one_folder_is_one_album_across_quality_tiers() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo
+            .create(&Artist::new("Green Day".into()))
+            .unwrap();
+        let folder = "/music/Green Day/American Idiot";
+
+        let first = repo
+            .get_or_create_for_folder(folder, "American Idiot", aid, Some(2004), None)
+            .unwrap();
+        let second = repo
+            .get_or_create_for_folder(folder, "American Idiot", aid, Some(2004), None)
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            repo.folder_path_of(first.id.unwrap()).unwrap().as_deref(),
+            Some(folder)
+        );
+    }
+
+    /// Two folders are two albums, even sharing title, artist and year — this is
+    /// what the `quality_split` setting promises ("if the same album exists in CD
+    /// and Hi-Res, create two separate entries"), now without a suffix in the
+    /// title: the client renders the quality from `sample_rate`/`bit_depth`.
+    #[test]
+    fn two_folders_stay_two_albums() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo
+            .create(&Artist::new("Pink Floyd".into()))
+            .unwrap();
+
+        let cd = repo
+            .get_or_create_for_folder(
+                "/music/PF/Division Bell",
+                "The Division Bell",
+                aid,
+                Some(1994),
+                None,
+            )
+            .unwrap();
+        let hires = repo
+            .get_or_create_for_folder(
+                "/music/PF/Division Bell (24-192)",
+                "The Division Bell",
+                aid,
+                Some(1994),
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(cd.id, hires.id, "two rips must not be merged");
+        assert_eq!(cd.title, hires.title, "and neither title carries a suffix");
+    }
+
+    /// An album indexed before folders were recorded adopts the first folder that
+    /// claims it, so a library converts as it is rescanned instead of doubling.
+    #[test]
+    fn a_folderless_album_is_adopted_not_duplicated() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo.create(&Artist::new("The Who".into())).unwrap();
+
+        // As the old scanner would have left it: no folder recorded.
+        let legacy = repo.get_or_create("Tommy", aid, Some(1969)).unwrap();
+        assert!(repo.folder_path_of(legacy.id.unwrap()).unwrap().is_none());
+
+        let rescanned = repo
+            .get_or_create_for_folder("/music/The Who/Tommy", "Tommy", aid, Some(1969), None)
+            .unwrap();
+
+        assert_eq!(legacy.id, rescanned.id, "the existing row must be reused");
+        assert_eq!(
+            repo.folder_path_of(legacy.id.unwrap()).unwrap().as_deref(),
+            Some("/music/The Who/Tommy")
+        );
+    }
+
+    /// With no folder to go on, identity falls back to exactly what it was.
+    #[test]
+    fn an_empty_folder_falls_back_to_title_and_artist() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo.create(&Artist::new("Nobody".into())).unwrap();
+
+        let a = repo
+            .get_or_create_for_folder("", "Untitled", aid, None, None)
+            .unwrap();
+        let b = repo
+            .get_or_create_for_folder("", "Untitled", aid, None, None)
+            .unwrap();
+        assert_eq!(a.id, b.id);
+        assert!(repo.folder_path_of(a.id.unwrap()).unwrap().is_none());
+    }
+
+    /// The MusicBrainz rule still wins where it applies: two distinct releases
+    /// in two folders stay distinct, and the same release id is not duplicated.
+    #[test]
+    fn musicbrainz_identity_survives_folder_identity() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo.create(&Artist::new("Artist".into())).unwrap();
+
+        let one = repo
+            .get_or_create_for_folder("/m/A", "Album", aid, Some(2000), Some("mbid-1"))
+            .unwrap();
+        let two = repo
+            .get_or_create_for_folder("/m/B", "Album", aid, Some(2000), Some("mbid-2"))
+            .unwrap();
+        assert_ne!(one.id, two.id);
+
+        // Same folder, same release id → same row.
+        let again = repo
+            .get_or_create_for_folder("/m/A", "Album", aid, Some(2000), Some("mbid-1"))
+            .unwrap();
+        assert_eq!(one.id, again.id);
     }
 }

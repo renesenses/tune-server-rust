@@ -26,6 +26,8 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_heartbeat(state);
     spawn_bio_sync(state);
     spawn_community_sync(state);
+    spawn_replaygain_analysis(state);
+    spawn_radio_logo_refresh(state);
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
@@ -181,6 +183,12 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                     };
                     match orchestrator.play(req).await {
                         Ok(_) => {
+                            // Mark the restart so the poller suppresses a phantom
+                            // gapless auto-advance: this replay restarts the
+                            // CURRENT track from 0, and that position drop would
+                            // otherwise be read as a real transition, running
+                            // now-playing one track ahead of the audio.
+                            playback.mark_restart(zone_id).await;
                             // Restore the queue length from the DB so the poller
                             // keeps auto-advancing after the restart (mirrors the
                             // /zones/{id}/play handler; without it a mid-album stall
@@ -289,14 +297,38 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     continue;
                 }
 
+                // Cross-protocol duplicate guard (Phase B, #1239): the startup
+                // batch had NO dedup at all — a device already owning a zone
+                // under another protocol (BluOS via mDNS) gained a second
+                // "dlna" zone here on every fresh boot. Match on the persisted
+                // host/MAC identity of visible zones.
+                if let Some((zid, zname, ztype)) =
+                    zone_repo.find_visible_zone_by_identity(&d.host, d.mac_address.as_deref())
+                {
+                    if !ztype.is_empty() && !ztype.eq_ignore_ascii_case("dlna") {
+                        info!(
+                            name = %d.name,
+                            device_id = %d.id,
+                            host = %d.host,
+                            conflicting_zone = %zname,
+                            conflicting_zone_id = zid,
+                            conflicting_type = %ztype,
+                            "ssdp_startup_zone_skipped_conflicting_protocol"
+                        );
+                        continue;
+                    }
+                }
+
                 // Auto-created zones start dormant and don't count against the
                 // free tier; the cap is enforced at first play in
                 // orchestrator.play(). So discovery may always register a device.
                 match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
                     Ok((zid, true)) => {
+                        let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
                     }
-                    Ok((_, false)) => {
+                    Ok((zid, false)) => {
+                        let _ = zone_repo.set_identity(zid, &d.host, d.mac_address.as_deref());
                         let _ = zone_repo.set_online_by_device(&d.id, true);
                     }
                     Err(e) => {
@@ -658,6 +690,14 @@ fn spawn_heartbeat(state: &AppState) {
                 .into_iter()
                 .filter_map(|z| z.output_device_id.map(|did| (did, z.name)))
                 .collect();
+            // Physical identity persisted on zones (Phase B): lets the
+            // mozaiklabs admin identify renderer brands by MAC OUI instead
+            // of guessing from device names.
+            let zone_identities: std::collections::HashMap<String, (String, String)> = zone_repo
+                .device_identities()
+                .into_iter()
+                .map(|(did, host, mac)| (did, (host, mac)))
+                .collect();
 
             let devices: Vec<serde_json::Value> = match outputs.try_lock() {
                 Ok(registry) => registry
@@ -682,7 +722,23 @@ fn spawn_heartbeat(state: &AppState) {
                                 .or_else(|| id.strip_prefix("uuid:"))
                                 .unwrap_or(&id)
                         });
-                        serde_json::json!({ "name": name, "type": dev_type })
+                        let (mac, manufacturer) = zone_identities
+                            .get(&id)
+                            .map(|(_, mac)| {
+                                (
+                                    mac.clone(),
+                                    tune_core::discovery::mac::vendor_for_mac(mac)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "name": name,
+                            "type": dev_type,
+                            "mac": mac,
+                            "manufacturer": manufacturer,
+                        })
                     })
                     .collect(),
                 Err(_) => Vec::new(),
@@ -734,7 +790,49 @@ fn spawn_heartbeat(state: &AppState) {
                     // absent (old server, 204, empty body, etc.) we keep the
                     // cached state unchanged.
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        if let Some(tier_str) = body.get("license_tier").and_then(|v| v.as_str()) {
+                        // Floating-license single-session model: the cloud tells
+                        // us when this key is currently held by ANOTHER server.
+                        // Unlike a bare `license_valid:false` (which can be a
+                        // transient re-binding and is softened by the offline
+                        // grace), a session conflict is authoritative "not now":
+                        // suppress premium here immediately, but keep the key and
+                        // `last_validated` intact so premium snaps back once the
+                        // other server stops pinging and the conflict clears.
+                        let session_conflict = body
+                            .get("session_conflict")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+
+                        if session_conflict {
+                            let active_server = body
+                                .get("active_server")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let active_since = body
+                                .get("active_since")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            license
+                                .set_session_conflict(active_server.clone(), active_since.clone())
+                                .await;
+                            warn!(
+                                active_server = ?active_server,
+                                "license_session_conflict_held_elsewhere"
+                            );
+                            event_bus.emit(
+                                "license.session_conflict",
+                                serde_json::json!({
+                                    "active_server": active_server,
+                                    "active_since": active_since,
+                                }),
+                            );
+                        } else if let Some(tier_str) =
+                            body.get("license_tier").and_then(|v| v.as_str())
+                        {
+                            // No conflict reported → make sure any prior conflict
+                            // is cleared before applying the normal verdict.
+                            license.clear_session_conflict().await;
+
                             let valid = body
                                 .get("license_valid")
                                 .and_then(|v| v.as_bool())
@@ -893,6 +991,9 @@ async fn refresh_account_premium(
         // up by a re-validation reaches the live QobuzService immediately.
         license.set_qobuz_proxy_first(user.qobuz_proxy_first).await;
         apply_qobuz_proxy_first(services, user.qobuz_proxy_first).await;
+        // Paid-module entitlements (separate SKUs, e.g. the Diretta output)
+        // travel with the account validation, like the premium flag above.
+        license.set_modules(user.modules.clone()).await;
         debug!(premium = user.premium, "mozaik_account_premium_refreshed");
     }
 }
@@ -987,8 +1088,29 @@ fn spawn_bio_sync(state: &AppState) {
     });
 }
 
+/// Best-effort, once at boot: fill in missing station logos from the
+/// mozaiklabs.fr radio directory so the seeded default stations show a vignette
+/// instead of the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
+fn spawn_radio_logo_refresh(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let n = crate::routes::radios::refresh_radio_logos(&state).await;
+        if n > 0 {
+            tracing::info!(updated = n, "radio_logos_backfilled_at_startup");
+        }
+    });
+}
+
 fn spawn_community_sync(state: &AppState) {
     tune_core::cloud::community_sync::spawn(state.backend.clone());
+}
+
+/// Background ReplayGain analysis: fills `rg_track_gain`/`rg_track_peak` (+ album)
+/// for local tracks whose files carry no ReplayGain tags, by measuring EBU R128
+/// loudness. Throttled and fully separate from the scan (which stays tag-only) so
+/// it never slows indexing. Gated by the `replaygain_analysis_enabled` setting.
+fn spawn_replaygain_analysis(state: &AppState) {
+    tune_core::audio::replaygain::spawn(state.backend.clone());
 }
 
 fn spawn_concert_alerts(state: &AppState) {
@@ -1019,8 +1141,21 @@ fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
     });
 }
 
-/// Periodically re-enumerate local audio devices (every 120s) to detect USB DACs
-/// that were plugged in after startup or took time to initialize.
+/// Periodically re-enumerate local audio devices to detect USB DACs that were
+/// plugged in after startup or took time to initialize.
+///
+/// Cadence is platform-dependent. On Windows/macOS we poll every 120s so a
+/// freshly-plugged USB DAC appears quickly. On Linux, PipeWire already handles
+/// device hotplug dynamically and each cpal re-enumeration re-probes *every*
+/// PipeWire/ALSA node; doing that every 2 minutes for hours has been linked to
+/// runaway pipewire/wireplumber memory growth → OOM (JeromeQ, #1257, Ubuntu
+/// 24.04, 8GB). So poll far less often there — a USB DAC is merely detected a
+/// little later.
+#[cfg(target_os = "linux")]
+const LOCAL_AUDIO_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+#[cfg(not(target_os = "linux"))]
+const LOCAL_AUDIO_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[cfg(feature = "local-audio")]
 fn spawn_local_audio_rescan(state: &AppState) {
     let state = state.clone();
@@ -1029,7 +1164,7 @@ fn spawn_local_audio_rescan(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
             rescan_local_audio_devices(&state).await;
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            tokio::time::sleep(LOCAL_AUDIO_RESCAN_INTERVAL).await;
         }
     });
 }
@@ -1057,6 +1192,22 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
         }
     }
     false
+}
+
+/// Whether ANY zone (local or network) is currently playing, read from the
+/// in-memory playback state — no device or network probing. Used on Linux to
+/// suppress the periodic audio re-enumeration during a listening session:
+/// re-probing PipeWire while music plays for hours drives runaway pipewire
+/// memory growth (JeromeQ, #1257). Network renderers don't use PipeWire, but a
+/// long radio session to one is exactly when the useless re-probing piles up.
+#[cfg(all(feature = "local-audio", target_os = "linux"))]
+async fn any_zone_playing(state: &AppState) -> bool {
+    state
+        .playback
+        .all_states()
+        .await
+        .iter()
+        .any(|z| z.state == tune_core::playback::PlayState::Playing)
 }
 
 /// Re-enumerate local audio devices and register any new ones.
@@ -1098,6 +1249,17 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // cycle once playback stops. This also protects any active ASIO output.
     if any_local_output_playing(state).await {
         debug!("local_audio_rescan_skipped_active_playback");
+        return;
+    }
+
+    // On Linux, also skip while ANY zone is playing (even a network renderer).
+    // Re-probing PipeWire every cycle during a long listening session is the
+    // exact pattern that grows pipewire/wireplumber memory unbounded → OOM
+    // (JeromeQ, #1257, radio to a Volumio zone). A USB DAC plugged in mid-
+    // session is simply picked up on the next idle cycle.
+    #[cfg(target_os = "linux")]
+    if any_zone_playing(state).await {
+        debug!("local_audio_rescan_skipped_zone_playing");
         return;
     }
 
@@ -1244,6 +1406,13 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 Ok((zid, false)) => {
                     let _ = zone_repo.set_online_by_device(device_id, true);
                     debug!(zone_id = zid, device_id = %device_id, "local_audio_zone_set_online");
+                    // Même soin d'étiquette générique qu'au démarrage (#1233).
+                    if !is_default
+                        && let Ok(n) = zone_repo.rename_generic_local_label(zid, dev_name)
+                        && n > 0
+                    {
+                        info!(zone_id = zid, name = %dev_name, "local_zone_generic_label_healed");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(name = %zone_name, device_id = %device_id, error = %e, "local_audio_hotplug_zone_create_failed");

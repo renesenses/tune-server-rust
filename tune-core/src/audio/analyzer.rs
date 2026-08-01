@@ -143,6 +143,16 @@ fn k_weighting_coefficients(fs: f64) -> (Biquad, Biquad) {
 /// 3. Absolute gating at -70 LUFS
 /// 4. Relative gating at mean - 10 dB
 pub async fn measure_loudness(file_path: &str) -> Option<f64> {
+    measure_loudness_and_peak(file_path)
+        .await
+        .map(|(lufs, _)| lufs)
+}
+
+/// Measure both the EBU R128 integrated loudness (LUFS) and the linear sample
+/// peak (0.0–1.0) in a SINGLE decode pass — used by the ReplayGain analysis to
+/// derive `rg_track_gain` (reference − LUFS) and `rg_track_peak` without decoding
+/// the file twice.
+pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64)> {
     // Decode to native sample rate, stereo.
     // We don't assume 48 kHz because the native decoder does not resample.
     let path = file_path.to_string();
@@ -170,6 +180,13 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
         .iter()
         .map(|&s| s as f64 / scale)
         .collect();
+
+    // Linear sample peak across all channels (clamped to 1.0 for clipped content),
+    // computed on the un-weighted samples before K-weighting mutates them.
+    let peak = samples
+        .iter()
+        .fold(0.0_f64, |m, &s| m.max(s.abs()))
+        .min(1.0);
 
     let num_frames = samples.len() / channels;
     if num_frames == 0 {
@@ -205,7 +222,7 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
             return None;
         }
         let lufs = -0.691 + 10.0 * power_sum.log10();
-        return Some((lufs * 10.0).round() / 10.0);
+        return Some(((lufs * 10.0).round() / 10.0, peak));
     }
 
     // Compute block loudness values
@@ -260,7 +277,7 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
 
     let lufs = -0.691 + 10.0 * mean_rel.log10();
     // Round to 1 decimal
-    Some((lufs * 10.0).round() / 10.0)
+    Some(((lufs * 10.0).round() / 10.0, peak))
 }
 
 // ---------------------------------------------------------------------------

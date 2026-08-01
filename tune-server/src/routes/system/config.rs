@@ -113,7 +113,11 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
-        ("enrich_on_scan", json!(false)),
+        // Default on (unchanged behaviour); scan.rs treats unset as enabled.
+        // The web toggle writes "false" to opt out (JF Paquet).
+        ("enrich_on_scan", json!(true)),
+        // Folder → playlist discovery at scan time — opt-in (Frédéric).
+        ("scan_folder_playlists", json!(false)),
         ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
@@ -165,6 +169,9 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         "appliance".to_string(),
         json!(crate::routes::appliance::is_appliance()),
     );
+    // Adresses d'accès depuis un autre appareil (Android ne résout pas .local :
+    // l'IP est la seule voie universelle — harmonique131, forum-hifi p.25).
+    config.insert("server_urls".to_string(), json!(server_urls(state.port)));
     // Premium licensing info
     let license_state = state.license.license_state().await;
     let premium_tier = license_state.tier;
@@ -624,6 +631,9 @@ pub(super) async fn restart() -> impl IntoResponse {
             use std::os::unix::process::CommandExt;
             if let Ok(exe) = std::env::current_exe() {
                 let args: Vec<String> = std::env::args().skip(1).collect();
+                // Ne pas rouvrir le navigateur au redémarrage : l'onglet existant
+                // se reconnecte tout seul (Jean, forum #1236 — deux onglets).
+                unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
                 tracing::info!(exe = %exe.display(), "restart_reexec");
                 let err = std::process::Command::new(&exe).args(&args).exec();
                 // exec() only returns on failure → fall back to spawn+exit so a
@@ -635,6 +645,45 @@ pub(super) async fn restart() -> impl IntoResponse {
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
                     .spawn();
+            }
+        }
+
+        // WINDOWS: we can't exec() in place. A plain restart is NOT swapping the
+        // binary (unlike the update flow, which must exit and let tune-update.bat
+        // do the PID-gated swap), so we CAN relaunch the SAME exe ourselves:
+        // spawn a fresh copy, then exit. Without this, `exit(0)` just killed Tune
+        // on a bare Windows install with no supervisor (Mika, #1209: "Network
+        // error: server unreachable" then "Failed to load zones" — the server
+        // never came back and had to be relaunched by hand). The listening socket
+        // is created non-inheritable (socket2 sets WSA_FLAG_NO_HANDLE_INHERIT), so
+        // the child does NOT inherit it and this process's exit fully releases
+        // port 8888; the child's bind() retries for ~20s (main.rs) to cover the
+        // brief release window. On a supervised install the child simply races the
+        // supervisor's relaunch and whichever loses exits cleanly on the bind
+        // guard — no crash loop.
+        #[cfg(windows)]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                tracing::info!(exe = %exe.display(), "restart_windows_spawn");
+                match std::process::Command::new(&exe)
+                    .args(&args)
+                    // Onglet existant déjà connecté — pas de nouvel onglet (#1236).
+                    .env_remove("TUNE_OPEN_BROWSER")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        tracing::info!(pid = child.id(), "restart_windows_new_process_spawned");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "restart_windows_spawn_failed — manual restart required");
+                    }
+                }
+                // Give the child a moment to start before we release the port.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
 
@@ -908,24 +957,65 @@ pub(super) async fn set_license(
     State(state): State<AppState>,
     Json(body): Json<LicenseBody>,
 ) -> impl IntoResponse {
-    match state.license.set_license_key(&body.key).await {
-        Ok(()) => Json(json!({
-            "status": "ok",
-            "tier": "premium",
-        }))
-        .into_response(),
-        Err(e) => (
+    // Store the key as "pending" (no Premium granted yet), then confirm it with
+    // the licensing server before unlocking anything. A fake key therefore never
+    // unlocks Premium, while a genuine key is activated in this same round-trip.
+    if let Err(e) = state.license.set_license_key(&body.key).await {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "status": "error",
-                "message": e,
-            })),
+            Json(json!({"status": "error", "message": e})),
         )
-            .into_response(),
+            .into_response();
     }
+
+    let tier = crate::routes::cloud::validate_stored_license(&state).await;
+    let premium = tier == tune_core::license::Tier::Premium;
+    let ls = state.license.license_state().await;
+    Json(json!({
+        "status": if premium { "ok" } else { "pending" },
+        "tier": ls.tier,
+        "message": if premium {
+            "Licence validée : Premium activé."
+        } else {
+            "Clé enregistrée. Premium s'activera dès qu'elle sera validée en ligne (vérifiez votre connexion et la clé)."
+        },
+    }))
+    .into_response()
 }
 
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
     state.license.clear_license().await;
     Json(json!({ "status": "ok", "tier": "free" }))
+}
+
+/// URLs d'accès au serveur depuis un autre appareil du réseau.
+/// Priorité à TUNE_ADVERTISE_IP (VPN/NordVPN : l'IP détectée serait celle du
+/// tunnel), sinon l'IP LAN détectée par la sonde UDP ; plus le nom mDNS
+/// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
+/// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
+/// est mis en cache.
+pub(super) fn server_urls(port: u16) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
+        if !ip.is_empty() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+    }
+    if urls.is_empty() {
+        if let Some(ip) = tune_core::discovery::ssdp::get_local_ip() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+    }
+    static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let host = HOSTNAME.get_or_init(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    });
+    if !host.is_empty() && host != "localhost" && !host.contains('.') {
+        urls.push(format!("http://{host}.local:{port}"));
+    }
+    urls
 }

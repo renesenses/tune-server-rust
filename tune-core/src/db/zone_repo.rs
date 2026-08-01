@@ -71,11 +71,27 @@ pub mod sql {
         )
     }
 
+    pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET name = {} \
+             WHERE id = {} AND name IN ('This Computer', 'Cet ordinateur')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET is_hidden = 1 WHERE id = {}",
             d.placeholder(1)
         )
+    }
+
+    pub fn delete_all() -> &'static str {
+        // last_track_id is the permanent free-tier activation marker: a
+        // resurrected zone would otherwise keep consuming a quota slot on
+        // its first play, defeating the whole point of the reset.
+        "UPDATE zones SET is_hidden = 1, last_track_id = NULL"
     }
 
     pub fn unhide_by_device_id<D: SqlDialect>(d: &D) -> String {
@@ -608,6 +624,104 @@ impl ZoneRepo {
         }
     }
 
+    /// Persist the renderer's physical identity (host, and MAC when known) on
+    /// the zone. The MAC is the durable cross-protocol key: it survives UUID
+    /// changes AND DHCP renumbering, where `host` alone goes stale. A `None`
+    /// or empty MAC never erases a previously stored one. Best-effort on
+    /// pre-migration DBs, like [`set_host`](Self::set_host).
+    pub fn set_identity(&self, id: i64, host: &str, mac: Option<&str>) -> Result<(), String> {
+        self.set_host(id, host)?;
+        if let Some(mac) = mac.filter(|m| !m.is_empty()) {
+            let sql = self.update_field_sql("mac");
+            let params: [&dyn ToSqlValue; 2] = [&mac, &id];
+            match self.db.execute(&sql, &params) {
+                Ok(_) => {}
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                    tracing::debug!(id, error = %e, "zone_mac_column_missing_ignoring_update");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// A visible zone already bound to this physical device — same persisted
+    /// host (IP) or same MAC, case-insensitive. Returns `(id, name,
+    /// output_type)`. The cross-protocol duplicate guard uses this so a
+    /// Bluesound Node seen as BluOS + DLNA + OpenHome (three names, three
+    /// UUIDs) still maps to the one zone it already has (forum #1239).
+    pub fn find_visible_zone_by_identity(
+        &self,
+        host: &str,
+        mac: Option<&str>,
+    ) -> Option<(i64, String, String)> {
+        let mac = mac.unwrap_or("");
+        if host.is_empty() && mac.is_empty() {
+            return None;
+        }
+        // SQLite placeholders are positional (`?`), so every occurrence needs
+        // its own parameter — 4 slots, [host, host, mac, mac].
+        let ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let (p1, p2, p3, p4) = (ph(1), ph(2), ph(3), ph(4));
+        let sql = format!(
+            "SELECT id, name, COALESCE(output_type, '') FROM zones \
+             WHERE COALESCE(is_hidden, 0) = 0 \
+             AND ((host IS NOT NULL AND host <> '' AND {p1} <> '' AND LOWER(host) = LOWER({p2})) \
+               OR (mac IS NOT NULL AND mac <> '' AND {p3} <> '' AND UPPER(mac) = UPPER({p4}))) \
+             ORDER BY id LIMIT 1"
+        );
+        let params: [&dyn ToSqlValue; 4] = [&host, &host, &mac, &mac];
+        // Strong read for the same reason as zone_id_by_host: a zone created
+        // moments ago must be visible to the very next discovery event.
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(rows) => rows.first().map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            }),
+            // Pre-migration DB without the mac column: fall back to nothing
+            // rather than failing discovery.
+            Err(e) => {
+                tracing::debug!(error = %e, "zone_identity_lookup_failed_ignoring");
+                None
+            }
+        }
+    }
+
+    /// The persisted physical identity of every visible zone's device:
+    /// `(output_device_id, host, mac)`. Feeds the heartbeat telemetry so the
+    /// admin can identify renderer brands from the MAC's OUI. Graceful on
+    /// pre-migration DBs (missing column → empty list).
+    pub fn device_identities(&self) -> Vec<(String, String, String)> {
+        let sql = "SELECT COALESCE(output_device_id, ''), COALESCE(host, ''), \
+                   COALESCE(mac, '') FROM zones WHERE COALESCE(is_hidden, 0) = 0";
+        match self.db.query_many(sql, &[]) {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|cols| {
+                    let did = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+                    if did.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        did,
+                        cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                        cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    ))
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "zone_device_identities_failed_ignoring");
+                Vec::new()
+            }
+        }
+    }
+
     /// Re-point a zone to a new `output_device_id`. Used when a renderer comes
     /// back with a new UPnP UUID: host-based dedup keeps the existing zone (and
     /// its per-zone settings: native FLAC, volume…) instead of spawning a
@@ -646,6 +760,32 @@ impl ZoneRepo {
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
         self.db.execute(&sql, &params)
+    }
+
+    /// Rename a LOCAL zone stuck on the generic default label ("This
+    /// Computer" / "Cet ordinateur") to its device name. Older versions named
+    /// EVERY local zone with the generic label, so a machine with several
+    /// DACs showed indistinguishable twins (forum #1233, Alain Bonnel). Only
+    /// the exact generic labels are touched — a user-renamed zone never is.
+    pub fn rename_generic_local_label(
+        &self,
+        zone_id: i64,
+        device_name: &str,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::rename_generic_local_label,
+            sql::rename_generic_local_label,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&device_name, &zone_id];
+        self.db.execute(&sql, &params)
+    }
+
+    /// Soft-delete EVERY zone and clear the free-tier activation markers.
+    /// A Free user whose 3-zone quota is consumed by stale renderers can
+    /// wipe the slate and explicitly re-create the zones he wants: discovery
+    /// never resurrects a hidden zone, only POST /zones does.
+    pub fn delete_all(&self) -> Result<usize, String> {
+        self.db.execute(sql::delete_all(), &[])
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -902,6 +1042,90 @@ mod tests {
         // An offline (but previously played) zone no longer counts.
         repo.update_online(b, false).unwrap();
         assert_eq!(repo.count_active().unwrap(), 1);
+    }
+
+    #[test]
+    fn identity_lookup_matches_host_or_mac() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo
+            .create("Node Salon", Some("bluos"), Some("bluos:node1"))
+            .unwrap();
+        repo.set_identity(id, "192.168.1.30", Some("90:56:82:AA:BB:CC"))
+            .unwrap();
+
+        // Host match, case-insensitive; MAC match, case-insensitive.
+        let by_host = repo.find_visible_zone_by_identity("192.168.1.30", None);
+        assert_eq!(by_host.as_ref().map(|z| z.0), Some(id));
+        assert_eq!(by_host.unwrap().2, "bluos");
+        let by_mac = repo.find_visible_zone_by_identity("10.0.0.99", Some("90:56:82:aa:bb:cc"));
+        assert_eq!(by_mac.map(|z| z.0), Some(id));
+
+        // No false positives on empty keys or unknown identity.
+        assert!(repo.find_visible_zone_by_identity("", None).is_none());
+        assert!(
+            repo.find_visible_zone_by_identity("10.0.0.99", Some(""))
+                .is_none()
+        );
+        assert!(
+            repo.find_visible_zone_by_identity("10.0.0.98", Some("00:11:22:33:44:55"))
+                .is_none()
+        );
+
+        // A hidden (deleted) zone never matches — its device may come back,
+        // but the user's deletion stands.
+        repo.delete(id).unwrap();
+        assert!(
+            repo.find_visible_zone_by_identity("192.168.1.30", Some("90:56:82:AA:BB:CC"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn set_identity_never_erases_known_mac() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo
+            .create("Ampli", Some("dlna"), Some("uuid:amp"))
+            .unwrap();
+        repo.set_identity(id, "192.168.1.40", Some("00:A0:DE:11:22:33"))
+            .unwrap();
+        // A later pass without a MAC (ARP miss) must keep the stored one.
+        repo.set_identity(id, "192.168.1.41", None).unwrap();
+        let hit = repo.find_visible_zone_by_identity("10.9.9.9", Some("00:a0:de:11:22:33"));
+        assert_eq!(hit.map(|z| z.0), Some(id));
+        // And the host was refreshed.
+        assert_eq!(
+            repo.find_visible_zone_by_identity("192.168.1.41", None)
+                .map(|z| z.0),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn delete_all_frees_quota_durably() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let a = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+        repo.update_online(a, true).unwrap();
+        repo.save_playback_position(a, 0, Some(42), Some("local"), None)
+            .unwrap();
+        assert_eq!(repo.count_active().unwrap(), 1);
+
+        repo.delete_all().unwrap();
+        assert!(repo.list().unwrap().is_empty());
+        assert_eq!(repo.count_active().unwrap(), 0);
+
+        // Resurrect the same device (explicit POST /zones path): the
+        // activation marker must be gone, so the zone is dormant again and
+        // does not silently re-consume a free-tier slot.
+        repo.unhide(a).unwrap();
+        let zone = repo.get(a).unwrap().unwrap();
+        assert_eq!(zone.last_track_id, None);
+        assert_eq!(repo.count_active().unwrap(), 0);
     }
 
     #[test]

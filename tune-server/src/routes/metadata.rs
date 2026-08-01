@@ -987,42 +987,6 @@ fn normalize_genre(
     None
 }
 
-/// Strip hi-res suffixes like "(96kHz/24bit)" from album titles for API lookups.
-fn clean_album_title(title: &str) -> String {
-    // Remove patterns like (44.1kHz), (96kHz/24bit), (192kHz 24bit) etc.
-    let mut result = String::with_capacity(title.len());
-    let mut depth = 0i32;
-    let mut paren_start = 0;
-    for (i, c) in title.char_indices() {
-        if c == '(' {
-            if depth == 0 {
-                paren_start = i;
-            }
-            depth += 1;
-        } else if c == ')' {
-            depth -= 1;
-            if depth <= 0 {
-                depth = 0;
-                // Check if the parenthesized content looks like a hi-res suffix.
-                let inner = &title[paren_start + 1..i];
-                let lower = inner.to_lowercase();
-                if lower.contains("khz") || lower.contains("hz") {
-                    // Skip this parenthesized part (and leading whitespace).
-                    while result.ends_with(' ') {
-                        result.pop();
-                    }
-                } else {
-                    // Keep it.
-                    result.push_str(&title[paren_start..=i]);
-                }
-            }
-        } else if depth == 0 {
-            result.push(c);
-        }
-    }
-    result.trim().to_string()
-}
-
 /// Regex-free artist normalization for fuzzy grouping.
 /// Strips leading "The ", trailing ensemble suffixes (Quartet, Trio, Orchestra, etc.),
 /// and featuring clauses.
@@ -1716,7 +1680,7 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
             continue;
         }
 
-        let clean_title = clean_album_title(album_title);
+        let clean_title = tune_core::scanner::quality::strip_quality_suffix(album_title);
         let mut genre: Option<String> = None;
 
         // 1) Last.fm

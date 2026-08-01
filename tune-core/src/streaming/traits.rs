@@ -18,6 +18,11 @@ pub struct StreamTrack {
     pub disc_number: Option<u32>,
     pub explicit: bool,
     pub quality: Option<StreamQuality>,
+    /// International Standard Recording Code, when the service exposes it. Enables
+    /// exact cross-service matching (see `streaming::matching::best_stream_match`).
+    /// `#[serde(default)]` so older serialized results without the field still load.
+    #[serde(default)]
+    pub isrc: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -279,6 +284,18 @@ pub trait StreamingService: Send + Sync {
         false
     }
 
+    /// Whether the blob just restored is a stale shape that must be rewritten.
+    ///
+    /// Set by a service when `restore_tokens` reads a row written by an older
+    /// build that persisted something it no longer should — today, the Qobuz
+    /// plaintext password. Dropping the field from `save_tokens` alone is not
+    /// enough: the old value sits in `settings` until something happens to
+    /// overwrite the row, which for a working token may be never. The registry
+    /// checks this right after restoring and rewrites the row on the spot.
+    fn tokens_need_rewrite(&self) -> bool {
+        false
+    }
+
     async fn post_restore(&mut self) {}
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
@@ -303,6 +320,7 @@ mod tests {
             track_number: Some(1),
             disc_number: Some(1),
             explicit: false,
+            isrc: Some("USSM19900001".into()),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: 96000,

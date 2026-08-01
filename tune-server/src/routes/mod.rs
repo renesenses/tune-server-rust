@@ -17,7 +17,6 @@ pub mod developer_api;
 pub mod devices;
 pub mod digest;
 pub mod discogs;
-pub mod dj;
 pub mod eq_pro;
 pub mod export;
 pub mod graphql;
@@ -73,6 +72,7 @@ pub mod spotify_connect;
 pub mod squeezebox;
 pub mod stream_handler;
 pub mod streaming;
+pub mod support;
 pub mod system;
 pub mod tagger;
 pub mod tags;
@@ -301,7 +301,8 @@ pub fn router_with_plugins(
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
         .nest("/marketplace", marketplace::router())
-        .nest("/dj", dj::router())
+        // DJ mode moved to the `dj` native plugin (P5, #917); with that feature
+        // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
         .nest("/playlist-transfer", playlist_transfer::router())
@@ -349,6 +350,7 @@ pub fn router_with_plugins(
         .nest("/upnp", upnp::router())
         .nest("/auth", crate::auth::router())
         .nest("/cloud", cloud::router())
+        .nest("/support", support::router())
         .nest("/multi-server", multi_server::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
@@ -393,6 +395,12 @@ pub fn router_with_plugins(
     // (already stated) while `api` is still `Router<AppState>` — nesting it
     // as a service is the only way to combine the two, and it keeps the
     // plugin's internal state entirely its own.
+    //
+    // One consequence: the nested service owns everything under its prefix, so
+    // an unknown sub-path answers with axum's bare 404 rather than
+    // `api_fallback`'s JSON body. Left deliberately — forcing our fallback on
+    // the plugin router would take away its ability to answer its own 404s,
+    // which matters more than a uniform error shape under /ext.
     let api = plugin_routers
         .into_iter()
         .fold(api, |api, (plugin_name, plugin_router)| {

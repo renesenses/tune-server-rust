@@ -3,25 +3,47 @@ use tracing::{debug, info};
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
+/// A catalog row as served by `GET /api/v1/plugins` on mozaiklabs.fr (the
+/// Laravel `Plugin::toApiArray()`). Every non-key field is defaulted: the
+/// catalog schema has grown across eras (python-era rows lack `price`,
+/// `downloads`, `rating`) and a single unknown/missing field must not turn
+/// the whole catalog into an empty list (serde fails the entire Vec).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplacePlugin {
     pub slug: String,
     pub name: String,
+    /// Human-facing name (`display_name` in the Laravel model).
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub author: String,
     /// `None` means free plugin.
+    #[serde(default)]
     pub price: Option<f64>,
+    #[serde(default)]
     pub category: String,
+    #[serde(default, alias = "install_count")]
     pub downloads: u64,
+    #[serde(default, alias = "vote_score")]
     pub rating: f64,
     #[serde(default)]
     pub installed: bool,
+    #[serde(default)]
     pub installed_version: Option<String>,
     /// Legacy field kept for backward compat.
-    #[serde(default)]
+    #[serde(default, alias = "vote_count")]
     pub votes: i64,
+    #[serde(default)]
     pub download_url: Option<String>,
+    /// `wasm` rows are installable by the Rust server; python-era rows are not.
+    #[serde(default)]
+    pub platforms: Option<String>,
+    #[serde(default)]
+    pub install_type: Option<String>,
 }
 
 pub struct PluginMarketplace {
@@ -39,8 +61,12 @@ impl PluginMarketplace {
     }
 
     /// List available plugins from the marketplace catalog.
+    ///
+    /// The Laravel store serves the catalog at `/api/v1/plugins` — the older
+    /// `/api/v1/plugins/catalog` path never existed server-side, so this
+    /// client silently returned an empty catalog (404 → `vec![]`).
     pub async fn list(&self) -> Vec<MarketplacePlugin> {
-        let url = format!("{}/api/v1/plugins/catalog", self.base_url);
+        let url = format!("{}/api/v1/plugins", self.base_url);
         let client = crate::http::client::shared();
 
         match client.get(&url).send().await {
@@ -56,26 +82,15 @@ impl PluginMarketplace {
         }
     }
 
-    /// Fetch detail for a single marketplace plugin by slug.
+    /// Fetch detail for a single marketplace plugin by slug (or package name).
+    ///
+    /// The Laravel store has no per-plugin detail endpoint, so this filters
+    /// the catalog list client-side.
     pub async fn detail(&self, slug: &str) -> Option<MarketplacePlugin> {
-        let url = format!(
-            "{}/api/v1/plugins/catalog/{}",
-            self.base_url,
-            urlencoding::encode(slug)
-        );
-        let client = crate::http::client::shared();
-
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-            Ok(resp) => {
-                debug!(slug, status = %resp.status(), "marketplace_detail_failed");
-                None
-            }
-            Err(e) => {
-                debug!(slug, error = %e, "marketplace_detail_request_failed");
-                None
-            }
-        }
+        self.list()
+            .await
+            .into_iter()
+            .find(|p| p.slug == slug || p.name == slug)
     }
 
     /// Download a plugin binary/archive by name.

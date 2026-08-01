@@ -76,8 +76,24 @@ pub struct ZonePollerMetrics {
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
+/// Plafond du recul sur une zone arrêtée : 2^5 = 32 ticks, soit ~32 s entre
+/// deux tentatives quand l'appareil ne répond plus. Assez pour cesser de le
+/// noyer, assez court pour repérer une lecture démarrée depuis sa façade.
+const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
 const GAPLESS_WINDOW_MS: u64 = 30_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
+/// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
+/// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
+/// finir de jouer ce qu'il n'a pas reçu — il a calé.
+///
+/// Marge volontairement large : un FLAC est à débit variable, la dernière
+/// fraction de temps ne correspond pas exactement à la même fraction d'octets.
+const MIN_SERVED_PERCENT_FOR_NATURAL_END: u64 = 90;
+/// Nombre de ticks (~1 s) pendant lesquels on refuse de conclure à une fin
+/// naturelle sur un flux manifestement incomplet, laissant au renderer le temps
+/// de reprendre sa lecture. Passé ce délai, la lecture a réellement échoué : on
+/// arrête la zone bruyamment au lieu d'avancer en silence.
+const STALL_DECLINE_MAX_TICKS: u8 = 10;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
 /// This prevents the progress bar from snapping back to the pre-seek
@@ -104,6 +120,12 @@ const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
+/// After a stall-recovery restart (OAAT stall supervisor replays the current
+/// track from 0), suppress a gapless position-reset auto-advance for this many
+/// seconds. A genuine end-of-track transition cannot occur this soon after a
+/// from-zero replay, so the window only ever swallows the phantom advance; the
+/// natural-end fallback still advances tracks shorter than the window.
+const RESTART_ADVANCE_SUPPRESS_SECS: u64 = 20;
 /// Minimum fraction of track duration that must have been played before a
 /// gapless transition is accepted.  Prevents false transitions when a
 /// renderer (e.g. DMP-A8) reports state changes immediately after
@@ -177,6 +199,42 @@ pub(crate) mod decisions {
     ///   (guards slow renderers that report duration 0 while buffering).
     ///
     /// Both branches additionally require `wall_elapsed >= MIN_TRACK_WALL_SECS`.
+    /// Le renderer peut-il réellement avoir terminé le morceau ?
+    ///
+    /// Un `Stopped` au-delà de [`MIN_PLAYED_FRACTION`] est accepté comme une fin
+    /// naturelle, en se fiant à la position qu'annonce le renderer. Or sur un
+    /// réseau qui hoquette, il cale, cesse de récupérer le flux et annonce
+    /// `Stopped` — Tune enchaînait alors sur la piste suivante, amputant la fin
+    /// du morceau **sans laisser la moindre trace** (« Us And Them » de JP :
+    /// 6:36 jouées sur 7:49).
+    ///
+    /// Les octets servis tranchent, indépendamment de ce que le renderer
+    /// raconte : on ne finit pas de jouer un fichier qu'on n'a pas reçu.
+    /// `total_bytes` à `None` (radio, flux décodé) ⇒ on ne juge pas.
+    ///
+    /// `seeked` neutralise le critère : après un saut dans le morceau, le
+    /// renderer ne récupère que la portion restante, les octets servis sont donc
+    /// légitimement incomplets et vetoraient une fin parfaitement normale.
+    /// (`ZoneState::last_seek_at` est remis à zéro par `play()` à chaque
+    /// changement de piste, il vaut donc bien « un saut a eu lieu sur CETTE
+    /// piste ».)
+    pub fn renderer_could_have_finished(
+        bytes_sent: u64,
+        total_bytes: Option<u64>,
+        seeked: bool,
+    ) -> bool {
+        if seeked {
+            return true;
+        }
+        match total_bytes {
+            None | Some(0) => true,
+            Some(total) => {
+                bytes_sent.saturating_mul(100)
+                    >= total.saturating_mul(super::MIN_SERVED_PERCENT_FOR_NATURAL_END)
+            }
+        }
+    }
+
     pub fn played_enough(track_duration_ms: u64, peak_position_ms: u64, wall_elapsed: u64) -> bool {
         if track_duration_ms == 0 {
             peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS && wall_elapsed >= MIN_TRACK_WALL_SECS
@@ -198,6 +256,10 @@ pub(crate) mod decisions {
     /// least `MIN_WALL_FRACTION_FOR_NATURAL_END` of its duration (you cannot end
     /// a 4-minute track in 35 seconds at 1x). Unknown duration keeps the original
     /// modest 5-second floor. Rejects the DMP-A8's spurious early ended_naturally.
+    ///
+    /// The premise — nothing finishes a track faster than 1x — only holds for a
+    /// renderer. An output that reports `realtime: false` is exempt; see
+    /// [`natural_end`], which is where that exemption is applied.
     pub fn ended_naturally_wall_ok(wall_elapsed: u64, track_duration_ms: u64) -> bool {
         if track_duration_ms == 0 {
             wall_elapsed >= 5
@@ -211,6 +273,47 @@ pub(crate) mod decisions {
     /// armed — a strong signal the renderer auto-advanced to the next track.
     pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
         last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
+    }
+
+    /// The `position_reset` fallback advances metadata only, assuming the
+    /// renderer auto-transitioned internally — its position dropped to 0 because
+    /// it is already playing the next track. That premise holds only for outputs
+    /// that do internal gapless (DLNA). For a Chromecast / slimproto /
+    /// exclusive-local output, a drop to 0 means the track ENDED (device went
+    /// IDLE/FINISHED), not that it advanced — advancing metadata sends no `play`
+    /// and steals the event from the natural-end path (Stopped branch →
+    /// play_from_queue = real load), causing the endless 1-2s-then-zero loop
+    /// (Rhorn, #1072). So the fallback only fires for internal-gapless outputs.
+    pub fn position_reset_fires(raw_position_reset: bool, can_internal_gapless: bool) -> bool {
+        raw_position_reset && can_internal_gapless
+    }
+
+    /// A renderer can report the PREVIOUS session's position for the first
+    /// seconds after a fresh Play (Villerio's DMP-A6: ~374s — yesterday's end
+    /// position — reported 6s into a new start). That stale sample poisons the
+    /// peak, triggers near-end gapless staging seconds into the track, and the
+    /// snap back to the real position then reads as a phantom
+    /// `position_reset` advance.
+    ///
+    /// A real position can never exceed the wall time actually elapsed (+15s
+    /// margin for seek-restore/clock slack): `track_started_at` is folded by
+    /// the seek/resume target (see the "Fold a NEW seek" baseline above), so
+    /// `wall_elapsed` tracks the true 1x play position at every point in the
+    /// track — not only the first few seconds. Any sample above that ceiling
+    /// is therefore provably impossible and must be discarded outright,
+    /// whenever it arrives.
+    ///
+    /// This used to be gated on `wall_elapsed_secs < 30`, which let a renderer
+    /// that keeps reporting a stale near-end position for LONGER than 30s
+    /// (Bertrand's DMP-A8, .18) poison the peak the instant the 30s grace
+    /// lapsed: peak jumped to the fake near-end value, `played_enough` flipped
+    /// true, and the very next honest snap-to-0 read as a `position_reset`
+    /// advance ~30s into track 1 — the queue pointer ran ahead of the renderer
+    /// and the Qobuz playlist appeared to "stop at the first track". Dropping
+    /// the window makes the invariant hold for the whole track and cures both
+    /// the poisoned-peak advance and the near-end gapless mis-staging.
+    pub fn stale_start_position(wall_elapsed_secs: u64, position_ms: u64) -> bool {
+        position_ms > wall_elapsed_secs * 1000 + 15_000
     }
 
     /// The peak position reached (near) the track's full duration, so the track
@@ -261,6 +364,16 @@ pub(crate) mod decisions {
     /// After `STOPPED_TICKS_THRESHOLD` consecutive Stopped ticks, should this be
     /// treated as a natural track end (re-trigger play) rather than a playback
     /// failure (stop the zone)?
+    ///
+    /// `realtime` is [`OutputStatus::realtime`](tune_output_api::OutputStatus):
+    /// `false` means the output does not consume the track at 1x — a recorder
+    /// that writes the container to disk at network speed finishes a 5-minute
+    /// track in a second or two. Every wall-clock plausibility guard here
+    /// (`played_enough`'s floor, `ended_naturally_wall_ok`) assumes 1x playback,
+    /// so for such an output `ended_naturally` + Stopped is taken at face value.
+    /// Without this the queue advanced only after half of each track's DURATION
+    /// had elapsed, and a rip ran at half of listening speed instead of network
+    /// speed.
     pub fn natural_end(
         played_enough: bool,
         repeat_active: bool,
@@ -268,13 +381,15 @@ pub(crate) mod decisions {
         ended_naturally: bool,
         wall_elapsed: u64,
         track_duration_ms: u64,
+        realtime: bool,
     ) -> bool {
         let is_short_track =
             track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
         let repeat_end = repeat_active && peak_position_ms > 5_000;
         played_enough
             || repeat_end
-            || (ended_naturally && ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
+            || (ended_naturally
+                && (!realtime || ended_naturally_wall_ok(wall_elapsed, track_duration_ms)))
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
     }
 
@@ -336,14 +451,37 @@ pub(crate) mod decisions {
         queue_duration_ms: u64,
         position_ms: u64,
     ) -> bool {
-        let effective_duration_ms = if reported_duration_ms > 0 {
-            reported_duration_ms
-        } else {
-            queue_duration_ms
-        };
+        let effective_duration_ms = sane_current_duration(reported_duration_ms, queue_duration_ms);
         !gapless_sent
             && effective_duration_ms > GAPLESS_WINDOW_MS
             && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
+    }
+
+    /// The renderer-reported duration for the CURRENT track, sanitised against
+    /// the queue-known (DB) duration.
+    ///
+    /// The renderer's own reported duration is normally authoritative and is
+    /// trusted verbatim — a well-behaved renderer that reports a slightly (or
+    /// even a few times) different value than the scanned duration is kept as-is
+    /// on purpose. But some renderers report an *egregiously* wrong duration for
+    /// the playing track — the HiFi Rose RS130 reports e.g. 17000 ms for a track
+    /// that is really 174693 ms. Fed into the gapless-arming window that either
+    /// armed SetNextAVTransportURI near t=0 (far too small) or never at all (far
+    /// past the real end), cutting the album. Only when the reported value is
+    /// off by more than 4x (or under a quarter) of a known DB duration — a gap
+    /// no legitimate renderer/encoding difference produces — do we distrust it
+    /// and use the DB duration. A `0` reported (LMS UPnP bridge) falls back to
+    /// the DB as before; an unknown DB (0) means we can't judge, so keep the
+    /// reported value.
+    pub fn sane_current_duration(reported_ms: u64, db_ms: u64) -> u64 {
+        let reported_is_egregious = db_ms > 0
+            && reported_ms > 0
+            && (reported_ms > db_ms.saturating_mul(4) || reported_ms < db_ms / 4);
+        if reported_ms == 0 || reported_is_egregious {
+            db_ms
+        } else {
+            reported_ms
+        }
     }
 
     /// Position-based end-of-track: the output still reports Playing but the
@@ -447,6 +585,45 @@ pub(crate) mod decisions {
             && queue_duration_ms > END_MARGIN_MS
             && wall_elapsed_secs.saturating_mul(1000)
                 >= queue_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+
+    /// Wall-clock end-of-track fallback for a **Chromecast** output.
+    ///
+    /// Cast tears down its media session the instant a track's byte stream ends
+    /// and broadcasts the `idle_reason = FINISHED` transition only ONCE. The
+    /// poller queries with a fresh-connect `GET_STATUS` every ~1 s and never
+    /// listens for that broadcast, so it routinely misses the FINISHED window
+    /// and then reads an EMPTY `entries` array — state=Stopped, position=0,
+    /// `ended_naturally = false` — which the Stopped arm cannot distinguish from
+    /// a mid-track blip. And if the receiver instead keeps claiming
+    /// Playing/Buffering with its position frozen a little short of the known
+    /// duration, the position paths (`reached_end_exclusive` needs position
+    /// within 250 ms of duration, `past_end_reached` needs it *beyond*) never
+    /// fire either. The album then stalls after track 1 on Chromecast while a
+    /// DLNA renderer — which has BOTH this fallback and `poll_failed_past_end` —
+    /// advances fine (Rhorn, Chromecast Audio, forum #1226; #648/#649 cured the
+    /// 30-60 s stall but left this never-advances gap).
+    ///
+    /// Unlike the DLNA LMS-bridge fallback this KEEPS the `played_enough` (peak
+    /// ≥ 80 %) guard: a Chromecast reports an honest advancing position while it
+    /// plays, so the peak is trustworthy and gating on it means a genuine
+    /// mid-track buffering stall (position frozen well before 80 %) can NOT
+    /// false-advance. Fires only once Tune's own wall clock has passed the
+    /// queue-known duration + margin, and the caller still requires
+    /// `POSITION_PAST_END_TICKS` consecutive hits. A well-behaved Chromecast
+    /// reaches the end via `reached_end_exclusive` a beat earlier, so this only
+    /// takes over when the device's own end-of-track signal never lands.
+    pub fn chromecast_wall_clock_past_end(
+        output_type: &str,
+        played_enough: bool,
+        track_duration_ms: u64,
+        wall_elapsed_secs: u64,
+    ) -> bool {
+        output_type == "chromecast"
+            && played_enough
+            && track_duration_ms > END_MARGIN_MS
+            && wall_elapsed_secs.saturating_mul(1000)
+                >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
     /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
@@ -585,6 +762,17 @@ pub mod fsm {
         pub stopped_ticks: u8,
         pub natural_end: bool,
         pub gapless_sent: bool,
+        /// `OutputStatus::realtime` — `false` for an output that finishes a
+        /// track faster than 1x (a recorder), which exempts it from the
+        /// wall-clock plausibility guard on `ended_naturally`.
+        pub realtime: bool,
+        /// Whether the output can transition internally (live probe). For an
+        /// exclusive local output or the OAAT direct-file loop, `gapless_sent`
+        /// is only a re-arm suppressor — no internal transition ever comes, so
+        /// the natural end must advance instead of waiting (the actual branch
+        /// already probes this; without it the shadow predicted
+        /// NaturalEndGaplessWaiting on every OAAT direct-path track end).
+        pub can_internal_gapless: bool,
         pub stream_consuming: bool,
         /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
         /// DSD track on a DLNA renderer whose peak position reached the end.
@@ -626,6 +814,7 @@ pub mod fsm {
         }
         if i.ended_naturally
             && (i.played_enough
+                || !i.realtime
                 || decisions::ended_naturally_wall_ok(i.wall_elapsed, i.track_duration_ms))
         {
             return LocalEndedNaturally;
@@ -641,7 +830,7 @@ pub mod fsm {
         let stopped_ticks = i.stopped_ticks.saturating_add(1);
         if stopped_ticks >= STOPPED_TICKS_THRESHOLD {
             if i.natural_end {
-                return if i.gapless_sent {
+                return if i.gapless_sent && i.can_internal_gapless {
                     NaturalEndGaplessWaiting
                 } else {
                     NaturalEndAdvance
@@ -761,11 +950,13 @@ pub mod fsm {
                 gapless_advance_pending: false,
                 gapless_stuck_ticks: 0,
                 ended_naturally: false,
+                realtime: true,
                 wall_elapsed: 0,
                 track_duration_ms: 0,
                 stopped_ticks: 0,
                 natural_end: false,
                 gapless_sent: false,
+                can_internal_gapless: true,
                 stream_consuming: false,
                 dlna_dsd_reached_end: false,
             }
@@ -826,6 +1017,32 @@ pub mod fsm {
                     ..base()
                 }),
                 StoppedOutcome::Ignore
+            );
+        }
+
+        #[test]
+        fn natural_end_advances_when_output_cannot_chain_internally() {
+            // gapless_sent posé par le chemin « skip » (sortie exclusive ou
+            // boucle directe OAAT) : pas de transition interne possible — la
+            // fin naturelle doit avancer, pas attendre (divergence shadow-FSM
+            // observée à chaque fin de piste locale OAAT, 29/07).
+            let i = StoppedInput {
+                natural_end: true,
+                gapless_sent: true,
+                can_internal_gapless: false,
+                stopped_ticks: STOPPED_TICKS_THRESHOLD,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::NaturalEndAdvance);
+
+            // Avec transition interne possible, le comportement historique reste.
+            let i2 = StoppedInput {
+                can_internal_gapless: true,
+                ..i
+            };
+            assert_eq!(
+                classify_stopped(&i2),
+                StoppedOutcome::NaturalEndGaplessWaiting
             );
         }
 
@@ -931,6 +1148,37 @@ pub mod fsm {
                 classify_stopped(&StoppedInput {
                     ended_naturally: true,
                     wall_elapsed: 4,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+        }
+
+        /// The recorder case, mirroring
+        /// `natural_end_non_realtime_output_skips_the_wall_guard`: a
+        /// `realtime: false` output that says the track is done is believed
+        /// immediately, at the same inputs the DMP-A8 guard rejects.
+        #[test]
+        fn non_realtime_ended_naturally_is_immediate() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 1,
+                    track_duration_ms: 300_000,
+                    realtime: false,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // Identical inputs from a renderer: still rejected.
+            assert_ne!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 1,
+                    track_duration_ms: 300_000,
+                    realtime: true,
                     ..base()
                 }),
                 StoppedOutcome::LocalEndedNaturally
@@ -1257,6 +1505,51 @@ pub mod fsm {
     }
 }
 
+/// Backoff des sondages sur une zone **arrêtée**.
+///
+/// Le chemin « zone en lecture » recule déjà après un échec
+/// (`ZonePollState::backoff_remaining`), mais celui des zones arrêtées — qui
+/// sert à détecter une lecture démarrée hors de Tune — faisait `continue` sans
+/// rien mémoriser : un appareil lent ou injoignable était donc re-sondé chaque
+/// seconde, indéfiniment. Or `get_status_bounded` abandonne au bout de 5 s
+/// pendant que la requête SOAP dessous garde son propre timeout de 10 s et ses
+/// deux réessais — les appels s'empilaient sur un renderer qui les traite un par
+/// un, jusqu'à ce qu'il ne réponde plus à rien, commande de lecture comprise
+/// (Cyrus Stream X2 de JP : 1372 `GetPositionInfo` en échec, contre 3
+/// `SetAVTransportURI`).
+///
+/// `poll_states` ne peut pas porter cet état : il est purgé à chaque tick pour
+/// ne garder que les zones en lecture.
+#[derive(Debug, Default, Clone)]
+struct IdlePollBackoff {
+    consecutive_errors: u8,
+    remaining: u8,
+}
+
+impl IdlePollBackoff {
+    /// Faut-il sauter ce tick ? Consomme un tick de recul le cas échéant.
+    fn should_skip(&mut self) -> bool {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sondage réussi : on repart à plein rythme.
+    fn record_success(&mut self) {
+        self.consecutive_errors = 0;
+        self.remaining = 0;
+    }
+
+    /// Sondage en échec : recul exponentiel, plafonné.
+    fn record_failure(&mut self) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        self.remaining = 1u8 << self.consecutive_errors.min(IDLE_BACKOFF_MAX_SHIFT);
+    }
+}
+
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
@@ -1332,6 +1625,10 @@ struct ZonePollState {
     /// transition and forces play_from_queue.
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
+    /// Ticks pendant lesquels on a refusé de conclure à une fin naturelle parce
+    /// que le flux servi était manifestement incomplet (voir
+    /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
+    stall_declines: u8,
     radio_stopped_ticks: u8,
     /// Last position (ms) the renderer reported on the previous radio poll.
     /// An advancing position means the renderer is actually streaming even
@@ -1389,6 +1686,7 @@ impl PositionPoller {
             let mut ticker = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
             let notify = TRACK_END_NOTIFY.clone();
             let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
+            let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
 
             loop {
                 // Wake on either the regular 1-second tick OR an immediate
@@ -1397,12 +1695,18 @@ impl PositionPoller {
                     _ = ticker.tick() => {},
                     _ = notify.notified() => {},
                 }
-                self.tick(&mut poll_states, &startup_at).await;
+                self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                    .await;
             }
         })
     }
 
-    async fn tick(&self, poll_states: &mut HashMap<i64, ZonePollState>, startup_at: &Instant) {
+    async fn tick(
+        &self,
+        poll_states: &mut HashMap<i64, ZonePollState>,
+        idle_backoff: &mut HashMap<i64, IdlePollBackoff>,
+        startup_at: &Instant,
+    ) {
         let states = self.playback.all_states().await;
 
         poll_states.retain(|zone_id, _| {
@@ -1415,6 +1719,9 @@ impl PositionPoller {
         let all_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .list()
             .unwrap_or_default();
+
+        // Ne pas laisser l'état de recul survivre à une zone supprimée.
+        idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
 
         for zone in &all_zones {
             let zone_id = zone.id.unwrap_or(0);
@@ -1433,6 +1740,12 @@ impl PositionPoller {
                 continue;
             } // already handled below
 
+            // Recul après échec : sans cela un appareil injoignable était sondé
+            // chaque seconde sans fin (voir IdlePollBackoff).
+            if idle_backoff.entry(zone_id).or_default().should_skip() {
+                continue;
+            }
+
             let status = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
@@ -1442,8 +1755,23 @@ impl PositionPoller {
                     }
                 };
                 match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                    Ok(s) => {
+                        idle_backoff.entry(zone_id).or_default().record_success();
+                        s
+                    }
+                    Err(e) => {
+                        let b = idle_backoff.entry(zone_id).or_default();
+                        b.record_failure();
+                        debug!(
+                            zone_id,
+                            device = %device_id,
+                            error = %e,
+                            consecutive_errors = b.consecutive_errors,
+                            skip_ticks = b.remaining,
+                            "idle_poll_failed_backing_off"
+                        );
+                        continue;
+                    }
                 }
             };
 
@@ -1611,6 +1939,7 @@ impl PositionPoller {
                 gapless_advance_pending: false,
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
+                stall_declines: 0,
                 radio_stopped_ticks: 0,
                 last_radio_position_ms: 0,
                 last_device_volume: None,
@@ -1652,6 +1981,7 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.scrobbled_key = None;
                     ps.last_bytes_sent = 0;
+                    ps.stall_declines = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
                 }
@@ -2134,6 +2464,33 @@ impl PositionPoller {
             }
 
             // Track the high-water mark for position — used to verify that
+            // Discard provably-stale early samples BEFORE they poison anything:
+            // some renderers report the previous session's position for the
+            // first seconds after a fresh Play (DMP-A6 → near-end staging at
+            // +6s then phantom position_reset advance). Skip the whole
+            // position-driven logic for this tick; the next honest sample
+            // resumes it, and past 30s of wall time the guard stands down.
+            let wall_elapsed_now = ps
+                .track_started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            // A non-realtime output is exempt: "position far ahead of the wall
+            // clock" is a ghost only if playback runs at 1x. A recorder that
+            // finished the capture reports position = duration straight away, so
+            // this `continue` skipped the whole end-of-track path on every tick
+            // until the wall clock caught up with the track's length.
+            if status.realtime
+                && decisions::stale_start_position(wall_elapsed_now, status.position_ms)
+            {
+                debug!(
+                    zone_id,
+                    pos_ms = status.position_ms,
+                    wall_s = wall_elapsed_now,
+                    "stale_start_position_ignored"
+                );
+                continue;
+            }
+
             // enough of the track was actually played before accepting a
             // gapless transition.  We update this BEFORE checking for resets
             // so the peak reflects the last known good position.
@@ -2179,8 +2536,36 @@ impl PositionPoller {
             // the renderer (forum #1019, Marantz ND8006). `gapless_sent` stays
             // true from SetNext until the transition is detected or the track
             // generation changes, so it covers the whole window.
-            let position_reset =
+            // Snapshot the real previous position BEFORE it is overwritten
+            // below — the diagnostic `info!` further down must log the genuine
+            // prior sample, not the just-stored current one (the old code read
+            // `ps.last_position_ms` after the overwrite, so `prev_pos` was
+            // always mis-logged equal to `new_pos`).
+            let prev_position_ms = ps.last_position_ms;
+            let mut position_reset =
                 decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+            // Suppress this metadata-only advance fallback for outputs that don't
+            // do internal gapless (Chromecast, slimproto, exclusive local): for
+            // them a position drop to 0 means the track ENDED (device IDLE /
+            // FINISHED), not that it auto-advanced. Firing here sends no `play`
+            // and steals the event from the natural-end path (Stopped branch →
+            // play_from_queue = real load), causing Rhorn's 1-2s-then-zero loop
+            // (#1072). Compute can_internal_gapless only when a raw reset fires
+            // (rare: end of track). Env-guarded for rollback.
+            if position_reset && std::env::var("TUNE_DISABLE_CAST_ADVANCE_FIX").is_err() {
+                let can_internal_gapless = {
+                    let outputs = self.outputs.lock().await;
+                    match outputs.get(&device_id) {
+                        Some(arc) => arc.lock().await.supports_internal_gapless(),
+                        None => false,
+                    }
+                };
+                position_reset =
+                    decisions::position_reset_fires(position_reset, can_internal_gapless);
+                if !position_reset {
+                    info!(zone_id, "position_reset_deferred_to_natural_end");
+                }
+            }
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
@@ -2201,7 +2586,7 @@ impl PositionPoller {
                         .unwrap_or(0);
                     info!(
                         zone_id,
-                        prev_pos = ps.last_position_ms,
+                        prev_pos = prev_position_ms,
                         new_pos = status.position_ms,
                         arm_to_advance_ms,
                         "gapless_position_reset_detected"
@@ -2213,10 +2598,30 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.last_position_ms = 0;
                     ps.last_bytes_sent = 0;
+                    ps.stall_declines = 0;
                     ps.track_started_at = Some(Instant::now());
                     ps.gapless_advance_pending = false;
                     ps.gapless_stuck_ticks = 0;
-                    if let Some(next_pos) = Self::next_position(zone_state) {
+                    // A stall-recovery restart (OAAT stall supervisor) replays
+                    // the CURRENT track from 0. That from-zero position drop
+                    // trips `position_reset` exactly like a real gapless
+                    // transition — but the renderer is still on the SAME track,
+                    // so advancing would run now-playing one track ahead of the
+                    // audio ("ça avance mais joue le morceau précédent", Xavier,
+                    // OAAT Tune Endpoint). Suppress the advance for a brief
+                    // window after a restart; the state resets above still run,
+                    // so the next genuine transition re-arms and advances
+                    // normally.
+                    let recently_restarted = zone_state
+                        .last_restart_at
+                        .map(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(RESTART_ADVANCE_SUPPRESS_SECS)
+                        })
+                        .unwrap_or(false);
+                    if recently_restarted {
+                        info!(zone_id, "gapless_advance_suppressed_after_restart");
+                    } else if let Some(next_pos) = Self::next_position(zone_state) {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         if let Err(e) = self
                             .orchestrator
@@ -2268,8 +2673,14 @@ impl PositionPoller {
                     // Stopped while it buffers the new stream (especially for
                     // streaming seeks that recreate the session).  Suppress
                     // stopped_ticks to prevent false track-end detection.
-                    let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
-                        < TRACK_LOAD_GRACE_SECS
+                    // Not for a non-realtime output. The grace exists to let a
+                    // renderer buffer, and its `peak < 5s` condition reads "no
+                    // audio has come out yet" — but a recorder that finished the
+                    // whole capture in two seconds legitimately never reports a
+                    // position past 5s, so the grace held every track back for
+                    // its full 45s and a rip crawled at ~46s per track.
+                    let in_track_load_grace = status.realtime
+                        && ps.track_loaded_at.elapsed().as_secs() < TRACK_LOAD_GRACE_SECS
                         && ps.peak_position_ms < 5_000;
                     // A DSD track on a DLNA renderer whose peak reached the end.
                     // Gapless is intentionally not armed for a DSD next on DLNA
@@ -2315,8 +2726,13 @@ impl PositionPoller {
                             status.ended_naturally,
                             wall_elapsed,
                             track_duration_ms,
+                            status.realtime,
                         ),
                         gapless_sent: ps.gapless_sent,
+                        realtime: status.realtime,
+                        // Refined by the natural-end branch below (live probe),
+                        // same late-update pattern as stream_consuming.
+                        can_internal_gapless: true,
                         stream_consuming: false,
                         dlna_dsd_reached_end,
                     };
@@ -2457,8 +2873,16 @@ impl PositionPoller {
                                 status.ended_naturally,
                                 wall_elapsed,
                                 track_duration_ms,
+                                status.realtime,
                             );
-                            if status.ended_naturally && wall_elapsed < 5 && !played_enough {
+                            // Not a warning for a non-realtime output: finishing
+                            // a track in under 5s is its normal mode, not a
+                            // renderer misreporting the end.
+                            if status.ended_naturally
+                                && status.realtime
+                                && wall_elapsed < 5
+                                && !played_enough
+                            {
                                 warn!(
                                     zone_id,
                                     wall_elapsed,
@@ -2478,13 +2902,16 @@ impl PositionPoller {
                                 // (DEvir: repeat fails on clean ASIO playback).
                                 // Only wait when the output can actually
                                 // transition internally; otherwise end normally.
-                                let awaiting_dlna_transition = ps.gapless_sent && {
+                                let can_internal_gapless = {
                                     let outputs = self.outputs.lock().await;
                                     match outputs.get(&device_id) {
                                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                                         None => false,
                                     }
                                 };
+                                fsm_in.can_internal_gapless = can_internal_gapless;
+                                let awaiting_dlna_transition =
+                                    ps.gapless_sent && can_internal_gapless;
                                 if awaiting_dlna_transition {
                                     fsm_actual =
                                         Some(fsm::StoppedOutcome::NaturalEndGaplessWaiting);
@@ -2506,9 +2933,61 @@ impl PositionPoller {
                                     ps.gapless_stuck_ticks = 0;
                                     ps.gapless_cooldown = 4;
                                 } else {
-                                    fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
-                                    ps.gapless_sent = false;
-                                    track_ended = true;
+                                    // Avant d'accepter cette fin : le renderer
+                                    // a-t-il vraiment reçu le morceau ? Sur un
+                                    // réseau qui hoquette il cale, annonce
+                                    // Stopped, et on tronquait la fin en
+                                    // silence. Les octets servis tranchent.
+                                    let sid = zone_state
+                                        .now_playing
+                                        .as_ref()
+                                        .and_then(|np| np.stream_id.clone());
+                                    let (sent, total) = match sid.as_deref() {
+                                        Some(sid) => (
+                                            self.orchestrator
+                                                .streamer_bytes_sent(sid)
+                                                .await
+                                                .unwrap_or(0),
+                                            self.orchestrator.streamer_total_bytes(sid).await,
+                                        ),
+                                        None => (0, None),
+                                    };
+                                    let seeked = zone_state.last_seek_at.is_some();
+                                    if decisions::renderer_could_have_finished(sent, total, seeked)
+                                    {
+                                        fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
+                                        ps.gapless_sent = false;
+                                        track_ended = true;
+                                    } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
+                                        // On laisse au renderer le temps de
+                                        // reprendre : s'il repart, il repassera
+                                        // Playing et cette branche disparaît.
+                                        ps.stall_declines = ps.stall_declines.saturating_add(1);
+                                        if ps.stall_declines == 1 {
+                                            warn!(
+                                                zone_id,
+                                                peak_pos = ps.peak_position_ms,
+                                                track_dur = track_duration_ms,
+                                                bytes_sent = sent,
+                                                bytes_total = total.unwrap_or(0),
+                                                "renderer_stopped_on_incomplete_stream_waiting"
+                                            );
+                                        }
+                                    } else {
+                                        // La lecture a échoué : on arrête la
+                                        // zone bruyamment plutôt que d'avancer
+                                        // en faisant croire à une fin normale.
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            bytes_sent = sent,
+                                            bytes_total = total.unwrap_or(0),
+                                            "renderer_stalled_not_advancing_stopping_zone"
+                                        );
+                                        track_ended = false;
+                                        force_stop = true;
+                                    }
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
                                 // Check if the stream is still being consumed
@@ -2590,11 +3069,12 @@ impl PositionPoller {
                     // (pre-mutation). gapless_enabled is filled in the arm branch
                     // when it is actually read; default true matches the arm.
                     let fsm_has_next = Self::next_position(zone_state).is_some();
-                    let is_dlna = all_zones
+                    let output_type_str = all_zones
                         .iter()
                         .find(|z| z.id == Some(zone_id))
                         .and_then(|z| z.output_type.as_deref())
-                        == Some("dlna");
+                        .unwrap_or("");
+                    let is_dlna = output_type_str == "dlna";
                     let mut fsm_pin = fsm::PlayingInput {
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
@@ -2677,6 +3157,7 @@ impl PositionPoller {
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.last_bytes_sent = 0;
+                        ps.stall_declines = 0;
                         ps.track_started_at = Some(Instant::now());
                         ps.stopped_ticks = 0;
                         ps.past_end_ticks = 0;
@@ -2801,7 +3282,26 @@ impl PositionPoller {
                             track_duration_ms,
                             wall_elapsed,
                         );
-                    if past_end || reached_end_exclusive || wall_clock_past_end {
+                    // Chromecast has no reliable end-of-track signal on a 1 Hz
+                    // fresh-connect poll (FINISHED is a one-shot broadcast; a
+                    // frozen near-end position dodges the position paths), and —
+                    // unlike DLNA — no wall-clock fallback, so an album stalls
+                    // after track 1 (Rhorn, forum #1226). Advance on Tune's own
+                    // clock once the track's full duration has elapsed, still
+                    // gated by played_enough (peak ≥ 80 %, honest on Cast) so a
+                    // genuine mid-track buffering stall can't false-advance.
+                    let chromecast_wall_clock_past_end = !in_seek_grace
+                        && decisions::chromecast_wall_clock_past_end(
+                            output_type_str,
+                            played_enough,
+                            track_duration_ms,
+                            wall_elapsed,
+                        );
+                    if past_end
+                        || reached_end_exclusive
+                        || wall_clock_past_end
+                        || chromecast_wall_clock_past_end
+                    {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
                             info!(
@@ -2812,6 +3312,7 @@ impl PositionPoller {
                                 past_end_ticks = ps.past_end_ticks,
                                 exclusive_end = reached_end_exclusive,
                                 wall_clock_end = wall_clock_past_end,
+                                cast_wall_clock_end = chromecast_wall_clock_past_end,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
@@ -2955,70 +3456,83 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                // Try to generate similar tracks based on the last played track
                 let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let seed_artist = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.artist_name.clone());
 
-                if let Some(seed_id) = seed_track_id {
+                // « Radio artistes similaires » : la graine est le NOM d'artiste,
+                // donc une écoute streaming (pas de track_id local) alimente
+                // aussi l'autoplay. Repli sur le générateur genre/BPM local si
+                // l'API d'enrichissement est injoignable ou ne matche rien dans
+                // la bibliothèque (Tune doit marcher sans mozaiklabs.fr).
+                let mut generated = Vec::new();
+                if let Some(ref artist) = seed_artist {
+                    info!(zone_id, artist = %artist, "autoplay_similar_artists_radio");
+                    generated = crate::playback::auto_dj::generate_similar_artists_queue(
+                        &self.db, artist, 10,
+                    )
+                    .await;
+                }
+                if generated.is_empty() {
+                    if let Some(seed_id) = seed_track_id {
+                        info!(
+                            zone_id,
+                            seed_track_id = seed_id,
+                            "autoplay_generating_tracks"
+                        );
+                        generated = crate::playback::auto_dj::generate_queue(&self.db, seed_id, 10);
+                    } else if seed_artist.is_none() {
+                        debug!(zone_id, "autoplay_skipped_no_seed");
+                    }
+                }
+
+                let track_ids: Vec<i64> = generated
+                    .iter()
+                    .filter_map(|t| t["track_id"].as_i64())
+                    .collect();
+
+                if !track_ids.is_empty() {
                     info!(
                         zone_id,
-                        seed_track_id = seed_id,
-                        "autoplay_generating_tracks"
+                        count = track_ids.len(),
+                        "autoplay_tracks_generated"
                     );
-                    let generated = crate::playback::auto_dj::generate_queue(&self.db, seed_id, 10);
 
-                    if !generated.is_empty() {
-                        let track_ids: Vec<i64> = generated
-                            .iter()
-                            .filter_map(|t| t["track_id"].as_i64())
-                            .collect();
-
-                        if !track_ids.is_empty() {
-                            info!(
-                                zone_id,
-                                count = track_ids.len(),
-                                "autoplay_tracks_generated"
-                            );
-
-                            // Append generated tracks to the play queue
-                            let queue_repo =
-                                crate::db::play_queue_repo::PlayQueueRepo::with_backend(
-                                    self.db.clone(),
-                                );
-                            if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
-                                warn!(zone_id, error = %e, "autoplay_append_queue_failed");
-                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-                                return;
-                            }
-
-                            // Emit autoplay_tracks_added event for UI updates
-                            if let Some(ref bus) = self.event_bus {
-                                bus.emit(
-                                    "playback.autoplay_tracks_added",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "track_ids": track_ids,
-                                        "tracks": generated,
-                                        "seed_track_id": seed_id,
-                                    }),
-                                );
-                            }
-
-                            // Play the first generated track (next position after current)
-                            let new_pos = zone_state.queue_position + 1;
-                            info!(zone_id, new_pos, "autoplay_starting_generated_track");
-                            if let Err(e) =
-                                self.orchestrator.play_from_queue(zone_id, new_pos).await
-                            {
-                                warn!(zone_id, error = %e, "autoplay_play_failed");
-                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-                            }
-                            return;
-                        }
+                    // Append generated tracks to the play queue
+                    let queue_repo =
+                        crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+                    if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
+                        warn!(zone_id, error = %e, "autoplay_append_queue_failed");
+                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        return;
                     }
-                    info!(zone_id, "autoplay_no_similar_tracks_found");
-                } else {
-                    debug!(zone_id, "autoplay_skipped_no_local_seed_track");
+
+                    // Emit autoplay_tracks_added event for UI updates
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "playback.autoplay_tracks_added",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "track_ids": track_ids,
+                                "tracks": generated,
+                                "seed_track_id": seed_track_id,
+                                "seed_artist": seed_artist,
+                            }),
+                        );
+                    }
+
+                    // Play the first generated track (next position after current)
+                    let new_pos = zone_state.queue_position + 1;
+                    info!(zone_id, new_pos, "autoplay_starting_generated_track");
+                    if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                        warn!(zone_id, error = %e, "autoplay_play_failed");
+                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                    }
+                    return;
                 }
+                info!(zone_id, "autoplay_no_similar_tracks_found");
             }
 
             // Log the queue geometry so a "doesn't advance to next track" report
@@ -3089,6 +3603,78 @@ impl PositionPoller {
         let Some(next_pos) = Self::next_position(zone_state) else {
             return false;
         };
+
+        // Local-file gapless (OAAT native DSD): the output reads the next
+        // track's `.dsf` directly, so resolve it as a local file WITHOUT a
+        // transcode session (no orphaned DSD->PCM decode / send-timeout stall)
+        // and stage it via set_next_media(file_path=..). If the next item has no
+        // local file (streaming track), don't arm — the natural-end fallback
+        // advances the queue.
+        let prefers_local_file = {
+            let outputs = self.outputs.lock().await;
+            match outputs.get(device_id) {
+                Some(arc) => arc.lock().await.prefers_local_file_gapless(),
+                None => false,
+            }
+        };
+        if prefers_local_file {
+            let t0 = Instant::now();
+            match self
+                .orchestrator
+                .resolve_gapless_next_local_file(zone_id, next_pos)
+                .await
+            {
+                Ok(resolved) if resolved.file_path.is_some() => {
+                    let output_arc = {
+                        let outputs = self.outputs.lock().await;
+                        outputs.get(device_id).map(|a| a.clone())
+                    };
+                    let Some(output_arc) = output_arc else {
+                        return false;
+                    };
+                    let output = output_arc.lock().await;
+                    let media = crate::outputs::PlayMedia {
+                        url: &resolved.url,
+                        mime_type: &resolved.mime_type,
+                        title: Some(&resolved.title),
+                        artist: resolved.artist.as_deref(),
+                        album: resolved.album.as_deref(),
+                        cover_url: resolved.cover_url.as_deref(),
+                        duration_ms: resolved.duration_ms,
+                        file_size: resolved.file_size,
+                        file_path: resolved.file_path.as_deref(),
+                        sample_rate: resolved.sample_rate,
+                        bit_depth: resolved.bit_depth,
+                        channels: resolved.channels,
+                        live_stream: false,
+                        origin_url: None,
+                    };
+                    return match output.set_next_media(&media).await {
+                        Ok(()) => {
+                            info!(
+                                zone_id,
+                                title = %resolved.title,
+                                resolve_ms = t0.elapsed().as_millis() as u64,
+                                "gapless_next_set_local_file"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
+                            false
+                        }
+                    };
+                }
+                Ok(_) => {
+                    info!(zone_id, "gapless_local_file_skipped_no_local_next");
+                    return false;
+                }
+                Err(e) => {
+                    warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
+                    return false;
+                }
+            }
+        }
 
         // v0.9 gapless characterization: time the next-track resolution and
         // surface failures at warn. These paths were debug-only, so streaming
@@ -3171,6 +3757,7 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        origin_url: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
@@ -3213,6 +3800,34 @@ impl PositionPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_start_position_rejects_previous_session_ghost() {
+        // A6 reporting yesterday's ~374s six seconds into a fresh play.
+        assert!(decisions::stale_start_position(6, 374_000));
+        // Honest early sample: position consistent with wall time.
+        assert!(!decisions::stale_start_position(6, 6_500));
+        // Seek-restore margin: resume at +14s while wall says 2s is tolerated.
+        assert!(!decisions::stale_start_position(2, 14_000));
+    }
+
+    #[test]
+    fn stale_start_position_rejects_ghost_beyond_30s_window() {
+        // DMP-A8 (Bertrand, .18): the renderer keeps reporting a stale near-end
+        // position PAST the old 30s grace. `track_started_at` is folded on
+        // seek/resume so an honest 1x position can never exceed wall+15s at any
+        // point — a ~235s sample at 30-40s of wall time is provably impossible
+        // and must still be rejected (previously it was accepted the instant
+        // the 30s window lapsed, poisoning the peak and firing a phantom
+        // position_reset advance ~30s into track 1).
+        assert!(decisions::stale_start_position(30, 235_000));
+        assert!(decisions::stale_start_position(40, 374_000));
+        // Honest deep-into-track sample is still accepted: position ~= wall.
+        assert!(!decisions::stale_start_position(200, 200_000));
+        // Honest sample within the +15s clock/seek-restore slack, late in the
+        // track, is likewise fine.
+        assert!(!decisions::stale_start_position(200, 214_000));
+    }
 
     #[test]
     fn volume_not_adopted_on_first_observation() {
@@ -3382,6 +3997,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -3433,6 +4049,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -3639,6 +4256,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -3774,6 +4392,43 @@ mod tests {
     }
 
     #[test]
+    fn dmpa8_stale_ghost_does_not_poison_peak_or_advance() {
+        // Reproduces the .18 DMP-A8 "playlist stops at track 1" chain at the
+        // pure-decision level. Track 1 is 240s; the renderer reports a stale
+        // ~235s near-end position for the whole first ~30s of a fresh play.
+        let track_duration_ms = 240_000;
+        let stale_pos_ms = 235_000;
+
+        // Every stale sample is provably impossible (position >> wall+15s) and
+        // is rejected — at 5s in AND once past the old 30s window — so it never
+        // becomes the peak.
+        assert!(decisions::stale_start_position(5, stale_pos_ms));
+        assert!(decisions::stale_start_position(30, stale_pos_ms));
+        assert!(decisions::stale_start_position(35, stale_pos_ms));
+
+        // With the ghost filtered, the peak only ever reflects honest samples
+        // (~a few seconds in this window), so the track is NOT "played enough".
+        let honest_peak_ms = 5_000;
+        assert!(!decisions::played_enough(
+            track_duration_ms,
+            honest_peak_ms,
+            35
+        ));
+
+        // Even if the renderer then snaps to 0 while gapless is armed, the
+        // caller gates the metadata advance on played_enough — which is false —
+        // so no phantom position_reset advance fires 30s into track 1. (The raw
+        // drop shape matches; the played_enough guard is what prevents it.)
+        let raw_drop_matches = decisions::position_reset(stale_pos_ms, 1_000, true);
+        assert!(raw_drop_matches);
+        let played_enough = decisions::played_enough(track_duration_ms, honest_peak_ms, 35);
+        assert!(
+            !(raw_drop_matches && played_enough),
+            "advance must be gated off while the ghost is filtered"
+        );
+    }
+
+    #[test]
     fn position_reset_requires_armed_gapless() {
         // Same position drop but no gapless armed → not a reset.
         assert!(!decisions::position_reset(40_000, 2_000, false));
@@ -3785,6 +4440,26 @@ mod tests {
         assert!(!decisions::position_reset(40_000, 8_000, true));
         // Previous position not above the 30s ceiling → not a reset.
         assert!(!decisions::position_reset(20_000, 2_000, true));
+    }
+
+    #[test]
+    fn position_reset_fallback_only_fires_for_internal_gapless_outputs() {
+        // A raw position drop to 0 fires the metadata-only advance fallback ONLY
+        // for renderers that auto-transition internally (DLNA). For a Chromecast
+        // / slimproto / exclusive-local output the drop means the track ENDED
+        // (device IDLE/FINISHED) — the fallback must NOT fire; the natural-end
+        // path (Stopped branch → play_from_queue) then does a real load.
+        // Regression for Rhorn's Chromecast end-of-track loop (#1072).
+        let raw = decisions::position_reset(40_000, 2_000, true);
+        assert!(raw, "the drop shape matches on both output kinds");
+
+        // Chromecast (can_internal_gapless == false) → suppressed.
+        assert!(!decisions::position_reset_fires(raw, false));
+        // DLNA (can_internal_gapless == true) → fires as before.
+        assert!(decisions::position_reset_fires(raw, true));
+        // No raw reset → never, regardless of output kind.
+        assert!(!decisions::position_reset_fires(false, true));
+        assert!(!decisions::position_reset_fires(false, false));
     }
 
     #[test]
@@ -3809,18 +4484,20 @@ mod tests {
 
     #[test]
     fn natural_end_when_played_enough() {
-        assert!(decisions::natural_end(true, false, 0, false, 0, 300_000));
+        assert!(decisions::natural_end(
+            true, false, 0, false, 0, 300_000, true
+        ));
     }
 
     #[test]
     fn natural_end_repeat_active_with_meaningful_playback() {
         // Repeat on + peak > 5s → treat as natural end (DEvir QA B-05).
         assert!(decisions::natural_end(
-            false, true, 6_000, false, 0, 300_000
+            false, true, 6_000, false, 0, 300_000, true
         ));
         // Repeat on but peak <= 5s → not enough.
         assert!(!decisions::natural_end(
-            false, true, 4_000, false, 0, 300_000
+            false, true, 4_000, false, 0, 300_000, true
         ));
     }
 
@@ -3829,29 +4506,63 @@ mod tests {
         // ended_naturally is trusted only once >= MIN_WALL_FRACTION of the known
         // duration has elapsed in wall time — a 5:00 track cannot end at 5s
         // (DMP-A8 spurious ended_naturally). 50% of 300s = 150s.
-        assert!(!decisions::natural_end(false, false, 0, true, 5, 300_000));
-        assert!(!decisions::natural_end(false, false, 0, true, 149, 300_000));
-        assert!(decisions::natural_end(false, false, 0, true, 150, 300_000));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 5, 300_000, true
+        ));
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 149, 300_000, true
+        ));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 150, 300_000, true
+        ));
         // Unknown duration (0) keeps the original modest 5s floor.
-        assert!(decisions::natural_end(false, false, 0, true, 5, 0));
-        assert!(!decisions::natural_end(false, false, 0, true, 4, 0));
+        assert!(decisions::natural_end(false, false, 0, true, 5, 0, true));
+        assert!(!decisions::natural_end(false, false, 0, true, 4, 0, true));
+    }
+
+    /// A non-realtime output (a recorder writing the container to disk) is
+    /// exempt from the wall-clock floor: it finishes a 5:00 track in a second or
+    /// two, and holding the queue back until 150s had elapsed pinned a rip at
+    /// half of listening speed instead of network speed.
+    #[test]
+    fn natural_end_non_realtime_output_skips_the_wall_guard() {
+        // Same inputs the DMP-A8 guard rejects above — accepted here.
+        assert!(decisions::natural_end(
+            false, false, 0, true, 1, 300_000, false
+        ));
+        assert!(decisions::natural_end(
+            false, false, 0, true, 0, 300_000, false
+        ));
+
+        // The exemption is not a blanket "always end": without ended_naturally
+        // there is still nothing to act on.
+        assert!(!decisions::natural_end(
+            false, false, 0, false, 0, 300_000, false
+        ));
+
+        // And it changes nothing for a renderer.
+        assert!(!decisions::natural_end(
+            false, false, 0, true, 1, 300_000, true
+        ));
     }
 
     #[test]
     fn natural_end_short_track_half_played() {
         // Short track (< 30s) with >= 50% peak → natural end.
         assert!(decisions::natural_end(
-            false, false, 6_000, false, 0, 10_000
+            false, false, 6_000, false, 0, 10_000, true
         ));
         // Short track but < 50% peak → not yet.
         assert!(!decisions::natural_end(
-            false, false, 4_000, false, 0, 10_000
+            false, false, 4_000, false, 0, 10_000, true
         ));
     }
 
     #[test]
     fn natural_end_all_guards_false() {
-        assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
+        assert!(!decisions::natural_end(
+            false, false, 0, false, 0, 300_000, true
+        ));
     }
 
     // DSD-over-DLNA end-of-track fast path (Benjithom, RS130: ~5s gap between DSD
@@ -3922,6 +4633,45 @@ mod tests {
         assert!(!decisions::wall_clock_past_end(false, 0, 300_000, 304));
         // Queue duration unknown → no advance.
         assert!(!decisions::wall_clock_past_end(true, 0, 0, 304));
+    }
+
+    #[test]
+    fn chromecast_wall_clock_past_end_advances_after_full_duration() {
+        // Chromecast, played enough (peak ≥80%), wall clock passed dur+margin:
+        // Cast never surfaced a usable end-of-track signal → advance on our clock
+        // (Rhorn, forum #1226: album stalls after track 1 on Chromecast Audio).
+        assert!(decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            true,
+            300_000,
+            304
+        ));
+        // Not enough wall time elapsed yet → keep playing.
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            true,
+            300_000,
+            120
+        ));
+        // Peak below 80% (a genuine mid-track buffering stall) → must NOT advance
+        // even though the wall clock passed the duration.
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            false,
+            300_000,
+            304
+        ));
+        // Non-chromecast output → fallback disabled (DLNA/local keep their paths).
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "dlna", true, 300_000, 304
+        ));
+        // Unknown track duration → no advance (nothing to compare the clock to).
+        assert!(!decisions::chromecast_wall_clock_past_end(
+            "chromecast",
+            true,
+            0,
+            304
+        ));
     }
 
     #[test]
@@ -4031,6 +4781,32 @@ mod tests {
     }
 
     #[test]
+    fn should_arm_gapless_ignores_egregious_renderer_duration() {
+        use decisions::{sane_current_duration, should_arm_gapless};
+        // The HiFi Rose RS130 reports a duration far off the real track. Only
+        // an egregious (>4x / <1/4) mismatch with a known DB duration is
+        // distrusted — a merely-imprecise renderer duration is still trusted.
+        //
+        // (a) egregiously LARGE (800000 for a real 174693 ms track): without the
+        // guard the arm window sits past the real end so gapless never arms and
+        // the album cuts; with the guard the DB duration wins and it arms in time.
+        assert!(should_arm_gapless(false, 800_000, 174_693, 160_000));
+        // (b) egregiously SMALL (40000 for a real 174693 ms track): without the
+        // guard it would arm at ~t=10s; with the guard it waits for the real end.
+        assert!(!should_arm_gapless(false, 40_000, 174_693, 50_000));
+        // A merely-different (3.3x) reported value is STILL trusted — this is the
+        // deliberate "well-behaved renderer" design, unchanged.
+        assert!(should_arm_gapless(false, 300_000, 999_000, 275_000));
+        // Helper directly: egregious → DB; imprecise → reported; 0 → DB;
+        // unknown DB → keep reported (can't judge).
+        assert_eq!(sane_current_duration(800_000, 174_693), 174_693);
+        assert_eq!(sane_current_duration(40_000, 174_693), 174_693);
+        assert_eq!(sane_current_duration(300_000, 999_000), 300_000);
+        assert_eq!(sane_current_duration(0, 174_693), 174_693);
+        assert_eq!(sane_current_duration(800_000, 0), 800_000);
+    }
+
+    #[test]
     fn past_end_reached_beyond_margin() {
         // Position past duration + END_MARGIN_MS, played enough → reached.
         assert!(decisions::past_end_reached(240_000, true, 244_000));
@@ -4111,6 +4887,7 @@ mod tests {
             gapless_advance_pending: true, // metadata was advanced
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -4142,6 +4919,148 @@ mod tests {
     }
 
     #[test]
+    fn idle_backoff_skips_then_retries() {
+        let mut b = super::IdlePollBackoff::default();
+        // Sans échec, on sonde à chaque tick.
+        assert!(!b.should_skip());
+
+        // Premier échec : 2 ticks sautés, puis on retente.
+        b.record_failure();
+        assert_eq!(b.remaining, 2);
+        assert!(b.should_skip());
+        assert!(b.should_skip());
+        assert!(!b.should_skip(), "après le recul, un sondage doit repartir");
+    }
+
+    #[test]
+    fn idle_backoff_grows_and_is_capped() {
+        let mut b = super::IdlePollBackoff::default();
+        for expected in [2u8, 4, 8, 16, 32] {
+            b.record_failure();
+            assert_eq!(b.remaining, expected);
+            while b.should_skip() {}
+        }
+        // Plafond : 20 échecs de plus ne dépassent pas 2^IDLE_BACKOFF_MAX_SHIFT.
+        for _ in 0..20 {
+            b.record_failure();
+            assert_eq!(b.remaining, 1u8 << super::IDLE_BACKOFF_MAX_SHIFT);
+            while b.should_skip() {}
+        }
+    }
+
+    #[test]
+    fn idle_backoff_resets_on_success() {
+        let mut b = super::IdlePollBackoff::default();
+        b.record_failure();
+        b.record_failure();
+        assert!(b.remaining > 0);
+        b.record_success();
+        assert_eq!(b.consecutive_errors, 0);
+        assert!(
+            !b.should_skip(),
+            "un appareil qui répond doit être sondé à plein rythme"
+        );
+    }
+
+    /// Quantifie le gain : sur une minute face à un appareil qui ne répond
+    /// jamais, l'ancien chemin sondait à chaque tick (60 fois). Avec le recul,
+    /// on compte les sondages réellement tentés — c'est le flux que le renderer
+    /// subissait et qui finissait par le figer.
+    #[test]
+    fn idle_backoff_collapses_poll_rate_on_a_dead_device() {
+        let mut b = super::IdlePollBackoff::default();
+        let mut polls = 0;
+        for _ in 0..60 {
+            if b.should_skip() {
+                continue;
+            }
+            polls += 1;
+            b.record_failure(); // l'appareil ne répond jamais
+        }
+        assert!(
+            polls <= 8,
+            "60 ticks devraient donner une poignée de sondages, pas {polls}"
+        );
+        assert!(
+            polls >= 4,
+            "il faut quand même retenter régulièrement, or {polls}"
+        );
+    }
+
+    #[test]
+    fn a_fully_served_stream_may_have_finished() {
+        // Tout servi, ou la marge de 10 % : le renderer a pu finir.
+        assert!(super::decisions::renderer_could_have_finished(
+            39_838_610,
+            Some(39_838_610),
+            false
+        ));
+        assert!(super::decisions::renderer_could_have_finished(
+            36_000_000,
+            Some(39_838_610),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_clearly_short_stream_cannot_have_finished() {
+        // Le cas de JP : 16 Mo servis sur 39,8 Mo, et le renderer annonce
+        // Stopped. Il n'a pas pu finir de jouer ce qu'il n'a pas reçu.
+        assert!(!super::decisions::renderer_could_have_finished(
+            16_121_856,
+            Some(39_838_610),
+            false
+        ));
+        assert!(!super::decisions::renderer_could_have_finished(
+            0,
+            Some(1_000),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_unknown_total_is_never_judged() {
+        // Radio, flux décodé à la volée : aucune conclusion possible, on garde
+        // le comportement d'avant plutôt que de bloquer une lecture saine.
+        assert!(super::decisions::renderer_could_have_finished(
+            0, None, false
+        ));
+        assert!(super::decisions::renderer_could_have_finished(
+            0,
+            Some(0),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_served_threshold_matches_the_documented_percentage() {
+        let total = 1_000_u64;
+        let pile = total * super::MIN_SERVED_PERCENT_FOR_NATURAL_END / 100;
+        assert!(super::decisions::renderer_could_have_finished(
+            pile,
+            Some(total),
+            false
+        ));
+        assert!(!super::decisions::renderer_could_have_finished(
+            pile - 1,
+            Some(total),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_seek_neutralises_the_served_bytes_criterion() {
+        // Après un saut, le renderer ne récupère que la portion restante : les
+        // octets servis sont légitimement partiels et ne doivent pas vetoer une
+        // fin normale (régression DEvir, v0.9.0-rc4).
+        assert!(super::decisions::renderer_could_have_finished(
+            1_000,
+            Some(39_838_610),
+            true
+        ));
+    }
+
+    #[test]
     fn gapless_stuck_cleared_on_playing() {
         // When the renderer transitions to Playing, gapless_advance_pending
         // should be cleared (the gapless transition succeeded).
@@ -4169,6 +5088,7 @@ mod tests {
             gapless_advance_pending: true,
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
+            stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,

@@ -164,8 +164,18 @@ const MIGRATION_TABLES: &[&str] = &[
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
-/// Uses simple types (TEXT/BIGINT/INTEGER/DOUBLE PRECISION) for maximum
-/// compatibility with the SQLite data being copied.
+///
+/// Numeric columns (year, track_number, duration_ms, sample_rate, …) are
+/// declared TEXT here ON PURPOSE: `insert_batch`/`bind_migration_value` bind
+/// every copied SQLite value as a TEXT parameter (SQLite is dynamically typed,
+/// so this is the only universally-safe binding), and PG has no implicit
+/// text→integer cast for an INSERT — a numeric column type here would make the
+/// data copy fail. The intended numeric types are restored AFTER the copy by
+/// the idempotent heal migrations run_pg_migrations() applies at PG startup
+/// (010 albums/tracks, 011 listen_history, 012 the rest). The forced restart
+/// into PostgreSQL after a migrate (routes/system/database.rs) guarantees that
+/// convergence runs before the first real query. Do NOT switch these columns to
+/// numeric types without also making the copy bind them natively.
 ///
 /// Every CREATE TABLE uses IF NOT EXISTS and every INSERT for seed data
 /// uses ON CONFLICT DO NOTHING, making this fully idempotent.
@@ -215,7 +225,10 @@ CREATE TABLE IF NOT EXISTS albums (
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,
-    original_date TEXT
+    original_date TEXT,
+    -- The folder on disk holding this release. What identifies an album: see
+    -- `scanner::album_folder`.
+    folder_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -687,6 +700,7 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto';
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_native_flac TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
@@ -774,7 +788,22 @@ pub async fn migrate_sqlite_to_pg(
         }
     }
 
-    // No sequence reset needed — all PKs are TEXT in migration schema
+    // Bring the freshly-migrated database up to the latest schema right now —
+    // most importantly migration 012, which converts the TEXT `id` columns this
+    // schema creates back to auto-incrementing BIGINT with a sequence (a fresh
+    // install gets BIGSERIAL from 001). Without it the migrated DB inherits
+    // SQLite's dynamic typing and rejects every NEW insert that omits `id`
+    // ("null value in column \"id\" ... violates not-null constraint" — the
+    // scan sees the files but writes 0, JF). Startup runs the migrations too,
+    // but the migrate route only restarts when persisting the DATABASE_URL
+    // succeeds, so doing it here guarantees a usable database regardless.
+    // Idempotent: the startup pass then finds nothing to do.
+    if let Err(e) = crate::db::migrations::run_pg_migrations(&pool).await {
+        tracing::warn!(error = %e, "pg_migrate_post_migration_upgrade_failed");
+        result
+            .errors
+            .push(format!("post-migration schema upgrade failed: {e}"));
+    }
 
     let elapsed = start.elapsed();
     info!(

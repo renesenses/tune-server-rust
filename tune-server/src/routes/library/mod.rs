@@ -7,7 +7,9 @@ mod credits;
 mod duplicates;
 mod enrich;
 mod facets;
+mod folder_facet;
 mod genres;
+mod ingest;
 mod ratings;
 mod search;
 mod stats;
@@ -34,6 +36,11 @@ pub(super) struct SearchQuery {
 }
 
 pub(super) const API_CACHE_TTL_SECS: i64 = 86400; // 24 hours
+
+/// Body limit for a drag-and-dropped album on `/ingest/upload`. Sized for a
+/// hi-res or DSD release, which a 50 MB default would refuse outright. The
+/// handler streams each part to disk, so this bounds the request, not memory.
+const INGEST_UPLOAD_LIMIT: usize = 8 * 1024 * 1024 * 1024;
 
 pub(super) fn api_cache_get(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
@@ -162,6 +169,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/count", get(albums::album_count))
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
+        .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
@@ -207,10 +215,29 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/metadata",
             get(tracks::track_metadata_get).put(tracks::track_metadata_put),
         )
+        // Ingest — bring an outside folder into the library. `upload` gets its
+        // own body limit: the global 50 MB cap is fine for JSON but would
+        // reject a dropped album on the first file.
+        .route(
+            "/ingest/settings",
+            get(ingest::get_ingest_settings).put(ingest::put_ingest_settings),
+        )
+        .route("/ingest/analyze", post(ingest::analyze))
+        .route("/ingest/release-tracks", post(ingest::release_tracks))
+        .route("/ingest/plan", post(ingest::plan))
+        .route("/ingest/apply", post(ingest::apply))
+        .route("/ingest/jobs", get(ingest::list_jobs))
+        .route("/ingest/jobs/{id}", get(ingest::get_job))
+        .route("/ingest/jobs/{id}/undo", post(ingest::undo_job))
+        .route(
+            "/ingest/upload",
+            post(ingest::upload).layer(axum::extract::DefaultBodyLimit::max(INGEST_UPLOAD_LIMIT)),
+        )
         .route("/browse", get(browse::browse_roots))
         .route("/browse/dir", get(browse::browse_directory))
         .route("/folders", get(browse::browse_folders))
         .route("/genres", get(genres::list_genres))
+        .route("/genres/rename", post(genres::rename_genre))
         .route("/genres/{name}/albums", get(genres::genre_albums))
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))

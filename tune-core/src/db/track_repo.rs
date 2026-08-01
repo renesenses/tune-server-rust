@@ -7,6 +7,18 @@ use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
 
+/// Build the `LIKE` pattern that matches every track whose file lives under
+/// `prefix` (recursively). Trailing separators are trimmed so a library pointed
+/// at a share/drive root doesn't produce a doubled separator that matches
+/// nothing (same trap handled in `browse.rs`). The server's `MAIN_SEPARATOR` is
+/// the separator stored in `tracks.file_path` (paths are absolute local paths on
+/// the scanning host), so both the flat filter and the folder facet agree.
+pub fn folder_like_pattern(prefix: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let base = prefix.trim_end_matches(['/', '\\']);
+    format!("{base}{sep}%")
+}
+
 /// Engine-agnostic SQL builders for track_repo.
 ///
 /// Complex dynamic queries (search() FTS5, list_doubtful() aggregate,
@@ -134,6 +146,14 @@ pub mod sql {
     pub fn update_audio_hash<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE tracks SET audio_hash = {} WHERE file_path = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn update_duration<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET duration_ms = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -520,6 +540,7 @@ impl TrackRepo {
         country: Option<&str>,
         mood: Option<&str>,
         source_media: Option<&str>,
+        folder: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -616,6 +637,15 @@ impl TrackRepo {
             }
         }
 
+        // Folder facet (Oxygen drill-down): restrict to tracks whose file lives
+        // under the selected directory subtree. The current breadcrumb path IS
+        // the filter — recursive so a parent folder includes its sub-folders.
+        if let Some(fld) = folder.filter(|s| !s.is_empty()) {
+            conditions.push(format!("t.file_path LIKE {}", make_ph(idx)));
+            owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
+            idx += 1;
+        }
+
         if let Some(query) = q {
             let like = format!("%{}%", query);
             conditions.push(format!(
@@ -682,6 +712,15 @@ impl TrackRepo {
     pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_audio_hash, sql::update_audio_hash);
         let params: [&dyn ToSqlValue; 2] = [&audio_hash, &file_path];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Persist a duration recovered at play time (see the orchestrator's
+    /// play-time backfill) so a track scanned with `duration_ms = 0` self-heals.
+    pub fn update_duration(&self, id: i64, duration_ms: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::update_duration, sql::update_duration);
+        let params: [&dyn ToSqlValue; 2] = [&duration_ms, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -923,6 +962,7 @@ impl TrackRepo {
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
             if track.title.to_lowercase().contains("personal jesus") {
                 tracing::warn!(
@@ -963,7 +1003,16 @@ impl TrackRepo {
                 &track.musicbrainz_recording_id,
                 &track.comments,
             ];
-            match self.db.execute(&insert_sql, &params) {
+            row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+        }
+        // One backend call for the whole batch: on Postgres this reuses a
+        // single connection + prepared statement instead of a per-row
+        // runtime hop (see DbBackend::execute_many).
+        for (track, res) in tracks
+            .iter()
+            .zip(self.db.execute_many(&insert_sql, &row_params))
+        {
+            match res {
                 Ok(_) => count += 1,
                 // Previously this failure was swallowed silently: the scanner
                 // reported "files=N errors=0" while the tracks never landed in
@@ -992,6 +1041,9 @@ impl TrackRepo {
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let update_sql = self.dialect_sql(sql::update, sql::update);
         let mut count = 0usize;
+        // Rows without an id are skipped, so collect the params first and
+        // batch them through one execute_many call (see create_batch).
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
             let Some(id) = track.id else { continue };
             let params: [&dyn ToSqlValue; 25] = [
@@ -1021,8 +1073,12 @@ impl TrackRepo {
                 &track.comments,
                 &id,
             ];
-            if self.db.execute(&update_sql, &params).is_ok() {
-                count += 1;
+            row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+        }
+        for res in self.db.execute_many(&update_sql, &row_params) {
+            match res {
+                Ok(_) => count += 1,
+                Err(e) => tracing::warn!(error = %e, "track_update_failed_in_batch"),
             }
         }
         Ok(count)
@@ -1299,6 +1355,23 @@ mod tests {
         );
         // The retained "Time" is the first-seen path (album 1), not a copy.
         assert_eq!(out[0].file_path.as_deref(), Some("/nas/time.flac"));
+    }
+
+    #[test]
+    fn update_duration_backfills_a_zero_duration_track() {
+        // A track scanned with duration_ms = 0 (scan timeout / unreadable DSD)
+        // is what the play-time backfill repairs. Verify the persist path.
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut track = Track::new("Silent Length".into());
+        track.file_path = Some("/music/mystery.dsf".into());
+        track.duration_ms = 0;
+        let id = repo.create(&track).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().duration_ms, 0);
+
+        repo.update_duration(id, 207_000).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().duration_ms, 207_000);
     }
 
     #[test]

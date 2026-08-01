@@ -672,6 +672,7 @@ impl TidalService {
             track_number: item["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: item["volumeNumber"].as_u64().map(|n| n as u32),
             explicit: item["explicit"].as_bool().unwrap_or(false),
+            isrc: item["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate,

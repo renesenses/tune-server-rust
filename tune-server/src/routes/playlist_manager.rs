@@ -309,16 +309,22 @@ async fn transfer_playlist(
             } else {
                 format!("{title} {artist}")
             };
-            match svc.search(&query, 5).await {
+            match svc.search(&query, 10).await {
                 Ok(results) => {
-                    if let Some(first) = results.tracks.first() {
+                    if let Some(best) = tune_core::streaming::matching::best_stream_match(
+                        title,
+                        artist,
+                        "",
+                        0,
+                        &results.tracks,
+                    ) {
                         matched += 1;
                         track_details.push(json!({
                             "source_title": title,
                             "source_artist": artist,
-                            "matched_title": first.title,
-                            "matched_artist": first.artist,
-                            "matched_id": first.id,
+                            "matched_title": best.title,
+                            "matched_artist": best.artist,
+                            "matched_id": best.id,
                             "status": "matched",
                         }));
                     } else {

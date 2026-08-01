@@ -89,6 +89,8 @@ pub(super) struct TrackFilterQuery {
     pub country: Option<String>,
     pub mood: Option<String>,
     pub source_media: Option<String>,
+    /// Oxygen folder facet: absolute directory prefix; matches its whole subtree.
+    pub folder: Option<String>,
 }
 
 pub(super) async fn list_tracks(
@@ -111,7 +113,8 @@ pub(super) async fn list_tracks(
         || p.artist.is_some()
         || p.country.is_some()
         || p.mood.is_some()
-        || p.source_media.is_some();
+        || p.source_media.is_some()
+        || p.folder.as_deref().is_some_and(|s| !s.is_empty());
 
     if has_filters {
         match repo.list_filtered(
@@ -128,6 +131,7 @@ pub(super) async fn list_tracks(
             p.country.as_deref(),
             p.mood.as_deref(),
             p.source_media.as_deref(),
+            p.folder.as_deref(),
             limit,
             offset,
         ) {

@@ -337,8 +337,17 @@ CREATE TABLE IF NOT EXISTS albums (
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,
-    original_date TEXT
+    original_date TEXT,
+    -- The folder on disk holding this release. What identifies an album: see
+    -- `scanner::album_folder`.
+    folder_path TEXT
 );
+
+-- No index on folder_path here: this batch runs against EXISTING databases too,
+-- where `CREATE TABLE IF NOT EXISTS albums` is a no-op and the column does not
+-- exist yet, so indexing it would abort the whole batch and the server with it.
+-- Migration 60 adds column and index together, and it runs on fresh databases
+-- as well (see `run_migrations`), so both cases end up indexed.
 
 CREATE TABLE IF NOT EXISTS tracks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -432,7 +441,8 @@ CREATE TABLE IF NOT EXISTS zones (
     last_play_state TEXT DEFAULT 'stopped',
     dsd_mode TEXT DEFAULT 'auto',
     dlna_native_flac INTEGER DEFAULT 0,
-    host TEXT
+    host TEXT,
+    mac TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both
