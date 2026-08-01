@@ -526,14 +526,19 @@ fn spawn_token_refresher(state: &AppState) {
                     let mut svc = svc.lock().await;
                     match svc.refresh_if_needed().await {
                         Ok(true) => {
-                            if let Some(tokens) = svc.save_tokens() {
-                                let settings =
-                                    tune_core::db::settings_repo::SettingsRepo::with_backend(
-                                        db.clone(),
-                                    );
-                                settings
-                                    .set(&format!("auth_tokens_{name}"), &tokens.to_string())
-                                    .ok();
+                            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(
+                                db.clone(),
+                            );
+                            let key = format!("auth_tokens_{name}");
+                            if svc.session_expired() {
+                                // The token was rejected and could not be
+                                // renewed. Delete the row instead of leaving a
+                                // credential the provider has refused, which a
+                                // restart would dutifully reload.
+                                settings.delete(&key).ok();
+                                tracing::warn!(service = %name, "expired_session_row_deleted");
+                            } else if let Some(tokens) = svc.save_tokens() {
+                                settings.set(&key, &tokens.to_string()).ok();
                             }
                         }
                         Ok(false) => {}

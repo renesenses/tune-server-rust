@@ -32,6 +32,9 @@ pub struct QobuzService {
     last_relogin_attempt: Option<std::time::Instant>,
     /// Set when `restore_tokens` read a pre-fix row carrying `stored_password`.
     needs_token_rewrite: bool,
+    /// Set when Qobuz rejected the token and no relogin was possible — the
+    /// session is over and the persisted row is worthless.
+    session_expired: bool,
 }
 
 /// (primary, fallback) API bases for the given endpoint order.
@@ -113,6 +116,7 @@ impl QobuzService {
             enabled_override: None,
             last_relogin_attempt: None,
             needs_token_rewrite: false,
+            session_expired: false,
         }
     }
 
@@ -440,6 +444,9 @@ impl QobuzService {
         self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
         self.username = data["user"]["display_name"].as_str().map(Into::into);
         self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
+        // A fresh session clears the expiry flag, whether this login came from
+        // the user or from `auto_relogin`.
+        self.session_expired = false;
 
         info!(username = ?self.username, "qobuz_authenticated");
         Ok(self.auth_status_internal())
@@ -1347,14 +1354,36 @@ impl StreamingService for QobuzService {
             return Ok(false);
         }
         let test = self.api_get("/user/get", &[]).await;
-        if let Err(ref e) = test
-            && (e.contains("401") || e.contains("403"))
-            && self.auto_relogin().await
-        {
+        let Err(ref e) = test else {
+            return Ok(false);
+        };
+        // Only a rejected session is conclusive. A timeout or a 5xx says
+        // nothing about the token and must not cost the user their session.
+        if !(e.contains("401") || e.contains("403")) {
+            return Ok(false);
+        }
+        if self.auto_relogin().await {
             info!("qobuz_token_refreshed_via_relogin");
             return Ok(true);
         }
-        Ok(false)
+        // Qobuz rejected the token and we cannot get a new one. Drop it: while
+        // it stayed in place, `auth_status` still answered `authenticated:
+        // true`, so the UI showed the service connected, the friendly "session
+        // expired, reconnect in Settings" branch in `get_track_url` (which
+        // tests for a *missing* token) never ran, and playback failed with a
+        // raw `qobuz /track/getFileUrl: 401`. Clearing it makes every one of
+        // those report the truth.
+        warn!("qobuz_session_expired_token_cleared");
+        self.user_auth_token = None;
+        self.subscription = None;
+        self.session_expired = true;
+        // `username` is kept on purpose: the account is still known, it just
+        // needs a password again, and the client can name it in the prompt.
+        Ok(true)
+    }
+
+    fn session_expired(&self) -> bool {
+        self.session_expired
     }
 
     /// The persisted blob deliberately carries **no password**.
@@ -1798,6 +1827,49 @@ mod tests {
             "stored_username": "testuser",
         }));
         assert_eq!(restored.stored_password, None);
+    }
+
+    #[test]
+    fn qobuz_fresh_service_reports_no_expired_session() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        assert!(!svc.session_expired());
+        assert!(!svc.auth_status_internal().authenticated);
+    }
+
+    #[test]
+    fn qobuz_cleared_session_reports_disconnected() {
+        // The state `refresh_if_needed` leaves behind once Qobuz has refused the
+        // token: `authenticated` must be false, or the UI keeps showing the
+        // service as connected while every call 401s.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.user_auth_token = None;
+        svc.subscription = None;
+        svc.username = Some("testuser".into());
+        svc.session_expired = true;
+
+        let status = svc.auth_status_internal();
+        assert!(!status.authenticated);
+        assert!(svc.session_expired());
+        // The account stays named so the prompt can address it.
+        assert_eq!(status.username.as_deref(), Some("testuser"));
+        // And nothing is persisted for a session that no longer exists.
+        assert!(svc.save_tokens().is_none());
+    }
+
+    #[test]
+    fn qobuz_login_clears_the_expired_flag() {
+        // Reconnecting must undo the expiry, otherwise the row would be deleted
+        // again right after a successful login.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.session_expired = true;
+
+        // What `login_internal` does on success, without the network round trip.
+        svc.user_auth_token = Some("fresh".into());
+        svc.session_expired = false;
+
+        assert!(!svc.session_expired());
+        assert!(svc.auth_status_internal().authenticated);
+        assert!(svc.save_tokens().is_some());
     }
 
     #[test]

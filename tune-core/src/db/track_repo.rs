@@ -19,6 +19,68 @@ pub fn folder_like_pattern(prefix: &str) -> String {
     format!("{base}{sep}%")
 }
 
+/// The longest common directory prefix of all `tracks.file_path` — the real
+/// library root inferred from the data. Fallback for the folder views (Oxygen
+/// facet, browse "Répertoires") when `music_dirs` is stale and its configured
+/// roots match no stored path (the browse_root_zero_tracks drift: e.g. .18 set
+/// to /mnt/music while files live under /data/music). For sorted strings
+/// LCP(all) == LCP(min, max), so two aggregates suffice — no full scan. Returns
+/// the directory (trailing separator dropped), or None if the library is empty
+/// or the common prefix has no separator.
+pub fn derive_common_root(backend: &dyn DbBackend) -> Option<String> {
+    let agg = |f: &str| -> Option<String> {
+        backend
+            .query_one(
+                &format!(
+                    "SELECT {f}(file_path) FROM tracks \
+                     WHERE file_path IS NOT NULL AND file_path <> ''"
+                ),
+                &[],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_string()))
+    };
+    let (min, max) = (agg("MIN")?, agg("MAX")?);
+    let lcp = common_prefix(&min, &max);
+    // Trim back to the last separator → a directory (handles both / and \ so it
+    // works whichever separator the scanning host stored).
+    let idx = lcp.rfind(['/', '\\'])?;
+    let root = &lcp[..idx];
+    (!root.is_empty()).then(|| root.to_string())
+}
+
+/// Longest common (char-boundary-safe) prefix of two strings.
+pub(crate) fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let mut end = 0;
+    for ((i, ca), cb) in a.char_indices().zip(b.chars()) {
+        if ca != cb {
+            break;
+        }
+        end = i + ca.len_utf8();
+    }
+    &a[..end]
+}
+
+#[cfg(test)]
+mod common_root_tests {
+    use super::common_prefix;
+
+    #[test]
+    fn common_prefix_is_the_shared_directory() {
+        // Real .18 case: min/max of the library share "/data/music/".
+        assert_eq!(
+            common_prefix("/data/music/10. x.flac", "/data/music/V_DSF/y.dsf"),
+            "/data/music/"
+        );
+        assert_eq!(common_prefix("/a/b", "/a/c"), "/a/");
+        assert_eq!(common_prefix("/x", "/y"), "/");
+        assert_eq!(common_prefix("same", "same"), "same");
+        // Multibyte: must cut on a char boundary, never mid-codepoint.
+        assert_eq!(common_prefix("/muské/a", "/muskà/b"), "/musk");
+    }
+}
+
 /// Engine-agnostic SQL builders for track_repo.
 ///
 /// Complex dynamic queries (search() FTS5, list_doubtful() aggregate,
