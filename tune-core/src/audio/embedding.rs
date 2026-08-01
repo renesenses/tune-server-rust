@@ -243,6 +243,24 @@ async fn ensure_model(dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Provision the onnxruntime shared lib next to the model and load it into `ort`
+/// exactly once (`ort::init_from` must run before the first `Session`). The
+/// dylib is cached under the model's directory, so it is fetched only on the
+/// first activation. Once `*ready` is set the runtime is live for the process.
+async fn ensure_runtime_loaded(model_path: &Path, ready: &mut bool) -> Result<(), String> {
+    if *ready {
+        return Ok(());
+    }
+    let cache_root = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let dylib = super::runtime::ensure_runtime(cache_root).await?;
+    ort::init_from(&dylib)
+        .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
+        .commit();
+    info!(dylib = %dylib.display(), "audio_runtime_loaded");
+    *ready = true;
+    Ok(())
+}
+
 /// Spawn the background audio-embedding sweep. Mirrors `replaygain::spawn`:
 /// opt-in via `audio_embedding_enabled`, downloads + checksum-verifies the CLAP
 /// model on first activation (to the configured path), then chips away at the
@@ -253,6 +271,8 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         let mut embedder: Option<AudioEmbedder> = None;
+        // The onnxruntime dylib is loaded once, globally, before any Session.
+        let mut runtime_ready = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
@@ -260,6 +280,8 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     if let Some(p) = configured_model_path(&settings) {
                         if let Err(e) = ensure_model(&p).await {
                             warn!(error = %e, "audio_model_unavailable");
+                        } else if let Err(e) = ensure_runtime_loaded(&p, &mut runtime_ready).await {
+                            warn!(error = %e, "audio_runtime_unavailable");
                         } else {
                             match AudioEmbedder::load(&p) {
                                 Ok(e) => {
@@ -283,4 +305,43 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
             tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end provisioning proof: fetch the real pyke onnxruntime archive for
+    /// THIS platform, LZMA2-decompress + untar it, load it into `ort`, download
+    /// the published CLAP model, and embed a buffer — asserting a normalised 512-d
+    /// vector comes out. Ignored by default (network + ~120 MB model + ~40 MB
+    /// runtime). Run explicitly to validate the activation path on a new platform:
+    ///   cargo test -p tune-core --features audio-embedding \
+    ///     provision_and_embed -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn provision_and_embed() {
+        let dir = std::env::temp_dir().join("tune-audio-embed-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("clap-audio-2023.onnx");
+
+        ensure_model(&model).await.expect("download model");
+        let mut ready = false;
+        ensure_runtime_loaded(&model, &mut ready)
+            .await
+            .expect("provision onnxruntime");
+        assert!(ready);
+
+        let mut embedder = AudioEmbedder::load(&model).expect("load embedder");
+        // 1 s of quiet noise → a valid, finite, unit-norm embedding.
+        let wav: Vec<f32> = (0..48_000)
+            .map(|i| ((i % 97) as f32 / 97.0 - 0.5) * 0.01)
+            .collect();
+        let emb = embedder.embed(&wav).expect("embed");
+        assert_eq!(emb.len(), EMBED_DIM);
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "embedding not unit-norm: {norm}");
+        assert!(emb.iter().all(|x| x.is_finite()));
+    }
 }
