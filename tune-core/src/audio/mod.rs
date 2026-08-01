@@ -25,5 +25,6 @@ pub mod replaygain;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+pub mod tap;
 pub mod wav;
 pub mod wavpack;
