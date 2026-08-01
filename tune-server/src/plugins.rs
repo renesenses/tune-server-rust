@@ -151,6 +151,14 @@ pub async fn init(
     }
 
     let loaded = loader.setup_all(api_base_url).await;
+
+    // Publish the dormant set first, and unconditionally: opt-in plugins
+    // (DJ/Karaoke) are the whole reason `loaded` can be empty while there is
+    // still something for the plugin manager to list. Do it before the
+    // early-return below or a fresh install — nothing loaded yet — would hide
+    // them from the manager and leave the user no way to install them.
+    let _ = state.plugin_available.set(loader.unloaded_plugins());
+
     if loaded.is_empty() {
         return Vec::new();
     }

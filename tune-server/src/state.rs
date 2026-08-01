@@ -70,6 +70,11 @@ pub struct AppState {
     /// hang for as long as the slowest plugin, and would hold `plugins` while
     /// doing so — delaying shutdown too.
     pub plugin_info: Arc<OnceLock<Vec<tune_core::plugin_sdk::PluginInfo>>>,
+    /// Compiled-in plugins that did not load at startup — opt-in ones the user
+    /// has not installed, or ones they disabled. Published alongside
+    /// [`Self::plugin_info`] so the plugin manager can list a dormant plugin
+    /// (offering "Install"/"Enable") instead of it vanishing from the API.
+    pub plugin_available: Arc<OnceLock<Vec<tune_core::plugin_sdk::AvailablePluginInfo>>>,
     /// Loaded WASM plugins (P2 of the plugin ABI). Published once by
     /// [`crate::plugins_host::load_wasm_plugins`] at startup and read by the
     /// `/api/v1/plugins/{id}/…` route mount. Gated behind `plugins-wasm`, so
@@ -227,6 +232,7 @@ impl AppState {
             skin_manager,
             plugins,
             plugin_info: Arc::new(OnceLock::new()),
+            plugin_available: Arc::new(OnceLock::new()),
             #[cfg(feature = "plugins-wasm")]
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]

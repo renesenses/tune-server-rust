@@ -67,6 +67,11 @@ impl TunePlugin for DjPlugin {
     fn description(&self) -> &str {
         "DJ mode: crossfade, decks, waveform and BPM analysis"
     }
+    // Opt-in: a niche mode that stays dormant until the user installs it from
+    // the plugin manager, rather than running for everyone by default.
+    fn default_enabled(&self) -> bool {
+        false
+    }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
         ctx.register_router(router(self.backend.clone()));
