@@ -22,5 +22,8 @@ pub mod levels;
 pub mod mixer;
 pub mod pipeline;
 pub mod replaygain;
+/// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
+#[cfg(feature = "audio-embedding")]
+pub mod runtime;
 pub mod wav;
 pub mod wavpack;
