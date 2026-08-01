@@ -1645,6 +1645,12 @@ struct ZonePollState {
     /// poll state (it holds a live borrow), so this ensures the fallback fires at
     /// most once per track. Cleared on every track-generation change.
     wall_clock_end_fired: bool,
+    /// Instrumentation latch (#1239): last `should_arm_gapless` decision we
+    /// emitted in the `gapless_arm_trace` INFO line for the current track. The
+    /// trace fires only when this value flips (arming window opens/closes) —
+    /// `None` on a fresh track forces one line per track — so it never spams at
+    /// the ~1 s tick rate. Read-only diagnostic; drives no playback decision.
+    gapless_arm_logged: Option<bool>,
 }
 
 pub struct PositionPoller {
@@ -1944,6 +1950,7 @@ impl PositionPoller {
                 last_radio_position_ms: 0,
                 last_device_volume: None,
                 wall_clock_end_fired: false,
+                gapless_arm_logged: None,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -1996,6 +2003,8 @@ impl PositionPoller {
                 ps.gapless_stuck_ticks = 0;
                 // Re-arm the DLNA poll-fail wall-clock fallback for the new track.
                 ps.wall_clock_end_fired = false;
+                // Force one gapless_arm_trace line at the start of the new track.
+                ps.gapless_arm_logged = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -3118,6 +3127,53 @@ impl PositionPoller {
                         ps.track_started_at = Some(Instant::now());
                     }
 
+                    // Instrumentation (#1239): trace the gapless arming window for
+                    // a realtime renderer that has a next track (BluOS reports
+                    // honest secs/totlen). Recomputes should_arm_gapless read-only
+                    // — it drives no decision — and logs ONLY when the armed state
+                    // flips (window opens/closes) or once per track (the latch is
+                    // reset to None on track change), so it never spams the ~1 s
+                    // tick. Goal: later confirm why the arming window fails to open
+                    // after a /Add. `reason` explains the current arm gate.
+                    if status.realtime && fsm_has_next {
+                        let armed = decisions::should_arm_gapless(
+                            ps.gapless_sent,
+                            status.duration_ms,
+                            track_duration_ms,
+                            status.position_ms,
+                        );
+                        if ps.gapless_arm_logged != Some(armed) {
+                            let effective_duration_ms = decisions::sane_current_duration(
+                                status.duration_ms,
+                                track_duration_ms,
+                            );
+                            let reason = if ps.gapless_sent {
+                                "already_armed"
+                            } else if effective_duration_ms <= GAPLESS_WINDOW_MS {
+                                "duration_le_window"
+                            } else if status.position_ms
+                                < effective_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)
+                            {
+                                "before_arming_window"
+                            } else {
+                                "in_arming_window"
+                            };
+                            info!(
+                                zone_id,
+                                output = output_type_str,
+                                armed,
+                                reason,
+                                reported_duration_ms = status.duration_ms,
+                                queue_duration_ms = track_duration_ms,
+                                effective_duration_ms,
+                                position_ms = status.position_ms,
+                                gapless_sent = ps.gapless_sent,
+                                "gapless_arm_trace"
+                            );
+                            ps.gapless_arm_logged = Some(armed);
+                        }
+                    }
+
                     // Detect gapless transition: renderer reports a different
                     // duration than the current track AND the position confirms
                     // the track actually ended (near end or reset to start).
@@ -3163,6 +3219,9 @@ impl PositionPoller {
                         ps.past_end_ticks = 0;
                         ps.gapless_advance_pending = false;
                         ps.gapless_stuck_ticks = 0;
+                        // New track after a gapless advance (no generation bump):
+                        // re-arm the once-per-track gapless_arm_trace line.
+                        ps.gapless_arm_logged = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -3244,8 +3303,32 @@ impl PositionPoller {
                     // ahead of actual playback.
                     // Margin path (pure predicate, v0.9 extraction): position ran
                     // past duration + END_MARGIN_MS.
+                    //
+                    // Fix B (#1239): guard against an UNDER-scanned DB duration. A
+                    // BluOS Node reports honest secs/totlen; when Tune's scanned
+                    // (queue) duration is shorter than the real audio, the DB-only
+                    // threshold fires early — the track is cut mid-play, which on
+                    // BluOS triggers a /Clear + /Play and desyncs the now-playing
+                    // metadata by one track. For a realtime renderer we widen the
+                    // end-of-track threshold to max(queue, reported) BEFORE the
+                    // margin, reusing `sane_current_duration` for reliability: it
+                    // returns the DB duration when reported is 0 or egregiously off
+                    // (RS130), so an absurd/absent report keeps the DB-only
+                    // behavior and max() only ever widens for a trustworthy report
+                    // that exceeds the DB scan. Non-realtime outputs are unchanged.
+                    // This can only DELAY the position-based past-end, never block a
+                    // track: the Stopped/natural-end and wall-clock paths remain the
+                    // ultimate end-of-track guarantees for a renderer that stalls.
+                    let effective_end_duration_ms = if status.realtime {
+                        track_duration_ms.max(decisions::sane_current_duration(
+                            status.duration_ms,
+                            track_duration_ms,
+                        ))
+                    } else {
+                        track_duration_ms
+                    };
                     let past_end = decisions::past_end_reached(
-                        track_duration_ms,
+                        effective_end_duration_ms,
                         played_enough,
                         status.position_ms,
                     );
@@ -4002,6 +4085,7 @@ mod tests {
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
+            gapless_arm_logged: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -4054,6 +4138,7 @@ mod tests {
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
+            gapless_arm_logged: None,
         };
 
         // Simulates entering Playing state
@@ -4261,6 +4346,7 @@ mod tests {
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
+            gapless_arm_logged: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -4892,6 +4978,7 @@ mod tests {
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
+            gapless_arm_logged: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -5093,6 +5180,7 @@ mod tests {
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
+            gapless_arm_logged: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
