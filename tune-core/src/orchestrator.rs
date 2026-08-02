@@ -415,6 +415,27 @@ pub(crate) fn command_may_have_landed(err: &str) -> bool {
     err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
 }
 
+/// Should a network output be fed from a pre-transcoded temp file (blocking,
+/// Content-Length known) rather than a streaming session?
+///
+/// A temp file is required for renderers that reject chunked transfer
+/// (darTZeel LHC-208 etc.): every non-WAV target (FLAC), and every WAV target a
+/// renderer demands as raw LPCM (`dlna_needs_wav`). The exception is
+/// `dsd_lpcm_streams` — a DSD source going out as WAV/LPCM with the
+/// `dsd_lpcm_stream` toggle on: the streaming path already advertises an exact
+/// Content-Length (`StreamInfo::wav_content_length`), so blocking to /tmp is
+/// pointless and, on DSD256/512, fatal (the ~decode exceeds the 120s temp-file
+/// timeout → the renderer plays silence). Kept a pure function so the decision
+/// matrix is unit-testable without an orchestrator.
+fn use_file_transcode_for(
+    is_network: bool,
+    target_is_wav: bool,
+    dlna_needs_wav: bool,
+    dsd_lpcm_streams: bool,
+) -> bool {
+    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -2052,8 +2073,26 @@ impl PlaybackOrchestrator {
             // StreamSession prevents the channel from closing when the decoder
             // finishes, so ASIO/WASAPI can consume all buffered data at their
             // own pace. This avoids the 28s download delay of file transcode.
-            let use_file_transcode =
-                is_network_output && (target_format_str != "wav" || dlna_needs_wav);
+            // A DSD source served as WAV/LPCM can stream (exact Content-Length
+            // from wav_content_length) instead of blocking on a temp file that
+            // times out at 120s for DSD256/512 → silence (Villerio). Gated by
+            // the `dsd_lpcm_stream` setting (toggle in Settings → Lecture),
+            // off by default pending field validation; read live so the toggle
+            // takes effect without a restart.
+            let dsd_lpcm_streams = src_fmt == AudioFormat::Dsd
+                && target_fmt == AudioFormat::Wav
+                && SettingsRepo::with_backend(self.db.clone())
+                    .get("dsd_lpcm_stream")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("true");
+            let use_file_transcode = use_file_transcode_for(
+                is_network_output,
+                target_format_str == "wav",
+                dlna_needs_wav,
+                dsd_lpcm_streams,
+            );
 
             let info = StreamInfo {
                 format: out_ext.clone(),
@@ -6353,7 +6392,27 @@ mod tests {
     use crate::playback::{NowPlaying, PlayState, PlaybackManager};
     use crate::streaming::registry::ServiceRegistry;
 
-    use super::{PlaybackOrchestrator, passthrough_didl_duration_ms};
+    use super::{PlaybackOrchestrator, passthrough_didl_duration_ms, use_file_transcode_for};
+
+    #[test]
+    fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
+        // The fix: a DSD source served as WAV to a renderer that demands LPCM
+        // (dlna_needs_wav) streams instead of blocking on a temp file — but
+        // ONLY with the toggle on. Everything else keeps its prior behaviour.
+
+        // DSD → WAV, renderer needs LPCM, toggle ON → stream (the fix).
+        assert!(!use_file_transcode_for(true, true, true, true));
+        // Same, toggle OFF → temp file (rollback, unchanged).
+        assert!(use_file_transcode_for(true, true, true, false));
+        // FLAC target (non-WAV) always temp-files for Content-Length — the
+        // dsd flag can't apply (dsd_lpcm_streams stays false for non-DSD/WAV).
+        assert!(use_file_transcode_for(true, false, false, false));
+        // WAV target a renderer is fine to stream (dlna_needs_wav false):
+        // streams regardless of the flag (local/OAAT/Linn path, unchanged).
+        assert!(!use_file_transcode_for(true, true, false, false));
+        // Local/OAAT (not network): never file-transcodes.
+        assert!(!use_file_transcode_for(false, true, true, false));
+    }
 
     #[test]
     fn passthrough_duration_prefers_probed_over_scanned() {
