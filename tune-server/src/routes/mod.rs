@@ -12,7 +12,6 @@ pub mod connect;
 pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
-pub mod declick;
 pub mod deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
@@ -343,7 +342,6 @@ pub fn router_with_plugins(
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())
         .nest("/converter", converter::router())
-        .nest("/declick", declick::router())
         .nest("/shazam", shazam::router())
         .nest("/social", social::router())
         .nest("/home", home::router())
