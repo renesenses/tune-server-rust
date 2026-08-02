@@ -1398,6 +1398,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // maps it back to 16-bit and reads misaligned samples (the #1137 silence
     // class). Off by default; overrides dlna_lpcm/dlna_cap_16bit when set.
     add_column_if_missing(db, "zones", "dlna_wav24", "INTEGER DEFAULT 0");
+    // Per-zone SetAVTransportURI→Play delay in ms (default 0 = use the config /
+    // device-name default). Lets a renderer with a cold-start under-run (first
+    // seconds hachées — Cyrille, Yamaha R-N2000A) buffer before its transport
+    // clock starts, the network analogue of the local ring-buffer prefill.
+    // Overrides `[device_delays]` / `dlna_play_delay_ms` from config.
+    add_column_if_missing(db, "zones", "dlna_play_delay_ms", "INTEGER DEFAULT 0");
     // Physical host (IP) of the renderer, used to dedup DLNA zones across
     // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
     // N12 after a restart) must reconnect to its existing zone instead of

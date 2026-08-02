@@ -651,6 +651,37 @@ impl ZoneRepo {
         }
     }
 
+    /// Per-zone SetAVTransportURI→Play delay in ms (0 = use the config default).
+    pub fn get_dlna_play_delay_ms(&self, id: i64) -> u64 {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT COALESCE(dlna_play_delay_ms, 0) FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+            .max(0) as u64
+    }
+
+    pub fn update_dlna_play_delay_ms(&self, id: i64, delay_ms: u64) -> Result<(), String> {
+        let sql = self.update_field_sql("dlna_play_delay_ms");
+        let params: [&dyn ToSqlValue; 2] = [&(delay_ms as i64), &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "dlna_play_delay_ms_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Persist the renderer's host (IP) on the zone, for host-based dedup.
     /// Best-effort: silently ignores a missing `host` column (pre-migration DB).
     pub fn set_host(&self, id: i64, host: &str) -> Result<(), String> {

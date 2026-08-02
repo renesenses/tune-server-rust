@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reqwest::Client;
 use tokio::io::AsyncWriteExt;
@@ -40,7 +40,10 @@ pub struct DlnaOutput {
     client: Client,
     /// Short-timeout client used for fire-and-forget Stop before play.
     stop_client: Client,
-    play_delay_ms: u64,
+    /// Pause between SetAVTransportURI and Play, in ms. Interior-mutable so a
+    /// per-zone override (Settings → renderer panel) can be applied live to the
+    /// already-registered output without rebuilding it. 0 = no delay.
+    play_delay_ms: AtomicU64,
     /// Alternates between false ("1") and true ("2") so that consecutive
     /// DIDL items sent via SetAVTransportURI / SetNextAVTransportURI use
     /// different item IDs.  Renderers like Marantz ND8006 cache DIDL
@@ -97,16 +100,28 @@ impl DlnaOutput {
                 ))
                 .build()
                 .unwrap_or_default(),
-            play_delay_ms: 0,
+            play_delay_ms: AtomicU64::new(0),
             next_item_id_flip: AtomicBool::new(false),
             micromega_ip,
             connection_manager_url,
         }
     }
 
-    pub fn with_play_delay(mut self, delay_ms: u64) -> Self {
-        self.play_delay_ms = delay_ms;
+    pub fn with_play_delay(self, delay_ms: u64) -> Self {
+        self.play_delay_ms.store(delay_ms, Ordering::Relaxed);
         self
+    }
+
+    /// Update the SetAVTransportURI→Play delay on an already-registered output
+    /// (via &self downcast in the zone PATCH handler). Takes effect on the next
+    /// play; no rebuild needed.
+    pub fn set_play_delay(&self, delay_ms: u64) {
+        self.play_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    /// Current SetAVTransportURI→Play delay in ms.
+    pub fn play_delay_ms(&self) -> u64 {
+        self.play_delay_ms.load(Ordering::Relaxed)
     }
 
     /// Send a SOAP action without retries and with the short-timeout client.
@@ -368,8 +383,9 @@ impl OutputTarget for DlnaOutput {
             return Err(format!("SetAVTransportURI rejected: {set_uri_resp}"));
         }
 
-        if self.play_delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
+        let play_delay = self.play_delay_ms.load(Ordering::Relaxed);
+        if play_delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(play_delay)).await;
         }
 
         // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
@@ -414,7 +430,7 @@ impl OutputTarget for DlnaOutput {
             return Err(last_err);
         }
 
-        info!(device = %self.name, url = media.url, delay_ms = self.play_delay_ms, "dlna_play");
+        info!(device = %self.name, url = media.url, delay_ms = play_delay, "dlna_play");
         Ok(())
     }
 
