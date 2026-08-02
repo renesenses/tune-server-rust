@@ -80,6 +80,16 @@ pub mod sql {
         )
     }
 
+    pub fn hide_duplicate_generic_local<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 1 \
+             WHERE id <> {} AND output_type = 'local' \
+             AND name IN ('This Computer', 'Cet ordinateur') \
+             AND COALESCE(is_hidden, 0) = 0",
+            d.placeholder(1)
+        )
+    }
+
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET is_hidden = 1 WHERE id = {}",
@@ -809,6 +819,25 @@ impl ZoneRepo {
             sql::rename_generic_local_label,
         );
         let params: [&dyn ToSqlValue; 2] = [&device_name, &zone_id];
+        self.db.execute(&sql, &params)
+    }
+
+    /// Hide stale duplicate LOCAL zones stuck on a generic default label
+    /// ("This Computer" / "Cet ordinateur"), keeping `keep_id` — the zone bound
+    /// to the live default device. The local device_id is derived from the
+    /// device NAME (`local:<name>`), which is localizable and user-renamable, so
+    /// renaming the Mac or a macOS locale change mints a new device_id and thus
+    /// a SECOND default-device zone carrying the other-locale generic label.
+    /// `get_or_create`/`deduplicate` key on device_id and never merge these
+    /// twins, leaving both "This Computer" and "Cet ordinateur" in the picker
+    /// (Philippe Vella). Only the exact generic labels are touched — a
+    /// user-renamed zone is never hidden. Returns the number hidden.
+    pub fn hide_duplicate_generic_local(&self, keep_id: i64) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::hide_duplicate_generic_local,
+            sql::hide_duplicate_generic_local,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&keep_id];
         self.db.execute(&sql, &params)
     }
 
