@@ -94,6 +94,30 @@ impl AudioEmbedder {
     }
 }
 
+/// Convert decoded interleaved i32 PCM into a **mono** f32 waveform in [-1, 1]
+/// for the embedder. The full-scale rule is `sample / 2^(bits-1)` (matching the
+/// loudness pass; librosa normalises identically).
+///
+/// CLAP expects mono. `decode_to_pcm` is asked for 1 channel, but some decoder
+/// paths ignore that and return **interleaved stereo** (#1108). Fed as if it were
+/// mono, L/R/L/R doubles the effective sample rate and smears the timbre — enough
+/// to preserve same-album structure (Phase 1) yet wreck cross-modal alignment
+/// (text↔audio, Phase 3). Averaging the channels per frame restores true mono.
+fn to_mono_f32(samples: &[i32], channels: u32, bit_depth: u16) -> Vec<f32> {
+    let scale = (1i64 << (bit_depth.saturating_sub(1)).min(31)) as f32;
+    let ch = channels.max(1) as usize;
+    if ch <= 1 {
+        return samples.iter().map(|&s| s as f32 / scale).collect();
+    }
+    samples
+        .chunks(ch)
+        .map(|frame| {
+            let sum: i64 = frame.iter().map(|&s| s as i64).sum();
+            (sum as f32 / frame.len() as f32) / scale
+        })
+        .collect()
+}
+
 /// Embed up to `TRACK_BATCH` local tracks that have no audio embedding yet.
 /// Returns how many were processed (0 ⇒ nothing left, caller idles). Mirrors
 /// `replaygain::analyze_track_batch`: bounded, throttled, resumable via the
@@ -164,10 +188,7 @@ pub async fn analyze_embedding_batch(
         }
 
         if let Ok(Ok(Ok(d))) = decoded {
-            // i32 samples → f32 in [-1, 1], the same full-scale rule the loudness
-            // pass uses (sample / 2^(bits-1)); librosa normalises identically.
-            let scale = (1i64 << (d.bit_depth.saturating_sub(1)).min(31)) as f32;
-            let wav: Vec<f32> = d.samples_i32.iter().map(|&s| s as f32 / scale).collect();
+            let wav = to_mono_f32(&d.samples_i32, d.channels, d.bit_depth);
             match embedder.embed(&wav) {
                 Ok(emb) => {
                     let row = vec![
@@ -332,6 +353,24 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_mono_f32_averages_interleaved_stereo() {
+        // 16-bit full scale = 2^15 = 32768. Two stereo frames.
+        let s = [16384, 0, 0, -16384];
+        let m = to_mono_f32(&s, 2, 16);
+        assert_eq!(m.len(), 2);
+        assert!((m[0] - 0.25).abs() < 1e-4, "{}", m[0]); // (16384+0)/2 / 32768
+        assert!((m[1] + 0.25).abs() < 1e-4, "{}", m[1]); // (0-16384)/2 / 32768
+    }
+
+    #[test]
+    fn to_mono_f32_mono_passthrough() {
+        let m = to_mono_f32(&[16384, -16384], 1, 16);
+        assert_eq!(m.len(), 2);
+        assert!((m[0] - 0.5).abs() < 1e-4);
+        assert!((m[1] + 0.5).abs() < 1e-4);
+    }
 
     /// End-to-end provisioning proof: fetch the real pyke onnxruntime archive for
     /// THIS platform, LZMA2-decompress + untar it, load it into `ort`, download
