@@ -151,6 +151,14 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     config
         .entry("onboarding_completed".to_string())
         .or_insert(json!(onboarding_complete));
+    // DSD → LPCM streaming toggle (Settings → Lecture). PATCH stores it as a
+    // raw "true"/"false" string; surface it as a real boolean (default false)
+    // so the toggle reflects the persisted state.
+    let dsd_lpcm_stream = config
+        .get("dsd_lpcm_stream")
+        .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
+        .unwrap_or(false);
+    config.insert("dsd_lpcm_stream".to_string(), json!(dsd_lpcm_stream));
     // Derived boolean: web client checks discogs_token_set to display badge.
     // Check both the DB setting and the env/toml fallback so that users
     // who set TUNE_DISCOGS_TOKEN in .env or tune.toml also see it as configured.
