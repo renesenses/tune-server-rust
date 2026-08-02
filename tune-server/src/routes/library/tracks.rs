@@ -185,6 +185,52 @@ pub(super) async fn track_count(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "count": count }))
 }
 
+#[derive(Deserialize)]
+pub(super) struct SimilarParams {
+    limit: Option<i64>,
+}
+
+/// GET /library/tracks/{id}/similar — acoustically similar tracks ("Plus comme
+/// ça", Phase 2). Ranks the library by cosine distance to the seed's CLAP
+/// embedding via `acoustic_neighbors`, hydrates the tracks and re-emits them in
+/// similarity order with a `similarity` score. Empty (not an error) when the
+/// seed has no embedding yet — the audio-embedding pass hasn't covered it, or
+/// this build never computed vectors — so the client can fall back gracefully.
+pub(super) async fn track_similar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(p): Query<SimilarParams>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let neighbors =
+        tune_core::audio::embedding_store::acoustic_neighbors(&state.backend, id, limit);
+    if neighbors.is_empty() {
+        return Json(json!({ "seed_track_id": id, "count": 0, "items": [] }));
+    }
+    let ids: Vec<i64> = neighbors.iter().map(|(t, _)| *t).collect();
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .list_by_ids(&ids)
+        .unwrap_or_default();
+    let by_id: std::collections::HashMap<i64, &tune_core::db::models::Track> =
+        tracks.iter().filter_map(|t| t.id.map(|i| (i, t))).collect();
+    // Re-emit in acoustic-rank order (list_by_ids is unordered) with the score.
+    let items: Vec<Value> = neighbors
+        .iter()
+        .filter_map(|(tid, score)| {
+            let t = by_id.get(tid)?;
+            let mut v = serde_json::to_value(t).ok()?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "similarity".into(),
+                    json!((score * 1000.0).round() / 1000.0),
+                );
+            }
+            Some(v)
+        })
+        .collect();
+    Json(json!({ "seed_track_id": id, "count": items.len(), "items": items }))
+}
+
 pub(super) async fn get_track(
     State(state): State<AppState>,
     Path(id): Path<i64>,
