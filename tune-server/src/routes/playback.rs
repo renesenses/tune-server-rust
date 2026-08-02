@@ -488,9 +488,19 @@ async fn set_queue_retrying(
 
 async fn play(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     body: Option<Json<PlayRequest>>,
 ) -> impl IntoResponse {
+    // A user-initiated play starts (or takes over) the listening session on
+    // this zone: stamp the caller's profile so record_listen — and every
+    // autoplay / gapless advance that inherits it — tags listen_history to the
+    // right person. Transport (next/previous/resume) reuses this owner; after a
+    // restart the in-memory session resets to None → NULL until the next play.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     // When called with an empty body (e.g. Play after Stop), resume the
     // current track instead of returning 400 "no track source specified".
     let body = match body {
