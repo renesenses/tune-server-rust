@@ -296,10 +296,11 @@ pub(super) async fn rescan_track(
 
 pub(super) async fn quick_fav_track(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<QuickFavQuery>,
 ) -> Json<Value> {
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     let repo = ProfileRepo::with_backend(state.backend.clone());
     let is_fav = repo.is_favorite(profile_id, "track", id).unwrap_or(false);
     if is_fav {

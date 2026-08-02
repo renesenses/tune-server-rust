@@ -376,7 +376,7 @@ impl HistoryRepo {
         &self,
         period: &str,
         zone_id: Option<i64>,
-        _profile_id: Option<i64>,
+        profile_id: Option<i64>,
         top_n: i64,
     ) -> Result<DashboardData, String> {
         let days: Option<i64> = match period {
@@ -420,6 +420,15 @@ impl HistoryRepo {
         if let Some(zid) = zone_id {
             simple_conditions.push(format!("zone_id = {zid}"));
         }
+        // Per-profile view: strict equality, so rows with a NULL profile_id
+        // (listens that predate profile tagging, or server-initiated playback
+        // with no owner) are excluded from a specific person's stats rather
+        // than misattributed. When no profile is requested the dashboard stays
+        // global and those NULL rows keep counting. See the record_listen
+        // ownership chain (session → trigger owner → NULL).
+        if let Some(pid) = profile_id {
+            simple_conditions.push(format!("profile_id = {pid}"));
+        }
         let simple_where = if simple_conditions.is_empty() {
             String::new()
         } else {
@@ -432,6 +441,9 @@ impl HistoryRepo {
         }
         if let Some(zid) = zone_id {
             aliased_conditions.push(format!("h.zone_id = {zid}"));
+        }
+        if let Some(pid) = profile_id {
+            aliased_conditions.push(format!("h.profile_id = {pid}"));
         }
         let where_clause = if aliased_conditions.is_empty() {
             String::new()
