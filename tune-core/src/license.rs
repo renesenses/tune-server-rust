@@ -55,7 +55,6 @@ pub enum Feature {
     DacCalibration,
     BatchConverter,
     PlaylistsHub,
-    Declick,
 }
 
 impl Feature {
@@ -87,7 +86,6 @@ impl Feature {
             Feature::DacCalibration,
             Feature::BatchConverter,
             Feature::PlaylistsHub,
-            Feature::Declick,
         ]
     }
 
@@ -118,7 +116,6 @@ impl Feature {
             Feature::DacCalibration => "DAC Calibration",
             Feature::BatchConverter => "Batch Audio Converter",
             Feature::PlaylistsHub => "Playlists Hub",
-            Feature::Declick => "Dé-ploc",
         }
     }
 }
@@ -794,8 +791,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyfour_features() {
-        assert_eq!(Feature::all_premium().len(), 24);
+    fn all_premium_has_twentythree_features() {
+        assert_eq!(Feature::all_premium().len(), 23);
     }
 
     #[test]
