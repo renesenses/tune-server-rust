@@ -88,7 +88,7 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::event_bus::EventBus;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
-use crate::playback::{NowPlaying, PlaybackManager, PlayState};
+use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
 
@@ -120,8 +120,7 @@ fn spawn_paced_levels_forwarder(
     play_seq: u64,
     start_position_ms: i64,
 ) -> tokio::sync::mpsc::UnboundedSender<crate::audio::levels::AudioLevels> {
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
     tokio::spawn(async move {
         let mut next_emit = tokio::time::Instant::now();
         let mut started = false;
@@ -2185,8 +2184,7 @@ impl PlaybackOrchestrator {
                                 let actual_ch = channels;
                                 let sr = out_sr;
                                 tokio::spawn(async move {
-                                    let play_seq =
-                                        playback.current_play_seq(zone_id).await;
+                                    let play_seq = playback.current_play_seq(zone_id).await;
                                     // Temp-file : le PCM décodé part du début
                                     // du fichier (un seek passe par Range HTTP).
                                     let levels_tx = spawn_paced_levels_forwarder(
@@ -2307,12 +2305,10 @@ impl PlaybackOrchestrator {
                                 (seek_s * 1000.0) as i64,
                             )
                         }
-                        None => {
-                            tokio::sync::mpsc::unbounded_channel::<
-                                crate::audio::levels::AudioLevels,
-                            >()
-                            .0
-                        }
+                        None => tokio::sync::mpsc::unbounded_channel::<
+                            crate::audio::levels::AudioLevels,
+                        >()
+                        .0,
                     };
 
                     let fp_clone = fp.clone();
