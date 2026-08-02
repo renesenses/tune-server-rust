@@ -35,6 +35,37 @@ const PER_FILE_PAUSE_MS: u64 = 400;
 /// How long the loop sleeps once there is nothing left to analyse.
 const IDLE_SLEEP_SECS: u64 = 900;
 
+/// Ceiling on the ESTIMATED decoded footprint of one track before analysis.
+///
+/// `measure_loudness_and_peak` holds the whole track twice: the decoder's
+/// `Vec<i32>` (4 B/sample) plus the normalised `Vec<f64>` (8 B/sample) —
+/// 12 bytes per sample overall. A 30-minute 24/192 stereo track is ~690 M
+/// samples ≈ 8 GB: on a 6-7 GB box the OOM killer shoots the whole server
+/// in a loop (#1109, production 02/08). Until the analysis streams, any
+/// track whose estimate exceeds this budget is skipped (stamped, logged) —
+/// the overwhelming majority of libraries stays fully analysed.
+const MAX_ANALYSIS_EST_BYTES: u64 = 1_200_000_000;
+
+/// The 12 B/sample estimate above, from the DB columns the scan filled.
+/// Unknown rate/channels fall back to CD stereo; unknown duration returns 0
+/// (no basis to refuse — the track is analysed as before).
+fn estimated_analysis_bytes(
+    duration_ms: Option<i64>,
+    sample_rate: Option<i64>,
+    channels: Option<i64>,
+) -> u64 {
+    let dur_s = match duration_ms {
+        Some(ms) if ms > 0 => ms as u64 / 1000,
+        _ => return 0,
+    };
+    let rate = sample_rate.filter(|&r| r > 0).unwrap_or(44_100) as u64;
+    let ch = channels.filter(|&c| c > 0).unwrap_or(2) as u64;
+    dur_s
+        .saturating_mul(rate)
+        .saturating_mul(ch)
+        .saturating_mul(12)
+}
+
 /// Setting gate. Absent/"true" ⇒ on (Bertrand wants calculated tags filled
 /// automatically); set to "false" to disable the whole pass.
 const ENABLED_KEY: &str = "replaygain_analysis_enabled";
@@ -95,7 +126,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // sentinel) and without file-tag ReplayGain (`rg_track_gain`). The two
     // NOT EXISTS keep the sweep advancing and honour the file's own tags.
     let rows = match backend.query_many(
-        "SELECT t.id, t.file_path FROM tracks t \
+        "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
@@ -126,6 +157,24 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             Some(p) if !p.is_empty() => p,
             _ => continue,
         };
+
+        let est = estimated_analysis_bytes(
+            r.get(2).and_then(|v| v.as_i64()),
+            r.get(3).and_then(|v| v.as_i64()),
+            r.get(4).and_then(|v| v.as_i64()),
+        );
+        if est > MAX_ANALYSIS_EST_BYTES {
+            warn!(
+                track_id,
+                path = %path,
+                estimated_mb = est / 1_048_576,
+                "replaygain_skipped_oversized — full-decode analysis would risk \
+                 OOM (#1109); will be analysed once streaming analysis lands"
+            );
+            let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
+            let _ = repo.set(track_id, "rg_skipped_oversized", "1");
+            continue;
+        }
 
         match crate::audio::analyzer::measure_loudness_and_peak(&path).await {
             Some((lufs, peak)) => {
@@ -258,6 +307,20 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_estimate_math() {
+        // 30 min of 24/192 stereo ≈ 8 GB decoded+normalised: must exceed the budget.
+        let est = estimated_analysis_bytes(Some(30 * 60 * 1000), Some(192_000), Some(2));
+        assert!(est > MAX_ANALYSIS_EST_BYTES, "{est}");
+        // A 5-minute CD track (~160 MB) sails under it.
+        let cd = estimated_analysis_bytes(Some(5 * 60 * 1000), Some(44_100), Some(2));
+        assert!(cd < MAX_ANALYSIS_EST_BYTES, "{cd}");
+        // Unknown duration → 0 → never refused on missing data.
+        assert_eq!(estimated_analysis_bytes(None, Some(192_000), Some(2)), 0);
+        // Unknown rate/channels fall back to CD stereo, not to zero.
+        assert!(estimated_analysis_bytes(Some(300_000), None, None) > 0);
+    }
 
     #[test]
     fn gain_is_reference_minus_lufs() {
