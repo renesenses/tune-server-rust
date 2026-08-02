@@ -202,6 +202,10 @@ pub struct PlaybackEvent {
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
+    /// Un [`crate::audio::tap::ZoneTap`] par zone — le tap PCM que le
+    /// forwarder de niveaux alimente et que les plugins d'analyse consomment.
+    /// Verrou synchrone : accès courts, jamais tenus à travers un await.
+    zone_taps: std::sync::Mutex<HashMap<i64, Arc<crate::audio::tap::ZoneTap>>>,
 }
 
 impl Default for PlaybackManager {
@@ -216,7 +220,19 @@ impl PlaybackManager {
         Self {
             zones: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            zone_taps: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Le tap PCM d'une zone (créé au premier accès). Voir
+    /// [`crate::audio::tap`] pour le contrat.
+    pub fn zone_tap(&self, zone_id: i64) -> Arc<crate::audio::tap::ZoneTap> {
+        self.zone_taps
+            .lock()
+            .expect("zone_taps lock")
+            .entry(zone_id)
+            .or_default()
+            .clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<PlaybackEvent> {

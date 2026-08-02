@@ -427,7 +427,7 @@ pub fn decode_to_pcm_streaming_with_levels(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
-    levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
 ) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         file_path,
@@ -450,7 +450,7 @@ pub fn decode_to_pcm_streaming_seeked(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
-    levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
@@ -474,7 +474,7 @@ fn decode_to_pcm_streaming_inner(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
-    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
     let ext = Path::new(file_path)
@@ -603,7 +603,7 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             if let Some(ref ltx) = levels_tx {
-                super::levels::send_windowed_levels(ltx, chunk, output_bd, ch, sr);
+                super::tap::send_windowed_pcm(ltx, chunk, output_bd, ch, sr);
             }
         }
         return Ok((output_bd, source_rate));
@@ -821,7 +821,7 @@ fn decode_to_pcm_streaming_inner(
             // The unbounded channel never blocks; the clone above is cheap
             // compared to the latency savings for network outputs.
             if let Some(ref ltx) = levels_tx {
-                super::levels::send_windowed_levels(
+                super::tap::send_windowed_pcm(
                     ltx,
                     &chunk,
                     output_bd,
@@ -1510,7 +1510,7 @@ fn decode_dsd_streaming(
     chunk_size: usize,
     first_chunk_sent: &mut bool,
     data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
-    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
+    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     rt: &tokio::runtime::Handle,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
@@ -1568,7 +1568,7 @@ fn decode_dsd_streaming(
                     }
                 }
                 if let Some(ltx) = levels_tx {
-                    super::levels::send_windowed_levels(ltx, &chunk, output_bd, ch, output_rate);
+                    super::tap::send_windowed_pcm(ltx, &chunk, output_bd, ch, output_rate);
                 }
             }
             Ok(false)
@@ -1647,7 +1647,7 @@ fn decode_dsd_streaming(
         };
         if send_ok {
             if let Some(ltx) = levels_tx {
-                super::levels::send_windowed_levels(ltx, &pcm_buf, output_bd, ch, output_rate);
+                super::tap::send_windowed_pcm(ltx, &pcm_buf, output_bd, ch, output_rate);
             }
         }
     }
