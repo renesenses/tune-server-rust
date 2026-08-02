@@ -12,7 +12,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
-use crate::routes::active_profile::DEFAULT_PROFILE_ID;
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -161,6 +161,7 @@ fn default_true() -> bool {
 
 async fn transfer_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<TransferRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -353,11 +354,9 @@ async fn transfer_playlist(
     let mut remote_playlist_id: Option<String> = None;
     if !body.dry_run && matched > 0 {
         if body.target_service == "local" {
-            if let Ok(id) = playlist_repo.create(
-                &target_name,
-                Some("Transferred playlist"),
-                DEFAULT_PROFILE_ID,
-            ) {
+            if let Ok(id) =
+                playlist_repo.create(&target_name, Some("Transferred playlist"), profile.id())
+            {
                 playlist_repo.add_tracks(id, &matched_track_ids, None).ok();
                 target_playlist_id = Some(id);
             }
@@ -758,6 +757,7 @@ struct BackupRequest {
 
 async fn backup_playlists(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<BackupRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -794,7 +794,7 @@ async fn backup_playlists(
 
         if svc_name == "local" {
             let playlists = playlist_repo
-                .list(DEFAULT_PROFILE_ID, 99999, 0)
+                .list(profile.id(), 99999, 0)
                 .unwrap_or_default();
             for pl in &playlists {
                 let pl_id = pl.id.unwrap_or(0);
@@ -959,6 +959,7 @@ struct RestoreRequest {
 
 async fn restore_backup(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     body: Option<Json<RestoreRequest>>,
 ) -> impl IntoResponse {
@@ -994,7 +995,7 @@ async fn restore_backup(
 
     // Check for existing playlist
     let existing_playlists = playlist_repo
-        .list(DEFAULT_PROFILE_ID, 99999, 0)
+        .list(profile.id(), 99999, 0)
         .unwrap_or_default();
     let existing = existing_playlists.iter().find(|p| p.name == target_name);
     if existing.is_some() && !overwrite {
@@ -1017,7 +1018,7 @@ async fn restore_backup(
         match playlist_repo.create(
             target_name,
             Some(&format!("Restored from snapshot #{id}")),
-            DEFAULT_PROFILE_ID,
+            profile.id(),
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -1098,6 +1099,7 @@ struct MergeSource {
 
 async fn merge_playlists(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<MergeRequest>,
 ) -> impl IntoResponse {
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
@@ -1118,20 +1120,17 @@ async fn merge_playlists(
         all_track_ids.retain(|id| seen.insert(*id));
     }
 
-    let new_id = match playlist_repo.create(
-        &body.target_name,
-        Some("Merged playlist"),
-        DEFAULT_PROFILE_ID,
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": e})),
-            )
-                .into_response();
-        }
-    };
+    let new_id =
+        match playlist_repo.create(&body.target_name, Some("Merged playlist"), profile.id()) {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"detail": e})),
+                )
+                    .into_response();
+            }
+        };
 
     playlist_repo.add_tracks(new_id, &all_track_ids, None).ok();
 
@@ -1319,6 +1318,7 @@ struct ImportTrack {
 
 async fn import_playlists(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<ImportRequest>,
 ) -> impl IntoResponse {
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
@@ -1326,17 +1326,16 @@ async fn import_playlists(
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
 
-    let playlist_id =
-        match playlist_repo.create(&name, Some("Imported playlist"), DEFAULT_PROFILE_ID) {
-            Ok(id) => id,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"detail": e})),
-                )
-                    .into_response();
-            }
-        };
+    let playlist_id = match playlist_repo.create(&name, Some("Imported playlist"), profile.id()) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": e})),
+            )
+                .into_response();
+        }
+    };
 
     let mut matched = 0i64;
     let mut not_found = 0i64;
