@@ -2358,8 +2358,9 @@ impl PlaybackOrchestrator {
                                 (seek_s * 1000.0) as i64,
                             )
                         }
-                        None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>()
-                        .0,
+                        None => {
+                            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
+                        }
                     };
 
                     let fp_clone = fp.clone();
@@ -2913,8 +2914,7 @@ impl PlaybackOrchestrator {
                         )
                     }
                     None => {
-                        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>()
-                            .0
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
                     }
                 };
 
