@@ -14,6 +14,33 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio::sync::OnceCell;
+
+/// Process-global guard so onnxruntime is initialised into `ort` exactly once,
+/// before any `Session` is built — no matter which subsystem reaches it first
+/// (the background audio-embedding sweep or the natural-language search
+/// endpoint). `ort::init_from().commit()` must run once and only once per
+/// process; a second commit is an error, so both paths funnel through here.
+static RUNTIME_LOADED: OnceCell<()> = OnceCell::const_new();
+
+/// Provision (download+verify+unpack on first use) the onnxruntime shared lib
+/// under `cache_root` and load it globally into `ort`, exactly once for the
+/// process. Concurrent callers coalesce onto a single init; on failure the guard
+/// stays unset so a later call retries.
+pub async fn ensure_loaded(cache_root: &Path) -> Result<(), String> {
+    RUNTIME_LOADED
+        .get_or_try_init(|| async {
+            let dylib = ensure_runtime(cache_root).await?;
+            ort::init_from(&dylib)
+                .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
+                .commit();
+            tracing::info!(dylib = %dylib.display(), "audio_runtime_loaded");
+            Ok::<(), String>(())
+        })
+        .await
+        .map(|_| ())
+}
+
 /// A platform's prebuilt onnxruntime: where to get it, its archive checksum, and
 /// the canonical shared-lib filename to load out of it.
 struct Dist {

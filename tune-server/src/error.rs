@@ -58,6 +58,16 @@ impl AppError {
             code: Some("conflict".into()),
         }
     }
+
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        tracing::warn!(error = %msg, "service_unavailable");
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg,
+            code: Some("service_unavailable".into()),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
