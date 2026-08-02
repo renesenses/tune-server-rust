@@ -830,6 +830,24 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Hydrate tracks for a set of ids in ONE query. Order is not preserved
+    /// (SQL `IN` is unordered) — the caller reorders (e.g. by acoustic-similarity
+    /// rank). Ids are trusted i64 from our own queries, so inlining them is safe
+    /// and avoids a variable-length placeholder list across dialects.
+    pub fn list_by_ids(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
+        let rows = self.db.query_many_strong(&sql, &[])?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
     /// Like `list_by_album` but restricted to tracks matching an active
     /// quality/format filter, so the album detail agrees with a filtered grid.
     /// Sergio: a Hi-Res + 96kHz + FLAC filter matched a mixed album (the grid
@@ -1570,6 +1588,31 @@ mod tests {
             repo.get(id).unwrap().unwrap().album_artist.as_deref(),
             Some("Tagged Albumartist")
         );
+    }
+
+    #[test]
+    fn list_by_ids_hydrates_requested_tracks_only() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        let mut a = Track::new("A".into());
+        a.file_path = Some("/a.flac".into());
+        let mut b = Track::new("B".into());
+        b.file_path = Some("/b.flac".into());
+        let mut c = Track::new("C".into());
+        c.file_path = Some("/c.flac".into());
+        let ia = repo.create(&a).unwrap();
+        let _ib = repo.create(&b).unwrap();
+        let ic = repo.create(&c).unwrap();
+
+        let mut titles: Vec<String> = repo
+            .list_by_ids(&[ia, ic])
+            .unwrap()
+            .iter()
+            .map(|t| t.title.clone())
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["A".to_string(), "C".to_string()]);
+        assert!(repo.list_by_ids(&[]).unwrap().is_empty());
     }
 
     #[test]
