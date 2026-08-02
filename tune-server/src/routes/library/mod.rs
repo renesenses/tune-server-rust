@@ -242,6 +242,7 @@ pub fn router() -> Router<AppState> {
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))
         .route("/search", get(search::search))
+        .route("/search/acoustic", post(search::acoustic_search))
         .route("/stats", get(stats::library_stats))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))

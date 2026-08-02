@@ -24,7 +24,9 @@ const TRACK_BATCH: usize = 32;
 /// Pause between files so the background pass never saturates the CPU.
 const PER_FILE_PAUSE_MS: u64 = 50;
 /// Sentinel key stamped on every processed track (success OR failure) so an
-/// undecodable file is not retried forever — same idiom as `rg_analyzed`.
+/// undecodable file is not retried forever — same idiom as `rg_analyzed`. Its
+/// *value* is the `MODEL_ID` it was analysed under, so a model bump invalidates
+/// it and the track is re-swept (see the candidate query below).
 const SENTINEL: &str = "audio_embed_analyzed";
 
 /// Samples fed to the model: 10 s @ 48 kHz mono, matching CLAP's fixed window.
@@ -59,14 +61,19 @@ impl AudioEmbedder {
     ///
     /// The waveform is repeat-padded / truncated to the fixed 10 s window, the
     /// same `repeatpad` rule CLAP applies, so a short track is tiled rather than
-    /// zero-padded (which would dilute its timbre with silence).
+    /// zero-padded (which would dilute its timbre with silence). Each sample is
+    /// 16-bit quantised first — CLAP's reference loader round-trips audio through
+    /// `int16` (`int16_to_float32(float32_to_int16(y))`), so a hi-res source must
+    /// be dithered down to 16-bit to land on the same manifold the model was
+    /// trained on. Skipping this quietly degrades cross-modal (text↔audio)
+    /// alignment even though same-album structure survives.
     pub fn embed(&mut self, waveform: &[f32]) -> Result<Vec<f32>, String> {
         if waveform.is_empty() {
             return Err("empty waveform".into());
         }
         let mut buf = vec![0f32; WINDOW_SAMPLES];
         for (i, s) in buf.iter_mut().enumerate() {
-            *s = waveform[i % waveform.len()];
+            *s = quantize_i16(waveform[i % waveform.len()]);
         }
 
         let input = Tensor::from_array(([1usize, WINDOW_SAMPLES], buf))
@@ -75,7 +82,7 @@ impl AudioEmbedder {
             .session
             .run(ort::inputs!["waveform" => input])
             .map_err(|e| format!("ort run: {e}"))?;
-        let (_shape, data) = outputs["embedding"]
+        let (_shape, data) = outputs["audio_embedding"]
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("ort extract: {e}"))?;
 
@@ -92,6 +99,17 @@ impl AudioEmbedder {
         }
         Ok(v)
     }
+}
+
+/// 16-bit quantise a sample, reproducing CLAP's `int16_to_float32(float32_to_int16(y))`
+/// round-trip exactly. `float32_to_int16` clips to [-1, 1] then scales by 32767
+/// and truncates toward zero (numpy `.astype(np.int16)`); `int16_to_float32`
+/// divides by 32767. Rust's `as i16` cast truncates toward zero identically, and
+/// the clamp keeps it in range so the cast never saturates unexpectedly.
+#[inline]
+fn quantize_i16(x: f32) -> f32 {
+    let q = (x.clamp(-1.0, 1.0) * 32767.0) as i16;
+    q as f32 / 32767.0
 }
 
 /// Convert decoded interleaved i32 PCM into a **mono** f32 waveform in [-1, 1]
@@ -132,15 +150,20 @@ pub async fn analyze_embedding_batch(
     // leave those without an acoustic embedding (smart_radio falls back to
     // metadata for them) rather than risk the stall. The timeout below is the
     // belt to this suspenders for any other format that misbehaves.
+    // Candidate = not yet analysed *for the current model*. The sentinel value
+    // holds the MODEL_ID it was stamped under, so a model bump (e.g.
+    // clap-audio-2023 → clap-music-2023) makes every track a candidate again and
+    // the sweep re-embeds the whole library into the new space, exactly once.
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
            AND (t.format IS NULL OR \
                 lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')) \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed') \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
+                   AND m.value = ?) \
          LIMIT ?",
-        &[&(TRACK_BATCH as i64) as &dyn ToSqlValue],
+        &[&MODEL_ID as &dyn ToSqlValue, &(TRACK_BATCH as i64) as &dyn ToSqlValue],
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -214,9 +237,10 @@ pub async fn analyze_embedding_batch(
             }
         }
 
-        // Stamp the sentinel whether or not it produced a vector, so a broken
-        // or silent file drops out of the sweep instead of being retried.
-        let _ = repo.set(track_id, SENTINEL, &now.to_string());
+        // Stamp the sentinel with the current MODEL_ID whether or not it
+        // produced a vector, so a broken or silent file drops out of the sweep
+        // (until the next model bump) instead of being retried every pass.
+        let _ = repo.set(track_id, SENTINEL, MODEL_ID);
         done += 1;
         tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
     }
@@ -231,11 +255,14 @@ const IDLE_SLEEP_SECS: u64 = 900;
 const ENABLED_KEY: &str = "audio_embedding_enabled";
 /// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
 const MODEL_PATH_KEY: &str = "audio_embedding_model_path";
-/// Published CLAP audio tower (ONNX, mel in-graph, 512-d). Fetched on first
-/// activation and cached at the configured path.
-const MODEL_URL: &str = "https://github.com/renesenses/tune-server-rust/releases/download/models/clap-audio-2023/clap-audio-2023.onnx";
-/// SHA-256 of the model above — a corrupt/partial download is rejected.
-const MODEL_SHA256: &str = "31c37def7ff2a9a36da07667bc7412dfb5ca16e081673055e45d3ac26de387d9";
+/// Published CLAP **music** audio tower (ONNX, mel in-graph, 512-d;
+/// `music_audioset`/HTSAT-base). Fetched on first activation and cached at the
+/// configured path. Supersedes the generalist `clap-audio-2023`.
+const MODEL_URL: &str = "https://github.com/renesenses/tune-server-rust/releases/download/models/clap-music-2023/clap-audio-music-2023.onnx";
+/// SHA-256 of the model above — a corrupt/partial download is rejected, and an
+/// existing file whose hash differs (e.g. the old `clap-audio-2023` at the same
+/// configured path) is treated as stale and re-fetched.
+const MODEL_SHA256: &str = "d888118262b6144033928e5d7bed57a51bacde7899c4c4a109de1074857b951a";
 
 fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
     settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
@@ -257,14 +284,38 @@ fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> O
 /// that wrote it). Written atomically via a temp file so a killed download
 /// never leaves a truncated model in place.
 async fn ensure_model(dest: &Path) -> Result<(), String> {
+    ensure_file(dest, MODEL_URL, MODEL_SHA256, "audio_model").await
+}
+
+/// Fetch `url` to `dest` unless a file with the expected SHA-256 is already
+/// there. An existing file whose hash does NOT match `sha256` is treated as
+/// stale (e.g. a superseded model at the same configured path) and re-fetched.
+/// Written atomically via a temp file so a killed download never leaves a
+/// truncated file in place.
+pub(super) async fn ensure_file(
+    dest: &Path,
+    url: &str,
+    sha256: &str,
+    what: &str,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
     if dest.exists() {
-        return Ok(());
+        match std::fs::read(dest) {
+            Ok(existing) => {
+                let have = format!("{:x}", Sha256::new_with_prefix(&existing).finalize());
+                if have == sha256 {
+                    return Ok(());
+                }
+                warn!(dest = %dest.display(), what, "stale_asset_rehashing_mismatch_refetch");
+            }
+            Err(e) => warn!(dest = %dest.display(), what, error = %e, "asset_reread_failed_refetch"),
+        }
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    info!(url = MODEL_URL, dest = %dest.display(), "audio_model_downloading");
-    let bytes = reqwest::get(MODEL_URL)
+    info!(url, dest = %dest.display(), what, "asset_downloading");
+    let bytes = reqwest::get(url)
         .await
         .map_err(|e| format!("download: {e}"))?
         .error_for_status()
@@ -273,35 +324,25 @@ async fn ensure_model(dest: &Path) -> Result<(), String> {
         .await
         .map_err(|e| format!("download body: {e}"))?;
 
-    use sha2::{Digest, Sha256};
     let got = format!("{:x}", Sha256::new_with_prefix(&bytes).finalize());
-    if got != MODEL_SHA256 {
-        return Err(format!("checksum mismatch: got {got}, want {MODEL_SHA256}"));
+    if got != sha256 {
+        return Err(format!("checksum mismatch: got {got}, want {sha256}"));
     }
 
-    let tmp = dest.with_extension("onnx.part");
+    let tmp = dest.with_extension("part");
     std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
-    info!(dest = %dest.display(), bytes = bytes.len(), "audio_model_ready");
+    info!(dest = %dest.display(), bytes = bytes.len(), what, "asset_ready");
     Ok(())
 }
 
-/// Provision the onnxruntime shared lib next to the model and load it into `ort`
-/// exactly once (`ort::init_from` must run before the first `Session`). The
+/// Provision the onnxruntime shared lib next to the model and load it globally
+/// into `ort` (once per process; see [`super::runtime::ensure_loaded`]). The
 /// dylib is cached under the model's directory, so it is fetched only on the
-/// first activation. Once `*ready` is set the runtime is live for the process.
-async fn ensure_runtime_loaded(model_path: &Path, ready: &mut bool) -> Result<(), String> {
-    if *ready {
-        return Ok(());
-    }
+/// first activation.
+async fn ensure_runtime_loaded(model_path: &Path) -> Result<(), String> {
     let cache_root = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let dylib = super::runtime::ensure_runtime(cache_root).await?;
-    ort::init_from(&dylib)
-        .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
-        .commit();
-    info!(dylib = %dylib.display(), "audio_runtime_loaded");
-    *ready = true;
-    Ok(())
+    super::runtime::ensure_loaded(cache_root).await
 }
 
 /// Spawn the background audio-embedding sweep. Mirrors `replaygain::spawn`:
@@ -314,8 +355,6 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         let mut embedder: Option<AudioEmbedder> = None;
-        // The onnxruntime dylib is loaded once, globally, before any Session.
-        let mut runtime_ready = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
@@ -323,7 +362,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     if let Some(p) = configured_model_path(&settings) {
                         if let Err(e) = ensure_model(&p).await {
                             warn!(error = %e, "audio_model_unavailable");
-                        } else if let Err(e) = ensure_runtime_loaded(&p, &mut runtime_ready).await {
+                        } else if let Err(e) = ensure_runtime_loaded(&p).await {
                             warn!(error = %e, "audio_runtime_unavailable");
                         } else {
                             match AudioEmbedder::load(&p) {
@@ -372,6 +411,23 @@ mod tests {
         assert!((m[1] + 0.5).abs() < 1e-4);
     }
 
+    #[test]
+    fn quantize_i16_matches_int16_roundtrip() {
+        // Exact grid points survive unchanged.
+        assert_eq!(quantize_i16(0.0), 0.0);
+        assert!((quantize_i16(1.0) - 1.0).abs() < 1e-6); // 32767/32767
+        assert!((quantize_i16(-1.0) + 1.0).abs() < 1e-6);
+        // Out-of-range clamps before scaling (no i16 wrap).
+        assert!((quantize_i16(2.0) - 1.0).abs() < 1e-6);
+        assert!((quantize_i16(-2.0) + 1.0).abs() < 1e-6);
+        // A 24-bit-resolution value snaps to the nearest 16-bit step (truncation
+        // toward zero): 0.5 * 32767 = 16383.5 → 16383 → /32767.
+        let q = quantize_i16(0.5);
+        assert!((q - 16383.0 / 32767.0).abs() < 1e-6, "{q}");
+        // Sub-LSB positive values collapse to 0 (truncation), proving 16-bit grid.
+        assert_eq!(quantize_i16(1.0 / 65536.0), 0.0);
+    }
+
     /// End-to-end provisioning proof: fetch the real pyke onnxruntime archive for
     /// THIS platform, LZMA2-decompress + untar it, load it into `ort`, download
     /// the published CLAP model, and embed a buffer — asserting a normalised 512-d
@@ -385,14 +441,12 @@ mod tests {
         let dir = std::env::temp_dir().join("tune-audio-embed-e2e");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("clap-audio-2023.onnx");
+        let model = dir.join("clap-audio-music-2023.onnx");
 
         ensure_model(&model).await.expect("download model");
-        let mut ready = false;
-        ensure_runtime_loaded(&model, &mut ready)
+        ensure_runtime_loaded(&model)
             .await
             .expect("provision onnxruntime");
-        assert!(ready);
 
         let mut embedder = AudioEmbedder::load(&model).expect("load embedder");
         // 1 s of quiet noise → a valid, finite, unit-norm embedding.
