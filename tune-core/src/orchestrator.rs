@@ -136,6 +136,14 @@ fn spawn_paced_levels_forwarder(
         // Un pré-transcode DASH peut retarder le démarrage de 30 s ; au-delà
         // de cette borne on abandonne pour ne pas fuiter la tâche.
         let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        // Le rattrapage ne s'arme qu'après avoir vu la position rapportée
+        // PROGRESSER pendant la vie de ce forwarder : au changement de piste,
+        // le poller rapporte encore brièvement la position de l'ancienne
+        // piste — s'y fier faisait déverser toutes les fenêtres d'un coup
+        // (inondation du bus) puis mourir le forwarder, plus aucun niveau
+        // pour le reste de la piste.
+        let mut last_reported: Option<i64> = None;
+        let mut reported_advancing = false;
         while let Some(raw) = rx.recv().await {
             let mut reported_position_ms: i64 = 0;
             loop {
@@ -144,6 +152,12 @@ fn spawn_paced_levels_forwarder(
                 }
                 let zone_state = playback.get_state(zone_id).await;
                 reported_position_ms = zone_state.position_ms;
+                if let Some(prev) = last_reported {
+                    if reported_position_ms > prev {
+                        reported_advancing = true;
+                    }
+                }
+                last_reported = Some(reported_position_ms);
                 match zone_state.state {
                     PlayState::Playing => {
                         started = true;
@@ -173,12 +187,18 @@ fn spawn_paced_levels_forwarder(
             // ~5 s de staging sur un 24/192 en passthrough), on émet sans
             // attendre jusqu'à recoller à ~1 s. Borné par construction : le
             // retard vaut quelques secondes de fenêtres, pas la piste entière.
-            let lagging = reported_position_ms > 0
+            let lagging = reported_advancing
                 && (position.as_millis() as i64) < reported_position_ms - 1_000;
             if lagging {
-                // Pendant le rattrapage, l'horloge d'émission reste collée au
-                // présent — sinon les `+= window` s'accumuleraient dans le
-                // futur et gèleraient le flux une fois recollé.
+                // Fenêtre du passé audible : personne n'en veut — ni le tap
+                // ni les clients. On la saute sans l'émettre (l'émettre en
+                // rafale inondait le bus : « broadcast lagged, skipped
+                // 2000 messages ») et on garde l'horloge au présent.
+                if (position.as_millis() as i64) + 2_000 < reported_position_ms {
+                    position += raw.window;
+                    next_emit = now;
+                    continue;
+                }
                 next_emit = now;
             } else {
                 tokio::time::sleep_until(next_emit).await;
