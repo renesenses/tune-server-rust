@@ -206,6 +206,11 @@ pub struct PlaybackManager {
     /// forwarder de niveaux alimente et que les plugins d'analyse consomment.
     /// Verrou synchrone : accès courts, jamais tenus à travers un await.
     zone_taps: std::sync::Mutex<HashMap<i64, Arc<crate::audio::tap::ZoneTap>>>,
+    /// Génération des forwarders de niveaux, par zone. Un forwarder capture
+    /// la valeur au spawn et s'arrête dès qu'elle change. Bumpée par l'avance
+    /// gapless : contrairement à `play_seq`, elle invalide les niveaux sans
+    /// toucher à la sémantique des lectures en cours.
+    levels_gens: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl Default for PlaybackManager {
@@ -221,7 +226,24 @@ impl PlaybackManager {
             zones: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             zone_taps: std::sync::Mutex::new(HashMap::new()),
+            levels_gens: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// La génération de niveaux d'une zone (créée au premier accès).
+    pub fn levels_gen(&self, zone_id: i64) -> Arc<std::sync::atomic::AtomicU64> {
+        self.levels_gens
+            .lock()
+            .expect("levels_gens lock")
+            .entry(zone_id)
+            .or_default()
+            .clone()
+    }
+
+    /// Invalide tous les forwarders de niveaux vivants de la zone.
+    pub fn bump_levels_gen(&self, zone_id: i64) {
+        self.levels_gen(zone_id)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Le tap PCM d'une zone (créé au premier accès). Voir

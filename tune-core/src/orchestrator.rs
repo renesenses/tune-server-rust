@@ -130,6 +130,12 @@ fn spawn_paced_levels_forwarder(
         // temps réel : un consommateur naïf (une FFT par fenêtre) suit sans
         // retamponner, le ring borné n'absorbe que la gigue.
         let tap = playback.zone_tap(zone_id);
+        // Génération capturée au spawn : l'avance gapless la bumpe pour tuer
+        // le forwarder de la piste précédente à l'instant de la transition —
+        // sans attendre qu'il draine sa file (ses stamps décriraient une piste
+        // que le renderer ne joue plus).
+        let gen_arc = playback.levels_gen(zone_id);
+        let gen_at_spawn = gen_arc.load(std::sync::atomic::Ordering::Relaxed);
         let mut next_emit = tokio::time::Instant::now();
         let mut started = false;
         let mut position = std::time::Duration::from_millis(start_position_ms.max(0) as u64);
@@ -147,7 +153,9 @@ fn spawn_paced_levels_forwarder(
         while let Some(raw) = rx.recv().await {
             let mut reported_position_ms: i64 = 0;
             loop {
-                if playback.current_play_seq(zone_id).await != play_seq {
+                if playback.current_play_seq(zone_id).await != play_seq
+                    || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
+                {
                     return;
                 }
                 let zone_state = playback.get_state(zone_id).await;
@@ -274,6 +282,25 @@ pub struct PlaybackOrchestrator {
     /// Only negative results are cached — if a MIME is not in the set, it's
     /// either supported or hasn't been checked yet.
     dlna_unsupported_mimes: Mutex<HashMap<String, Vec<String>>>,
+    /// Zones dont une résolution gapless est en cours : les sessions créées
+    /// pendant cette fenêtre pré-chargent la piste SUIVANTE — leur attacher
+    /// un forwarder de niveaux daterait les fenêtres avec l'horloge de la
+    /// piste courante (stamps d'une piste sur la position d'une autre). Les
+    /// niveaux de la piste suivante démarrent à l'avance gapless, voir
+    /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
+    levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+/// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
+struct LevelsPrewarmScope<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<i64>>,
+    zone_id: i64,
+}
+
+impl Drop for LevelsPrewarmScope<'_> {
+    fn drop(&mut self) {
+        self.set.lock().expect("levels_prewarm lock").remove(&self.zone_id);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -478,7 +505,28 @@ impl PlaybackOrchestrator {
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
+            levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Marque la zone en résolution gapless jusqu'au drop du garde.
+    fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
+        self.levels_prewarm
+            .lock()
+            .expect("levels_prewarm lock")
+            .insert(zone_id);
+        LevelsPrewarmScope { set: &self.levels_prewarm, zone_id }
+    }
+
+    /// Faut-il attacher un forwarder de niveaux aux sessions de cette zone ?
+    /// Non pendant une résolution gapless (pré-chargement de la piste
+    /// suivante).
+    fn levels_attach_allowed(&self, zone_id: i64) -> bool {
+        !self
+            .levels_prewarm
+            .lock()
+            .expect("levels_prewarm lock")
+            .contains(&zone_id)
     }
 
     /// Remove any gapless-prepared stream session for a zone.
@@ -2289,9 +2337,14 @@ impl PlaybackOrchestrator {
                             );
 
                             // Emit audio levels in the background, paced to
-                            // the playback clock by the forwarder.
-                            if let Some(ref bus) = ev_bus {
-                                let bus = bus.clone();
+                            // the playback clock by the forwarder. Pas pendant
+                            // un pré-chargement gapless : la session décrit la
+                            // piste SUIVANTE, ses niveaux partiraient datés de
+                            // l'horloge de la piste courante.
+                            if let Some(bus) = ev_bus
+                                .clone()
+                                .filter(|_| self.levels_attach_allowed(zone_id))
+                            {
                                 let playback = playback.clone();
                                 let actual_ch = channels;
                                 let sr = out_sr;
@@ -2400,13 +2453,16 @@ impl PlaybackOrchestrator {
                 let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
                 let streamer_sessions = self.streamer.sessions_state();
                 let close_session_id = session_id.clone();
+                // Pré-chargement gapless : session de la piste suivante, pas
+                // de forwarder (voir `levels_prewarm`).
+                let attach_levels = self.levels_attach_allowed(zone_id);
                 tokio::spawn(async move {
                     debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
                     // Forwarder cadencé si le bus existe ; sinon un canal dont
                     // le récepteur est aussitôt abandonné (le décodeur ignore
                     // les erreurs d'envoi).
-                    let levels_tx = match ev_bus {
+                    let levels_tx = match ev_bus.filter(|_| attach_levels) {
                         Some(bus) => {
                             let play_seq = playback.current_play_seq(zone_id).await;
                             spawn_paced_levels_forwarder(
@@ -2582,7 +2638,7 @@ impl PlaybackOrchestrator {
             let skip_passthrough_levels = source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
-            if !skip_passthrough_levels {
+            if !skip_passthrough_levels && self.levels_attach_allowed(req.zone_id) {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();
                     let playback = self.playback.clone();
@@ -2944,6 +3000,8 @@ impl PlaybackOrchestrator {
             let zone_id = req.zone_id;
             let streamer_for_eof = self.streamer.clone();
             let session_id_for_eof = session_id.clone();
+            // Pré-chargement gapless : pas de forwarder (voir `levels_prewarm`).
+            let attach_levels = self.levels_attach_allowed(zone_id);
             // Seek d'une piste streaming (Qobuz/Tidal) sur sortie locale/OAAT :
             // le chemin local passait déjà l'offset au décodeur, celui-ci
             // repartait TOUJOURS de zéro — l'audio recommençait au début alors
@@ -2961,7 +3019,7 @@ impl PlaybackOrchestrator {
                 // streaming-service content played through local/OAAT outputs.
                 // Paced to the playback clock by the forwarder; without a bus,
                 // the receiver is dropped and the decoder's sends are no-ops.
-                let levels_tx = match ev_bus {
+                let levels_tx = match ev_bus.filter(|_| attach_levels) {
                     Some(bus) => {
                         let play_seq = playback.current_play_seq(zone_id).await;
                         spawn_paced_levels_forwarder(
@@ -5841,9 +5899,53 @@ impl PlaybackOrchestrator {
         // the poller must keep its gapless_cooldown intact so it doesn't falsely
         // detect track-end on renderers that briefly report Stopped during
         // gapless transitions. Position MUST reset to 0 (new track from start).
+        let advance_track_id = np.track_id;
         self.playback.update_now_playing(zone_id, np).await;
         self.playback.update_position(zone_id, 0).await;
         self.playback.emit_position(zone_id, 0);
+
+        // Niveaux de la piste devenue courante. Le pré-chargement gapless
+        // n'attache pas de forwarder (ses fenêtres seraient datées de
+        // l'horloge de la piste précédente — stamps ~4 min devant le
+        // renderer, VU morts, observé sur Stream X) : on invalide ici les
+        // forwarders de l'ancienne piste puis on démarre un décodage dédié,
+        // position 0, comme pour une lecture explicite en passthrough.
+        self.playback.bump_levels_gen(zone_id);
+        if let (Some(bus), Some(track_id)) = (self.event_bus.clone(), advance_track_id) {
+            let track = crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .get(track_id)
+                .ok()
+                .flatten();
+            // DSD : indécodable inline pour les niveaux (même garde que le
+            // chemin passthrough).
+            let is_dsd = track
+                .as_ref()
+                .and_then(|t| t.format.as_deref())
+                .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"));
+            if let Some(path) = track.and_then(|t| t.file_path).filter(|_| !is_dsd) {
+                let playback = self.playback.clone();
+                tokio::spawn(async move {
+                    let play_seq = playback.current_play_seq(zone_id).await;
+                    let levels_tx =
+                        spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(dec) =
+                            crate::audio::decode::decode_to_pcm(&path, None, None, 0.0, 0.0)
+                        {
+                            crate::audio::tap::send_windowed_pcm(
+                                &levels_tx,
+                                &dec.pcm_bytes(),
+                                dec.bit_depth,
+                                dec.channels as u16,
+                                dec.sample_rate,
+                            );
+                        }
+                    })
+                    .await
+                    .ok();
+                });
+            }
+        }
         Ok(())
     }
 
@@ -5852,6 +5954,9 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<ResolvedQueueItem, String> {
+        // Pré-chargement gapless : pas de forwarder de niveaux sur les
+        // sessions créées ici (voir `levels_prewarm`).
+        let _prewarm = self.begin_levels_prewarm(zone_id);
         // Clean up any previously prepared gapless session for this zone
         // before creating a new one.
         self.cleanup_gapless_session(zone_id).await;
@@ -6004,6 +6109,9 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<ResolvedQueueItem, String> {
+        // Pré-chargement gapless : pas de forwarder de niveaux (voir
+        // `levels_prewarm`).
+        let _prewarm = self.begin_levels_prewarm(zone_id);
         // Drop any previously prepared gapless (URL) session for this zone so we
         // don't leak a transcode session when switching to the local-file path.
         self.cleanup_gapless_session(zone_id).await;
