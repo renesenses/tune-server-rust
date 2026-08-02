@@ -1790,6 +1790,32 @@ fn convert_24bit_pcm_to_depth(pcm_24: &[u8], target_bd: u16) -> Vec<u8> {
 /// Uses `DsdToPcmStreamer` to process the file in chunks, avoiding the
 /// catastrophic memory usage of the old batch approach.
 /// Memory usage: O(block_size + filter_len) ≈ 40 KB regardless of file size.
+/// Upper bound of output PCM samples needed for a `seek_s`..`seek_s+max_duration_s`
+/// window, so a bounded read (e.g. a 10 s preview or the embedding window) stops
+/// decoding early instead of converting the WHOLE DSD file. The DSD→PCM path runs
+/// a per-output-sample FIR: a full DSD64 track is billions of multiply-adds on a
+/// non-cancellable thread, which reads as a hang. Returns `usize::MAX` when no
+/// duration is requested, so the "decode everything" path is unchanged.
+fn dsd_needed_samples(
+    seek_s: f64,
+    max_duration_s: f64,
+    output_rate: u32,
+    channels: usize,
+) -> usize {
+    if max_duration_s <= 0.0 {
+        return usize::MAX;
+    }
+    let skip_frames = if seek_s > 0.0 {
+        (seek_s * output_rate as f64) as usize
+    } else {
+        0
+    };
+    let keep_frames = (max_duration_s * output_rate as f64).ceil() as usize;
+    skip_frames
+        .saturating_add(keep_frames)
+        .saturating_mul(channels.max(1))
+}
+
 fn decode_dsd_to_pcm(
     file_path: &str,
     ext: &str,
@@ -1828,10 +1854,18 @@ fn decode_dsd_to_pcm(
         all_samples.reserve((info.total_samples / decimation) as usize * channels);
         let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, true);
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            if all_samples.len() >= needed {
+                break;
+            }
         }
-        append_pcm24(&mut all_samples, &streamer.flush());
+        // Skip the filter flush once the window is satisfied (its tail would be
+        // trimmed away anyway); only a full-file read needs it.
+        if all_samples.len() < needed {
+            append_pcm24(&mut all_samples, &streamer.flush());
+        }
         (dsd_rate, output_rate, channels)
     } else {
         let info = super::dff::parse_dff(file_path)?;
@@ -1845,10 +1879,16 @@ fn decode_dsd_to_pcm(
         let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            if all_samples.len() >= needed {
+                break;
+            }
         }
-        append_pcm24(&mut all_samples, &streamer.flush());
+        if all_samples.len() < needed {
+            append_pcm24(&mut all_samples, &streamer.flush());
+        }
         (dsd_rate, output_rate, channels)
     };
 
@@ -1994,6 +2034,42 @@ mod decode_integration_tests {
         assert!(
             mid < -3_000_000,
             "all-zero DSD should decode to strong negative PCM, got {mid}"
+        );
+    }
+
+    #[test]
+    fn dsd_needed_samples_bounds() {
+        // No duration requested → decode the whole file (unchanged path).
+        assert_eq!(dsd_needed_samples(0.0, 0.0, 48_000, 2), usize::MAX);
+        // 10 s @ 48 kHz stereo = 480_000 frames × 2 channels.
+        assert_eq!(dsd_needed_samples(0.0, 10.0, 48_000, 2), 480_000 * 2);
+        // Seek adds its frames to the window; mono keeps the frame count.
+        assert_eq!(dsd_needed_samples(1.0, 10.0, 48_000, 1), 48_000 + 480_000);
+    }
+
+    // A bounded read must stop decoding early — decode less than the full file
+    // instead of converting all of it and trimming (the DSD hang, Sandro's DSF).
+    #[test]
+    fn decode_dsf_bounded_stops_early() {
+        let path = std::env::temp_dir().join("tune_test_dsf_bounded.dsf");
+        let p = path.to_str().unwrap();
+        write_test_dsf(p, 0x55);
+        let full = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
+        let bounded = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.005).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!bounded.samples_i32.is_empty());
+        assert!(
+            bounded.samples_i32.len() < full.samples_i32.len(),
+            "bounded decode must be shorter than full: {} vs {}",
+            bounded.samples_i32.len(),
+            full.samples_i32.len(),
+        );
+        let frames = bounded.samples_i32.len() / bounded.channels.max(1) as usize;
+        assert!(
+            frames as f64 / 176_400.0 <= 0.006,
+            "bounded window should be ~0.005 s, got {} frames",
+            frames,
         );
     }
 
