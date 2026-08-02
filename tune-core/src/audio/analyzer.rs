@@ -135,6 +135,166 @@ fn k_weighting_coefficients(fs: f64) -> (Biquad, Biquad) {
     )
 }
 
+/// Streaming EBU R128 (BS.1770-4) integrated-loudness + sample-peak accumulator.
+///
+/// Feed interleaved, normalized (`[-1, 1]`) f64 samples in any chunking — the
+/// K-weighting filter state is continuous across `feed` calls, so feeding a
+/// signal all at once or in chunks yields the **same** value as the previous
+/// whole-track code. Memory is bounded by one 400 ms block regardless of track
+/// length: only one `f64` per 100 ms block (`block_powers`) is retained. This is
+/// what lets `measure_loudness_and_peak` analyse multi-GB hi-res tracks without
+/// materialising them in RAM (fixes the OOM crash-loop, #1109).
+struct LoudnessAccumulator {
+    channels: usize,
+    block_frames: usize,
+    step_frames: usize,
+    /// Per-channel K-weighting biquads (state carried across `feed`).
+    filters: Vec<(Biquad, Biquad)>,
+    /// Per-channel K-weighted samples from the current block start onward.
+    bufs: Vec<std::collections::VecDeque<f64>>,
+    /// Mean-square power per 400 ms block (channel-summed).
+    block_powers: Vec<f64>,
+    /// Running linear sample peak on the *un-weighted* samples.
+    peak: f64,
+    total_frames: usize,
+}
+
+impl LoudnessAccumulator {
+    fn new(sample_rate: usize, channels: usize) -> Self {
+        let fs = sample_rate as f64;
+        Self {
+            channels,
+            block_frames: (fs * 0.4) as usize,
+            step_frames: (fs * 0.1) as usize,
+            filters: (0..channels)
+                .map(|_| k_weighting_coefficients(fs))
+                .collect(),
+            bufs: (0..channels)
+                .map(|_| std::collections::VecDeque::new())
+                .collect(),
+            block_powers: Vec::new(),
+            peak: 0.0,
+            total_frames: 0,
+        }
+    }
+
+    /// Feed interleaved normalized samples. Emits every complete 400 ms block
+    /// aligned on the 100 ms step (identical alignment to the batch loop
+    /// `while start + block_frames <= num_frames { start += step_frames }`).
+    fn feed(&mut self, interleaved: &[f64]) {
+        if self.channels == 0 {
+            return;
+        }
+        let frames = interleaved.len() / self.channels;
+        for f in 0..frames {
+            for c in 0..self.channels {
+                let raw = interleaved[f * self.channels + c];
+                self.peak = self.peak.max(raw.abs());
+                let (s1, s2) = &mut self.filters[c];
+                self.bufs[c].push_back(s2.process(s1.process(raw)));
+            }
+            self.total_frames += 1;
+        }
+        if self.block_frames == 0 || self.step_frames == 0 {
+            return;
+        }
+        while self.bufs[0].len() >= self.block_frames {
+            let mut power_sum = 0.0;
+            for c in 0..self.channels {
+                let ms: f64 = self.bufs[c]
+                    .iter()
+                    .take(self.block_frames)
+                    .map(|s| s * s)
+                    .sum::<f64>()
+                    / self.block_frames as f64;
+                power_sum += ms; // channel weight = 1.0 (mono/stereo)
+            }
+            self.block_powers.push(power_sum);
+            for c in 0..self.channels {
+                self.bufs[c].drain(..self.step_frames);
+            }
+        }
+    }
+
+    /// Integrated loudness (LUFS, rounded to 0.1) + peak (clamped to 1.0). `None`
+    /// for silence / below-threshold / empty input.
+    fn finish(self) -> Option<(f64, f64)> {
+        let peak = self.peak.min(1.0);
+
+        // Too short for even one 400 ms block: simple loudness over all samples
+        // (nothing was drained, so the buffers still hold the whole signal).
+        if self.block_powers.is_empty() {
+            if self.total_frames == 0 {
+                return None;
+            }
+            let mut power_sum = 0.0;
+            for buf in &self.bufs {
+                if buf.is_empty() {
+                    return None;
+                }
+                power_sum += buf.iter().map(|s| s * s).sum::<f64>() / buf.len() as f64;
+            }
+            if power_sum <= 0.0 {
+                return None;
+            }
+            let lufs = -0.691 + 10.0 * power_sum.log10();
+            return Some(((lufs * 10.0).round() / 10.0, peak));
+        }
+
+        // Absolute gating: keep blocks above -70 LUFS.
+        let abs_threshold = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+        let gated_abs: Vec<f64> = self
+            .block_powers
+            .iter()
+            .copied()
+            .filter(|&p| p > abs_threshold)
+            .collect();
+        if gated_abs.is_empty() {
+            return None;
+        }
+        // Relative threshold = mean of abs-gated blocks - 10 dB.
+        let mean_abs: f64 = gated_abs.iter().sum::<f64>() / gated_abs.len() as f64;
+        let rel_threshold = mean_abs * 10.0_f64.powf(-10.0 / 10.0);
+        let gated_rel: Vec<f64> = self
+            .block_powers
+            .iter()
+            .copied()
+            .filter(|&p| p > rel_threshold)
+            .collect();
+        if gated_rel.is_empty() {
+            return None;
+        }
+        let mean_rel: f64 = gated_rel.iter().sum::<f64>() / gated_rel.len() as f64;
+        if mean_rel <= 0.0 {
+            return None;
+        }
+        let lufs = -0.691 + 10.0 * mean_rel.log10();
+        Some(((lufs * 10.0).round() / 10.0, peak))
+    }
+}
+
+/// i32 → normalized f64 scale for a given bit depth.
+fn pcm_scale(bit_depth: u16) -> f64 {
+    match bit_depth {
+        24 => (1i64 << 23) as f64,
+        32 => (1i64 << 31) as f64,
+        _ => 32768.0,
+    }
+}
+
+/// Integrated loudness (LUFS) from already-normalized interleaved samples — the
+/// pure math, shared by tests and (via [`LoudnessAccumulator`]) the streaming
+/// file path.
+fn integrated_loudness_from_samples(
+    samples: &[f64],
+    sample_rate: usize,
+    channels: usize,
+) -> Option<f64> {
+    let mut acc = LoudnessAccumulator::new(sample_rate, channels);
+    acc.feed(samples);
+    acc.finish().map(|(lufs, _)| lufs)
+}
+
 /// Measure EBU R128 integrated loudness (in LUFS) using native decoding.
 ///
 /// Implements ITU-R BS.1770-4:
@@ -153,131 +313,52 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
 /// derive `rg_track_gain` (reference − LUFS) and `rg_track_peak` without decoding
 /// the file twice.
 pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64)> {
-    // Decode to native sample rate, stereo.
-    // We don't assume 48 kHz because the native decoder does not resample.
-    let path = file_path.to_string();
-    let decoded = tokio::task::spawn_blocking(move || {
-        super::decode::decode_to_pcm(&path, None, Some(2), 0.0, 0.0)
-    })
-    .await
-    .ok()?
-    .ok()?;
+    // Analyse in bounded time segments and stream them through the accumulator,
+    // so memory never scales with track length. Decoding a whole long 24/192
+    // track into RAM cost several GB and OOM-killed the server in a crash-loop
+    // (#1109). K-weighting state is continuous across segments, so the result is
+    // identical to a single whole-track pass. We decode at the native rate,
+    // stereo (the native decoder does not resample), same as before.
+    const SEG_SECONDS: f64 = 30.0;
 
-    let sample_rate = decoded.sample_rate as usize;
-    let channels = decoded.channels as usize;
-    if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
-        return None;
-    }
+    let mut acc: Option<LoudnessAccumulator> = None;
+    let mut seek = 0.0_f64;
 
-    // Convert i32 → f64 normalized to [-1, 1] based on bit depth
-    let scale = match decoded.bit_depth {
-        24 => (1i64 << 23) as f64,
-        32 => (1i64 << 31) as f64,
-        _ => 32768.0,
-    };
-    let samples: Vec<f64> = decoded
-        .samples_i32
-        .iter()
-        .map(|&s| s as f64 / scale)
-        .collect();
+    loop {
+        let path = file_path.to_string();
+        let decoded = tokio::task::spawn_blocking(move || {
+            super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
+        })
+        .await
+        .ok()?
+        .ok()?;
 
-    // Linear sample peak across all channels (clamped to 1.0 for clipped content),
-    // computed on the un-weighted samples before K-weighting mutates them.
-    let peak = samples
-        .iter()
-        .fold(0.0_f64, |m, &s| m.max(s.abs()))
-        .min(1.0);
-
-    let num_frames = samples.len() / channels;
-    if num_frames == 0 {
-        return None;
-    }
-
-    // De-interleave into per-channel buffers
-    let mut ch_bufs: Vec<Vec<f64>> = (0..channels)
-        .map(|c| (0..num_frames).map(|f| samples[f * channels + c]).collect())
-        .collect();
-
-    // Apply K-weighting to each channel
-    let fs = sample_rate as f64;
-    for ch in &mut ch_bufs {
-        let (mut stage1, mut stage2) = k_weighting_coefficients(fs);
-        for s in ch.iter_mut() {
-            *s = stage1.process(*s);
-            *s = stage2.process(*s);
+        let sample_rate = decoded.sample_rate as usize;
+        let channels = decoded.channels as usize;
+        if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
+            break; // EOF (or unreadable): done.
         }
-    }
 
-    // 400ms blocks with 75% overlap (= step of 100ms)
-    let block_frames = (sample_rate as f64 * 0.4) as usize;
-    let step_frames = (sample_rate as f64 * 0.1) as usize;
-    if block_frames == 0 || step_frames == 0 || num_frames < block_frames {
-        // File too short for even one block — compute simple loudness
-        let mut power_sum = 0.0;
-        for ch in &ch_bufs {
-            let ms: f64 = ch.iter().map(|s| s * s).sum::<f64>() / ch.len() as f64;
-            power_sum += ms; // weight = 1.0 for L and R
+        let scale = pcm_scale(decoded.bit_depth);
+        let samples: Vec<f64> = decoded
+            .samples_i32
+            .iter()
+            .map(|&s| s as f64 / scale)
+            .collect();
+        acc.get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
+            .feed(&samples);
+
+        // A segment shorter than requested means we reached the end. Advance the
+        // seek by the actual decoded duration so segments stay contiguous even if
+        // the decoder rounds the boundary.
+        let frames = decoded.samples_i32.len() / channels;
+        if (frames as f64) < SEG_SECONDS * sample_rate as f64 {
+            break;
         }
-        if power_sum <= 0.0 {
-            return None;
-        }
-        let lufs = -0.691 + 10.0 * power_sum.log10();
-        return Some(((lufs * 10.0).round() / 10.0, peak));
+        seek += frames as f64 / sample_rate as f64;
     }
 
-    // Compute block loudness values
-    let mut block_powers: Vec<f64> = Vec::new();
-    let mut start = 0;
-    while start + block_frames <= num_frames {
-        let mut power_sum = 0.0;
-        for ch in &ch_bufs {
-            let block = &ch[start..start + block_frames];
-            let ms: f64 = block.iter().map(|s| s * s).sum::<f64>() / block_frames as f64;
-            power_sum += ms; // channel weight = 1.0 for stereo
-        }
-        block_powers.push(power_sum);
-        start += step_frames;
-    }
-
-    if block_powers.is_empty() {
-        return None;
-    }
-
-    // Absolute gating: keep blocks above -70 LUFS
-    let abs_threshold = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
-    let gated_abs: Vec<f64> = block_powers
-        .iter()
-        .copied()
-        .filter(|&p| p > abs_threshold)
-        .collect();
-
-    if gated_abs.is_empty() {
-        return None; // entire file is below -70 LUFS
-    }
-
-    // Relative threshold = mean of abs-gated blocks - 10 dB
-    let mean_abs: f64 = gated_abs.iter().sum::<f64>() / gated_abs.len() as f64;
-    let rel_threshold = mean_abs * 10.0_f64.powf(-10.0 / 10.0); // mean / 10
-
-    // Final gating: keep blocks above relative threshold
-    let gated_rel: Vec<f64> = block_powers
-        .iter()
-        .copied()
-        .filter(|&p| p > rel_threshold)
-        .collect();
-
-    if gated_rel.is_empty() {
-        return None;
-    }
-
-    let mean_rel: f64 = gated_rel.iter().sum::<f64>() / gated_rel.len() as f64;
-    if mean_rel <= 0.0 {
-        return None;
-    }
-
-    let lufs = -0.691 + 10.0 * mean_rel.log10();
-    // Round to 1 decimal
-    Some(((lufs * 10.0).round() / 10.0, peak))
+    acc?.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -289,40 +370,54 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64)> {
 /// Scans backwards from the end of the file to find the last sample whose
 /// absolute amplitude exceeds `threshold_db` (a negative dB value, e.g. -50).
 pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 {
-    let path = file_path.to_string();
-    let decoded = tokio::task::spawn_blocking(move || {
-        super::decode::decode_to_pcm(&path, None, Some(1), 0.0, 0.0)
-    })
-    .await;
-
-    let decoded = match decoded {
-        Ok(Ok(d)) => d,
-        _ => return 0.0,
-    };
-
-    let sample_rate = decoded.sample_rate as f64;
-    if sample_rate <= 0.0 || decoded.samples_i32.is_empty() {
-        return 0.0;
-    }
-
+    // Streamed in segments so a long track is never decoded into RAM at once
+    // (same OOM class as the loudness pass, #1109). Forward scan tracking the
+    // index of the last sample above threshold — equivalent to the old backward
+    // scan over the whole buffer.
+    const SEG_SECONDS: f64 = 30.0;
     let threshold_linear = 10.0_f64.powf(threshold_db / 20.0);
 
-    // Normalize based on bit depth
-    let scale = match decoded.bit_depth {
-        24 => (1i64 << 23) as f64,
-        32 => (1i64 << 31) as f64,
-        _ => 32768.0,
-    };
+    let mut sample_rate = 0.0_f64;
+    let mut total: usize = 0;
+    let mut last_loud: Option<usize> = None;
+    let mut seek = 0.0_f64;
 
-    // Find the last sample above threshold, scanning backwards
-    let last_loud = decoded
-        .samples_i32
-        .iter()
-        .rposition(|&s| (s as f64 / scale).abs() > threshold_linear);
+    loop {
+        let path = file_path.to_string();
+        let decoded = match tokio::task::spawn_blocking(move || {
+            super::decode::decode_to_pcm(&path, None, Some(1), seek, SEG_SECONDS)
+        })
+        .await
+        {
+            Ok(Ok(d)) => d,
+            _ => break,
+        };
 
+        let sr = decoded.sample_rate as usize;
+        if sr == 0 || decoded.samples_i32.is_empty() {
+            break;
+        }
+        sample_rate = sr as f64;
+        let scale = pcm_scale(decoded.bit_depth);
+        for (i, &s) in decoded.samples_i32.iter().enumerate() {
+            if (s as f64 / scale).abs() > threshold_linear {
+                last_loud = Some(total + i);
+            }
+        }
+        let frames = decoded.samples_i32.len(); // mono: 1 sample per frame
+        total += frames;
+        if (frames as f64) < SEG_SECONDS * sr as f64 {
+            break;
+        }
+        seek += frames as f64 / sr as f64;
+    }
+
+    if sample_rate <= 0.0 || total == 0 {
+        return 0.0;
+    }
     match last_loud {
-        Some(pos) => (decoded.samples_i32.len() - 1 - pos) as f64 / sample_rate,
-        None => decoded.samples_i32.len() as f64 / sample_rate, // entire file is silent
+        Some(pos) => (total - 1 - pos) as f64 / sample_rate,
+        None => total as f64 / sample_rate, // entire file is silent
     }
 }
 
@@ -717,6 +812,45 @@ mod tests {
 
         let lufs = -0.691 + 10.0 * mean_rel.log10();
         Some((lufs * 10.0).round() / 10.0)
+    }
+
+    /// The streaming `LoudnessAccumulator` must (a) match the reference batch math
+    /// exactly when fed in one shot, and (b) be invariant to chunking — the two
+    /// guarantees that let the file path stream in bounded memory (#1109) without
+    /// changing any ReplayGain value.
+    #[test]
+    fn accumulator_matches_reference_and_is_chunk_invariant() {
+        let sr = 48_000usize;
+        let n = sr * 3; // 3 s → many 400 ms / 100 ms blocks
+        let mut i16s: Vec<i16> = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            // Loud for 2 s then quiet, to exercise absolute + relative gating.
+            let a = if t < 2.0 { 0.5 } else { 0.02 };
+            let v = (a * (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 32767.0) as i16;
+            i16s.push(v); // L
+            i16s.push(v); // R
+        }
+        let f64s: Vec<f64> = i16s.iter().map(|&s| s as f64 / 32768.0).collect();
+
+        let reference = compute_loudness_from_samples(&i16s, sr, 2).unwrap();
+
+        let one_shot = integrated_loudness_from_samples(&f64s, sr, 2).unwrap();
+        assert!(
+            (one_shot - reference).abs() < 1e-9,
+            "one-shot {one_shot} != reference {reference}"
+        );
+
+        // Feed in odd, frame-aligned chunks that cross block/step boundaries.
+        let mut acc = LoudnessAccumulator::new(sr, 2);
+        for chunk in f64s.chunks(777 * 2) {
+            acc.feed(chunk);
+        }
+        let (chunked, _) = acc.finish().unwrap();
+        assert!(
+            (chunked - reference).abs() < 1e-9,
+            "chunked {chunked} != reference {reference}"
+        );
     }
 
     // -----------------------------------------------------------------------
