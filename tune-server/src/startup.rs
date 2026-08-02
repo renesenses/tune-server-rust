@@ -564,6 +564,26 @@ pub async fn register_local_outputs(state: &AppState) {
                     {
                         info!(zone_id = zid, name = %dev.name, "local_zone_generic_label_healed");
                     }
+                    // Device par défaut : le device_id étant dérivé du NOM du
+                    // périphérique (`local:<name>`), un renommage du Mac ou un
+                    // changement de locale macOS crée une SECONDE zone par
+                    // défaut portant l'étiquette générique de l'autre langue
+                    // (« This Computer » ⇄ « Cet ordinateur »). get_or_create /
+                    // deduplicate matchent sur device_id et ne fusionnent jamais
+                    // ces jumelles → les deux restent dans le sélecteur (Philippe
+                    // Vella). On masque les jumelles génériques, en gardant celle
+                    // liée au device vivant. Étiquettes génériques uniquement —
+                    // une zone renommée par l'utilisateur n'est jamais touchée.
+                    if dev.is_default
+                        && let Ok(n) = zone_repo.hide_duplicate_generic_local(zid)
+                        && n > 0
+                    {
+                        info!(
+                            zone_id = zid,
+                            hidden = n,
+                            "local_default_zone_duplicates_hidden"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(

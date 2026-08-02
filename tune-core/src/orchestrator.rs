@@ -9,6 +9,15 @@ use tracing::{debug, info, warn};
 /// no-op result instead of a user-facing error.
 const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transcode__";
 
+/// A second play of the SAME track pushed to a NETWORK renderer within this
+/// window is treated as a redundant re-trigger (a slow pre-transcode resolve
+/// racing a poller/gapless advance) and coalesced instead of re-sent — a second
+/// `SetAVTransportURI` restarts a push renderer from 0 (Revox S100 double-play,
+/// forum). A legitimate re-play of the same track (repeat-one, the same track
+/// twice in a queue) only recurs after the track has played, i.e. minutes
+/// later, well outside this window; explicit seeks and stop→replay are exempt.
+const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
 /// concurrent plays, keyed by source path. A burst of play taps for a
 /// slow-to-decode NAS track otherwise kicks off one full transcode each
@@ -254,6 +263,11 @@ pub struct PlaybackOrchestrator {
     /// Only negative results are cached — if a MIME is not in the set, it's
     /// either supported or hasn't been checked yet.
     dlna_unsupported_mimes: Mutex<HashMap<String, Vec<String>>>,
+    /// Per-zone record of the last track pushed to a NETWORK renderer:
+    /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
+    /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
+    /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
+    last_net_play: Mutex<HashMap<i64, (String, Option<String>, std::time::Instant)>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -458,7 +472,31 @@ impl PlaybackOrchestrator {
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
+            last_net_play: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Duplicate-network-play detector. Returns `true` when `(source,
+    /// source_id)` was recorded as this zone's last network play within
+    /// `DUPLICATE_NET_PLAY_WINDOW` of `now` (⇒ a redundant re-send to coalesce);
+    /// otherwise records it as the new last play and returns `false`. Pure map
+    /// logic split out of `play_inner` for unit testing.
+    fn record_or_detect_duplicate_net_play(
+        map: &mut HashMap<i64, (String, Option<String>, std::time::Instant)>,
+        zone_id: i64,
+        source: &str,
+        source_id: &Option<String>,
+        now: std::time::Instant,
+    ) -> bool {
+        let dup = map.get(&zone_id).is_some_and(|(src, sid, when)| {
+            src == source
+                && sid == source_id
+                && now.duration_since(*when) < DUPLICATE_NET_PLAY_WINDOW
+        });
+        if !dup {
+            map.insert(zone_id, (source.to_string(), source_id.clone(), now));
+        }
+        dup
     }
 
     /// Remove any gapless-prepared stream session for a zone.
@@ -714,6 +752,53 @@ impl PlaybackOrchestrator {
                 source: resolved.source,
                 error: Some("superseded by a newer play".into()),
             });
+        }
+
+        // Coalesce a redundant re-play of the SAME track to a NETWORK renderer.
+        // The generation guard above only aborts an OVERLAPPING play; it cannot
+        // stop one that starts just AFTER the first already sent its URI. A slow
+        // pre-transcode-to-file resolve (Tidal AAC / hi-res DASH, 4-10s) races a
+        // second play/advance trigger for the same track, and BOTH reach the
+        // renderer — the second SetAVTransportURI restarts it from 0 (Revox S100:
+        // plays a few seconds, jumps to 0, then plays through — forum, Philippe
+        // Vella). If we pushed this exact (source, source_id) to this zone within
+        // DUPLICATE_NET_PLAY_WINDOW and this is not an explicit seek, skip the
+        // redundant send. Network push outputs only — local/USB pull outputs
+        // prefill their own ring buffer and don't restart-glitch. The record is
+        // cleared on stop(), so a stop→replay of the same track still plays.
+        let is_net_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| !id.starts_with("local:"));
+        let is_seek = req.seek_ms.unwrap_or(0) > 0;
+        if is_net_output && !is_seek {
+            let is_dup = {
+                let mut last = self.last_net_play.lock().await;
+                Self::record_or_detect_duplicate_net_play(
+                    &mut last,
+                    req.zone_id,
+                    &resolved.source,
+                    &req.source_id,
+                    std::time::Instant::now(),
+                )
+            };
+            if is_dup {
+                info!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    source = %resolved.source,
+                    "orchestrator_play_coalesced_duplicate_net_send"
+                );
+                if let Some(ref sid) = resolved.stream_id {
+                    self.streamer.remove_session(sid).await;
+                }
+                return Ok(PlayResult {
+                    stream_url: None,
+                    output_sent: false,
+                    source: resolved.source,
+                    error: None,
+                });
+            }
         }
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
@@ -5195,6 +5280,9 @@ impl PlaybackOrchestrator {
             .ok();
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
+        // Forget the last network-play record so a stop→replay of the SAME track
+        // is not mistaken for the duplicate-send it guards against (play_inner).
+        self.last_net_play.lock().await.remove(&zone_id);
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -6412,6 +6500,45 @@ mod tests {
         assert!(!use_file_transcode_for(true, true, false, false));
         // Local/OAAT (not network): never file-transcodes.
         assert!(!use_file_transcode_for(false, true, true, false));
+    }
+
+    #[test]
+    fn duplicate_net_play_coalesces_same_track_within_window() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        type Map = HashMap<i64, (String, Option<String>, Instant)>;
+        let f = PlaybackOrchestrator::record_or_detect_duplicate_net_play;
+        let t0 = Instant::now();
+        let sid = Some("tidal-123".to_string());
+
+        let mut map: Map = HashMap::new();
+        // First play of the track → recorded, NOT a duplicate.
+        assert!(!f(&mut map, 5, "tidal", &sid, t0));
+        // Same (source, source_id) a few seconds later → duplicate (coalesce).
+        assert!(f(&mut map, 5, "tidal", &sid, t0 + Duration::from_secs(4)));
+        // A DIFFERENT track (real advance) → NOT a duplicate.
+        let other = Some("tidal-999".to_string());
+        assert!(!f(
+            &mut map,
+            5,
+            "tidal",
+            &other,
+            t0 + Duration::from_secs(4)
+        ));
+        // Different source, same id → NOT a duplicate.
+        assert!(!f(&mut map, 5, "qobuz", &sid, t0 + Duration::from_secs(4)));
+
+        // Same track but OUTSIDE the window (repeat-one / dup-in-queue, minutes
+        // later) → NOT a duplicate.
+        let mut map2: Map = HashMap::new();
+        assert!(!f(&mut map2, 7, "tidal", &sid, t0));
+        let far = t0 + super::DUPLICATE_NET_PLAY_WINDOW + Duration::from_secs(1);
+        assert!(!f(&mut map2, 7, "tidal", &sid, far));
+
+        // Different zones never collide.
+        let mut map3: Map = HashMap::new();
+        assert!(!f(&mut map3, 1, "tidal", &sid, t0));
+        assert!(!f(&mut map3, 2, "tidal", &sid, t0));
     }
 
     #[test]

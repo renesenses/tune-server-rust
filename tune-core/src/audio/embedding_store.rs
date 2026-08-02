@@ -12,8 +12,16 @@ use crate::db::backend::{DbBackend, ToSqlValue};
 pub const EMBED_DIM: usize = 512;
 
 /// Model identifier stored alongside each embedding, so a future model can
-/// re-embed without invalidating rows produced by this one.
-pub const MODEL_ID: &str = "clap-audio-2023";
+/// re-embed without invalidating rows produced by this one. The write sweep
+/// keys its "already analysed" sentinel on this value, so bumping the ID makes
+/// an embedding-enabled instance re-sweep the whole library into the new space
+/// (old `clap-audio-2023` vectors are silently superseded track-by-track).
+///
+/// `clap-music-2023` = LAION `music_audioset` towers (HTSAT-base), the
+/// music-specialised checkpoint. It replaces the generalist `clap-audio-2023`
+/// (`630k-audioset`, HTSAT-tiny) and shares its joint space with the CLAP text
+/// tower, enabling natural-language acoustic search (Phase 3).
+pub const MODEL_ID: &str = "clap-music-2023";
 
 /// Pack a normalised embedding into the `BLOB`/`BYTEA` column (little-endian f32).
 pub fn to_bytes(embedding: &[f32]) -> Vec<u8> {
@@ -70,6 +78,27 @@ pub fn fetch_all(backend: &Arc<dyn DbBackend>, limit: i64) -> Vec<(i64, Vec<f32>
         .collect()
 }
 
+/// Rank the library by cosine similarity to an arbitrary (already-normalised)
+/// query vector, most similar first. `exclude` drops one track id (the seed,
+/// when querying by track). Returns `(track_id, cosine)`. Works for any query in
+/// the CLAP joint space — a seed track's audio embedding OR a text-tower query
+/// embedding (natural-language acoustic search), since both share that space.
+pub fn rank_by_vector(
+    backend: &Arc<dyn DbBackend>,
+    query: &[f32],
+    limit: usize,
+    exclude: Option<i64>,
+) -> Vec<(i64, f32)> {
+    let mut scored: Vec<(i64, f32)> = fetch_all(backend, 500_000)
+        .into_iter()
+        .filter(|(id, _)| Some(*id) != exclude)
+        .map(|(id, v)| (id, cosine(query, &v)))
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(limit);
+    scored
+}
+
 /// Rank the library by acoustic similarity to a seed track's embedding, most
 /// similar first, excluding the seed itself. Returns `(track_id, cosine)`; empty
 /// when the seed has no embedding (caller falls back to the metadata path).
@@ -82,12 +111,5 @@ pub fn acoustic_neighbors(
         Some(v) => v,
         None => return Vec::new(),
     };
-    let mut scored: Vec<(i64, f32)> = fetch_all(backend, 500_000)
-        .into_iter()
-        .filter(|(id, _)| *id != seed_track_id)
-        .map(|(id, v)| (id, cosine(&seed, &v)))
-        .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(limit);
-    scored
+    rank_by_vector(backend, &seed, limit, Some(seed_track_id))
 }

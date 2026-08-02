@@ -26,5 +26,8 @@ pub mod replaygain;
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
 pub mod tap;
+/// CLAP text tower for natural-language acoustic search (Phase 3).
+#[cfg(feature = "audio-embedding")]
+pub mod text_embedding;
 pub mod wav;
 pub mod wavpack;

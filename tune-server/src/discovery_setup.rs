@@ -190,7 +190,7 @@ async fn handle_ssdp_discovered(
             .or_else(|| svc_urls.get("ConnectionManager"))
             .map(|p| resolve_control_url(&dev.host, dev.port, p));
         if let (Some(av), Some(rc)) = (av_url, rc_url) {
-            let delay = config.play_delay_for(&dev.name);
+            let delay = crate::config::resolve_play_delay(db, config, &dev.id, &dev.name);
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                 dev.name.clone(),
                 dev.id.clone(),

@@ -80,6 +80,16 @@ pub mod sql {
         )
     }
 
+    pub fn hide_duplicate_generic_local<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 1 \
+             WHERE id <> {} AND output_type = 'local' \
+             AND name IN ('This Computer', 'Cet ordinateur') \
+             AND COALESCE(is_hidden, 0) = 0",
+            d.placeholder(1)
+        )
+    }
+
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET is_hidden = 1 WHERE id = {}",
@@ -641,6 +651,37 @@ impl ZoneRepo {
         }
     }
 
+    /// Per-zone SetAVTransportURI→Play delay in ms (0 = use the config default).
+    pub fn get_dlna_play_delay_ms(&self, id: i64) -> u64 {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT COALESCE(dlna_play_delay_ms, 0) FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+            .max(0) as u64
+    }
+
+    pub fn update_dlna_play_delay_ms(&self, id: i64, delay_ms: u64) -> Result<(), String> {
+        let sql = self.update_field_sql("dlna_play_delay_ms");
+        let params: [&dyn ToSqlValue; 2] = [&(delay_ms as i64), &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "dlna_play_delay_ms_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Persist the renderer's host (IP) on the zone, for host-based dedup.
     /// Best-effort: silently ignores a missing `host` column (pre-migration DB).
     pub fn set_host(&self, id: i64, host: &str) -> Result<(), String> {
@@ -809,6 +850,25 @@ impl ZoneRepo {
             sql::rename_generic_local_label,
         );
         let params: [&dyn ToSqlValue; 2] = [&device_name, &zone_id];
+        self.db.execute(&sql, &params)
+    }
+
+    /// Hide stale duplicate LOCAL zones stuck on a generic default label
+    /// ("This Computer" / "Cet ordinateur"), keeping `keep_id` — the zone bound
+    /// to the live default device. The local device_id is derived from the
+    /// device NAME (`local:<name>`), which is localizable and user-renamable, so
+    /// renaming the Mac or a macOS locale change mints a new device_id and thus
+    /// a SECOND default-device zone carrying the other-locale generic label.
+    /// `get_or_create`/`deduplicate` key on device_id and never merge these
+    /// twins, leaving both "This Computer" and "Cet ordinateur" in the picker
+    /// (Philippe Vella). Only the exact generic labels are touched — a
+    /// user-renamed zone is never hidden. Returns the number hidden.
+    pub fn hide_duplicate_generic_local(&self, keep_id: i64) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::hide_duplicate_generic_local,
+            sql::hide_duplicate_generic_local,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&keep_id];
         self.db.execute(&sql, &params)
     }
 

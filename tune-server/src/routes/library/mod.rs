@@ -184,6 +184,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route(
             "/tracks/{id}/synced-lyrics",
             get(tracks::track_synced_lyrics),
@@ -242,6 +243,7 @@ pub fn router() -> Router<AppState> {
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))
         .route("/search", get(search::search))
+        .route("/search/acoustic", post(search::acoustic_search))
         .route("/stats", get(stats::library_stats))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))

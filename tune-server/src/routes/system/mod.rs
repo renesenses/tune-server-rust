@@ -82,7 +82,13 @@ pub fn router() -> Router<AppState> {
         .route("/database/export", get(database::export_database))
         .route("/update/check", get(update::update_check))
         .route("/changelog", get(update::changelog))
-        .route("/peers", get(admin::system_peers))
+        .route(
+            "/peers",
+            get(admin::system_peers)
+                .post(admin::add_peer)
+                .delete(admin::remove_peer),
+        )
+        .route("/peer-info", get(admin::peer_info))
         .route(
             "/scan/schedule",
             get(scan::scan_schedule).post(scan::set_scan_schedule),

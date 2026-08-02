@@ -3015,6 +3015,22 @@ impl OutputTarget for LocalOutput {
             // If the stream was never started (very short track or error),
             // start it now with whatever data we have.
             if !stream_started {
+                // Empty stream: the source delivered zero audio bytes (a
+                // superseded/aborted start — e.g. a rapid re-trigger of the same
+                // track, seen in Philippe Vella's log as two orchestrator_play
+                // ~330 ms apart). Starting the cpal stream on an empty ring
+                // played audible silence while the transport kept advancing the
+                // progress bar ("le son coupe, la barre continue"). Bail instead
+                // so the orchestrator sees the track did not actually play,
+                // rather than a phantom "playing" state on a silent output.
+                if total_bytes_read == 0 {
+                    warn!(
+                        device = %device_name,
+                        "local_audio_empty_stream_no_playback"
+                    );
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
                 if let Err(e) = stream.play() {
                     warn!(error = %e, "audio_stream_play_failed_final");
                     playing.store(false, Ordering::SeqCst);
