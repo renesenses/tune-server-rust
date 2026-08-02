@@ -28,9 +28,10 @@ pub(super) struct ImportRatingsBody {
 
 pub(super) async fn export_ratings(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<ExportRatingQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "$1".to_string()
     } else {
@@ -70,9 +71,10 @@ pub(super) async fn export_ratings(
 
 pub(super) async fn import_ratings(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Json(body): Json<ImportRatingsBody>,
 ) -> Json<Value> {
-    let profile_id = body.profile_id.unwrap_or(1);
+    let profile_id = body.profile_id.unwrap_or_else(|| profile.id());
     let repo = RatingRepo::with_backend(state.backend.clone());
     let mut imported = 0i32;
     let mut failed = 0i32;

@@ -164,6 +164,13 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
     Json(json!(items))
 }
 
+// View scope, NOT action identity: this handler reads the profile from the
+// explicit `?profile_id=` query param and deliberately does NOT use the
+// `ActiveProfile` extractor. A present param means "this profile's stats"
+// (strict, NULL rows excluded in full_dashboard); an absent param means "the
+// household total" (all rows, NULL included). Adding a header fallback here
+// would flip that default to per-profile the moment api.ts starts sending
+// X-Profile-Id on every request. See ActiveProfile's convention doc.
 async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParams>) -> Json<Value> {
     let period = p.period.as_deref().unwrap_or("30d");
     let top_n = p.top_n.unwrap_or(10);
