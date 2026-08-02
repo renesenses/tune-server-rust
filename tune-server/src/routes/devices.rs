@@ -280,7 +280,12 @@ pub async fn register_manual_device(
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("DLNA {}", dev.host));
-            let delay = state.config.play_delay_for(&device_name);
+            let delay = crate::config::resolve_play_delay(
+                &state.backend,
+                &state.config,
+                &device_id,
+                &device_name,
+            );
             let cm_url = service_urls
                 .get("connectionmanager")
                 .or_else(|| service_urls.get("ConnectionManager"))
@@ -468,7 +473,12 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
 
                 if let (Some(av), Some(rc)) = (av_url, rc_url) {
                     let base = format!("http://{}:{}", d.host, d.port);
-                    let delay = state.config.play_delay_for(&d.name);
+                    let delay = crate::config::resolve_play_delay(
+                        &state.backend,
+                        &state.config,
+                        &d.id,
+                        &d.name,
+                    );
                     let cm_url = service_urls
                         .get("connectionmanager")
                         .or_else(|| service_urls.get("ConnectionManager"))

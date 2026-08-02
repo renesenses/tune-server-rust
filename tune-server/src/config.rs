@@ -73,6 +73,29 @@ impl TuneConfig {
     }
 }
 
+/// Effective SetAVTransportURI→Play delay for a device: the owning zone's
+/// per-zone override (`dlna_play_delay_ms` > 0, set from the renderer panel) if
+/// present, else the config default (`[device_delays]` / `dlna_play_delay_ms`
+/// via `play_delay_for`). Used at every point a `DlnaOutput` is built so the
+/// per-zone value survives restart/rediscovery, not only a live PATCH.
+pub fn resolve_play_delay(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    config: &TuneConfig,
+    device_id: &str,
+    device_name: &str,
+) -> u64 {
+    use tune_core::db::zone_repo::ZoneRepo;
+    let repo = ZoneRepo::with_backend(db.clone());
+    let zone_override = repo
+        .get_by_device_id(device_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.id)
+        .map(|zid| repo.get_dlna_play_delay_ms(zid))
+        .filter(|d| *d > 0);
+    zone_override.unwrap_or_else(|| config.play_delay_for(device_name))
+}
+
 impl Default for TuneConfig {
     fn default() -> Self {
         Self {

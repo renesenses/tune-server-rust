@@ -76,6 +76,10 @@ struct PatchZone {
     /// fallback) to a DLNA renderer that advertises `audio/L24`. The UI only
     /// offers this after the capability probe reports 24-bit LPCM support.
     dlna_wav24: Option<bool>,
+    /// Per-zone SetAVTransportURI→Play delay in ms (0 = use config default). Lets
+    /// a renderer with a cold-start under-run buffer before its transport clock
+    /// starts (first seconds hachées — Cyrille, Yamaha R-N2000A).
+    dlna_play_delay_ms: Option<i64>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -853,6 +857,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_wav24".into(),
                 json!(zone_repo.get_dlna_wav24(zone_id)),
             );
+            obj.insert(
+                "dlna_play_delay_ms".into(),
+                json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
+            );
             let online = match z.output_type.as_deref() {
                 // Browser zones have no output device by design (the web
                 // client pulls stream_url itself) — always online.
@@ -958,6 +966,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
                 obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
+                obj.insert(
+                    "dlna_play_delay_ms".into(),
+                    json!(repo.get_dlna_play_delay_ms(id)),
+                );
                 let online = match zone.output_type.as_deref() {
                     // Same rules as list_zones: browser zones need no device;
                     // a local zone without output_device_id is an orphan that
@@ -1087,6 +1099,31 @@ async fn patch_zone(
     if let Some(wav24) = body.dlna_wav24 {
         if let Err(e) = repo.update_dlna_wav24(id, wav24) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(delay) = body.dlna_play_delay_ms {
+        let delay = delay.max(0) as u64;
+        if let Err(e) = repo.update_dlna_play_delay_ms(id, delay) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // Apply live to the already-registered output so the new delay takes
+        // effect on the next play without a rebuild/restart. 0 = fall back to the
+        // config default (`[device_delays]` / `dlna_play_delay_ms`) by name.
+        if let Some(device_id) = repo.get(id).ok().flatten().and_then(|z| z.output_device_id) {
+            let output = { state.outputs.lock().await.get(&device_id) };
+            if let Some(output) = output {
+                let guard = output.lock().await;
+                // `name()` is an OutputTarget trait method → read it on the trait
+                // object before downcasting to the concrete DlnaOutput.
+                let effective = if delay > 0 {
+                    delay
+                } else {
+                    state.config.play_delay_for(guard.name())
+                };
+                if let Some(dlna) = guard.as_any().downcast_ref::<DlnaOutput>() {
+                    dlna.set_play_delay(effective);
+                }
+            }
         }
     }
     get_zone(State(state), Path(id)).await.into_response()
@@ -1367,7 +1404,8 @@ async fn register_dlna_output_from_device(
 
     // If cached service URLs are available, use them
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
-        let delay = state.config.play_delay_for(&dev.name);
+        let delay =
+            crate::config::resolve_play_delay(&state.backend, &state.config, &dev.id, &dev.name);
         let dlna = DlnaOutput::new(
             dev.name.clone(),
             dev.id.clone(),
@@ -1397,7 +1435,12 @@ async fn register_dlna_output_from_device(
                             .get("connectionmanager")
                             .or_else(|| service_urls.get("ConnectionManager"))
                             .map(|p| format!("{base}{p}"));
-                        let delay = state.config.play_delay_for(&dev.name);
+                        let delay = crate::config::resolve_play_delay(
+                            &state.backend,
+                            &state.config,
+                            &dev.id,
+                            &dev.name,
+                        );
                         let dlna = DlnaOutput::new(
                             dev.name.clone(),
                             dev.id.clone(),
