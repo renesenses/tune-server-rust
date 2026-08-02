@@ -76,14 +76,22 @@ impl OutputTarget for BluosOutput {
         // BluOS expects the url parameter without re-encoding — .query()
         // would double-encode http:// in the stream URL, causing silent failure.
         let mut play_url = format!("{}/Play?url={}", self.base_url(), media.url);
+        // The Node's now-playing text is set via title1/title2/title3, NOT
+        // title/artist/album: the BluOS Custom Integration API mandates
+        // "title1, title2 and title3 MUST be used […] Do not use values such as
+        // album, artist and name". The Node silently ignores title/artist/album,
+        // so only the cover (image=) rendered while title/artist/album never
+        // appeared (Bilou, forum "Lecture BluOS"). Map title1=track title,
+        // title2=artist, title3=album — the three now-playing lines the Node
+        // reads back in its status XML (<title1>… at get_status).
         if let Some(t) = media.title {
-            play_url.push_str(&format!("&title={}", urlencoding::encode(t)));
+            play_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
         }
         if let Some(a) = media.artist {
-            play_url.push_str(&format!("&artist={}", urlencoding::encode(a)));
+            play_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
         }
         if let Some(al) = media.album {
-            play_url.push_str(&format!("&album={}", urlencoding::encode(al)));
+            play_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
         }
         if let Some(img) = media.cover_url {
             play_url.push_str(&format!("&image={}", urlencoding::encode(img)));
@@ -206,14 +214,17 @@ impl OutputTarget for BluosOutput {
         // BluOS /Add?prepend=1 queues the next track for gapless playback.
         // Raw URL construction (no .query()) to avoid double-encoding, same as play_media.
         let mut add_url = format!("{}/Add?url={}&prepend=1", self.base_url(), media.url);
+        // Same title1/title2/title3 mapping as play_media (the Node ignores
+        // title/artist/album), so the gapless-staged next track also carries its
+        // now-playing text instead of only the cover.
         if let Some(t) = media.title {
-            add_url.push_str(&format!("&title={}", urlencoding::encode(t)));
+            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
         }
         if let Some(a) = media.artist {
-            add_url.push_str(&format!("&artist={}", urlencoding::encode(a)));
+            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
         }
         if let Some(al) = media.album {
-            add_url.push_str(&format!("&album={}", urlencoding::encode(al)));
+            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
         }
         if let Some(img) = media.cover_url {
             add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
