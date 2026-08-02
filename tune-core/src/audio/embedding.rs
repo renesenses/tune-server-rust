@@ -163,7 +163,10 @@ pub async fn analyze_embedding_batch(
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
                    AND m.value = ?) \
          LIMIT ?",
-        &[&MODEL_ID as &dyn ToSqlValue, &(TRACK_BATCH as i64) as &dyn ToSqlValue],
+        &[
+            &MODEL_ID as &dyn ToSqlValue,
+            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+        ],
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -308,7 +311,9 @@ pub(super) async fn ensure_file(
                 }
                 warn!(dest = %dest.display(), what, "stale_asset_rehashing_mismatch_refetch");
             }
-            Err(e) => warn!(dest = %dest.display(), what, error = %e, "asset_reread_failed_refetch"),
+            Err(e) => {
+                warn!(dest = %dest.display(), what, error = %e, "asset_reread_failed_refetch")
+            }
         }
     }
     if let Some(parent) = dest.parent() {

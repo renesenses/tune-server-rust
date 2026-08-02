@@ -87,8 +87,8 @@ impl TextEmbedder {
             ));
         }
 
-        let ids_t =
-            Tensor::from_array(([1usize, CONTEXT], ids)).map_err(|e| format!("ort input_ids: {e}"))?;
+        let ids_t = Tensor::from_array(([1usize, CONTEXT], ids))
+            .map_err(|e| format!("ort input_ids: {e}"))?;
         let mask_t = Tensor::from_array(([1usize, CONTEXT], mask))
             .map_err(|e| format!("ort attention_mask: {e}"))?;
         let outputs = self

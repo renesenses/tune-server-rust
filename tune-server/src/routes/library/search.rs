@@ -116,7 +116,11 @@ pub(super) async fn acoustic_search(
     use tune_core::audio::{embedding_store, text_embedding};
     use tune_core::license::Feature;
 
-    if !state.license.check_feature(Feature::AiRecommendations).await {
+    if !state
+        .license
+        .check_feature(Feature::AiRecommendations)
+        .await
+    {
         return Ok(Json(json!({
             "error": "premium_required",
             "message": "Acoustic search requires a Premium license",
@@ -127,7 +131,9 @@ pub(super) async fn acoustic_search(
 
     let query = body.query.trim();
     if query.is_empty() {
-        return Err(crate::error::AppError::bad_request("query must not be empty"));
+        return Err(crate::error::AppError::bad_request(
+            "query must not be empty",
+        ));
     }
     let limit = body.limit.unwrap_or(50).clamp(1, 200) as usize;
 
