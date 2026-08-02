@@ -186,6 +186,66 @@ impl PcmPublisher {
     }
 }
 
+impl ZoneTap {
+    /// Publish one already-windowed frame. No-op without subscribers. Used by
+    /// the paced levels forwarder, which owns the real-time clock: frames on
+    /// the tap arrive at playback pace, so a naive consumer (plugin doing an
+    /// FFT per window) keeps up without draining into its own buffer — the
+    /// bounded ring only has to absorb jitter, not a decode-speed burst.
+    pub fn publish(&self, frame: PcmTapFrame) {
+        if self.sender.receiver_count() > 0 {
+            let _ = self.sender.send(frame);
+        }
+    }
+}
+
+/// A raw decoder window on its way to the paced forwarder: the decoder has no
+/// zone context — it ships the signal and its format; the forwarder completes
+/// (zone, position, play_seq) before publishing on the tap.
+#[derive(Debug)]
+pub struct RawWindow {
+    /// Interleaved little-endian samples as decoded.
+    pub pcm: Vec<u8>,
+    pub bit_depth: u16,
+    pub channels: u16,
+    pub sample_rate: u32,
+    /// Audio duration covered by this window.
+    pub window: Duration,
+}
+
+/// Split `pcm` into ~[`WINDOW_MS`] windows and send them raw on `tx`.
+/// Decoders produce 32 KiB chunks (~186 ms at CD rates): too coarse for a
+/// fluid analyzer. Returns `false` when the receiver is gone (playback
+/// stopped or superseded) — callers stop sending.
+pub fn send_windowed_pcm(
+    tx: &tokio::sync::mpsc::UnboundedSender<RawWindow>,
+    pcm: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    sample_rate: u32,
+) -> bool {
+    let frame_size = (bit_depth / 8) as usize * channels as usize;
+    if frame_size == 0 || sample_rate == 0 {
+        return true;
+    }
+    let frames_per_window = (sample_rate as usize * WINDOW_MS as usize / 1000).max(1);
+    let window_bytes = frames_per_window * frame_size;
+    for chunk in pcm.chunks(window_bytes) {
+        let frames = chunk.len() / frame_size;
+        let raw = RawWindow {
+            pcm: chunk.to_vec(),
+            bit_depth,
+            channels,
+            sample_rate,
+            window: Duration::from_secs_f64(frames as f64 / sample_rate as f64),
+        };
+        if tx.send(raw).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +297,49 @@ mod tests {
         pub_.send_windowed(&vec![0u8; sr as usize * 4]);
         assert!((pub_.position().as_secs_f64() - 1.0).abs() < 1e-6);
         assert_eq!(tap.receiver_count(), 0);
+    }
+
+    #[test]
+    fn raw_windowing_splits_and_keeps_duration() {
+        // 1 s of 16-bit stereo at 44.1 kHz → 25 windows of 40 ms.
+        let sr = 44100u32;
+        let pcm = vec![0u8; sr as usize * 4];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(send_windowed_pcm(&tx, &pcm, 16, 2, sr));
+        drop(tx);
+
+        let mut count = 0;
+        let mut total = Duration::ZERO;
+        while let Ok(raw) = rx.try_recv() {
+            count += 1;
+            total += raw.window;
+            assert_eq!(raw.sample_rate, sr);
+        }
+        assert_eq!(count, 25, "1 s / 40 ms = 25 windows");
+        let ms = total.as_millis();
+        assert!((990..=1010).contains(&ms), "total ≈ 1 s, got {ms} ms");
+    }
+
+    #[test]
+    fn raw_windowing_reports_dropped_receiver() {
+        let sr = 44100u32;
+        let pcm = vec![0u8; sr as usize * 4];
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        assert!(!send_windowed_pcm(&tx, &pcm, 16, 2, sr));
+    }
+
+    #[test]
+    fn publish_without_subscriber_is_noop() {
+        let tap = ZoneTap::new();
+        assert_eq!(tap.receiver_count(), 0);
+        tap.publish(PcmTapFrame {
+            zone_id: 1,
+            pcm: std::sync::Arc::from(vec![0u8; 4].into_boxed_slice()),
+            format: fmt(44100),
+            track_position: Duration::ZERO,
+            window: Duration::from_millis(40),
+            play_seq: 0,
+        });
     }
 }

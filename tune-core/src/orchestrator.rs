@@ -119,21 +119,32 @@ fn spawn_paced_levels_forwarder(
     zone_id: i64,
     play_seq: u64,
     start_position_ms: i64,
-) -> tokio::sync::mpsc::UnboundedSender<crate::audio::levels::AudioLevels> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+) -> tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
     tokio::spawn(async move {
+        // Le forwarder est le métronome du signal : il reçoit les fenêtres
+        // brutes à la vitesse du décodage, les recadence sur l'horloge de
+        // lecture, publie chaque fenêtre estampillée sur le tap PCM de la
+        // zone (la primitive des plugins d'analyse — voir audio::tap), puis
+        // calcule et émet `playback.audio_levels`. Le tap transporte donc du
+        // temps réel : un consommateur naïf (une FFT par fenêtre) suit sans
+        // retamponner, le ring borné n'absorbe que la gigue.
+        let tap = playback.zone_tap(zone_id);
         let mut next_emit = tokio::time::Instant::now();
         let mut started = false;
         let mut position = std::time::Duration::from_millis(start_position_ms.max(0) as u64);
         // Un pré-transcode DASH peut retarder le démarrage de 30 s ; au-delà
         // de cette borne on abandonne pour ne pas fuiter la tâche.
         let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-        while let Some(lvl) = rx.recv().await {
+        while let Some(raw) = rx.recv().await {
+            let mut reported_position_ms: i64 = 0;
             loop {
                 if playback.current_play_seq(zone_id).await != play_seq {
                     return;
                 }
-                match playback.get_state(zone_id).await.state {
+                let zone_state = playback.get_state(zone_id).await;
+                reported_position_ms = zone_state.position_ms;
+                match zone_state.state {
                     PlayState::Playing => {
                         started = true;
                         break;
@@ -157,7 +168,49 @@ fn spawn_paced_levels_forwarder(
             if next_emit < now {
                 next_emit = now;
             }
-            tokio::time::sleep_until(next_emit).await;
+            // Rattrapage borné sur la position du renderer : si le flux émis
+            // est en retard sur le son (démarrage tardif du décodage — mesuré
+            // ~5 s de staging sur un 24/192 en passthrough), on émet sans
+            // attendre jusqu'à recoller à ~1 s. Borné par construction : le
+            // retard vaut quelques secondes de fenêtres, pas la piste entière.
+            let lagging = reported_position_ms > 0
+                && (position.as_millis() as i64) < reported_position_ms - 1_000;
+            if lagging {
+                // Pendant le rattrapage, l'horloge d'émission reste collée au
+                // présent — sinon les `+= window` s'accumuleraient dans le
+                // futur et gèleraient le flux une fois recollé.
+                next_emit = now;
+            } else {
+                tokio::time::sleep_until(next_emit).await;
+            }
+
+            let window = raw.window;
+            // Un seul Arc porte les échantillons : le tap le clone en O(1)
+            // pour chaque abonné, compute_levels le lit sans copie.
+            let pcm: std::sync::Arc<[u8]> = std::sync::Arc::from(raw.pcm.into_boxed_slice());
+            tap.publish(crate::audio::tap::PcmTapFrame {
+                zone_id,
+                pcm: pcm.clone(),
+                format: crate::audio::tap::PcmFormat {
+                    sample_rate: raw.sample_rate,
+                    channels: raw.channels,
+                    bit_depth: raw.bit_depth,
+                    // Tous les chemins de décodage produisent de l'entier
+                    // signé little-endian (voir decode.rs) ; un futur chemin
+                    // f32 devra le déclarer ici.
+                    sample_format: crate::audio::tap::SampleFormat::SignedInt,
+                },
+                track_position: position,
+                window,
+                play_seq,
+            });
+
+            let lvl = crate::audio::levels::compute_levels(
+                &pcm,
+                raw.bit_depth,
+                raw.channels,
+                raw.sample_rate,
+            );
             bus.emit(
                 "playback.audio_levels",
                 serde_json::json!({
@@ -175,8 +228,8 @@ fn spawn_paced_levels_forwarder(
                     "spectrum": lvl.spectrum,
                 }),
             );
-            position += lvl.window;
-            next_emit += lvl.window;
+            next_emit += window;
+            position += window;
         }
     });
     tx
@@ -2191,7 +2244,7 @@ impl PlaybackOrchestrator {
                                         bus, playback, zone_id, play_seq, 0,
                                     );
                                     tokio::task::spawn_blocking(move || {
-                                        crate::audio::levels::send_windowed_levels(
+                                        crate::audio::tap::send_windowed_pcm(
                                             &levels_tx, &pcm_bytes, actual_bd, actual_ch, sr,
                                         );
                                     })
@@ -2305,9 +2358,7 @@ impl PlaybackOrchestrator {
                                 (seek_s * 1000.0) as i64,
                             )
                         }
-                        None => tokio::sync::mpsc::unbounded_channel::<
-                            crate::audio::levels::AudioLevels,
-                        >()
+                        None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>()
                         .0,
                     };
 
@@ -2495,7 +2546,7 @@ impl PlaybackOrchestrator {
                                 0.0,
                             );
                             if let Ok(ref dec) = decoded {
-                                crate::audio::levels::send_windowed_levels(
+                                crate::audio::tap::send_windowed_pcm(
                                     &levels_tx,
                                     &dec.pcm_bytes(),
                                     dec.bit_depth,
@@ -2862,7 +2913,7 @@ impl PlaybackOrchestrator {
                         )
                     }
                     None => {
-                        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>()
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>()
                             .0
                     }
                 };

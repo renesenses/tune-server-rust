@@ -34,37 +34,6 @@ fn to_db(linear: f64) -> f32 {
     }
 }
 
-/// Cadence cible des événements de niveaux envoyés aux clients (25 Hz).
-pub const LEVELS_WINDOW_MS: u64 = 40;
-
-/// Découpe `pcm` en fenêtres de ~[`LEVELS_WINDOW_MS`] et envoie les niveaux
-/// de chacune sur `tx`. Les décodeurs produisent des chunks de 32 KiB
-/// (~186 ms en CD 16/44.1) : trop grossier pour un analyseur de spectre
-/// fluide. Renvoie `false` si le récepteur est parti (lecture remplacée).
-pub fn send_windowed_levels(
-    tx: &tokio::sync::mpsc::UnboundedSender<AudioLevels>,
-    pcm: &[u8],
-    bit_depth: u16,
-    channels: u16,
-    sample_rate: u32,
-) -> bool {
-    let frame_size = (bit_depth / 8) as usize * channels as usize;
-    if frame_size == 0 || sample_rate == 0 {
-        return true;
-    }
-    let frames_per_window = (sample_rate as usize * LEVELS_WINDOW_MS as usize / 1000).max(1);
-    let window_bytes = frames_per_window * frame_size;
-    for window in pcm.chunks(window_bytes) {
-        if tx
-            .send(compute_levels(window, bit_depth, channels, sample_rate))
-            .is_err()
-        {
-            return false;
-        }
-    }
-    true
-}
-
 pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u32) -> AudioLevels {
     if pcm.is_empty() || channels == 0 {
         return AudioLevels::default();
@@ -288,38 +257,6 @@ mod tests {
         let levels = compute_levels(&pcm, 16, 2, 44100);
         assert!(levels.peak_left_db() > -1.0);
         assert!(levels.peak_right_db() > -1.0);
-    }
-
-    #[test]
-    fn windowed_levels_split_and_carry_duration() {
-        // 1 s de PCM 16 bit stéréo à 44,1 kHz → 25 fenêtres de 40 ms.
-        let sr = 44100u32;
-        let pcm = vec![0u8; sr as usize * 4];
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(send_windowed_levels(&tx, &pcm, 16, 2, sr));
-        drop(tx);
-
-        let mut count = 0;
-        let mut total = std::time::Duration::ZERO;
-        while let Ok(lvl) = rx.try_recv() {
-            count += 1;
-            total += lvl.window;
-        }
-        assert_eq!(count, 25, "1 s / 40 ms = 25 fenêtres");
-        let total_ms = total.as_millis();
-        assert!(
-            (990..=1010).contains(&total_ms),
-            "durée totale ≈ 1 s, obtenu {total_ms} ms"
-        );
-    }
-
-    #[test]
-    fn windowed_levels_report_dropped_receiver() {
-        let sr = 44100u32;
-        let pcm = vec![0u8; sr as usize * 4];
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        drop(rx);
-        assert!(!send_windowed_levels(&tx, &pcm, 16, 2, sr));
     }
 
     #[test]
