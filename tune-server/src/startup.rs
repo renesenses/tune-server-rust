@@ -30,6 +30,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     let state_clone = state.clone();
     tokio::spawn(async move {
         crate::routes::devices::reregister_manual_devices(&state_clone).await;
+        // Re-probe auto-discovered renderers whose lazy SSDP responder won't
+        // resurface them after a restart (Cyrus Stream X2, #1126).
+        crate::discovery_setup::reregister_known_renderers(&state_clone).await;
     });
 }
 
