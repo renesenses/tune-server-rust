@@ -333,35 +333,45 @@ pub(super) async fn album_bio(
             .into_response();
         }
     }
-    // Resolve artist MBID for the API call
-    let mbid = if let Some(aid) = album.artist_id {
-        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-        artist_repo
-            .get(aid)
-            .ok()
-            .flatten()
-            .and_then(|a| a.musicbrainz_id)
-    } else {
-        None
-    };
-    let Some(mbid) = mbid else {
-        return Json(
-            json!({"album": album.title, "bio": null, "error": "no artist MusicBrainz ID"}),
-        )
-        .into_response();
-    };
+    // Community album-bio API is keyed by NAME (title + artist) and generated
+    // on demand by the cloud — NO MusicBrainz id required, so it works for
+    // every album. The old code proxied to the artist-MBID endpoint (wrong URL
+    // too) and failed for the whole library, which has no MBIDs (#bios).
+    let artist_name = album.artist_name.clone().or_else(|| {
+        album.artist_id.and_then(|aid| {
+            ArtistRepo::with_backend(state.backend.clone())
+                .get(aid)
+                .ok()
+                .flatten()
+                .map(|a| a.name)
+        })
+    });
+    let artist_q = artist_name.as_deref().unwrap_or("");
     let lang = q.lang.as_deref().unwrap_or("fr");
+    let cache_key = format!("cache:albumbio:{}:{artist_q}:{lang}", album.title);
+    if let Some(cached) = super::api_cache_get(&state.backend, &cache_key) {
+        return Json(cached).into_response();
+    }
     match state
         .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
+        .get("https://mozaiklabs.fr/api/v1/albums/bio")
+        .query(&[("title", album.title.as_str()), ("artist", artist_q)])
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            Json(data).into_response()
+            let out = json!({
+                "album": album.title,
+                "bio": data.get("bio").cloned().unwrap_or(Value::Null),
+                "source": data.get("source").cloned().unwrap_or(Value::Null),
+            });
+            if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
+                super::api_cache_set(&state.backend, &cache_key, &out);
+            }
+            Json(out).into_response()
         }
-        _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
+        _ => Json(json!({"album": album.title, "bio": null})).into_response(),
     }
 }
 
