@@ -203,6 +203,15 @@ async fn handle_ssdp_discovered(
             let mut reg = outputs.lock().await;
             reg.register(Box::new(dlna));
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
+            drop(reg);
+            // Persist LOCATION + UUID so a lazy-SSDP renderer (Cyrus Stream X2)
+            // can be re-probed over HTTP after a restart instead of vanishing
+            // until it next answers multicast (#1126).
+            if let Some(ref loc) = dev.location {
+                crate::routes::devices::persist_discovered_dlna(
+                    db, &dev.id, loc, &dev.name, &dev.host, dev.port,
+                );
+            }
         }
     }
 
