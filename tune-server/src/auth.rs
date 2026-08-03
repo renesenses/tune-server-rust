@@ -270,6 +270,66 @@ fn extract_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String>
     None
 }
 
+/// Authorize a WebSocket upgrade.
+///
+/// WS routers are mounted at the top level, *outside* the API auth middleware,
+/// so a connection otherwise receives the full snapshot (zones, queue,
+/// now-playing) and the live event stream with no token at all. This gates the
+/// upgrade instead.
+///
+/// When auth is disabled the socket is open (unchanged behaviour). When enabled,
+/// the caller must present a valid credential via:
+/// - the `tune_session` cookie (browsers send it on same-origin handshakes, so
+///   the logged-in web client keeps working),
+/// - an `Authorization: Bearer <jwt>` / `ApiKey <key>` header (native clients),
+/// - or a `?token=`/`?access_token=` query parameter (browsers cannot set
+///   headers on a WebSocket handshake).
+pub fn ws_authorized(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query_token: Option<&str>,
+) -> bool {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let auth_enabled = settings
+        .get("auth_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !auth_enabled {
+        return true;
+    }
+
+    let jwt_secret = settings
+        .get("jwt_secret")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+
+    // Header- or cookie-borne credential (Bearer JWT or ApiKey).
+    if let Some(tok) = extract_token_from_headers(headers) {
+        if let Some(key) = tok.strip_prefix("ApiKey:") {
+            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
+            if !stored.is_empty() && key == stored {
+                return true;
+            }
+        } else if let Some(secret) = &jwt_secret {
+            if verify_jwt(&tok, secret).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    // Query-param JWT (browser WebSocket can't set an Authorization header).
+    if let (Some(tok), Some(secret)) = (query_token, &jwt_secret) {
+        if !tok.is_empty() && verify_jwt(tok, secret).is_ok() {
+            return true;
+        }
+    }
+
+    false
+}
+
 // ---------------------------------------------------------------------------
 // AuthUser — axum extractor for route-level auth
 // ---------------------------------------------------------------------------
