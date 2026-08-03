@@ -47,17 +47,18 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
 
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(256);
 
-    if !state.register_server(
+    if let Err(reason) = state.register_server(
         register.server_id.clone(),
         register.server_name.clone(),
         register.bridge_token,
         msg_tx,
     ) {
-        warn!("max servers reached, rejecting");
+        // Log the server_id and reason, never the bridge_token.
+        warn!(server_id = %register.server_id, reason, "register rejected");
         let reject = serde_json::json!({
             "type": "relay.registered",
             "ok": false,
-            "error": "max servers reached"
+            "error": reason
         });
         let _ = ws_tx.send(Message::Text(reject.to_string().into())).await;
         return;
