@@ -482,7 +482,10 @@ pub(super) async fn enrichment_run(
 // POST /system/cleanup — existing cleanup (unchanged)
 // ---------------------------------------------------------------------------
 
-pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+pub(super) async fn cleanup(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
 

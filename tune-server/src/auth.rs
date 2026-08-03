@@ -496,7 +496,10 @@ impl FromRequestParts<AppState> for RequireAdmin {
         if !auth_enabled {
             return Ok(RequireAdmin);
         }
-        match AuthUser::from_request_parts(parts, state).await {
+        // Disambiguate: AuthUser now implements both FromRequestParts and
+        // OptionalFromRequestParts (the latter merged in via the WS/auth work),
+        // so the bare `AuthUser::from_request_parts` call is ambiguous (E0034).
+        match <AuthUser as FromRequestParts<AppState>>::from_request_parts(parts, state).await {
             Ok(user) if user.role == "admin" => Ok(RequireAdmin),
             Ok(_) => Err((
                 StatusCode::FORBIDDEN,

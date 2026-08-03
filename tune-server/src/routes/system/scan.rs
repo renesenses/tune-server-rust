@@ -1215,6 +1215,7 @@ pub(super) struct ScanScheduleReq {
 }
 
 pub(super) async fn set_scan_schedule(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ScanScheduleReq>,
 ) -> Json<Value> {

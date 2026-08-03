@@ -87,3 +87,19 @@ async fn admin_route_unauthorized_with_invalid_token() {
         StatusCode::UNAUTHORIZED,
     );
 }
+
+/// A representative route from the *extended* set (DB maintenance) — proves the
+/// `RequireAdmin` annotation was actually applied to the second batch, not just
+/// library_clear.
+#[tokio::test]
+async fn extended_admin_route_forbidden_for_user_token() {
+    let state = new_state();
+    enable_auth(&state);
+    let app: Router = tune_server::routes::router(state.clone());
+    let req = Request::post("/api/v1/system/database/optimize")
+        .header(header::AUTHORIZATION, format!("Bearer {}", tok("user", 2)))
+        .body(Body::empty())
+        .unwrap();
+    let st = app.oneshot(req).await.unwrap().status();
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}

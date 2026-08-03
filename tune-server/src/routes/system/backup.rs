@@ -13,7 +13,10 @@ pub(super) async fn list_backups() -> Json<Value> {
     Json(json!(items))
 }
 
-pub(super) async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn create_backup(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
     if db_path == ":memory:" {
         return (StatusCode::BAD_REQUEST, "cannot backup in-memory database").into_response();
@@ -57,6 +60,7 @@ pub(super) async fn restore_backup(
 }
 
 pub(super) async fn create_encrypted_backup(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
