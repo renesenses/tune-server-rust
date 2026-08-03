@@ -230,6 +230,16 @@ async fn api_fallback(
         .into_response()
 }
 
+/// Minimal HTML-entity escaping for untrusted text reflected into a page on the
+/// server's own origin. Order matters: `&` first so we don't double-escape.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 pub fn router(state: AppState) -> Router {
     router_with_plugins(state, Vec::new())
 }
@@ -443,9 +453,11 @@ pub fn router_with_plugins(
         .nest("/ws/bridge", bridge::router())
         .with_state(state)
         .route("/add-station", get(|axum::extract::Query(q): axum::extract::Query<radios::AddFromWebQuery>| async move {
+            // q.name is attacker-controlled and reflected into HTML on the
+            // server's own origin — escape it or it is a reflected XSS.
             axum::response::Html(format!(
                 r#"<!DOCTYPE html><html><body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#4ade80">✓ Radio ajoutée</h1><p><strong>{}</strong></p><p style="color:#888">Vous pouvez fermer cet onglet.</p></div></body></html>"#,
-                q.name
+                html_escape(&q.name)
             ))
         }))
         .merge(stream_handler::router(streamer_sessions))
@@ -495,4 +507,19 @@ pub fn router_with_plugins(
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(CompressionLayer::new())
     .layer(CorsLayer::permissive())
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::html_escape;
+
+    #[test]
+    fn escapes_html_metacharacters() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x&y")</script>"#),
+            "&lt;script&gt;alert(&quot;x&amp;y&quot;)&lt;/script&gt;"
+        );
+        assert_eq!(html_escape("O'Brien"), "O&#x27;Brien");
+        assert_eq!(html_escape("plain radio"), "plain radio");
+    }
 }

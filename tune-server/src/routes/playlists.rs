@@ -794,19 +794,114 @@ struct ImportM3uUrl {
     name: Option<String>,
 }
 
+/// Reject addresses that must never be reachable via a user-supplied URL:
+/// loopback, private, link-local (incl. 169.254.169.254 cloud metadata),
+/// CGNAT, and their IPv6 equivalents. Blocks the SSRF pivot into internal
+/// services. (`Ipv6Addr::is_unique_local`/`is_unicast_link_local` are still
+/// unstable, so the v6 ranges are matched by prefix.)
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // 100.64/10 CGNAT
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Fetch a user-supplied URL with SSRF guards: http(s) only, resolved host must
+/// not be private/reserved, redirects disabled (a 3xx could bounce to an
+/// internal address), a request timeout, and a hard body-size cap.
+async fn fetch_url_guarded(
+    raw_url: &str,
+    max_bytes: usize,
+) -> Result<String, (StatusCode, String)> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid url".to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only http(s) urls are allowed".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or((StatusCode::BAD_REQUEST, "missing host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut resolved = false;
+    for addr in tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "dns resolution failed".to_string()))?
+    {
+        resolved = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "url resolves to a private or reserved address".to_string(),
+            ));
+        }
+    }
+    if !resolved {
+        return Err((StatusCode::BAD_GATEWAY, "host did not resolve".to_string()));
+    }
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("client build: {e}"),
+            )
+        })?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("fetch failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("upstream status {}", resp.status()),
+        ));
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("read failed: {e}")))?
+    {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "playlist too large".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| (StatusCode::BAD_REQUEST, "non-utf8 content".to_string()))
+}
+
 async fn import_m3u_url(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Json(body): Json<ImportM3uUrl>,
 ) -> impl IntoResponse {
-    let m3u_content = match reqwest::get(&body.url).await {
-        Ok(resp) => match resp.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("read failed: {e}")).into_response();
-            }
-        },
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("fetch failed: {e}")).into_response(),
+    // 5 MiB is plenty for an M3U/M3U8 playlist and bounds memory use.
+    let m3u_content = match fetch_url_guarded(&body.url, 5 * 1024 * 1024).await {
+        Ok(text) => text,
+        Err((status, msg)) => return (status, msg).into_response(),
     };
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
@@ -1374,5 +1469,45 @@ mod linn_tests {
             "http://10.0.0.1:9790/minimserver/*/x/11*20Joe*20Jackson*20-*20Look*20Sharp!.flac",
         );
         assert_eq!(stem, "11 Joe Jackson - Look Sharp!");
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::is_blocked_ip;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn blocks_internal_and_reserved_addresses() {
+        for s in [
+            "127.0.0.1",       // loopback
+            "10.1.2.3",        // private
+            "192.168.0.1",     // private
+            "172.16.5.4",      // private
+            "169.254.169.254", // link-local / cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",         // unspecified
+            "::1",             // v6 loopback
+            "fe80::1",         // v6 link-local
+            "fc00::1",         // v6 unique-local
+        ] {
+            assert!(is_blocked_ip(&ip(s)), "{s} should be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        for s in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(!is_blocked_ip(&ip(s)), "{s} should be allowed");
+        }
     }
 }
