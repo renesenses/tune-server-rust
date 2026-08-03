@@ -2113,6 +2113,7 @@ struct CreateAlarm {
 
 async fn create_alarm(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<CreateAlarm>,
 ) -> impl IntoResponse {
@@ -2121,9 +2122,10 @@ async fn create_alarm(
     let source_type = body.source_type.unwrap_or_else(|| "playlist".into());
     let volume = body.volume.unwrap_or(0.3);
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
+    let profile_id = profile.id();
     match state.backend.execute(
-        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue],
+        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
         Ok(_) => {
             let id = state.backend.last_insert_rowid();

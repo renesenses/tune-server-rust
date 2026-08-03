@@ -308,6 +308,9 @@ impl AlarmScheduler {
     /// trigger it directly.
     pub async fn fire_alarm(&self, alarm: &serde_json::Value) {
         let alarm_id = alarm["id"].as_i64().unwrap_or(0);
+        // Owner of this alarm: its playback is tagged to that profile's history
+        // (inherited by any autoplay after). None → NULL, never guessed.
+        let alarm_profile_id = alarm["profile_id"].as_i64();
         let zone_id = alarm["zone_id"].as_i64();
         let source_type = alarm["source_type"].as_str().unwrap_or("radio");
         let source_id = alarm["source_id"]
@@ -380,6 +383,13 @@ impl AlarmScheduler {
                 bit_depth: None,
                 media_format: None,
             };
+            // Stamp the alarm owner as the zone's session profile BEFORE the
+            // play so record_listen tags the alarm's listen to that person
+            // (chantier 2 / C2). None leaves it unset → NULL.
+            self.orchestrator
+                .playback
+                .set_session_profile(target_zone, alarm_profile_id)
+                .await;
             if let Err(e) = self.orchestrator.play(req).await {
                 warn!(alarm_id, zone_id = target_zone, error = %e, "alarm_play_error");
             }
@@ -415,7 +425,7 @@ impl AlarmScheduler {
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let rows = self.db.query_many(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids FROM alarms WHERE enabled = '1'",
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE enabled = '1'",
             &[],
         )?;
         Ok(rows
@@ -437,6 +447,7 @@ impl AlarmScheduler {
                     "enabled": r.get(12).and_then(SqlValue::as_i64).unwrap_or(0),
                     "days_of_week": r.get(13).and_then(SqlValue::as_str),
                     "multi_zone_ids": r.get(14).and_then(SqlValue::as_str),
+                    "profile_id": r.get(15).and_then(SqlValue::as_i64),
                 })
             })
             .collect())
@@ -446,7 +457,7 @@ impl AlarmScheduler {
     pub fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let row = self.db.query_one(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids FROM alarms WHERE id = ?",
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE id = ?",
             &[&id as &dyn ToSqlValue],
         )?;
         Ok(row.map(|r| {
@@ -466,6 +477,7 @@ impl AlarmScheduler {
                 "enabled": r.get(12).and_then(SqlValue::as_i64).unwrap_or(0),
                 "days_of_week": r.get(13).and_then(SqlValue::as_str),
                 "multi_zone_ids": r.get(14).and_then(SqlValue::as_str),
+                "profile_id": r.get(15).and_then(SqlValue::as_i64),
             })
         }))
     }
