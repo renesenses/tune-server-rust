@@ -42,7 +42,13 @@ pub fn mdns_host_label(hostname: &str) -> String {
     let base = hostname.trim().trim_end_matches(".local");
     let label: String = base
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let label = label.trim_matches('-').to_string();
     if label.is_empty() {
