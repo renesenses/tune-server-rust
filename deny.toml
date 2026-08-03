@@ -30,6 +30,11 @@ ignore = [
 version = 2
 confidence-threshold = 0.9
 allow = [
+    # First-party: Tune's own crates ship under the Business Source License 1.1
+    # (see LICENSE). Declared honestly as BUSL-1.1 since issue #1147 — must be
+    # allowed here or cargo-deny rejects our own workspace members. No
+    # third-party BUSL-1.1 dependency exists.
+    "BUSL-1.1",
     "MIT",
     "MIT-0",
     "Apache-2.0",

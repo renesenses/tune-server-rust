@@ -35,8 +35,9 @@ jobs:
       - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
-  # `audio-embedding` feature, absent from every other job. Compile-check it so
-  # the feature can't rot. `load-dynamic` needs no onnxruntime binary at build.
+  # `audio-embedding` feature, now shipped in the release + docker builds. This
+  # job compile-checks it in isolation so a break surfaces on the PR rather than
+  # only at release time. `load-dynamic` needs no onnxruntime binary at build.
   audio-embedding:
     name: Audio embedding feature
     runs-on: ubuntu-latest

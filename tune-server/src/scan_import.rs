@@ -57,6 +57,42 @@ pub(crate) fn decide_compilation_albums<'a>(
         .collect()
 }
 
+/// Per-FOLDER compilation decision, complementing [`decide_compilation_albums`]
+/// (keyed by `(folder, album)`, which misses a hand-made compilation whose
+/// tracks carry DIFFERENT album tags — each `(folder, album)` group then holds a
+/// single track, so the "≥2 artists" tell-tale never fires; JP Borderies).
+///
+/// Returns `folder → (various_artists, use_folder_title)`:
+/// - `various_artists`: the folder holds ≥2 distinct artists → album artist is
+///   "Various Artists". A single-artist multi-disc folder (1 artist) is untouched.
+/// - `use_folder_title`: additionally ≥2 distinct album tags → the per-track
+///   album tags are unrelated, so the folder name is the real album title. A
+///   genuine various-artists album with ONE album tag (e.g. "Woodstock") keeps
+///   its title (only `decide_compilation_albums` flags it): here it stays false.
+///
+/// `items` yields `(folder, artist, album)`; `artist` = the album_artist tag if
+/// present, else the track artist.
+pub(crate) fn decide_compilation_folders<'a>(
+    items: impl Iterator<Item = (String, Option<&'a str>, Option<&'a str>)>,
+) -> HashMap<String, (bool, bool)> {
+    let mut acc: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    for (dir, artist, album) in items {
+        let e = acc.entry(dir).or_default();
+        if let Some(a) = artist.map(str::trim).filter(|s| !s.is_empty()) {
+            e.0.insert(a.to_lowercase());
+        }
+        if let Some(al) = album.map(str::trim).filter(|s| !s.is_empty()) {
+            e.1.insert(al.to_lowercase());
+        }
+    }
+    acc.into_iter()
+        .map(|(dir, (artists, albums))| {
+            let va = artists.len() >= 2;
+            (dir, (va, va && albums.len() >= 2))
+        })
+        .collect()
+}
+
 /// Serialize the parsed multi-genre list to a JSON array string for
 /// `tracks.genres`. Falls back to splitting the single `genre` tag for legacy
 /// rows that predate multi-genre parsing.
@@ -166,6 +202,11 @@ pub struct TrackImporter {
     dir_album_artist: HashMap<String, String>,
     /// Per-batch `(folder, album)` → is-compilation decision.
     comp_decision: HashMap<(String, String), bool>,
+    /// Per-batch FOLDER → (various-artists, use-folder-name-as-title). Catches a
+    /// hand-made compilation folder whose tracks span multiple album tags AND
+    /// artists — which the `(folder, album)` decision above misses because mixed
+    /// album tags split every group down to one track (JP Borderies).
+    folder_comp: HashMap<String, (bool, bool)>,
     artwork_extracted: u64,
 }
 
@@ -181,6 +222,7 @@ impl TrackImporter {
             albums_with_cover: HashSet::new(),
             dir_album_artist: HashMap::new(),
             comp_decision: HashMap::new(),
+            folder_comp: HashMap::new(),
             artwork_extracted: 0,
         }
     }
@@ -204,6 +246,15 @@ impl TrackImporter {
                 .unwrap_or_default();
             Some((dir, album, meta.album_artist.as_deref(), meta.compilation))
         }));
+        self.folder_comp = decide_compilation_folders(batch.iter().filter_map(|sf| {
+            let meta = sf.metadata.as_ref()?;
+            let dir = std::path::Path::new(&sf.path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let artist = meta.album_artist.as_deref().or(meta.artist.as_deref());
+            Some((dir, artist, meta.album.as_deref()))
+        }));
     }
 
     /// Resolve artist + album, extract album cover / artist image as a side
@@ -220,22 +271,31 @@ impl TrackImporter {
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let is_compilation = meta
-            .album
-            .as_ref()
-            .and_then(|a| {
-                self.comp_decision
-                    .get(&(album_dir.clone(), a.to_lowercase()))
-                    .copied()
-            })
-            .unwrap_or_else(|| {
-                meta.compilation
-                    || meta
-                        .album_artist
-                        .as_deref()
-                        .map(is_various_artists)
-                        .unwrap_or(false)
-            });
+        // Per-folder compilation signal (mixed album tags + artists) OR the
+        // per-(folder,album) decision. `use_folder_title` = the folder name is
+        // the real album title (per-track album tags are unrelated).
+        let (folder_va, use_folder_title) = self
+            .folder_comp
+            .get(&album_dir)
+            .copied()
+            .unwrap_or((false, false));
+        let is_compilation = folder_va
+            || meta
+                .album
+                .as_ref()
+                .and_then(|a| {
+                    self.comp_decision
+                        .get(&(album_dir.clone(), a.to_lowercase()))
+                        .copied()
+                })
+                .unwrap_or_else(|| {
+                    meta.compilation
+                        || meta
+                            .album_artist
+                            .as_deref()
+                            .map(is_various_artists)
+                            .unwrap_or(false)
+                });
 
         let album_artist_name = if is_compilation {
             "Various Artists".to_string()
@@ -341,15 +401,37 @@ impl TrackImporter {
         } else {
             String::new()
         };
-        let album_key = meta.album.as_ref().map(|t| {
-            (
-                album_folder.clone(),
-                t.clone(),
-                album_artist_id.unwrap_or(0),
-                meta.year.map(|y| y as i32),
-                meta.musicbrainz_release_id.clone(),
-            )
-        });
+        let album_key = if use_folder_title {
+            // Mixed compilation: one album per folder, named after the folder and
+            // keyed on folder + Various-Artists id. The per-track album / year /
+            // mbid are unrelated across the compilation, so they are dropped from
+            // the key — otherwise a differing year would re-split the folder into
+            // several albums.
+            std::path::Path::new(&album_dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .or_else(|| meta.album.clone())
+                .map(|t| {
+                    (
+                        album_folder.clone(),
+                        t,
+                        album_artist_id.unwrap_or(0),
+                        None,
+                        None,
+                    )
+                })
+        } else {
+            meta.album.as_ref().map(|t| {
+                (
+                    album_folder.clone(),
+                    t.clone(),
+                    album_artist_id.unwrap_or(0),
+                    meta.year.map(|y| y as i32),
+                    meta.musicbrainz_release_id.clone(),
+                )
+            })
+        };
 
         let album = if let Some(ref key) = album_key {
             if let Some(cached) = self.album_cache.get(key) {
@@ -526,6 +608,77 @@ mod tests {
         // Nothing at all → None (not an empty-array string).
         assert_eq!(build_genres_json(&[], None), None);
         assert_eq!(build_genres_json(&[], Some("")), None);
+    }
+
+    #[test]
+    fn decide_compilation_folders_flags_mixed_folders_only() {
+        // JP Borderies: a hand-made compilation — several artists AND several
+        // album tags in one folder → Various Artists + folder-name title.
+        let mixed = decide_compilation_folders(
+            [
+                (
+                    "/comp".to_string(),
+                    Some("Angela Brown"),
+                    Some("Just Fabulous - Live"),
+                ),
+                (
+                    "/comp".to_string(),
+                    Some("Aretha Franklin"),
+                    Some("Amazing Grace"),
+                ),
+                (
+                    "/comp".to_string(),
+                    Some("Nina Simone"),
+                    Some("Pastel Blues"),
+                ),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(mixed.get("/comp"), Some(&(true, true)));
+
+        // Genuine various-artists album: many artists, ONE album tag ("Woodstock")
+        // → VA artist, but KEEP the album title (use_folder_title = false).
+        let va_one_tag = decide_compilation_folders(
+            [
+                (
+                    "/woodstock".to_string(),
+                    Some("Jimi Hendrix"),
+                    Some("Woodstock"),
+                ),
+                ("/woodstock".to_string(), Some("Santana"), Some("Woodstock")),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(va_one_tag.get("/woodstock"), Some(&(true, false)));
+
+        // Single-artist multi-disc: one artist, two album tags → untouched.
+        let multidisc = decide_compilation_folders(
+            [
+                (
+                    "/album".to_string(),
+                    Some("Pink Floyd"),
+                    Some("The Wall (Disc 1)"),
+                ),
+                (
+                    "/album".to_string(),
+                    Some("Pink Floyd"),
+                    Some("The Wall (Disc 2)"),
+                ),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(multidisc.get("/album"), Some(&(false, false)));
+
+        // Plain single-artist single-album folder → untouched.
+        let plain = decide_compilation_folders(
+            [(
+                "/kob".to_string(),
+                Some("Miles Davis"),
+                Some("Kind of Blue"),
+            )]
+            .into_iter(),
+        );
+        assert_eq!(plain.get("/kob"), Some(&(false, false)));
     }
 
     #[test]

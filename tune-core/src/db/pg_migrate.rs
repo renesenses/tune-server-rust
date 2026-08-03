@@ -363,7 +363,9 @@ CREATE TABLE IF NOT EXISTS queue_items (
     artist TEXT,
     album TEXT,
     cover_url TEXT,
-    duration_ms TEXT DEFAULT 0
+    duration_ms TEXT DEFAULT 0,
+    track_number TEXT,
+    disc_number TEXT
 );
 
 -- One-time copy of the split tables into queue_items. Idempotent: the guard
@@ -691,6 +693,9 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
 
+-- alarms: owning profile (SQLite migration v64)
+ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
+
 -- zones: playback state + DLNA/DSD flags (SQLite migrations v36/v38/v39/v40/v50
 -- and the post-migration safety pass: alac_passthrough / dlna_lpcm /
 -- dlna_cap_16bit / host)
@@ -715,6 +720,10 @@ ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DE
 
 -- podcast_subscriptions: streaming source id (SQLite migration v59)
 ALTER TABLE podcast_subscriptions ADD COLUMN IF NOT EXISTS source_id TEXT;
+
+-- queue_items: per-album numbering for streaming tracks (SQLite migration v64)
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
 "#;
 
 /// Run the full SQLite → PostgreSQL migration.

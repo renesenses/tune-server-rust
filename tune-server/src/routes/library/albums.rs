@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -229,10 +230,11 @@ pub(super) async fn album_tracks(
 
 pub(super) async fn quick_fav_album(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<QuickFavQuery>,
 ) -> Json<Value> {
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     let repo = ProfileRepo::with_backend(state.backend.clone());
     let is_fav = repo.is_favorite(profile_id, "album", id).unwrap_or(false);
     if is_fav {
@@ -245,11 +247,12 @@ pub(super) async fn quick_fav_album(
 
 pub(super) async fn rate_album(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<RateRequest>,
 ) -> impl IntoResponse {
     let repo = RatingRepo::with_backend(state.backend.clone());
-    let profile_id = body.profile_id.unwrap_or(1);
+    let profile_id = body.profile_id.unwrap_or_else(|| profile.id());
     match repo.rate_album(id, profile_id, body.rating, body.note.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -258,11 +261,12 @@ pub(super) async fn rate_album(
 
 pub(super) async fn get_album_rating(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<RatingQuery>,
 ) -> impl IntoResponse {
     let repo = RatingRepo::with_backend(state.backend.clone());
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     match repo.get_rating(id, profile_id) {
         Ok(Some(r)) => Json(json!(r)).into_response(),
         Ok(None) => Json(json!({ "rating": null, "album_id": id })).into_response(),

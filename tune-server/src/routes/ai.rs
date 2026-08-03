@@ -19,10 +19,28 @@ const SYSTEM_PROMPT: &str = "\
 Tu es l'assistant musical de Tune Server, un serveur de musique audiophile. \
 Tu controles la lecture de musique, la recherche dans la bibliotheque locale, \
 la gestion de la file d'attente et des zones de lecture. \
-Reponds toujours en francais sauf si l'utilisateur parle dans une autre langue. \
 Sois concis et naturel. Quand tu lances de la musique, confirme ce que tu joues. \
 Si tu ne trouves pas ce que l'utilisateur demande, propose des alternatives \
 basees sur les resultats de recherche.";
+
+/// Language directive appended to the system prompt so the assistant answers in
+/// the UI language (the `Accept-Language`-derived `lang`), not always French
+/// (#1143). Naming the target language in English keeps the instruction reliable
+/// across models; the "unless…" clause preserves the original nuance of letting
+/// the user switch language mid-conversation.
+fn language_directive(lang: &str) -> &'static str {
+    match lang {
+        "en" => "Reply to the user in English unless they clearly write in another language.",
+        "de" => "Reply to the user in German unless they clearly write in another language.",
+        "es" => "Reply to the user in Spanish unless they clearly write in another language.",
+        "it" => "Reply to the user in Italian unless they clearly write in another language.",
+        "zh" => "Reply to the user in Chinese unless they clearly write in another language.",
+        "ja" => "Reply to the user in Japanese unless they clearly write in another language.",
+        "ko" => "Reply to the user in Korean unless they clearly write in another language.",
+        "ro" => "Reply to the user in Romanian unless they clearly write in another language.",
+        _ => "Reply to the user in French unless they clearly write in another language.",
+    }
+}
 
 const MAX_TOOL_ROUNDS: usize = 5;
 
@@ -84,6 +102,8 @@ async fn ai_query(
         .unwrap_or_default();
 
     let client = AnthropicClient::new(api_key, model);
+    // Answer in the UI language, not always French (#1143).
+    let system = format!("{SYSTEM_PROMPT} {}", language_directive(&lang));
     let tools = all_tools();
     let mut executor = ToolExecutor::with_backend(
         state.backend.clone(),
@@ -101,7 +121,7 @@ async fn ai_query(
 
     for round in 0..MAX_TOOL_ROUNDS {
         let response = client
-            .chat(SYSTEM_PROMPT, messages.clone(), &tools)
+            .chat(&system, messages.clone(), &tools)
             .await
             .map_err(|e| AppError::internal(format!("Claude API error: {e}")))?;
 
@@ -155,7 +175,7 @@ async fn ai_query(
     }
 
     let final_response = client
-        .chat(SYSTEM_PROMPT, messages, &[])
+        .chat(&system, messages, &[])
         .await
         .map_err(|e| AppError::internal(format!("Claude API error: {e}")))?;
 

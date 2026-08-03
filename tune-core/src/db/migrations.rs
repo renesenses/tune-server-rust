@@ -787,6 +787,26 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
 );
 ",
     },
+    // Alarm ownership (chantier 2 / C2): which profile a scheduled alarm belongs
+    // to, so its playback is tagged to that person's listening history. Nullable
+    // — legacy alarms have no owner and stay NULL (never guessed). Applied via
+    // add_column_if_missing below for idempotency.
+    Migration {
+        version: 64,
+        name: "add_alarms_profile_id",
+        up: "", // Applied programmatically (idempotent add_column_if_missing).
+    },
+    // A streaming album's own track/disc numbers were lost once enqueued: the
+    // unified queue stored `position` but not the album's numbering, so a
+    // multi-disc streaming album showed disc 2 continuing at 25,26… instead of
+    // restarting at 1. Persist them alongside the inline streaming metadata.
+    // NULL on every pre-existing row and on local items (which read the numbers
+    // from the joined `tracks` row), so nothing else changes.
+    Migration {
+        version: 65,
+        name: "add_queue_item_track_disc_number",
+        up: "", // Applied programmatically via add_column_if_missing (idempotent).
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1336,6 +1356,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 62 {
             merge_albums_split_by_quality(db);
         }
+        if migration.version == 64 {
+            add_column_if_missing(db, "alarms", "profile_id", "INTEGER");
+        }
+        if migration.version == 65 {
+            // Per-album numbering for streaming queue items — see the migration's
+            // comment. add_column_if_missing keeps this a no-op on a fresh DB
+            // (CORE_SCHEMA already carries the columns) and safe on partial re-runs.
+            add_column_if_missing(db, "queue_items", "track_number", "INTEGER");
+            add_column_if_missing(db, "queue_items", "disc_number", "INTEGER");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -1398,6 +1428,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // maps it back to 16-bit and reads misaligned samples (the #1137 silence
     // class). Off by default; overrides dlna_lpcm/dlna_cap_16bit when set.
     add_column_if_missing(db, "zones", "dlna_wav24", "INTEGER DEFAULT 0");
+    // Per-zone SetAVTransportURI→Play delay in ms (default 0 = use the config /
+    // device-name default). Lets a renderer with a cold-start under-run (first
+    // seconds hachées — Cyrille, Yamaha R-N2000A) buffer before its transport
+    // clock starts, the network analogue of the local ring-buffer prefill.
+    // Overrides `[device_delays]` / `dlna_play_delay_ms` from config.
+    add_column_if_missing(db, "zones", "dlna_play_delay_ms", "INTEGER DEFAULT 0");
     // Physical host (IP) of the renderer, used to dedup DLNA zones across
     // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
     // N12 after a restart) must reconnect to its existing zone instead of

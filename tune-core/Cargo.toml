@@ -56,6 +56,11 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], 
 # rustls version reqwest resolves (0.23).
 rustls = "0.23"
 webpki-roots = "0.26"
+# Real OS hostname (gethostname(2)) for network identity — mDNS instance name +
+# peer-info name. Env HOSTNAME/COMPUTERNAME is unset under systemd, so the old
+# env-only derivation collided every instance on "tune-server" (#1112, #1127).
+# Already in the lockfile transitively, so this is a near-free direct dep.
+hostname = "0.4"
 # Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
 # behind the `plugins-wasm` feature so the default server build is unchanged.
 # default-features trimmed to compiler + runtime + WAT parsing; no async,
@@ -73,6 +78,13 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dy
 # `audio-embedding`, so the default build pulls none of this.
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
+# CLAP text tower tokenizer (natural-language acoustic search, Phase 3). Loads the
+# published RoBERTa `tokenizer.json`. `default-features = false` drops the CLI-only
+# extras (progressbar/hf-hub/esaxx training), but `onig` is kept: on native targets
+# tokenizers routes its regex `SysRegex` through oniguruma, and the RoBERTa
+# ByteLevel pre-tokenizer's split IS a regex — so `onig` is required for correct
+# tokenization, not optional. Gated behind `audio-embedding` with the ONNX stack.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Linux : nice/ionice des threads du pool de scan (scanner/walker.rs).
@@ -111,4 +123,4 @@ postgres = ["dep:sqlx"]
 # Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
-audio-embedding = ["dep:ort", "dep:flate2", "dep:tar"]
+audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]

@@ -128,6 +128,14 @@ pub struct ZoneState {
     /// track ahead of the audio — Xavier, OAAT Tune Endpoint).
     #[serde(skip)]
     pub last_restart_at: Option<Instant>,
+    /// Profile that owns the current listening session on this zone. Set by
+    /// user-initiated play handlers (from the `X-Profile-Id` header) and by the
+    /// alarm scheduler; read by the orchestrator when writing `listen_history`.
+    /// Autoplay / gapless advances reuse the zone without touching it, so they
+    /// inherit the session owner for free. `None` → the listen is tagged NULL
+    /// (server-initiated, no owner) rather than misattributed to a person.
+    #[serde(default)]
+    pub session_profile_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +166,7 @@ impl Default for ZoneState {
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
+            session_profile_id: None,
         }
     }
 }
@@ -510,6 +519,21 @@ impl PlaybackManager {
         });
     }
 
+    /// Record which profile owns the current listening session on this zone.
+    /// Uses `entry` so a handler can stamp the session BEFORE the first
+    /// `play()` creates the zone (otherwise the first track would tag NULL).
+    /// No event is emitted — this is internal attribution, not UI state.
+    pub async fn set_session_profile(&self, zone_id: i64, profile_id: Option<i64>) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .session_profile_id = profile_id;
+    }
+
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
@@ -638,6 +662,7 @@ mod tests {
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
+            session_profile_id: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…

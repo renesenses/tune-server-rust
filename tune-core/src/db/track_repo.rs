@@ -91,7 +91,14 @@ pub mod sql {
     use super::SqlDialect;
 
     pub fn select_track() -> &'static str {
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+        // `album_artist` falls back to the album's canonical artist (`albums.
+        // artist_id`, e.g. "Various Artists" for a compilation) when the per-file
+        // ALBUMARTIST tag is missing. Without this, the Oxygen "by genre" view —
+        // which groups a *filtered subset* of an album's tracks client-side — has
+        // no album_artist to key on and shows track 1's artist for compilations
+        // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
+        // position, so row parsing is unchanged.
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -823,6 +830,24 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Hydrate tracks for a set of ids in ONE query. Order is not preserved
+    /// (SQL `IN` is unordered) — the caller reorders (e.g. by acoustic-similarity
+    /// rank). Ids are trusted i64 from our own queries, so inlining them is safe
+    /// and avoids a variable-length placeholder list across dialects.
+    pub fn list_by_ids(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
+        let rows = self.db.query_many_strong(&sql, &[])?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
     /// Like `list_by_album` but restricted to tracks matching an active
     /// quality/format filter, so the album detail agrees with a filtered grid.
     /// Sergio: a Hi-Res + 96kHz + FLAC filter matched a mixed album (the grid
@@ -1502,6 +1527,92 @@ mod tests {
 
         repo.delete(id).unwrap();
         assert!(repo.get(id).unwrap().is_none());
+    }
+
+    // Bilou / Oxygen "by genre": a compilation whose files carry NO ALBUMARTIST
+    // tag must still report the album's canonical artist ("Various Artists"),
+    // not the per-track guest artist — otherwise the client-side album grouping
+    // over a genre-filtered subset shows track 1's artist.
+    #[test]
+    fn album_artist_falls_back_to_album_canonical_when_tag_missing() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let va = artist_repo
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let guest = artist_repo
+            .create(&Artist::new("Guest One".into()))
+            .unwrap();
+        let alid = album_repo
+            .get_or_create("Comp", va, None)
+            .unwrap()
+            .id
+            .unwrap();
+
+        let mut track = Track::new("Song".into());
+        track.album_id = Some(alid);
+        track.artist_id = Some(guest);
+        track.album_artist = None; // file has no ALBUMARTIST tag
+        let id = repo.create(&track).unwrap();
+
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.artist_name.as_deref(), Some("Guest One"));
+        assert_eq!(fetched.album_artist.as_deref(), Some("Various Artists"));
+    }
+
+    // Regression: a real per-file ALBUMARTIST tag still wins over the fallback.
+    #[test]
+    fn album_artist_tag_wins_over_album_canonical() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("The Band".into())).unwrap();
+        let alid = album_repo
+            .get_or_create("LP", aid, None)
+            .unwrap()
+            .id
+            .unwrap();
+
+        let mut track = Track::new("Tune".into());
+        track.album_id = Some(alid);
+        track.artist_id = Some(aid);
+        track.album_artist = Some("Tagged Albumartist".into());
+        let id = repo.create(&track).unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().album_artist.as_deref(),
+            Some("Tagged Albumartist")
+        );
+    }
+
+    #[test]
+    fn list_by_ids_hydrates_requested_tracks_only() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        let mut a = Track::new("A".into());
+        a.file_path = Some("/a.flac".into());
+        let mut b = Track::new("B".into());
+        b.file_path = Some("/b.flac".into());
+        let mut c = Track::new("C".into());
+        c.file_path = Some("/c.flac".into());
+        let ia = repo.create(&a).unwrap();
+        let _ib = repo.create(&b).unwrap();
+        let ic = repo.create(&c).unwrap();
+
+        let mut titles: Vec<String> = repo
+            .list_by_ids(&[ia, ic])
+            .unwrap()
+            .iter()
+            .map(|t| t.title.clone())
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["A".to_string(), "C".to_string()]);
+        assert!(repo.list_by_ids(&[]).unwrap().is_empty());
     }
 
     #[test]

@@ -9,6 +9,15 @@ use tracing::{debug, info, warn};
 /// no-op result instead of a user-facing error.
 const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transcode__";
 
+/// A second play of the SAME track pushed to a NETWORK renderer within this
+/// window is treated as a redundant re-trigger (a slow pre-transcode resolve
+/// racing a poller/gapless advance) and coalesced instead of re-sent — a second
+/// `SetAVTransportURI` restarts a push renderer from 0 (Revox S100 double-play,
+/// forum). A legitimate re-play of the same track (repeat-one, the same track
+/// twice in a queue) only recurs after the track has played, i.e. minutes
+/// later, well outside this window; explicit seeks and stop→replay are exempt.
+const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
 /// concurrent plays, keyed by source path. A burst of play taps for a
 /// slow-to-decode NAS track otherwise kicks off one full transcode each
@@ -289,6 +298,11 @@ pub struct PlaybackOrchestrator {
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
     levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// Per-zone record of the last track pushed to a NETWORK renderer:
+    /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
+    /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
+    /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
+    last_net_play: Mutex<HashMap<i64, (String, Option<String>, std::time::Instant)>>,
 }
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
@@ -509,6 +523,7 @@ impl PlaybackOrchestrator {
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            last_net_play: Mutex::new(HashMap::new()),
         }
     }
 
@@ -533,6 +548,29 @@ impl PlaybackOrchestrator {
             .lock()
             .expect("levels_prewarm lock")
             .contains(&zone_id)
+    }
+
+    /// Duplicate-network-play detector. Returns `true` when `(source,
+    /// source_id)` was recorded as this zone's last network play within
+    /// `DUPLICATE_NET_PLAY_WINDOW` of `now` (⇒ a redundant re-send to coalesce);
+    /// otherwise records it as the new last play and returns `false`. Pure map
+    /// logic split out of `play_inner` for unit testing.
+    fn record_or_detect_duplicate_net_play(
+        map: &mut HashMap<i64, (String, Option<String>, std::time::Instant)>,
+        zone_id: i64,
+        source: &str,
+        source_id: &Option<String>,
+        now: std::time::Instant,
+    ) -> bool {
+        let dup = map.get(&zone_id).is_some_and(|(src, sid, when)| {
+            src == source
+                && sid == source_id
+                && now.duration_since(*when) < DUPLICATE_NET_PLAY_WINDOW
+        });
+        if !dup {
+            map.insert(zone_id, (source.to_string(), source_id.clone(), now));
+        }
+        dup
     }
 
     /// Remove any gapless-prepared stream session for a zone.
@@ -790,6 +828,53 @@ impl PlaybackOrchestrator {
             });
         }
 
+        // Coalesce a redundant re-play of the SAME track to a NETWORK renderer.
+        // The generation guard above only aborts an OVERLAPPING play; it cannot
+        // stop one that starts just AFTER the first already sent its URI. A slow
+        // pre-transcode-to-file resolve (Tidal AAC / hi-res DASH, 4-10s) races a
+        // second play/advance trigger for the same track, and BOTH reach the
+        // renderer — the second SetAVTransportURI restarts it from 0 (Revox S100:
+        // plays a few seconds, jumps to 0, then plays through — forum, Philippe
+        // Vella). If we pushed this exact (source, source_id) to this zone within
+        // DUPLICATE_NET_PLAY_WINDOW and this is not an explicit seek, skip the
+        // redundant send. Network push outputs only — local/USB pull outputs
+        // prefill their own ring buffer and don't restart-glitch. The record is
+        // cleared on stop(), so a stop→replay of the same track still plays.
+        let is_net_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| !id.starts_with("local:"));
+        let is_seek = req.seek_ms.unwrap_or(0) > 0;
+        if is_net_output && !is_seek {
+            let is_dup = {
+                let mut last = self.last_net_play.lock().await;
+                Self::record_or_detect_duplicate_net_play(
+                    &mut last,
+                    req.zone_id,
+                    &resolved.source,
+                    &req.source_id,
+                    std::time::Instant::now(),
+                )
+            };
+            if is_dup {
+                info!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    source = %resolved.source,
+                    "orchestrator_play_coalesced_duplicate_net_send"
+                );
+                if let Some(ref sid) = resolved.stream_id {
+                    self.streamer.remove_session(sid).await;
+                }
+                return Ok(PlayResult {
+                    stream_url: None,
+                    output_sent: false,
+                    source: resolved.source,
+                    error: None,
+                });
+            }
+        }
+
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
         let album = req.album_title.clone().or(resolved.album.clone());
         let track_meta = req.track_id.and_then(|tid| {
@@ -1035,6 +1120,15 @@ impl PlaybackOrchestrator {
         // click (Bilou). Station plays are already tracked in the radio_stations
         // table (record_play), so nothing is lost.
         if record_history && resolved.source != "radio" {
+            // Owning profile = the zone's current session, set by the play
+            // handler from X-Profile-Id and inherited by autoplay / gapless
+            // advances (which reuse the zone without touching it). Resolved here
+            // in async context so record_listen itself stays sync.
+            let session_profile_id = self
+                .playback
+                .get_state(req.zone_id)
+                .await
+                .session_profile_id;
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -1051,6 +1145,7 @@ impl PlaybackOrchestrator {
                 resolved.duration_ms.unwrap_or(0),
                 req.zone_id,
                 cover_path.as_deref(),
+                session_profile_id,
             );
         }
 
@@ -4961,14 +5056,13 @@ impl PlaybackOrchestrator {
         duration_ms: i64,
         zone_id: i64,
         cover_url: Option<&str>,
+        session_profile_id: Option<i64>,
     ) {
-        // Resolve active profile from settings (null = default profile).
-        let active_profile_id: Option<i64> = SettingsRepo::with_backend(self.db.clone())
-            .get("active_profile_id")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse().ok());
-
+        // The owning profile is resolved by the caller from the zone's session
+        // (set by the play handler from X-Profile-Id, inherited by autoplay /
+        // gapless advances). `None` → tag NULL rather than guess an owner: a
+        // wrong attribution pollutes a person's taste profile once per-profile
+        // recommendations land, an absence doesn't.
         let repo = HistoryRepo::with_backend(self.db.clone());
         repo.record(&ListenRecord {
             id: None,
@@ -4983,7 +5077,7 @@ impl PlaybackOrchestrator {
             listened_at: None,
             zone_id: Some(zone_id),
             cover_url: cover_url.map(Into::into),
-            profile_id: active_profile_id,
+            profile_id: session_profile_id,
         })
         .ok();
 
@@ -5279,6 +5373,9 @@ impl PlaybackOrchestrator {
             .ok();
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
+        // Forget the last network-play record so a stop→replay of the SAME track
+        // is not mistaken for the duplicate-send it guards against (play_inner).
+        self.last_net_play.lock().await.remove(&zone_id);
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -5683,15 +5780,7 @@ impl PlaybackOrchestrator {
     pub fn persist_streaming_queue(
         &self,
         zone_id: i64,
-        tracks: &[(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )],
+        tracks: &[crate::db::play_queue_repo::StreamingQueueItem],
     ) {
         let repo = PlayQueueRepo::with_backend(self.db.clone());
         if let Err(e) = repo.set_streaming_queue(zone_id, tracks) {
@@ -6549,6 +6638,45 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_net_play_coalesces_same_track_within_window() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        type Map = HashMap<i64, (String, Option<String>, Instant)>;
+        let f = PlaybackOrchestrator::record_or_detect_duplicate_net_play;
+        let t0 = Instant::now();
+        let sid = Some("tidal-123".to_string());
+
+        let mut map: Map = HashMap::new();
+        // First play of the track → recorded, NOT a duplicate.
+        assert!(!f(&mut map, 5, "tidal", &sid, t0));
+        // Same (source, source_id) a few seconds later → duplicate (coalesce).
+        assert!(f(&mut map, 5, "tidal", &sid, t0 + Duration::from_secs(4)));
+        // A DIFFERENT track (real advance) → NOT a duplicate.
+        let other = Some("tidal-999".to_string());
+        assert!(!f(
+            &mut map,
+            5,
+            "tidal",
+            &other,
+            t0 + Duration::from_secs(4)
+        ));
+        // Different source, same id → NOT a duplicate.
+        assert!(!f(&mut map, 5, "qobuz", &sid, t0 + Duration::from_secs(4)));
+
+        // Same track but OUTSIDE the window (repeat-one / dup-in-queue, minutes
+        // later) → NOT a duplicate.
+        let mut map2: Map = HashMap::new();
+        assert!(!f(&mut map2, 7, "tidal", &sid, t0));
+        let far = t0 + super::DUPLICATE_NET_PLAY_WINDOW + Duration::from_secs(1);
+        assert!(!f(&mut map2, 7, "tidal", &sid, far));
+
+        // Different zones never collide.
+        let mut map3: Map = HashMap::new();
+        assert!(!f(&mut map3, 1, "tidal", &sid, t0));
+        assert!(!f(&mut map3, 2, "tidal", &sid, t0));
+    }
+
+    #[test]
     fn passthrough_duration_prefers_probed_over_scanned() {
         // #1132: the scanned duration (5:65 = 305_000 ms) is a few seconds too
         // long vs. the file's real STREAMINFO duration (300_000 ms). The DIDL
@@ -6958,6 +7086,7 @@ mod tests {
             180_000,
             zone_id,
             None,
+            Some(7),
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -6965,6 +7094,17 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].title, "Test Song");
         assert_eq!(history[0].artist_name.as_deref(), Some("Artist"));
+        // The owning profile passed by the caller is persisted verbatim
+        // (session → history tag), no longer read from the global setting.
+        // recent()'s RECORD_COLS omits profile_id, so assert on the column
+        // directly to prove the write stored the caller's value.
+        let stored_profile = orch
+            .db
+            .query_one("SELECT profile_id FROM listen_history LIMIT 1", &[])
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
+        assert_eq!(stored_profile, Some(7));
         assert_eq!(history[0].source, "local");
     }
 

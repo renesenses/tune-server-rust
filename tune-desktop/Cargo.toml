@@ -7,7 +7,8 @@
 name = "tune-desktop"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+# Business Source License 1.1 (see repo LICENSE), not MIT — cf issue #1147.
+license = "BUSL-1.1"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
 repository = "https://github.com/renesenses/tune-server-rust"
 description = "Tune native desktop controller (Tauri 2) — thin client over tune-server's HTTP/WS API."

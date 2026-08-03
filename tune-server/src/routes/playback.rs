@@ -13,7 +13,7 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
 
 use crate::error::AppError;
-use crate::routes::active_profile::DEFAULT_PROFILE_ID;
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
 /// Map an orchestrator play error to an appropriate HTTP status code.
@@ -488,9 +488,19 @@ async fn set_queue_retrying(
 
 async fn play(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     body: Option<Json<PlayRequest>>,
 ) -> impl IntoResponse {
+    // A user-initiated play starts (or takes over) the listening session on
+    // this zone: stamp the caller's profile so record_listen — and every
+    // autoplay / gapless advance that inherits it — tags listen_history to the
+    // right person. Transport (next/previous/resume) reuses this owner; after a
+    // restart the in-memory session resets to None → NULL until the next play.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     // When called with an empty body (e.g. Play after Stop), resume the
     // current track instead of returning 400 "no track source specified".
     let body = match body {
@@ -666,6 +676,8 @@ async fn play(
                     t.cover_path.clone(),
                     t.duration_ms as i64,
                     Some(source.clone()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
                 )
             })
             .collect();
@@ -764,6 +776,8 @@ async fn play(
                     t.cover_path.clone(),
                     t.duration_ms as i64,
                     Some(source.clone()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
                 )
             })
             .collect();
@@ -895,6 +909,9 @@ async fn play(
                             album: album_val,
                             cover_url: cover_val,
                             duration_ms: duration_val,
+                            // Single-track play request carries no album numbering.
+                            track_number: None,
+                            disc_number: None,
                         }],
                     ) {
                         warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -1533,6 +1550,9 @@ async fn queue_add(
             album,
             cover_url: cover,
             duration_ms: duration,
+            // The queue-add request has no track/disc fields.
+            track_number: None,
+            disc_number: None,
         });
     }
 
@@ -1557,6 +1577,9 @@ async fn queue_add(
             album,
             cover_url: cover,
             duration_ms: duration,
+            // Batch streaming items carry no track/disc number.
+            track_number: None,
+            disc_number: None,
         });
     }
 
@@ -1703,6 +1726,7 @@ async fn queue_remove(
 
 async fn save_queue_as_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<SaveAsPlaylistRequest>,
 ) -> impl IntoResponse {
@@ -1716,7 +1740,7 @@ async fn save_queue_as_playlist(
         .name
         .unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
-    match playlist_repo.create(&name, None, DEFAULT_PROFILE_ID) {
+    match playlist_repo.create(&name, None, profile.id()) {
         Ok(id) => {
             playlist_repo.add_tracks(id, &track_ids, None).ok();
             (
@@ -1957,15 +1981,7 @@ async fn do_transfer(
         .get_streaming_queue(from_zone)
         .unwrap_or_default();
     if !streaming_items.is_empty() {
-        let tracks: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )> = streaming_items
+        let tracks: Vec<tune_core::db::play_queue_repo::StreamingQueueItem> = streaming_items
             .iter()
             .map(|item| {
                 (
@@ -1976,6 +1992,8 @@ async fn do_transfer(
                     item["cover_path"].as_str().map(String::from),
                     item["duration_ms"].as_i64().unwrap_or(0),
                     item["source"].as_str().map(String::from),
+                    item["track_number"].as_i64(),
+                    item["disc_number"].as_i64(),
                 )
             })
             .collect();
@@ -2102,6 +2120,7 @@ struct CreateAlarm {
 
 async fn create_alarm(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<CreateAlarm>,
 ) -> impl IntoResponse {
@@ -2110,9 +2129,10 @@ async fn create_alarm(
     let source_type = body.source_type.unwrap_or_else(|| "playlist".into());
     let volume = body.volume.unwrap_or(0.3);
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
+    let profile_id = profile.id();
     match state.backend.execute(
-        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue],
+        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
         Ok(_) => {
             let id = state.backend.last_insert_rowid();
