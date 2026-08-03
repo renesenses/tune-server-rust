@@ -1046,7 +1046,7 @@ impl PlaybackOrchestrator {
             }
 
             let result = self
-                .send_to_output(device_id, &media, req.seek_ms, zone_audiophile)
+                .send_to_output(device_id, &media, req.seek_ms, zone_audiophile, req.zone_id)
                 .await;
             let total_ms = play_start.elapsed().as_millis();
             info!(
@@ -4644,6 +4644,7 @@ impl PlaybackOrchestrator {
         media: &crate::outputs::traits::PlayMedia<'_>,
         start_position_ms: Option<u64>,
         zone_audiophile: bool,
+        zone_id: i64,
     ) -> (bool, Option<String>) {
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
@@ -4720,6 +4721,12 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    // Headphone crossfeed (local DAC only). Returns None when the
+                    // zone has crossfeed disabled OR is in PURE mode, so a PURE
+                    // zone stays bit-perfect. Rebuilt per-play at the resolved
+                    // stream sample rate so the delay line matches the DAC clock.
+                    let cf_sr = media.sample_rate.unwrap_or(44100);
+                    local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
                 }
                 drop(output);
             }
@@ -5038,6 +5045,52 @@ impl PlaybackOrchestrator {
         }
         let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
         if eq.is_enabled() { Some(eq) } else { None }
+    }
+
+    /// Build the headphone crossfeed processor for a zone's LOCAL output, or
+    /// `None` when it should not run. Symmetric to `load_eq_processor`:
+    ///
+    ///   - PURE (audiophile) mode → `None` (bit-perfect path, no coloration).
+    ///   - crossfeed `enabled == false` (the default) → `None`.
+    ///   - `amount == 0` → `None` (would be a pure identity anyway).
+    ///
+    /// Config lives in the settings key `zone_{id}_crossfeed` as JSON
+    /// `{ "enabled": bool, "amount": f32, "delay_ms": f32 }`. Values are clamped
+    /// defensively (amount 0..0.5, delay_ms 0..5) mirroring the route validation.
+    fn load_crossfeed_processor(
+        &self,
+        zone_id: i64,
+        sample_rate: u32,
+    ) -> Option<crate::audio::crossfeed::CrossfeedProcessor> {
+        // PURE mode: no crossfeed, keep the signal path bit-perfect.
+        if self.zone_audiophile(zone_id) {
+            return None;
+        }
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let cfg: serde_json::Value = settings
+            .get(&format!("zone_{zone_id}_crossfeed"))
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())?;
+        if !cfg
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let amount = cfg.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
+        let amount = amount.clamp(0.0, 0.5);
+        if amount == 0.0 {
+            return None;
+        }
+        let delay_ms = cfg.get("delay_ms").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
+        let delay_ms = delay_ms.clamp(0.0, 5.0);
+        Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+            sample_rate,
+            amount,
+            delay_ms,
+        ))
     }
 
     fn record_listen(
@@ -6898,7 +6951,7 @@ mod tests {
                 ..Default::default()
             };
             let (output_sent, output_error) =
-                orch.send_to_output(device_id, &media, None, false).await;
+                orch.send_to_output(device_id, &media, None, false, 1).await;
             assert!(!output_sent, "{device_id} : l'envoi doit échouer");
             let err = output_error.expect("une erreur doit être remontée");
 
@@ -7391,7 +7444,8 @@ mod tests {
             mime_type: "audio/wav",
             ..Default::default()
         };
-        let (output_sent, output_error) = orch.send_to_output(device_id, &media, None, false).await;
+        let (output_sent, output_error) =
+            orch.send_to_output(device_id, &media, None, false, 1).await;
         assert!(
             !output_sent,
             "rejecting output must report output_sent=false"

@@ -677,6 +677,11 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// Optional headphone crossfeed effect, applied AFTER the convolver on the
+    /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
+    /// PURE) and only when the stream is stereo. Set per-play by the
+    /// orchestrator via `set_crossfeed`.
+    crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
 }
 
 impl LocalOutput {
@@ -720,6 +725,7 @@ impl LocalOutput {
             next_media: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            crossfeed: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -741,6 +747,19 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+    }
+
+    /// Install (or clear with `None`) the headphone crossfeed processor for the
+    /// zone about to play on this output. Set per-play by the orchestrator,
+    /// mirroring `set_pure_bypass`: the orchestrator passes `None` when the zone
+    /// has crossfeed disabled or is in PURE mode. Applied in the playback loop
+    /// after the convolver, only for stereo streams.
+    pub fn set_crossfeed(&self, cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>) {
+        *self.crossfeed.lock().unwrap() = cf;
+    }
+
+    pub fn has_crossfeed(&self) -> bool {
+        self.crossfeed.lock().unwrap().is_some()
     }
 
     pub fn has_convolver(&self) -> bool {
@@ -1080,6 +1099,41 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     data_offset.map(|d| (channels, sample_rate, bit_depth, d))
 }
 
+/// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
+/// in place, at the three playback-loop feed sites.
+///
+/// Order matches the signal flow: room-correction **convolver** first, then the
+/// headphone **crossfeed**. Both are skipped when `pure_bypass` is set (PURE /
+/// audiophile zone → bit-perfect). Crossfeed additionally requires a stereo
+/// stream (`channels == 2`); on non-stereo it is left untouched. Uses the same
+/// try-lock pattern as the convolver so a contended lock never blocks audio.
+#[inline]
+fn apply_local_dsp(
+    samples: &mut [f32],
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    channels: u16,
+) {
+    if pure_bypass.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut conv) = convolver.lock() {
+        if let Some(ref mut c) = *conv {
+            c.process_interleaved(samples);
+        }
+    }
+    // Crossfeed is a headphone (local DAC) effect and only makes sense on a
+    // stereo stream — the difference-based algorithm needs L/R pairs.
+    if channels == 2 {
+        if let Ok(mut cf) = crossfeed.lock() {
+            if let Some(ref mut c) = *cf {
+                c.process_interleaved(samples);
+            }
+        }
+    }
+}
+
 /// Convert raw PCM bytes to f32 samples.
 ///
 /// `bit_depth` semantics:
@@ -1275,6 +1329,7 @@ impl OutputTarget for LocalOutput {
         let audio_backend = self.audio_backend.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
+        let crossfeed = self.crossfeed.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -1730,13 +1785,7 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if !pure_bypass.load(Ordering::Relaxed) {
-                        if let Ok(mut conv) = convolver.lock() {
-                            if let Some(ref mut c) = *conv {
-                                c.process_interleaved(&mut samples);
-                            }
-                        }
-                    }
+                    apply_local_dsp(&mut samples, &convolver, &crossfeed, &pure_bypass, channels);
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -2062,13 +2111,7 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if !pure_bypass.load(Ordering::Relaxed) {
-                        if let Ok(mut conv) = convolver.lock() {
-                            if let Some(ref mut c) = *conv {
-                                c.process_interleaved(&mut samples);
-                            }
-                        }
-                    }
+                    apply_local_dsp(&mut samples, &convolver, &crossfeed, &pure_bypass, channels);
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -2962,13 +3005,7 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                if !pure_bypass.load(Ordering::Relaxed) {
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
-                        }
-                    }
-                }
+                apply_local_dsp(&mut samples, &convolver, &crossfeed, &pure_bypass, channels);
 
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
