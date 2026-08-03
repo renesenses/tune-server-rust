@@ -128,6 +128,15 @@ pub struct ZoneState {
     /// track ahead of the audio — Xavier, OAAT Tune Endpoint).
     #[serde(skip)]
     pub last_restart_at: Option<Instant>,
+    /// Wall-clock instant the CURRENT track was last (re)started via `play()`.
+    /// Read by the orchestrator to coalesce a redundant controller
+    /// double-dispatch: a `play()` for the track already playing that arrives a
+    /// few seconds after it started is a re-tap and must NOT re-send
+    /// SetAVTransportURI+Play, which restarts a network renderer from byte 0
+    /// (Revox S100 "plays ~10s then jumps to 0" — #1271). A deliberate replay of
+    /// the same track lands far later (older timestamp) and is untouched.
+    #[serde(skip)]
+    pub last_play_started_at: Option<Instant>,
     /// Profile that owns the current listening session on this zone. Set by
     /// user-initiated play handlers (from the `X-Profile-Id` header) and by the
     /// alarm scheduler; read by the orchestrator when writing `listen_history`.
@@ -166,6 +175,7 @@ impl Default for ZoneState {
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
+            last_play_started_at: None,
             session_profile_id: None,
         }
     }
@@ -318,6 +328,9 @@ impl PlaybackManager {
         if !is_recent_seek {
             state.position_ms = 0;
         }
+        // Stamp the (re)start instant so the orchestrator can coalesce a
+        // redundant controller double-dispatch of this same track (#1271).
+        state.last_play_started_at = Some(Instant::now());
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
         state.now_playing = Some(np);
@@ -640,6 +653,7 @@ mod tests {
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
+            last_play_started_at: None,
             session_profile_id: None,
         };
         let v = now_playing_event_data(&state);
