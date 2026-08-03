@@ -770,14 +770,8 @@ async fn process_responses(
                     continue;
                 };
 
-                let device = build_renderer_device(
-                    &dev_id,
-                    &resp.location,
-                    host,
-                    port,
-                    device_type,
-                    &desc,
-                );
+                let device =
+                    build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
 
                 let mut st = state.lock().await;
                 st.known_locations.insert(dev_id.clone(), resp.location);

@@ -3286,6 +3286,22 @@ impl PlaybackOrchestrator {
             let eq_profile_pretranscode =
                 self.load_eq_processor(req.zone_id, stream_data.quality.sample_rate, 2);
 
+            // Browser (Web Audio) zones pull the stream themselves via <audio> and
+            // issue arbitrary byte-Range requests to buffer/seek. Our native FLAC
+            // encoder writes no SEEKTABLE, so a mid-file offset never lands on a
+            // frame boundary; Safari can't resync and playback stalls a few seconds
+            // in while the timeline keeps running (Philippe Vella, Tidal HI-RES on
+            // the browser "Cet ordinateur" zone, 0.9.42). WAV's linear byte↔sample
+            // layout makes every Range resolvable, so serve WAV to browser zones —
+            // the same format the local output already plays fine for these tracks.
+            let is_browser_output = ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_type)
+                .as_deref()
+                == Some("browser");
+
             struct DashWarm {
                 cache_path: String,
                 enc_format: &'static str,
@@ -3307,7 +3323,9 @@ impl PlaybackOrchestrator {
                 let wdid = req.output_device_id.as_deref().unwrap_or("");
                 let wflac =
                     ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-                let wfmt = if wdid.is_empty()
+                let wfmt = if is_browser_output {
+                    "wav"
+                } else if wdid.is_empty()
                     || wflac
                     || self.dlna_supports_mime(wdid, "audio/flac").await
                 {
@@ -3471,7 +3489,11 @@ impl PlaybackOrchestrator {
                 None => {
                     let force =
                         ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-                    let fmt = if dash_did.is_empty()
+                    let fmt = if is_browser_output {
+                        // Browser pulls with byte-Range requests; a seektable-less
+                        // FLAC stalls it (see is_browser_output note above). WAV.
+                        "wav"
+                    } else if dash_did.is_empty()
                         || force
                         || self.dlna_supports_mime(dash_did, "audio/flac").await
                     {
