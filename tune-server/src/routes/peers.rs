@@ -1,3 +1,4 @@
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -8,10 +9,12 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/", get(list_peers))
 }
 
-async fn list_peers() -> Json<Value> {
+async fn list_peers(State(state): State<AppState>) -> Json<Value> {
+    let peers = state.discovered_tune_peers().await;
+    let total = peers.len();
     Json(json!({
-        "items": [],
-        "total": 0,
-        "message": "mDNS peer discovery via _tune-server._tcp",
+        "items": peers,
+        "total": total,
+        "discovery": "_tune-server._tcp",
     }))
 }

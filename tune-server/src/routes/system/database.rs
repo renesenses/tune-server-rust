@@ -51,7 +51,10 @@ pub(super) async fn database_status(
     })))
 }
 
-pub(super) async fn database_optimize(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn database_optimize(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let start = Instant::now();
     let sql = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
         "PRAGMA optimize; VACUUM; ANALYZE;"
@@ -77,7 +80,10 @@ pub(super) async fn database_optimize(State(state): State<AppState>) -> impl Int
 ///
 /// Also performs a WAL checkpoint so that read-only connections (used by
 /// the browse/list endpoints) immediately see any recent writes.
-pub(super) async fn rebuild_fts(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn rebuild_fts(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let conn = match state.db.connection().lock() {
         Ok(c) => c,
         Err(e) => {
@@ -111,6 +117,7 @@ pub(super) async fn rebuild_fts(State(state): State<AppState>) -> impl IntoRespo
 }
 
 pub(super) async fn export_database(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());

@@ -320,11 +320,20 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64)> {
     // identical to a single whole-track pass. We decode at the native rate,
     // stereo (the native decoder does not resample), same as before.
     const SEG_SECONDS: f64 = 30.0;
+    // Defense in depth (#1277): even if a decoder ever ignores a failed seek and
+    // keeps returning the head of the track, no analysis loop may run forever.
+    // 24h is far beyond any real track, so this never truncates legitimate input
+    // — it only fires on a non-progressing decoder.
+    const MAX_ANALYSIS_SECONDS: f64 = 24.0 * 3600.0;
 
     let mut acc: Option<LoudnessAccumulator> = None;
     let mut seek = 0.0_f64;
 
     loop {
+        if seek > MAX_ANALYSIS_SECONDS {
+            warn!(file = file_path, seek, "loudness_analysis_seek_cap_hit");
+            break;
+        }
         let path = file_path.to_string();
         let decoded = tokio::task::spawn_blocking(move || {
             super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
@@ -375,6 +384,9 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
     // index of the last sample above threshold — equivalent to the old backward
     // scan over the whole buffer.
     const SEG_SECONDS: f64 = 30.0;
+    // Defense in depth (#1277): mirror the loudness pass — never let a
+    // non-progressing decoder spin this loop forever. See measure_loudness_and_peak.
+    const MAX_ANALYSIS_SECONDS: f64 = 24.0 * 3600.0;
     let threshold_linear = 10.0_f64.powf(threshold_db / 20.0);
 
     let mut sample_rate = 0.0_f64;
@@ -383,6 +395,10 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
     let mut seek = 0.0_f64;
 
     loop {
+        if seek > MAX_ANALYSIS_SECONDS {
+            warn!(file = file_path, seek, "trailing_silence_seek_cap_hit");
+            break;
+        }
         let path = file_path.to_string();
         let decoded = match tokio::task::spawn_blocking(move || {
             super::decode::decode_to_pcm(&path, None, Some(1), seek, SEG_SECONDS)

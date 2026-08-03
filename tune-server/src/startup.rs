@@ -30,6 +30,19 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     let state_clone = state.clone();
     tokio::spawn(async move {
         crate::routes::devices::reregister_manual_devices(&state_clone).await;
+        // Re-probe auto-discovered renderers whose lazy SSDP responder won't
+        // resurface them after a restart (Cyrus Stream X2, #1126).
+        crate::discovery_setup::reregister_known_renderers(&state_clone).await;
+    });
+
+    // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
+    // so one with a lazy SSDP responder (Cyrus Stream X2) comes back online
+    // after a restart without waiting for multicast (#1126). Runs concurrently
+    // with SSDP; the registry is keyed by UUID so the first to win re-attaches
+    // the zone and the other is a no-op.
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        crate::routes::devices::reprobe_persisted_dlna_devices(&state_clone).await;
     });
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,

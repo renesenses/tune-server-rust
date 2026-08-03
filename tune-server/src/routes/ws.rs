@@ -15,7 +15,54 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/", get(ws_handler))
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+/// Authorizes the WS upgrade *before* the `WebSocketUpgrade` extractor runs, so
+/// an unauthenticated caller is rejected with 401 without ever reaching the
+/// upgrade. WS routers are mounted outside the API auth middleware, so without
+/// this the socket would receive the full snapshot and live event stream with
+/// no token. Running as a leading extractor also makes the gate unit-testable:
+/// a synthetic `oneshot` request carries no hyper upgrade state, so
+/// `WebSocketUpgrade` itself always fails there — only a check that runs first
+/// can exercise the 401 path.
+struct WsAuthorized;
+
+impl axum::extract::FromRequestParts<AppState> for WsAuthorized {
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let query_token = parts.uri.query().and_then(ws_token_from_query);
+        if crate::auth::ws_authorized(state, &parts.headers, query_token.as_deref()) {
+            Ok(WsAuthorized)
+        } else {
+            Err((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "authentication required",
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Extract `token` / `access_token` from a raw query string. JWTs are URL-safe
+/// (base64url + `.`), so no percent-decoding is required.
+fn ws_token_from_query(raw: &str) -> Option<String> {
+    for pair in raw.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next()?;
+        if k == "token" || k == "access_token" {
+            return Some(it.next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
+async fn ws_handler(
+    _auth: WsAuthorized,
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 

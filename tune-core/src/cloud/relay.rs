@@ -455,7 +455,9 @@ pub fn spawn_relay_client(settings: &SettingsRepo, local_port: u16) -> Option<Ar
         _ => {
             let token = uuid::Uuid::new_v4().to_string();
             let _ = settings.set("bridge_token", &token);
-            info!(token = %token, "generated new bridge token");
+            // Never log the token value — it is the client-facing bearer secret
+            // used to reach this server through the relay.
+            info!("generated new bridge token");
             token
         }
     };

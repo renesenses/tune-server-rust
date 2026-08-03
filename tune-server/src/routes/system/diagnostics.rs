@@ -523,6 +523,7 @@ pub(super) async fn get_log_level(State(state): State<AppState>) -> Json<Value> 
 }
 
 pub(super) async fn set_log_level(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<LogLevelBody>,
 ) -> Json<Value> {

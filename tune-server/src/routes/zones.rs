@@ -141,20 +141,46 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
 
+    // Headphone crossfeed config (local output only). Defaults when unset:
+    // disabled, amount 0.30, delay 0.30 ms.
+    let crossfeed = read_crossfeed_config(&settings, id);
+
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
             "zone_id": id,
             "dsp_preset_id": preset_id,
             "dsp_enabled": enabled,
             "eq_profile": eq_profile.unwrap_or_default(),
+            "crossfeed": crossfeed,
         }))
         .into_response(),
         Err(_) => Json(json!({
             "zone_id": id,
             "eq_profile": eq_profile.unwrap_or_default(),
+            "crossfeed": crossfeed,
         }))
         .into_response(),
     }
+}
+
+/// Read the `zone_{id}_crossfeed` settings row into a normalised JSON object,
+/// falling back to defaults (disabled, amount 0.30, delay 0.30 ms) for any
+/// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`.
+fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, id: i64) -> Value {
+    let stored: Option<Value> = settings
+        .get(&format!("zone_{id}_crossfeed"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let v = stored.unwrap_or(Value::Null);
+    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    let amount = v.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.30);
+    let delay_ms = v.get("delay_ms").and_then(|d| d.as_f64()).unwrap_or(0.30);
+    json!({
+        "enabled": enabled,
+        "amount": amount,
+        "delay_ms": delay_ms,
+    })
 }
 
 async fn set_zone_dsp(
@@ -182,6 +208,38 @@ async fn set_zone_dsp(
         }
     }
 
+    // Handle crossfeed sub-object if present (local-output headphone effect).
+    // Same premium gate (Feature::DspEq) as the EQ path above. Ranges clamped:
+    // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
+    let mut crossfeed_saved: Option<Value> = None;
+    if let Some(cf_val) = body.get("crossfeed") {
+        let enabled = cf_val
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let amount = cf_val
+            .get("amount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.30)
+            .clamp(0.0, 0.5);
+        let delay_ms = cf_val
+            .get("delay_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.30)
+            .clamp(0.0, 5.0);
+        let normalised = json!({
+            "enabled": enabled,
+            "amount": amount,
+            "delay_ms": delay_ms,
+        });
+        let key = format!("zone_{id}_crossfeed");
+        let _ = settings.set(
+            &key,
+            &serde_json::to_string(&normalised).unwrap_or_default(),
+        );
+        crossfeed_saved = Some(normalised);
+    }
+
     let preset_id = body["dsp_preset_id"].as_i64();
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
     let repo = ZoneRepo::with_backend(state.backend.clone());
@@ -192,6 +250,7 @@ async fn set_zone_dsp(
         "dsp_preset_id": preset_id,
         "dsp_enabled": enabled,
         "eq_profile": body.get("eq_profile"),
+        "crossfeed": crossfeed_saved,
     }))
     .into_response()
 }

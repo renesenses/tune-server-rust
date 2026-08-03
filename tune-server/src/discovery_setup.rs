@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use tracing::info;
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use tune_core::db::backend::DbBackend;
 use tune_core::outputs::OutputRegistry;
@@ -52,6 +53,73 @@ fn set_zone_online(event_bus: &EventBus, db: &Arc<dyn DbBackend>, device_id: &st
             serde_json::json!({ "device_id": device_id, "online": online }),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Known-renderer persistence (#1126)
+// ---------------------------------------------------------------------------
+
+/// Settings key holding the JSON array of renderers seen at least once via SSDP.
+const KNOWN_RENDERERS_KEY: &str = "known_renderers";
+
+/// A DLNA/OpenHome renderer we discovered via SSDP, persisted so it can be
+/// re-probed directly over HTTP at startup (#1126).
+///
+/// Some renderers (Cyrus Stream X2) don't answer M-SEARCH when idle and rarely
+/// emit `ssdp:alive`, so after a server restart normal SSDP rediscovery never
+/// fires and the device's zone stays `online:false` forever — rejecting all
+/// playback — even though the device is reachable (ping + description.xml over
+/// HTTP work). Persisting its LOCATION/UUID lets [`reregister_known_renderers`]
+/// HTTP-probe it and re-register through the same path SSDP uses, so the
+/// EXISTING zone (keyed on the uuid-based device_id) reconnects instead of a
+/// duplicate being created. Mirrors the manual-device store in
+/// `routes::devices`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KnownRenderer {
+    device_id: String,
+    location: String,
+    name: String,
+}
+
+fn load_known_renderers(db: &Arc<dyn DbBackend>) -> Vec<KnownRenderer> {
+    let repo = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    match repo.get(KNOWN_RENDERERS_KEY) {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn save_known_renderers(db: &Arc<dyn DbBackend>, renderers: &[KnownRenderer]) {
+    let repo = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    match serde_json::to_string(renderers) {
+        Ok(json) => {
+            if let Err(e) = repo.set(KNOWN_RENDERERS_KEY, &json) {
+                warn!(error = %e, "known_renderers_persist_failed");
+            }
+        }
+        Err(e) => warn!(error = %e, "known_renderers_serialize_failed"),
+    }
+}
+
+/// Upsert a discovered renderer by device_id (replacing any prior entry).
+/// Best-effort: a persistence failure is logged, never panics, and never
+/// blocks discovery. Skips the settings write when the stored entry is already
+/// identical, so the periodic SSDP re-discovery doesn't churn the DB.
+fn persist_known_renderer(db: &Arc<dyn DbBackend>, device_id: &str, location: &str, name: &str) {
+    let mut renderers = load_known_renderers(db);
+    if renderers
+        .iter()
+        .any(|r| r.device_id == device_id && r.location == location && r.name == name)
+    {
+        return;
+    }
+    renderers.retain(|r| r.device_id != device_id);
+    renderers.push(KnownRenderer {
+        device_id: device_id.to_string(),
+        location: location.to_string(),
+        name: name.to_string(),
+    });
+    save_known_renderers(db, &renderers);
 }
 
 /// Spawn the SSDP handler that registers DLNA/OpenHome outputs and auto-creates zones.
@@ -154,6 +222,10 @@ async fn handle_ssdp_discovered(
         })
         .unwrap_or_default();
 
+    // Whether we actually registered an output for this renderer below — only
+    // then is it worth persisting for restart recovery (#1126).
+    let mut registered = false;
+
     if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
         let evt_urls = dev
             .capabilities
@@ -173,6 +245,7 @@ async fn handle_ssdp_discovered(
         );
         let mut reg = outputs.lock().await;
         reg.register(Box::new(oh));
+        registered = true;
         info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
     } else {
         // Resolve each controlURL to an absolute URL (see `resolve_control_url`):
@@ -202,6 +275,7 @@ async fn handle_ssdp_discovered(
             .with_play_delay(delay);
             let mut reg = outputs.lock().await;
             reg.register(Box::new(dlna));
+            registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
             // Persist LOCATION + UUID so a lazy-SSDP renderer (Cyrus Stream X2)
@@ -213,6 +287,12 @@ async fn handle_ssdp_discovered(
                 );
             }
         }
+    }
+
+    // Persist this renderer so it can be re-probed directly at the next startup,
+    // even if it never answers SSDP M-SEARCH again (#1126). Best-effort.
+    if registered && let Some(location) = dev.location.as_deref() {
+        persist_known_renderer(db, &dev.id, location, &dev.name);
     }
 
     let skip_keywords = [
@@ -393,10 +473,88 @@ async fn handle_ssdp_discovered(
     }
 }
 
+/// Re-probe every persisted renderer at startup and re-register the reachable
+/// ones (#1126).
+///
+/// Renderers with a lazy SSDP responder (Cyrus Stream X2) never resurface
+/// through the multicast scan after a restart, so their zone would stay offline
+/// and reject all playback. For each stored renderer we HTTP-probe its LOCATION
+/// (via [`tune_core::discovery::ssdp::probe_renderer`]) and, only if the
+/// descriptor's UUID still matches, feed it through the SAME
+/// [`handle_ssdp_discovered`] path a live SSDP discovery uses — so the existing
+/// zone (keyed on the uuid-based device_id) reconnects instead of a duplicate
+/// being created. If the UUID differs a different device now lives at that URL,
+/// so we skip it and let live discovery handle the newcomer. Best-effort per
+/// device; failures are logged and never block boot. Mirrors
+/// `routes::devices::reregister_manual_devices`.
+pub async fn reregister_known_renderers(state: &AppState) {
+    let renderers = load_known_renderers(&state.backend);
+    if renderers.is_empty() {
+        return;
+    }
+    info!(count = renderers.len(), "reregistering_known_renderers");
+
+    // No OpenHome event listener here: the live SSDP handler's listener isn't
+    // reachable from AppState, and creating a second one would race it for the
+    // fixed :8890 bind at boot (`OpenHomeEventListener::new` falls back to an
+    // ephemeral port when 8890 is taken) — a subtle regression on the primary
+    // listener. DLNA renderers (the #1126 case, e.g. Cyrus Stream X2) ignore the
+    // listener entirely; an OpenHome renderer re-attached here gets its push
+    // events back on its next SSDP advertise (which re-registers it with the real
+    // listener) and polls its state until then.
+    let oh_listener: Option<Arc<OpenHomeEventListener>> = None;
+
+    let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut recovered = 0usize;
+    for kr in renderers {
+        match tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location).await {
+            Some(dev) if dev.id == kr.device_id => {
+                handle_ssdp_discovered(
+                    &dev,
+                    &state.outputs,
+                    &state.backend,
+                    &state.config,
+                    &state.event_bus,
+                    &oh_listener,
+                    &state.playback,
+                    &state.license,
+                    &mut seen_hosts,
+                )
+                .await;
+                recovered += 1;
+                info!(
+                    id = %kr.device_id,
+                    name = %kr.name,
+                    location = %kr.location,
+                    "known_renderer_reregistered"
+                );
+            }
+            Some(dev) => {
+                warn!(
+                    stored_id = %kr.device_id,
+                    live_id = %dev.id,
+                    location = %kr.location,
+                    "known_renderer_uuid_changed_skipping"
+                );
+            }
+            None => {
+                warn!(
+                    id = %kr.device_id,
+                    location = %kr.location,
+                    "known_renderer_probe_failed"
+                );
+            }
+        }
+    }
+    info!(recovered, "known_renderers_reregister_complete");
+}
+
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
 ///
 /// Returns the `MdnsScanner` handle (must be kept alive for the scanner to keep running).
-pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns::MdnsScanner> {
+pub fn spawn_mdns_handler(
+    state: &AppState,
+) -> Option<std::sync::Arc<tune_core::discovery::mdns::MdnsScanner>> {
     let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
     let handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
         let mut mdns = mdns
@@ -404,7 +562,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
             .with_airplay()
             .with_bluos()
             .with_oaat()
-            .with_squeezebox();
+            .with_squeezebox()
+            // Browse peer Tune servers too, so this server can list the other
+            // Tune servers on the network (#1273). Each server already announces
+            // itself via `register_self`; without this it never browsed back.
+            .with_tune_peers();
         if let Err(e) = mdns.start() {
             tracing::warn!(error = %e, "mdns_start_failed");
         }
@@ -415,6 +577,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
         if let Err(e) = mdns.register_self(port, tune_core::version()) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
         }
+        // Publish the scanner so routes (`/peers`, `/system/discover-servers`)
+        // can list the discovered peers. AppState keeps it alive for the whole
+        // process, so the returned handle is a convenience clone only.
+        let mdns = std::sync::Arc::new(mdns);
+        *state.mdns_scanner.lock().unwrap() = Some(mdns.clone());
         Some(mdns)
     } else {
         None

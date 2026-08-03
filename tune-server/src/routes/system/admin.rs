@@ -377,8 +377,14 @@ pub(super) async fn remove_peer(
     Json(json!({ "ok": true }))
 }
 
-pub(super) async fn discover_servers() -> Json<Value> {
-    Json(json!({ "servers": [], "message": "peer discovery not yet implemented" }))
+/// Auto-discovered peer Tune servers (mDNS `_tune-server._tcp`, #1273).
+///
+/// Complements `/system/peers` (manually-added, persisted peers): this is the
+/// zero-config path, empty on networks that block multicast (Docker macvlan,
+/// Windows firewall) where the manual list is the fallback.
+pub(super) async fn discover_servers(State(state): State<AppState>) -> Json<Value> {
+    let servers = state.discovered_tune_peers().await;
+    Json(json!({ "total": servers.len(), "servers": servers }))
 }
 
 pub(super) async fn listening_stats(State(state): State<AppState>) -> Json<Value> {

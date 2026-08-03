@@ -94,7 +94,16 @@ impl PluginMarketplace {
     }
 
     /// Download a plugin binary/archive by name.
+    ///
+    /// The body is read with a hard size cap: `resp.bytes()` buffered the whole
+    /// response into memory unbounded, so a compromised or misbehaving
+    /// marketplace could OOM the server with an oversized (or endless) payload.
+    /// A WASM plugin is comfortably under the cap. (Cryptographic signature
+    /// verification of the artifact is a separate, larger piece — audit item 8.)
     pub async fn download(&self, name: &str) -> Result<Vec<u8>, String> {
+        /// 50 MiB — generous for a WASM plugin, bounds worst-case memory.
+        const MAX_PLUGIN_BYTES: usize = 50 * 1024 * 1024;
+
         let url = format!(
             "{}/api/v1/plugins/{}/download",
             self.base_url,
@@ -102,7 +111,7 @@ impl PluginMarketplace {
         );
         let client = crate::http::client::long_timeout();
 
-        let resp = client
+        let mut resp = client
             .get(&url)
             .send()
             .await
@@ -112,13 +121,33 @@ impl PluginMarketplace {
             return Err(format!("plugin download failed: {}", resp.status()));
         }
 
-        let bytes = resp
-            .bytes()
+        // Reject early if the advertised length already exceeds the cap.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_PLUGIN_BYTES as u64 {
+                return Err(format!(
+                    "plugin too large: {len} bytes (max {MAX_PLUGIN_BYTES})"
+                ));
+            }
+        }
+
+        // Stream with a running cap so a missing/lying Content-Length can't
+        // blow past the limit either.
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("failed to read plugin bytes: {e}"))?;
+            .map_err(|e| format!("failed to read plugin bytes: {e}"))?
+        {
+            if bytes.len() + chunk.len() > MAX_PLUGIN_BYTES {
+                return Err(format!(
+                    "plugin exceeds maximum size of {MAX_PLUGIN_BYTES} bytes"
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         info!(plugin = %name, size = bytes.len(), "marketplace_plugin_downloaded");
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Vote for a plugin (up or down).

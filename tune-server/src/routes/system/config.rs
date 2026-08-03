@@ -268,6 +268,7 @@ pub(super) async fn get_settings(
 pub(super) struct ConfigPatch(pub(super) serde_json::Map<String, Value>);
 
 pub(super) async fn update_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -535,6 +536,7 @@ pub(super) struct AddMusicDir {
 }
 
 pub(super) async fn add_music_dir(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<AddMusicDir>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -599,6 +601,7 @@ pub(super) async fn add_music_dir(
 }
 
 pub(super) async fn remove_music_dir(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<AddMusicDir>,
 ) -> Result<Json<Value>, AppError> {
@@ -622,7 +625,7 @@ pub(super) async fn remove_music_dir(
     Ok(Json(json!({ "dirs": dirs })))
 }
 
-pub(super) async fn restart() -> impl IntoResponse {
+pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
     tokio::spawn(async {
         // Let the HTTP response flush before we swap the process image.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

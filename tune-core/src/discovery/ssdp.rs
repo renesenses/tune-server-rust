@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 use super::device::{DiscoveredDevice, OutputType};
-use super::xml_parser::fetch_device_description;
+use super::xml_parser::{DeviceDescription, fetch_device_description};
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
@@ -567,6 +567,89 @@ fn port_from_location(location: &str) -> u16 {
         .unwrap_or(80)
 }
 
+/// Build a renderer [`DiscoveredDevice`] from a fetched device description.
+///
+/// Pure construction only — no scanner-state mutation and no event send — so it
+/// can be shared between the live SSDP scan loop and the restart-recovery probe
+/// ([`probe_renderer`]). The scan loop keeps ownership of its own
+/// `known_locations`/`miss_count`/`devices` bookkeeping and the event send.
+fn build_renderer_device(
+    dev_id: &str,
+    location: &str,
+    host: String,
+    port: u16,
+    device_type: OutputType,
+    desc: &DeviceDescription,
+) -> DiscoveredDevice {
+    let mut device = DiscoveredDevice::new(
+        dev_id.to_string(),
+        desc.friendly_name.clone(),
+        device_type,
+        host,
+        port,
+    );
+    device.manufacturer = if desc.manufacturer.is_empty() {
+        None
+    } else {
+        Some(desc.manufacturer.clone())
+    };
+    device.model = if desc.model_name.is_empty() {
+        None
+    } else {
+        Some(desc.model_name.clone())
+    };
+    device.location = Some(location.to_string());
+
+    device.capabilities.insert(
+        "service_urls".into(),
+        serde_json::to_value(desc.service_urls()).unwrap_or_default(),
+    );
+    device.capabilities.insert(
+        "event_sub_urls".into(),
+        serde_json::to_value(desc.event_sub_urls()).unwrap_or_default(),
+    );
+    // We just fetched the description over TCP, so the ARP cache has this host:
+    // recover the MAC (stable identity + brand display) while it is warm.
+    super::mac::enrich_identity(&mut device);
+    if desc.is_openhome() {
+        device
+            .capabilities
+            .insert("openhome".into(), serde_json::Value::Bool(true));
+    }
+    device
+}
+
+/// Probe a persisted renderer LOCATION directly over HTTP and rebuild its
+/// DiscoveredDevice, for restart recovery of renderers with a lazy SSDP
+/// responder (#1126). Returns None if unreachable or not a renderer.
+///
+/// Free function: it does NOT touch [`SsdpScanner`]/scanner state, so it is
+/// usable at startup before the scanner exists. Mirrors the scan loop's
+/// renderer classification (openhome → Openhome; media renderer or bare
+/// AVTransport → Dlna; anything else → None).
+pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDevice> {
+    let desc = fetch_device_description(location).await.ok()?;
+    let host = host_from_location(location).unwrap_or_default();
+    let port = port_from_location(location);
+
+    let device_type = if desc.is_openhome() {
+        OutputType::Openhome
+    } else if desc.is_media_renderer() || desc.has_av_transport() {
+        OutputType::Dlna
+    } else {
+        return None;
+    };
+
+    Some(build_renderer_device(
+        dev_id,
+        location,
+        host,
+        port,
+        device_type,
+        &desc,
+    ))
+}
+
 async fn process_responses(
     state: &Arc<Mutex<ScannerState>>,
     event_tx: &mpsc::Sender<SsdpEvent>,
@@ -687,42 +770,8 @@ async fn process_responses(
                     continue;
                 };
 
-                let mut device = DiscoveredDevice::new(
-                    dev_id.clone(),
-                    desc.friendly_name.clone(),
-                    device_type,
-                    host,
-                    port,
-                );
-                device.manufacturer = if desc.manufacturer.is_empty() {
-                    None
-                } else {
-                    Some(desc.manufacturer.clone())
-                };
-                device.model = if desc.model_name.is_empty() {
-                    None
-                } else {
-                    Some(desc.model_name.clone())
-                };
-                device.location = Some(resp.location.clone());
-
-                device.capabilities.insert(
-                    "service_urls".into(),
-                    serde_json::to_value(desc.service_urls()).unwrap_or_default(),
-                );
-                device.capabilities.insert(
-                    "event_sub_urls".into(),
-                    serde_json::to_value(desc.event_sub_urls()).unwrap_or_default(),
-                );
-                // We just fetched the description over TCP, so the ARP cache
-                // has this host: recover the MAC (stable identity + brand
-                // display) while it is warm.
-                super::mac::enrich_identity(&mut device);
-                if desc.is_openhome() {
-                    device
-                        .capabilities
-                        .insert("openhome".into(), serde_json::Value::Bool(true));
-                }
+                let device =
+                    build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
 
                 let mut st = state.lock().await;
                 st.known_locations.insert(dev_id.clone(), resp.location);

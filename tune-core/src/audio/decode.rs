@@ -1402,21 +1402,44 @@ fn decode_symphonia(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    // Seek if requested
+    let source_bd = resolve_bit_depth(&audio_params);
+
+    // Seek if requested. On a non-seekable source (e.g. a FLAC over SMB with no
+    // seektable) `format.seek` fails and the reader stays at position 0. If we
+    // then kept decoding, we'd return the *first* segment again for every seek
+    // offset — the ReplayGain / trailing-silence analyzers advance `seek` by a
+    // full segment each time, never see a short final segment, and loop forever
+    // (#1277, a regression of the #1109 segmented-decode OOM fix). Honour the
+    // error by returning an EMPTY segment: the analyzers break on the resulting
+    // `is_empty()`. The first segment (seek_s == 0.0, no seek) always decodes
+    // normally, so the analysis still runs over the head of the track.
     if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        let _ = format.seek(
-            SeekMode::Coarse,
-            SeekTo::Time {
-                time,
-                track_id: Some(track_id),
-            },
-        );
+        if format
+            .seek(
+                SeekMode::Coarse,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(track_id),
+                },
+            )
+            .is_err()
+        {
+            debug!(
+                file = file_path,
+                seek_s, "decode_symphonia_seek_failed_returning_empty"
+            );
+            return Ok(DecodedAudio {
+                samples_i32: Vec::new(),
+                bit_depth: source_bd,
+                sample_rate: target_sample_rate.unwrap_or(source_rate),
+                channels: target_channels.unwrap_or(source_channels),
+                duration_s: 0.0,
+            });
+        }
     }
-
-    let source_bd = resolve_bit_depth(&audio_params);
 
     let mut all_samples: Vec<i32> = Vec::new();
     let max_samples = if max_duration_s > 0.0 {
