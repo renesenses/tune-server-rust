@@ -1046,6 +1046,15 @@ impl PlaybackOrchestrator {
         // click (Bilou). Station plays are already tracked in the radio_stations
         // table (record_play), so nothing is lost.
         if record_history && resolved.source != "radio" {
+            // Owning profile = the zone's current session, set by the play
+            // handler from X-Profile-Id and inherited by autoplay / gapless
+            // advances (which reuse the zone without touching it). Resolved here
+            // in async context so record_listen itself stays sync.
+            let session_profile_id = self
+                .playback
+                .get_state(req.zone_id)
+                .await
+                .session_profile_id;
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -1062,6 +1071,7 @@ impl PlaybackOrchestrator {
                 resolved.duration_ms.unwrap_or(0),
                 req.zone_id,
                 cover_path.as_deref(),
+                session_profile_id,
             );
         }
 
@@ -4962,14 +4972,13 @@ impl PlaybackOrchestrator {
         duration_ms: i64,
         zone_id: i64,
         cover_url: Option<&str>,
+        session_profile_id: Option<i64>,
     ) {
-        // Resolve active profile from settings (null = default profile).
-        let active_profile_id: Option<i64> = SettingsRepo::with_backend(self.db.clone())
-            .get("active_profile_id")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse().ok());
-
+        // The owning profile is resolved by the caller from the zone's session
+        // (set by the play handler from X-Profile-Id, inherited by autoplay /
+        // gapless advances). `None` → tag NULL rather than guess an owner: a
+        // wrong attribution pollutes a person's taste profile once per-profile
+        // recommendations land, an absence doesn't.
         let repo = HistoryRepo::with_backend(self.db.clone());
         repo.record(&ListenRecord {
             id: None,
@@ -4984,7 +4993,7 @@ impl PlaybackOrchestrator {
             listened_at: None,
             zone_id: Some(zone_id),
             cover_url: cover_url.map(Into::into),
-            profile_id: active_profile_id,
+            profile_id: session_profile_id,
         })
         .ok();
 
@@ -6951,6 +6960,7 @@ mod tests {
             180_000,
             zone_id,
             None,
+            Some(7),
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -6958,6 +6968,17 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].title, "Test Song");
         assert_eq!(history[0].artist_name.as_deref(), Some("Artist"));
+        // The owning profile passed by the caller is persisted verbatim
+        // (session → history tag), no longer read from the global setting.
+        // recent()'s RECORD_COLS omits profile_id, so assert on the column
+        // directly to prove the write stored the caller's value.
+        let stored_profile = orch
+            .db
+            .query_one("SELECT profile_id FROM listen_history LIMIT 1", &[])
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
+        assert_eq!(stored_profile, Some(7));
         assert_eq!(history[0].source, "local");
     }
 
