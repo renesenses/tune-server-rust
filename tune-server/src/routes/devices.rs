@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use std::sync::Arc;
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::discovery::device::dedup_devices;
@@ -375,6 +377,184 @@ async fn reregister_with_backoff(state: &AppState, dev: ManualDevice) {
             }
         }
     }
+}
+
+// ── Auto-discovered DLNA renderers: persist + reprobe (#1126) ──────────────
+//
+// Some renderers (Cyrus Stream X2) don't answer SSDP M-SEARCH while idle and
+// only rarely emit `ssdp:alive`, so after a restart they never resurface via
+// multicast and their zone stays offline indefinitely — every `play` rejected.
+// They ARE reachable though (ping, description.xml over HTTP). So we persist
+// each auto-discovered DLNA renderer's LOCATION + UUID and, at startup, probe
+// the LOCATION directly over HTTP (verifying the UUID still matches) to
+// re-register it alongside multicast. The registry is keyed by the `uuid:…`
+// device_id, so whichever path wins re-attaches the SAME zone (no duplicate).
+
+/// Settings key holding the JSON array of auto-discovered DLNA renderers.
+const DISCOVERED_DLNA_KEY: &str = "discovered_dlna_devices";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveredDlnaDevice {
+    /// `uuid:…` — the DLNA device_id; keying the registry by it re-attaches the
+    /// existing zone rather than creating a duplicate.
+    uuid: String,
+    /// Full description.xml URL as advertised by SSDP (may use a non-standard
+    /// path/port); used verbatim for the HTTP reprobe.
+    location: String,
+    name: String,
+    host: String,
+    port: u16,
+}
+
+fn load_discovered_dlna(backend: &Arc<dyn DbBackend>) -> Vec<DiscoveredDlnaDevice> {
+    let repo = SettingsRepo::with_backend(backend.clone());
+    match repo.get(DISCOVERED_DLNA_KEY) {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn save_discovered_dlna(backend: &Arc<dyn DbBackend>, devices: &[DiscoveredDlnaDevice]) {
+    let repo = SettingsRepo::with_backend(backend.clone());
+    match serde_json::to_string(devices) {
+        Ok(json) => {
+            if let Err(e) = repo.set(DISCOVERED_DLNA_KEY, &json) {
+                warn!(error = %e, "discovered_dlna_persist_failed");
+            }
+        }
+        Err(e) => warn!(error = %e, "discovered_dlna_serialize_failed"),
+    }
+}
+
+/// Persist (upsert by uuid) an auto-discovered DLNA renderer so it can be
+/// re-probed after a restart. Called from the SSDP discovery path once a
+/// renderer with a LOCATION is registered. Skips the settings write when
+/// nothing changed, so a chatty `ssdp:alive` stream costs nothing.
+pub fn persist_discovered_dlna(
+    backend: &Arc<dyn DbBackend>,
+    uuid: &str,
+    location: &str,
+    name: &str,
+    host: &str,
+    port: u16,
+) {
+    let mut devices = load_discovered_dlna(backend);
+    if devices
+        .iter()
+        .any(|d| d.uuid == uuid && d.location == location && d.name == name && d.host == host)
+    {
+        return;
+    }
+    devices.retain(|d| d.uuid != uuid);
+    devices.push(DiscoveredDlnaDevice {
+        uuid: uuid.to_string(),
+        location: location.to_string(),
+        name: name.to_string(),
+        host: host.to_string(),
+        port,
+    });
+    save_discovered_dlna(backend, &devices);
+}
+
+/// Re-probe every persisted auto-discovered DLNA renderer at startup (mirrors
+/// [`reregister_manual_devices`]). Each runs in its own task with backoff so a
+/// briefly-unreachable device neither blocks the others nor delays boot.
+pub async fn reprobe_persisted_dlna_devices(state: &AppState) {
+    let devices = load_discovered_dlna(&state.backend);
+    if devices.is_empty() {
+        return;
+    }
+    info!(count = devices.len(), "reprobing_discovered_dlna_devices");
+    for dev in devices {
+        let state = state.clone();
+        tokio::spawn(async move { reprobe_dlna_with_backoff(&state, dev).await });
+    }
+}
+
+async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) {
+    let mut delay = REREGISTER_BASE_DELAY;
+    for attempt in 1..=REREGISTER_MAX_ATTEMPTS {
+        match register_discovered_dlna(state, &dev).await {
+            Ok(name) => {
+                info!(uuid = %dev.uuid, name = %name, attempt, "discovered_dlna_reprobed");
+                return;
+            }
+            Err(e) if attempt == REREGISTER_MAX_ATTEMPTS => {
+                warn!(uuid = %dev.uuid, host = %dev.host, attempts = attempt, error = %e, "discovered_dlna_reprobe_gave_up");
+                return;
+            }
+            Err(e) => {
+                warn!(uuid = %dev.uuid, host = %dev.host, attempt, retry_in_s = delay.as_secs(), error = %e, "discovered_dlna_reprobe_retry");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(REREGISTER_MAX_DELAY);
+            }
+        }
+    }
+}
+
+/// Probe a persisted DLNA renderer at its stored LOCATION and, if the
+/// descriptor's UUID still matches, register the output + re-attach its zone.
+async fn register_discovered_dlna(
+    state: &AppState,
+    dev: &DiscoveredDlnaDevice,
+) -> Result<String, String> {
+    let desc = fetch_device_description(&dev.location)
+        .await
+        .map_err(|e| format!("cannot fetch DLNA description from {}: {e}", dev.location))?;
+    if !desc.is_media_renderer() {
+        return Err(format!(
+            "{} is no longer a DLNA Media Renderer",
+            dev.location
+        ));
+    }
+    // Guard against IP/LOCATION reuse by another device: only re-attach when the
+    // descriptor's UUID still matches the one we persisted.
+    if desc.udn != dev.uuid {
+        return Err(format!(
+            "UUID mismatch at {}: descriptor '{}' != persisted '{}'",
+            dev.location, desc.udn, dev.uuid
+        ));
+    }
+    let service_urls = desc.service_urls();
+    let (Some(av), Some(rc)) = (
+        service_urls.get("avtransport"),
+        service_urls.get("renderingcontrol"),
+    ) else {
+        return Err("media renderer missing AVTransport or RenderingControl".to_string());
+    };
+    let base = format!("http://{}:{}", dev.host, dev.port);
+    let device_name = if dev.name.is_empty() {
+        format!("DLNA {}", dev.host)
+    } else {
+        dev.name.clone()
+    };
+    let delay =
+        crate::config::resolve_play_delay(&state.backend, &state.config, &dev.uuid, &device_name);
+    let cm_url = service_urls
+        .get("connectionmanager")
+        .or_else(|| service_urls.get("ConnectionManager"))
+        .map(|p| format!("{base}{p}"));
+    let dlna = DlnaOutput::new(
+        device_name.clone(),
+        dev.uuid.clone(),
+        dev.host.clone(),
+        format!("{base}{av}"),
+        format!("{base}{rc}"),
+        cm_url,
+    )
+    .with_play_delay(delay);
+    // Registry is keyed by device_id (the uuid): a later multicast discovery
+    // replaces this entry rather than duplicating it.
+    state.outputs.lock().await.register(Box::new(dlna));
+    let _ = ensure_zone(state, &device_name, "dlna", &dev.uuid);
+    // Drive auto_resume: it waits on `device.reconnected` to resume a zone that
+    // was playing before the restart — the multicast path may never fire for a
+    // lazy SSDP responder, which is the whole point of #1126.
+    state.event_bus.emit(
+        "device.reconnected",
+        json!({ "device_id": &dev.uuid, "name": &device_name, "host": &dev.host }),
+    );
+    Ok(device_name)
 }
 
 async fn add_device(
