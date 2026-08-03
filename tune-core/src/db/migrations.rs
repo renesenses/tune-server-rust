@@ -787,6 +787,15 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
 );
 ",
     },
+    // Alarm ownership (chantier 2 / C2): which profile a scheduled alarm belongs
+    // to, so its playback is tagged to that person's listening history. Nullable
+    // — legacy alarms have no owner and stay NULL (never guessed). Applied via
+    // add_column_if_missing below for idempotency.
+    Migration {
+        version: 64,
+        name: "add_alarms_profile_id",
+        up: "", // Applied programmatically (idempotent add_column_if_missing).
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1335,6 +1344,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 62 {
             merge_albums_split_by_quality(db);
+        }
+        if migration.version == 64 {
+            add_column_if_missing(db, "alarms", "profile_id", "INTEGER");
         }
 
         db.execute(
