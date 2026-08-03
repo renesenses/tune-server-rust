@@ -111,6 +111,7 @@ pub(super) async fn rebuild_fts(State(state): State<AppState>) -> impl IntoRespo
 }
 
 pub(super) async fn export_database(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());

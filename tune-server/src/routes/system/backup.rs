@@ -31,6 +31,7 @@ pub(super) async fn create_backup(State(state): State<AppState>) -> impl IntoRes
 }
 
 pub(super) async fn restore_backup(
+    _admin: crate::auth::RequireAdmin,
     State(_state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {

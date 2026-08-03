@@ -126,7 +126,10 @@ pub(super) async fn update_check() -> Json<Value> {
 /// Validates that an update is available, then spawns the download/extract/install
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
-pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn update_install(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();

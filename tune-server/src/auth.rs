@@ -467,6 +467,46 @@ impl OptionalFromRequestParts<AppState> for AuthUser {
     }
 }
 
+/// Extractor that requires an **admin** caller for privileged operations
+/// (library wipe, config mutation, backup restore, DB export, restart,
+/// self-update, …). The JWT already carries a role, but no business route
+/// checked it — any valid token could hit these. This closes that (audit
+/// item 4, RBAC).
+///
+/// When auth is disabled the server is fully open (first-run / trusted LAN by
+/// choice), so this passes through — consistent with the rest of the auth
+/// model, which only enforces once auth is enabled. When enabled, a non-admin
+/// token gets 403 and a missing/invalid token 401.
+pub struct RequireAdmin;
+
+impl FromRequestParts<AppState> for RequireAdmin {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let auth_enabled = settings
+            .get("auth_enabled")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if !auth_enabled {
+            return Ok(RequireAdmin);
+        }
+        match AuthUser::from_request_parts(parts, state).await {
+            Ok(user) if user.role == "admin" => Ok(RequireAdmin),
+            Ok(_) => Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin role required"})),
+            )),
+            Err(rejection) => Err(rejection),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auth routes
 // ---------------------------------------------------------------------------

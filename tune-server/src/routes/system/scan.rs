@@ -1231,7 +1231,10 @@ pub(super) async fn set_scan_schedule(
     Json(json!({ "enabled": body.enabled, "time": body.time }))
 }
 
-pub(super) async fn library_clear(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn library_clear(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     match repo.delete_all() {
         Ok(count) => {
