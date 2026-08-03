@@ -21,10 +21,51 @@ pub fn router() -> Router<AppState> {
         )
         .route("/presets/{id}/activate", post(activate_preset))
         .route("/bands", get(get_bands).post(set_bands))
+        .route(
+            "/expert-settings",
+            get(get_expert_settings).post(set_expert_settings),
+        )
         // Advanced EQ routes
         .route("/parametric", get(get_parametric).post(set_parametric))
         .route("/graphic", get(get_graphic).post(set_graphic))
         .route("/room-correction", post(apply_room_correction))
+}
+
+/// Résolution du mode Expert (nombre de bandes de l'égaliseur graphique).
+/// Stockée SERVEUR — pas dans le navigateur — pour que web, iPad et mobile
+/// partagent la même grille. Valeurs : 10 (octave), 15 (2/3), 31 (1/3 ISO).
+const EQ_EXPERT_BAND_CHOICES: [u32; 3] = [10, 15, 31];
+
+async fn get_expert_settings(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let bands = settings
+        .get("eq_expert_bands")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| EQ_EXPERT_BAND_CHOICES.contains(n))
+        .unwrap_or(10);
+    Json(json!({ "expert_bands": bands }))
+}
+
+#[derive(Deserialize)]
+struct ExpertSettingsBody {
+    expert_bands: u32,
+}
+
+async fn set_expert_settings(
+    State(state): State<AppState>,
+    Json(body): Json<ExpertSettingsBody>,
+) -> Result<Json<Value>, AppError> {
+    if !EQ_EXPERT_BAND_CHOICES.contains(&body.expert_bands) {
+        return Err(AppError::bad_request(format!(
+            "expert_bands doit être 10, 15 ou 31 (reçu {})",
+            body.expert_bands
+        )));
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("eq_expert_bands", &body.expert_bands.to_string())?;
+    Ok(Json(json!({ "expert_bands": body.expert_bands })))
 }
 
 fn load_presets(state: &AppState) -> Vec<Value> {
