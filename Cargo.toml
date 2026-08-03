@@ -10,7 +10,9 @@ resolver = "2"
 [workspace.package]
 version = "0.9.41"
 edition = "2024"
-license = "MIT"
+# Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
+# old value misdeclared far broader rights to audit/SBOM tools (issue #1147).
+license = "BUSL-1.1"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
 repository = "https://github.com/renesenses/tune-server-rust"
 

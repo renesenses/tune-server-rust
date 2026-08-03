@@ -488,9 +488,19 @@ async fn set_queue_retrying(
 
 async fn play(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     body: Option<Json<PlayRequest>>,
 ) -> impl IntoResponse {
+    // A user-initiated play starts (or takes over) the listening session on
+    // this zone: stamp the caller's profile so record_listen — and every
+    // autoplay / gapless advance that inherits it — tags listen_history to the
+    // right person. Transport (next/previous/resume) reuses this owner; after a
+    // restart the in-memory session resets to None → NULL until the next play.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     // When called with an empty body (e.g. Play after Stop), resume the
     // current track instead of returning 400 "no track source specified".
     let body = match body {
@@ -2110,6 +2120,7 @@ struct CreateAlarm {
 
 async fn create_alarm(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<CreateAlarm>,
 ) -> impl IntoResponse {
@@ -2118,9 +2129,10 @@ async fn create_alarm(
     let source_type = body.source_type.unwrap_or_else(|| "playlist".into());
     let volume = body.volume.unwrap_or(0.3);
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
+    let profile_id = profile.id();
     match state.backend.execute(
-        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue],
+        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
         Ok(_) => {
             let id = state.backend.last_insert_rowid();

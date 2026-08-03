@@ -787,6 +787,15 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
 );
 ",
     },
+    // Alarm ownership (chantier 2 / C2): which profile a scheduled alarm belongs
+    // to, so its playback is tagged to that person's listening history. Nullable
+    // — legacy alarms have no owner and stay NULL (never guessed). Applied via
+    // add_column_if_missing below for idempotency.
+    Migration {
+        version: 64,
+        name: "add_alarms_profile_id",
+        up: "", // Applied programmatically (idempotent add_column_if_missing).
+    },
     // A streaming album's own track/disc numbers were lost once enqueued: the
     // unified queue stored `position` but not the album's numbering, so a
     // multi-disc streaming album showed disc 2 continuing at 25,26… instead of
@@ -794,7 +803,7 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
     // NULL on every pre-existing row and on local items (which read the numbers
     // from the joined `tracks` row), so nothing else changes.
     Migration {
-        version: 64,
+        version: 65,
         name: "add_queue_item_track_disc_number",
         up: "", // Applied programmatically via add_column_if_missing (idempotent).
     },
@@ -1348,6 +1357,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             merge_albums_split_by_quality(db);
         }
         if migration.version == 64 {
+            add_column_if_missing(db, "alarms", "profile_id", "INTEGER");
+        }
+        if migration.version == 65 {
             // Per-album numbering for streaming queue items — see the migration's
             // comment. add_column_if_missing keeps this a no-op on a fresh DB
             // (CORE_SCHEMA already carries the columns) and safe on partial re-runs.
