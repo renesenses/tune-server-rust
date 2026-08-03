@@ -545,7 +545,9 @@ pub async fn reregister_known_renderers(state: &AppState) {
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
 ///
 /// Returns the `MdnsScanner` handle (must be kept alive for the scanner to keep running).
-pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns::MdnsScanner> {
+pub fn spawn_mdns_handler(
+    state: &AppState,
+) -> Option<std::sync::Arc<tune_core::discovery::mdns::MdnsScanner>> {
     let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
     let handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
         let mut mdns = mdns
@@ -553,7 +555,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
             .with_airplay()
             .with_bluos()
             .with_oaat()
-            .with_squeezebox();
+            .with_squeezebox()
+            // Browse peer Tune servers too, so this server can list the other
+            // Tune servers on the network (#1273). Each server already announces
+            // itself via `register_self`; without this it never browsed back.
+            .with_tune_peers();
         if let Err(e) = mdns.start() {
             tracing::warn!(error = %e, "mdns_start_failed");
         }
@@ -564,6 +570,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
         if let Err(e) = mdns.register_self(port, tune_core::version()) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
         }
+        // Publish the scanner so routes (`/peers`, `/system/discover-servers`)
+        // can list the discovered peers. AppState keeps it alive for the whole
+        // process, so the returned handle is a convenience clone only.
+        let mdns = std::sync::Arc::new(mdns);
+        *state.mdns_scanner.lock().unwrap() = Some(mdns.clone());
         Some(mdns)
     } else {
         None
