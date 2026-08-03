@@ -195,8 +195,8 @@ fn spawn_paced_levels_forwarder(
             // ~5 s de staging sur un 24/192 en passthrough), on émet sans
             // attendre jusqu'à recoller à ~1 s. Borné par construction : le
             // retard vaut quelques secondes de fenêtres, pas la piste entière.
-            let lagging = reported_advancing
-                && (position.as_millis() as i64) < reported_position_ms - 1_000;
+            let lagging =
+                reported_advancing && (position.as_millis() as i64) < reported_position_ms - 1_000;
             if lagging {
                 // Fenêtre du passé audible : personne n'en veut — ni le tap
                 // ni les clients. On la saute sans l'émettre (l'émettre en
@@ -299,7 +299,10 @@ struct LevelsPrewarmScope<'a> {
 
 impl Drop for LevelsPrewarmScope<'_> {
     fn drop(&mut self) {
-        self.set.lock().expect("levels_prewarm lock").remove(&self.zone_id);
+        self.set
+            .lock()
+            .expect("levels_prewarm lock")
+            .remove(&self.zone_id);
     }
 }
 
@@ -515,7 +518,10 @@ impl PlaybackOrchestrator {
             .lock()
             .expect("levels_prewarm lock")
             .insert(zone_id);
-        LevelsPrewarmScope { set: &self.levels_prewarm, zone_id }
+        LevelsPrewarmScope {
+            set: &self.levels_prewarm,
+            zone_id,
+        }
     }
 
     /// Faut-il attacher un forwarder de niveaux aux sessions de cette zone ?
