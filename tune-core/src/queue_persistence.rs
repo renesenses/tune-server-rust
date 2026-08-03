@@ -239,6 +239,9 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
                         album: it.album_title.clone(),
                         cover_url: it.cover_url.clone(),
                         duration_ms: it.duration_ms,
+                        // Snapshot items don't carry per-album numbering.
+                        track_number: None,
+                        disc_number: None,
                     });
                 }
             }
@@ -257,6 +260,9 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
                     album: t.album_title.clone(),
                     cover_url: t.cover_url.clone(),
                     duration_ms: t.duration_ms,
+                    // Legacy streaming snapshot entries carry no track/disc number.
+                    track_number: None,
+                    disc_number: None,
                 });
             }
         }
@@ -480,6 +486,8 @@ mod tests {
                     album: None,
                     cover_url: None,
                     duration_ms: 100,
+                    track_number: None,
+                    disc_number: None,
                 },
             ],
         )

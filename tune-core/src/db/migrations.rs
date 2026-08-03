@@ -787,6 +787,17 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
 );
 ",
     },
+    // A streaming album's own track/disc numbers were lost once enqueued: the
+    // unified queue stored `position` but not the album's numbering, so a
+    // multi-disc streaming album showed disc 2 continuing at 25,26… instead of
+    // restarting at 1. Persist them alongside the inline streaming metadata.
+    // NULL on every pre-existing row and on local items (which read the numbers
+    // from the joined `tracks` row), so nothing else changes.
+    Migration {
+        version: 64,
+        name: "add_queue_item_track_disc_number",
+        up: "", // Applied programmatically via add_column_if_missing (idempotent).
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1335,6 +1346,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 62 {
             merge_albums_split_by_quality(db);
+        }
+        if migration.version == 64 {
+            // Per-album numbering for streaming queue items — see the migration's
+            // comment. add_column_if_missing keeps this a no-op on a fresh DB
+            // (CORE_SCHEMA already carries the columns) and safe on partial re-runs.
+            add_column_if_missing(db, "queue_items", "track_number", "INTEGER");
+            add_column_if_missing(db, "queue_items", "disc_number", "INTEGER");
         }
 
         db.execute(

@@ -666,6 +666,8 @@ async fn play(
                     t.cover_path.clone(),
                     t.duration_ms as i64,
                     Some(source.clone()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
                 )
             })
             .collect();
@@ -764,6 +766,8 @@ async fn play(
                     t.cover_path.clone(),
                     t.duration_ms as i64,
                     Some(source.clone()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
                 )
             })
             .collect();
@@ -895,6 +899,9 @@ async fn play(
                             album: album_val,
                             cover_url: cover_val,
                             duration_ms: duration_val,
+                            // Single-track play request carries no album numbering.
+                            track_number: None,
+                            disc_number: None,
                         }],
                     ) {
                         warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -1533,6 +1540,9 @@ async fn queue_add(
             album,
             cover_url: cover,
             duration_ms: duration,
+            // The queue-add request has no track/disc fields.
+            track_number: None,
+            disc_number: None,
         });
     }
 
@@ -1557,6 +1567,9 @@ async fn queue_add(
             album,
             cover_url: cover,
             duration_ms: duration,
+            // Batch streaming items carry no track/disc number.
+            track_number: None,
+            disc_number: None,
         });
     }
 
@@ -1958,15 +1971,7 @@ async fn do_transfer(
         .get_streaming_queue(from_zone)
         .unwrap_or_default();
     if !streaming_items.is_empty() {
-        let tracks: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )> = streaming_items
+        let tracks: Vec<tune_core::db::play_queue_repo::StreamingQueueItem> = streaming_items
             .iter()
             .map(|item| {
                 (
@@ -1977,6 +1982,8 @@ async fn do_transfer(
                     item["cover_path"].as_str().map(String::from),
                     item["duration_ms"].as_i64().unwrap_or(0),
                     item["source"].as_str().map(String::from),
+                    item["track_number"].as_i64(),
+                    item["disc_number"].as_i64(),
                 )
             })
             .collect();

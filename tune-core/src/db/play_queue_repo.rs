@@ -121,7 +121,7 @@ pub mod sql {
 
     pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -130,13 +130,15 @@ pub mod sql {
             d.placeholder(6),
             d.placeholder(7),
             d.placeholder(8),
-            d.placeholder(9)
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11)
         )
     }
 
     pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
             d.placeholder(1)
         )
     }
@@ -185,7 +187,8 @@ pub mod sql {
                 COALESCE(t.title, q.title), COALESCE(ar.name, q.artist), \
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
-                COALESCE(al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth \
+                COALESCE(al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
+                q.track_number, q.disc_number \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \
          LEFT JOIN albums al ON t.album_id = al.id \
@@ -307,6 +310,24 @@ pub struct QueueItem {
     pub bit_depth: Option<i64>,
 }
 
+/// One streaming item for the legacy tuple-based enqueue API
+/// (`set_streaming_queue` / `append_streaming_queue` / `persist_streaming_queue`):
+/// `(source_id, title, artist, album, cover_url, duration_ms, source,
+/// track_number, disc_number)`. The trailing `track_number`/`disc_number` carry
+/// the album's own numbering so multi-disc streaming albums stay distinguishable
+/// in the queue (#1062); pass `None` when the source has no numbering.
+pub type StreamingQueueItem = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
 /// A queue row in the unified single-position-space model. Unlike `QueueItem`
 /// (local-only, `track_id: i64`), this represents BOTH local and streaming
 /// items: `track_id`/`file_path` are set for local, `source_id` for streaming,
@@ -329,6 +350,12 @@ pub struct QueueEntry {
     pub format: Option<String>,
     pub sample_rate: Option<i64>,
     pub bit_depth: Option<i64>,
+    /// Album track number (streaming items only; local items read it from the
+    /// joined `tracks` row). NULL for pre-existing rows and local items.
+    pub track_number: Option<i64>,
+    /// Album disc number (streaming items only). NULL for pre-existing rows and
+    /// local items. Lets multi-disc streaming albums keep per-disc numbering.
+    pub disc_number: Option<i64>,
 }
 
 impl QueueEntry {
@@ -351,6 +378,8 @@ pub enum QueueInput {
         album: Option<String>,
         cover_url: Option<String>,
         duration_ms: i64,
+        track_number: Option<i64>,
+        disc_number: Option<i64>,
     },
 }
 
@@ -650,8 +679,10 @@ impl PlayQueueRepo {
                         album,
                         cover_url,
                         duration_ms,
+                        track_number,
+                        disc_number,
                     } => {
-                        let p: [&dyn ToSqlValue; 9] = [
+                        let p: [&dyn ToSqlValue; 11] = [
                             &zone_id,
                             &pos,
                             source_id,
@@ -661,6 +692,8 @@ impl PlayQueueRepo {
                             cover_url,
                             duration_ms,
                             source,
+                            track_number,
+                            disc_number,
                         ];
                         tx.execute(&insert_streaming_sql, &p)?;
                     }
@@ -748,19 +781,10 @@ impl PlayQueueRepo {
         })
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn set_streaming_queue(
         &self,
         zone_id: i64,
-        tracks: &[(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )],
+        tracks: &[StreamingQueueItem],
     ) -> Result<(), String> {
         let delete_local_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
@@ -769,11 +793,13 @@ impl PlayQueueRepo {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             tx.execute(&delete_local_sql, &p)?;
             tx.execute(&delete_streaming_sql, &p)?;
-            for (i, (source_id, title, artist, album, cover_url, duration_ms, source)) in
-                tracks.iter().enumerate()
+            for (
+                i,
+                (source_id, title, artist, album, cover_url, duration_ms, source, track_no, disc_no),
+            ) in tracks.iter().enumerate()
             {
                 let pos = i as i64;
-                let p: [&dyn ToSqlValue; 9] = [
+                let p: [&dyn ToSqlValue; 11] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -783,6 +809,8 @@ impl PlayQueueRepo {
                     cover_url,
                     duration_ms,
                     source,
+                    track_no,
+                    disc_no,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -794,26 +822,20 @@ impl PlayQueueRepo {
     pub fn append_streaming_queue(
         &self,
         zone_id: i64,
-        tracks: &[(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )],
+        tracks: &[StreamingQueueItem],
     ) -> Result<(), String> {
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
         // Get current count to compute starting position for new items
         let current_count = self.count_streaming(zone_id).unwrap_or(0);
 
         self.db.write_tx(&mut |tx| {
-            for (i, (source_id, title, artist, album, cover_url, duration_ms, source)) in
-                tracks.iter().enumerate()
+            for (
+                i,
+                (source_id, title, artist, album, cover_url, duration_ms, source, track_no, disc_no),
+            ) in tracks.iter().enumerate()
             {
                 let pos = current_count + i as i64;
-                let p: [&dyn ToSqlValue; 9] = [
+                let p: [&dyn ToSqlValue; 11] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -823,6 +845,8 @@ impl PlayQueueRepo {
                     cover_url,
                     duration_ms,
                     source,
+                    track_no,
+                    disc_no,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -846,6 +870,8 @@ impl PlayQueueRepo {
                     "duration_ms": cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
                     "position": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
                     "source": cols.get(7).and_then(|v| v.as_string()),
+                    "track_number": cols.get(8).and_then(|v| v.as_i64()),
+                    "disc_number": cols.get(9).and_then(|v| v.as_i64()),
                 })
             })
             .collect();
@@ -892,7 +918,7 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
     }
 }
 
-/// Maps a row from `sql::unified_select_base()` (16 columns) to a QueueEntry.
+/// Maps a row from `sql::unified_select_base()` (18 columns) to a QueueEntry.
 fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
     QueueEntry {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -911,6 +937,8 @@ fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
         format: cols.get(13).and_then(|v| v.as_string()),
         sample_rate: cols.get(14).and_then(|v| v.as_i64()),
         bit_depth: cols.get(15).and_then(|v| v.as_i64()),
+        track_number: cols.get(16).and_then(|v| v.as_i64()),
+        disc_number: cols.get(17).and_then(|v| v.as_i64()),
     }
 }
 
@@ -979,6 +1007,8 @@ mod tests {
                     None,
                     200_000,
                     None,
+                    None,
+                    None,
                 ),
                 (
                     "qobuz".into(),
@@ -987,6 +1017,8 @@ mod tests {
                     None,
                     None,
                     200_000,
+                    None,
+                    None,
                     None,
                 ),
             ],
@@ -1150,6 +1182,8 @@ mod tests {
         let db = test_db();
         let repo = PlayQueueRepo::new(db);
 
+        // Song 1 = disc 1 / track 1, Song 2 = disc 2 / track 1: a multi-disc album
+        // whose per-disc numbering must survive the queue round-trip (#1062).
         let tracks = vec![
             (
                 "src-1".into(),
@@ -1159,6 +1193,8 @@ mod tests {
                 Some("http://cover1.jpg".into()),
                 300_000i64,
                 Some("tidal".into()),
+                Some(1),
+                Some(1),
             ),
             (
                 "src-2".into(),
@@ -1168,6 +1204,8 @@ mod tests {
                 None,
                 250_000i64,
                 Some("tidal".into()),
+                Some(1),
+                Some(2),
             ),
         ];
 
@@ -1178,9 +1216,15 @@ mod tests {
         assert_eq!(queue[0]["artist_name"], "Artist 1");
         assert_eq!(queue[0]["duration_ms"], 300_000);
         assert_eq!(queue[0]["source"], "tidal");
+        // #1062: the album's own track/disc numbers are persisted and read back,
+        // so disc 2 track 1 stays "1 / disc 2", not conflated with `position`.
+        assert_eq!(queue[0]["track_number"], 1);
+        assert_eq!(queue[0]["disc_number"], 1);
         assert_eq!(queue[1]["title"], "Song 2");
         assert!(queue[1]["album_title"].is_null());
         assert_eq!(queue[1]["source"], "tidal");
+        assert_eq!(queue[1]["track_number"], 1);
+        assert_eq!(queue[1]["disc_number"], 2);
     }
 
     #[test]
@@ -1196,6 +1240,8 @@ mod tests {
             None,
             100_000i64,
             Some("qobuz".into()),
+            None,
+            None,
         )];
         repo.set_streaming_queue(1, &tracks1).unwrap();
 
@@ -1207,6 +1253,8 @@ mod tests {
             None,
             200_000i64,
             Some("tidal".into()),
+            None,
+            None,
         )];
         repo.set_streaming_queue(1, &tracks2).unwrap();
 
@@ -1238,6 +1286,8 @@ mod tests {
                 None,
                 123_000i64,
                 Some("tidal".into()),
+                None,
+                None,
             )],
         )
         .unwrap();
@@ -1313,7 +1363,11 @@ mod tests {
         let p = PostgresDialect;
         assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?, 'local')"));
         assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4, 'local')"));
-        assert!(sql::insert_streaming(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(sql::insert_streaming(&p)
+            .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        // The new per-album numbering columns must ride along the streaming insert.
+        assert!(sql::insert_streaming(&s).contains("track_number"));
+        assert!(sql::insert_streaming(&s).contains("disc_number"));
         assert!(sql::get_queue(&s).contains("queue_items"));
         assert!(sql::select_streaming(&s).contains("track_id IS NULL"));
     }
@@ -1377,6 +1431,8 @@ mod tests {
             album: Some("Album".into()),
             cover_url: None,
             duration_ms: 200_000,
+            track_number: None,
+            disc_number: None,
         }
     }
 
