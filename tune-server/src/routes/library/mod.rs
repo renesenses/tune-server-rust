@@ -40,7 +40,15 @@ pub(super) const API_CACHE_TTL_SECS: i64 = 86400; // 24 hours
 /// Body limit for a drag-and-dropped album on `/ingest/upload`. Sized for a
 /// hi-res or DSD release, which a 50 MB default would refuse outright. The
 /// handler streams each part to disk, so this bounds the request, not memory.
-const INGEST_UPLOAD_LIMIT: usize = 8 * 1024 * 1024 * 1024;
+///
+/// `saturating_mul` keeps this const-evaluable on 32-bit targets (Android
+/// armv7): 8 GiB overflows a 32-bit `usize`, so there it caps at `usize::MAX`
+/// (~4 GiB) — ample for any upload a 32-bit device could handle — while 64-bit
+/// targets get the full 8 GiB unchanged.
+const INGEST_UPLOAD_LIMIT: usize = 8usize
+    .saturating_mul(1024)
+    .saturating_mul(1024)
+    .saturating_mul(1024);
 
 pub(super) fn api_cache_get(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,

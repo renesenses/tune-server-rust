@@ -56,6 +56,11 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], 
 # rustls version reqwest resolves (0.23).
 rustls = "0.23"
 webpki-roots = "0.26"
+# Real OS hostname (gethostname(2)) for network identity — mDNS instance name +
+# peer-info name. Env HOSTNAME/COMPUTERNAME is unset under systemd, so the old
+# env-only derivation collided every instance on "tune-server" (#1112, #1127).
+# Already in the lockfile transitively, so this is a near-free direct dep.
+hostname = "0.4"
 # Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
 # behind the `plugins-wasm` feature so the default server build is unchanged.
 # default-features trimmed to compiler + runtime + WAT parsing; no async,
