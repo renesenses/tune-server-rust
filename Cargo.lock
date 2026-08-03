@@ -5011,6 +5011,7 @@ dependencies = [
  "csv",
  "flate2",
  "futures-util",
+ "hostname",
  "if-addrs 0.13.4",
  "libc",
  "lofty",
