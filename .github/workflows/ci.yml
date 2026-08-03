@@ -206,12 +206,13 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
+    # advisories that forced continue-on-error are fixed (bump to 47.0.3).
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
         with:
-          # Low-severity wasmtime advisories in the WASM plugin engine (only
-          # first-party plugins are loaded; no drop-in bump today). Kept in sync
-          # with deny.toml's [advisories] ignore. Revisit at the next wasmtime bump.
-          ignore: RUSTSEC-2026-0222,RUSTSEC-2026-0223
+          # Only the unmaintained-warning advisories with no available fix are
+          # ignored (paste, instant — transitive, no runtime path). Kept in sync
+          # with deny.toml. Every vulnerability, wasmtime included, now blocks.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384

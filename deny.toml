@@ -17,13 +17,8 @@ ignore = [
     # instant 0.1 — unmaintained (RUSTSEC-2024-0384), superseded by web-time.
     # Transitive only. No vulnerability; a native build never hits its wasm path.
     "RUSTSEC-2024-0384",
-    # wasmtime — two low-severity advisories (RUSTSEC-2026-0222 CVSS 3.8,
-    # RUSTSEC-2026-0223 CVSS 2.0) in the WASM plugin engine. Both require an
-    # attacker-controlled module; Tune only loads first-party plugins in the
-    # sandbox, and there is no drop-in wasmtime bump today. Revisit at the next
-    # wasmtime upgrade.
-    "RUSTSEC-2026-0222",
-    "RUSTSEC-2026-0223",
+    # NOTE: the wasmtime advisories RUSTSEC-2026-0222/0223 were resolved by the
+    # bump to wasmtime 47.0.3 and are no longer ignored.
 ]
 
 [licenses]

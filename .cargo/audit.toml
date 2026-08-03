@@ -2,12 +2,7 @@
 # and the CI cargo-audit step. The release preflight runs bare `cargo audit`,
 # which reads THIS file (not deny.toml), so the allowlist must live here too.
 [advisories]
-ignore = [
-    # wasmtime — two low-severity advisories (RUSTSEC-2026-0222 CVSS 3.8,
-    # RUSTSEC-2026-0223 CVSS 2.0) in the WASM plugin engine. Both require an
-    # attacker-controlled module; Tune only loads first-party plugins in the
-    # sandbox, and there is no drop-in wasmtime bump today. Revisit at the next
-    # wasmtime upgrade. (Completes #1066, which missed the preflight path.)
-    "RUSTSEC-2026-0222",
-    "RUSTSEC-2026-0223",
-]
+# The wasmtime advisories RUSTSEC-2026-0222/0223 were fixed by bumping wasmtime
+# to 47.0.3 (the "no drop-in bump" excuse no longer holds), so the ignore list
+# is empty again — cargo audit now blocks on any new advisory.
+ignore = []
