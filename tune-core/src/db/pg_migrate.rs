@@ -691,6 +691,9 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
 
+-- alarms: owning profile (SQLite migration v64)
+ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
+
 -- zones: playback state + DLNA/DSD flags (SQLite migrations v36/v38/v39/v40/v50
 -- and the post-migration safety pass: alac_passthrough / dlna_lpcm /
 -- dlna_cap_16bit / host)
