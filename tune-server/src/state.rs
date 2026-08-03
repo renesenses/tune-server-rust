@@ -55,6 +55,12 @@ pub struct AppState {
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
+    /// mDNS scanner handle, populated by
+    /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
+    /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
+    /// servers it browses on `_tune-server._tcp` (#1273). `None` until the mDNS
+    /// daemon starts, or if it failed to start.
+    pub mdns_scanner: Arc<std::sync::Mutex<Option<Arc<tune_core::discovery::mdns::MdnsScanner>>>>,
     pub license: Arc<tune_core::license::LicenseManager>,
     pub skin_manager: Arc<tune_core::skins::SkinManager>,
     /// Compiled-in plugins. Empty until [`crate::plugins::init`] runs, which
@@ -228,6 +234,7 @@ impl AppState {
             update_phase: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
+            mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             license,
             skin_manager,
             plugins,
@@ -238,6 +245,45 @@ impl AppState {
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })
+    }
+
+    /// Peer Tune servers discovered on the LAN via mDNS (`_tune-server._tcp`).
+    ///
+    /// Reads the live mDNS scanner (populated by
+    /// [`crate::discovery_setup::spawn_mdns_handler`], which browses peers tagged
+    /// [`OutputType::Local`]) and drops our own advertisement. Returns an empty
+    /// list before discovery starts or when multicast is blocked (Docker macvlan,
+    /// Windows firewall) — the manually-added peer list (`/system/peers`) is the
+    /// robust fallback for those networks. Shared by `/peers` and
+    /// `/system/discover-servers`.
+    pub async fn discovered_tune_peers(&self) -> Vec<serde_json::Value> {
+        use tune_core::discovery::device::OutputType;
+        let scanner = { self.mdns_scanner.lock().unwrap().clone() };
+        let Some(scanner) = scanner else {
+            return Vec::new();
+        };
+        let self_ip = tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string());
+        scanner
+            .devices()
+            .await
+            .into_iter()
+            .filter(|d| d.device_type == OutputType::Local)
+            .filter(|d| self_ip.as_deref() != Some(d.host.as_str()))
+            .map(|d| {
+                serde_json::json!({
+                    "id": d.id,
+                    "name": d.name,
+                    "host": d.host,
+                    "port": d.port,
+                    "available": d.available,
+                    "version": d
+                        .capabilities
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                })
+            })
+            .collect()
     }
 
     /// Build the appropriate `DbBackend` based on the selected engine.
