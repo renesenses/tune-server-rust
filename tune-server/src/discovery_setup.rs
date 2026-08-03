@@ -291,9 +291,7 @@ async fn handle_ssdp_discovered(
 
     // Persist this renderer so it can be re-probed directly at the next startup,
     // even if it never answers SSDP M-SEARCH again (#1126). Best-effort.
-    if registered
-        && let Some(location) = dev.location.as_deref()
-    {
+    if registered && let Some(location) = dev.location.as_deref() {
         persist_known_renderer(db, &dev.id, location, &dev.name);
     }
 
