@@ -5696,15 +5696,7 @@ impl PlaybackOrchestrator {
     pub fn persist_streaming_queue(
         &self,
         zone_id: i64,
-        tracks: &[(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )],
+        tracks: &[crate::db::play_queue_repo::StreamingQueueItem],
     ) {
         let repo = PlayQueueRepo::with_backend(self.db.clone());
         if let Err(e) = repo.set_streaming_queue(zone_id, tracks) {

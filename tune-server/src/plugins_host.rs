@@ -153,6 +153,8 @@ impl HostContext for AppStateHost {
                         .and_then(Value::as_str)
                         .map(String::from),
                     duration_ms: t.get("duration_ms").and_then(Value::as_i64).unwrap_or(0),
+                    track_number: t.get("track_number").and_then(Value::as_i64),
+                    disc_number: t.get("disc_number").and_then(Value::as_i64),
                 });
             }
         }

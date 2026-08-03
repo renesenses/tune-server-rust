@@ -461,7 +461,9 @@ CREATE TABLE IF NOT EXISTS queue_items (
     artist TEXT,
     album TEXT,
     cover_url TEXT,
-    duration_ms INTEGER DEFAULT 0
+    duration_ms INTEGER DEFAULT 0,
+    track_number INTEGER,
+    disc_number INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
