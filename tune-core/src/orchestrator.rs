@@ -18,6 +18,18 @@ const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transcode__";
 /// later, well outside this window; explicit seeks and stop→replay are exempt.
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// A public `play()` for the track ALREADY playing on a zone that arrives within
+/// this window of the track's start is treated as a redundant controller
+/// double-dispatch (a re-tap) and coalesced at the entry point — BEFORE any
+/// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
+/// catches an OVERLAPPING second play; when the second play arrives just AFTER
+/// the first fully established playback (sequential, a few seconds apart), that
+/// guard sees no overlap and lets it through, and the second `SetAVTransportURI`
+/// restarts a network renderer from byte 0 (Revox S100 "plays ~10s then jumps to
+/// 0" — #1271). Kept short so a deliberate replay of the same track — which
+/// lands far later — plays normally; a seek is exempt regardless.
+const RETAP_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
 /// concurrent plays, keyed by source path. A burst of play taps for a
 /// slow-to-decode NAS track otherwise kicks off one full transcode each
@@ -526,9 +538,76 @@ impl PlaybackOrchestrator {
         // dormant auto-discovered zones filled the quota AND closes the "play a
         // few zones at a time to stay free" loophole.
         self.enforce_zone_cap(req.zone_id).await?;
+
+        // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
+        // for the SAME track a few seconds apart. The first play already sent
+        // SetAVTransportURI + Play to the renderer; the second, arriving AFTER the
+        // first fully established playback (so the `superseded` play_seq guard in
+        // play_inner sees no overlap and lets it through), would send a SECOND
+        // SetAVTransportURI and restart a network renderer from byte 0 — the Revox
+        // S100 "plays ~10s then jumps to 0" (forum, Philippe Vella). If this
+        // request targets the track already playing on the zone and that track was
+        // (re)started within RETAP_DEDUP_WINDOW, coalesce it: return the current
+        // state WITHOUT re-resolving the source or re-sending to the renderer.
+        //
+        // This is complementary to the `superseded` (overlapping) and the
+        // last_net_play (post-resolve) guards in play_inner, both untouched.
+        // Safety of the exclusions:
+        //   - a play of a DIFFERENT track never matches (is_same_track_retap);
+        //   - a genuine replay of the same track after the window has an older
+        //     start timestamp, so it is NOT coalesced (plays from 0);
+        //   - an explicit seek is exempt (seek_ms > 0);
+        //   - stall recovery stops the zone first, so state != Playing here, and
+        //     auto-resume runs from a Stopped state — neither trips this guard.
+        if req.seek_ms.unwrap_or(0) == 0 {
+            let state = self.playback.get_state(req.zone_id).await;
+            if state.state == PlayState::Playing {
+                if let Some(np) = state.now_playing.as_ref() {
+                    let recent = state
+                        .last_play_started_at
+                        .map(|t| t.elapsed() < RETAP_DEDUP_WINDOW)
+                        .unwrap_or(false);
+                    if recent && Self::is_same_track_retap(np, &req) {
+                        info!(
+                            zone_id = req.zone_id,
+                            title = %np.title,
+                            source = %np.source,
+                            "orchestrator_play_retap_deduped_same_inflight_track"
+                        );
+                        return Ok(PlayResult {
+                            stream_url: None,
+                            output_sent: false,
+                            source: np.source.clone(),
+                            error: None,
+                        });
+                    }
+                }
+            }
+        }
+
         // Public entry point: this is a *new* logical play, so it is recorded
         // in the listen history.
         self.play_inner(req, true).await
+    }
+
+    /// Identity match for the re-tap dedup: is `req` targeting the SAME track the
+    /// zone's current `now_playing` (`np`) represents? Prefers the library
+    /// `track_id` when both sides carry one; otherwise matches a non-empty
+    /// streaming `(source, source_id)` — and if `req` names a `source` it must
+    /// agree with the now-playing source. Returns `false` when neither side
+    /// yields a positive identifier, so two unidentifiable plays never collide
+    /// (a false negative merely lets the normal play path run). Pure so it can be
+    /// unit-tested without a live orchestrator.
+    fn is_same_track_retap(np: &NowPlaying, req: &PlayRequest) -> bool {
+        if let (Some(a), Some(b)) = (np.track_id, req.track_id) {
+            return a == b;
+        }
+        match (&np.source_id, &req.source_id) {
+            (Some(a), Some(b)) if !a.is_empty() && a == b => {
+                req.source.as_deref().is_none_or(|s| s == np.source)
+            }
+            _ => false,
+        }
     }
 
     /// Free-tier gate: block *activating* a brand-new zone once the free active
@@ -6481,7 +6560,9 @@ mod tests {
     use crate::playback::{NowPlaying, PlayState, PlaybackManager};
     use crate::streaming::registry::ServiceRegistry;
 
-    use super::{PlaybackOrchestrator, passthrough_didl_duration_ms, use_file_transcode_for};
+    use super::{
+        PlayRequest, PlaybackOrchestrator, passthrough_didl_duration_ms, use_file_transcode_for,
+    };
 
     #[test]
     fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
@@ -6540,6 +6621,96 @@ mod tests {
         let mut map3: Map = HashMap::new();
         assert!(!f(&mut map3, 1, "tidal", &sid, t0));
         assert!(!f(&mut map3, 2, "tidal", &sid, t0));
+    }
+
+    #[test]
+    fn retap_identity_matches_same_track_only() {
+        // #1271 re-tap dedup identity predicate. Local library track: matches on
+        // track_id when both sides have one.
+        let np_local = NowPlaying {
+            track_id: Some(42),
+            source: "local".into(),
+            ..Default::default()
+        };
+        let same_local = PlayRequest {
+            track_id: Some(42),
+            ..Default::default()
+        };
+        let other_local = PlayRequest {
+            track_id: Some(43),
+            ..Default::default()
+        };
+        assert!(PlaybackOrchestrator::is_same_track_retap(
+            &np_local,
+            &same_local
+        ));
+        assert!(!PlaybackOrchestrator::is_same_track_retap(
+            &np_local,
+            &other_local
+        ));
+
+        // Streaming track: matches on (source, source_id) when there is no
+        // library track_id. A request that names the source must agree with it.
+        let np_stream = NowPlaying {
+            track_id: None,
+            source: "tidal".into(),
+            source_id: Some("tidal-123".into()),
+            ..Default::default()
+        };
+        let same_stream = PlayRequest {
+            source: Some("tidal".into()),
+            source_id: Some("tidal-123".into()),
+            ..Default::default()
+        };
+        // Web client omits `source` — still matches on the id alone.
+        let same_stream_no_src = PlayRequest {
+            source: None,
+            source_id: Some("tidal-123".into()),
+            ..Default::default()
+        };
+        let other_stream = PlayRequest {
+            source: Some("tidal".into()),
+            source_id: Some("tidal-999".into()),
+            ..Default::default()
+        };
+        // Same id but a DIFFERENT source (Qobuz vs Tidal) → not the same track.
+        let cross_source = PlayRequest {
+            source: Some("qobuz".into()),
+            source_id: Some("tidal-123".into()),
+            ..Default::default()
+        };
+        assert!(PlaybackOrchestrator::is_same_track_retap(
+            &np_stream,
+            &same_stream
+        ));
+        assert!(PlaybackOrchestrator::is_same_track_retap(
+            &np_stream,
+            &same_stream_no_src
+        ));
+        assert!(!PlaybackOrchestrator::is_same_track_retap(
+            &np_stream,
+            &other_stream
+        ));
+        assert!(!PlaybackOrchestrator::is_same_track_retap(
+            &np_stream,
+            &cross_source
+        ));
+
+        // Neither side yields a positive id → never a match (no false coalesce).
+        let np_bare = NowPlaying {
+            track_id: None,
+            source: "local".into(),
+            source_id: None,
+            ..Default::default()
+        };
+        let req_bare = PlayRequest {
+            track_id: None,
+            source_id: None,
+            ..Default::default()
+        };
+        assert!(!PlaybackOrchestrator::is_same_track_retap(
+            &np_bare, &req_bare
+        ));
     }
 
     #[test]
