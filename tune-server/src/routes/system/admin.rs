@@ -243,9 +243,10 @@ fn save_peers(state: &AppState, peers: &[PeerAddr]) {
 }
 
 fn local_hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "tune-server".into())
+    // Real OS hostname (shared helper) — the old env-only derivation collapsed
+    // to "tune-server" under systemd, so every peer advertised the same name and
+    // the "Tune servers on the network" list looked empty/duplicated (#1127).
+    tune_core::discovery::system_hostname()
 }
 
 fn zone_count(state: &AppState) -> i64 {
