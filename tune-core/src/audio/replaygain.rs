@@ -46,6 +46,15 @@ const IDLE_SLEEP_SECS: u64 = 900;
 /// the overwhelming majority of libraries stays fully analysed.
 const MAX_ANALYSIS_EST_BYTES: u64 = 1_200_000_000;
 
+/// A single file must never stall the whole sweep. `measure_loudness_and_peak`
+/// decodes in segments via `spawn_blocking`; a pathological file (corrupt FLAC,
+/// symphonia decode loop) or a dormant NAS mount can make a segment hang and
+/// never return — the pass then gets stuck on that one file forever
+/// (« n'avance plus », Bilou #1155). Bound each track: on timeout we log, stamp
+/// it analysed and move on. Generous vs. a normal streaming analysis (seconds,
+/// up to ~2 min for a very long hi-res track), tight vs. an indefinite hang.
+const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
+
 /// The 12 B/sample estimate above, from the DB columns the scan filled.
 /// Unknown rate/channels fall back to CD stereo; unknown duration returns 0
 /// (no basis to refuse — the track is analysed as before).
@@ -176,15 +185,33 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             continue;
         }
 
-        match crate::audio::analyzer::measure_loudness_and_peak(&path).await {
-            Some((lufs, peak)) => {
+        let measured = tokio::time::timeout(
+            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+            crate::audio::analyzer::measure_loudness_and_peak(&path),
+        )
+        .await;
+        match measured {
+            Ok(Some((lufs, peak))) => {
                 let gain = track_gain_db(lufs);
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
             }
-            None => {
+            Ok(None) => {
                 // Undecodable / silent — still stamp so we don't retry forever.
                 debug!(track_id, path = %path, "replaygain_measure_none");
+            }
+            Err(_elapsed) => {
+                // The file blocked analysis (pathological decode / dormant NAS
+                // mount) past the per-track bound. Stamp it analysed below so the
+                // sweep ADVANCES instead of looping on it forever (#1155). The
+                // orphaned blocking decode can't be cancelled, but the sentinel
+                // keeps this file out of every future batch, so we hit it once.
+                warn!(
+                    track_id,
+                    path = %path,
+                    timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
+                    "replaygain_measure_timeout — file stalled analysis; skipping so the sweep advances (#1155)"
+                );
             }
         }
         // Sentinel = unix seconds, so an album pass can tell a track has been
