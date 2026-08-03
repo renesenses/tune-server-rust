@@ -795,7 +795,17 @@ impl PlayQueueRepo {
             tx.execute(&delete_streaming_sql, &p)?;
             for (
                 i,
-                (source_id, title, artist, album, cover_url, duration_ms, source, track_no, disc_no),
+                (
+                    source_id,
+                    title,
+                    artist,
+                    album,
+                    cover_url,
+                    duration_ms,
+                    source,
+                    track_no,
+                    disc_no,
+                ),
             ) in tracks.iter().enumerate()
             {
                 let pos = i as i64;
@@ -831,7 +841,17 @@ impl PlayQueueRepo {
         self.db.write_tx(&mut |tx| {
             for (
                 i,
-                (source_id, title, artist, album, cover_url, duration_ms, source, track_no, disc_no),
+                (
+                    source_id,
+                    title,
+                    artist,
+                    album,
+                    cover_url,
+                    duration_ms,
+                    source,
+                    track_no,
+                    disc_no,
+                ),
             ) in tracks.iter().enumerate()
             {
                 let pos = current_count + i as i64;
@@ -1363,8 +1383,10 @@ mod tests {
         let p = PostgresDialect;
         assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?, 'local')"));
         assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4, 'local')"));
-        assert!(sql::insert_streaming(&p)
-            .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(
+            sql::insert_streaming(&p)
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)")
+        );
         // The new per-album numbering columns must ride along the streaming insert.
         assert!(sql::insert_streaming(&s).contains("track_number"));
         assert!(sql::insert_streaming(&s).contains("disc_number"));
