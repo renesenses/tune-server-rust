@@ -415,8 +415,7 @@ impl AlbumRepo {
             &album.release_date,
             &album.original_date,
         ];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     /// Look up an album by (title, artist, year), or create it.
@@ -446,8 +445,7 @@ impl AlbumRepo {
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&title, &artist_id, &year];
-        self.db.execute(&create_sql, &params)?;
-        let id = self.db.last_insert_rowid();
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
         let mut album = Album::new(title.to_string());
         album.id = Some(id);
         album.artist_id = Some(artist_id);
@@ -496,8 +494,7 @@ impl AlbumRepo {
         }
         let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
         let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
-        self.db.execute(&create_sql, &params)?;
-        let id = self.db.last_insert_rowid();
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
         let mut album = Album::new(title.to_string());
         album.id = Some(id);
         album.artist_id = Some(artist_id);
@@ -557,8 +554,7 @@ impl AlbumRepo {
             Some(_) => {
                 let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
                 let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
-                self.db.execute(&create_sql, &params)?;
-                let new_id = self.db.last_insert_rowid();
+                let new_id = self.db.execute_returning_id(&create_sql, &params)?;
                 self.set_folder_path(new_id, folder)?;
                 let mut album = Album::new(title.to_string());
                 album.id = Some(new_id);

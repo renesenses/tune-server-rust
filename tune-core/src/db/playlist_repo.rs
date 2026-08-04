@@ -133,8 +133,7 @@ impl PlaylistRepo {
     ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &description, &profile_id];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Playlist>, String> {
