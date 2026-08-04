@@ -2441,7 +2441,14 @@ impl PlaybackOrchestrator {
                 target_format_str == "wav",
                 dlna_needs_wav,
                 dsd_lpcm_streams,
-            );
+            )
+                // Browser zone with an active EQ: the streaming pipe does NOT
+                // run the EqProcessor (only transcode_source_to_file does), so
+                // the "forced" transcode served EQ-less audio — measured on
+                // .18: EQ'd WAV capture was byte-identical to the decoded
+                // source. Route through the temp-file path, which also gives
+                // <audio> the Content-Length + Range it wants (#1168).
+                || (is_browser_output && eq_forces_transcode);
 
             let info = StreamInfo {
                 format: out_ext.clone(),
