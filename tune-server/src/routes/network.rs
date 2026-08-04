@@ -90,12 +90,11 @@ async fn create_mount(
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
     let mount_type = body.mount_type.unwrap_or_else(|| "smb".into());
-    match state.backend.execute(
+    match state.backend.execute_returning_id(
         "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password) VALUES (?, ?, ?, ?, ?, ?)",
         &[&mount_type as &dyn ToSqlValue, &body.server as &dyn ToSqlValue, &body.share as &dyn ToSqlValue, &body.mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -603,12 +602,11 @@ async fn mount_smb_share(
 
     // Persist to database
     use tune_core::db::backend::ToSqlValue;
-    match state.backend.execute(
+    match state.backend.execute_returning_id(
         "INSERT INTO network_mounts (mount_type, server, share, mount_path, username) VALUES (?, ?, ?, ?, ?)",
         &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (
                 StatusCode::CREATED,
                 Json(json!({

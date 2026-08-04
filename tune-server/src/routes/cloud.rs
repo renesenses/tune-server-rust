@@ -293,12 +293,11 @@ async fn sso_callback(
         let default_color = "#6366f1";
         state
             .backend
-            .execute(
+            .execute_returning_id(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
                 &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
             )
-            .ok();
-        state.backend.last_insert_rowid()
+            .unwrap_or(0)
     };
 
     let role = if user.is_admin { "admin" } else { "user" };

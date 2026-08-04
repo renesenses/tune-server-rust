@@ -732,7 +732,7 @@ async fn save_radio_favorite(
     use tune_core::db::backend::ToSqlValue;
     let artist = body.artist.unwrap_or_default();
     let station = body.station_name.unwrap_or_default();
-    match state.backend.execute(
+    match state.backend.execute_returning_id(
         // `INSERT OR IGNORE` is SQLite-only; the Postgres backend forwards it
         // verbatim → `syntax error at or near "OR"` (500), so saving a radio
         // favorite failed on PG (.15) and the heart never lit up. `ON CONFLICT
@@ -740,8 +740,7 @@ async fn save_radio_favorite(
         "INSERT INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         &[&body.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station as &dyn ToSqlValue, &body.cover_url as &dyn ToSqlValue, &body.stream_url as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -802,15 +801,14 @@ async fn save_current_as_favorite(
     let cover_url = np.cover_path.clone();
 
     use tune_core::db::backend::ToSqlValue;
-    match state.backend.execute(
+    match state.backend.execute_returning_id(
         // Portable upsert-ignore (SQLite `INSERT OR IGNORE` 500s on the PG
         // backend — see save_radio_favorite above). This is the /save-current
         // path the heart button hits.
         "INSERT INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         &[&title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station_name as &dyn ToSqlValue, &cover_url as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id, "title": title, "artist": artist }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -1234,12 +1232,11 @@ async fn create_alarm_global(
         Some(multi_zone_ids)
     };
     let profile_id = profile.id();
-    match state.backend.execute(
+    match state.backend.execute_returning_id(
         "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &body.source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
