@@ -1901,10 +1901,20 @@ impl PlaybackOrchestrator {
         // one pointing at a moved X:\…\.flac played no sound). Fail fast here so
         // play() returns a clean error the client shows, instead of streaming
         // silence.
-        if !std::path::Path::new(&file_path).exists() {
-            warn!(track_id, file = %file_path, "local_track_file_missing");
-            return Err(format!("file_not_found:{file_path}"));
-        }
+        //
+        // The DB stores paths NFC-normalized (scanner), but a file is opened by
+        // its raw on-disk bytes: on a Samba/CIFS or macOS-origin share whose
+        // filenames are NFD (decomposed), the stored NFC path misses the real
+        // file and a present, listable track reads as "missing" (Dominique
+        // Comet, 0.9.48 after a rescan rewrote paths to NFC). Resolve the true
+        // on-disk spelling (stored form, then NFD) before giving up.
+        let file_path = match resolve_existing_local_path(&file_path) {
+            Some(resolved) => resolved,
+            None => {
+                warn!(track_id, file = %file_path, "local_track_file_missing");
+                return Err(format!("file_not_found:{file_path}"));
+            }
+        };
 
         let fmt = track.format.unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
@@ -6879,9 +6889,53 @@ fn decode_radio_stream_to_pcm(
     }
 }
 
+/// On-disk path candidates for a stored (NFC-normalized) DB path, in
+/// resolution order: the stored spelling first, then its NFD (decomposed)
+/// form. The scanner stores paths NFC-normalized for consistent DB lookups,
+/// but Samba/CIFS and macOS-origin shares hold filenames in NFD, so the stored
+/// spelling can miss the real file when handed to the OS to open.
+fn local_path_candidates(stored: &str) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let mut candidates = vec![stored.to_string()];
+    let nfd: String = stored.nfd().collect();
+    if nfd != stored {
+        candidates.push(nfd);
+    }
+    candidates
+}
+
+/// First path spelling that actually exists on disk (see
+/// [`local_path_candidates`]), or `None` when the file is genuinely gone.
+fn resolve_existing_local_path(stored: &str) -> Option<String> {
+    local_path_candidates(stored)
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn local_path_candidates_offers_nfd_for_accented_paths() {
+        // Pure ASCII path: only the stored spelling, no redundant candidate.
+        assert_eq!(
+            super::local_path_candidates("/music/Gramophone/01.flac"),
+            vec!["/music/Gramophone/01.flac".to_string()]
+        );
+        // NFC path with a composed "é" (U+00E9): a second, NFD candidate
+        // ("e" + combining acute U+0301) is offered so an NFD Samba/CIFS or
+        // macOS-origin share still resolves to the real file (Dominique Comet).
+        let nfc = "/music/Caf\u{00e9}/track.flac";
+        let cands = super::local_path_candidates(nfc);
+        assert_eq!(cands.len(), 2, "accented path must offer stored + NFD");
+        assert_eq!(cands[0], nfc);
+        assert_ne!(cands[1], nfc);
+        assert!(
+            cands[1].contains('\u{0301}'),
+            "second candidate must be NFD (combining acute accent)"
+        );
+    }
 
     use tokio::sync::Mutex;
 
