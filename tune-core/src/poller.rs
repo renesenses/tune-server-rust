@@ -494,6 +494,23 @@ pub(crate) mod decisions {
             && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// Position to persist for auto-resume. A position within `END_MARGIN_MS`
+    /// of the track end means the track is effectively complete; persist 0 so a
+    /// later auto-resume plays it from the start instead of seeking into the
+    /// end zone — which, on an exclusive output, immediately trips the
+    /// `reached_end_exclusive` past-end detector and (repeat=All) restarts the
+    /// track at 0:00. Seen by DEvir on an ASIO Fireface with Tidal HI-RES whose
+    /// real decoded duration (201.377 s) exceeds the rounded metadata (201.000 s),
+    /// so the periodically-saved position (201215 ms) landed past `duration`.
+    /// `duration_ms == 0` (unknown) persists the raw position unchanged.
+    pub fn position_to_persist(position_ms: u64, duration_ms: u64) -> u64 {
+        if duration_ms > 0 && position_ms.saturating_add(END_MARGIN_MS) >= duration_ms {
+            0
+        } else {
+            position_ms
+        }
+    }
+
     /// Identity key of the currently playing track for the once-per-track
     /// scrobble latch (#1113).
     ///
@@ -2461,14 +2478,15 @@ impl PositionPoller {
                 let track_id = np.and_then(|n| n.track_id);
                 let source = np.map(|n| n.source.as_str());
                 let source_id = np.and_then(|n| n.source_id.as_deref());
+                // Don't persist a position within END_MARGIN of the end — a
+                // resume there would seek into the end zone and (on exclusive
+                // outputs) bounce via the past-end detector. See
+                // decisions::position_to_persist.
+                let dur_ms = np.map(|n| n.duration_ms as i64).unwrap_or(0).max(0) as u64;
+                let save_position_ms =
+                    decisions::position_to_persist(status.position_ms, dur_ms) as i64;
                 ZoneRepo::with_backend(self.db.clone())
-                    .save_playback_position(
-                        zone_id,
-                        status.position_ms as i64,
-                        track_id,
-                        source,
-                        source_id,
-                    )
+                    .save_playback_position(zone_id, save_position_ms, track_id, source, source_id)
                     .ok();
             }
 
@@ -3342,6 +3360,7 @@ impl PositionPoller {
                     // looped). Gated to exclusive outputs so DLNA — which can sit
                     // near the end legitimately — keeps the +3s margin above.
                     let reached_end_exclusive = !past_end
+                        && !in_seek_grace
                         && track_duration_ms > decisions::END_MARGIN_MS
                         && played_enough
                         && status.position_ms + 250 >= track_duration_ms
@@ -4902,6 +4921,21 @@ mod tests {
         assert!(!decisions::past_end_reached(240_000, false, 244_000));
         // Duration at/below the margin → not reached.
         assert!(!decisions::past_end_reached(1_000, true, 50_000));
+    }
+
+    #[test]
+    fn position_to_persist_zeros_near_end() {
+        // DEvir's exact case: saved position past the rounded duration → 0,
+        // so auto-resume plays from the start instead of bouncing off the end.
+        assert_eq!(decisions::position_to_persist(201_215, 201_000), 0);
+        // Within END_MARGIN_MS of the end → 0.
+        assert_eq!(decisions::position_to_persist(199_000, 201_000), 0);
+        // Exactly on the margin boundary (pos + margin == duration) → 0.
+        assert_eq!(decisions::position_to_persist(198_000, 201_000), 0);
+        // Comfortably mid-track → persisted unchanged (normal resume works).
+        assert_eq!(decisions::position_to_persist(30_000, 201_000), 30_000);
+        // Unknown duration (0) → raw position, never zeroed.
+        assert_eq!(decisions::position_to_persist(201_215, 0), 201_215);
     }
 
     #[test]
