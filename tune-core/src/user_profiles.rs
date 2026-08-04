@@ -141,7 +141,7 @@ impl ProfileManager {
         let pin_hash: Option<String> = pin.map(hash_pin);
         let trimmed = name.trim().to_string();
 
-        self.db.execute(
+        let id = self.db.execute_returning_id(
             "INSERT INTO user_profiles (name, avatar_color, pin_hash) VALUES (?, ?, ?)",
             &[
                 &trimmed as &dyn ToSqlValue,
@@ -149,8 +149,6 @@ impl ProfileManager {
                 &pin_hash,
             ],
         )?;
-
-        let id = self.db.last_insert_rowid();
         self.get(id)?
             .ok_or_else(|| "profile not found after create".into())
     }

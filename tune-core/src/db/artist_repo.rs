@@ -231,8 +231,7 @@ impl ArtistRepo {
             &artist.image_path,
             &artist.image_source,
         ];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     /// Sequential `query_one_strong` + `execute` + `last_insert_rowid`
@@ -266,8 +265,7 @@ impl ArtistRepo {
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
-        self.db.execute(&create_sql, &params)?;
-        let id = self.db.last_insert_rowid();
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
         Ok(Artist {
             id: Some(id),
             name: name.to_string(),

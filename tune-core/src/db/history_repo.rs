@@ -200,8 +200,7 @@ impl HistoryRepo {
             &rec.cover_url,
             &rec.profile_id,
         ];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     pub fn recent(&self, limit: i64) -> Result<Vec<ListenRecord>, String> {

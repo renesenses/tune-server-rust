@@ -48,6 +48,26 @@ pub trait DbBackend: Send + Sync {
     /// hood and exposes the latest value here.
     fn last_insert_rowid(&self) -> i64;
 
+    /// Atomically execute an INSERT and return the new row id.
+    ///
+    /// The `execute()` + `last_insert_rowid()` pair is a data race: the two
+    /// calls take the backend lock (or a pooled Postgres connection)
+    /// *separately*, so a concurrent insert can slip in between and make
+    /// `last_insert_rowid()` return the *other* row's id (audit item 5). This
+    /// runs both inside a single `write_tx`, which holds one connection for the
+    /// whole closure, so the id belongs to the insert we just did. The default
+    /// works for every backend (no `RETURNING id` SQL surgery needed); impls
+    /// may override for efficiency.
+    fn execute_returning_id(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<i64, String> {
+        let mut id = 0i64;
+        self.write_tx(&mut |tx| {
+            tx.execute(sql, params)?;
+            id = tx.last_insert_rowid();
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
     /// Read at most one row. Returns the row's columns as `SqlValue`s
     /// in declaration order. The repo decodes them via the `as_i64` /
     /// `as_str` / `as_f64` helpers on `SqlValue`.
@@ -454,6 +474,23 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
 
     fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid()
+    }
+
+    fn execute_returning_id(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<i64, String> {
+        // Hold the write connection across execute + last_insert_rowid so the id
+        // belongs to the insert we just did (audit item 5), WITHOUT opening a
+        // transaction: the trait default wraps this in `write_tx` (BEGIN), which
+        // panics when the caller already has a tx open (e.g. a scan's
+        // `BEGIN IMMEDIATE`). One lock, no BEGIN, works inside or outside a tx.
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let conn = self.connection().lock().unwrap();
+        conn.execute(sql, &refs[..])
+            .map_err(|e| format!("execute: {e}"))?;
+        Ok(conn.last_insert_rowid())
     }
 
     fn query_one(
