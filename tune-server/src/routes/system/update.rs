@@ -79,6 +79,119 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
     })
 }
 
+/// Trusted **minisign** public key for release signatures (audit item 8). The
+/// matching secret key lives only in the release CI (a GitHub Actions secret);
+/// this is the verify-only half, safe to embed.
+///
+/// ROLLOUT: left empty on purpose. While empty, signature verification is
+/// skipped and self-update behaves exactly as before — nothing breaks. Fill it
+/// with the real public key (the base64 line of `minisign -G`'s `.pub` file)
+/// once the CI signing step is live; verification then becomes mandatory.
+const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB7T9aBRwUM";
+
+/// Verify a downloaded update archive against a minisign-signed `SHA256SUMS`
+/// before it is extracted/installed. The signature authenticates `SHA256SUMS`
+/// with the embedded key; the authenticated `SHA256SUMS` authenticates the
+/// archive by hash. Defeats a compromised release proxy / GitHub metadata
+/// pushing a malicious binary (RCE).
+async fn verify_update_signature(
+    client: &reqwest::Client,
+    archive_name: &str,
+    archive_bytes: &[u8],
+    sums_url: Option<&str>,
+    sig_url: Option<&str>,
+) -> Result<(), String> {
+    if UPDATE_PUBLIC_KEY.is_empty() {
+        warn!("update_signature_check_skipped_no_key");
+        return Ok(());
+    }
+
+    let sums_url = sums_url.ok_or("release has no SHA256SUMS — refusing unsigned update")?;
+    let sig_url =
+        sig_url.ok_or("release has no SHA256SUMS.minisig signature — refusing unsigned update")?;
+
+    let fetch = |url: String| async move {
+        let resp = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("fetch {url} failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("fetch {url}: HTTP {}", resp.status()));
+        }
+        resp.text()
+            .await
+            .map_err(|e| format!("read {url} failed: {e}"))
+    };
+    let sums = fetch(sums_url.to_string()).await?;
+    let sig_str = fetch(sig_url.to_string()).await?;
+
+    // 1. Signature over SHA256SUMS with the embedded trusted key.
+    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY)
+        .map_err(|e| format!("invalid embedded update public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(&sig_str)
+        .map_err(|e| format!("invalid update signature: {e}"))?;
+    pk.verify(sums.as_bytes(), &sig, false)
+        .map_err(|_| "update signature does not match — refusing to install".to_string())?;
+
+    // 2. The now-authenticated SHA256SUMS must list our archive with a hash
+    //    matching the bytes we downloaded.
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::digest(archive_bytes));
+    let want = sums
+        .lines()
+        .find_map(|line| {
+            let mut it = line.split_whitespace();
+            let hash = it.next()?;
+            // `sha256sum` may prefix the name with `*` (binary) and CI writes a
+            // `./` path prefix — match on the trailing file name.
+            let file = it.next()?.trim_start_matches('*');
+            if file.ends_with(archive_name) {
+                Some(hash.to_lowercase())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| format!("{archive_name} not listed in signed SHA256SUMS"))?;
+    if want != got {
+        return Err(format!(
+            "archive hash mismatch — signed {want}, downloaded {got}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod signed_update_tests {
+    use super::UPDATE_PUBLIC_KEY;
+
+    // A real signature produced by `minisign -S` with the production key pair,
+    // over the message below. Locks in that (a) the embedded public key parses,
+    // (b) it verifies genuine minisign CLI output (prehashed format), and
+    // (c) tampering is detected — i.e. the whole signed-update chain agrees.
+    const FIXTURE_MSG: &[u8] = b"hello-tune-update";
+    const FIXTURE_SIG: &str = "untrusted comment: signature from minisign secret key\n\
+RURjeNGnrhiQYLis6QuGtYZRL+wCW2VzRIUVBFXrOHJphbtvrnQXDKmV2aitwA1ZHqOAPuIJRSVYT1HWTfHrXzosPtLiwNtZSA4=\n\
+trusted comment: timestamp:1785772095\tfile:sigtest.txt\thashed\n\
+kwD8rrpp1dpGuBsy+q0AByW/UZ9CjNSAOJH5bivNcpTQDNkE1aB073ruWxcwOeuJXwpWeh/XVMnkDIoV0BU3Aw==\n";
+
+    #[test]
+    fn embedded_key_verifies_real_minisign_signature() {
+        assert!(
+            !UPDATE_PUBLIC_KEY.is_empty(),
+            "production public key must be embedded"
+        );
+        let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY)
+            .expect("embedded public key parses");
+        let sig = minisign_verify::Signature::decode(FIXTURE_SIG).expect("signature decodes");
+        pk.verify(FIXTURE_MSG, &sig, false)
+            .expect("genuine signature verifies");
+        // Tampered payload must be rejected.
+        assert!(pk.verify(b"tampered-payload", &sig, false).is_err());
+    }
+}
+
 /// GET /system/update/check
 ///
 /// Fetches the latest release from GitHub, compares versions, and returns update info.
@@ -229,6 +342,19 @@ pub(super) async fn update_install(
         "update_download_starting"
     );
 
+    // Signed-update material: the archive is verified against a minisign-signed
+    // SHA256SUMS before install (audit item 8). Both are release assets.
+    let sums_url = release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS")
+        .map(|a| a.browser_download_url.clone());
+    let sig_url = release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS.minisig")
+        .map(|a| a.browser_download_url.clone());
+
     // 2. Mark phase = downloading and spawn the background task
     {
         let mut phase = state.update_phase.lock().unwrap();
@@ -283,6 +409,22 @@ pub(super) async fn update_install(
                 return;
             }
         };
+
+        // --- Verify signature (before extract/install) ---
+        set_phase("verifying");
+        if let Err(e) = verify_update_signature(
+            &http_client,
+            &asset.name,
+            &archive_bytes,
+            sums_url.as_deref(),
+            sig_url.as_deref(),
+        )
+        .await
+        {
+            error!(error = %e, "update_signature_verification_failed");
+            set_phase(&format!("failed: {e}"));
+            return;
+        }
 
         // --- Extract ---
         set_phase("extracting");
