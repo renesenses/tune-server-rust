@@ -265,55 +265,93 @@ mod tests {
 }
 
 // ── Encrypted backup ────────────────────────────────────────────────
+//
+// V2 = Argon2id key derivation + XChaCha20-Poly1305 AEAD. The AEAD tag
+// authenticates the ciphertext, so a wrong password or ANY tampering fails
+// loudly. The legacy V1 (time-seeded salt + single SHA-256 + repeating XOR, no
+// MAC — a wrong password silently "decrypted" to garbage) is still *read* for
+// backward compatibility but is never written again.
 
-const MAGIC: &[u8; 12] = b"TUNE_ENC_V1\0";
+const MAGIC_V1: &[u8; 12] = b"TUNE_ENC_V1\0";
+const MAGIC_V2: &[u8; 12] = b"TUNE_ENC_V2\0";
 const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 24; // XChaCha20 extended nonce
+
+/// Argon2id → 32-byte key. Argon2's default is Argon2id with sane memory/time
+/// costs; the salt makes precomputation useless.
+fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    let mut key = [0u8; 32];
+    argon2::Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("key derivation failed: {e}"))?;
+    Ok(key)
+}
 
 pub fn encrypt_backup(data: &[u8], password: &str) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 
     let mut salt = [0u8; SALT_LEN];
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    for (i, b) in salt.iter_mut().enumerate() {
-        *b = ((seed >> (i * 8)) & 0xFF) as u8;
-    }
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut salt).expect("OS RNG unavailable");
+    getrandom::getrandom(&mut nonce).expect("OS RNG unavailable");
 
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    hasher.update(&salt);
-    let key_bytes = hasher.finalize();
+    let key = derive_key(password, &salt).expect("argon2 key derivation");
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), data)
+        .expect("AEAD encryption never fails for a valid key/nonce");
 
-    // Simple XOR cipher with SHA256-derived key stream (portable, no CBC API issues)
-    let mut encrypted = data.to_vec();
-    for (i, byte) in encrypted.iter_mut().enumerate() {
-        *byte ^= key_bytes[i % key_bytes.len()];
-    }
-
-    let mut output = Vec::new();
-    output.extend_from_slice(MAGIC);
-    output.extend_from_slice(&salt);
-    output.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    output.extend_from_slice(&encrypted);
-    output
+    let mut out = Vec::with_capacity(12 + SALT_LEN + NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(MAGIC_V2);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    out
 }
 
 pub fn decrypt_backup(encrypted: &[u8], password: &str) -> Result<Vec<u8>, String> {
-    use sha2::{Digest, Sha256};
-
-    if encrypted.len() < MAGIC.len() + SALT_LEN + 8 {
+    if encrypted.len() < 12 {
         return Err("data too short".into());
     }
-    if &encrypted[..12] != MAGIC {
-        return Err("invalid magic header".into());
+    match &encrypted[..12] {
+        m if m == MAGIC_V2 => decrypt_v2(encrypted, password),
+        m if m == MAGIC_V1 => decrypt_v1(encrypted, password),
+        _ => Err("invalid magic header".into()),
     }
+}
 
+fn decrypt_v2(encrypted: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+
+    let header = 12 + SALT_LEN + NONCE_LEN;
+    // AEAD ciphertext carries a 16-byte Poly1305 tag.
+    if encrypted.len() < header + 16 {
+        return Err("truncated data".into());
+    }
+    let salt = &encrypted[12..12 + SALT_LEN];
+    let nonce = &encrypted[12 + SALT_LEN..header];
+    let ciphertext = &encrypted[header..];
+
+    let key = derive_key(password, salt)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    cipher
+        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map_err(|_| "wrong password or corrupted backup".to_string())
+}
+
+/// Legacy V1 reader (insecure — no integrity check). Kept only so pre-existing
+/// encrypted backups can still be restored.
+fn decrypt_v1(encrypted: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+
+    if encrypted.len() < 12 + SALT_LEN + 8 {
+        return Err("data too short".into());
+    }
     let salt = &encrypted[12..12 + SALT_LEN];
     let original_len = u64::from_le_bytes(encrypted[28..36].try_into().unwrap()) as usize;
     let cipher_data = &encrypted[36..];
-
     if cipher_data.len() < original_len {
         return Err("truncated data".into());
     }
@@ -338,26 +376,53 @@ mod encrypt_tests {
     fn encrypt_decrypt_roundtrip() {
         let data = b"Hello, this is a test backup with some content!";
         let encrypted = encrypt_backup(data, "my_password");
-        assert!(&encrypted[..12] == MAGIC);
+        assert_eq!(&encrypted[..12], MAGIC_V2, "new backups use the V2 format");
         let decrypted = decrypt_backup(&encrypted, "my_password").unwrap();
         assert_eq!(decrypted, data);
     }
 
     #[test]
-    fn wrong_password_fails() {
-        let data = b"Secret data";
-        let encrypted = encrypt_backup(data, "correct");
-        let result = decrypt_backup(&encrypted, "wrong");
-        // Decryption may succeed but produce garbage, or fail
-        // At minimum, the data should not match
-        if let Ok(decrypted) = result {
-            assert_ne!(decrypted, data);
-        }
+    fn wrong_password_is_rejected() {
+        // AEAD: a wrong password MUST fail, never return garbage as success.
+        let encrypted = encrypt_backup(b"Secret data", "correct");
+        assert!(decrypt_backup(&encrypted, "wrong").is_err());
+    }
+
+    #[test]
+    fn tampering_is_detected() {
+        let mut encrypted = encrypt_backup(b"important bytes", "pw");
+        // Flip a bit in the ciphertext body → Poly1305 tag must reject it.
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0x01;
+        assert!(decrypt_backup(&encrypted, "pw").is_err());
     }
 
     #[test]
     fn invalid_header_fails() {
-        let result = decrypt_backup(b"NOT_A_BACKUP_FILE", "password");
-        assert!(result.is_err());
+        assert!(decrypt_backup(b"NOT_A_BACKUP_FILE", "password").is_err());
+    }
+
+    #[test]
+    fn reads_legacy_v1_backup() {
+        // Existing V1 (XOR) backups must still restore.
+        use sha2::{Digest, Sha256};
+        let data = b"legacy backup payload";
+        let password = "old_pw";
+        let salt = [7u8; SALT_LEN];
+        let mut h = Sha256::new();
+        h.update(password.as_bytes());
+        h.update(salt);
+        let key = h.finalize();
+        let mut enc = data.to_vec();
+        for (i, b) in enc.iter_mut().enumerate() {
+            *b ^= key[i % key.len()];
+        }
+        let mut blob = Vec::new();
+        blob.extend_from_slice(MAGIC_V1);
+        blob.extend_from_slice(&salt);
+        blob.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&enc);
+
+        assert_eq!(decrypt_backup(&blob, password).unwrap(), data);
     }
 }
