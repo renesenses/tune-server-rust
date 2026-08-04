@@ -51,6 +51,9 @@ quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
+# Verifies minisign signatures over release checksums (self-update, audit
+# item 8). Pure-Rust, no libsodium — verify-only, the trusted key is embedded.
+minisign-verify = "0.2"
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 unicode-normalization = { workspace = true }
