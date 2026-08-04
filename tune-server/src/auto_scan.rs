@@ -667,6 +667,129 @@ pub(crate) fn scan_exclude_patterns(
         .unwrap_or_default()
 }
 
+/// How long to wait before re-checking a freshly-changed file's size. A file
+/// still being written — a large copy in progress, a download, or a file
+/// produced in real time — fires Create/Modify events while incomplete; scanning
+/// it then
+/// reads 0 bytes or a truncated FLAC (`scan_file_empty_skipped`) and churns a
+/// burst of retry inserts. We defer until the size is non-zero and stable across
+/// this window.
+const WATCHER_SETTLE_RECHECK_MS: u64 = 400;
+
+/// Split a batch of watcher changes into files ready to scan now vs. files still
+/// being written (carried to the next cycle, ~2 s later). Deletes pass straight
+/// through as ready. Excluded paths and Tune's own temp files are dropped (never
+/// scanned, never deferred). An Added/Modified file is "settled" when its size
+/// is non-zero and unchanged across a single `WATCHER_SETTLE_RECHECK_MS` recheck
+/// — ONE sleep per batch regardless of how many files changed, so a burst never
+/// blocks the loop per-file. A file that vanished between events is dropped.
+fn settle_partition(
+    changes: Vec<tune_core::scanner::watcher::FileChange>,
+    excludes: &[String],
+) -> (
+    Vec<tune_core::scanner::watcher::FileChange>,
+    Vec<tune_core::scanner::watcher::FileChange>,
+) {
+    use tune_core::scanner::watcher::ChangeType;
+    let mut ready = Vec::new();
+    let mut to_recheck: Vec<(tune_core::scanner::watcher::FileChange, u64)> = Vec::new();
+    for change in changes {
+        let path_l = change.path.to_lowercase();
+        if !excludes.is_empty() && excludes.iter().any(|x| path_l.contains(x.as_str())) {
+            continue;
+        }
+        if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
+            continue;
+        }
+        if change.change_type == ChangeType::Deleted {
+            ready.push(change);
+            continue;
+        }
+        match std::fs::metadata(&change.path) {
+            Ok(m) => to_recheck.push((change, m.len())),
+            // Gone/unreadable between the event and now — a transient. Drop it;
+            // if it reappears a fresh event will re-surface it.
+            Err(_) => {}
+        }
+    }
+    if to_recheck.is_empty() {
+        return (ready, Vec::new());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(WATCHER_SETTLE_RECHECK_MS));
+    let mut pending = Vec::new();
+    for (change, size1) in to_recheck {
+        match std::fs::metadata(&change.path) {
+            // Non-zero AND unchanged over the recheck window → writing has stopped.
+            Ok(m) if m.len() > 0 && m.len() == size1 => ready.push(change),
+            // Still zero, or grew during the window → keep writing; re-check next cycle.
+            Ok(_) => pending.push(change),
+            // Vanished during the recheck → drop.
+            Err(_) => {}
+        }
+    }
+    (ready, pending)
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::settle_partition;
+    use std::io::Write;
+    use tune_core::scanner::watcher::{ChangeType, FileChange};
+
+    fn ch(path: &str, t: ChangeType) -> FileChange {
+        FileChange {
+            change_type: t,
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn settles_stable_nonzero_defers_zero_drops_missing_and_excluded() {
+        let dir = std::env::temp_dir().join("tune_settle_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stable = dir.join("stable.flac");
+        std::fs::File::create(&stable)
+            .unwrap()
+            .write_all(b"1234567890")
+            .unwrap();
+        let stable_p = stable.to_string_lossy().to_string();
+
+        let empty = dir.join("empty.flac"); // zero bytes → still being written
+        std::fs::File::create(&empty).unwrap();
+        let empty_p = empty.to_string_lossy().to_string();
+
+        let missing_p = dir.join("missing.flac").to_string_lossy().to_string(); // never created
+
+        let changes = vec![
+            ch(&stable_p, ChangeType::Added),
+            ch(&empty_p, ChangeType::Added),
+            ch(&missing_p, ChangeType::Added),
+            ch("/lib/A_Sibling_excluded_dir/foo.flac", ChangeType::Added),
+            ch(&stable_p, ChangeType::Deleted),
+        ];
+        let (ready, pending) = settle_partition(changes, &["excluded".to_string()]);
+
+        // Stable non-zero Added is scanned now; Delete passes straight through.
+        assert!(
+            ready
+                .iter()
+                .any(|c| c.path == stable_p && c.change_type == ChangeType::Added)
+        );
+        assert!(ready.iter().any(|c| c.change_type == ChangeType::Deleted));
+        // Zero-byte file is deferred, not scanned.
+        assert!(pending.iter().any(|c| c.path == empty_p));
+        assert!(!ready.iter().any(|c| c.path == empty_p));
+        // Missing + excluded are dropped entirely (neither ready nor pending).
+        for set in [&ready, &pending] {
+            assert!(!set.iter().any(|c| c.path == missing_p));
+            assert!(!set.iter().any(|c| c.path.contains("excluded")));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<AtomicBool>>) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let music_dirs: Vec<String> = settings
@@ -739,6 +862,10 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                     .map(|v| v != "false" && v != "0")
                     .unwrap_or(true);
             let mut liveness_tick: u32 = 0;
+            // Files seen changed but still being written (a large copy in
+            // progress, a download, a real-time producer): carried across cycles
+            // until their size settles, so the final COMPLETE write is scanned.
+            let mut pending_settle: Vec<tune_core::scanner::watcher::FileChange> = Vec::new();
             loop {
                 // Every ~2 min (each idle iteration blocks ~2s): re-watch
                 // roots that appeared or came back after an unmount, and
@@ -748,10 +875,17 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                 if liveness_tick % 60 == 0 {
                     watcher.ensure_watches();
                 }
-                let changes = watcher.poll_debounced(
+                let mut changes = watcher.poll_debounced(
                     std::time::Duration::from_secs(2),
                     std::time::Duration::from_millis(500),
                 );
+                // Re-examine files that were still being written last cycle, then
+                // split off any that are STILL growing (or zero-byte) so we scan
+                // only complete files — no more 0-byte/truncated snapshots of a
+                // file captured mid-write. One recheck sleep for the whole batch.
+                changes.append(&mut pending_settle);
+                let (changes, still_writing) = settle_partition(changes, &watcher_excludes);
+                pending_settle = still_writing;
                 let had_changes = !changes.is_empty();
                 for change in changes {
                     // Same exclusions as the scans (re-read per event batch
