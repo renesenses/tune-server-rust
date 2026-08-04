@@ -168,9 +168,9 @@ async fn create_collection(
     let sort_by = body.sort_by.clone();
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
-    state
+    let id = state
         .backend
-        .execute(
+        .execute_returning_id(
             "INSERT INTO smart_collections \
          (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -187,8 +187,6 @@ async fn create_collection(
             ],
         )
         .map_err(AppError::internal)?;
-
-    let id = state.backend.last_insert_rowid();
 
     let created = json!({
         "id": id,

@@ -58,25 +58,30 @@ impl RadioFavoriteRepo {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let affected = self.db.execute(
-            "INSERT OR IGNORE INTO radio_favorites \
-             (title, artist, station_name, cover_url, stream_url, saved_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            &[
-                &title,
-                &artist,
-                &station_name,
-                &cover_url as &dyn crate::db::backend::ToSqlValue,
-                &stream_url as &dyn crate::db::backend::ToSqlValue,
-                &now,
-            ],
-        )?;
+        let mut inserted_id: Option<i64> = None;
+        self.db.write_tx(&mut |tx| {
+            let affected = tx.execute(
+                "INSERT OR IGNORE INTO radio_favorites \
+                 (title, artist, station_name, cover_url, stream_url, saved_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    &title,
+                    &artist,
+                    &station_name,
+                    &cover_url as &dyn crate::db::backend::ToSqlValue,
+                    &stream_url as &dyn crate::db::backend::ToSqlValue,
+                    &now,
+                ],
+            )?;
+            if affected > 0 {
+                inserted_id = Some(tx.last_insert_rowid());
+            }
+            Ok(())
+        })?;
 
-        if affected == 0 {
-            Ok(None) // already exists
-        } else {
-            let id = self.db.last_insert_rowid();
-            Ok(Some(RadioFavorite {
+        match inserted_id {
+            None => Ok(None), // already exists
+            Some(id) => Ok(Some(RadioFavorite {
                 id,
                 title: title.into(),
                 artist: artist.into(),
@@ -84,7 +89,7 @@ impl RadioFavoriteRepo {
                 cover_url: cover_url.map(String::from),
                 stream_url: stream_url.map(String::from),
                 saved_at: now,
-            }))
+            })),
         }
     }
 
