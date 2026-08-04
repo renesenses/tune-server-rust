@@ -9,6 +9,19 @@ use crate::state::AppState;
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
+    // Warm the ASIO device cache once at boot, while the audio devices are still
+    // idle. An ASIO driver — notably SOtM Diretta — can't be re-enumerated once a
+    // zone owns it for playback; `list_asio_devices` then serves this cache
+    // instead of re-opening the driver. Without a warm pass, the cache stays
+    // empty until someone opens the device list, so if auto-resume starts a zone
+    // at boot first, the on-demand listing runs while the driver is busy and the
+    // DAC never appears — the zone is stuck on the wrong output with no sound
+    // (JP Borderies: SOtM DAC absent from the list). Enumerating here, before any
+    // playback, captures it. Fire-and-forget; no-op off Windows / without `asio`.
+    tokio::task::spawn_blocking(|| {
+        let _ = tune_core::outputs::local::list_asio_devices();
+    });
+
     reset_zones_offline(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
