@@ -1833,26 +1833,80 @@ struct EqSettings {
     bands: Option<Vec<Value>>,
 }
 
-async fn get_eq(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
+    profile
+        .bands
+        .iter()
+        .map(|b| json!({"freq": b.freq, "gain": b.gain, "q": b.q, "type": b.band_type}))
+        .collect()
+}
+
+/// Read the zone's expert-mode EQ (bands stored in `zone_{id}_eq_profile`).
+///
+/// These two handlers were STUBS until 0.9.48: the web Expert equalizer
+/// POSTed here, the server echoed the body back and persisted NOTHING — the
+/// UI showed the EQ as applied with zero audible effect (found by measuring
+/// the stream served by .18: EQ on/off captures were md5-identical).
+async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let profile: tune_core::audio::eq::EqProfile = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let bands = eq_bands_json(&profile);
     Json(json!({
         "zone_id": zone_id,
-        "enabled": false,
-        "preset": "flat",
-        "bands": [],
+        "enabled": profile.enabled && !bands.is_empty(),
+        "preset": if bands.is_empty() { "flat" } else { "custom" },
+        "bands": bands,
     }))
 }
 
+/// Persist the zone's expert-mode EQ bands into the SAME per-zone profile the
+/// orchestrator reads (`zone_{id}_eq_profile`), preserving the profiler tilt
+/// fields. Same premium gate as the /dsp path.
 async fn set_eq(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<EqSettings>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return resp;
+    }
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let key = format!("zone_{zone_id}_eq_profile");
+    let mut profile: tune_core::audio::eq::EqProfile = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    if let Some(bands) = &body.bands {
+        profile.bands = bands
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+    }
+    if let Some(enabled) = body.enabled {
+        profile.enabled = enabled;
+    }
+    let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+
+    let bands = eq_bands_json(&profile);
     Json(json!({
         "zone_id": zone_id,
-        "enabled": body.enabled.unwrap_or(false),
+        "enabled": profile.enabled,
         "preset": body.preset.unwrap_or_else(|| "custom".into()),
-        "bands": body.bands.unwrap_or_default(),
+        "bands": bands,
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
