@@ -4,7 +4,11 @@ members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "p
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-desktop", "tune-widget"]
+# tune-pyo3 is a native Python extension (cdylib) with its own standalone
+# workspace: it links libpython and needs Python headers, which the server CI
+# and build matrix do not provide. Keeping it excluded also means its pyo3
+# dependency is versioned independently of the server tree.
+exclude = ["tune-desktop", "tune-widget", "tune-pyo3"]
 resolver = "2"
 
 [workspace.package]
