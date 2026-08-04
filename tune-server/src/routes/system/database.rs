@@ -120,7 +120,10 @@ pub(super) async fn export_database(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    // Use the resolved path from config: on Windows/macOS a relative db_path is
+    // rewritten to the per-user data dir at startup, so re-reading the raw env
+    // var here would point at a file that does not exist (os error 2).
+    let db_path = state.config.db_path.clone();
     if db_path == ":memory:" {
         return Ok((StatusCode::BAD_REQUEST, "cannot export in-memory database").into_response());
     }
