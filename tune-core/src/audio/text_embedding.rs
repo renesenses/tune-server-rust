@@ -117,17 +117,21 @@ impl TextEmbedder {
 /// Process-global text embedder, provisioned + loaded once on first search.
 static TEXT_EMBEDDER: OnceCell<Mutex<TextEmbedder>> = OnceCell::const_new();
 
-/// Resolve the text model + tokenizer cache paths. Both default next to the
-/// configured audio model (so they share the onnxruntime dylib). Returns `None`
-/// when acoustic embedding was never configured (no audio model path) — the
-/// handler maps that to "acoustic search unavailable".
-fn text_paths(settings: &SettingsRepo) -> Option<(PathBuf, PathBuf)> {
-    let audio = settings
+/// Resolve the text model + tokenizer cache paths. Both live next to the
+/// configured audio model (sharing the onnxruntime dylib) when the audio sweep
+/// has provisioned one; otherwise they fall back to a default `embedding_models`
+/// directory so acoustic **search** self-provisions on first use even if the
+/// audio-embedding sweep was never enabled (#1288/Fabien: "Menu Ambiance → 503",
+/// `audio_embedding_model_path unset`). Mirrors the relative `artwork_cache`
+/// convention — resolved against the server's working directory.
+fn text_paths(settings: &SettingsRepo) -> (PathBuf, PathBuf) {
+    let dir = settings
         .get("audio_embedding_model_path")
         .ok()
         .flatten()
-        .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())?;
-    let dir = Path::new(&audio).parent()?.to_path_buf();
+        .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
+        .and_then(|audio| Path::new(&audio).parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("embedding_models"));
     let model = settings
         .get(TEXT_MODEL_PATH_KEY)
         .ok()
@@ -135,7 +139,7 @@ fn text_paths(settings: &SettingsRepo) -> Option<(PathBuf, PathBuf)> {
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("clap-text-music-2023.onnx"));
     let tokenizer = dir.join("clap-music-tokenizer.json");
-    Some((model, tokenizer))
+    (model, tokenizer)
 }
 
 /// Embed a natural-language query into the CLAP joint space for acoustic search.
@@ -149,9 +153,7 @@ pub async fn embed_query(backend: &Arc<dyn DbBackend>, query: &str) -> Result<Ve
     let cell = TEXT_EMBEDDER
         .get_or_try_init(|| async {
             let settings = SettingsRepo::with_backend(backend.clone());
-            let (model, tokenizer) = text_paths(&settings).ok_or_else(|| {
-                "acoustic search not configured (audio_embedding_model_path unset)".to_string()
-            })?;
+            let (model, tokenizer) = text_paths(&settings);
             super::embedding::ensure_file(&model, TEXT_MODEL_URL, TEXT_MODEL_SHA256, "text_model")
                 .await?;
             super::embedding::ensure_file(

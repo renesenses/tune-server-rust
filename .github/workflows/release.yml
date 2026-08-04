@@ -489,6 +489,30 @@ jobs:
           find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS
           cd ..
 
+      # Sign SHA256SUMS with minisign so the self-update client can verify the
+      # release cryptographically (audit item 8). No-ops until MINISIGN_SECRET_KEY
+      # is configured, so releases keep working during rollout. The client only
+      # enforces once its embedded public key is set (UPDATE_PUBLIC_KEY).
+      - name: Sign checksums (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY not set — skipping release signing"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          # minisign needs the 2-line key format (comment + base64). The secret
+          # may be stored with or without the leading "untrusted comment:" line,
+          # so reconstruct it when absent.
+          case "$MINISIGN_SECRET_KEY" in
+            "untrusted comment:"*) printf '%s\n' "$MINISIGN_SECRET_KEY" ;;
+            *) printf 'untrusted comment: minisign encrypted secret key\n%s\n' "$MINISIGN_SECRET_KEY" ;;
+          esac > minisign.key
+          minisign -S -s minisign.key -m SHA256SUMS -x SHA256SUMS.minisig
+          rm -f minisign.key
+          echo "Signed SHA256SUMS -> SHA256SUMS.minisig"
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -496,7 +520,7 @@ jobs:
             artifacts/**/*.zip
             artifacts/**/*.dmg
             artifacts/**/*.exe
-            SHA256SUMS
+            SHA256SUMS*
           generate_release_notes: true
           # Pre-release tags carry a suffix (e.g. v0.9.0-rc2); stable tags are
           # plain vX.Y.Z. Mark suffixed tags as pre-releases and keep them off
