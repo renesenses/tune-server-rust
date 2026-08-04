@@ -189,8 +189,7 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::create_tag, sql::create_tag);
         let color_val = color.unwrap_or("#808080");
         let params: [&dyn ToSqlValue; 2] = [&name, &color_val];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Tag>, String> {

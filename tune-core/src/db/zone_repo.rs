@@ -286,8 +286,7 @@ impl ZoneRepo {
         // the rowid we read reflects the INSERT we just did.
         let create_sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
-        self.db.execute(&create_sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&create_sql, &params)?)
     }
 
     /// Atomically get an existing zone by output_device_id, or create a new one.

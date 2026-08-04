@@ -278,11 +278,10 @@ impl SmartCollectionRepo {
             )?;
             Ok(id)
         } else {
-            self.db.execute(
+            Ok(self.db.execute_returning_id(
                 "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order, max_limit) VALUES (?, ?, ?, ?, ?, ?)",
                 &[&collection.name as &dyn ToSqlValue, &rules_json, &match_mode, &collection.sort_by as &dyn ToSqlValue, &sort_order, &collection.limit as &dyn ToSqlValue],
-            )?;
-            Ok(self.db.last_insert_rowid())
+            )?)
         }
     }
 

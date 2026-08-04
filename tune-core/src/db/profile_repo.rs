@@ -160,8 +160,7 @@ impl ProfileRepo {
     ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&username, &display_name, &avatar_path];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     pub fn update(
