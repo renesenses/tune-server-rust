@@ -1667,12 +1667,116 @@ impl PlaybackOrchestrator {
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
 
-        let (url, stream_id, out_mime, out_sr, out_bd, out_ch) =
-            if is_radio && (is_local_output || is_oaat_output) {
-                // Local/OAAT outputs cannot play compressed streams directly —
-                // they expect raw PCM in a WAV container.  For radio (infinite
-                // stream), we decode the HTTP stream progressively to PCM and
-                // serve it as WAV through a streaming session.
+        let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = if is_radio
+            && (is_local_output || is_oaat_output)
+        {
+            // Local/OAAT outputs cannot play compressed streams directly —
+            // they expect raw PCM in a WAV container.  For radio (infinite
+            // stream), we decode the HTTP stream progressively to PCM and
+            // serve it as WAV through a streaming session.
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+                ..Default::default()
+            };
+
+            let (session_id, tx, data_ready, session) =
+                self.streamer.create_radio_session(wav_info, 256).await;
+
+            info!(
+                source = "radio",
+                url = %audio_url,
+                "radio_decode_to_wav_for_local_output"
+            );
+
+            let radio_url = audio_url.to_string();
+            // VU-mètres sur radio : forwarder de niveaux alimenté par le PCM
+            // décodé du flux (le décodage-pour-niveaux fichier ne s'applique
+            // pas à un live). Observateur pur, n'affecte pas le flux servi.
+            let radio_levels_tx = if let Some(ref bus) = self.event_bus {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                Some(spawn_paced_levels_forwarder(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    0,
+                ))
+            } else {
+                None
+            };
+            tokio::spawn(async move {
+                // Download + decode in a blocking thread since symphonia and
+                // reqwest::blocking are both synchronous.
+                let result = tokio::task::spawn_blocking(move || {
+                    decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, radio_levels_tx)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        debug!("radio_local_decode_stream_ended");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "radio_local_decode_failed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "radio_local_decode_task_panic");
+                    }
+                }
+            });
+
+            let server_ip = self.server_ip();
+            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (
+                stream_url,
+                Some(session_id),
+                "audio/wav".to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
+        } else if is_radio {
+            // Network outputs (DLNA): check if the renderer supports the
+            // radio stream format (typically AAC). If not, proxy + transcode
+            // to WAV so the renderer can play it.
+            // Passthrough ONLY when the URL carries an unambiguous,
+            // renderer-supported extension (.mp3/.flac/.wav). Extension-less
+            // Icecast mounts fall through guess_mime_from_url() to the default
+            // "audio/mpeg", and .aac (ADTS) maps to "audio/mp4" — both are
+            // mislabels. The renderer then opens a stream whose bytes don't
+            // match the advertised protocolInfo, reports PLAYING and emits
+            // SILENCE (Cyrille, Yamaha R-N2000A). Transcode every ambiguous
+            // codec (.aac/.ogg/.opus/HLS/extension-less) to WAV so sound is
+            // guaranteed; explicit .mp3/.flac stations still pass through with
+            // no CPU/bandwidth cost.
+            let url_path = audio_url.split(['?', '#']).next().unwrap_or(audio_url);
+            let reliable_ext = {
+                let p = url_path.to_lowercase();
+                p.ends_with(".mp3") || p.ends_with(".flac") || p.ends_with(".wav")
+            };
+            // A radio stream bound to a specific DLNA renderer is ALWAYS
+            // proxied+transcoded to WAV. Direct passthrough of an infinite
+            // Icecast stream is unreliable: it carries no Content-Length and
+            // may use ICY framing, so the renderer HEAD-probes, reports
+            // PLAYING, then emits silence — even for an explicit .mp3 whose
+            // HEAD returns 200 (Cyrille, Yamaha R-N2000A: Radio Classique
+            // proxied → sound, TSF Jazz sent direct → silent + retry loop).
+            // WAV is universally supported, so proxying guarantees sound at
+            // low CPU/LAN cost. Only device-less network resolves (no HEAD to
+            // gamble on) keep the extension-based passthrough.
+            let needs_proxy = if req.output_device_id.is_some() {
+                true
+            } else {
+                !reliable_ext
+            };
+
+            if needs_proxy {
                 let wav_info = StreamInfo {
                     format: "wav".into(),
                     mime_type: "audio/wav".into(),
@@ -1683,38 +1787,41 @@ impl PlaybackOrchestrator {
                     duration_ms: None,
                     ..Default::default()
                 };
-
                 let (session_id, tx, data_ready, session) =
                     self.streamer.create_radio_session(wav_info, 256).await;
-
-                info!(
-                    source = "radio",
-                    url = %audio_url,
-                    "radio_decode_to_wav_for_local_output"
-                );
-
+                info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
                 let radio_url = audio_url.to_string();
+                // VU-mètres sur radio (DLNA) : forwarder de niveaux alimenté
+                // par le PCM décodé. Observateur pur, n'affecte pas le flux.
+                let radio_levels_tx = if let Some(ref bus) = self.event_bus {
+                    let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                    Some(spawn_paced_levels_forwarder(
+                        bus.clone(),
+                        self.playback.clone(),
+                        req.zone_id,
+                        play_seq,
+                        0,
+                    ))
+                } else {
+                    None
+                };
                 tokio::spawn(async move {
-                    // Download + decode in a blocking thread since symphonia and
-                    // reqwest::blocking are both synchronous.
                     let result = tokio::task::spawn_blocking(move || {
-                        decode_radio_stream_to_pcm(radio_url, tx, data_ready, session)
+                        decode_radio_stream_to_pcm(
+                            radio_url,
+                            tx,
+                            data_ready,
+                            session,
+                            radio_levels_tx,
+                        )
                     })
                     .await;
-
                     match result {
-                        Ok(Ok(())) => {
-                            debug!("radio_local_decode_stream_ended");
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "radio_local_decode_failed");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "radio_local_decode_task_panic");
-                        }
+                        Ok(Ok(())) => debug!("radio_dlna_decode_stream_ended"),
+                        Ok(Err(e)) => warn!(error = %e, "radio_dlna_decode_failed"),
+                        Err(e) => warn!(error = %e, "radio_dlna_decode_task_panic"),
                     }
                 });
-
                 let server_ip = self.server_ip();
                 let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
                 (
@@ -1725,101 +1832,30 @@ impl PlaybackOrchestrator {
                     Some(16u32),
                     Some(2u32),
                 )
-            } else if is_radio {
-                // Network outputs (DLNA): check if the renderer supports the
-                // radio stream format (typically AAC). If not, proxy + transcode
-                // to WAV so the renderer can play it.
-                // Passthrough ONLY when the URL carries an unambiguous,
-                // renderer-supported extension (.mp3/.flac/.wav). Extension-less
-                // Icecast mounts fall through guess_mime_from_url() to the default
-                // "audio/mpeg", and .aac (ADTS) maps to "audio/mp4" — both are
-                // mislabels. The renderer then opens a stream whose bytes don't
-                // match the advertised protocolInfo, reports PLAYING and emits
-                // SILENCE (Cyrille, Yamaha R-N2000A). Transcode every ambiguous
-                // codec (.aac/.ogg/.opus/HLS/extension-less) to WAV so sound is
-                // guaranteed; explicit .mp3/.flac stations still pass through with
-                // no CPU/bandwidth cost.
-                let url_path = audio_url.split(['?', '#']).next().unwrap_or(audio_url);
-                let reliable_ext = {
-                    let p = url_path.to_lowercase();
-                    p.ends_with(".mp3") || p.ends_with(".flac") || p.ends_with(".wav")
-                };
-                // A radio stream bound to a specific DLNA renderer is ALWAYS
-                // proxied+transcoded to WAV. Direct passthrough of an infinite
-                // Icecast stream is unreliable: it carries no Content-Length and
-                // may use ICY framing, so the renderer HEAD-probes, reports
-                // PLAYING, then emits silence — even for an explicit .mp3 whose
-                // HEAD returns 200 (Cyrille, Yamaha R-N2000A: Radio Classique
-                // proxied → sound, TSF Jazz sent direct → silent + retry loop).
-                // WAV is universally supported, so proxying guarantees sound at
-                // low CPU/LAN cost. Only device-less network resolves (no HEAD to
-                // gamble on) keep the extension-based passthrough.
-                let needs_proxy = if req.output_device_id.is_some() {
-                    true
-                } else {
-                    !reliable_ext
-                };
-
-                if needs_proxy {
-                    let wav_info = StreamInfo {
-                        format: "wav".into(),
-                        mime_type: "audio/wav".into(),
-                        sample_rate: 44100,
-                        bit_depth: 16,
-                        channels: 2,
-                        file_size: None,
-                        duration_ms: None,
-                        ..Default::default()
-                    };
-                    let (session_id, tx, data_ready, session) =
-                        self.streamer.create_radio_session(wav_info, 256).await;
-                    info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
-                    let radio_url = audio_url.to_string();
-                    tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            decode_radio_stream_to_pcm(radio_url, tx, data_ready, session)
-                        })
-                        .await;
-                        match result {
-                            Ok(Ok(())) => debug!("radio_dlna_decode_stream_ended"),
-                            Ok(Err(e)) => warn!(error = %e, "radio_dlna_decode_failed"),
-                            Err(e) => warn!(error = %e, "radio_dlna_decode_task_panic"),
-                        }
-                    });
-                    let server_ip = self.server_ip();
-                    let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-                    (
-                        stream_url,
-                        Some(session_id),
-                        "audio/wav".to_string(),
-                        Some(44100u32),
-                        Some(16u32),
-                        Some(2u32),
-                    )
-                } else {
-                    // Renderer supports the format — send direct URL.
-                    // Downgrade https→http since DLNA renderers can't do TLS.
-                    let direct_url = if audio_url.starts_with("https://") {
-                        audio_url.replacen("https://", "http://", 1)
-                    } else {
-                        audio_url.to_string()
-                    };
-                    (direct_url, None, mime_type.to_string(), None, None, None)
-                }
             } else {
-                // Media-server / podcast direct URL. Carry the real resolution the
-                // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
-                // instead of letting the signal path default to 44.1kHz/16bit and
-                // mislabel a hi-res ALAC as lossy AAC (Yves, NAS).
-                (
-                    audio_url.to_string(),
-                    None,
-                    mime_type.to_string(),
-                    req.sample_rate,
-                    req.bit_depth.map(|b| b as u32),
-                    None,
-                )
-            };
+                // Renderer supports the format — send direct URL.
+                // Downgrade https→http since DLNA renderers can't do TLS.
+                let direct_url = if audio_url.starts_with("https://") {
+                    audio_url.replacen("https://", "http://", 1)
+                } else {
+                    audio_url.to_string()
+                };
+                (direct_url, None, mime_type.to_string(), None, None, None)
+            }
+        } else {
+            // Media-server / podcast direct URL. Carry the real resolution the
+            // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
+            // instead of letting the signal path default to 44.1kHz/16bit and
+            // mislabel a hi-res ALAC as lossy AAC (Yves, NAS).
+            (
+                audio_url.to_string(),
+                None,
+                mime_type.to_string(),
+                req.sample_rate,
+                req.bit_depth.map(|b| b as u32),
+                None,
+            )
+        };
 
         // Every branch above may have replaced the station/enclosure URL with one
         // of our proxy endpoints (WAV transcode for renderers that need it, or a
@@ -6532,6 +6568,10 @@ fn decode_radio_stream_to_pcm(
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     session: std::sync::Arc<crate::http::streamer::StreamSession>,
+    // Pur observateur : les VU-mètres. Un flux radio est décodé live (pas de
+    // fichier), donc le décodage-pour-niveaux des pistes locales ne s'applique
+    // pas — on tappe ici le PCM déjà décodé. `None` = pas de bus (tests).
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
 ) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
@@ -6775,6 +6815,17 @@ fn decode_radio_stream_to_pcm(
 
             while pcm_buf.len() >= chunk_size {
                 let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+                // VU-mètres : tappe le PCM 16-bit avant de le servir (canal
+                // séparé, non bloquant — n'affecte pas le flux du renderer).
+                if let Some(ref ltx) = levels_tx {
+                    crate::audio::tap::send_windowed_pcm(
+                        ltx,
+                        &chunk,
+                        16,
+                        channels as u16,
+                        source_sample_rate,
+                    );
+                }
                 if rt.block_on(tx.send(chunk)).is_err() {
                     debug!("radio_local_decode_consumer_dropped");
                     return Ok(());
