@@ -238,8 +238,16 @@ impl DlnaOutput {
     }
 
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
-        let is_dsd = media.mime_type.contains("dsd") || media.mime_type.contains("dsf");
-        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
+        Self::didl_metadata_mime(media, item_id, media.mime_type)
+    }
+
+    /// Like [`Self::didl_metadata`] but announces an explicit `mime` instead of
+    /// `media.mime_type`. Used to align the announced MIME with the renderer's
+    /// GetProtocolInfo Sink spelling (Beoplay A9 / Sink audio/x-flac, forum
+    /// 714) and for the 714 PCM fallback.
+    fn didl_metadata_mime(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
+        let is_dsd = mime.contains("dsd") || mime.contains("dsf");
+        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
             .dlna_art_profile(true)
@@ -346,27 +354,91 @@ impl OutputTarget for DlnaOutput {
         }
 
         let item_id = self.next_item_id();
-        let metadata = Self::didl_metadata(media, item_id);
-        let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
-            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
-            media.url
-        )).await?;
 
-        if set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>") {
-            // Error 714 ("Illegal MIME-type") means the renderer parsed the DIDL
-            // but its ConnectionManager Sink does not list the advertised MIME /
-            // protocolInfo. Surface the exact MIME + protocolInfo we sent AND the
-            // renderer's Sink, so the mismatch is diagnosable from a single log
-            // line (Mickaël, #1146: TIDAL → Beoplay 714). This is a strict-parser
-            // renderer (B&O, Lyngdorf); the same MIME works on lax renderers, so
-            // the actionable signal is "which MIME the Sink actually accepts".
+        // First attempt: announce `media.mime_type` UNCHANGED — exactly the
+        // previous behaviour. The Sink is NOT probed here: a healthy renderer
+        // (Sonos & co) accepts this MIME, so the happy path does ZERO extra
+        // GetProtocolInfo round-trip (no latency added in nominal playback).
+        // The Sink is probed ONLY when a 714 actually occurs (see below).
+        let mut attempt_mime = media.mime_type.to_string();
+        // Sink probed lazily on the first 714 and reused across the ≤2 retries.
+        let mut sink: Vec<String> = Vec::new();
+        let mut tried_exact = false;
+        let mut tried_fallback = false;
+        loop {
+            let metadata = Self::didl_metadata_mime(media, item_id, &attempt_mime);
+            let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
+                "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
+                media.url
+            )).await?;
+
+            if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
+                break;
+            }
+
+            // Error 714 ("Illegal MIME-type"): the renderer parsed the DIDL but
+            // its ConnectionManager Sink does not list the announced MIME.
+            // Beoplay A9 / Sink audio/x-flac, forum 714: strict renderers (B&O,
+            // Lyngdorf) reject `audio/flac` when their Sink only lists
+            // `audio/x-flac`, even though they decode the stream. ONLY here (on
+            // a real 714) do we pay a single GetProtocolInfo probe, then retry
+            // up to twice: (a) with the exact Sink spelling, (b) with a PCM
+            // profile the Sink lists. Strict renderers gate on the announced
+            // MIME but decode by content, so a Sink-accepted label lets the
+            // actual FLAC bytes through.
             let is_714 = set_uri_resp.contains(">714<")
                 || set_uri_resp.to_lowercase().contains("illegal mime");
+
+            if is_714 && (!tried_exact || !tried_fallback) {
+                // Probe the Sink once, on the first 714 only.
+                if sink.is_empty() {
+                    sink = self.get_protocol_info().await.unwrap_or_default();
+                }
+
+                // Retry (a): announce the exact spelling the Sink lists
+                // (e.g. audio/x-flac) if it differs from what we just sent.
+                if !tried_exact {
+                    tried_exact = true;
+                    let exact = advertised_mime_for_sink(media.mime_type, &sink);
+                    if !exact.eq_ignore_ascii_case(&attempt_mime) {
+                        warn!(
+                            device = %self.name,
+                            advertised_mime = %attempt_mime,
+                            exact_mime = %exact,
+                            sink = ?sink,
+                            "dlna_set_uri_714_exact_spelling_retry"
+                        );
+                        attempt_mime = exact;
+                        continue;
+                    }
+                }
+
+                // Retry (b): fall back to a PCM MIME the Sink lists (audio/wav
+                // then audio/L16) if we have not tried it yet.
+                if !tried_fallback {
+                    tried_fallback = true;
+                    if let Some(fb) = fallback_mime_from_sink(&sink) {
+                        if !fb.eq_ignore_ascii_case(&attempt_mime) {
+                            warn!(
+                                device = %self.name,
+                                advertised_mime = %attempt_mime,
+                                fallback_mime = %fb,
+                                sink = ?sink,
+                                "dlna_set_uri_714_pcm_fallback_retry"
+                            );
+                            attempt_mime = fb;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if is_714 {
-                let sink = self.get_protocol_info().await.unwrap_or_default();
+                // Surface the exact MIME + Sink so the mismatch is diagnosable
+                // from a single log line (Mickaël, #1146: TIDAL → Beoplay 714).
                 warn!(
                     device = %self.name,
-                    advertised_mime = media.mime_type,
+                    advertised_mime = %attempt_mime,
                     live_stream = media.live_stream,
                     sink_entries = sink.len(),
                     sink = ?sink,
@@ -374,8 +446,7 @@ impl OutputTarget for DlnaOutput {
                     "dlna_set_uri_illegal_mime_714"
                 );
                 return Err(format!(
-                    "SetAVTransportURI rejected 714 Illegal MIME-type: renderer Sink does not accept advertised MIME '{}' (sink has {} entries); rejected: {set_uri_resp}",
-                    media.mime_type,
+                    "SetAVTransportURI rejected 714 Illegal MIME-type: renderer Sink does not accept advertised MIME '{attempt_mime}' (sink has {} entries); rejected: {set_uri_resp}",
                     sink.len()
                 ));
             }
@@ -837,6 +908,69 @@ fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
     false
 }
 
+/// Base MIME (third colon-separated field, params stripped) of a Sink entry
+/// such as `http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM`.
+fn sink_entry_base_mime(entry: &str) -> Option<String> {
+    let field = entry.split(':').nth(2)?;
+    let mime = field.trim();
+    Some(mime.split(';').next().unwrap_or(mime).trim().to_string())
+}
+
+/// Choose the MIME spelling to announce in the DIDL / SetAVTransportURI given
+/// the renderer's GetProtocolInfo `Sink`.
+///
+/// Beoplay A9 / Sink audio/x-flac, forum 714: strict renderers (B&O, Lyngdorf)
+/// reject SetAVTransportURI with 714 "Illegal MIME-type" when the announced
+/// MIME differs from the exact spelling listed in their Sink, even though they
+/// can decode the stream. If `desired` is already listed we keep it; if only a
+/// known alias is listed (`audio/flac`↔`audio/x-flac`, `audio/mpeg`↔`audio/mp3`,
+/// `audio/wav`↔`audio/x-wav`) we announce the spelling the Sink actually lists;
+/// otherwise `desired` is returned unchanged (empty/unknown Sink ⇒ previous
+/// behaviour, no regression).
+fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
+    let listed: Vec<String> = sink
+        .iter()
+        .filter_map(|e| sink_entry_base_mime(e))
+        .collect();
+    // Already listed verbatim (case-insensitive): announce as-is.
+    if listed.iter().any(|b| b.eq_ignore_ascii_case(desired)) {
+        return desired.to_string();
+    }
+    let aliases: &[&str] = match desired.to_lowercase().as_str() {
+        "audio/flac" => &["audio/x-flac"],
+        "audio/x-flac" => &["audio/flac"],
+        "audio/mpeg" => &["audio/mp3"],
+        "audio/mp3" => &["audio/mpeg"],
+        "audio/wav" => &["audio/x-wav"],
+        "audio/x-wav" => &["audio/wav"],
+        _ => &[],
+    };
+    for alias in aliases {
+        if let Some(found) = listed.iter().find(|b| b.eq_ignore_ascii_case(alias)) {
+            return found.clone();
+        }
+    }
+    desired.to_string()
+}
+
+/// Pick a universally-decodable PCM MIME the renderer's `Sink` lists, for the
+/// one-shot 714 fallback (Beoplay A9 / forum 714). Prefers WAV, then LPCM
+/// (`audio/L16`), returning the exact spelling the Sink uses so the announced
+/// MIME passes the renderer's strict Sink check. `None` when the Sink lists no
+/// PCM profile.
+fn fallback_mime_from_sink(sink: &[String]) -> Option<String> {
+    for want in ["audio/wav", "audio/x-wav", "audio/l16"] {
+        if let Some(found) = sink
+            .iter()
+            .filter_map(|e| sink_entry_base_mime(e))
+            .find(|b| b.eq_ignore_ascii_case(want))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -893,6 +1027,62 @@ mod tests {
             "audio/flac",
             &["http-get:*:*:*".to_string()]
         ));
+    }
+
+    #[test]
+    fn advertised_mime_rewrites_flac_to_sink_x_flac() {
+        // Beoplay A9 (forum 714): Sink lists audio/x-flac but NOT audio/flac.
+        // We must announce the exact spelling the Sink lists, else 714.
+        let sink = vec![
+            "http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".to_string(),
+            "http-get:*:audio/wav:*".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM".to_string(),
+        ];
+        assert_eq!(
+            advertised_mime_for_sink("audio/flac", &sink),
+            "audio/x-flac"
+        );
+    }
+
+    #[test]
+    fn advertised_mime_keeps_exact_sink_spelling() {
+        // Sink lists audio/flac verbatim → announce it unchanged.
+        let sink = vec!["http-get:*:audio/flac:DLNA.ORG_PN=FLAC".to_string()];
+        assert_eq!(advertised_mime_for_sink("audio/flac", &sink), "audio/flac");
+    }
+
+    #[test]
+    fn advertised_mime_unchanged_when_alias_absent() {
+        // Neither audio/flac nor audio/x-flac listed, and empty Sink → keep
+        // the desired MIME unchanged (previous behaviour, no regression).
+        let sink = vec!["http-get:*:audio/mpeg:*".to_string()];
+        assert_eq!(advertised_mime_for_sink("audio/flac", &sink), "audio/flac");
+        assert_eq!(advertised_mime_for_sink("audio/flac", &[]), "audio/flac");
+    }
+
+    #[test]
+    fn advertised_mime_rewrites_mpeg_mp3_alias() {
+        let sink = vec!["http-get:*:audio/mp3:*".to_string()];
+        assert_eq!(advertised_mime_for_sink("audio/mpeg", &sink), "audio/mp3");
+    }
+
+    #[test]
+    fn fallback_mime_prefers_wav_then_l16() {
+        let sink = vec![
+            "http-get:*:audio/x-flac:*".to_string(),
+            "http-get:*:audio/wav:*".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+        ];
+        assert_eq!(fallback_mime_from_sink(&sink).as_deref(), Some("audio/wav"));
+
+        let sink_l16 = vec!["http-get:*:audio/L16;rate=44100;channels=2:*".to_string()];
+        assert_eq!(
+            fallback_mime_from_sink(&sink_l16).as_deref(),
+            Some("audio/L16")
+        );
+
+        let sink_none = vec!["http-get:*:audio/x-flac:*".to_string()];
+        assert_eq!(fallback_mime_from_sink(&sink_none), None);
     }
 
     #[test]
