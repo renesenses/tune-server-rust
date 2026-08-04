@@ -2226,10 +2226,18 @@ impl PlaybackOrchestrator {
         // traitement (les puristes ont le mode PURE, qui désactive ceci via
         // load_eq_processor→None) : on force alors le chemin transcodé, où
         // l'EQ est déjà branché. Jamais sur un passthrough DSD/ALAC voulu.
-        let eq_forces_transcode = is_network_output
+        // Les zones NAVIGATEUR tirent aussi le fichier brut via <audio> (FLAC
+        // local servi direct) : même trou que #1216, mesuré sur .18 — deux
+        // captures du flux EQ ±12 dB strictement identiques (md5). L'EQ y
+        // force donc aussi le transcodage.
+        let eq_forces_transcode = (is_network_output || is_browser_output)
             && !dsd_passthrough
             && !alac_passthrough
             && self.zone_has_active_eq(req.zone_id);
+        // En navigateur, la sortie transcodée doit être du WAV : un FLAC
+        // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
+        // Range (#1168) — même règle que le bras streaming.
+        let browser_needs_wav = browser_needs_wav || (is_browser_output && eq_forces_transcode);
 
         let needs_transcode = needs_transcode_for_output
             || oaat_needs_wav
