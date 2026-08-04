@@ -103,7 +103,7 @@ async fn create_smart_playlist(
 
     let result = state
         .backend
-        .execute(
+        .execute_returning_id(
             sql,
             &[
                 &body.name as &dyn ToSqlValue,
@@ -114,7 +114,6 @@ async fn create_smart_playlist(
                 &body.max_tracks as &dyn ToSqlValue,
             ],
         )
-        .map(|_| state.backend.last_insert_rowid())
         .map_err(|e| AppError::internal(e));
 
     match result {

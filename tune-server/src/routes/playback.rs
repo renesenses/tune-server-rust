@@ -2184,12 +2184,11 @@ async fn create_alarm(
     let volume = body.volume.unwrap_or(0.3);
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
     let profile_id = profile.id();
-    match state.backend.execute(
+    match state.backend.execute_returning_id(
         "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

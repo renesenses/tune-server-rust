@@ -511,14 +511,13 @@ fn import_playlists(
             continue;
         }
 
-        backend.execute(
+        let pl_id = backend.execute_returning_id(
             "INSERT INTO playlists (name, description) VALUES (?, ?)",
             &[
                 &name.to_string() as &dyn ToSqlValue,
                 &desc.map(|s| s.to_string()) as &dyn ToSqlValue,
             ],
         )?;
-        let pl_id = backend.last_insert_rowid();
 
         if let Some(tracks) = pl["tracks"].as_array() {
             for t in tracks {

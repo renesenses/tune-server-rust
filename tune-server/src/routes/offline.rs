@@ -204,17 +204,16 @@ async fn download_single_track(
 ) -> Response {
     // Insert or update the offline_cache entry
     use tune_core::db::backend::ToSqlValue;
-    let result = state.backend.execute(
+    let id = match state.backend.execute_returning_id(
         "INSERT INTO offline_cache (source, source_id, quality, status) VALUES (?, ?, ?, 'pending') \
          ON CONFLICT(source, source_id) DO UPDATE SET status = 'pending', quality = excluded.quality",
         &[&source as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &quality as &dyn ToSqlValue],
-    );
-
-    if let Err(e) = result {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-    }
-
-    let id = state.backend.last_insert_rowid();
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
+    };
 
     // Spawn background download task
     let backend = state.backend.clone();
