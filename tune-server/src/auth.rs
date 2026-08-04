@@ -582,21 +582,24 @@ async fn register(
         }
     };
 
-    // Create profile
+    // Create profile. Atomically return the new id: the old code read
+    // `last_insert_rowid()` BEFORE checking the INSERT even succeeded (and via a
+    // separate lock, so a concurrent insert could hand back the wrong id) —
+    // audit item 5.
     use tune_core::db::backend::ToSqlValue;
-    let result = state.backend.execute(
+    let profile_id = match state.backend.execute_returning_id(
         "INSERT INTO profiles (username, display_name, password_hash_v2, email) VALUES (?, ?, ?, ?)",
         &[&username as &dyn ToSqlValue, &username as &dyn ToSqlValue, &password_hash as &dyn ToSqlValue, &body.email as &dyn ToSqlValue],
-    );
-    let profile_id = state.backend.last_insert_rowid();
-
-    if let Err(e) = result {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to create profile: {e}")})),
-        )
-            .into_response();
-    }
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to create profile: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     // Determine role
     let is_admin = profile_id == 1; // first user is admin

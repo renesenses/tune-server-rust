@@ -451,7 +451,14 @@ impl TrackRepo {
             &track.musicbrainz_recording_id,
             &track.comments,
         ];
-        self.db.execute(&sql, &params).map_err(TuneError::Db)?;
+        // Capture the new track id atomically, BEFORE the file_first_seen
+        // insert below — otherwise `last_insert_rowid()` at the end returns that
+        // side-table's row id for any newly-seen file (intervening-insert race,
+        // audit item 5).
+        let id = self
+            .db
+            .execute_returning_id(&sql, &params)
+            .map_err(TuneError::Db)?;
 
         // Record the library "first seen" timestamp for local files, keyed by
         // path in a side table that survives a full rescan (delete_all wipes
@@ -476,7 +483,7 @@ impl TrackRepo {
             }
         }
 
-        Ok(self.db.last_insert_rowid())
+        Ok(id)
     }
 
     pub fn create(&self, track: &Track) -> Result<i64, TuneError> {

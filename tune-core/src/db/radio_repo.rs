@@ -183,8 +183,7 @@ impl RadioRepo {
             &station.bitrate,
             &station.is_favorite,
         ];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {

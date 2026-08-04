@@ -86,7 +86,7 @@ impl PlaybackHistory {
             .as_secs() as i64;
 
         use crate::db::backend::ToSqlValue;
-        self.db.execute(
+        Ok(self.db.execute_returning_id(
             "INSERT INTO playback_history \
              (track_id, title, artist_name, album_title, source, source_id, \
               zone_id, played_at, duration_ms, listened_ms) \
@@ -103,9 +103,7 @@ impl PlaybackHistory {
                 &duration_ms,
                 &listened_ms,
             ],
-        )?;
-
-        Ok(self.db.last_insert_rowid())
+        )?)
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
