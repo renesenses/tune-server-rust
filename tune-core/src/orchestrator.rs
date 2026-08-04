@@ -2047,6 +2047,26 @@ impl PlaybackOrchestrator {
                 | Some("slimproto")
         );
 
+        // Browser (Web Audio) zones pull the file themselves via <audio> and can
+        // only decode the mainstream web codecs (FLAC/MP3/AAC/WAV/Ogg/Opus). An
+        // exotic source — above all DSD — is otherwise served RAW (no network/
+        // local output claims it, so nothing forces a transcode) and the <audio>
+        // element is handed bytes it can't play, staying SILENT (Reivax66, local
+        // DSD album on the "Cet ordinateur" zone, 0.9.44). Decode those to PCM/WAV
+        // here, mirroring the streaming arm which already serves WAV to browser
+        // zones. Codecs a browser plays natively stay direct (no regression).
+        let is_browser_output = zone_output_type.as_deref() == Some("browser");
+        let browser_needs_wav = is_browser_output
+            && matches!(
+                source_format,
+                Some(AudioFormat::Dsd)
+                    | Some(AudioFormat::WavPack)
+                    | Some(AudioFormat::Ape)
+                    | Some(AudioFormat::Wma)
+                    | Some(AudioFormat::Aiff)
+                    | Some(AudioFormat::Alac)
+            );
+
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
         let dsd_passthrough = if source_format == Some(AudioFormat::Dsd) && is_network_output {
             let did = req
@@ -2178,6 +2198,7 @@ impl PlaybackOrchestrator {
         let needs_transcode = needs_transcode_for_output
             || oaat_needs_wav
             || local_needs_wav
+            || browser_needs_wav
             || needs_downsample
             || dlna_needs_wav
             || eq_forces_transcode
@@ -2200,7 +2221,7 @@ impl PlaybackOrchestrator {
             resolved_ch,
         ) = if needs_transcode {
             let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
-            let target_fmt = if oaat_needs_wav || local_needs_wav {
+            let target_fmt = if oaat_needs_wav || local_needs_wav || browser_needs_wav {
                 AudioFormat::Wav
             } else if dlna_needs_wav {
                 // Renderer doesn't support FLAC — transcode to WAV (LPCM)
@@ -2269,6 +2290,11 @@ impl PlaybackOrchestrator {
                 // byte width.  The local output converts to f32 for cpal anyway,
                 // so there is zero quality loss.
                 32
+            } else if browser_needs_wav {
+                // Browser <audio> plays 16-bit PCM WAV everywhere; 24/32-bit are
+                // spotty across engines. Match the streaming arm (browser = 16-bit
+                // WAV) so playback is guaranteed audible.
+                16
             } else if src_fmt == AudioFormat::Dsd {
                 24
             } else if oaat_needs_wav {
