@@ -745,7 +745,11 @@ mod settle_tests {
 
     #[test]
     fn settles_stable_nonzero_defers_zero_drops_missing_and_excluded() {
-        let dir = std::env::temp_dir().join("tune_settle_test");
+        // NOT under the system temp dir: is_tune_temp_file() drops everything
+        // there, which would (correctly) exclude the fixtures and mask the logic
+        // under test. A unique dir relative to the test cwd (the crate root) is
+        // resolved by fs::metadata but never matches starts_with(temp_dir()).
+        let dir = std::path::PathBuf::from(format!(".settle_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let stable = dir.join("stable.flac");
