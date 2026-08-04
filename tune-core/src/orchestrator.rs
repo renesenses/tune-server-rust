@@ -512,6 +512,29 @@ fn use_file_transcode_for(
     is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
 }
 
+/// Is `output_type` (from [`PlaybackOrchestrator::output_type_of`]) one of the
+/// push-URI renderer types (DLNA/OpenHome/Chromecast/BluOS/Squeezebox/
+/// Slimproto) that receives a URI and can restart playback from byte 0 on a
+/// redundant `SetAVTransportURI` (or equivalent) — the failure mode the
+/// duplicate-net-play coalescing in `play_inner` (#1129) guards against?
+/// Pull-based outputs — `local`, and out-of-tree outputs like `oaat` and
+/// `diretta` that fetch/stream audio themselves rather than being pushed a
+/// URI — never exhibit it, so they must be excluded here rather than only via
+/// a `device_id` naming convention (a pull output has no reason to prefix its
+/// `device_id` with `"local:"`). Pure so it's unit-testable without an
+/// orchestrator or a registered output.
+fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
+    matches!(
+        output_type,
+        Some("dlna")
+            | Some("openhome")
+            | Some("chromecast")
+            | Some("bluos")
+            | Some("squeezebox")
+            | Some("slimproto")
+    )
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -916,13 +939,21 @@ impl PlaybackOrchestrator {
         // plays a few seconds, jumps to 0, then plays through — forum, Philippe
         // Vella). If we pushed this exact (source, source_id) to this zone within
         // DUPLICATE_NET_PLAY_WINDOW and this is not an explicit seek, skip the
-        // redundant send. Network push outputs only — local/USB pull outputs
-        // prefill their own ring buffer and don't restart-glitch. The record is
-        // cleared on stop(), so a stop→replay of the same track still plays.
-        let is_net_output = req
-            .output_device_id
-            .as_deref()
-            .is_some_and(|id| !id.starts_with("local:"));
+        // redundant send. Push-URI outputs only (the ones that can even exhibit a
+        // SetAVTransportURI restart-from-0) — checked against the registered
+        // output's real `output_type()` via `is_push_uri_output_type`, rather
+        // than guessed from the device_id string. Local/USB outputs prefill
+        // their own ring buffer and don't restart-glitch, and neither do
+        // pull-based out-of-tree outputs (oaat, diretta) that fetch audio
+        // themselves instead of being pushed a URI — a `!starts_with("local:")`
+        // guess would have wrongly caught both of those (they don't use a
+        // "local:" device_id prefix either), coalescing a legitimate same-track
+        // replay within the window. The record is cleared on stop(), so a
+        // stop→replay of the same track still plays.
+        let is_net_output = match req.output_device_id.as_deref() {
+            Some(id) => is_push_uri_output_type(self.output_type_of(id).await.as_deref()),
+            None => false,
+        };
         let is_seek = req.seek_ms.unwrap_or(0) > 0;
         if is_net_output && !is_seek {
             let is_dup = {
@@ -4735,7 +4766,8 @@ impl PlaybackOrchestrator {
 
     /// `output_type()` of the registered output for `device_id` (e.g. "dlna",
     /// "local", "openhome"), or `None` when the device is not registered. Used
-    /// to gate the initial DLNA prebuffer barrier (#1259) to DLNA outputs only.
+    /// to gate the initial DLNA prebuffer barrier (#1259) to DLNA outputs only,
+    /// and the duplicate-net-play coalescing (#1129) to push-URI outputs only.
     async fn output_type_of(&self, device_id: &str) -> Option<String> {
         let arc = { self.outputs.lock().await.get(device_id) };
         match arc {
@@ -6770,8 +6802,30 @@ mod tests {
     use crate::streaming::registry::ServiceRegistry;
 
     use super::{
-        PlayRequest, PlaybackOrchestrator, passthrough_didl_duration_ms, use_file_transcode_for,
+        PlayRequest, PlaybackOrchestrator, is_push_uri_output_type, passthrough_didl_duration_ms,
+        use_file_transcode_for,
     };
+
+    #[test]
+    fn duplicate_net_play_gate_excludes_pull_outputs() {
+        // #1129's coalescing exists for renderers that receive a URI and can
+        // restart from byte 0 on a redundant send (Revox S100). Pull-based
+        // outputs never have that failure mode and must stay excluded.
+        assert!(is_push_uri_output_type(Some("dlna")));
+        assert!(is_push_uri_output_type(Some("openhome")));
+        assert!(is_push_uri_output_type(Some("chromecast")));
+        assert!(is_push_uri_output_type(Some("bluos")));
+        assert!(is_push_uri_output_type(Some("squeezebox")));
+        assert!(is_push_uri_output_type(Some("slimproto")));
+
+        // Pull-based: fetch/stream audio themselves, never restart-glitch.
+        assert!(!is_push_uri_output_type(Some("local")));
+        assert!(!is_push_uri_output_type(Some("oaat")));
+        assert!(!is_push_uri_output_type(Some("diretta")));
+
+        // Unregistered device (output_type_of returned None): never coalesce.
+        assert!(!is_push_uri_output_type(None));
+    }
 
     #[test]
     fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
