@@ -4,12 +4,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
 
-#[allow(unused_imports)]
 use crate::state::AppState;
 
-pub(super) async fn list_backups() -> Json<Value> {
-    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
-    let items = tune_core::db_backup::list_backups(&db_path);
+pub(super) async fn list_backups(State(state): State<AppState>) -> Json<Value> {
+    let items = tune_core::db_backup::list_backups(&state.config.db_path);
     Json(json!(items))
 }
 
@@ -17,7 +15,7 @@ pub(super) async fn create_backup(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    let db_path = state.config.db_path.clone();
     if db_path == ":memory:" {
         return (StatusCode::BAD_REQUEST, "cannot backup in-memory database").into_response();
     }
@@ -35,10 +33,10 @@ pub(super) async fn create_backup(
 
 pub(super) async fn restore_backup(
     _admin: crate::auth::RequireAdmin,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    let db_path = state.config.db_path.clone();
     if db_path == ":memory:" {
         return (
             StatusCode::BAD_REQUEST,
@@ -85,7 +83,12 @@ pub(super) async fn create_encrypted_backup(
             .into_response();
     };
 
-    let backup_path = format!("backups/{}", info.filename);
+    // Backups live next to the resolved db file, not relative to the CWD
+    let backup_dir = std::path::Path::new(&db_path)
+        .parent()
+        .map(|p| p.join("backups"))
+        .unwrap_or_else(|| std::path::PathBuf::from("backups"));
+    let backup_path = backup_dir.join(&info.filename);
     let data = match std::fs::read(&backup_path) {
         Ok(d) => d,
         Err(e) => {
@@ -99,7 +102,7 @@ pub(super) async fn create_encrypted_backup(
 
     let encrypted = tune_core::db_backup::encrypt_backup(&data, &password);
     let enc_filename = format!("{}.enc", info.filename);
-    let enc_path = format!("backups/{enc_filename}");
+    let enc_path = backup_dir.join(&enc_filename);
     if let Err(e) = std::fs::write(&enc_path, &encrypted) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
