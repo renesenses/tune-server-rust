@@ -18,6 +18,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // DAC never appears — the zone is stuck on the wrong output with no sound
     // (JP Borderies: SOtM DAC absent from the list). Enumerating here, before any
     // playback, captures it. Fire-and-forget; no-op off Windows / without `asio`.
+    // `outputs::local` only exists under `local-audio` (the oaat-only CI build
+    // compiles without it).
+    #[cfg(feature = "local-audio")]
     tokio::task::spawn_blocking(|| {
         let _ = tune_core::outputs::local::list_asio_devices();
     });
