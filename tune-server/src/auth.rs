@@ -538,13 +538,14 @@ struct RegisterRequest {
 
 async fn register(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     let username = body.username.trim().to_string();
-    if username.is_empty() || body.password.len() < 4 {
+    if username.is_empty() || body.password.len() < 8 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "username required and password must be at least 4 characters"})),
+            Json(json!({"error": "username required and password must be at least 8 characters"})),
         )
             .into_response();
     }
@@ -619,7 +620,7 @@ async fn register(
         }
     };
 
-    let cookie = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+    let cookie = session_cookie(&token, &headers);
 
     let mut response = Json(json!({
         "token": token,
@@ -651,11 +652,83 @@ struct LoginRequest {
     password: String,
 }
 
+// ---------------------------------------------------------------------------
+// Login brute-force throttling + cookie hardening
+// ---------------------------------------------------------------------------
+
+const LOGIN_MAX_FAILURES: u32 = 10;
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Per-IP failed-login counters. The audit flagged that login had no attempt
+/// throttling at all — this bounds online password guessing.
+static LOGIN_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn login_rate_limited(ip: std::net::IpAddr) -> bool {
+    // The local operator is never locked out.
+    if ip.is_loopback() {
+        return false;
+    }
+    let mut map = LOGIN_FAILURES.lock().unwrap();
+    match map.get(&ip) {
+        Some((count, first)) if first.elapsed() < LOGIN_WINDOW => *count >= LOGIN_MAX_FAILURES,
+        Some(_) => {
+            map.remove(&ip);
+            false
+        }
+        None => false,
+    }
+}
+
+fn record_login_failure(ip: std::net::IpAddr) {
+    if ip.is_loopback() {
+        return;
+    }
+    let mut map = LOGIN_FAILURES.lock().unwrap();
+    let entry = map.entry(ip).or_insert((0, std::time::Instant::now()));
+    if entry.1.elapsed() >= LOGIN_WINDOW {
+        *entry = (1, std::time::Instant::now());
+    } else {
+        entry.0 += 1;
+    }
+}
+
+fn clear_login_failures(ip: std::net::IpAddr) {
+    LOGIN_FAILURES.lock().unwrap().remove(&ip);
+}
+
+/// Build the session cookie. `Secure` is added only when the request arrived
+/// over HTTPS (via the `X-Forwarded-Proto` a TLS-terminating proxy sets), so
+/// the cookie still works on a plain-HTTP LAN deployment while getting the
+/// `Secure` flag wherever TLS is actually in play.
+fn session_cookie(token: &str, headers: &axum::http::HeaderMap) -> String {
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    let base = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+    if https {
+        format!("{base}; Secure")
+    } else {
+        base
+    }
+}
+
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    if login_rate_limited(peer.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "too many login attempts, try again later"})),
+        )
+            .into_response();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Look up profile
@@ -680,6 +753,7 @@ async fn login(
     let (profile_id, old_hash, new_hash, is_admin) = match row {
         Some(r) => r,
         None => {
+            record_login_failure(peer.ip());
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "invalid credentials"})),
@@ -730,12 +804,14 @@ async fn login(
     };
 
     if !valid {
+        record_login_failure(peer.ip());
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
     }
+    clear_login_failures(peer.ip());
 
     // If logged in with old SHA-256 hash, upgrade to argon2
     if !valid_v2 && valid {
@@ -763,7 +839,7 @@ async fn login(
         }
     };
 
-    let cookie = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+    let cookie = session_cookie(&token, &headers);
 
     let mut response = Json(json!({
         "token": token,

@@ -233,3 +233,88 @@ async fn auth_disabled_keeps_first_run_setup_open() {
         "first-run enable-auth must not be blocked"
     );
 }
+
+/// Brute-force throttling: after LOGIN_MAX_FAILURES bad attempts from one IP,
+/// further attempts are rejected with 429. Uses a dedicated IP so it can't
+/// interfere with (or be tripped by) the other tests' failed logins.
+#[tokio::test]
+async fn login_is_rate_limited_after_repeated_failures() {
+    let state = new_state();
+    let app = app(&state, "198.51.100.9:5000");
+    for _ in 0..10 {
+        let (st, _) = post_json(
+            &app,
+            "/api/v1/auth/login",
+            None,
+            r#"{"username":"nope","password":"bad"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (st, _) = post_json(
+        &app,
+        "/api/v1/auth/login",
+        None,
+        r#"{"username":"nope","password":"bad"}"#,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::TOO_MANY_REQUESTS,
+        "should lock out after 10 failures"
+    );
+}
+
+/// Registration enforces a minimum password length (raised 4 -> 8).
+#[tokio::test]
+async fn register_rejects_short_password() {
+    let state = new_state();
+    let app = app(&state, LOCAL);
+    let (st, body) = post_json(
+        &app,
+        "/api/v1/auth/register",
+        None,
+        r#"{"username":"newuser","password":"short7"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(body.contains("8 characters"), "got: {body}");
+}
+
+/// The session cookie carries `Secure` when the request came over HTTPS
+/// (X-Forwarded-Proto), and omits it on plain HTTP so LAN use isn't broken.
+#[tokio::test]
+async fn session_cookie_secure_follows_forwarded_proto() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let mk = |proto: &str| {
+        Request::post("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-forwarded-proto", proto)
+            .body(Body::from(
+                r#"{"username":"default","password":"whatever"}"#.to_string(),
+            ))
+            .unwrap()
+    };
+
+    let state = new_state();
+    let resp = app(&state, LOCAL).oneshot(mk("https")).await.unwrap();
+    let c = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(c.contains("Secure"), "https cookie must be Secure: {c}");
+
+    let state = new_state();
+    let resp = app(&state, LOCAL).oneshot(mk("http")).await.unwrap();
+    let c = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(!c.contains("Secure"), "http cookie must not be Secure: {c}");
+}
