@@ -1,15 +1,22 @@
 //! Synchronized lyrics via LRCLIB.
 //!
-//! - Parses LRC-format timestamped lyrics into `Vec<LyricLine>`.
+//! - Parses LRC-format timestamped lyrics into `Vec<LyricLine>` (delegates
+//!   to the canonical parser in [`crate::metadata::lyrics`]).
 //! - Fetches from <https://lrclib.net/api/get> (no API key required).
-//! - Caches results in `lyrics_cache` DB table.
+//! - Caches results in the `lyrics_cache` DB table (SQLite and Postgres),
+//!   including negative results which are retried after 14 days.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+
+/// Negative cache entries (no lyrics found) are retried after this delay.
+const NEGATIVE_CACHE_TTL_DAYS: i64 = 14;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -48,83 +55,69 @@ struct LrclibResponse {
     plain_lyrics: Option<String>,
 }
 
+/// Raw LRCLIB result: original `syncedLyrics` (LRC text) and `plainLyrics`.
+#[derive(Debug, Clone, Default)]
+pub struct LrclibRaw {
+    pub synced_lyrics: Option<String>,
+    pub plain_lyrics: Option<String>,
+}
+
+impl LrclibRaw {
+    pub fn is_empty(&self) -> bool {
+        self.synced_lyrics
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+            && self
+                .plain_lyrics
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+    }
+}
+
 // ---------------------------------------------------------------------------
-// LRC parser
+// LRC parser (canonical implementation lives in metadata::lyrics)
 // ---------------------------------------------------------------------------
 
 /// Parse an LRC-format string into a sorted `Vec<LyricLine>`.
 ///
 /// Accepted format per line: `[MM:SS.xx] text` where `xx` can be 1-3
-/// digits (centiseconds or milliseconds).
+/// digits (centiseconds or milliseconds). Several timestamps per line are
+/// supported and metadata tags (`[ar:..]`, `[ti:..]`…) are ignored.
 pub fn parse_lrc(lrc: &str) -> Vec<LyricLine> {
-    let mut lines = Vec::new();
-
-    for raw in lrc.lines() {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-
-        // Find `[MM:SS.xx]` prefix.
-        let Some(close) = raw.find(']') else {
-            continue;
-        };
-        if !raw.starts_with('[') {
-            continue;
-        }
-
-        let timestamp = &raw[1..close];
-        let text = raw[close + 1..].trim().to_string();
-
-        if let Some(ms) = parse_timestamp(timestamp) {
-            lines.push(LyricLine { time_ms: ms, text });
-        }
-    }
-
-    lines.sort_by_key(|l| l.time_ms);
-    lines
-}
-
-/// Parse `MM:SS.xx` into milliseconds.
-fn parse_timestamp(ts: &str) -> Option<i64> {
-    let (min_part, rest) = ts.split_once(':')?;
-    let (sec_part, frac_part) = rest.split_once('.')?;
-
-    let minutes: i64 = min_part.parse().ok()?;
-    let seconds: i64 = sec_part.parse().ok()?;
-
-    // Fractional part: 2 digits = centiseconds, 3 digits = milliseconds.
-    let frac_str = frac_part.trim();
-    let millis_frac: i64 = match frac_str.len() {
-        1 => frac_str.parse::<i64>().ok()? * 100,
-        2 => frac_str.parse::<i64>().ok()? * 10,
-        3 => frac_str.parse::<i64>().ok()?,
-        _ => return None,
-    };
-
-    Some(minutes * 60_000 + seconds * 1_000 + millis_frac)
+    crate::metadata::lyrics::parse_lrc(lrc)
+        .into_iter()
+        .map(|l| LyricLine {
+            time_ms: l.time_ms as i64,
+            text: l.text,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // LRCLIB fetch
 // ---------------------------------------------------------------------------
 
-/// Fetch lyrics from LRCLIB for a given artist/track/duration.
+/// Fetch raw lyrics from LRCLIB for a given artist/track/album/duration.
 ///
-/// `duration_secs` is the track length in seconds (integer). LRCLIB
-/// uses it for disambiguation when multiple versions exist.
-pub async fn fetch_from_lrclib(
+/// Returns `Ok(None)` when LRCLIB has no entry (HTTP 404), `Err` on
+/// network/protocol failures. Short 5 s timeout: this is called from an
+/// interactive endpoint and must fail fast.
+pub async fn fetch_lrclib_raw(
     client: &reqwest::Client,
     artist: &str,
     track_name: &str,
+    album_name: Option<&str>,
     duration_secs: Option<i64>,
-) -> Result<Lyrics, String> {
+) -> Result<Option<LrclibRaw>, String> {
     let mut url = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}",
         urlencoding::encode(artist),
         urlencoding::encode(track_name),
     );
 
+    if let Some(album) = album_name.filter(|a| !a.trim().is_empty()) {
+        url.push_str(&format!("&album_name={}", urlencoding::encode(album)));
+    }
     if let Some(dur) = duration_secs {
         url.push_str(&format!("&duration={dur}"));
     }
@@ -133,18 +126,14 @@ pub async fn fetch_from_lrclib(
 
     let resp = client
         .get(&url)
-        .header("User-Agent", "Tune Music Server (https://mozaiklabs.fr)")
+        .header("User-Agent", format!("Tune/{}", crate::version()))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .map_err(|e| format!("lrclib request failed: {e}"))?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Lyrics {
-            synced: false,
-            lines: Vec::new(),
-            plain_text: None,
-            source: "lrclib".into(),
-        });
+        return Ok(None);
     }
 
     if !resp.status().is_success() {
@@ -156,7 +145,28 @@ pub async fn fetch_from_lrclib(
         .await
         .map_err(|e| format!("lrclib parse error: {e}"))?;
 
-    let lines = body
+    Ok(Some(LrclibRaw {
+        synced_lyrics: body.synced_lyrics,
+        plain_lyrics: body.plain_lyrics,
+    }))
+}
+
+/// Fetch lyrics from LRCLIB for a given artist/track/duration.
+///
+/// `duration_secs` is the track length in seconds (integer). LRCLIB
+/// uses it for disambiguation when multiple versions exist.
+pub async fn fetch_from_lrclib(
+    client: &reqwest::Client,
+    artist: &str,
+    track_name: &str,
+    album_name: Option<&str>,
+    duration_secs: Option<i64>,
+) -> Result<Lyrics, String> {
+    let raw = fetch_lrclib_raw(client, artist, track_name, album_name, duration_secs)
+        .await?
+        .unwrap_or_default();
+
+    let lines = raw
         .synced_lyrics
         .as_deref()
         .map(parse_lrc)
@@ -165,74 +175,123 @@ pub async fn fetch_from_lrclib(
     Ok(Lyrics {
         synced: !lines.is_empty(),
         lines,
-        plain_text: body.plain_lyrics,
+        plain_text: raw.plain_lyrics,
         source: "lrclib".into(),
     })
 }
 
 // ---------------------------------------------------------------------------
-// Cache layer
+// Cache layer (`lyrics_cache` table — exists in both SQLite and Postgres)
 // ---------------------------------------------------------------------------
 
-/// Load cached lyrics from the `lyrics_cache` table.
-fn load_cached(db: &Arc<dyn DbBackend>, track_id: i64) -> Option<Lyrics> {
-    let sql = "SELECT synced_lyrics, plain_lyrics, source FROM lyrics_cache WHERE track_id = ?";
+/// One row of the `lyrics_cache` table. `synced_lyrics` holds raw LRC text,
+/// `plain_lyrics` the unsynced fallback; both `None` = cached negative.
+#[derive(Debug, Clone, Default)]
+pub struct LyricsCacheEntry {
+    pub synced_lyrics: Option<String>,
+    pub plain_lyrics: Option<String>,
+    pub source: String,
+    /// ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+    pub fetched_at: Option<String>,
+}
+
+impl LyricsCacheEntry {
+    pub fn is_negative(&self) -> bool {
+        self.synced_lyrics
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+            && self
+                .plain_lyrics
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+    }
+
+    /// True when a cached negative is still fresh (no re-fetch needed).
+    pub fn negative_still_fresh(&self) -> bool {
+        let Some(ref fetched) = self.fetched_at else {
+            return false;
+        };
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(NEGATIVE_CACHE_TTL_DAYS);
+        // Both engines store `YYYY-MM-DDTHH:MM:SSZ`: lexicographic order is
+        // chronological order for this fixed-width format.
+        fetched.as_str() >= cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string().as_str()
+    }
+}
+
+fn dialect_sql(db: &Arc<dyn DbBackend>, f: impl Fn(&dyn SqlDialect) -> String) -> String {
+    match db.engine() {
+        Engine::Sqlite => f(&SqliteDialect),
+        Engine::Postgres => f(&PostgresDialect),
+    }
+}
+
+/// Load the cached `lyrics_cache` row for a track, if any.
+pub fn load_cache_entry(db: &Arc<dyn DbBackend>, track_id: i64) -> Option<LyricsCacheEntry> {
+    let sql = dialect_sql(db, |d| {
+        format!(
+            "SELECT synced_lyrics, plain_lyrics, source, fetched_at \
+             FROM lyrics_cache WHERE track_id = {}",
+            d.placeholder(1)
+        )
+    });
     let params: [&dyn ToSqlValue; 1] = [&track_id];
 
-    let row = db.query_one(sql, &params).ok()??;
-    if row.len() < 3 {
+    let row = db.query_one(&sql, &params).ok()??;
+    if row.len() < 4 {
         return None;
     }
 
-    let synced_raw = row[0].as_str().map(|s| s.to_string());
-    let plain = row[1].as_str().map(|s| s.to_string());
-    let source = row[2].as_str().unwrap_or("lrclib").to_string();
-
-    let lines = synced_raw.as_deref().map(parse_lrc).unwrap_or_default();
-
-    Some(Lyrics {
-        synced: !lines.is_empty(),
-        lines,
-        plain_text: plain,
-        source,
+    Some(LyricsCacheEntry {
+        synced_lyrics: row[0].as_str().map(|s| s.to_string()),
+        plain_lyrics: row[1].as_str().map(|s| s.to_string()),
+        source: row[2].as_str().unwrap_or("lrclib").to_string(),
+        fetched_at: row[3].as_str().map(|s| s.to_string()),
     })
 }
 
-/// Store lyrics in the `lyrics_cache` table (upsert).
-fn store_cache(db: &Arc<dyn DbBackend>, track_id: i64, title: &str, artist: &str, lyrics: &Lyrics) {
-    let synced_text: Option<String> = if lyrics.synced {
-        // Re-serialize LRC lines back to canonical LRC text.
-        Some(
-            lyrics
-                .lines
-                .iter()
-                .map(|l| {
-                    let mins = l.time_ms / 60_000;
-                    let secs = (l.time_ms % 60_000) / 1_000;
-                    let centis = (l.time_ms % 1_000) / 10;
-                    format!("[{mins:02}:{secs:02}.{centis:02}] {}", l.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+/// Upsert a `lyrics_cache` row (works on SQLite and Postgres). Storing a
+/// row with both bodies `None` records a negative result.
+pub fn store_cache_entry(
+    db: &Arc<dyn DbBackend>,
+    track_id: i64,
+    title: &str,
+    artist: &str,
+    synced_lyrics: Option<&str>,
+    plain_lyrics: Option<&str>,
+) {
+    let sql = dialect_sql(db, |d| {
+        format!(
+            "INSERT INTO lyrics_cache \
+             (track_id, title, artist, synced_lyrics, plain_lyrics, source, fetched_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT(track_id) DO UPDATE SET \
+             title = excluded.title, artist = excluded.artist, \
+             synced_lyrics = excluded.synced_lyrics, \
+             plain_lyrics = excluded.plain_lyrics, \
+             source = excluded.source, fetched_at = excluded.fetched_at",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
         )
-    } else {
-        None
-    };
+    });
 
-    let sql = "INSERT OR REPLACE INTO lyrics_cache \
-               (track_id, title, artist, synced_lyrics, plain_lyrics, source, fetched_at) \
-               VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))";
-
-    let params: [&dyn ToSqlValue; 6] = [
+    let fetched_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let source = "lrclib";
+    let params: [&dyn ToSqlValue; 7] = [
         &track_id,
         &title,
         &artist,
-        &synced_text.as_deref() as &dyn ToSqlValue,
-        &lyrics.plain_text.as_deref() as &dyn ToSqlValue,
-        &lyrics.source.as_str(),
+        &synced_lyrics as &dyn ToSqlValue,
+        &plain_lyrics as &dyn ToSqlValue,
+        &source,
+        &fetched_at,
     ];
 
-    if let Err(e) = db.execute(sql, &params) {
+    if let Err(e) = db.execute(&sql, &params) {
         warn!(error = %e, track_id, "lyrics_cache_store_failed");
     }
 }
@@ -242,19 +301,32 @@ fn store_cache(db: &Arc<dyn DbBackend>, track_id: i64, title: &str, artist: &str
 // ---------------------------------------------------------------------------
 
 /// Get lyrics for a track. Checks the DB cache first, then falls back
-/// to LRCLIB if not cached.
+/// to LRCLIB if not cached (negatives are retried after 14 days).
 pub async fn get_lyrics(
     db: &Arc<dyn DbBackend>,
     client: &reqwest::Client,
     track_id: i64,
     title: &str,
     artist: &str,
+    album: Option<&str>,
     duration_ms: i64,
 ) -> Result<Lyrics, String> {
     // 1. Try cache.
-    if let Some(cached) = load_cached(db, track_id) {
-        debug!(track_id, "lyrics_cache_hit");
-        return Ok(cached);
+    if let Some(cached) = load_cache_entry(db, track_id) {
+        if !cached.is_negative() || cached.negative_still_fresh() {
+            debug!(track_id, "lyrics_cache_hit");
+            let lines = cached
+                .synced_lyrics
+                .as_deref()
+                .map(parse_lrc)
+                .unwrap_or_default();
+            return Ok(Lyrics {
+                synced: !lines.is_empty(),
+                lines,
+                plain_text: cached.plain_lyrics,
+                source: cached.source,
+            });
+        }
     }
 
     // 2. Fetch from LRCLIB.
@@ -264,12 +336,32 @@ pub async fn get_lyrics(
         None
     };
 
-    let lyrics = fetch_from_lrclib(client, artist, title, duration_secs).await?;
+    let raw = fetch_lrclib_raw(client, artist, title, album, duration_secs)
+        .await?
+        .unwrap_or_default();
 
     // 3. Cache result (even empty — avoids repeated failed lookups).
-    store_cache(db, track_id, title, artist, &lyrics);
+    store_cache_entry(
+        db,
+        track_id,
+        title,
+        artist,
+        raw.synced_lyrics.as_deref(),
+        raw.plain_lyrics.as_deref(),
+    );
 
-    Ok(lyrics)
+    let lines = raw
+        .synced_lyrics
+        .as_deref()
+        .map(parse_lrc)
+        .unwrap_or_default();
+
+    Ok(Lyrics {
+        synced: !lines.is_empty(),
+        lines,
+        plain_text: raw.plain_lyrics,
+        source: "lrclib".into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -317,5 +409,25 @@ mod tests {
         let lines = parse_lrc(lrc);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].time_ms, 3_500);
+    }
+
+    #[test]
+    fn negative_cache_freshness() {
+        let fresh = LyricsCacheEntry {
+            fetched_at: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            ..Default::default()
+        };
+        assert!(fresh.is_negative());
+        assert!(fresh.negative_still_fresh());
+
+        let stale = LyricsCacheEntry {
+            fetched_at: Some("2020-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(stale.is_negative());
+        assert!(!stale.negative_still_fresh());
+
+        let missing = LyricsCacheEntry::default();
+        assert!(!missing.negative_still_fresh());
     }
 }
