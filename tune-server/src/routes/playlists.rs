@@ -954,12 +954,11 @@ async fn share_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> i
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 
-    // Generate a pseudo-random token from high-resolution clock
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let token = format!("{:032x}", nanos ^ (id as u128 * 0x517cc1b727220a95));
+    // Unguessable share token: 128 bits from a CSPRNG. The old token was
+    // `clock_nanos XOR (id * constant)` — derived from the share time and the
+    // playlist id, so anyone who knew roughly when a playlist was shared could
+    // brute-force the token and read it (audit — predictable share tokens).
+    let token = uuid::Uuid::new_v4().simple().to_string();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("playlist_share_{id}");
     if let Err(e) = settings.set(&key, &token) {
