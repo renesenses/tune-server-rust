@@ -839,6 +839,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
             json!({
                 "display_name": f.display_name(),
                 "enabled": enabled,
+                "available": f.available(),
             }),
         );
     }
