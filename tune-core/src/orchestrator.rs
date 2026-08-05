@@ -53,6 +53,7 @@ async fn transcode_source_to_file(
     target_bd: u16,
     target_fmt: String,
     eq: Option<crate::audio::eq::EqProcessor>,
+    convolver: Option<crate::audio::convolver::Convolver>,
     dest: String,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // 1. Decode source to PCM (blocking I/O).
@@ -75,6 +76,14 @@ async fn transcode_source_to_file(
     // 1b. Apply EQ if enabled for this zone.
     if let Some(mut eq) = eq {
         eq.process_pcm(&mut pcm_bytes, actual_bd);
+    }
+
+    // 1c. Apply the room-correction FIR convolver (after EQ) if the zone has an
+    // uploaded impulse response. This is what brings room correction to network
+    // renderers (DLNA/UPnP/AirPlay): the local output has its own convolver, but
+    // a streamed zone only gets DSP that runs here, before encoding.
+    if let Some(mut conv) = convolver {
+        conv.process_pcm(&mut pcm_bytes, actual_bd);
     }
 
     // 2. Encode to the target format.
@@ -2243,7 +2252,7 @@ impl PlaybackOrchestrator {
         let eq_forces_transcode = (is_network_output || is_browser_output)
             && !dsd_passthrough
             && !alac_passthrough
-            && self.zone_has_active_eq(req.zone_id);
+            && (self.zone_has_active_eq(req.zone_id) || self.zone_has_active_ir(req.zone_id));
         // En navigateur, la sortie transcodée doit être du WAV : un FLAC
         // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
         // Range (#1168) — même règle que le bras streaming.
@@ -2483,7 +2492,11 @@ impl PlaybackOrchestrator {
                 // EQ alters the encoded bytes and is not part of the cache key,
                 // so a zone with an active EQ never uses the cache (always fresh).
                 let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
-                let cache_path_opt = if eq_profile.is_some() {
+                // The FIR convolver, like the EQ, alters the encoded bytes and
+                // is not part of the cache key → a zone with an active IR never
+                // uses the cache (always fresh).
+                let convolver = self.load_convolver(req.zone_id, out_sr, channels);
+                let cache_path_opt = if eq_profile.is_some() || convolver.is_some() {
                     None
                 } else {
                     crate::transcode_cache::cache_path(
@@ -2598,6 +2611,7 @@ impl PlaybackOrchestrator {
                             target_bd,
                             target_format_str.clone(),
                             eq_profile,
+                            convolver,
                             tmp_path.clone(),
                         ),
                     )
@@ -5067,6 +5081,7 @@ impl PlaybackOrchestrator {
                 out_bd,
                 target_fmt,
                 None,
+                None,
                 tmp.clone(),
             )
             .await
@@ -5270,6 +5285,54 @@ impl PlaybackOrchestrator {
         }
         let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
         if eq.is_enabled() { Some(eq) } else { None }
+    }
+
+    /// True when the zone has an uploaded room-correction IR and is not in PURE
+    /// mode. Cheap settings read (like `zone_has_active_eq`) used to force the
+    /// transcode path so the FIR reaches network renderers, not just local.
+    fn zone_has_active_ir(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(&format!("ir_path_{zone_id}"))
+            .ok()
+            .flatten()
+            .map(|p| !p.is_empty() && std::path::Path::new(&p).exists())
+            .unwrap_or(false)
+    }
+
+    /// Build the room-correction FIR convolver for a zone's TRANSCODED stream,
+    /// or `None`. Symmetric to `load_eq_processor`: PURE (audiophile) mode →
+    /// `None`; otherwise load the uploaded IR (`ir_path_{zone}`) for the
+    /// stream's sample rate + channel count. Applied in `transcode_source_to_file`
+    /// after the EQ, so it colours the bytes served to a network renderer.
+    fn load_convolver(
+        &self,
+        zone_id: i64,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Option<crate::audio::convolver::Convolver> {
+        if self.zone_audiophile(zone_id) {
+            return None;
+        }
+        let path = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(&format!("ir_path_{zone_id}"))
+            .ok()
+            .flatten()
+            .filter(|p| !p.is_empty())?;
+        match crate::audio::convolver::Convolver::from_wav_for(
+            &path,
+            1024,
+            sample_rate,
+            channels as usize,
+        ) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(zone_id, path, error = %e, "room_correction_ir_load_failed");
+                None
+            }
+        }
     }
 
     /// Build the headphone crossfeed processor for a zone's LOCAL output, or
