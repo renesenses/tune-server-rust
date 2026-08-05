@@ -63,47 +63,53 @@ impl OutputTarget for BluosOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         // Clear the Node's internal play queue before starting a new track.
-        // BluOS keeps its own queue: set_next_media (/Add?prepend=1) stages the
-        // gapless track into it, and /Play?url= does NOT purge leftover entries.
         // Without this, tracks from a previous album stayed queued and the Node
         // auto-advanced onto them at every track transition (Scordia: a new CD
         // plays track 1, then jumps to the previous CD's tracks — "in memory"
         // yet absent from Tune's own queue/history, because they live on the
-        // Node). Fire-and-forget: a failed Clear must not block playback. Gapless
-        // within the album still works — set_next_media rebuilds a fresh queue.
+        // Node). Fire-and-forget: a failed Clear must not block playback.
         let _ = self.api_get("Clear", &[]).await;
 
+        // Play THROUGH the Node's queue (/Add then /Play?id=0), not as a
+        // /Play?url= custom stream. The custom stream lives OUTSIDE the queue:
+        // on Bilou's Node (0.9.49 log) the gapless /Add?prepend=1 entry was
+        // never fetched at end of track — the Node just stopped, the poller saw
+        // stopped/pos=0 for ~25 s and killed the zone (stopped_early_waiting →
+        // bluos_stop). Queue entries also render their title1/2/3 lines on the
+        // Node display, where the custom-stream play showed the title only.
+        //
         // BluOS expects the url parameter without re-encoding — .query()
         // would double-encode http:// in the stream URL, causing silent failure.
-        let mut play_url = format!("{}/Play?url={}", self.base_url(), media.url);
+        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
         // The Node's now-playing text is set via title1/title2/title3, NOT
         // title/artist/album: the BluOS Custom Integration API mandates
         // "title1, title2 and title3 MUST be used […] Do not use values such as
-        // album, artist and name". The Node silently ignores title/artist/album,
-        // so only the cover (image=) rendered while title/artist/album never
-        // appeared (Bilou, forum "Lecture BluOS"). Map title1=track title,
+        // album, artist and name". The Node silently ignores title/artist/album
+        // (Bilou, forum "Lecture BluOS"). Map title1=track title,
         // title2=artist, title3=album — the three now-playing lines the Node
         // reads back in its status XML (<title1>… at get_status).
         if let Some(t) = media.title {
-            play_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
+            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
         }
         if let Some(a) = media.artist {
-            play_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
+            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
         }
         if let Some(al) = media.album {
-            play_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
+            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
         }
         if let Some(img) = media.cover_url {
-            play_url.push_str(&format!("&image={}", urlencoding::encode(img)));
+            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
         }
         self.client
-            .get(&play_url)
+            .get(&add_url)
             .send()
             .await
-            .map_err(|e| format!("bluos Play: {e}"))?
+            .map_err(|e| format!("bluos Add: {e}"))?
             .text()
             .await
-            .map_err(|e| format!("bluos Play read: {e}"))?;
+            .map_err(|e| format!("bluos Add read: {e}"))?;
+        // Start the queue at its (single, freshly added) first entry.
+        self.api_get("Play", &[("id", "0")]).await?;
         info!(
             device = %self.name,
             url = media.url,
@@ -211,9 +217,18 @@ impl OutputTarget for BluosOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        // BluOS /Add?prepend=1 queues the next track for gapless playback.
+        // Append the next track to the Node's queue (plain /Add, NO prepend=1).
+        // All-in-queue model: play_media now puts the current track IN the
+        // Node's queue (/Add + /Play?id=0), so the gapless next track must be
+        // appended AFTER it — prepend=1 would insert it BEFORE the current
+        // entry and it would never be reached. The old model (current track as
+        // a /Play?url= custom stream + /Add?prepend=1) froze gapless entirely:
+        // on Bilou's Node (0.9.49 log, 05/08) the prepended entry was never
+        // fetched at end of track — no stream_request, Node stopped at pos=0
+        // for ~25 s until the poller killed the zone (stopped_early_waiting →
+        // bluos_stop).
         // Raw URL construction (no .query()) to avoid double-encoding, same as play_media.
-        let mut add_url = format!("{}/Add?url={}&prepend=1", self.base_url(), media.url);
+        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
         // Same title1/title2/title3 mapping as play_media (the Node ignores
         // title/artist/album), so the gapless-staged next track also carries its
         // now-playing text instead of only the cover.
