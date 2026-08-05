@@ -198,6 +198,7 @@ async fn lyrics_for_track(
         track_id,
         title,
         artist,
+        track.album_title.as_deref(),
         track.duration_ms,
     )
     .await
@@ -272,6 +273,7 @@ async fn now_for_zone(
         track_id,
         &title,
         &artist,
+        np.album_title.as_deref(),
         np.duration_ms,
     )
     .await
