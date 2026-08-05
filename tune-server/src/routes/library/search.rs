@@ -25,6 +25,41 @@ pub(super) struct AcousticQuery {
     pub limit: Option<i64>,
 }
 
+/// Clé de dédoublonnage d'un enregistrement : titre normalisé (casse/espaces),
+/// artiste normalisé, durée arrondie à la seconde. Le même enregistrement copié
+/// dans deux dossiers produit la même clé ; deux versions d'une même chanson
+/// (studio vs live) ont des durées différentes et gardent des clés distinctes —
+/// c'est pourquoi on n'utilise PAS titre+artiste seuls.
+#[cfg_attr(not(feature = "audio-embedding"), allow(dead_code))]
+fn dedup_key(title: &str, artist: Option<&str>, duration_ms: i64) -> (String, String, i64) {
+    fn norm(s: &str) -> String {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+    (
+        norm(title),
+        norm(artist.unwrap_or_default()),
+        // Arrondi à la seconde la plus proche.
+        (duration_ms + 500).div_euclid(1000),
+    )
+}
+
+/// Dédoublonne une liste de pistes déjà classée par similarité décroissante :
+/// garde la première occurrence de chaque clé (meilleure similarité), préserve
+/// l'ordre. À appliquer AVANT la troncature à `limit`.
+#[cfg_attr(not(feature = "audio-embedding"), allow(dead_code))]
+fn dedup_ranked_tracks(
+    tracks: Vec<tune_core::db::models::Track>,
+) -> Vec<tune_core::db::models::Track> {
+    let mut seen = std::collections::HashSet::new();
+    tracks
+        .into_iter()
+        .filter(|t| seen.insert(dedup_key(&t.title, t.artist_name.as_deref(), t.duration_ms)))
+        .collect()
+}
+
 pub(super) async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
@@ -146,7 +181,10 @@ pub(super) async fn acoustic_search(
             ))
         })?;
 
-    let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, limit, None);
+    // Sur-échantillonne (2× limit) : le dédoublonnage ci-dessous retire des
+    // entrées, et il doit s'appliquer AVANT la troncature à `limit` pour ne pas
+    // renvoyer moins de résultats que demandé.
+    let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, limit * 2, None);
     if ranked.is_empty() {
         return Ok(Json(json!({ "query": query, "tracks": [], "count": 0 })));
     }
@@ -157,9 +195,13 @@ pub(super) async fn acoustic_search(
         .get_multiple(&ids)
         .unwrap_or_default();
 
-    // get_multiple preserves the ranked order; annotate each with its cosine.
+    // get_multiple preserves the ranked order; drop duplicate recordings (same
+    // file copied in two folders → same title/artist/duration), keeping the
+    // best-ranked occurrence, then truncate and annotate each with its cosine.
+    let tracks = dedup_ranked_tracks(tracks);
     let items: Vec<Value> = tracks
         .iter()
+        .take(limit)
         .map(|t| {
             let mut v = t.to_json();
             if let (Some(obj), Some(id)) = (v.as_object_mut(), t.id) {
@@ -189,4 +231,66 @@ pub(super) async fn acoustic_search(
     Err(crate::error::AppError::service_unavailable(
         "acoustic search is not available in this build",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedup_key, dedup_ranked_tracks};
+    use tune_core::db::models::Track;
+
+    fn track(id: i64, title: &str, artist: &str, duration_ms: i64) -> Track {
+        let mut t = Track::new(title.to_string());
+        t.id = Some(id);
+        t.artist_name = Some(artist.to_string());
+        t.duration_ms = duration_ms;
+        t
+    }
+
+    #[test]
+    fn dedup_key_normalise_casse_espaces_et_duree() {
+        // Casse et espaces (bords + internes multiples) sont normalisés ;
+        // la durée est arrondie à la seconde la plus proche.
+        assert_eq!(
+            dedup_key("  Road   Movie ", Some("Bernard  LAVILLIERS"), 249_733),
+            dedup_key("road movie", Some("bernard lavilliers"), 250_499),
+        );
+        // Artiste absent == artiste vide.
+        assert_eq!(
+            dedup_key("Titre", None, 1_000),
+            dedup_key("Titre", Some(""), 1_000)
+        );
+        // 249 733 ms → 250 s ; 249 400 ms → 249 s : clés différentes.
+        assert_ne!(
+            dedup_key("Road Movie", Some("Bernard Lavilliers"), 249_733),
+            dedup_key("Road Movie", Some("Bernard Lavilliers"), 249_400),
+        );
+    }
+
+    #[test]
+    fn dedup_garde_premiere_occurrence_et_ordre() {
+        // Cas réel .18 : même fichier dans deux dossiers (ids 53273 / 66258).
+        let tracks = vec![
+            track(53273, "Road Movie", "Bernard Lavilliers", 249_733),
+            track(1, "Autre Piste", "Quelqu'un", 180_000),
+            track(66258, "Road Movie", "Bernard Lavilliers", 249_733),
+            track(2, "Encore Une", "Quelqu'un", 200_000),
+        ];
+        let out = dedup_ranked_tracks(tracks);
+        let ids: Vec<i64> = out.iter().filter_map(|t| t.id).collect();
+        // Le doublon exact disparaît, la première occurrence (meilleure
+        // similarité) est conservée, l'ordre du classement est préservé.
+        assert_eq!(ids, vec![53273, 1, 2]);
+    }
+
+    #[test]
+    fn dedup_conserve_versions_studio_et_live() {
+        // Même titre + même artiste mais durées différentes (studio vs live) :
+        // les deux versions doivent rester.
+        let tracks = vec![
+            track(10, "Road Movie", "Bernard Lavilliers", 249_733),
+            track(11, "Road Movie", "Bernard Lavilliers", 312_000),
+        ];
+        let out = dedup_ranked_tracks(tracks);
+        assert_eq!(out.len(), 2);
+    }
 }
