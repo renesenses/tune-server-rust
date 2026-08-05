@@ -972,14 +972,21 @@ impl AlbumRepo {
             // ids happen to be the highest), hence the "only the first few albums
             // are sorted" report (Bilou, #1102).
             "added_at" | "added_date" => format!(
-                // file_first_seen.first_seen_at is DOUBLE, but tracks.file_mtime
-                // is TEXT in the Postgres schema — a bare COALESCE(double, text)
-                // is a hard error on PG ("types double precision and text cannot
-                // be matched"), so the sort silently returned no albums on .15
-                // (empty library → "black screen" on the clients). Cast the
-                // fallback to a number; NULLIF guards against empty strings.
-                // Valid on SQLite too (REAL affinity).
-                "(SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(t.file_mtime, '') AS DOUBLE PRECISION))) \
+                // file_first_seen.first_seen_at is DOUBLE, but the type of
+                // tracks.file_mtime on Postgres depends on the install vintage:
+                // TEXT on some installs (bug #550 fixed that case), DOUBLE
+                // PRECISION on others (.15) — schema drift between PG installs.
+                // A bare COALESCE(double, text) is a hard error on the TEXT
+                // installs, and NULLIF(double_col, '') is a hard error at
+                // *parse/analyze* time on the DOUBLE installs ("invalid input
+                // syntax for type double precision"), which made the sort
+                // return no albums on .15 (empty library → "black screen" on
+                // the clients) — and added_at is the handler's default sort,
+                // so every list was empty. Cast the column to TEXT first so
+                // the expression is valid whichever type the column has;
+                // NULLIF guards against empty strings. Valid on SQLite too
+                // (soft affinities).
+                "(SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) \
                   FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
                   WHERE t.album_id = a.id) {dir} NULLS LAST, a.id {dir}"
             ),
@@ -1035,7 +1042,7 @@ impl AlbumRepo {
         let base_select = if matches!(sort, "added_at" | "added_date") {
             sql::select_album().replacen(
                 " FROM albums a",
-                ", (SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(t.file_mtime, '') AS DOUBLE PRECISION)))                    FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path                    WHERE t.album_id = a.id) AS added_at FROM albums a",
+                ", (SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))                    FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path                    WHERE t.album_id = a.id) AS added_at FROM albums a",
                 1,
             )
         } else {
@@ -2166,6 +2173,46 @@ mod tests {
         let desc = arepo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "A"); // mtime 3000 newest
         assert_eq!(desc[1].title, "B");
+    }
+
+    #[test]
+    fn added_at_mtime_expression_is_column_type_agnostic() {
+        // On Postgres, tracks.file_mtime is TEXT on some installs and DOUBLE
+        // PRECISION on others (schema drift between install vintages — .15 is
+        // DOUBLE). The sort expression must be valid for both: it casts the
+        // column to TEXT before the NULLIF/CAST-to-double dance. SQLite's
+        // soft affinities let one column hold both representations, so store
+        // a numeric mtime, a text mtime and an empty-string mtime and check
+        // the sort still works and orders by the numeric value.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+        let c = arepo.create(&Album::new("C".into())).unwrap();
+        for (album_id, path) in [(a, "/a.flac"), (b, "/b.flac"), (c, "/c.flac")] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            trepo.create(&t).unwrap();
+        }
+        // Force the three storage classes: REAL (double installs), TEXT
+        // (text installs), and the empty string NULLIF must neutralise.
+        db.execute_batch(
+            "UPDATE tracks SET file_mtime = 3000.0 WHERE file_path = '/a.flac';
+             UPDATE tracks SET file_mtime = '1000' WHERE file_path = '/b.flac';
+             UPDATE tracks SET file_mtime = '' WHERE file_path = '/c.flac';
+             DELETE FROM file_first_seen;",
+        )
+        .unwrap();
+
+        let desc = arepo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        let titles: Vec<_> = desc.into_iter().map(|al| al.title).collect();
+        // A (3000) before B (1000); C has no usable timestamp → NULLS LAST.
+        assert_eq!(titles, vec!["A", "B", "C"]);
     }
 
     #[test]

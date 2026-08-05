@@ -1633,6 +1633,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "track_audio_embedding",
         include_str!("../../migrations/postgres/015_track_audio_embedding.sql"),
     ),
+    (
+        16,
+        "alarms_profile_id",
+        include_str!("../../migrations/postgres/016_alarms_profile_id.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
