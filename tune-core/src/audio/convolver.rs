@@ -77,8 +77,9 @@ impl Convolver {
         }
     }
 
-    /// Load impulse response from a WAV file.
-    pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
+    /// Parse a WAV impulse response into per-channel f32 taps + its sample
+    /// rate. Walks the RIFF chunks so extra chunks before `data` don't break it.
+    fn read_wav_ir(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
         let data = std::fs::read(path).map_err(|e| format!("read IR: {e}"))?;
         if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
             return Err("not a RIFF/WAVE file".into());
@@ -194,7 +195,42 @@ impl Convolver {
             }
         }
 
+        Ok((ir, sample_rate))
+    }
+
+    /// Load an impulse response from a WAV file (any sample rate / channels).
+    pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
+        let (ir, _sr) = Self::read_wav_ir(path)?;
         Ok(Self::new(&ir, block_size))
+    }
+
+    /// Load an IR for a specific stream rate + channel count. Requires the IR's
+    /// sample rate to match (resampling is a follow-up); a mono IR is duplicated
+    /// to the stream's channel count. Used by the transcode path so the FIR can
+    /// apply to network renderers, not just the local output.
+    pub fn from_wav_for(
+        path: &str,
+        block_size: usize,
+        target_sr: u32,
+        target_channels: usize,
+    ) -> Result<Self, String> {
+        let (ir, sr) = Self::read_wav_ir(path)?;
+        if sr != target_sr {
+            return Err(format!(
+                "IR sample rate {sr} Hz != stream rate {target_sr} Hz — export the FIR at {target_sr} Hz"
+            ));
+        }
+        let adapted = if ir.len() == target_channels {
+            ir
+        } else if ir.len() == 1 {
+            vec![ir[0].clone(); target_channels]
+        } else {
+            return Err(format!(
+                "IR has {} channels, stream has {target_channels}",
+                ir.len()
+            ));
+        };
+        Ok(Self::new(&adapted, block_size))
     }
 
     /// Process interleaved f32 samples in-place.
@@ -273,6 +309,86 @@ impl Convolver {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    /// Convolve a whole interleaved buffer offline (one-shot), in place and at
+    /// the same length as the input. `process_interleaved` leaves the final
+    /// partial (< block_size) frames unprocessed (they'd stay dry → an audible
+    /// click at the buffer end); pad up to the next block boundary so that last
+    /// block is flushed too, then truncate back. The IR decay *past* the buffer
+    /// end is dropped (a few ms of tail) — acceptable for room correction.
+    ///
+    /// Use a FRESH Convolver per buffer (no carried-over state across tracks).
+    pub fn process_offline(&mut self, samples: &mut Vec<f32>) {
+        let ch = self.channels;
+        if ch == 0 || samples.is_empty() {
+            return;
+        }
+        let orig_len = samples.len();
+        let frames = orig_len / ch;
+        let rem = frames % self.block_size;
+        if rem != 0 {
+            let pad = (self.block_size - rem) * ch;
+            samples.extend(std::iter::repeat(0.0).take(pad));
+        }
+        self.process_interleaved(samples);
+        samples.truncate(orig_len);
+    }
+
+    /// Apply the convolver to interleaved integer PCM bytes in place, matching
+    /// the layout the transcode pipeline hands to `EqProcessor::process_pcm`
+    /// (little-endian, `bit_depth` of 16/24/32). Decodes to f32, convolves
+    /// offline, and writes the samples back with soft clamping.
+    pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        let ch = self.channels;
+        if ch == 0 || pcm.is_empty() {
+            return;
+        }
+        let bps = (bit_depth / 8) as usize;
+        if bps == 0 {
+            return;
+        }
+        let total = pcm.len() / bps;
+        let mut buf: Vec<f32> = Vec::with_capacity(total);
+        for i in 0..total {
+            let o = i * bps;
+            let s = match bit_depth {
+                16 => i16::from_le_bytes([pcm[o], pcm[o + 1]]) as f32 / 32768.0,
+                24 => {
+                    let v = i32::from_le_bytes([0, pcm[o], pcm[o + 1], pcm[o + 2]]);
+                    v as f32 / 2147483648.0
+                }
+                32 => {
+                    let v = i32::from_le_bytes([pcm[o], pcm[o + 1], pcm[o + 2], pcm[o + 3]]);
+                    v as f32 / 2147483648.0
+                }
+                _ => return,
+            };
+            buf.push(s);
+        }
+        self.process_offline(&mut buf);
+        for i in 0..total {
+            let o = i * bps;
+            let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+            match bit_depth {
+                16 => {
+                    let v = (s * 32767.0).round() as i16;
+                    pcm[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                24 => {
+                    let v = (s * 8_388_607.0).round() as i32;
+                    let b = v.to_le_bytes();
+                    pcm[o] = b[0];
+                    pcm[o + 1] = b[1];
+                    pcm[o + 2] = b[2];
+                }
+                32 => {
+                    let v = (s * 2_147_483_647.0).round() as i32;
+                    pcm[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +463,47 @@ mod tests {
                 (s - [1.0, 0.5, 0.25, 0.125][i]).abs() < 0.01,
                 "sample {i}: {s}"
             );
+        }
+    }
+
+    #[test]
+    fn process_offline_flushes_last_partial_block() {
+        // IR = [1.0, 0.5], block 4. A 6-frame buffer is not a block multiple,
+        // so the streaming path alone leaves frames 4-5 dry; process_offline
+        // must flush them. Convolving an impulse yields the IR then silence.
+        let ir = vec![vec![1.0f32, 0.5]];
+        let mut conv = Convolver::new(&ir, 4);
+        let mut samples = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        conv.process_offline(&mut samples);
+        assert_eq!(samples.len(), 6, "length must be preserved");
+        let expected = [1.0, 0.5, 0.0, 0.0, 0.0, 0.0];
+        for (i, &e) in expected.iter().enumerate() {
+            assert!(
+                (samples[i] - e).abs() < 0.001,
+                "frame {i}: {} != {e}",
+                samples[i]
+            );
+        }
+    }
+
+    #[test]
+    fn process_pcm_16bit_round_trip() {
+        let ir = vec![vec![1.0f32, 0.5]];
+        let mut conv = Convolver::new(&ir, 4);
+        let frames: [i16; 6] = [32767, 0, 0, 0, 0, 0];
+        let mut pcm: Vec<u8> = Vec::new();
+        for f in frames {
+            pcm.extend_from_slice(&f.to_le_bytes());
+        }
+        conv.process_pcm(&mut pcm, 16);
+        let out: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert!((out[0] as i32 - 32767).abs() < 4, "out0={}", out[0]);
+        assert!((out[1] as i32 - 16383).abs() < 4, "out1={}", out[1]); // 0.5 * full-scale
+        for (i, &v) in out.iter().enumerate().skip(2) {
+            assert!(v.abs() < 4, "out{i}={v}");
         }
     }
 }
