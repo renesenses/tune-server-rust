@@ -573,6 +573,14 @@ pub(super) async fn update_install(
         // PID filter fixes that.)
         #[cfg(windows)]
         {
+            // Record the version we're swapping TO next to the binary. The next
+            // startup compares it to the version that actually loaded: if the
+            // bat-swap was blocked (antivirus, a locked/relaunched .exe) the
+            // server comes back on the OLD binary with no error anywhere — this
+            // marker is what lets startup surface that silent failure (#1220).
+            if let Some(dir) = current_exe.parent() {
+                let _ = std::fs::write(dir.join("tune-update-expected.txt"), version.trim());
+            }
             info!(
                 "update_windows_exiting_for_bat_swap — tune-update.bat will swap the binary and restart"
             );
@@ -947,11 +955,107 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         .map(|p| p.starts_with("failed"))
         .unwrap_or(false);
 
+    // Result of the LAST applied update, recorded at startup (see
+    // record_post_update_result). Lets the UI surface a silent swap failure —
+    // e.g. Windows came back on the old binary — instead of the update just
+    // looking like it did nothing.
+    let last_update_result = SettingsRepo::with_backend(state.backend.clone())
+        .get("last_update_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
     Json(json!({
         "current_version": tune_core::version(),
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
+        "last_update_result": last_update_result,
     }))
+}
+
+/// Compare the version an in-progress update was swapping TO against the version
+/// that actually loaded this startup. `Some(true)` = the swap took, `Some(false)`
+/// = it silently reverted to the old binary, `None` = nothing to compare (no
+/// update was pending). Tolerant of a leading `v` and surrounding whitespace.
+fn swap_took(expected: &str, actual: &str) -> Option<bool> {
+    let norm = |s: &str| s.trim().trim_start_matches('v').to_string();
+    let (e, a) = (norm(expected), norm(actual));
+    if e.is_empty() {
+        return None;
+    }
+    Some(e == a)
+}
+
+/// Called once at startup: turn the markers left by an in-progress update into a
+/// persisted `last_update_result` the UI can show. Fixes the silent Windows
+/// bat-swap failure (#1220): the binary swap could be blocked (antivirus, a
+/// locked/relaunched .exe) and the server would come back on the OLD version
+/// with no error anywhere — "the update did nothing". Consumes the markers.
+pub fn record_post_update_result(state: &AppState) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let current = tune_core::version();
+
+    // Marker written by tune-update.bat when it could NOT replace the locked
+    // binary — the most explicit failure, with user-facing detail.
+    let bat_failed = dir.join("tune-update-failed.txt");
+    if let Ok(detail) = std::fs::read_to_string(&bat_failed) {
+        let detail = detail.trim().to_string();
+        warn!(detail = %detail, "update_swap_failed_bat — binary replacement was blocked");
+        let _ = settings.set(
+            "last_update_result",
+            &json!({
+                "status": "failed",
+                "reason": "binary_locked",
+                "detail": detail,
+                "current_version": current,
+            })
+            .to_string(),
+        );
+        let _ = std::fs::remove_file(&bat_failed);
+        let _ = std::fs::remove_file(dir.join("tune-update-expected.txt"));
+        return;
+    }
+
+    // Marker written by the server just before it exited for the swap: the
+    // version we EXPECTED to be running now.
+    let expected_marker = dir.join("tune-update-expected.txt");
+    if let Ok(expected) = std::fs::read_to_string(&expected_marker) {
+        match swap_took(&expected, current) {
+            Some(true) => {
+                info!(version = current, "update_swap_verified");
+                let _ = settings.set(
+                    "last_update_result",
+                    &json!({ "status": "success", "current_version": current }).to_string(),
+                );
+            }
+            Some(false) => {
+                let expected = expected.trim();
+                warn!(
+                    expected,
+                    actual = current,
+                    "update_swap_failed_version_mismatch — restarted on the old binary (swap blocked?)"
+                );
+                let _ = settings.set(
+                    "last_update_result",
+                    &json!({
+                        "status": "failed",
+                        "reason": "swap_did_not_take",
+                        "expected_version": expected,
+                        "current_version": current,
+                    })
+                    .to_string(),
+                );
+            }
+            None => {}
+        }
+        let _ = std::fs::remove_file(&expected_marker);
+    }
 }
 
 /// POST /system/update/apply — kept for backward compatibility.
@@ -1314,5 +1418,23 @@ mod scan_guard_tests {
         let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
         s.set("scan_started_at", &stale.to_string()).unwrap();
         assert!(!scan_in_progress(&b));
+    }
+}
+
+#[cfg(test)]
+mod swap_result_tests {
+    use super::swap_took;
+
+    #[test]
+    fn swap_took_detects_match_mismatch_and_none() {
+        // Same version → the swap took.
+        assert_eq!(swap_took("0.9.49", "0.9.49"), Some(true));
+        // Tolerant of a leading `v` and surrounding whitespace.
+        assert_eq!(swap_took(" v0.9.49 ", "0.9.49"), Some(true));
+        // Came back on the OLD binary → the swap did not take (the #1220 case).
+        assert_eq!(swap_took("0.9.49", "0.9.48"), Some(false));
+        // No pending update (empty marker) → nothing to compare.
+        assert_eq!(swap_took("", "0.9.48"), None);
+        assert_eq!(swap_took("   ", "0.9.48"), None);
     }
 }

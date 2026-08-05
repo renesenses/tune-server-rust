@@ -9,6 +9,11 @@ use crate::state::AppState;
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
+    // Turn any update markers left by a just-applied update into a persisted
+    // last_update_result the UI can show. Catches a silent Windows bat-swap
+    // failure (came back on the old binary) instead of it looking like a no-op.
+    crate::routes::system::update::record_post_update_result(state);
+
     // Warm the ASIO device cache once at boot, while the audio devices are still
     // idle. An ASIO driver — notably SOtM Diretta — can't be re-enumerated once a
     // zone owns it for playback; `list_asio_devices` then serves this cache

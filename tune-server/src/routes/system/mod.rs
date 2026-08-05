@@ -15,7 +15,7 @@ mod plugins;
 mod remote;
 pub(crate) mod scan;
 mod tags;
-mod update;
+pub(crate) mod update;
 mod youtube;
 
 use axum::Router;
