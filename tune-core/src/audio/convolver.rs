@@ -77,8 +77,9 @@ impl Convolver {
         }
     }
 
-    /// Load impulse response from a WAV file.
-    pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
+    /// Parse a WAV impulse response into per-channel f32 taps + its sample
+    /// rate. Walks the RIFF chunks so extra chunks before `data` don't break it.
+    fn read_wav_ir(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
         let data = std::fs::read(path).map_err(|e| format!("read IR: {e}"))?;
         if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
             return Err("not a RIFF/WAVE file".into());
@@ -194,7 +195,42 @@ impl Convolver {
             }
         }
 
+        Ok((ir, sample_rate))
+    }
+
+    /// Load an impulse response from a WAV file (any sample rate / channels).
+    pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
+        let (ir, _sr) = Self::read_wav_ir(path)?;
         Ok(Self::new(&ir, block_size))
+    }
+
+    /// Load an IR for a specific stream rate + channel count. Requires the IR's
+    /// sample rate to match (resampling is a follow-up); a mono IR is duplicated
+    /// to the stream's channel count. Used by the transcode path so the FIR can
+    /// apply to network renderers, not just the local output.
+    pub fn from_wav_for(
+        path: &str,
+        block_size: usize,
+        target_sr: u32,
+        target_channels: usize,
+    ) -> Result<Self, String> {
+        let (ir, sr) = Self::read_wav_ir(path)?;
+        if sr != target_sr {
+            return Err(format!(
+                "IR sample rate {sr} Hz != stream rate {target_sr} Hz — export the FIR at {target_sr} Hz"
+            ));
+        }
+        let adapted = if ir.len() == target_channels {
+            ir
+        } else if ir.len() == 1 {
+            vec![ir[0].clone(); target_channels]
+        } else {
+            return Err(format!(
+                "IR has {} channels, stream has {target_channels}",
+                ir.len()
+            ));
+        };
+        Ok(Self::new(&adapted, block_size))
     }
 
     /// Process interleaved f32 samples in-place.
