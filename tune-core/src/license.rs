@@ -121,6 +121,26 @@ impl Feature {
             Feature::Declick => "Dé-ploc",
         }
     }
+
+    /// Whether the feature is actually available / functional right now — a
+    /// PRODUCT decision, independent of licence entitlement. The Premium
+    /// "Fonctionnalités" grid colours each widget from this combined with the
+    /// licence `enabled` flag:
+    ///   - not licensed          → grey  (locked, upsell)
+    ///   - licensed + available   → green (usable, the widget opens its page)
+    ///   - licensed + !available  → red   (entitled but not yet available)
+    ///
+    /// Default is `true` (available). To turn a widget red, add its variant to
+    /// the match arm below — this is the single source of truth.
+    pub fn available(&self) -> bool {
+        match self {
+            // Features licensed by Premium but NOT yet available/functional
+            // (product decision — Bertrand). These show a red cross in the UI.
+            // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
+            Feature::SocialSharing | Feature::WeeklyDigest => false,
+            _ => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
