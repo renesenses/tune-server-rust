@@ -122,13 +122,27 @@ pub(super) async fn list_tracks(
         || p.rating.is_some()
         || p.collection.as_deref().is_some_and(|s| !s.is_empty());
 
-    // Resolve the collection name → album ids (JSON settings), like the facet
-    // endpoint, so /library/tracks?collection=<name> filters to its albums.
-    let collection_ids: Option<Vec<i64>> = p
-        .collection
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|name| super::facets::collection_album_ids(&state, name));
+    // Resolve the collection name so /library/tracks?collection=<name> filters
+    // to its members. A MANUAL collection resolves to album ids (JSON settings);
+    // a SMART collection resolves to concrete track ids (its compiled rule query).
+    // Manual wins on a name clash. An unknown name → empty album set → matches
+    // nothing (the requested collection is simply empty).
+    let (collection_ids, collection_track_ids): (Option<Vec<i64>>, Option<Vec<i64>>) =
+        match p.collection.as_deref().filter(|s| !s.is_empty()) {
+            None => (None, None),
+            Some(name) => {
+                let album_ids = super::facets::collection_album_ids(&state, name);
+                if !album_ids.is_empty() {
+                    (Some(album_ids), None)
+                } else if let Some(track_ids) =
+                    super::facets::smart_collection_track_ids(&state, name)
+                {
+                    (None, Some(track_ids))
+                } else {
+                    (Some(Vec::new()), None)
+                }
+            }
+        };
 
     if has_filters {
         match repo.list_filtered(
@@ -148,6 +162,7 @@ pub(super) async fn list_tracks(
             p.folder.as_deref(),
             p.rating,
             collection_ids.as_deref(),
+            collection_track_ids.as_deref(),
             limit,
             offset,
         ) {
