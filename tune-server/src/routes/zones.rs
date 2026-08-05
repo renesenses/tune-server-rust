@@ -92,6 +92,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
@@ -160,6 +161,125 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
             "crossfeed": crossfeed,
         }))
         .into_response(),
+    }
+}
+
+/// Cache of computed convolver responses, keyed by zone id. The value pairs
+/// the filter fingerprint (path + size + mtime) with the full response body:
+/// re-uploading an IR rewrites the file, so the fingerprint changes and the
+/// entry is recomputed on the next read — no explicit invalidation hook needed.
+static CONVOLVER_RESPONSE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i64, (String, Value)>>,
+> = std::sync::OnceLock::new();
+
+/// `GET /zones/{id}/convolver/response` — frequency response of the zone's FIR
+/// convolver, for visualisation. Not premium-gated: applying an IR is, reading
+/// the resulting curve is not.
+///
+/// The running convolver only keeps its IR in FFT-partitioned form, so the taps
+/// are re-read from the persisted IR file (`ir_path_{zone_id}` setting — same
+/// source of truth as `restore_convolvers` and the transcode path). Multi-
+/// channel IRs are summarised by channel 0: averaging L/R taps would let
+/// inter-channel phase differences cancel and distort the magnitude curve.
+async fn convolver_response(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    match repo.get(id) {
+        Ok(Some(_)) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "zone not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let ir_path = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(&format!("ir_path_{id}"))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty());
+    let Some(ir_path) = ir_path else {
+        return Json(json!({"loaded": false})).into_response();
+    };
+    let Ok(meta) = std::fs::metadata(&ir_path) else {
+        // Path persisted but file gone (moved data dir…): nothing to plot.
+        return Json(json!({"loaded": false})).into_response();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let fingerprint = format!("{ir_path}|{}|{mtime}", meta.len());
+
+    let cache = CONVOLVER_RESPONSE_CACHE.get_or_init(Default::default);
+    if let Some((fp, body)) = cache.lock().expect("convolver cache poisoned").get(&id) {
+        if *fp == fingerprint {
+            return Json(body.clone()).into_response();
+        }
+    }
+
+    // ~200 log-spaced points × up to 128k taps of f64 accumulation: fast, but
+    // not "handler on the async runtime" fast — compute on the blocking pool.
+    let computed = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (ir, sample_rate) = tune_core::audio::convolver::Convolver::read_ir_taps(&ir_path)?;
+        if sample_rate == 0 {
+            return Err("IR sample rate is 0".into());
+        }
+        let taps = &ir[0]; // channel 0 (see handler doc)
+        let f_hi = 20_000.0f64.min(sample_rate as f64 * 0.45);
+        let freqs = tune_core::audio::convolver::log_freq_grid(200, 20.0, f_hi);
+        let points: Vec<Value> =
+            tune_core::audio::convolver::fir_frequency_response(taps, sample_rate, &freqs)
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "f": (p.freq_hz * 10.0).round() / 10.0,
+                        "db": (p.magnitude_db * 100.0).round() / 100.0,
+                        "phase_deg": (p.phase_deg * 100.0).round() / 100.0,
+                    })
+                })
+                .collect();
+        let latency_ms = taps.len() as f64 / 2.0 / sample_rate as f64 * 1000.0;
+        Ok(json!({
+            "loaded": true,
+            "taps": taps.len(),
+            "sample_rate": sample_rate,
+            "latency_ms": (latency_ms * 10.0).round() / 10.0,
+            "points": points,
+        }))
+    })
+    .await;
+
+    match computed {
+        Ok(Ok(body)) => {
+            cache
+                .lock()
+                .expect("convolver cache poisoned")
+                .insert(id, (fingerprint, body.clone()));
+            Json(body).into_response()
+        }
+        Ok(Err(e)) => {
+            warn!(zone_id = id, error = %e, "convolver_response_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("read IR: {e}")})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(zone_id = id, error = %e, "convolver_response_join_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "response computation failed"})),
+            )
+                .into_response()
+        }
     }
 }
 
