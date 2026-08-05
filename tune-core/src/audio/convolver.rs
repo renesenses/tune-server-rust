@@ -204,6 +204,15 @@ impl Convolver {
         Ok(Self::new(&ir, block_size))
     }
 
+    /// Read the raw taps of a WAV impulse response (per channel) plus its
+    /// sample rate, WITHOUT building a convolver. The running [`Convolver`]
+    /// only keeps the IR in FFT-partitioned form, so anything that needs the
+    /// time-domain coefficients again (e.g. the `/convolver/response`
+    /// visualisation endpoint) re-reads them from the persisted file.
+    pub fn read_ir_taps(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
+        Self::read_wav_ir(path)
+    }
+
     /// Load an IR for a specific stream rate + channel count. Requires the IR's
     /// sample rate to match (resampling is a follow-up); a mono IR is duplicated
     /// to the stream's channel count. Used by the transcode path so the FIR can
@@ -391,6 +400,78 @@ impl Convolver {
     }
 }
 
+/// One point of a FIR frequency response, as served by the
+/// `/zones/{id}/convolver/response` endpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsePoint {
+    pub freq_hz: f64,
+    pub magnitude_db: f64,
+    pub phase_deg: f64,
+}
+
+/// Log-spaced frequency grid (`n` points from `f_lo` to `f_hi` inclusive).
+pub fn log_freq_grid(n: usize, f_lo: f64, f_hi: f64) -> Vec<f64> {
+    if n == 0 || f_lo <= 0.0 || f_hi <= f_lo {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![f_lo];
+    }
+    let ratio = (f_hi / f_lo).ln();
+    (0..n)
+        .map(|i| f_lo * (ratio * i as f64 / (n - 1) as f64).exp())
+        .collect()
+}
+
+/// Evaluate the frequency response of a FIR filter at arbitrary frequencies by
+/// DIRECT summation: H(f) = Σ h[n]·e^(−j2πfn/fs), accumulated in f64. No FFT —
+/// the target grid is log-spaced, which an FFT bin grid can't serve without
+/// interpolation, and ~200 freqs × 128k taps stays a few tens of millions of
+/// f64 ops. The unit phasor is advanced by complex rotation (one sin/cos pair
+/// per frequency); f64 rotation drift over 128k steps is ~1e-11, negligible.
+///
+/// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
+/// which JSON can't carry); phase is the principal atan2 value in degrees.
+pub fn fir_frequency_response(
+    taps: &[f32],
+    sample_rate: u32,
+    freqs_hz: &[f64],
+) -> Vec<ResponsePoint> {
+    let fs = sample_rate as f64;
+    if taps.is_empty() || fs <= 0.0 {
+        return Vec::new();
+    }
+    freqs_hz
+        .iter()
+        .map(|&f| {
+            let theta = -2.0 * std::f64::consts::PI * f / fs;
+            let (wi, wr) = theta.sin_cos();
+            // Unit phasor e^(−j2πfn/fs), advanced by multiplication with w.
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for &h in taps {
+                let h = h as f64;
+                re += h * cr;
+                im += h * ci;
+                let nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+            let mag = (re * re + im * im).sqrt();
+            let magnitude_db = if mag > 1e-10 {
+                20.0 * mag.log10()
+            } else {
+                -200.0
+            };
+            ResponsePoint {
+                freq_hz: f,
+                magnitude_db,
+                phase_deg: im.atan2(re).to_degrees(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +586,72 @@ mod tests {
         for (i, &v) in out.iter().enumerate().skip(2) {
             assert!(v.abs() < 4, "out{i}={v}");
         }
+    }
+
+    #[test]
+    fn frequency_response_unit_impulse_is_flat_0db() {
+        // δ[n] → H(f) = 1 everywhere: 0 dB, 0° phase.
+        let taps = vec![1.0f32, 0.0, 0.0, 0.0];
+        let freqs = log_freq_grid(50, 20.0, 20_000.0);
+        assert_eq!(freqs.len(), 50);
+        assert!((freqs[0] - 20.0).abs() < 1e-9);
+        assert!((freqs[49] - 20_000.0).abs() < 1e-6);
+        for p in fir_frequency_response(&taps, 48_000, &freqs) {
+            assert!(
+                p.magnitude_db.abs() < 1e-6,
+                "{} Hz: {} dB",
+                p.freq_hz,
+                p.magnitude_db
+            );
+            assert!(
+                p.phase_deg.abs() < 1e-6,
+                "{} Hz: {}°",
+                p.freq_hz,
+                p.phase_deg
+            );
+        }
+    }
+
+    #[test]
+    fn frequency_response_pure_delay_flat_linear_phase() {
+        // δ[n−1] → |H| = 1 (0 dB), phase = −360·f/fs degrees (no wrap below
+        // fs/2 for a 1-sample delay).
+        let taps = vec![0.0f32, 1.0];
+        let fs = 48_000u32;
+        let freqs = log_freq_grid(50, 20.0, 20_000.0);
+        for p in fir_frequency_response(&taps, fs, &freqs) {
+            assert!(
+                p.magnitude_db.abs() < 1e-6,
+                "{} Hz: {} dB",
+                p.freq_hz,
+                p.magnitude_db
+            );
+            let expected = -360.0 * p.freq_hz / fs as f64;
+            assert!(
+                (p.phase_deg - expected).abs() < 1e-6,
+                "{} Hz: {}° != {expected}°",
+                p.freq_hz,
+                p.phase_deg
+            );
+        }
+    }
+
+    #[test]
+    fn frequency_response_two_tap_average_lowpass() {
+        // h = [0.5, 0.5] → |H(f)| = cos(πf/fs): −3.01 dB at fs/4, plunging
+        // toward −∞ near fs/2 (floored at −200 dB by the implementation).
+        let taps = vec![0.5f32, 0.5];
+        let fs = 48_000u32;
+        let pts = fir_frequency_response(&taps, fs, &[12_000.0, 23_990.0]);
+        assert!(
+            (pts[0].magnitude_db - (-3.0103)).abs() < 0.01,
+            "fs/4: {} dB",
+            pts[0].magnitude_db
+        );
+        assert!(
+            pts[1].magnitude_db < -60.0,
+            "near fs/2: {} dB",
+            pts[1].magnitude_db
+        );
     }
 }
