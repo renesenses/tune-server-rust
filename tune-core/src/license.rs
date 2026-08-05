@@ -134,9 +134,10 @@ impl Feature {
     /// the match arm below — this is the single source of truth.
     pub fn available(&self) -> bool {
         match self {
-            // Features licensed by Premium but NOT yet available/functional.
-            // Uncomment / extend as product decides, e.g.:
-            // Feature::SocialSharing | Feature::WeeklyDigest | Feature::Declick => false,
+            // Features licensed by Premium but NOT yet available/functional
+            // (product decision — Bertrand). These show a red cross in the UI.
+            // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
+            Feature::SocialSharing | Feature::WeeklyDigest => false,
             _ => true,
         }
     }
