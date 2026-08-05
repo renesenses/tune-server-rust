@@ -1633,6 +1633,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "track_audio_embedding",
         include_str!("../../migrations/postgres/015_track_audio_embedding.sql"),
     ),
+    (
+        16,
+        "alarms_profile_id",
+        include_str!("../../migrations/postgres/016_alarms_profile_id.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -1918,7 +1923,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 15, "latest PG migration must be 15");
+        assert_eq!(pg_latest_version(), 16, "latest PG migration must be 16");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

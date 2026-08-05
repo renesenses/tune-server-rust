@@ -205,6 +205,12 @@ pub async fn auth_middleware(
     if !is_extension_route
         && (path.contains("/system/health")
             || path.contains("/system/version")
+            // NB : /system/profile (fiche support) n'est volontairement PAS
+            // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
+            // trop large pour un appel anonyme quand l'auth est activée. Elle
+            // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
+            // l'écran Support est consulté par un utilisateur authentifié,
+            // jamais de façon anonyme.
             || path.contains("/cloud/sso/")
             || path == "/ws"
             || is_public_auth_route(&method, path))

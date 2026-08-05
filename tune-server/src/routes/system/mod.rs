@@ -12,6 +12,7 @@ pub(crate) use enrich::gate_enrichment;
 mod import;
 mod playlist_hub;
 mod plugins;
+mod profile;
 mod remote;
 pub(crate) mod scan;
 mod tags;
@@ -30,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/version", get(config::version))
         .route("/health", get(config::health))
         .route("/stats", get(config::stats))
+        .route("/profile", get(profile::system_profile))
         .route(
             "/config",
             get(config::get_config).patch(config::update_config),

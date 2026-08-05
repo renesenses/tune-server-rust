@@ -726,6 +726,41 @@ ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
 "#;
 
+/// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
+/// PRECISION (001 creates it DOUBLE on fresh installs; an mtime is numeric by
+/// nature, and `file_first_seen.first_seen_at` is already DOUBLE).
+/// `PG_FULL_SCHEMA` above deliberately creates it TEXT — the data copy binds
+/// every parameter as text, so converting BEFORE the copy would abort the
+/// whole `tracks` INSERT ("column is of type double precision but expression
+/// is of type text") and the library would arrive empty. Migration 013,
+/// replayed by `run_pg_migrations` right after the copy, normally performs
+/// the TEXT → DOUBLE conversion; this block repeats it so a failure in an
+/// earlier numbered migration cannot strand the drifted TEXT column (that
+/// TEXT/DOUBLE drift between install vintages is what broke the added_at
+/// album sort — see album_repo.rs list_sorted). Idempotent: strict no-op once
+/// the column is DOUBLE. '' (SQLite dynamic-typing garbage carried over by
+/// the text copy) becomes NULL, like any non-numeric value (regex guard
+/// mirrors migration 013). No Rust write path can produce '' — the model
+/// field is `Option<f64>` and binds natively — so once converted the column
+/// stays clean.
+const PG_NORMALIZE_FILE_MTIME: &str = r#"
+DO $$
+DECLARE
+    cur_type TEXT;
+BEGIN
+    SELECT data_type INTO cur_type
+      FROM information_schema.columns
+     WHERE table_name = 'tracks' AND column_name = 'file_mtime';
+    IF cur_type IN ('text', 'character varying') THEN
+        UPDATE tracks SET file_mtime = NULL WHERE file_mtime = '';
+        ALTER TABLE tracks ALTER COLUMN file_mtime TYPE DOUBLE PRECISION
+            USING (CASE WHEN file_mtime ~ '^-?[0-9]+(\.[0-9]+)?$'
+                        THEN file_mtime::double precision END);
+        RAISE NOTICE 'pg_migrate: tracks.file_mtime % -> double precision', cur_type;
+    END IF;
+END $$;
+"#;
+
 /// Run the full SQLite → PostgreSQL migration.
 ///
 /// 1. Connects to PG at `pg_url`
@@ -812,6 +847,17 @@ pub async fn migrate_sqlite_to_pg(
         result
             .errors
             .push(format!("post-migration schema upgrade failed: {e}"));
+    }
+
+    // Belt and braces: even if the upgrade above failed before migration 013
+    // could run, tracks.file_mtime must leave here with its canonical DOUBLE
+    // PRECISION type (see PG_NORMALIZE_FILE_MTIME). No-op when 013 already
+    // converted it.
+    if let Err(e) = sqlx::raw_sql(PG_NORMALIZE_FILE_MTIME).execute(&pool).await {
+        tracing::warn!(error = %e, "pg_migrate_file_mtime_normalize_failed");
+        result
+            .errors
+            .push(format!("file_mtime normalisation failed: {e}"));
     }
 
     let elapsed = start.elapsed();
