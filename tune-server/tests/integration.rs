@@ -1152,3 +1152,109 @@ async fn browser_zone_without_device_is_not_rejected_as_orphan() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(zone["online"], true, "browser zone must be online: {zone}");
 }
+
+// ───────────────────────── Lyrics endpoint (mode « Grand écran ») ─────────
+//
+// Contract with the web client:
+//   200 {"synced": bool, "source": "lrc"|"tag"|"lrclib",
+//        "lines": [{"t_ms": u64|null, "text": "..."}]}
+//   404 {"error": "no_lyrics"}
+// Cascade: sidecar .lrc → embedded tag → LRCLIB (opt-in). These tests cover
+// the local sources and the clean-404 paths (no network involved: the
+// lyrics_lrclib_enabled setting stays unset → LRCLIB is skipped).
+
+fn insert_track_with_file(state: &tune_server::state::AppState, title: &str, path: &str) -> i64 {
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+    let mut t = tune_core::db::models::Track::new(title.into());
+    t.file_path = Some(path.into());
+    repo.create(&t).expect("insert track")
+}
+
+#[tokio::test]
+async fn lyrics_unknown_track_is_404_no_lyrics() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/library/tracks/424242/lyrics").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "no_lyrics");
+}
+
+#[tokio::test]
+async fn lyrics_track_without_any_source_is_404_no_lyrics() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Muette");
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "no_lyrics");
+}
+
+#[tokio::test]
+async fn lyrics_sidecar_lrc_is_synced() {
+    let dir = std::env::temp_dir().join(format!("tune_lyrics_it_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let audio = dir.join("Ma Chanson.flac");
+    // Multi-timestamps on one line + metadata tags to ignore.
+    std::fs::write(
+        dir.join("Ma Chanson.lrc"),
+        "[ar:Artiste]\n[ti:Ma Chanson]\n[00:12.00][01:15.00]Refrain\n[00:30.500] Couplet\n",
+    )
+    .unwrap();
+
+    let (app, state) = make_app_with_state();
+    let tid = insert_track_with_file(&state, "Ma Chanson", audio.to_str().unwrap());
+
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["synced"], true);
+    assert_eq!(body["source"], "lrc");
+    let lines = body["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 3);
+    // Sorted by t_ms; the multi-timestamp line appears twice.
+    assert_eq!(lines[0]["t_ms"], 12_000);
+    assert_eq!(lines[0]["text"], "Refrain");
+    assert_eq!(lines[1]["t_ms"], 30_500);
+    assert_eq!(lines[1]["text"], "Couplet");
+    assert_eq!(lines[2]["t_ms"], 75_000);
+    assert_eq!(lines[2]["text"], "Refrain");
+}
+
+#[tokio::test]
+async fn lyrics_embedded_tag_plain_is_unsynced() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Taggée");
+    // The scanner persists embedded USLT/LYRICS content under this key.
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    meta.set(tid, "lyrics", "Première ligne\n\nDeuxième ligne")
+        .unwrap();
+
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["synced"], false);
+    assert_eq!(body["source"], "tag");
+    let lines = body["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["t_ms"], Value::Null);
+    assert_eq!(lines[0]["text"], "Première ligne");
+    assert_eq!(lines[1]["text"], "Deuxième ligne");
+}
+
+#[tokio::test]
+async fn lyrics_embedded_tag_with_lrc_timestamps_is_synced() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Taggée LRC");
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    meta.set(tid, "lyrics", "[00:01.00] Un\n[00:02.00] Deux")
+        .unwrap();
+
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["synced"], true);
+    assert_eq!(body["source"], "tag");
+    let lines = body["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["t_ms"], 1_000);
+    assert_eq!(lines[1]["t_ms"], 2_000);
+}

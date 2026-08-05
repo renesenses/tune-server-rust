@@ -627,6 +627,20 @@ CREATE TABLE IF NOT EXISTS track_source_links (
     UNIQUE(track_id, service)
 );
 
+-- LRCLIB lyrics cache (SQLite migration v43 / PG script 008). Present here
+-- too because a database created by THIS sqlite→pg migration records
+-- schema_version 99 and therefore never replays the numbered PG scripts:
+-- without this block such a DB has no lyrics_cache at all (drift).
+CREATE TABLE IF NOT EXISTS lyrics_cache (
+    track_id BIGINT PRIMARY KEY,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    synced_lyrics TEXT,
+    plain_lyrics TEXT,
+    source TEXT NOT NULL DEFAULT 'lrclib',
+    fetched_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);

@@ -57,6 +57,7 @@ async fn get_lyrics_for_track(
         track_id,
         title,
         artist,
+        track.album_title.as_deref(),
         track.duration_ms,
     )
     .await;
@@ -113,6 +114,7 @@ async fn search_lyrics(
         &state.http_client,
         &params.artist,
         &params.title,
+        None,
         params.duration,
     )
     .await;

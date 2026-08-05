@@ -390,53 +390,180 @@ pub(super) async fn track_all_tags(
     Json(result).into_response()
 }
 
+/// GET /api/v1/library/tracks/{id}/lyrics — mode « Grand écran + paroles ».
+///
+/// Contract (the web client is built against this — do not change):
+/// - 200: `{"synced": bool, "source": "lrc"|"tag"|"lrclib",
+///          "lines": [{"t_ms": <u64|null>, "text": "..."}]}`
+///   (`t_ms` is null when the source is unsynchronized)
+/// - 404: `{"error": "no_lyrics"}` when no source has lyrics.
+///
+/// Resolution cascade:
+/// 1. Sidecar `.lrc` / `.LRC` next to the audio file → synced, source "lrc".
+/// 2. Embedded tag (USLT/LYRICS via lofty; the scanner also persists it in
+///    `track_metadata` under the `lyrics` key). LRC timestamps inside the
+///    tag → synced; otherwise raw lines with `t_ms: null` → unsynced.
+/// 3. LRCLIB, only when the `lyrics_lrclib_enabled` setting is "true"
+///    (cache-first, negatives retried after 14 days).
+///
+/// Never returns 500 for a track without lyrics; LRCLIB failures degrade
+/// to a clean 404. No premium gate: this is a display feature.
 pub(super) async fn track_lyrics(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    fn no_lyrics() -> axum::response::Response {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "no_lyrics"}))).into_response()
+    }
+
+    fn synced_response(
+        source: &str,
+        lines: &[tune_core::metadata::lyrics::LrcLine],
+    ) -> axum::response::Response {
+        let out: Vec<Value> = lines
+            .iter()
+            .map(|l| json!({"t_ms": l.time_ms, "text": l.text}))
+            .collect();
+        Json(json!({"synced": true, "source": source, "lines": out})).into_response()
+    }
+
+    fn plain_response(source: &str, text: &str) -> Option<axum::response::Response> {
+        let out: Vec<Value> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| json!({"t_ms": Value::Null, "text": l}))
+            .collect();
+        if out.is_empty() {
+            return None;
+        }
+        Some(Json(json!({"synced": false, "source": source, "lines": out})).into_response())
+    }
+
     let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => return no_lyrics(),
     };
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let genius_token = settings.get("genius_api_token").ok().flatten();
-    let Some(token) = genius_token else {
-        return Json(json!({"track_id": id, "lyrics": null, "error": "Genius API not configured"}))
-            .into_response();
-    };
-    let title = &track.title;
-    let artist = track.artist_name.as_deref().unwrap_or("");
-    let q = format!("{title} {artist}");
-    let search_url = format!(
-        "https://api.genius.com/search?q={}",
-        urlencoding::encode(&q)
-    );
-    let resp = state
-        .http_client
-        .get(&search_url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let data: Value = r.json().await.unwrap_or(json!({}));
-            let hits = data.pointer("/response/hits").and_then(|v| v.as_array());
-            let url = hits
-                .and_then(|arr| arr.first())
-                .and_then(|h| h.pointer("/result/url"))
-                .and_then(|v| v.as_str());
-            Json(json!({
-                "track_id": id,
-                "title": title,
-                "artist": artist,
-                "genius_url": url,
-                "lyrics": null,
-            }))
-            .into_response()
+
+    // 1. Sidecar .lrc / .LRC next to the audio file.
+    if let Some(ref path) = track.file_path {
+        if let Some(content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
+            let lines = tune_core::metadata::lyrics::parse_lrc(&content);
+            if !lines.is_empty() {
+                return synced_response("lrc", &lines);
+            }
         }
-        _ => Json(json!({"track_id": id, "lyrics": null, "error": "Genius API request failed"}))
-            .into_response(),
+    }
+
+    // 2. Embedded tag: scanner-persisted `track_metadata['lyrics']` first
+    // (no file I/O), then a direct lofty read of the file.
+    let meta_repo =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    let tag_lyrics = meta_repo
+        .get_all(id)
+        .ok()
+        .and_then(|m| m.get("lyrics").cloned())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            track
+                .file_path
+                .as_deref()
+                .and_then(tune_core::metadata::lyrics::read_embedded_lyrics)
+        });
+    if let Some(text) = tag_lyrics {
+        let lines = tune_core::metadata::lyrics::parse_lrc(&text);
+        if !lines.is_empty() {
+            return synced_response("tag", &lines);
+        }
+        if let Some(resp) = plain_response("tag", &text) {
+            return resp;
+        }
+    }
+
+    // 3. LRCLIB — opt-in via the generic settings key `lyrics_lrclib_enabled`.
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let lrclib_enabled = settings
+        .get("lyrics_lrclib_enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    if !lrclib_enabled {
+        return no_lyrics();
+    }
+
+    let artist = track.artist_name.clone().unwrap_or_default();
+    if artist.is_empty() || track.title.is_empty() {
+        return no_lyrics();
+    }
+
+    // Cache first (positive entries never expire; negatives retry after 14 d).
+    if let Some(entry) = tune_core::lyrics::load_cache_entry(&state.backend, id) {
+        if let Some(lrc) = entry
+            .synced_lyrics
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let lines = tune_core::metadata::lyrics::parse_lrc(lrc);
+            if !lines.is_empty() {
+                return synced_response("lrclib", &lines);
+            }
+        }
+        if let Some(plain) = entry
+            .plain_lyrics
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            if let Some(resp) = plain_response("lrclib", plain) {
+                return resp;
+            }
+        }
+        if entry.negative_still_fresh() {
+            return no_lyrics();
+        }
+    }
+
+    let duration_secs = (track.duration_ms > 0).then_some(track.duration_ms / 1000);
+    match tune_core::lyrics::fetch_lrclib_raw(
+        &state.http_client,
+        &artist,
+        &track.title,
+        track.album_title.as_deref(),
+        duration_secs,
+    )
+    .await
+    {
+        Ok(raw) => {
+            let raw = raw.unwrap_or_default();
+            // Cache both hits and misses (misses are retried after 14 days).
+            tune_core::lyrics::store_cache_entry(
+                &state.backend,
+                id,
+                &track.title,
+                &artist,
+                raw.synced_lyrics.as_deref(),
+                raw.plain_lyrics.as_deref(),
+            );
+            if let Some(lrc) = raw.synced_lyrics.as_deref() {
+                let lines = tune_core::metadata::lyrics::parse_lrc(lrc);
+                if !lines.is_empty() {
+                    return synced_response("lrclib", &lines);
+                }
+            }
+            if let Some(plain) = raw.plain_lyrics.as_deref() {
+                if let Some(resp) = plain_response("lrclib", plain) {
+                    return resp;
+                }
+            }
+            no_lyrics()
+        }
+        // Network/protocol failure: clean 404, nothing cached so the next
+        // request retries.
+        Err(e) => {
+            tracing::debug!(track_id = id, error = %e, "lrclib_fetch_failed");
+            no_lyrics()
+        }
     }
 }
 
