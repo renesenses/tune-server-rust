@@ -619,6 +619,7 @@ impl TrackRepo {
         folder: Option<&str>,
         rating: Option<i32>,
         collection_ids: Option<&[i64]>,
+        collection_track_ids: Option<&[i64]>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -748,6 +749,22 @@ impl TrackRepo {
                     .collect::<Vec<_>>()
                     .join(",");
                 conditions.push(format!("t.album_id IN ({list})"));
+            }
+        }
+
+        // Smart collection: the caller resolved its rules to concrete track ids
+        // (our own i64s), inlined the same injection-safe way as album ids above.
+        // An empty set matches nothing.
+        if let Some(ids) = collection_track_ids {
+            if ids.is_empty() {
+                conditions.push("1 = 0".to_string());
+            } else {
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conditions.push(format!("t.id IN ({list})"));
             }
         }
 

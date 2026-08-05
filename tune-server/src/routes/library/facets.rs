@@ -439,8 +439,51 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
             out.push((name, count));
         }
     }
+
+    // Smart Collections (rule-based) sit in the same facet as the manual ones.
+    // Their member set is the compiled rule query; count = matching tracks (the
+    // collection's own LIMIT applies, so this count matches what filtering shows).
+    // A name already used by a manual collection wins — skip the smart duplicate
+    // so the facet value stays unambiguous when it is used to filter tracks.
+    let manual_names: std::collections::HashSet<String> =
+        out.iter().map(|(n, _)| n.to_lowercase()).collect();
+    let sc_repo = tune_core::library::smart_collections::SmartCollectionRepo::with_backend(
+        state.backend.clone(),
+    );
+    if let Ok(smarts) = sc_repo.list() {
+        for sc in &smarts {
+            if sc.name.is_empty() || manual_names.contains(&sc.name.to_lowercase()) {
+                continue;
+            }
+            let count = sc_repo
+                .execute_query(sc)
+                .map(|ids| ids.len() as i64)
+                .unwrap_or(0);
+            if count > 0 {
+                out.push((sc.name.clone(), count));
+            }
+        }
+    }
+
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out
+}
+
+/// Resolve a SMART collection name to its member track ids (compiled rule query).
+/// Used by `/library/tracks?collection=<name>` when the name isn't a manual
+/// collection, so clicking a Smart Collection in the Oxygen facet filters the
+/// track list to exactly its members. Case-insensitive; `None` if no such smart
+/// collection (or the query fails).
+pub(super) fn smart_collection_track_ids(state: &AppState, name: &str) -> Option<Vec<i64>> {
+    let repo = tune_core::library::smart_collections::SmartCollectionRepo::with_backend(
+        state.backend.clone(),
+    );
+    let sc = repo
+        .list()
+        .ok()?
+        .into_iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))?;
+    repo.execute_query(&sc).ok()
 }
 
 /// Count tracks per artist. Unlike other facets, the artist name is NOT a column
