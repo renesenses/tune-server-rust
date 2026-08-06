@@ -145,6 +145,42 @@ pub struct ZoneState {
     /// (server-initiated, no owner) rather than misattributed to a person.
     #[serde(default)]
     pub session_profile_id: Option<i64>,
+    /// Horloge murale (epoch ms UTC) du dernier changement de métadonnée
+    /// titre/artiste du now-playing. Pour une radio, c'est l'instant où le
+    /// serveur a détecté le changement de morceau dans le flux (ICY / API
+    /// livemeta) : le client s'en sert comme ancrage temporel des paroles
+    /// synchronisées (position ≈ maintenant − metadata_changed_at). Stampé au
+    /// `play()` et dans `update_now_playing` uniquement quand titre/artiste
+    /// changent réellement — le rappel périodique d'une métadonnée identique
+    /// ne doit pas faire repartir l'ancrage de zéro.
+    #[serde(default)]
+    pub metadata_changed_at_ms: Option<i64>,
+}
+
+/// Vrai quand la nouvelle métadonnée now-playing change d'identité
+/// (titre ou artiste) par rapport à l'ancienne — c'est CE changement qui
+/// redémarre l'ancrage temporel des paroles, pas un simple rafraîchissement.
+fn metadata_identity_changed(old: Option<&NowPlaying>, new: &NowPlaying) -> bool {
+    old.is_none_or(|o| o.title != new.title || o.artist_name != new.artist_name)
+}
+
+/// Epoch UTC en millisecondes (horloge murale du serveur).
+pub(crate) fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl ZoneState {
+    /// Âge (ms) de la dernière métadonnée now-playing, calculé sur l'horloge
+    /// du serveur. Les routes zone l'exposent tel quel : le client pose son
+    /// ancrage local (`maintenant_client − âge`) sans jamais comparer horloge
+    /// client et horloge serveur.
+    pub fn metadata_age_ms(&self) -> Option<i64> {
+        self.metadata_changed_at_ms
+            .map(|ts| (epoch_ms() - ts).max(0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +213,7 @@ impl Default for ZoneState {
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            metadata_changed_at_ms: None,
         }
     }
 }
@@ -356,6 +393,8 @@ impl PlaybackManager {
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
         state.now_playing = Some(np);
+        // Nouveau morceau → nouvel ancrage temporel de métadonnée.
+        state.metadata_changed_at_ms = Some(epoch_ms());
         state.track_generation = state.track_generation.wrapping_add(1);
         // Preserve last_seek_at if a seek just happened (< 5s ago) — the
         // orchestrator recreates the stream during seek, which calls play().
@@ -422,6 +461,7 @@ impl PlaybackManager {
             state.state = PlayState::Stopped;
             state.now_playing = None;
             state.position_ms = 0;
+            state.metadata_changed_at_ms = None;
         }
         self.emit(PlaybackEvent {
             event: "stopped".into(),
@@ -597,6 +637,12 @@ impl PlaybackManager {
     pub async fn update_now_playing(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
+            // Ancrage temporel : re-stampé uniquement quand titre/artiste
+            // changent vraiment. Un rafraîchissement de la même métadonnée
+            // (poll ICY périodique) ne doit pas remettre les paroles à zéro.
+            if metadata_identity_changed(state.now_playing.as_ref(), &np) {
+                state.metadata_changed_at_ms = Some(epoch_ms());
+            }
             state.now_playing = Some(np);
         }
         let data = zones
@@ -640,6 +686,16 @@ fn now_playing_event_data(state: &ZoneState) -> serde_json::Value {
             "track_generation".into(),
             serde_json::json!(state.track_generation),
         );
+        // Ancrage temporel des paroles radio : instant (serveur) du dernier
+        // changement titre/artiste + âge déjà calculé côté serveur, pour que
+        // le client n'ait pas à comparer deux horloges différentes.
+        if let Some(ts) = state.metadata_changed_at_ms {
+            obj.insert("metadata_changed_at".into(), serde_json::json!(ts));
+            obj.insert(
+                "metadata_age_ms".into(),
+                serde_json::json!((epoch_ms() - ts).max(0)),
+            );
+        }
     }
     v
 }
@@ -677,6 +733,7 @@ mod tests {
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            metadata_changed_at_ms: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -693,6 +750,64 @@ mod tests {
         let empty = now_playing_event_data(&state);
         assert_eq!(empty["queue_position"], 3);
         assert!(empty.get("track_id").is_none());
+    }
+
+    #[test]
+    fn metadata_identity_change_detection() {
+        let np = |title: &str, artist: Option<&str>| NowPlaying {
+            title: title.into(),
+            artist_name: artist.map(|s| s.to_string()),
+            source: "radio".into(),
+            ..Default::default()
+        };
+        let old = np("So What", Some("Miles Davis"));
+        // Pas d'ancien now-playing → changement.
+        assert!(metadata_identity_changed(None, &old));
+        // Même titre/artiste (poll ICY répété) → pas de changement.
+        assert!(!metadata_identity_changed(
+            Some(&old),
+            &np("So What", Some("Miles Davis"))
+        ));
+        // Titre différent, artiste différent, ou artiste qui apparaît → changement.
+        assert!(metadata_identity_changed(
+            Some(&old),
+            &np("Blue in Green", Some("Miles Davis"))
+        ));
+        assert!(metadata_identity_changed(
+            Some(&old),
+            &np("So What", Some("Bill Evans"))
+        ));
+        assert!(metadata_identity_changed(Some(&old), &np("So What", None)));
+    }
+
+    #[tokio::test]
+    async fn update_now_playing_stamps_anchor_only_on_identity_change() {
+        let pm = PlaybackManager::new();
+        let np = |title: &str| NowPlaying {
+            title: title.into(),
+            artist_name: Some("FIP".into()),
+            source: "radio".into(),
+            ..Default::default()
+        };
+        pm.play(9, np("Premier titre")).await;
+        let anchor1 = pm.get_state(9).await.metadata_changed_at_ms;
+        assert!(anchor1.is_some(), "play() doit poser l'ancrage");
+
+        // Même métadonnée re-poussée : l'ancrage NE bouge PAS.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        pm.update_now_playing(9, np("Premier titre")).await;
+        assert_eq!(pm.get_state(9).await.metadata_changed_at_ms, anchor1);
+
+        // Changement de titre : l'ancrage est re-stampé (>= précédent).
+        pm.update_now_playing(9, np("Deuxième titre")).await;
+        let anchor2 = pm.get_state(9).await.metadata_changed_at_ms;
+        assert!(anchor2.unwrap() > anchor1.unwrap());
+
+        // L'événement WS embarque l'ancrage + un âge calculé côté serveur.
+        let state = pm.get_state(9).await;
+        let data = now_playing_event_data(&state);
+        assert_eq!(data["metadata_changed_at"], anchor2.unwrap());
+        assert!(data["metadata_age_ms"].as_i64().unwrap() >= 0);
     }
 
     #[tokio::test]
