@@ -4694,11 +4694,18 @@ impl PlaybackOrchestrator {
                     // Tidal direct alors qu'une piste locale les anime. On
                     // décode le même flux en parallèle, uniquement pour les
                     // niveaux — le flux servi reste bit-perfect.
-                    self.spawn_proxy_levels_probe(
-                        req.zone_id,
-                        stream_data.url.clone(),
-                        codec_lower.clone(),
-                    );
+                    //
+                    // On tape NOTRE session proxy (`url`, localhost) et non
+                    // l'URL CDN signée `stream_data.url` : le navigateur, en
+                    // consommant le proxy, fait re-résoudre une URL signée
+                    // fraîche, et l'ancienne signature tapée directement était
+                    // rejetée par le CDN (aucune fenêtre décodée → aiguilles
+                    // figées, la 1re version du fix #1247). Passer par le proxy
+                    // réutilise sa re-résolution / reprise et sert exactement
+                    // les octets joués. Le bridage ≤30 s en avance impose une
+                    // contre-pression TCP : le proxy ne pré-télécharge pas
+                    // toute la piste.
+                    self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone());
 
                     // Report the mime of the codec we actually serve, not the
                     // upstream API's mime_type. Qobuz can return a mime that does
@@ -7454,6 +7461,153 @@ mod tests {
         assert!(
             (950..=1050).contains(&ms),
             "durée totale ≈ 1 s, reçu {ms} ms"
+        );
+    }
+
+    /// Sert `secs` secondes de WAV 16-bit stéréo 44,1 kHz silencieux sur un
+    /// port éphémère (une seule connexion), et renvoie l'URL. Support de test
+    /// pour la chaîne VU sans dépendre du réseau.
+    fn spawn_oneshot_wav_server(secs: u32) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let sr: u32 = 44100;
+                let data = vec![0u8; sr as usize * 4 * secs as usize];
+                let mut wav = Vec::with_capacity(44 + data.len());
+                wav.extend_from_slice(b"RIFF");
+                wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+                wav.extend_from_slice(b"WAVEfmt ");
+                wav.extend_from_slice(&16u32.to_le_bytes());
+                wav.extend_from_slice(&1u16.to_le_bytes());
+                wav.extend_from_slice(&2u16.to_le_bytes());
+                wav.extend_from_slice(&sr.to_le_bytes());
+                wav.extend_from_slice(&(sr * 4).to_le_bytes());
+                wav.extend_from_slice(&4u16.to_le_bytes());
+                wav.extend_from_slice(&16u16.to_le_bytes());
+                wav.extend_from_slice(b"data");
+                wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                wav.extend_from_slice(&data);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    wav.len()
+                );
+                let _ = s.write_all(&wav);
+            }
+        });
+        format!("http://{addr}/probe.wav")
+    }
+
+    /// Régression #1247 : la chaîne VU complète d'une session proxy — sonde
+    /// HTTP → forwarder cadencé → bus — doit émettre `playback.audio_levels`
+    /// pour une zone en Playing dont la position n'est pas rapportée (0), le
+    /// cas exact d'une zone « browser » servie en FLAC-proxy (Qobuz/Tidal
+    /// direct). Autonome (serveur WAV local one-shot), sans réseau.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn levels_chain_emits_audio_levels_on_bus() {
+        let url = spawn_oneshot_wav_server(3);
+        let zone_id = 987_655;
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            0,
+        );
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let probe = tokio::task::spawn_blocking(move || {
+            super::decode_http_stream_for_levels(url, "wav".into(), levels_tx, reported)
+        });
+
+        let mut n = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => n += 1,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let _ = probe.await;
+        assert!(
+            n >= 40,
+            "3 s d'audio ⇒ ~75 fenêtres de 40 ms sur le bus ; reçu {n}"
+        );
+    }
+
+    /// Vérification end-to-end de la chaîne VU d'une session proxy, contre
+    /// une URL FLAC/HTTP réelle : sonde → forwarder cadencé → bus. Reproduit
+    /// exactement le chemin de production (moins le WebSocket) pour une zone
+    /// « browser » (état Playing, position non rapportée = 0, comme quand le
+    /// navigateur ne bat pas encore le cœur). Compte les événements
+    /// `playback.audio_levels` réellement émis sur le bus.
+    ///
+    /// Piloté par TUNE_DIAG_PROBE_URL (URL d'une session proxy live, p.ex.
+    /// http://192.168.1.18:8888/stream/<id>.flac) pour ne pas dépendre du
+    /// réseau en CI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn diag_probe_emits_bus_events() {
+        let Ok(url) = std::env::var("TUNE_DIAG_PROBE_URL") else {
+            return;
+        };
+        let zone_id = 987_654;
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        // Passe la zone en Playing (comme un vrai play), sans rapporter de
+        // position — le pire cas du forwarder (browser sans heartbeat).
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            0,
+        );
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let probe = tokio::task::spawn_blocking(move || {
+            super::decode_http_stream_for_levels(url, "flac".into(), levels_tx, reported)
+        });
+
+        // Compte les audio_levels émis sur ~4 s (cadence réelle ≈ 25/s).
+        let mut n = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => n += 1,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        probe.abort();
+        eprintln!("DIAG audio_levels emitted in 4s = {n}");
+        assert!(
+            n >= 50,
+            "chaîne proxy→forwarder→bus doit émettre ~25/s ; reçu {n} en 4 s"
         );
     }
 
