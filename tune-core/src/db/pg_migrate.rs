@@ -448,8 +448,17 @@ CREATE TABLE IF NOT EXISTS favorites (
     item_type TEXT NOT NULL,
     item_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    item_name TEXT,
+    item_artist TEXT,
+    item_path TEXT,
     UNIQUE(profile_id, item_type, item_id)
 );
+-- Instantané d'identité des favoris (SQLite v66 / PG 017) : nécessaire ici
+-- aussi pour qu'une base PG créée par cette migration de données accepte la
+-- copie des colonnes présentes côté SQLite.
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
 CREATE TABLE IF NOT EXISTS streaming_favorites (

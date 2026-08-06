@@ -34,6 +34,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     cleanup_orphan_queues(state);
+    reconcile_favorites(state);
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
@@ -110,6 +111,33 @@ fn deduplicate_zones(state: &AppState) {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
     ) {
         tracing::warn!(error = %e, "zone_unique_index_failed");
+    }
+}
+
+/// Re-rattache les favoris orphelins aux items vivants retrouvés par identité
+/// (instantané titre/artiste/chemin, historique d'écoute en secours). Un
+/// rescan qui recrée albums/pistes sous de nouveaux rowids (racines music
+/// déplacées, library clear) laissait des favoris fantômes : cœurs éteints et
+/// filtre « Favoris » vide (bug .18, v0.9.50). Au démarrage on ne supprime
+/// JAMAIS un favori introuvable — un volume pas encore monté ou un scan à
+/// venir peut encore le ramener ; seule la passe post-scan complet supprime.
+fn reconcile_favorites(state: &AppState) {
+    let reconciler = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
+        state.backend.clone(),
+    );
+    match reconciler.run(false) {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                snapshots = stats.snapshots_backfilled,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "favorites_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "favorites_reconcile_failed"),
     }
 }
 
