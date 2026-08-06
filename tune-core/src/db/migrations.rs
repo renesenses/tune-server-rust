@@ -1945,7 +1945,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 16, "latest PG migration must be 16");
+        assert_eq!(pg_latest_version(), 17, "latest PG migration must be 17");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
