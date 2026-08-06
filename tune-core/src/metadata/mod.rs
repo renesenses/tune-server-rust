@@ -2856,6 +2856,61 @@ mod tests {
     }
 
     #[test]
+    fn try_read_metadata_untagged_wav_falls_back_to_path() {
+        // Regression (Jean-Luc Cassé, Windows): ~16% of his WAV-ripped albums never
+        // appeared in the library because an untagged WAV made lofty return no tag
+        // (or fail to parse), read_metadata returned None, and the scanner dropped
+        // the file as `skipped_no_metadata`. A supported, on-disk audio file must
+        // NEVER be dropped just because its tags are unreadable — it must index with
+        // metadata derived from the path.
+        use std::io::Write;
+
+        // Minimal canonical PCM WAV (stereo/16-bit/44100), no INFO/id3 tags.
+        let mut wav: Vec<u8> = Vec::new();
+        let data: [u8; 8] = [0; 8];
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&2u16.to_le_bytes()); // channels
+        wav.extend_from_slice(&44_100u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&176_400u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&4u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+
+        // Directory convention: .../Artist/Album/NN - Title.wav
+        let dir = std::env::temp_dir()
+            .join("tune_test_untagged_wav")
+            .join("Jean-Luc")
+            .join("Best Of");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("07 - Untagged Song.wav");
+        std::fs::File::create(&file)
+            .unwrap()
+            .write_all(&wav)
+            .unwrap();
+
+        let result = try_read_metadata(&file);
+        assert!(result.is_ok(), "untagged WAV must not error: {result:?}");
+        let meta = result.unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Untagged Song"));
+        assert_eq!(meta.album.as_deref(), Some("Best Of"));
+        assert_eq!(meta.artist.as_deref(), Some("Jean-Luc"));
+        assert_eq!(meta.album_artist.as_deref(), Some("Jean-Luc"));
+        assert_eq!(meta.track_number, Some(7));
+        // Holds through both fallback paths: tagless_fallback (lofty parsed props)
+        // and tagless_fallback_no_props (lofty failed) both normalise to "wav".
+        assert_eq!(meta.format.as_deref(), Some("wav"));
+
+        std::fs::remove_dir_all(std::env::temp_dir().join("tune_test_untagged_wav")).ok();
+    }
+
+    #[test]
     fn try_read_metadata_dsf_title_not_filename() {
         // Regression (LANDES Philippe / Benjithom): a tagged DSF must surface its
         // real ID3v2 title through the full try_read_metadata path, never fall
