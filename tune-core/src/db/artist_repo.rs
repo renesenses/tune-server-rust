@@ -6,6 +6,12 @@ use super::models::Artist;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
 
+/// Nom de l'artiste de repli quand un fichier est indexé sans tag artiste
+/// lisible (typiquement un fichier encore en cours d'écriture au moment où
+/// le watcher le voit). Partagé entre le scanner et les repos pour que la
+/// détection « artiste inconnu » compare toujours la même chaîne.
+pub const UNKNOWN_ARTIST_NAME: &str = "Unknown Artist";
+
 /// Engine-agnostic SQL builders for artist_repo.
 ///
 /// `COLLATE NOCASE` (SQLite-only) is replaced by `LOWER(col)` for
