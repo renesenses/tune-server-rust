@@ -3004,6 +3004,12 @@ impl PlaybackOrchestrator {
                 tokio::spawn(async move {
                     debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
+                    // Bus conservé pour signaler un échec de décodage au client :
+                    // un décodage transcodé qui échoue (codec non supporté, fichier
+                    // corrompu…) ne doit PLUS produire un flux silencieux qui boucle
+                    // toutes les ~2 s — on remonte une erreur visible.
+                    let err_bus = ev_bus.clone();
+
                     // Forwarder cadencé si le bus existe ; sinon un canal dont
                     // le récepteur est aussitôt abandonné (le décodeur ignore
                     // les erreurs d'envoi).
@@ -3048,9 +3054,27 @@ impl PlaybackOrchestrator {
                         }
                         Ok(Err(e)) => {
                             warn!(error = %e, file = %fp, "transcode_streaming_decode_failed");
+                            if let Some(ref bus) = err_bus {
+                                bus.emit(
+                                    "zone.playback_error",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "error": format!("Impossible de décoder la piste : {e}"),
+                                    }),
+                                );
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, file = %fp, "transcode_streaming_task_panic");
+                            if let Some(ref bus) = err_bus {
+                                bus.emit(
+                                    "zone.playback_error",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "error": "Le décodage de la piste a échoué (erreur interne).",
+                                    }),
+                                );
+                            }
                         }
                     }
 
