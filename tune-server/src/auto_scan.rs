@@ -63,12 +63,17 @@ pub fn build_track_from_metadata_opts(
     let album_artist_name = if is_compilation {
         "Various Artists"
     } else {
-        meta.album_artist
-            .as_deref()
-            .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"))
+        meta.album_artist.as_deref().unwrap_or_else(|| {
+            meta.artist
+                .as_deref()
+                .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
+        })
     };
 
-    let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
+    let track_artist_name = meta
+        .artist
+        .as_deref()
+        .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
     let album_artist_mbid = if is_compilation {
         None
