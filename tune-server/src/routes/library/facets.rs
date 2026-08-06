@@ -441,27 +441,57 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
     }
 
     // Smart Collections (rule-based) sit in the same facet as the manual ones.
-    // Their member set is the compiled rule query; count = matching tracks (the
-    // collection's own LIMIT applies, so this count matches what filtering shows).
+    // Counted with the SAME rule engine as the smart-collections endpoints
+    // (`build_album_query`), so the facet always agrees with the collection
+    // views. The legacy tune-core `compile_sql` engine used here before
+    // diverged — raw `any` match_mode silently read as ALL, `added_at` hit the
+    // phantom `t.created_at` column, unknown fields (`artist_name`) fell back
+    // to `t.title` — and every such collection vanished from the facet (count
+    // read 0) while placeholder rules counted the entire library. Collections
+    // with genuinely 0 matching tracks stay omitted, like every other facet.
     // A name already used by a manual collection wins — skip the smart duplicate
     // so the facet value stays unambiguous when it is used to filter tracks.
     let manual_names: std::collections::HashSet<String> =
         out.iter().map(|(n, _)| n.to_lowercase()).collect();
-    let sc_repo = tune_core::library::smart_collections::SmartCollectionRepo::with_backend(
-        state.backend.clone(),
-    );
-    if let Ok(smarts) = sc_repo.list() {
-        for sc in &smarts {
-            if sc.name.is_empty() || manual_names.contains(&sc.name.to_lowercase()) {
-                continue;
-            }
-            let count = sc_repo
-                .execute_query(sc)
-                .map(|ids| ids.len() as i64)
-                .unwrap_or(0);
-            if count > 0 {
-                out.push((sc.name.clone(), count));
-            }
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT name, rules, match_mode FROM smart_collections ORDER BY name",
+            &[],
+        )
+        .unwrap_or_default();
+    for row in &rows {
+        let name = row.first().and_then(|v| v.as_string()).unwrap_or_default();
+        if name.is_empty() || manual_names.contains(&name.to_lowercase()) {
+            continue;
+        }
+        let rules = row
+            .get(1)
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "[]".into());
+        let match_mode = row
+            .get(2)
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "all".into());
+        let where_clause = smart_collection_where(&rules, &match_mode, &conds);
+        // COUNT(DISTINCT t.id): track-level rules count matching tracks;
+        // album-level rules (added_at, play_count…) count every track of the
+        // matching albums. Same figure as the list endpoint's `track_count`
+        // (max_limit is a display cap on the album view, not a membership cap).
+        let sql = format!(
+            "SELECT COUNT(DISTINCT t.id) FROM albums al \
+             LEFT JOIN artists ar ON al.artist_id = ar.id \
+             LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+        );
+        let count = state
+            .backend
+            .query_one(&sql, &bound)
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if count > 0 {
+            out.push((name, count));
         }
     }
 
@@ -469,21 +499,59 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
     out
 }
 
-/// Resolve a SMART collection name to its member track ids (compiled rule query).
-/// Used by `/library/tracks?collection=<name>` when the name isn't a manual
-/// collection, so clicking a Smart Collection in the Oxygen facet filters the
-/// track list to exactly its members. Case-insensitive; `None` if no such smart
-/// collection (or the query fails).
-pub(super) fn smart_collection_track_ids(state: &AppState, name: &str) -> Option<Vec<i64>> {
-    let repo = tune_core::library::smart_collections::SmartCollectionRepo::with_backend(
-        state.backend.clone(),
+/// Compose the smart-collection rule engine's WHERE (aliases `al`/`ar`/`t`,
+/// see `build_album_query`) with extra `t.`-aliased facet conditions. The rules
+/// part is parenthesized so an `any` (OR-joined) collection isn't rebound by
+/// the appended ANDs. An empty rules WHERE means "matches everything" — that is
+/// the engine's semantic for rules it cannot compile.
+fn smart_collection_where(rules_json: &str, match_mode: &str, extra_conds: &[String]) -> String {
+    let (wc, _, _) = crate::routes::smart_collections::build_album_query(
+        rules_json, match_mode, "title", "asc", None,
     );
-    let sc = repo
-        .list()
-        .ok()?
-        .into_iter()
-        .find(|c| c.name.eq_ignore_ascii_case(name))?;
-    repo.execute_query(&sc).ok()
+    if extra_conds.is_empty() {
+        return wc;
+    }
+    let extra = extra_conds.join(" AND ");
+    match wc.strip_prefix("WHERE ") {
+        Some(rules) => format!("WHERE ({rules}) AND {extra}"),
+        None => format!("WHERE {extra}"),
+    }
+}
+
+/// Resolve a SMART collection name to its member track ids, via the same rule
+/// engine as the smart-collections endpoints (`build_album_query`) so
+/// `/library/tracks?collection=<name>` shows exactly the set the facet counted.
+/// Case-insensitive; `None` if no such smart collection (or the query fails).
+pub(super) fn smart_collection_track_ids(state: &AppState, name: &str) -> Option<Vec<i64>> {
+    let rows = state
+        .backend
+        .query_many("SELECT name, rules, match_mode FROM smart_collections", &[])
+        .ok()?;
+    let row = rows.iter().find(|r| {
+        r.first()
+            .and_then(|v| v.as_string())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    })?;
+    let rules = row
+        .get(1)
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "[]".into());
+    let match_mode = row
+        .get(2)
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "all".into());
+    let where_clause = smart_collection_where(&rules, &match_mode, &[]);
+    let sql = format!(
+        "SELECT DISTINCT t.id FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+    );
+    let rows = state.backend.query_many(&sql, &[]).ok()?;
+    Some(
+        rows.iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect(),
+    )
 }
 
 /// Count tracks per artist. Unlike other facets, the artist name is NOT a column
@@ -567,4 +635,30 @@ fn kv_facet(
             Some((value, count))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smart_collection_where;
+
+    #[test]
+    fn smart_where_parenthesizes_any_rules_before_extra_conds() {
+        // An `any` collection is OR-joined; the appended facet conditions must
+        // not rebind (`a OR b AND c` would read as `a OR (b AND c)`).
+        let rules = r#"[{"field":"genre","operator":"contains","value":"soul"},
+                        {"field":"genre","operator":"contains","value":"funk"}]"#;
+        let conds = vec!["t.year = ?".to_string()];
+        let wc = smart_collection_where(rules, "any", &conds);
+        assert!(wc.starts_with("WHERE ("), "{wc}");
+        assert!(wc.contains(") AND t.year = ?"), "{wc}");
+    }
+
+    #[test]
+    fn smart_where_extra_conds_only() {
+        // Rules the engine cannot compile mean "matches everything": the extra
+        // facet conditions must still form a valid WHERE on their own.
+        let wc = smart_collection_where("[]", "all", &["t.year = ?".to_string()]);
+        assert_eq!(wc, "WHERE t.year = ?");
+        assert_eq!(smart_collection_where("[]", "all", &[]), "");
+    }
 }

@@ -1,6 +1,6 @@
--- 018_album_metadata.sql
+-- 019_album_metadata.sql
 --
--- Store clé/valeur d'extra metadata au niveau ALBUM (SQLite migration v67),
+-- Store clé/valeur d'extra metadata au niveau ALBUM (SQLite migration v68),
 -- symétrique de track_metadata. Jusqu'ici l'UI web stockait les champs album
 -- du Vademecum (conductor, performer, barcode…) sur la PREMIÈRE piste de
 -- l'album faute d'endpoint album-level — donnée invisible depuis les autres
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS album_metadata (
 
 CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
 
-INSERT INTO schema_version (version, name) VALUES (18, 'album_metadata')
+INSERT INTO schema_version (version, name) VALUES (19, 'album_metadata')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;
