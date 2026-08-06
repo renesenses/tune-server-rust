@@ -12,7 +12,7 @@ use tune_core::metadata::tag_writer::{TagUpdate, write_tags};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
-pub(super) struct WriteTagsRequest {
+pub(crate) struct WriteTagsRequest {
     /// If true (default), only write fields that are currently empty in
     /// the file's tags. If false, overwrite all fields from DB metadata.
     #[serde(default = "default_true")]
@@ -33,7 +33,7 @@ fn default_true() -> bool {
 /// Writes metadata from the DB back to audio files' tags using lofty.
 /// Reads current file tags first, then only fills in missing fields
 /// (when `only_missing` is true).
-pub(super) async fn write_tags_to_files(
+pub(crate) async fn write_tags_to_files(
     State(state): State<AppState>,
     Json(body): Json<WriteTagsRequest>,
 ) -> impl IntoResponse {

@@ -819,6 +819,19 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
         name: "add_favorites_identity_snapshot",
         up: "", // Applied programmatically via add_column_if_missing (idempotent).
     },
+    Migration {
+        version: 67,
+        name: "add_album_metadata_table",
+        up: "
+CREATE TABLE IF NOT EXISTS album_metadata (
+    album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (album_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1662,6 +1675,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         17,
         "favorites_identity",
         include_str!("../../migrations/postgres/017_favorites_identity.sql"),
+    ),
+    (
+        18,
+        "album_metadata",
+        include_str!("../../migrations/postgres/018_album_metadata.sql"),
     ),
 ];
 

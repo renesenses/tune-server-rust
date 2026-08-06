@@ -17,7 +17,7 @@ use tune_core::metadata::{MetadataUpdate, write_metadata};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
-struct TrackEdit {
+pub(crate) struct TrackEdit {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
@@ -58,8 +58,15 @@ struct PaginationParams {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tracks/{id}/edit", post(edit_track))
+        // The web TrackTagsDrawer saves via PATCH /metadata/tracks/{id}, which
+        // never existed on the Rust port and 404'd. Same handler as /edit.
+        .route("/tracks/{id}", axum::routing::patch(edit_track))
         .route("/albums/{id}/edit", post(edit_album))
         .route("/artists/{id}/edit", post(edit_artist))
+        // Legacy Python-server endpoint still called by the web Metadata
+        // Manager ("Graver les tags") — 404'd on the Rust port. Delegates to
+        // the /library/write-tags job (fill-missing-only, whole library).
+        .route("/write-all-tags", post(write_all_tags_compat))
         .route("/doubtful", get(list_doubtful_metadata))
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
@@ -216,7 +223,7 @@ async fn fix_years_from_path(State(state): State<AppState>) -> impl IntoResponse
         .into_response()
 }
 
-async fn edit_track(
+pub(crate) async fn edit_track(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<TrackEdit>,
@@ -281,6 +288,19 @@ async fn edit_track(
     repo.update(&track).ok();
 
     Json(json!({ "status": "ok", "track_id": id })).into_response()
+}
+
+async fn write_all_tags_compat(state: State<AppState>) -> impl IntoResponse {
+    use crate::routes::library::write_tags::{WriteTagsRequest, write_tags_to_files};
+    write_tags_to_files(
+        state,
+        Json(WriteTagsRequest {
+            only_missing: true,
+            track_ids: None,
+            album_id: None,
+        }),
+    )
+    .await
 }
 
 async fn edit_album(

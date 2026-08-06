@@ -702,6 +702,49 @@ pub(super) async fn update_album(
     Json(album.to_json()).into_response()
 }
 
+// --- Album extended metadata endpoints ---
+
+/// GET /api/v1/library/albums/{id}/metadata
+/// Returns all extended metadata key-value pairs for an album.
+pub(super) async fn album_metadata_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
+
+    let repo = AlbumMetadataRepo::with_backend(state.backend.clone());
+    match repo.get_all(id) {
+        Ok(meta) => Json(json!(meta)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// PUT /api/v1/library/albums/{id}/metadata
+/// Batch-sets album-level extended metadata from a JSON object body.
+/// DB only — propagating album fields into each track's file tags stays the
+/// job of POST /library/write-tags {album_id}, so a save is never O(tracks).
+pub(super) async fn album_metadata_put(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
+
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
+    match album_repo.get(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "album not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+
+    let repo = AlbumMetadataRepo::with_backend(state.backend.clone());
+    if let Err(e) = repo.set_batch(id, &body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+
+    Json(json!({"status": "ok", "fields": body.len()})).into_response()
+}
+
 #[derive(Deserialize)]
 pub(super) struct BatchAlbumUpdate {
     album_ids: Vec<i64>,

@@ -133,6 +133,7 @@ const MIGRATION_TABLES: &[&str] = &[
     "tracks",
     "track_credits",
     "track_metadata",
+    "album_metadata",
     "playlists",
     "playlist_tracks",
     "zones",
@@ -282,6 +283,13 @@ CREATE TABLE IF NOT EXISTS track_metadata (
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (track_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS album_metadata (
+    album_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (album_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS playlists (
@@ -668,6 +676,7 @@ CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_t
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
+CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
 CREATE INDEX IF NOT EXISTS idx_track_source_links_track ON track_source_links(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(service);
 CREATE INDEX IF NOT EXISTS idx_offline_cache_source ON offline_cache(source, source_id);
@@ -955,6 +964,7 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
     let conflict_clause = match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
+        "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
         "favorites" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "item_tags" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",

@@ -708,80 +708,108 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 
 /// Full catalog of available extended metadata fields.
-/// (key, label_fr, category)
-const METADATA_FIELDS: &[(&str, &str, &str)] = &[
+/// (key, label_fr, category, scope)
+///
+/// `scope` says which entity a field belongs to — "track", "album" or "both" —
+/// so clients can build track/album editors from the catalog instead of
+/// hardcoding their own whitelist (the web UI's ALBUM_RELEVANT_KEYS).
+const METADATA_FIELDS: &[(&str, &str, &str, &str)] = &[
     // Identification
-    ("album_artist", "Artiste de l'album", "Identification"),
-    ("sort_artist", "Tri artiste", "Identification"),
-    ("sort_album", "Tri album", "Identification"),
-    ("disc_number", "N° disque", "Identification"),
-    ("disc_subtitle", "Sous-titre disque", "Identification"),
-    ("track_number", "N° piste", "Identification"),
-    ("genre", "Genre", "Identification"),
-    ("genres", "Genres (multi)", "Identification"),
-    ("year", "Année", "Identification"),
+    (
+        "album_artist",
+        "Artiste de l'album",
+        "Identification",
+        "both",
+    ),
+    ("sort_artist", "Tri artiste", "Identification", "both"),
+    ("sort_album", "Tri album", "Identification", "album"),
+    ("disc_number", "N° disque", "Identification", "track"),
+    (
+        "disc_subtitle",
+        "Sous-titre disque",
+        "Identification",
+        "track",
+    ),
+    ("track_number", "N° piste", "Identification", "track"),
+    ("genre", "Genre", "Identification", "both"),
+    ("genres", "Genres (multi)", "Identification", "both"),
+    ("year", "Année", "Identification", "both"),
     // Crédits
-    ("composer", "Compositeur", "Crédits"),
-    ("conductor", "Chef d'orchestre", "Crédits"),
-    ("lyricist", "Parolier", "Crédits"),
-    ("performer", "Interprète", "Crédits"),
-    ("remixer", "Remixeur", "Crédits"),
-    ("label", "Label", "Crédits"),
-    ("producer", "Producteur", "Crédits"),
+    ("composer", "Compositeur", "Crédits", "both"),
+    ("conductor", "Chef d'orchestre", "Crédits", "both"),
+    ("lyricist", "Parolier", "Crédits", "both"),
+    ("performer", "Interprète", "Crédits", "both"),
+    ("remixer", "Remixeur", "Crédits", "both"),
+    ("label", "Label", "Crédits", "both"),
+    ("producer", "Producteur", "Crédits", "both"),
     // Classification
-    ("bpm", "BPM", "Classification"),
-    ("mood", "Ambiance", "Classification"),
-    ("grouping", "Regroupement", "Classification"),
-    ("compilation", "Compilation", "Classification"),
+    ("bpm", "BPM", "Classification", "track"),
+    ("mood", "Ambiance", "Classification", "both"),
+    ("grouping", "Regroupement", "Classification", "both"),
+    ("compilation", "Compilation", "Classification", "album"),
     // Texte
-    ("comment", "Commentaire", "Texte"),
-    ("lyrics", "Paroles", "Texte"),
+    ("comment", "Commentaire", "Texte", "both"),
+    ("lyrics", "Paroles", "Texte", "track"),
     // Identifiants
-    ("isrc", "ISRC", "Identifiants"),
-    ("barcode", "Code-barres", "Identifiants"),
-    ("catalog_number", "Réf. catalogue", "Identifiants"),
-    ("media_type", "Support", "Identifiants"),
+    ("isrc", "ISRC", "Identifiants", "track"),
+    ("barcode", "Code-barres", "Identifiants", "album"),
+    ("catalog_number", "Réf. catalogue", "Identifiants", "album"),
+    ("media_type", "Support", "Identifiants", "album"),
     (
         "musicbrainz_recording_id",
         "MusicBrainz Recording ID",
         "Identifiants",
+        "track",
     ),
     (
         "musicbrainz_release_id",
         "MusicBrainz Release ID",
         "Identifiants",
+        "album",
     ),
     (
         "musicbrainz_release_group_id",
         "MusicBrainz Release Group ID",
         "Identifiants",
+        "album",
     ),
     (
         "mb_release_track_id",
         "MusicBrainz Release Track ID",
         "Identifiants",
+        "track",
     ),
-    ("release_country", "Pays de sortie", "Identifiants"),
+    ("release_country", "Pays de sortie", "Identifiants", "album"),
     // Dates
-    ("release_date", "Date de sortie", "Dates"),
-    ("original_date", "Date originale", "Dates"),
-    ("original_year", "Année originale", "Dates"),
+    ("release_date", "Date de sortie", "Dates", "album"),
+    ("original_date", "Date originale", "Dates", "album"),
+    ("original_year", "Année originale", "Dates", "album"),
     // Technique
-    ("format", "Format audio", "Technique"),
-    ("sample_rate", "Fréquence d'échantillonnage", "Technique"),
-    ("bit_depth", "Profondeur de bits", "Technique"),
-    ("channels", "Canaux", "Technique"),
-    ("duration_ms", "Durée", "Technique"),
-    ("file_size", "Taille du fichier", "Technique"),
-    ("file_path", "Chemin du fichier", "Technique"),
-    ("encoder", "Encodeur", "Technique"),
-    ("encoder_software", "Logiciel d'encodage", "Technique"),
-    ("source_media", "Support (MEDIA)", "Technique"),
-    ("copyright", "Copyright", "Technique"),
-    ("language", "Langue", "Technique"),
+    ("format", "Format audio", "Technique", "track"),
+    (
+        "sample_rate",
+        "Fréquence d'échantillonnage",
+        "Technique",
+        "track",
+    ),
+    ("bit_depth", "Profondeur de bits", "Technique", "track"),
+    ("channels", "Canaux", "Technique", "track"),
+    ("duration_ms", "Durée", "Technique", "track"),
+    ("file_size", "Taille du fichier", "Technique", "track"),
+    ("file_path", "Chemin du fichier", "Technique", "track"),
+    ("encoder", "Encodeur", "Technique", "track"),
+    (
+        "encoder_software",
+        "Logiciel d'encodage",
+        "Technique",
+        "track",
+    ),
+    ("source_media", "Support (MEDIA)", "Technique", "track"),
+    ("copyright", "Copyright", "Technique", "both"),
+    ("language", "Langue", "Technique", "both"),
     // ReplayGain
-    ("rg_track_gain", "ReplayGain piste", "ReplayGain"),
-    ("rg_album_gain", "ReplayGain album", "ReplayGain"),
+    ("rg_track_gain", "ReplayGain piste", "ReplayGain", "track"),
+    ("rg_album_gain", "ReplayGain album", "ReplayGain", "album"),
 ];
 
 const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
@@ -850,12 +878,13 @@ pub(super) async fn get_metadata_fields(
 
     // Group fields by category (stable French key), preserving catalog order.
     let mut categories: Vec<(&str, Vec<Value>)> = Vec::new();
-    for &(key, _label, category) in METADATA_FIELDS {
+    for &(key, _label, category, scope) in METADATA_FIELDS {
         let enabled = enabled_keys.iter().any(|k| k == key);
         let field = json!({
             "key": key,
             "label": crate::i18n::t(&lang, &format!("metafield.{key}")),
             "enabled": enabled,
+            "scope": scope,
         });
 
         if let Some(cat) = categories.iter_mut().find(|(name, _)| *name == category) {
@@ -893,8 +922,8 @@ pub(super) async fn set_metadata_fields(
         .filter_map(|k| {
             METADATA_FIELDS
                 .iter()
-                .find(|(key, _, _)| *key == k.as_str())
-                .map(|(key, _, _)| *key)
+                .find(|(key, _, _, _)| *key == k.as_str())
+                .map(|(key, _, _, _)| *key)
         })
         .collect();
     let json_val = serde_json::to_string(&valid_keys).unwrap_or_else(|_| "[]".into());
