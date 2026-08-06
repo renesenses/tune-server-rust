@@ -807,6 +807,23 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
         name: "add_queue_item_track_disc_number",
         up: "", // Applied programmatically via add_column_if_missing (idempotent).
     },
+    // The seeded "🖼️ Sans pochette" collection carried a placeholder rule
+    // (`format is_not_empty` — i.e. every track in the library) instead of an
+    // actual no-cover test; the rule engine supports `cover_path is_empty`, so
+    // point the seed at it. Guarded on the exact placeholder rules string so a
+    // user-customized collection is never touched; idempotent by the same
+    // guard. Fresh installs seed the placeholder in migration 41 and correct it
+    // here in the same run.
+    Migration {
+        version: 66,
+        name: "fix_sans_pochette_rule",
+        up: "
+UPDATE smart_collections
+SET rules = '[{\"field\":\"cover_path\",\"operator\":\"is_empty\",\"value\":\"\"}]'
+WHERE name LIKE '%pochette%'
+  AND rules = '[{\"field\":\"format\",\"operator\":\"is_not_empty\",\"value\":\"\"}]';
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1637,6 +1654,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         16,
         "alarms_profile_id",
         include_str!("../../migrations/postgres/016_alarms_profile_id.sql"),
+    ),
+    (
+        17,
+        "fix_sans_pochette_rule",
+        include_str!("../../migrations/postgres/017_fix_sans_pochette_rule.sql"),
     ),
 ];
 

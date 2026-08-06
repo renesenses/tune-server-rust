@@ -316,15 +316,29 @@ async fn delete_collection(
 }
 
 fn resolve_timestamp_sql(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix("now-") {
-        let days: i64 = rest.trim_end_matches('d').parse().unwrap_or(30);
+    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
+    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
+    // through to a literal string ('90d') that no date ever compares against.
+    let rest = input.strip_prefix("now-").unwrap_or(input);
+    let digits = rest.strip_suffix('d').unwrap_or(rest);
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        let days: i64 = digits.parse().unwrap_or(30);
         return format!("DATETIME('now', '-{days} days')");
     }
     format!("'{}'", input.replace('\'', "''"))
 }
 
 /// Build WHERE, ORDER, LIMIT clauses from smart collection criteria (album-level).
-fn build_album_query(
+///
+/// This is THE smart-collection rule engine: the list/albums/preview endpoints,
+/// the Oxygen `collection` facet and `/library/tracks?collection=` all go
+/// through it, so a collection always counts and filters the same set
+/// everywhere. (The legacy `SmartCollection::compile_sql` in tune-core diverged
+/// — raw `any` match_mode read as ALL, `added_at`/`rating`/`play_count` hit
+/// phantom `tracks` columns, unknown fields fell back to `t.title` — which made
+/// whole collections vanish from the facet or count the entire library.)
+/// The WHERE references aliases `al` (albums), `ar` (artists), `t` (tracks).
+pub(crate) fn build_album_query(
     rules_json: &str,
     match_mode: &str,
     sort_by: &str,
@@ -348,6 +362,9 @@ fn build_album_query(
             ">" | "gt" => ">",
             "<=" | "lte" | "less_than" | "less_equal" => "<=",
             "<" | "lt" => "<",
+            // tune-core seed/editor spelling — same semantics as is_null.
+            "is_empty" | "empty" => "is_null",
+            "is_not_empty" | "not_empty" => "is_not_null",
             other => other,
         };
         let value_raw = rule.get("value");
@@ -410,14 +427,18 @@ fn build_album_query(
         // --- added_at / last_played_at use timestamp logic ---
         if field == "added_at" {
             let ts = resolve_timestamp_sql(&value);
+            // NB: "greater_than"/"less_than" normalize to ">="/"<=" above, so
+            // both spellings must be matched here — the seeded "🆕 Récents"
+            // (added_at greater_than 90d) used to fall through `_ => continue`,
+            // dropping its only rule and matching the ENTIRE library.
             let cond = match op {
-                ">" => format!(
+                ">" | ">=" => format!(
                     "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') > {ts})"
+                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
                 ),
-                "<" => format!(
+                "<" | "<=" => format!(
                     "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') < {ts})"
+                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
                 ),
                 "between" => {
                     if let Some(arr) = value_raw.and_then(|v| v.as_array()) {
@@ -466,20 +487,20 @@ fn build_album_query(
                      JOIN listen_history lh ON lh.track_id = t3.id \
                      GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
                 ),
-                ("last_played_at", ">") => {
+                ("last_played_at", ">" | ">=") => {
                     let ts = resolve_timestamp_sql(&value);
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
                          JOIN listen_history lh ON lh.track_id = t3.id \
-                         WHERE lh.listened_at > {ts} GROUP BY t3.album_id)"
+                         WHERE lh.listened_at {op} {ts} GROUP BY t3.album_id)"
                     )
                 }
-                ("last_played_at", "<") => {
+                ("last_played_at", "<" | "<=") => {
                     let ts = resolve_timestamp_sql(&value);
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
                          JOIN listen_history lh ON lh.track_id = t3.id \
-                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) < {ts})"
+                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
                     )
                 }
                 ("last_played_at", "is_null") => format!(
@@ -733,7 +754,73 @@ async fn preview_albums(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_sort_order;
+    use super::{build_album_query, normalize_sort_order, resolve_timestamp_sql};
+
+    #[test]
+    fn resolve_timestamp_relative_forms() {
+        // "now-Nd" (editor form) and bare "Nd" (seeded "🆕 Récents") are both
+        // N-days-ago; anything else stays a quoted literal.
+        assert_eq!(
+            resolve_timestamp_sql("now-30d"),
+            "DATETIME('now', '-30 days')"
+        );
+        assert_eq!(resolve_timestamp_sql("90d"), "DATETIME('now', '-90 days')");
+        assert_eq!(resolve_timestamp_sql("90"), "DATETIME('now', '-90 days')");
+        assert_eq!(resolve_timestamp_sql("2024-01-01"), "'2024-01-01'");
+    }
+
+    #[test]
+    fn added_at_greater_than_compiles_instead_of_matching_everything() {
+        // Seeded "🆕 Récents": greater_than normalizes to ">=", which the
+        // added_at branch used to drop entirely — empty WHERE — so the
+        // collection counted the ENTIRE library.
+        let rules = r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None);
+        assert!(
+            where_clause.contains("DATETIME('now', '-90 days')"),
+            "added_at rule must compile: {where_clause}"
+        );
+        assert!(where_clause.contains(">="));
+    }
+
+    #[test]
+    fn is_not_empty_alias_compiles() {
+        // tune-core spelling ("is_not_empty") used to be dropped — the seeded
+        // "🖼️ Sans pochette" placeholder rule then matched the whole library.
+        let rules = r#"[{"field":"cover_path","operator":"is_empty","value":""}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None);
+        assert!(
+            where_clause.contains("al.cover_path IS NULL"),
+            "is_empty alias must compile: {where_clause}"
+        );
+
+        let rules = r#"[{"field":"format","operator":"is_not_empty","value":""}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None);
+        assert!(where_clause.contains("t.format IS NOT NULL"));
+    }
+
+    #[test]
+    fn any_mode_joins_with_or() {
+        // Raw 'any' from the seed rows (unquoted in DB) must keep OR semantics;
+        // the legacy tune-core engine silently fell back to ALL.
+        let rules = r#"[{"field":"genre","operator":"contains","value":"soul"},
+                        {"field":"genre","operator":"contains","value":"funk"}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "any", "title", "asc", None);
+        assert!(where_clause.contains(" OR "), "{where_clause}");
+        assert!(!where_clause.contains(" AND "));
+    }
+
+    #[test]
+    fn artist_name_field_compiles() {
+        // Web-editor rules use field "artist_name" and op "=" (Coltrane); the
+        // legacy engine fell back to t.title and matched nothing.
+        let rules = r#"[{"field":"artist_name","op":"=","value":"John Coltrane"}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "random", "desc", None);
+        assert!(
+            where_clause.contains("LOWER(ar.name) = LOWER('John Coltrane')"),
+            "{where_clause}"
+        );
+    }
 
     #[test]
     fn normalize_sort_order_tolerates_encodings() {
