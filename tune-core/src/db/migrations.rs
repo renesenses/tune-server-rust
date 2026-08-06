@@ -836,6 +836,19 @@ WHERE name LIKE '%pochette%'
   AND rules = '[{\"field\":\"format\",\"operator\":\"is_not_empty\",\"value\":\"\"}]';
 ",
     },
+    Migration {
+        version: 68,
+        name: "add_album_metadata_table",
+        up: "
+CREATE TABLE IF NOT EXISTS album_metadata (
+    album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (album_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1684,6 +1697,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         18,
         "fix_sans_pochette_rule",
         include_str!("../../migrations/postgres/018_fix_sans_pochette_rule.sql"),
+    ),
+    (
+        19,
+        "album_metadata",
+        include_str!("../../migrations/postgres/019_album_metadata.sql"),
     ),
 ];
 

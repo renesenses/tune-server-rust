@@ -14,7 +14,7 @@ mod ratings;
 mod search;
 mod stats;
 mod tracks;
-mod write_tags;
+pub(crate) mod write_tags;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -186,9 +186,18 @@ pub fn router() -> Router<AppState> {
             get(albums::get_album).put(albums::update_album),
         )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
+        .route(
+            "/albums/{id}/metadata",
+            get(albums::album_metadata_get).put(albums::album_metadata_put),
+        )
         .route("/tracks", get(tracks::list_tracks))
         .route("/tracks/count", get(tracks::track_count))
-        .route("/tracks/{id}", get(tracks::get_track))
+        // PUT mirrors POST /metadata/tracks/{id}/edit so track editing lives on
+        // the same REST family as albums/artists (PUT /library/…/{id}).
+        .route(
+            "/tracks/{id}",
+            get(tracks::get_track).put(crate::routes::metadata::edit_track),
+        )
         .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))

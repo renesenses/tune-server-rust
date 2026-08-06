@@ -1,3 +1,4 @@
+pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
