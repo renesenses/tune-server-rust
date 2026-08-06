@@ -328,14 +328,21 @@ pub(super) async fn artist_image_report(
     body: Option<Json<ImageReportBody>>,
 ) -> impl IntoResponse {
     let reason = body.and_then(|Json(b)| b.reason);
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("reported_artist_image_{id}");
-    let val = json!({
-        "artist_id": id,
-        "reason": reason,
-        "reported_at": now_iso_utc(),
-    });
-    settings.set(&key, &val.to_string()).ok();
+    // Recorded in metadata_reports like every other report. It used to be
+    // stashed as a settings key (reported_artist_image_{id}), which no code
+    // could list or aggregate and which never reached the community backend.
+    tune_core::db::metadata_report_repo::MetadataReportRepo::with_backend(state.backend.clone())
+        .insert(
+            "artist_image",
+            Some(id),
+            None,
+            None,
+            None,
+            reason.as_deref().unwrap_or("incorrect_image"),
+            None,
+            &now_iso_utc(),
+        )
+        .ok();
     // Also remove the wrong image locally so the artist shows a placeholder and
     // a fresh image is re-fetched on the next enrichment (Jean Valjean #1096:
     // "supprimer les images incorrectes en appuyant sur le drapeau").

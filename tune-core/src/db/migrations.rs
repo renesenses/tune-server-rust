@@ -849,6 +849,28 @@ CREATE TABLE IF NOT EXISTS album_metadata (
 CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
 ",
     },
+    // Signalements de métadonnées : jusqu'ici le seul report (image artiste)
+    // squattait la table settings (clé reported_artist_image_{id}) — aucune
+    // liste, aucune agrégation, aucun envoi cloud possible.
+    Migration {
+        version: 69,
+        name: "add_metadata_reports_table",
+        up: "
+CREATE TABLE IF NOT EXISTS metadata_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity TEXT NOT NULL,
+    entity_id INTEGER,
+    mbid TEXT,
+    field TEXT,
+    value TEXT,
+    reason TEXT NOT NULL,
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    pushed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_metadata_reports_entity ON metadata_reports(entity, entity_id);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1702,6 +1724,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         19,
         "album_metadata",
         include_str!("../../migrations/postgres/019_album_metadata.sql"),
+    ),
+    (
+        20,
+        "metadata_reports",
+        include_str!("../../migrations/postgres/020_metadata_reports.sql"),
     ),
 ];
 
