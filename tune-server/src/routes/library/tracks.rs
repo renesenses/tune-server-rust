@@ -427,33 +427,11 @@ pub(super) async fn track_lyrics(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    fn no_lyrics() -> axum::response::Response {
-        (StatusCode::NOT_FOUND, Json(json!({"error": "no_lyrics"}))).into_response()
-    }
-
-    fn synced_response(
-        source: &str,
-        lines: &[tune_core::metadata::lyrics::LrcLine],
-    ) -> axum::response::Response {
-        let out: Vec<Value> = lines
-            .iter()
-            .map(|l| json!({"t_ms": l.time_ms, "text": l.text}))
-            .collect();
-        Json(json!({"synced": true, "source": source, "lines": out})).into_response()
-    }
-
-    fn plain_response(source: &str, text: &str) -> Option<axum::response::Response> {
-        let out: Vec<Value> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(|l| json!({"t_ms": Value::Null, "text": l}))
-            .collect();
-        if out.is_empty() {
-            return None;
-        }
-        Some(Json(json!({"synced": false, "source": source, "lines": out})).into_response())
-    }
+    // Réponses partagées avec GET /lyrics/by-meta (même contrat JSON).
+    use crate::routes::lyrics::{
+        no_lyrics_response as no_lyrics, plain_lines_response as plain_response,
+        synced_lines_response as synced_response,
+    };
 
     let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {

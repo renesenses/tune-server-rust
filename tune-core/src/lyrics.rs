@@ -181,6 +181,42 @@ pub async fn fetch_from_lrclib(
 }
 
 // ---------------------------------------------------------------------------
+// Cache key for metadata-only lookups (radio: title+artist, no track id)
+// ---------------------------------------------------------------------------
+
+/// Normalise un champ de métadonnée (titre ou artiste) pour la clé de cache :
+/// minuscules + espaces internes réduits à un seul + trim. Deux variantes ICY
+/// du même morceau (« Miles Davis » / « miles  davis ») partagent ainsi la
+/// même entrée `lyrics_cache`.
+pub fn normalize_meta(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Identifiant synthétique de cache pour une paire titre+artiste normalisée.
+///
+/// `lyrics_cache` est clé par `track_id` (PK, sans FK) ; les pistes de la
+/// bibliothèque ont des ids AUTOINCREMENT strictement positifs. Les paroles
+/// « radio » (pas de piste) sont donc rangées sous un id **négatif** dérivé
+/// d'un FNV-1a 64 bits de `artist\u{1f}title` normalisés — aucune migration,
+/// aucune collision possible avec une vraie piste.
+pub fn meta_cache_id(title: &str, artist: &str) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let key = format!("{}\u{1f}{}", normalize_meta(artist), normalize_meta(title));
+    let mut hash = FNV_OFFSET;
+    for b in key.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // Borne sur 63 bits puis négation ; 0 est réservé (« pas d'id »).
+    let positive = (hash & 0x7fff_ffff_ffff_ffff) as i64;
+    if positive == 0 { -1 } else { -positive }
+}
+
+// ---------------------------------------------------------------------------
 // Cache layer (`lyrics_cache` table — exists in both SQLite and Postgres)
 // ---------------------------------------------------------------------------
 
@@ -409,6 +445,26 @@ mod tests {
         let lines = parse_lrc(lrc);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].time_ms, 3_500);
+    }
+
+    #[test]
+    fn normalize_meta_case_and_whitespace() {
+        assert_eq!(normalize_meta("  Miles   DAVIS "), "miles davis");
+        assert_eq!(normalize_meta("So\tWhat"), "so what");
+        assert_eq!(normalize_meta(""), "");
+    }
+
+    #[test]
+    fn meta_cache_id_stable_and_negative() {
+        let a = meta_cache_id("So What", "Miles Davis");
+        // Négatif : ne peut jamais entrer en collision avec un track_id réel.
+        assert!(a < 0);
+        // Stable et insensible à la casse / aux espaces multiples.
+        assert_eq!(a, meta_cache_id("so  what", "MILES  DAVIS"));
+        // Titre et artiste ne sont pas interchangeables.
+        assert_ne!(a, meta_cache_id("Miles Davis", "So What"));
+        // Une autre paire donne une autre clé.
+        assert_ne!(a, meta_cache_id("Blue in Green", "Miles Davis"));
     }
 
     #[test]

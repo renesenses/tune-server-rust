@@ -477,6 +477,22 @@ pub async fn create_zone_handler(
 }
 
 /// Public wrapper for use from ws.rs snapshot builder.
+/// Complète le JSON `current_track` d'une zone avec l'ancrage temporel de
+/// métadonnée : `metadata_changed_at` (epoch ms, horloge serveur) et
+/// `metadata_age_ms` (âge calculé côté serveur — le client s'ancre dessus
+/// sans dépendre de la synchronisation de son horloge). Utilisé par les
+/// paroles des pistes radio pour caler les lignes sur le début du morceau
+/// détecté dans le flux.
+pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, ps: &ZoneState) {
+    let (Some(ts), Some(age)) = (ps.metadata_changed_at_ms, ps.metadata_age_ms()) else {
+        return;
+    };
+    if let Some(track) = obj.get_mut("current_track").and_then(|v| v.as_object_mut()) {
+        track.insert("metadata_changed_at".into(), json!(ts));
+        track.insert("metadata_age_ms".into(), json!(age));
+    }
+}
+
 pub fn build_signal_path_pub(
     ps: &ZoneState,
     zone: &Zone,
@@ -985,6 +1001,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 }),
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
+            inject_metadata_anchor(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
             obj.insert(
@@ -1102,6 +1119,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     }),
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
+                inject_metadata_anchor(obj, &ps);
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 // Expose the queue index too so the client can refresh the
