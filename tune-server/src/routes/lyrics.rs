@@ -56,22 +56,33 @@ pub(crate) fn plain_lines_response(source: &str, text: &str) -> Option<axum::res
 struct ByMetaParams {
     title: String,
     artist: String,
+    /// Album — améliore le matching LRCLIB (pistes streaming Qobuz/Tidal).
+    album: Option<String>,
+    /// Durée en secondes — LRCLIB s'en sert pour départager les versions ;
+    /// précieux pour une piste streaming, absent/0 pour une radio.
+    duration: Option<i64>,
 }
 
-/// GET /lyrics/by-meta?title=X&artist=Y — paroles par métadonnées seules.
+/// GET /lyrics/by-meta?title=X&artist=Y[&album=Z][&duration=N]
 ///
-/// Pensé pour les pistes **radio** : le flux fournit titre + artiste mais il
-/// n'existe aucune piste en bibliothèque (pas de track id, pas de fichier,
-/// donc ni sidecar .lrc ni tag embarqué — LRCLIB uniquement). Même contrat que
-/// `GET /library/tracks/{id}/lyrics` :
+/// Paroles par **métadonnées seules**, pour les pistes sans id de
+/// bibliothèque : radios (le flux fournit titre + artiste) ET pistes
+/// **streaming** Qobuz/Tidal (`current_track.id` est nul — l'endpoint
+/// `/library/tracks/{id}/lyrics` ne peut rien pour elles). Pas de fichier,
+/// donc ni sidecar .lrc ni tag embarqué : LRCLIB uniquement.
+///
+/// `album` et `duration` sont optionnels et servent uniquement à affiner le
+/// match LRCLIB (une piste streaming les fournit ; une radio non). Même
+/// contrat que `GET /library/tracks/{id}/lyrics` :
 /// - 200 : `{"synced": bool, "source": "lrclib", "lines": [{"t_ms","text"}]}`
 /// - 404 : `{"error": "no_lyrics"}`
 ///
 /// Opt-in par le réglage `lyrics_lrclib_enabled` (même clé que les pistes
 /// locales) ; cache `lyrics_cache` sous un id synthétique négatif dérivé de
-/// titre+artiste normalisés (`tune_core::lyrics::meta_cache_id`), négatifs
-/// re-tentés après 14 jours. Jamais de 500 : un échec LRCLIB dégrade en 404
-/// propre (rien n'est mis en cache, la prochaine requête retente).
+/// titre+artiste normalisés (`tune_core::lyrics::meta_cache_id`) — les paroles
+/// d'un même titre+artiste sont identiques quel que soit l'album, donc l'album
+/// n'entre pas dans la clé. Négatifs re-tentés après 14 jours. Jamais de 500 :
+/// un échec LRCLIB dégrade en 404 propre (rien mis en cache → retente).
 async fn lyrics_by_meta(
     State(state): State<AppState>,
     Query(params): Query<ByMetaParams>,
@@ -81,6 +92,12 @@ async fn lyrics_by_meta(
     if title.is_empty() || artist.is_empty() {
         return no_lyrics_response();
     }
+    let album = params
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let duration = params.duration.filter(|d| *d > 0);
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let lrclib_enabled = settings
@@ -121,8 +138,11 @@ async fn lyrics_by_meta(
         }
     }
 
-    // Radio : pas d'album ni de durée fiables — LRCLIB matche sur titre+artiste.
-    match tune_core::lyrics::fetch_lrclib_raw(&state.http_client, artist, title, None, None).await {
+    // Radio : ni album ni durée (None) → match titre+artiste. Streaming :
+    // album + durée affinent le résultat (versions multiples départagées).
+    match tune_core::lyrics::fetch_lrclib_raw(&state.http_client, artist, title, album, duration)
+        .await
+    {
         Ok(raw) => {
             let raw = raw.unwrap_or_default();
             // Hits ET miss sont mis en cache (miss re-tentés après 14 jours).
