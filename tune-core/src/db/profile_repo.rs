@@ -198,6 +198,12 @@ impl ProfileRepo {
         let (pid, iid) = (profile_id.to_string(), item_id.to_string());
         let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
         self.db.execute(&sql, &params)?;
+        // Fige l'identité (titre/artiste/chemin) au moment de l'ajout, pour
+        // re-rattacher le favori si un rescan renouvelle les rowids (racines
+        // music déplacées, library clear — bug .18). Non-fatal : le favori
+        // reste acquis même si l'instantané échoue.
+        super::favorites_reconcile::FavoritesReconciler::with_backend(self.db.clone())
+            .snapshot_item(item_type, item_id);
         Ok(())
     }
 
