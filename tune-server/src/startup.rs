@@ -553,12 +553,58 @@ pub async fn register_local_outputs(state: &AppState) {
     let audio_backend_owned =
         db_backend.unwrap_or_else(|| state.config.local_audio_backend.clone());
     let audio_backend = &audio_backend_owned;
-    let mut devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
-    // When ASIO is selected but returns no devices, also enumerate WASAPI
-    // so the user still has fallback outputs available.
-    if devices.is_empty() && audio_backend.to_lowercase() == "asio" {
+
+    // Enumerate output devices OFF the async runtime and under a hard timeout.
+    //
+    // Enumerating ASIO opens each driver to read its formats, and an ASIO driver
+    // can only be opened by ONE process at a time: if another app (JRiver, foobar,
+    // a DSD ASIO proxy…) already holds it, the open BLOCKS — potentially forever.
+    // This call sits on the critical boot path *before* the HTTP listener starts
+    // serving, so a blocked ASIO probe used to wedge the whole server: the port was
+    // bound but nothing accepted connections → completely blank web UI (JP
+    // Borderies, Denafrips USB DAC in ASIO with JRiver open). Running it in
+    // `spawn_blocking` under a timeout guarantees the web UI always comes up; if the
+    // scan does not respond we start WITHOUT local zones for this boot rather than
+    // hang. The device becomes usable again once its driver is free (close the other
+    // app) and Tune is relaunched.
+    async fn scan_devices(backend: String) -> Option<Vec<tune_core::outputs::local::AudioDevice>> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || {
+                tune_core::outputs::local::list_audio_devices_with_backend(&backend)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(devices)) => Some(devices),
+            Ok(Err(_)) => {
+                warn!("local_audio_enumeration_panicked — starting without local zones this boot");
+                None
+            }
+            Err(_) => {
+                warn!(
+                    "local_audio_enumeration_timeout — an audio driver (most likely an ASIO device \
+                     held by another application such as JRiver) did not respond within 8s. Starting \
+                     the server WITHOUT local zones so the web UI stays available; close the other app \
+                     and relaunch Tune to use the device."
+                );
+                None
+            }
+        }
+    }
+
+    // `None` means the scan timed out or panicked. When that happens we do NOT
+    // attempt the WASAPI fallback: a hung ASIO probe still holds the internal scan
+    // lock, so a second enumeration would only block (and time out) again — better
+    // to bring the UI up now and let the next relaunch (with the driver free) pick
+    // the device up.
+    let scan = scan_devices(audio_backend_owned.clone()).await;
+    let mut devices = scan.clone().unwrap_or_default();
+    // When ASIO is selected AND the host actually responded but exposed no devices,
+    // also enumerate WASAPI so the user still has fallback outputs available.
+    if devices.is_empty() && scan.is_some() && audio_backend.eq_ignore_ascii_case("asio") {
         warn!("asio_returned_no_devices — also enumerating WASAPI as fallback");
-        devices = tune_core::outputs::local::list_audio_devices_with_backend("wasapi");
+        devices = scan_devices("wasapi".to_string()).await.unwrap_or_default();
     }
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
