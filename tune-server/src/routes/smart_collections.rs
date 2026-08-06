@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
+use crate::routes::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -94,7 +96,10 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     })
 }
 
-async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn list_collections(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+) -> Result<Json<Value>, AppError> {
     let rows = state
         .backend
         .query_many(
@@ -105,6 +110,8 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
         )
         .map_err(AppError::internal)?;
 
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -125,7 +132,7 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
             let sort_by = col["sort_by"].as_str().unwrap_or("title");
             let sort_order = col["sort_order"].as_str().unwrap_or("asc");
             let (where_clause, _order, _limit) =
-                build_album_query(&rules_str, match_mode, sort_by, sort_order, None);
+                build_album_query(&rules_str, match_mode, sort_by, sort_order, None, &ctx);
 
             let album_count_sql = format!(
                 "SELECT COUNT(DISTINCT al.id) FROM albums al \
@@ -167,6 +174,17 @@ async fn create_collection(
     let match_mode = body.match_mode.clone().unwrap_or_else(|| "all".into());
     let sort_by = body.sort_by.clone();
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
+
+    // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
+    let resolver = DbRefResolver::new(&state);
+    smart_refs::check_no_cycle(
+        &resolver,
+        RefKind::SmartCollection,
+        None,
+        &body.name,
+        &rules_json,
+    )
+    .map_err(AppError::bad_request)?;
 
     let id = state
         .backend
@@ -228,6 +246,27 @@ async fn update_collection(
     Path(id): Path<i64>,
     Json(body): Json<UpdateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Refuse les références circulaires avant d'écrire quoi que ce soit.
+    if let Some(ref rules) = body.rules {
+        let self_name = body
+            .name
+            .clone()
+            .or_else(|| {
+                DbRefResolver::new(&state)
+                    .smart_entity(RefKind::SmartCollection, id)
+                    .map(|e| e.name)
+            })
+            .unwrap_or_else(|| format!("#{id}"));
+        let resolver = DbRefResolver::new(&state);
+        smart_refs::check_no_cycle(
+            &resolver,
+            RefKind::SmartCollection,
+            Some(id),
+            &self_name,
+            &rules.to_string(),
+        )
+        .map_err(AppError::bad_request)?;
+    }
     if let Some(ref name) = body.name {
         state.backend.execute(
             "UPDATE smart_collections SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
@@ -344,6 +383,7 @@ pub(crate) fn build_album_query(
     sort_by: &str,
     sort_order: &str,
     max_limit: Option<i64>,
+    ctx: &RefCtx,
 ) -> (String, String, String) {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
 
@@ -376,6 +416,12 @@ pub(crate) fn build_album_query(
             })
             .unwrap_or_default();
         let esc = value.replace('\'', "''");
+
+        // --- règles « référence » (collection / playlist / favori) ---
+        if smart_refs::is_ref_field(field) {
+            conditions.push(smart_refs::album_ref_condition(field, op, &value, ctx));
+            continue;
+        }
 
         // --- credit rules use a subquery, handle separately ---
         if field == "credit" {
@@ -715,6 +761,7 @@ fn load_collection_criteria(
 
 async fn resolve_albums(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
@@ -723,8 +770,16 @@ async fn resolve_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let (where_clause, order, limit_clause) =
-        build_album_query(&rules_json, &match_mode, &sort_by, &sort_order, max_limit);
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let (where_clause, order, limit_clause) = build_album_query(
+        &rules_json,
+        &match_mode,
+        &sort_by,
+        &sort_order,
+        max_limit,
+        &ctx,
+    );
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
 
     // Return a bare array, matching the regular collections endpoint
@@ -738,6 +793,7 @@ async fn resolve_albums(
 
 async fn preview_albums(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
     let rules_json = body.rules.to_string();
@@ -745,8 +801,16 @@ async fn preview_albums(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let (where_clause, order, limit_clause) =
-        build_album_query(&rules_json, match_mode, sort_by, sort_order, body.max_limit);
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let (where_clause, order, limit_clause) = build_album_query(
+        &rules_json,
+        match_mode,
+        sort_by,
+        sort_order,
+        body.max_limit,
+        &ctx,
+    );
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
@@ -755,6 +819,7 @@ async fn preview_albums(
 #[cfg(test)]
 mod tests {
     use super::{build_album_query, normalize_sort_order, resolve_timestamp_sql};
+    use crate::routes::smart_refs::{EmptyResolver, RefCtx};
 
     #[test]
     fn resolve_timestamp_relative_forms() {
@@ -774,8 +839,9 @@ mod tests {
         // Seeded "🆕 Récents": greater_than normalizes to ">=", which the
         // added_at branch used to drop entirely — empty WHERE — so the
         // collection counted the ENTIRE library.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let rules = r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#;
-        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None);
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
         assert!(
             where_clause.contains("DATETIME('now', '-90 days')"),
             "added_at rule must compile: {where_clause}"
@@ -787,15 +853,16 @@ mod tests {
     fn is_not_empty_alias_compiles() {
         // tune-core spelling ("is_not_empty") used to be dropped — the seeded
         // "🖼️ Sans pochette" placeholder rule then matched the whole library.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let rules = r#"[{"field":"cover_path","operator":"is_empty","value":""}]"#;
-        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None);
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
         assert!(
             where_clause.contains("al.cover_path IS NULL"),
             "is_empty alias must compile: {where_clause}"
         );
 
         let rules = r#"[{"field":"format","operator":"is_not_empty","value":""}]"#;
-        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None);
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
         assert!(where_clause.contains("t.format IS NOT NULL"));
     }
 
@@ -803,9 +870,10 @@ mod tests {
     fn any_mode_joins_with_or() {
         // Raw 'any' from the seed rows (unquoted in DB) must keep OR semantics;
         // the legacy tune-core engine silently fell back to ALL.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let rules = r#"[{"field":"genre","operator":"contains","value":"soul"},
                         {"field":"genre","operator":"contains","value":"funk"}]"#;
-        let (where_clause, _, _) = build_album_query(rules, "any", "title", "asc", None);
+        let (where_clause, _, _) = build_album_query(rules, "any", "title", "asc", None, &ctx);
         assert!(where_clause.contains(" OR "), "{where_clause}");
         assert!(!where_clause.contains(" AND "));
     }
@@ -814,12 +882,44 @@ mod tests {
     fn artist_name_field_compiles() {
         // Web-editor rules use field "artist_name" and op "=" (Coltrane); the
         // legacy engine fell back to t.title and matched nothing.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let rules = r#"[{"field":"artist_name","op":"=","value":"John Coltrane"}]"#;
-        let (where_clause, _, _) = build_album_query(rules, "all", "random", "desc", None);
+        let (where_clause, _, _) = build_album_query(rules, "all", "random", "desc", None, &ctx);
         assert!(
             where_clause.contains("LOWER(ar.name) = LOWER('John Coltrane')"),
             "{where_clause}"
         );
+    }
+
+    #[test]
+    fn favorite_rule_flows_into_album_where_clause() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(2));
+        let (w, _o, _l) = build_album_query(
+            r#"[{"field":"favorite","op":"is","value":"album"}]"#,
+            "all",
+            "title",
+            "asc",
+            None,
+            &ctx,
+        );
+        assert!(w.contains("favorites"), "{w}");
+        assert!(w.contains("profile_id = 2"), "{w}");
+    }
+
+    #[test]
+    fn ref_rule_combines_with_classic_rule() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let (w, _o, _l) = build_album_query(
+            r#"[{"field":"genre","op":"contains","value":"Jazz"},
+                {"field":"in_playlist","op":"in","value":"classic:4"}]"#,
+            "all",
+            "title",
+            "asc",
+            None,
+            &ctx,
+        );
+        assert!(w.contains(" AND "), "{w}");
+        assert!(w.contains("playlist_tracks"), "{w}");
     }
 
     #[test]
