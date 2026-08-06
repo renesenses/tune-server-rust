@@ -486,12 +486,12 @@ pub(super) async fn update_install(
             // *lacked* it) and "postgresql://" is nowhere in the code — so every
             // update on a PG server (.15) was wrongly blocked while a non-PG
             // binary would have passed. Keep this marker a PG-ONLY literal.
-            let new_has_pg = std::fs::read(&new_binary)
-                .map(|bytes| {
-                    let s = String::from_utf8_lossy(&bytes);
-                    s.contains("postgres_backend_ready")
-                })
-                .unwrap_or(false);
+            // Scan the downloaded binary for the PG-only marker WITHOUT loading
+            // the whole ~53 MB into memory: `fs::read` + `from_utf8_lossy` used
+            // to allocate a ~150 MB lossy String copy of a binary — needless
+            // memory pressure on modest hardware right in the middle of an
+            // update. Stream it in bounded chunks instead.
+            let new_has_pg = file_contains_bytes(&new_binary, b"postgres_backend_ready");
             if !new_has_pg {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 warn!("update_blocked_missing_postgres_feature");
@@ -511,16 +511,40 @@ pub(super) async fn update_install(
             }
         };
 
-        if cfg!(windows) {
-            if let Err(e) = install_windows(&current_exe, &new_binary, &tmp_dir) {
+        // Install (swap the binary + web/). This is synchronous, blocking
+        // filesystem work. Wrap it in `catch_unwind` so a panic surfaces as a
+        // `failed` phase instead of vanishing: the update runs in a spawned task,
+        // so an uncaught panic silently ends it, leaving the phase stuck on
+        // "installing" and the server running the OLD binary while the UI keeps
+        // re-offering the update (JP Borderies, Windows: install never completed,
+        // no `restarting`, no error). `install_windows` now logs each step too,
+        // so a genuine hang is pinpointed by the last step logged.
+        info!(exe = %current_exe.display(), "update_install_starting");
+        let install_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if cfg!(windows) {
+                install_windows(&current_exe, &new_binary, &tmp_dir)
+            } else {
+                install_unix(&current_exe, &new_binary, &tmp_dir)
+            }
+        }));
+        match install_outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                set_phase(&format!("failed: Windows install failed: {e}"));
+                set_phase(&format!("failed: Install failed: {e}"));
                 return;
             }
-        } else if let Err(e) = install_unix(&current_exe, &new_binary, &tmp_dir) {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            set_phase(&format!("failed: Install failed: {e}"));
-            return;
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                error!(panic = %msg, "update_install_panicked");
+                set_phase(&format!("failed: Install crashed: {msg}"));
+                return;
+            }
         }
 
         // Success: install_windows/install_unix have copied the binary + web/
@@ -740,8 +764,10 @@ fn install_windows(
 
     let new_staging = current_exe.with_extension("new.exe");
     std::fs::copy(new_binary, &new_staging).map_err(|e| format!("copy new binary: {e}"))?;
+    info!(staging = %new_staging.display(), "update_win_binary_staged");
 
     update_web_dir(exe_dir, tmp_dir)?;
+    info!("update_win_web_swapped");
 
     // Wait for OUR specific PID to exit, not any process named tune-server.exe.
     // Matching by image name hangs forever whenever a second tune-server.exe is
@@ -809,13 +835,53 @@ fn install_windows(
     // A stale failure marker from a previous attempt would be misleading — clear it.
     let _ = std::fs::remove_file(&err_file);
     std::fs::write(&bat_path, bat_content).map_err(|e| format!("write update.bat: {e}"))?;
+    info!(bat = %bat_path.display(), "update_win_bat_written");
 
     std::process::Command::new("cmd")
         .args(["/C", "start", "/min", "", &bat_path.to_string_lossy()])
         .spawn()
         .map_err(|e| format!("launch update.bat: {e}"))?;
+    info!("update_win_bat_launched — process will now exit for the swap");
 
     Ok(())
+}
+
+/// Search a file for a byte pattern without loading it all into memory.
+///
+/// Reads in 64 KiB chunks with a `needle.len()-1` overlap so a match that
+/// straddles a chunk boundary is still found. Used by the update installer to
+/// detect a feature marker in a ~53 MB binary without allocating a full copy.
+fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> bool {
+    use std::io::Read;
+    if needle.is_empty() {
+        return true;
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    const CHUNK: usize = 64 * 1024;
+    let overlap = needle.len() - 1;
+    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + overlap);
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        window.extend_from_slice(&buf[..n]);
+        if window.windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+        // Keep only the trailing `overlap` bytes so a boundary-straddling match
+        // is caught on the next iteration.
+        if window.len() > overlap {
+            let cut = window.len() - overlap;
+            window.drain(..cut);
+        }
+    }
+    false
 }
 
 /// Replace the web/ directory with the one from the archive.
