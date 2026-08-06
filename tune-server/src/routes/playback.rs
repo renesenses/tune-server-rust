@@ -166,6 +166,11 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_position": zone_state.queue_position,
         "muted": zone_state.muted,
     });
+    // Ancrage temporel de la métadonnée courante (paroles radio) — mêmes
+    // champs que GET /zones et GET /zones/{id}.
+    if let Some(obj) = v.as_object_mut() {
+        crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
+    }
     // Include stream_url ONLY for browser playback zones, so the web client can
     // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
     // / AirPlay / SlimProto / local), an open web-client tab that fetched this URL

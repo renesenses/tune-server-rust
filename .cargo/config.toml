@@ -17,3 +17,20 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Opus decoding: audiopus_sys 0.2.2 builds a *vendored* libopus from source
+# via CMake. That bundled libopus ships a CMakeLists.txt with an old
+# `cmake_minimum_required`, and CMake 4.x (on the macOS/Windows GitHub runners
+# and on modern dev machines) removed compatibility with CMake < 3.5, aborting
+# the configure step with:
+#
+#   CMake Error: Compatibility with CMake < 3.5 has been removed from CMake.
+#
+# CMake reads `CMAKE_POLICY_VERSION_MINIMUM` from the environment as the default
+# policy version, which restores the pre-4.x behaviour without patching the
+# vendored sources. Setting it here (rather than in one CI step) makes every
+# build — PR CI, release matrix, and local dev — link libopus the same way.
+# Linux runners still ship CMake 3.x so they were unaffected, but this is
+# harmless there.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

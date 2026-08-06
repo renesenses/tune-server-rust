@@ -278,6 +278,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "audiopus"
+version = "0.3.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab55eb0e56d7c6de3d59f544e5db122d7725ec33be6a276ee8241f3be6473955"
+dependencies = [
+ "audiopus_sys",
+]
+
+[[package]]
+name = "audiopus_sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
+dependencies = [
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5011,7 +5031,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "axum",
  "bytes",
@@ -5030,7 +5050,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5044,12 +5064,13 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "ape-decoder",
  "argon2",
  "async-stream",
  "async-trait",
+ "audiopus",
  "axum",
  "blowfish",
  "bytes",
@@ -5109,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "async-trait",
  "axum",
@@ -5121,7 +5142,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "axum",
  "serde_json",
@@ -5134,7 +5155,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "async-trait",
  "axum",
@@ -5147,7 +5168,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "async-trait",
  "serde",
@@ -5156,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "argon2",
  "async-stream",

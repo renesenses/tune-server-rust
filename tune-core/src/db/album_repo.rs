@@ -130,6 +130,18 @@ pub mod sql {
         )
     }
 
+    pub fn get_artist_name<D: SqlDialect>(d: &D) -> String {
+        format!("SELECT name FROM artists WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn set_artist_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET artist_id = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {}, release_date = {}, original_date = {} WHERE id = {}",
@@ -473,7 +485,9 @@ impl AlbumRepo {
             );
             let params: [&dyn ToSqlValue; 1] = [&release_id];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return Ok(row_to_album(&row));
+                let mut album = row_to_album(&row);
+                self.reclaim_unknown_artist(&mut album, artist_id)?;
+                return Ok(album);
             }
         }
         if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
@@ -537,7 +551,17 @@ impl AlbumRepo {
             let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
             let params: [&dyn ToSqlValue; 1] = [&id];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return Ok(row_to_album(&row));
+                let mut album = row_to_album(&row);
+                // Un album créé alors que son premier fichier était encore en
+                // cours d'écriture (tags illisibles) est retombé sur « Unknown
+                // Artist ». Le dossier étant l'identité de l'album, chaque
+                // rescan retournait cette ligne telle quelle : l'artiste ne se
+                // corrigeait jamais, même une fois toutes les pistes taguées
+                // (bug .15 : centaines d'albums « Unknown Artist » dont les
+                // pistes portent le bon artiste). On répare ici, au moment où
+                // un vrai artiste se présente pour ce dossier.
+                self.reclaim_unknown_artist(&mut album, artist_id)?;
+                return Ok(album);
             }
         }
 
@@ -569,6 +593,65 @@ impl AlbumRepo {
                 Ok(candidate)
             }
         }
+    }
+
+    /// Rend à l'album son vrai artiste quand il est resté sur « Unknown Artist ».
+    ///
+    /// Ne touche à rien sauf si TOUTES ces conditions tiennent :
+    /// - l'artiste actuel de l'album est « Unknown Artist » (ou `artist_id`
+    ///   NULL / ligne artiste disparue) ;
+    /// - l'artiste demandé existe et n'est pas lui-même « Unknown Artist ».
+    ///
+    /// Un album correctement attribué n'est donc jamais réassigné (deux vrais
+    /// artistes en désaccord = éditions distinctes, on ne tranche pas ici), et
+    /// un fichier encore sans tags ne rétrograde jamais un album déjà résolu.
+    fn reclaim_unknown_artist(
+        &self,
+        album: &mut Album,
+        requested_artist_id: i64,
+    ) -> Result<(), TuneError> {
+        if album.artist_id == Some(requested_artist_id) {
+            return Ok(());
+        }
+        let currently_unknown = match (album.artist_id, album.artist_name.as_deref()) {
+            (None, _) => true,
+            // artist_id présent mais ligne artiste absente (LEFT JOIN → NULL).
+            (Some(_), None) => true,
+            (Some(_), Some(name)) => {
+                name.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+            }
+        };
+        if !currently_unknown {
+            return Ok(());
+        }
+        let name_sql = self.dialect_sql(sql::get_artist_name, sql::get_artist_name);
+        let params: [&dyn ToSqlValue; 1] = [&requested_artist_id];
+        let Some(requested_name) = self
+            .db
+            .query_one_strong(&name_sql, &params)?
+            .and_then(|row| row.first()?.as_string())
+        else {
+            return Ok(());
+        };
+        if requested_name.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME) {
+            return Ok(());
+        }
+        let Some(album_id) = album.id else {
+            return Ok(());
+        };
+        let set_sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+        let set_params: [&dyn ToSqlValue; 2] = [&requested_artist_id, &album_id];
+        self.db.execute(&set_sql, &set_params)?;
+        tracing::info!(
+            album_id,
+            album = %album.title,
+            previous_artist = ?album.artist_name,
+            new_artist = %requested_name,
+            "album_artist_reclaimed_from_unknown"
+        );
+        album.artist_id = Some(requested_artist_id);
+        album.artist_name = Some(requested_name);
+        Ok(())
     }
 
     /// The id of the album a folder holds, if one is recorded.
@@ -2364,5 +2447,127 @@ mod tests {
             .get_or_create_for_folder("/m/A", "Album", aid, Some(2000), Some("mbid-1"))
             .unwrap();
         assert_eq!(one.id, again.id);
+    }
+
+    /// Reproduction du bug .15 : le watcher voit le premier fichier d'un
+    /// dossier pendant son écriture (tags artiste illisibles) → l'album est
+    /// créé sous « Unknown Artist ». Au rescan avec les vrais tags, le dossier
+    /// retrouvait la même ligne et la retournait telle quelle : l'album restait
+    /// « Unknown Artist » pour toujours, alors que toutes ses pistes portaient
+    /// le bon artiste. L'album doit reprendre le vrai artiste.
+    #[test]
+    fn folder_album_reclaims_real_artist_over_unknown() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let unknown = artist_repo
+            .create(&Artist::new(
+                crate::db::artist_repo::UNKNOWN_ARTIST_NAME.into(),
+            ))
+            .unwrap();
+        let real = artist_repo
+            .create(&Artist::new("Shearwater".into()))
+            .unwrap();
+        let folder = "/music/Shearwater/The New World";
+
+        // Premier passage : fichier en cours d'écriture, artiste inconnu.
+        let created = repo
+            .get_or_create_for_folder(folder, "The New World", unknown, None, None)
+            .unwrap();
+        assert_eq!(created.artist_id, Some(unknown));
+
+        // Rescan avec les tags complets : même album, artiste réparé.
+        let healed = repo
+            .get_or_create_for_folder(folder, "The New World", real, None, None)
+            .unwrap();
+        assert_eq!(
+            healed.id, created.id,
+            "le dossier doit rester un seul album"
+        );
+        assert_eq!(healed.artist_id, Some(real));
+        assert_eq!(healed.artist_name.as_deref(), Some("Shearwater"));
+
+        // Et la réparation est persistée, pas seulement sur la valeur retournée.
+        let reread = repo.get(created.id.unwrap()).unwrap().unwrap();
+        assert_eq!(reread.artist_id, Some(real));
+    }
+
+    /// L'inverse ne doit jamais se produire : un fichier encore sans tags
+    /// (résolu « Unknown Artist ») ne rétrograde pas un album déjà attribué.
+    #[test]
+    fn unknown_artist_never_downgrades_a_resolved_album() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let real = artist_repo
+            .create(&Artist::new("Ben Harper".into()))
+            .unwrap();
+        let unknown = artist_repo
+            .create(&Artist::new(
+                crate::db::artist_repo::UNKNOWN_ARTIST_NAME.into(),
+            ))
+            .unwrap();
+        let folder = "/music/Ben Harper/No Mercy In This Land";
+
+        let created = repo
+            .get_or_create_for_folder(folder, "No Mercy In This Land", real, None, None)
+            .unwrap();
+        let after = repo
+            .get_or_create_for_folder(folder, "No Mercy In This Land", unknown, None, None)
+            .unwrap();
+        assert_eq!(after.id, created.id);
+        assert_eq!(
+            after.artist_id,
+            Some(real),
+            "l'album garde son vrai artiste"
+        );
+    }
+
+    /// Deux vrais artistes en désaccord sur un même dossier : on ne tranche
+    /// pas, l'album garde son attribution d'origine (comportement inchangé).
+    #[test]
+    fn a_real_artist_mismatch_is_left_alone() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let first = artist_repo.create(&Artist::new("Artist A".into())).unwrap();
+        let second = artist_repo.create(&Artist::new("Artist B".into())).unwrap();
+        let folder = "/music/A/Album";
+
+        let created = repo
+            .get_or_create_for_folder(folder, "Album", first, None, None)
+            .unwrap();
+        let after = repo
+            .get_or_create_for_folder(folder, "Album", second, None, None)
+            .unwrap();
+        assert_eq!(after.id, created.id);
+        assert_eq!(after.artist_id, Some(first));
+    }
+
+    /// Même réparation sur le chemin MusicBrainz : un album retrouvé par son
+    /// release id alors qu'il est resté « Unknown Artist » reprend le vrai
+    /// artiste entrant.
+    #[test]
+    fn mbid_album_reclaims_real_artist_over_unknown() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let unknown = artist_repo
+            .create(&Artist::new(
+                crate::db::artist_repo::UNKNOWN_ARTIST_NAME.into(),
+            ))
+            .unwrap();
+        let real = artist_repo
+            .create(&Artist::new("Orquesta Akokán".into()))
+            .unwrap();
+
+        let created = repo
+            .get_or_create_with_mbid("Orquesta Akokán", unknown, None, Some("mbid-akokan"))
+            .unwrap();
+        let healed = repo
+            .get_or_create_with_mbid("Orquesta Akokán", real, None, Some("mbid-akokan"))
+            .unwrap();
+        assert_eq!(healed.id, created.id);
+        assert_eq!(healed.artist_id, Some(real));
     }
 }

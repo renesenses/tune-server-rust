@@ -305,7 +305,10 @@ impl TrackImporter {
             // No album_artist tag: pin the album artist to the first track
             // artist seen in this folder so all of the album's tracks resolve to
             // a single album row instead of splitting per differing track artist.
-            let track_a = meta.artist.as_deref().unwrap_or("Unknown Artist");
+            let track_a = meta
+                .artist
+                .as_deref()
+                .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
             self.dir_album_artist
                 .entry(album_dir.clone())
                 .or_insert_with(|| track_a.to_string())
@@ -315,7 +318,7 @@ impl TrackImporter {
         let track_artist_name = meta
             .artist
             .as_deref()
-            .unwrap_or("Unknown Artist")
+            .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
             .to_string();
 
         let album_artist_mbid = if is_compilation {

@@ -572,7 +572,8 @@ fn decode_nonexistent_ape() {
 #[test]
 fn can_decode_all_native_formats() {
     for ext in &[
-        "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "aiff", "aif", "dsf", "dff", "wv", "ape",
+        "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "oga", "opus", "aiff", "aif", "dsf",
+        "dff", "wv", "ape",
     ] {
         assert!(
             tune_core::audio::decode::can_decode_native(&format!("test.{ext}")),
@@ -583,7 +584,8 @@ fn can_decode_all_native_formats() {
 
 #[test]
 fn cannot_decode_unsupported_formats() {
-    for ext in &["txt", "pdf", "jpg", "opus", "wma", "mid"] {
+    // .opus is now natively decodable (libopus); it is no longer in this list.
+    for ext in &["txt", "pdf", "jpg", "wma", "mid"] {
         assert!(
             !tune_core::audio::decode::can_decode_native(&format!("test.{ext}")),
             "can_decode_native should return false for .{ext}"
