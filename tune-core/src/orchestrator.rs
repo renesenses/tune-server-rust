@@ -293,6 +293,197 @@ fn spawn_paced_levels_forwarder(
     tx
 }
 
+/// Avance maximale du décodage-pour-niveaux d'une session proxy sur la
+/// position rapportée par la zone. Borne à la fois la mémoire (fenêtres en
+/// attente dans le canal du forwarder) et la bande passante : le second fetch
+/// CDN s'étale sur la durée de la piste au lieu de télécharger le fichier
+/// d'un bloc.
+const PROXY_LEVELS_MAX_AHEAD_MS: i64 = 30_000;
+
+/// Décode un flux HTTP en arrière-plan, UNIQUEMENT pour les VU-mètres.
+///
+/// Une session proxy (Qobuz/Tidal direct) sert les octets CDN verbatim —
+/// bit-perfect, rien n'est décodé côté serveur, donc aucun événement
+/// `playback.audio_levels` n'était émis : aiguilles figées sur une piste
+/// Qobuz alors qu'une piste locale (décodage-pour-niveaux du passthrough)
+/// animait les VU. Même principe que ce décodage parallèle des fichiers
+/// locaux, mais la « source » est l'URL CDN : on ouvre une seconde connexion
+/// et on décode au fil de l'eau, cadencé sur `reported_position_ms` (position
+/// de la zone, échantillonnée par l'appelant) pour rester ≤
+/// [`PROXY_LEVELS_MAX_AHEAD_MS`] en avance — un seek en avant se rattrape
+/// donc naturellement (le forwarder draine, la sonde décode plein pot).
+///
+/// Le flux servi au client n'est PAS touché : la sonde est un pur
+/// observateur, son échec (CDN, codec inconnu) laisse juste les VU muets.
+/// S'arrête dès que le forwarder de niveaux disparaît (stop / piste
+/// remplacée : le récepteur du canal est lâché).
+fn decode_http_stream_for_levels(
+    url: String,
+    codec_hint: String,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> Result<(), String> {
+    use symphonia::core::audio::conv::IntoSample;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+    use symphonia::core::meta::MetadataOptions;
+    use tracing::debug;
+
+    // Pas de timeout total : la connexion vit toute la piste (le débit est
+    // volontairement bridé au rythme de lecture, jamais idle assez longtemps
+    // pour un drop keep-alive CDN).
+    let response = crate::http::client::blocking_builder()
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .and_then(|c| c.get(&url).send())
+        .map_err(|e| format!("levels probe fetch failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("levels probe HTTP error: {}", response.status()));
+    }
+
+    let source = ReadOnlySource::new(response);
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut hint = Hint::new();
+    if !codec_hint.is_empty() {
+        hint.with_extension(&codec_hint);
+    }
+
+    let mut format: Box<dyn symphonia::core::formats::FormatReader> =
+        symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| format!("levels probe format probe failed: {e}"))?;
+
+    let (track_id, audio_params) = {
+        let track = format
+            .default_track(TrackType::Audio)
+            .ok_or("levels probe: no audio track found")?;
+        let params = match &track.codec_params {
+            Some(CodecParameters::Audio(params)) => params.clone(),
+            _ => return Err("levels probe: no audio codec parameters".into()),
+        };
+        (track.id, params)
+    };
+    let channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+    let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("levels probe decoder init failed: {e}"))?;
+
+    // Position décodée (référentiel piste) pour le bridage.
+    let mut decoded_ms: i64 = 0;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            // Fin de piste, ou drop CDN mid-track : la sonde s'arrête là. Le
+            // flux AUDIO a sa propre reprise (resumable_proxy_body) ; on ne
+            // la réplique pas pour de simples VU — au pire ils gèlent en fin
+            // de piste, la suivante relance une sonde neuve.
+            Ok(None) => break,
+            Err(e) => {
+                debug!(error = %e, "levels_probe_packet_error_stopping");
+                break;
+            }
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(error = %e, "levels_probe_frame_skip");
+                continue;
+            }
+        };
+
+        let frames = decoded.frames();
+        let ch = decoded.spec().channels().count();
+        let mut interleaved: Vec<f32> = Vec::with_capacity(frames * ch);
+        decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
+        let mut pcm: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
+        for sample in &interleaved {
+            let s16: i16 = (*sample).into_sample();
+            pcm.extend_from_slice(&s16.to_le_bytes());
+        }
+
+        if !crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, channels, sample_rate) {
+            // Forwarder parti (stop, ou piste remplacée) — plus personne
+            // n'écoute, on coupe la connexion CDN.
+            return Ok(());
+        }
+        if sample_rate > 0 {
+            decoded_ms += (frames as i64) * 1000 / sample_rate as i64;
+        }
+
+        // Bridage : rester au plus PROXY_LEVELS_MAX_AHEAD_MS devant la
+        // position rapportée (0 tant que la lecture n'a pas démarré — la
+        // sonde constitue alors juste son avance initiale puis attend).
+        while decoded_ms
+            > reported_position_ms.load(std::sync::atomic::Ordering::Relaxed)
+                + PROXY_LEVELS_MAX_AHEAD_MS
+        {
+            if levels_tx.is_closed() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    Ok(())
+}
+
+/// Corps de la sonde de niveaux proxy : forwarder cadencé + échantillonneur
+/// de position (le pont entre l'horloge de lecture async et la sonde
+/// bloquante) + décodage HTTP en tâche bloquante. Détaché de `self` pour être
+/// appelable depuis le funnel d'avance gapless, qui démarre les niveaux même
+/// pendant un pré-chargement (comme la branche locale du funnel).
+fn spawn_proxy_levels_probe_task(
+    playback: Arc<PlaybackManager>,
+    bus: Arc<EventBus>,
+    zone_id: i64,
+    url: String,
+    codec_hint: String,
+) {
+    tokio::spawn(async move {
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = spawn_paced_levels_forwarder(bus, playback.clone(), zone_id, play_seq, 0);
+        let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+
+        let sampler_pos = reported.clone();
+        let sampler_probe_tx = levels_tx.clone();
+        let sampler_playback = playback.clone();
+        tokio::spawn(async move {
+            while !sampler_probe_tx.is_closed() {
+                let state = sampler_playback.get_state(zone_id).await;
+                sampler_pos.store(state.position_ms, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+        });
+
+        let result = tokio::task::spawn_blocking(move || {
+            decode_http_stream_for_levels(url, codec_hint, levels_tx, reported)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => debug!(zone_id, "proxy_levels_probe_ended"),
+            Ok(Err(e)) => debug!(zone_id, error = %e, "proxy_levels_probe_failed"),
+            Err(e) => debug!(zone_id, error = %e, "proxy_levels_probe_panic"),
+        }
+    });
+}
+
 pub struct PlaybackOrchestrator {
     pub db: Arc<dyn crate::db::backend::DbBackend>,
     pub playback: Arc<PlaybackManager>,
@@ -592,6 +783,48 @@ impl PlaybackOrchestrator {
             .lock()
             .expect("levels_prewarm lock")
             .contains(&zone_id)
+    }
+
+    /// Forwarder de niveaux pour la zone, si elle y a droit (bus présent et
+    /// pas de pré-chargement gapless en cours). Capture le `play_seq`
+    /// courant : le forwarder meurt de lui-même quand la piste est remplacée.
+    /// Factorise le motif répété par tous les chemins qui ont le PCM décodé
+    /// en main (transcodes streaming, prefetch) — voir #1105/#1106.
+    async fn levels_forwarder_if_allowed(
+        &self,
+        zone_id: i64,
+        start_position_ms: i64,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>> {
+        let bus = self
+            .event_bus
+            .clone()
+            .filter(|_| self.levels_attach_allowed(zone_id))?;
+        let play_seq = self.playback.current_play_seq(zone_id).await;
+        Some(spawn_paced_levels_forwarder(
+            bus,
+            self.playback.clone(),
+            zone_id,
+            play_seq,
+            start_position_ms,
+        ))
+    }
+
+    /// VU-mètres d'une session proxy (passthrough streaming Qobuz/Tidal) :
+    /// lance en tâche de fond une seconde connexion CDN décodée uniquement
+    /// pour les niveaux (voir [`decode_http_stream_for_levels`]). Le flux
+    /// servi au renderer n'est pas touché — bit-perfect préservé. Une tâche
+    /// sœur échantillonne la position rapportée de la zone pour brider la
+    /// sonde au rythme de lecture ; les deux s'arrêtent quand le forwarder
+    /// disparaît (stop / piste remplacée).
+    fn spawn_proxy_levels_probe(&self, zone_id: i64, url: String, codec_hint: String) {
+        let Some(bus) = self
+            .event_bus
+            .clone()
+            .filter(|_| self.levels_attach_allowed(zone_id))
+        else {
+            return;
+        };
+        spawn_proxy_levels_probe_task(self.playback.clone(), bus, zone_id, url, codec_hint);
     }
 
     /// Duplicate-network-play detector. Returns `true` when `(source,
@@ -3837,6 +4070,12 @@ impl PlaybackOrchestrator {
             // plays SILENCE on renderers like the Ruark R3 / LHC-62 (Yves,
             // #1137). Cap the LPCM fallback at 16-bit; FLAC keeps full hi-res.
             let dash_is_wav = dash_enc_format == "wav";
+            // VU-mètres : le PCM décodé de ce pré-transcode part aussi vers le
+            // forwarder de niveaux (cadencé par lui — voir #1105). Sans ça,
+            // une piste DASH (Tidal HI-RES) sur DLNA/browser laissait les
+            // aiguilles figées. Le chemin remux (opt-in TUNE_DASH_REMUX) ne
+            // décode rien : VU légitimement muets dans ce cas.
+            let dash_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
             let transcode_result = tokio::task::spawn_blocking(move || {
                 // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
                 // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
@@ -3874,6 +4113,17 @@ impl PlaybackOrchestrator {
 
                 if let Some(mut eq) = eq_profile_pretranscode {
                     eq.process_pcm(&mut pcm_bytes, actual_bd);
+                }
+
+                // Niveaux post-EQ : les VU décrivent ce qui sera entendu.
+                if let Some(ref ltx) = dash_levels_tx {
+                    crate::audio::tap::send_windowed_pcm(
+                        ltx,
+                        &pcm_bytes,
+                        actual_bd,
+                        decoded.channels as u16,
+                        decoded.sample_rate,
+                    );
                 }
 
                 let rt = tokio::runtime::Handle::try_current()
@@ -4044,6 +4294,10 @@ impl PlaybackOrchestrator {
 
                 let tmp_dl_clone = tmp_dl.clone();
                 let tmp_flac_clone = tmp_flac.clone();
+                // VU-mètres : ce pré-transcode a le PCM décodé en main — il
+                // alimente aussi le forwarder de niveaux (YouTube/AAC sur
+                // DLNA restait aiguilles figées).
+                let aac_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
                 let transcode_result = tokio::task::spawn_blocking(move || {
                     // 1. Download
                     let resp = crate::http::client::blocking_builder()
@@ -4076,6 +4330,16 @@ impl PlaybackOrchestrator {
                         pcm_bytes =
                             crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                         actual_bd = 16;
+                    }
+
+                    if let Some(ref ltx) = aac_levels_tx {
+                        crate::audio::tap::send_windowed_pcm(
+                            ltx,
+                            &pcm_bytes,
+                            actual_bd,
+                            decoded.channels as u16,
+                            decoded.sample_rate,
+                        );
                     }
 
                     // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
@@ -4216,6 +4480,9 @@ impl PlaybackOrchestrator {
 
                     let tmp_dl_clone = tmp_dl.clone();
                     let tmp_wav_clone = tmp_wav.clone();
+                    // VU-mètres : même ajout que les autres pré-transcodes —
+                    // le PCM décodé alimente le forwarder de niveaux.
+                    let wav_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
                     let transcode_result = tokio::task::spawn_blocking(move || {
                         // 1. Download
                         let resp = crate::http::client::blocking_builder()
@@ -4253,6 +4520,16 @@ impl PlaybackOrchestrator {
                             pcm_bytes =
                                 crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                             actual_bd = 16;
+                        }
+
+                        if let Some(ref ltx) = wav_levels_tx {
+                            crate::audio::tap::send_windowed_pcm(
+                                ltx,
+                                &pcm_bytes,
+                                actual_bd,
+                                actual_ch as u16,
+                                actual_sr,
+                            );
                         }
 
                         // 3. Encode to WAV
@@ -4386,6 +4663,19 @@ impl PlaybackOrchestrator {
                     let url = self
                         .streamer
                         .get_stream_url(&session_id, &server_ip, &codec_lower);
+
+                    // VU-mètres (#1106) : le proxy sert les octets CDN
+                    // verbatim, rien n'est décodé côté serveur → aucun
+                    // `playback.audio_levels`, aiguilles figées sur Qobuz/
+                    // Tidal direct alors qu'une piste locale les anime. On
+                    // décode le même flux en parallèle, uniquement pour les
+                    // niveaux — le flux servi reste bit-perfect.
+                    self.spawn_proxy_levels_probe(
+                        req.zone_id,
+                        stream_data.url.clone(),
+                        codec_lower.clone(),
+                    );
+
                     // Report the mime of the codec we actually serve, not the
                     // upstream API's mime_type. Qobuz can return a mime that does
                     // not normalise to a lossless format, so Now Playing showed
@@ -4597,8 +4887,22 @@ impl PlaybackOrchestrator {
             let encode_ch = ch;
             let encode_path = tmp_str.clone();
             let encode_wav = use_wav;
+            // VU-mètres : le tampon prefetch EST le PCM décodé — sans ce
+            // renvoi, une piste streaming servie depuis le prefetch (gapless
+            // N+1) laissait les aiguilles figées alors que la piste jouée via
+            // le pipeline download+decode les animait.
+            let prefetch_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
             tokio::task::spawn_blocking(move || {
                 use std::io::Write;
+                if let Some(ref ltx) = prefetch_levels_tx {
+                    crate::audio::tap::send_windowed_pcm(
+                        ltx,
+                        &pcm_data,
+                        encode_bd,
+                        encode_ch as u16,
+                        encode_sr,
+                    );
+                }
                 let data_size = pcm_data.len() as u32;
                 let byte_rate = encode_sr * encode_ch as u32 * (encode_bd as u32 / 8);
                 let block_align = encode_ch as u16 * (encode_bd as u16 / 8);
@@ -4748,7 +5052,29 @@ impl PlaybackOrchestrator {
         } else {
             prefetched.pcm_data
         };
+        // VU-mètres : même renvoi que la branche réseau — le tampon prefetch
+        // est le PCM décodé, il alimente le forwarder de niveaux. Fenêtrage
+        // AVANT le gavage de la session (une passe memcpy, quelques dizaines
+        // de ms) : le gavage, lui, dure toute la piste (canal borné, rythmé
+        // par le client), les niveaux seraient arrivés trop tard.
+        let prefetch_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+        let pcm_data = std::sync::Arc::new(pcm_data);
         tokio::spawn(async move {
+            if let Some(ltx) = prefetch_levels_tx {
+                let levels_pcm = pcm_data.clone();
+                let levels_bd = out_bd;
+                let levels_ch = ch;
+                let levels_sr = sr;
+                tokio::task::spawn_blocking(move || {
+                    crate::audio::tap::send_windowed_pcm(
+                        &ltx,
+                        &levels_pcm,
+                        levels_bd,
+                        levels_ch as u16,
+                        levels_sr,
+                    );
+                });
+            }
             let chunk_size = 32768;
             let mut first = true;
             for chunk in pcm_data.chunks(chunk_size) {
@@ -6331,6 +6657,8 @@ impl PlaybackOrchestrator {
         // detect track-end on renderers that briefly report Stopped during
         // gapless transitions. Position MUST reset to 0 (new track from start).
         let advance_track_id = np.track_id;
+        let advance_source = np.source.clone();
+        let advance_source_id = np.source_id.clone();
         self.playback.update_now_playing(zone_id, np).await;
         self.playback.update_position(zone_id, 0).await;
         self.playback.emit_position(zone_id, 0);
@@ -6374,6 +6702,65 @@ impl PlaybackOrchestrator {
                     })
                     .await
                     .ok();
+                });
+            }
+        } else if let (Some(bus), Some(source_id)) =
+            (self.event_bus.clone(), advance_source_id.clone())
+        {
+            // Piste STREAMING devenue courante par avance gapless : pas de
+            // fichier local à décoder — sa session prewarm n'a jamais attaché
+            // de forwarder (levels_prewarm), donc les pistes 2..n d'un album
+            // Qobuz/Tidal gardaient les aiguilles figées même une fois le
+            // proxy corrigé pour la lecture explicite. On re-résout l'URL du
+            // service (cache DASH compris) et on lance la même sonde de
+            // niveaux que la lecture explicite en proxy ; un `file://` (fMP4
+            // DASH déjà sur disque) se décode localement, comme une piste
+            // passthrough.
+            if advance_source != "local" && advance_source != "radio" {
+                let services = self.services.clone();
+                let playback = self.playback.clone();
+                let source = advance_source.clone();
+                tokio::spawn(async move {
+                    let resolved = {
+                        let registry = services.lock().await;
+                        let Some(svc) = registry.get(&source) else {
+                            return;
+                        };
+                        let svc = svc.clone();
+                        drop(registry);
+                        let svc = svc.lock().await;
+                        svc.get_track_url(&source_id, None).await.ok()
+                    };
+                    let Some(data) = resolved else {
+                        debug!(zone_id, source = %source, "gapless_streaming_levels_url_unresolved");
+                        return;
+                    };
+                    let codec = data.quality.codec.to_lowercase();
+                    if let Some(path) = data.url.strip_prefix("file://") {
+                        // fMP4 DASH assemblé sur disque : décodage local
+                        // direct, même motif que la branche fichier ci-dessus.
+                        let play_seq = playback.current_play_seq(zone_id).await;
+                        let levels_tx =
+                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
+                        let path = path.to_string();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(dec) =
+                                crate::audio::decode::decode_to_pcm(&path, None, None, 0.0, 0.0)
+                            {
+                                crate::audio::tap::send_windowed_pcm(
+                                    &levels_tx,
+                                    &dec.pcm_bytes(),
+                                    dec.bit_depth,
+                                    dec.channels as u16,
+                                    dec.sample_rate,
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                    } else {
+                        spawn_proxy_levels_probe_task(playback, bus, zone_id, data.url, codec);
+                    }
                 });
             }
         }
@@ -6978,6 +7365,73 @@ fn resolve_existing_local_path(stored: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    /// La sonde de niveaux proxy (VU-mètres Qobuz/Tidal direct) décode un
+    /// flux HTTP en fenêtres brutes : 1 s de WAV silencieux servie par un
+    /// mini serveur one-shot doit produire ~25 fenêtres de 40 ms au format
+    /// annoncé. Couvre le pipeline probe → décodage → fenêtrage, et la
+    /// terminaison propre en fin de flux.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn levels_probe_decodes_http_stream_into_windows() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let sr: u32 = 44100;
+                let data = vec![0u8; sr as usize * 4]; // 1 s, 16-bit stéréo
+                let mut wav = Vec::with_capacity(44 + data.len());
+                wav.extend_from_slice(b"RIFF");
+                wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+                wav.extend_from_slice(b"WAVEfmt ");
+                wav.extend_from_slice(&16u32.to_le_bytes());
+                wav.extend_from_slice(&1u16.to_le_bytes());
+                wav.extend_from_slice(&2u16.to_le_bytes());
+                wav.extend_from_slice(&sr.to_le_bytes());
+                wav.extend_from_slice(&(sr * 4).to_le_bytes());
+                wav.extend_from_slice(&4u16.to_le_bytes());
+                wav.extend_from_slice(&16u16.to_le_bytes());
+                wav.extend_from_slice(b"data");
+                wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                wav.extend_from_slice(&data);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    wav.len()
+                );
+                let _ = s.write_all(&wav);
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Position rapportée très en avant : le bridage ne s'arme jamais.
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(600_000));
+        let url = format!("http://{addr}/probe.wav");
+        tokio::task::spawn_blocking(move || {
+            super::decode_http_stream_for_levels(url, "wav".into(), tx, reported)
+                .expect("probe decodes the served WAV")
+        })
+        .await
+        .expect("probe task join");
+
+        let mut windows = 0;
+        let mut total = std::time::Duration::ZERO;
+        while let Ok(w) = rx.try_recv() {
+            assert_eq!(w.sample_rate, 44100);
+            assert_eq!(w.channels, 2);
+            assert_eq!(w.bit_depth, 16);
+            total += w.window;
+            windows += 1;
+        }
+        assert!(windows >= 24, "1 s / 40 ms ≈ 25 fenêtres, reçu {windows}");
+        let ms = total.as_millis();
+        assert!(
+            (950..=1050).contains(&ms),
+            "durée totale ≈ 1 s, reçu {ms} ms"
+        );
+    }
 
     #[test]
     fn local_path_candidates_offers_nfd_for_accented_paths() {
