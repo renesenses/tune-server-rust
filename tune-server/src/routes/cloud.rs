@@ -27,7 +27,6 @@ pub fn router() -> Router<AppState> {
         .route("/plugins/{name}/install", post(marketplace_install))
         .route("/plugins/{name}/vote", post(marketplace_vote))
         .route("/community/artist-image", post(report_artist_image))
-        .route("/community/genre-correction", post(submit_genre_correction))
         .route("/community/covers", post(submit_community_cover))
         .route("/community/covers/sync", post(sync_community_covers))
         .route("/bridge/status", get(bridge_status))
@@ -509,31 +508,6 @@ async fn report_artist_image(
     match tune_core::cloud::community::report_artist_image(
         &body.mbid,
         &body.image_url,
-        base_url.as_deref(),
-    )
-    .await
-    {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct GenreCorrectionRequest {
-    album_id: String,
-    genre: String,
-}
-
-async fn submit_genre_correction(
-    State(state): State<AppState>,
-    Json(body): Json<GenreCorrectionRequest>,
-) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let base_url = settings.get("mozaik_base_url").ok().flatten();
-
-    match tune_core::cloud::community::submit_genre_correction(
-        &body.album_id,
-        &body.genre,
         base_url.as_deref(),
     )
     .await

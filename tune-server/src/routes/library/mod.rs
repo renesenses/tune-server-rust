@@ -11,6 +11,7 @@ mod folder_facet;
 mod genres;
 mod ingest;
 mod ratings;
+mod reports;
 mod search;
 mod stats;
 mod tracks;
@@ -228,6 +229,11 @@ pub fn router() -> Router<AppState> {
             post(credits::enrich_album_credits),
         )
         .route("/enrich-credits", post(credits::enrich_all_credits))
+        // Generic metadata reports (wrong cover / credit / bio / image).
+        .route(
+            "/reports",
+            get(reports::list_reports).post(reports::create_report),
+        )
         .route("/tracks/{id}/all-tags", get(tracks::track_all_tags))
         .route(
             "/tracks/{id}/metadata",

@@ -292,6 +292,19 @@ CREATE TABLE IF NOT EXISTS album_metadata (
     PRIMARY KEY (album_id, key)
 );
 
+CREATE TABLE IF NOT EXISTS metadata_reports (
+    id BIGSERIAL PRIMARY KEY,
+    entity TEXT NOT NULL,
+    entity_id BIGINT,
+    mbid TEXT,
+    field TEXT,
+    value TEXT,
+    reason TEXT NOT NULL,
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    pushed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

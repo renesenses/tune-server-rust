@@ -21,6 +21,10 @@ pub(crate) struct TrackEdit {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    /// Reattach the track to an existing album by id. The web Metadata
+    /// Manager has always sent this (grouping loose tracks under a new
+    /// album) but it was not deserialized, so the move silently did nothing.
+    album_id: Option<i64>,
     album_artist: Option<String>,
     genre: Option<String>,
     track_number: Option<u32>,
@@ -265,6 +269,12 @@ pub(crate) async fn edit_track(
     }
     if let Some(ref v) = body.album {
         track.album_title = Some(v.clone());
+    }
+    if let Some(aid) = body.album_id {
+        track.album_id = Some(aid);
+        if let Ok(Some(album)) = AlbumRepo::with_backend(state.backend.clone()).get(aid) {
+            track.album_title = Some(album.title);
+        }
     }
     if let Some(ref v) = body.genre {
         track.genre = Some(v.clone());
