@@ -665,18 +665,50 @@ fn decode_to_pcm_streaming_inner(
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime for streaming decode")?;
 
+    // Sample-accurate seek: how many leading frames to discard AFTER the
+    // demuxer seek so playback starts EXACTLY at the requested position.
+    // `SeekMode::Accurate` lands on the packet boundary at-or-before the
+    // target (actual_ts <= required_ts); the residual (required_ts - actual_ts)
+    // frames are trimmed in the decode loop below. `Coarse` (the old mode) did
+    // no trim and could land a full seek-index granule off — inaudible on local
+    // FLAC (dense native seektable) but seconds off on freshly transcoded Qobuz
+    // FLAC (sparse/absent seektable) and fragmented Tidal DASH, so streaming
+    // seeks appeared to overshoot the clicked position (DEvir, v0.9.50, ASIO).
+    let mut frames_to_skip: u64 = 0;
     if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        let _ = format.seek(
-            SeekMode::Coarse,
+        match format.seek(
+            SeekMode::Accurate,
             SeekTo::Time {
                 time,
                 track_id: Some(track_id),
             },
-        );
-        debug!(file = file_path, seek_s, "streaming_decode_seeked");
+        ) {
+            Ok(seeked) => {
+                // Symphonia 0.6 `Timestamp` is a newtype over i64; `.get()`
+                // yields the raw frame index. Accurate seek guarantees
+                // actual <= required, but clamp defensively.
+                let required = seeked.required_ts.get();
+                let actual = seeked.actual_ts.get();
+                frames_to_skip = (required - actual).max(0) as u64;
+                // Clear the decoder's internal state so the first post-seek
+                // packet decodes cleanly (Symphonia requires a reset after seek).
+                decoder.reset();
+                debug!(
+                    file = file_path,
+                    seek_s,
+                    required_ts = required,
+                    actual_ts = actual,
+                    frames_to_skip,
+                    "streaming_decode_seeked"
+                );
+            }
+            Err(e) => {
+                debug!(file = file_path, seek_s, error = %e, "streaming_decode_seek_failed");
+            }
+        }
     }
 
     // Send the WAV header as the first chunk using the REAL source sample
@@ -737,6 +769,22 @@ fn decode_to_pcm_streaming_inner(
 
         let mut packet_samples: Vec<i32> = Vec::new();
         decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
+
+        // Trim the leading frames left over from the Accurate seek so the very
+        // first emitted sample is the requested position (see `frames_to_skip`
+        // above). `packet_samples` is interleaved (channels consecutive), so a
+        // frame == `source_channels` samples; both counts are frame-aligned.
+        if frames_to_skip > 0 {
+            let ch = source_channels.max(1) as usize;
+            let skip_samples = (frames_to_skip as usize)
+                .saturating_mul(ch)
+                .min(packet_samples.len());
+            packet_samples.drain(..skip_samples);
+            frames_to_skip -= (skip_samples / ch) as u64;
+            if packet_samples.is_empty() {
+                continue;
+            }
+        }
 
         // Normalize: right-justify samples (same as batch decode)
         if shift > 0 && shift < 32 {
