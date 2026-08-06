@@ -579,6 +579,35 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             info!(orphan_albums, "auto_scan_orphan_albums_cleaned");
         }
 
+        // Réconciliation des favoris : le prune + orphan cleanup ci-dessus
+        // peuvent avoir renouvelé les rowids d'albums/pistes favoris (racines
+        // music déplacées — bug .18) ; on re-rattache par identité (instantané
+        // titre/artiste/chemin, historique d'écoute en secours) et on ne
+        // supprime un favori vraiment introuvable qu'après un scan complet
+        // sain (aucune racine manquante/illisible, non annulé).
+        {
+            let full_scan_ok = !crate::routes::system::scan::scan_cancel_requested()
+                && missing_dirs.is_empty()
+                && error_dirs.is_empty();
+            match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
+                .run(full_scan_ok)
+            {
+                Ok(fav_stats) if fav_stats.changed() > 0 || fav_stats.unresolved > 0 => {
+                    info!(
+                        scanned = fav_stats.scanned,
+                        snapshots = fav_stats.snapshots_backfilled,
+                        relinked = fav_stats.relinked,
+                        deduplicated = fav_stats.deduplicated,
+                        deleted = fav_stats.deleted,
+                        unresolved = fav_stats.unresolved,
+                        "auto_scan_favorites_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto_scan_favorites_reconcile_failed"),
+            }
+        }
+
         info!(
             total = stats.total_files,
             ok = stats.metadata_ok,

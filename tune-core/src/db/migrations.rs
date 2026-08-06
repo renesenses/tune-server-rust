@@ -807,6 +807,18 @@ CREATE TABLE IF NOT EXISTS track_audio_embedding (
         name: "add_queue_item_track_disc_number",
         up: "", // Applied programmatically via add_column_if_missing (idempotent).
     },
+    // Instantané d'identité des favoris : les favoris référencent des rowids
+    // d'albums/pistes/artistes, mais ces ids ne survivent pas à un rescan qui
+    // recrée les items (racines music déplacées, library clear, fusion de
+    // doublons) — cœurs éteints et filtre « Favoris » vide (bug .18, v0.9.50).
+    // On fige titre/artiste/chemin à l'ajout du favori pour re-rattacher
+    // l'item vivant par identité (db::favorites_reconcile). NULL sur les
+    // favoris existants ; backfillé à la première réconciliation.
+    Migration {
+        version: 66,
+        name: "add_favorites_identity_snapshot",
+        up: "", // Applied programmatically via add_column_if_missing (idempotent).
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1460,6 +1472,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
     add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");
 
+    // Instantané d'identité des favoris (migration v66) : titre/artiste/chemin
+    // figés à l'ajout, pour re-rattacher un favori quand un rescan renouvelle
+    // les rowids (racines music déplacées, library clear — bug .18). Passe de
+    // sûreté idempotente ; voir db::favorites_reconcile.
+    add_column_if_missing(db, "favorites", "item_name", "TEXT");
+    add_column_if_missing(db, "favorites", "item_artist", "TEXT");
+    add_column_if_missing(db, "favorites", "item_path", "TEXT");
+
     // Persistent "date added" side table (survives full rescan). CREATE IF NOT
     // EXISTS here too so DBs from any prior version get it regardless of which
     // migration version they came from.
@@ -1637,6 +1657,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         16,
         "alarms_profile_id",
         include_str!("../../migrations/postgres/016_alarms_profile_id.sql"),
+    ),
+    (
+        17,
+        "favorites_identity",
+        include_str!("../../migrations/postgres/017_favorites_identity.sql"),
     ),
 ];
 
@@ -1923,7 +1948,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 16, "latest PG migration must be 16");
+        assert_eq!(pg_latest_version(), 17, "latest PG migration must be 17");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

@@ -876,6 +876,38 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             tracing::info!(orphan_artists, "post_scan_orphan_artists_cleaned");
         }
 
+        // Réconciliation des favoris : un rescan qui a recréé albums/pistes
+        // sous de nouveaux rowids (racines music déplacées, library clear,
+        // fusion de doublons ci-dessus) laisse des favoris orphelins → cœurs
+        // éteints et filtre « Favoris » vide (bug .18, v0.9.50). On re-rattache
+        // par identité (instantané titre/artiste/chemin, historique d'écoute en
+        // secours) ; un favori vraiment introuvable n'est supprimé qu'après un
+        // scan COMPLET et sain (pas ciblé, pas annulé, aucune racine
+        // manquante/illisible) — jamais sur un scan partiel.
+        {
+            let full_scan_ok = !SCAN_CANCEL.load(Ordering::SeqCst)
+                && targeted.is_none()
+                && missing_dirs.is_empty()
+                && error_dirs.is_empty();
+            match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
+                .run(full_scan_ok)
+            {
+                Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = stats.scanned,
+                        snapshots = stats.snapshots_backfilled,
+                        relinked = stats.relinked,
+                        deduplicated = stats.deduplicated,
+                        deleted = stats.deleted,
+                        unresolved = stats.unresolved,
+                        "post_scan_favorites_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_favorites_reconcile_failed"),
+            }
+        }
+
         // Backfill embedded cover art for local albums still missing a cover.
         // The incremental scan only extracts covers from files it re-processed;
         // unchanged files are skipped, so an improved embedded-art extractor

@@ -402,5 +402,7 @@ async fn delete_plugin(
 }
 
 async fn plugin_docs() -> Json<Value> {
-    Json(json!({ "url": "https://mozaiklabs.fr/docs/plugins" }))
+    // `/docs/plugins` n'existe pas sur le site (404) : la doc plugins vit dans
+    // le guide utilisateur, section « Plugins » (#1282, Jean Valjean).
+    Json(json!({ "url": "https://mozaiklabs.fr/guide#plugins" }))
 }
