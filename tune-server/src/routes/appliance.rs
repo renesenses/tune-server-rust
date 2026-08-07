@@ -201,8 +201,16 @@ async fn status(headers: HeaderMap) -> Result<Json<Value>, AppError> {
 async fn wifi_scan(headers: HeaderMap) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     let lang = crate::i18n::lang_from_header(&headers);
-    let raw = nmcli(
-        &[
+    // `--rescan yes` forces a fresh scan and BLOCKS until it finishes; on a busy
+    // radio (a scan already in progress, or a slow adapter) nmcli returns an
+    // error or exceeds SCAN_TIMEOUT, so the endpoint failed and the UI locked up
+    // — "the Wi-Fi scan doesn't work, I have to refresh the page" (Pascal,
+    // regressed from 0.9.17). Use `--rescan auto` (nmcli triggers a rescan only
+    // if its cache is stale, and returns promptly otherwise); if that still
+    // fails, fall back to the cached list (`--rescan no`) so the user always
+    // gets whatever networks nmcli already knows instead of a hard error.
+    let list_args = |rescan: &'static str| {
+        vec![
             "-t",
             "-f",
             "IN-USE,SSID,SIGNAL,SECURITY",
@@ -210,12 +218,13 @@ async fn wifi_scan(headers: HeaderMap) -> Result<Json<Value>, AppError> {
             "wifi",
             "list",
             "--rescan",
-            "yes",
-        ],
-        SCAN_TIMEOUT,
-        &lang,
-    )
-    .await?;
+            rescan,
+        ]
+    };
+    let raw = match nmcli(&list_args("auto"), SCAN_TIMEOUT, &lang).await {
+        Ok(raw) => raw,
+        Err(_) => nmcli(&list_args("no"), SCAN_TIMEOUT, &lang).await?,
+    };
     Ok(Json(json!({ "networks": parse_wifi_list(&raw) })))
 }
 
