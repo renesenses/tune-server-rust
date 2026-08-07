@@ -74,10 +74,24 @@ impl HqplayerOutput {
         Ok(())
     }
 
-    /// Send an XML command and receive the response.
-    async fn send_command(&self, xml_body: &str) -> Result<String, String> {
+    /// Write an XML command over the persistent connection (reconnecting once on a
+    /// broken pipe), then apply `mode` to decide what happens after the write.
+    ///
+    /// This is the single place that owns the connection + one-reconnect logic, so
+    /// both the blocking QUERY path (`send_command`) and the fire-and-forget ACTION
+    /// path (`send_action`) share it — they differ only in `PostWrite`.
+    async fn send_inner(&self, xml_body: &str, mode: PostWrite) -> Result<String, String> {
         // Build full XML message
         let message = format!("{}\n{}", XML_HEADER, xml_body);
+
+        // Raw protocol logging: exact bytes we put on the wire. Cheap, debug-level.
+        // Lets us learn v6 behavior from the field (v6 stays silent on actions).
+        debug!(
+            device = %self.name,
+            bytes = message.len(),
+            raw = %message.replace('\n', "\\n"),
+            "hqplayer_send"
+        );
 
         let mut conn = self.connection.lock().await;
 
@@ -107,13 +121,45 @@ impl HqplayerOutput {
                 .write_all(message.as_bytes())
                 .await
                 .map_err(|e2| format!("hqplayer write retry failed: {e}, then {e2}"))?;
-            return read_response(stream2).await;
+            return post_write(stream2, mode).await;
         }
 
-        read_response(stream).await
+        post_write(stream, mode).await
     }
 
-    /// Send a command, dropping connection on error (for next retry).
+    /// Send an XML QUERY command and receive the (complete-XML) response.
+    /// Used for commands HQPlayer genuinely answers: `<GetInfo/>`, `<Status/>`.
+    async fn send_command(&self, xml_body: &str) -> Result<String, String> {
+        self.send_inner(xml_body, PostWrite::ReadResponse).await
+    }
+
+    /// Fire-and-forget send for ACTION/transport commands.
+    ///
+    /// HQPlayer v4/v5 acknowledge transport commands (PlaylistAdd/Play/Pause/Stop/
+    /// Seek/Volume) with an XML reply; HQPlayer **6** accepts and executes them but
+    /// stays SILENT. So we must NOT block on a full response — doing so hits the 5s
+    /// `read_response` timeout on v6 and fails the whole play ("hqplayer read
+    /// timeout"). Instead we write the command and do a very short, non-fatal drain:
+    /// a v4/v5 ack is consumed (so it can't pollute the next `<Status/>` read), while
+    /// v6 silence simply times out — which we treat as SUCCESS.
+    async fn send_action(&self, xml_body: &str) -> Result<(), String> {
+        let drained = self.send_inner(xml_body, PostWrite::DrainBrief).await?;
+        // Field telemetry: did v4/v5 ack, or is this a silent v6?
+        if drained.trim().is_empty() {
+            debug!(device = %self.name, cmd = %xml_body, "hqplayer_action_sent no_reply");
+        } else {
+            debug!(
+                device = %self.name,
+                cmd = %xml_body,
+                bytes_back = drained.len(),
+                reply = %drained.trim(),
+                "hqplayer_action_sent"
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a QUERY command, dropping connection on error (for next retry).
     async fn command(&self, xml_body: &str) -> Result<String, String> {
         match self.send_command(xml_body).await {
             Ok(response) => Ok(response),
@@ -125,6 +171,71 @@ impl HqplayerOutput {
             }
         }
     }
+
+    /// Send an ACTION command (fire-and-forget), dropping connection on a real
+    /// write/socket error so the next call reconnects. A short-drain timeout is
+    /// NOT an error here (that is the normal, expected v6 case).
+    async fn action(&self, xml_body: &str) -> Result<(), String> {
+        match self.send_action(xml_body).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let mut conn = self.connection.lock().await;
+                *conn = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// What to do on the connection after an XML command has been written.
+#[derive(Clone, Copy)]
+enum PostWrite {
+    /// Block until a complete XML document arrives (QUERY commands answer).
+    ReadResponse,
+    /// Fire-and-forget: briefly drain + discard any ack; timeout == success
+    /// (ACTION/transport commands; v6 stays silent).
+    DrainBrief,
+}
+
+/// Apply the post-write behavior selected by `mode` to an established stream.
+async fn post_write(stream: &mut TcpStream, mode: PostWrite) -> Result<String, String> {
+    match mode {
+        PostWrite::ReadResponse => read_response(stream).await,
+        PostWrite::DrainBrief => drain_brief(stream).await,
+    }
+}
+
+/// Fire-and-forget drain for ACTION/transport commands (see `send_action`).
+///
+/// Waits a short window for a *possible* v4/v5 ack and discards it; a v6 renderer
+/// stays silent, so the first read simply times out and we return success with no
+/// bytes. When an ack does arrive we keep draining with tiny follow-up reads so a
+/// partial ack can never pollute the next `read_response` (e.g. a later
+/// `<Status/>`). Returns whatever bytes were drained, for logging only.
+async fn drain_brief(stream: &mut TcpStream) -> Result<String, String> {
+    let mut buf = vec![0u8; 8192];
+    let window = std::time::Duration::from_millis(400);
+
+    // First peek: wait up to `window` for a v4/v5 ack. v6 silence -> timeout -> OK.
+    let mut drained = match tokio::time::timeout(window, stream.read(&mut buf)).await {
+        Ok(Ok(0)) => return Err("hqplayer: connection closed".to_string()),
+        Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+        Ok(Err(e)) => return Err(format!("hqplayer read error: {e}")),
+        Err(_) => return Ok(String::new()), // timeout == v6 silence == success
+    };
+
+    // An ack arrived (v4/v5): drain any remaining bytes with tiny non-blocking
+    // follow-up reads so nothing is left in the socket for the next query.
+    let mop = std::time::Duration::from_millis(50);
+    loop {
+        match tokio::time::timeout(mop, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => drained.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Ok(Err(_)) => break,
+            Err(_) => break, // no more data queued
+        }
+    }
+    Ok(drained)
 }
 
 /// Read XML response from HQPlayer TCP stream.
@@ -329,18 +440,23 @@ impl OutputTarget for HqplayerOutput {
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         info!(device = %self.name, url = media.url, "hqplayer_play");
 
+        // ACTION commands go through the fire-and-forget path: HQPlayer 6 executes
+        // transport commands but sends NO reply, so blocking on a response would
+        // hit the 5s read timeout and fail the play. `action` writes and only
+        // briefly drains any v4/v5 ack. See `send_action` for the full rationale.
+
         // Add URI to playlist (clear existing, start playing)
         let xml = format!(
             r#"<PlaylistAdd uri="{}" queued="0" clear="1"></PlaylistAdd>"#,
             escape_xml(media.url)
         );
-        self.command(&xml).await.map_err(|e| {
+        self.action(&xml).await.map_err(|e| {
             warn!(error = %e, "hqplayer_playlist_add_failed");
             e
         })?;
 
         // Issue play command
-        self.command("<Play />").await.map_err(|e| {
+        self.action("<Play />").await.map_err(|e| {
             warn!(error = %e, "hqplayer_play_failed");
             e
         })?;
@@ -349,17 +465,18 @@ impl OutputTarget for HqplayerOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.command("<Pause />").await?;
+        // Fire-and-forget: v6 does not ack transport commands. See `send_action`.
+        self.action("<Pause />").await?;
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
-        self.command("<Play />").await?;
+        self.action("<Play />").await?;
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
-        self.command("<Stop />").await?;
+        self.action("<Stop />").await?;
         info!(device = %self.name, "hqplayer_stop");
         Ok(())
     }
@@ -367,7 +484,7 @@ impl OutputTarget for HqplayerOutput {
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         let seconds = position_ms as f64 / 1000.0;
         let xml = format!(r#"<Seek position="{seconds:.1}" />"#);
-        self.command(&xml).await?;
+        self.action(&xml).await?;
         Ok(())
     }
 
@@ -376,7 +493,8 @@ impl OutputTarget for HqplayerOutput {
         // The Volume command takes a value; we pass 0-100 linear.
         let level = (volume * 100.0).round().clamp(0.0, 100.0) as u32;
         let xml = format!(r#"<Volume value="{level}" />"#);
-        self.command(&xml).await?;
+        // Fire-and-forget: v6 does not ack transport commands. See `send_action`.
+        self.action(&xml).await?;
         Ok(())
     }
 

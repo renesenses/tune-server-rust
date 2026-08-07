@@ -45,6 +45,40 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
     }
 }
 
+/// Best-effort detection of running inside a Docker/OCI container. In a
+/// container the binary lives in a read-only image layer, so the in-app update
+/// can never swap it (`copy new binary: Permission denied` — Yacine); the
+/// correct update path is `docker compose pull && docker compose up -d`. Any one
+/// of these signals is conclusive: the `/.dockerenv` marker file, a
+/// `docker`/`containerd`/`kubepods` entry in the process cgroup, or the
+/// `container` env var some runtimes set. Non-Linux hosts are never
+/// containerised this way, so they always return false.
+#[cfg(target_os = "linux")]
+fn running_in_docker() -> bool {
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    if std::env::var_os("container").is_some() {
+        return true;
+    }
+    for cgroup in ["/proc/1/cgroup", "/proc/self/cgroup"] {
+        if let Ok(contents) = std::fs::read_to_string(cgroup) {
+            if contents.contains("docker")
+                || contents.contains("containerd")
+                || contents.contains("kubepods")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_in_docker() -> bool {
+    false
+}
+
 /// Find the extractable archive asset (tar.gz or zip) for the current platform.
 /// Excludes .dmg and .exe installers — we want the raw archive containing the binary + web/.
 fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
@@ -260,6 +294,24 @@ pub(super) async fn update_install(
         }
     }
 
+    // Guard: in Docker the binary lives in a read-only image layer, so the
+    // self-update can never swap it (`copy new binary: Permission denied` —
+    // Yacine) and every retry fails the same way. Detect it up front, before
+    // downloading anything, and steer the user to the image-pull update path.
+    // This is not an error condition, so return 200 with a clear status the UI
+    // can present as guidance rather than a failure.
+    if running_in_docker() {
+        info!("update_skipped_docker");
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "status": "docker",
+                "message": "You're running Tune in Docker. Update by pulling the new image: docker compose pull && docker compose up -d (your data in the mounted volumes is preserved)."
+            })),
+        )
+            .into_response();
+    }
+
     // Guard: refuse update if .no-auto-update flag file exists
     let working_dir = std::env::current_exe()
         .ok()
@@ -459,6 +511,19 @@ pub(super) async fn update_install(
 
         // --- Install ---
         set_phase("installing");
+
+        // Belt-and-braces: the handler already steers Docker users to the
+        // image-pull path before we ever download, but if the install path is
+        // somehow reached in a container the binary swap is doomed (read-only
+        // image layer). Fail with a clear, actionable phase instead of the raw
+        // "copy new binary: Permission denied".
+        if running_in_docker() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            set_phase(
+                "failed: Running in Docker — update by pulling the new image (docker compose pull && docker compose up -d)",
+            );
+            return;
+        }
 
         let binary_name = if cfg!(windows) {
             "tune-server.exe"
