@@ -3973,34 +3973,10 @@ fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
 
 /// Simple linear-interpolation resampler for rate conversion.
 /// Kept as a fallback — the main path now uses rubato sinc resampling.
-#[allow(dead_code)]
-fn simple_resample(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> Vec<f32> {
-    if from_sr == to_sr {
-        return samples.to_vec();
-    }
-    let ch = channels as usize;
-    let in_frames = samples.len() / ch;
-    if in_frames == 0 {
-        return Vec::new();
-    }
-    let ratio = to_sr as f64 / from_sr as f64;
-    let out_frames = (in_frames as f64 * ratio) as usize;
-    let mut out = Vec::with_capacity(out_frames * ch);
-
-    for i in 0..out_frames {
-        let src_pos = i as f64 / ratio;
-        let idx = src_pos as usize;
-        let frac = (src_pos - idx as f64) as f32;
-        let idx0 = idx.min(in_frames - 1);
-        let idx1 = (idx + 1).min(in_frames - 1);
-        for c in 0..ch {
-            let s0 = samples[idx0 * ch + c];
-            let s1 = samples[idx1 * ch + c];
-            out.push(s0 + (s1 - s0) * frac);
-        }
-    }
-    out
-}
+/// Implementation lives in `crate::audio` so the radio→WAV proxy (DLNA, not
+/// gated behind `local-audio`) can share it; re-exported here for the local
+/// pipeline's existing call sites and tests.
+pub(crate) use crate::audio::simple_resample;
 
 /// Resample a complete buffer of interleaved f32 samples using rubato sinc.
 ///
