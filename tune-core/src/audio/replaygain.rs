@@ -55,6 +55,13 @@ const MAX_ANALYSIS_EST_BYTES: u64 = 1_200_000_000;
 /// up to ~2 min for a very long hi-res track), tight vs. an indefinite hang.
 const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
 
+/// How long the sweep backs off after finding a zone actively playing. The
+/// track pass fully decodes files — often over a network (SMB/NAS) mount — and
+/// on a busy link that starves the same disk/network the player reads from,
+/// stalling the audio pipeline (#1310, « la musique s'arrête au premier
+/// morceau »). The pass yields entirely while anything plays, then rechecks.
+const PLAYBACK_BACKOFF_SECS: u64 = 30;
+
 /// The 12 B/sample estimate above, from the DB columns the scan filled.
 /// Unknown rate/channels fall back to CD stereo; unknown duration returns 0
 /// (no basis to refuse — the track is analysed as before).
@@ -103,6 +110,22 @@ fn enabled(settings: &SettingsRepo) -> bool {
         .unwrap_or(true)
 }
 
+/// True if any zone is currently playing, per the persisted `last_play_state`
+/// the orchestrator writes on every play/pause/stop. The ReplayGain track pass
+/// must yield to playback (#1310): decoding whole files — often over a network
+/// mount — otherwise saturates the same disk/network the player reads from and
+/// stalls audio. Fails open (returns `false`) on a query error so a DB hiccup
+/// can never freeze the sweep permanently.
+fn any_zone_playing(backend: &Arc<dyn DbBackend>) -> bool {
+    matches!(
+        backend.query_one(
+            "SELECT 1 FROM zones WHERE last_play_state = 'playing' LIMIT 1",
+            &[],
+        ),
+        Ok(Some(_))
+    )
+}
+
 /// Spawn the background ReplayGain analysis loop. Drains tracks that lack
 /// ReplayGain, then idles; picks up any new tracks after later scans on its own.
 pub fn spawn(backend: Arc<dyn DbBackend>) {
@@ -112,9 +135,19 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
-                let did = analyze_track_batch(&backend).await;
+                // Yield the decode-heavy track pass to playback (#1310). The
+                // album pass is pure DB math (no file decode), so it keeps
+                // making progress even while a zone plays.
+                let playing = any_zone_playing(&backend);
+                let did = if playing {
+                    0
+                } else {
+                    analyze_track_batch(&backend).await
+                };
                 let albums = analyze_album_batch(&backend);
-                if did == 0 && albums == 0 {
+                if playing {
+                    tokio::time::sleep(std::time::Duration::from_secs(PLAYBACK_BACKOFF_SECS)).await;
+                } else if did == 0 && albums == 0 {
                     tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
                 } else {
                     // More to do — loop again promptly (the per-file pauses
@@ -158,6 +191,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     for r in &rows {
+        // Playback can start mid-batch; yield at once so a decode never
+        // competes with the audio pipeline (#1310).
+        if any_zone_playing(backend) {
+            debug!("replaygain_yield_to_playback — zone playing, pausing sweep mid-batch");
+            break;
+        }
         let track_id = match r.first().and_then(|v| v.as_i64()) {
             Some(id) => id,
             None => continue,
