@@ -7082,6 +7082,24 @@ fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
 /// Decodes packets progressively and converts to interleaved 16-bit PCM bytes.
 /// The loop runs until the stream ends, the sender is dropped (stop), or an
 /// unrecoverable error occurs.
+/// Choose a renderer-safe WAV output sample rate for a decoded radio stream.
+///
+/// Most DLNA/UPnP renderers only lock onto 44.1/48 kHz (and higher standard
+/// multiples). HE-AAC / aacPlus streams (Radio Morow: `morow_hi.aacp`) decode
+/// at the AAC-LC core rate — typically 22050 Hz — because symphonia does not
+/// apply the SBR extension that would double the rate to 44100. A 22050 Hz WAV
+/// is reported as PLAYING yet emitted as SILENCE by many renderers (Yves,
+/// LHC-60). We upsample any sub-44.1 kHz stream to 44100 Hz so sound is
+/// guaranteed. Streams already at 44.1 kHz or above pass through unchanged, so
+/// stations that already work incur no extra CPU and no quality change.
+pub(crate) fn renderer_safe_wav_rate(source_rate: u32) -> u32 {
+    if source_rate < 44_100 {
+        44_100
+    } else {
+        source_rate
+    }
+}
+
 fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -7243,13 +7261,19 @@ fn decode_radio_stream_to_pcm(
             _ => {}
         }
 
-        // Publish the true decoded format so the HTTP handler advertises the
-        // correct WAV sample rate/channels to the renderer (FIP is 48000, not
-        // the placeholder 44100 in StreamInfo). Set BEFORE first_chunk so the
-        // header, which is emitted after data_ready, reflects the real rate.
+        // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
+        // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
+        // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
+        let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
+        let needs_resample = output_sample_rate != source_sample_rate;
+
+        // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
+        // that matches the PCM we actually feed (FIP is 48000 → advertised as
+        // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
+        // BEFORE first_chunk so the header, emitted after data_ready, is right.
         session
             .detected_sample_rate
-            .store(source_sample_rate, std::sync::atomic::Ordering::Relaxed);
+            .store(output_sample_rate, std::sync::atomic::Ordering::Relaxed);
         session
             .detected_channels
             .store(source_channels, std::sync::atomic::Ordering::Relaxed);
@@ -7260,6 +7284,8 @@ fn decode_radio_stream_to_pcm(
         info!(
             channels = source_channels,
             sample_rate = source_sample_rate,
+            output_sample_rate = output_sample_rate,
+            resampled = needs_resample,
             reconnect = reconnects,
             gap_ms = ?gap_ms,
             "radio_local_decode_started"
@@ -7320,11 +7346,23 @@ fn decode_radio_stream_to_pcm(
             // Convert decoded audio buffer to interleaved 16-bit PCM bytes
             let channels = decoded.spec().channels().count();
             let frames = decoded.frames();
-            let mut packet_buf: Vec<u8> = Vec::with_capacity(frames * channels * 2);
 
             let mut interleaved: Vec<f32> = Vec::with_capacity(frames * channels);
             decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
 
+            // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
+            // before packing to i16, so the bytes match the advertised WAV
+            // header. No-op (single move) when the stream is already 44.1/48.
+            if needs_resample {
+                interleaved = crate::audio::simple_resample(
+                    &interleaved,
+                    source_sample_rate,
+                    output_sample_rate,
+                    channels as u16,
+                );
+            }
+
+            let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
             for sample in &interleaved {
                 let s16: i16 = (*sample).into_sample();
                 packet_buf.extend_from_slice(&s16.to_le_bytes());
@@ -7342,7 +7380,7 @@ fn decode_radio_stream_to_pcm(
                         &chunk,
                         16,
                         channels as u16,
-                        source_sample_rate,
+                        output_sample_rate,
                     );
                 }
                 if rt.block_on(tx.send(chunk)).is_err() {
@@ -7409,6 +7447,44 @@ fn resolve_existing_local_path(stored: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    /// Le débit WAV servi au renderer DLNA doit être « renderer-safe » : un
+    /// flux HE-AAC/aacPlus décodé à 22050 Hz (Radio Morow) est rééchantillonné
+    /// à 44100 Hz pour être audible ; un flux déjà en 44,1/48 kHz (ou plus)
+    /// passe inchangé, sans rééchantillonnage inutile.
+    #[test]
+    fn renderer_safe_rate_upsamples_low_rates_only() {
+        use super::renderer_safe_wav_rate;
+        // HE-AAC core rate → upsample to 44100
+        assert_eq!(renderer_safe_wav_rate(22050), 44100);
+        // Other low/non-standard rates → 44100
+        assert_eq!(renderer_safe_wav_rate(11025), 44100);
+        assert_eq!(renderer_safe_wav_rate(16000), 44100);
+        assert_eq!(renderer_safe_wav_rate(24000), 44100);
+        assert_eq!(renderer_safe_wav_rate(32000), 44100);
+        // Standard rates pass through unchanged (no needless resample)
+        assert_eq!(renderer_safe_wav_rate(44100), 44100);
+        assert_eq!(renderer_safe_wav_rate(48000), 48000);
+        // Hi-res radio kept as-is
+        assert_eq!(renderer_safe_wav_rate(88200), 88200);
+        assert_eq!(renderer_safe_wav_rate(96000), 96000);
+    }
+
+    /// Le rééchantillonnage 22050→44100 double bien le nombre de trames
+    /// (ratio 2.0) et préserve l'entrelacement stéréo : la sortie doit avoir
+    /// un nombre de trames pair et cohérent avec le ratio.
+    #[test]
+    fn radio_resample_doubles_frames_at_2x() {
+        // 1024 stereo frames of test signal (interleaved f32)
+        let in_frames = 1024usize;
+        let src: Vec<f32> = (0..in_frames * 2).map(|i| (i as f32) * 0.001).collect();
+        let out = crate::audio::simple_resample(&src, 22050, 44100, 2);
+        // 22050 → 44100 is exactly 2x
+        assert_eq!(out.len(), in_frames * 2 * 2);
+        // Identity when rate unchanged (44100 → 44100)
+        let same = crate::audio::simple_resample(&src, 44100, 44100, 2);
+        assert_eq!(same, src);
+    }
 
     /// La sonde de niveaux proxy (VU-mètres Qobuz/Tidal direct) décode un
     /// flux HTTP en fenêtres brutes : 1 s de WAV silencieux servie par un
