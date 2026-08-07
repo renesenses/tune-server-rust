@@ -65,6 +65,7 @@ pub mod skins;
 pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
+pub mod smart_refs;
 pub mod snapcast;
 pub mod social;
 pub mod sonos;

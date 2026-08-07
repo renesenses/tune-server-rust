@@ -9,6 +9,8 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::Engine;
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
+use crate::routes::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -95,6 +97,17 @@ async fn create_smart_playlist(
     let sort_by = body.sort_by.clone().unwrap_or_else(|| "title".into());
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
+    // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
+    let resolver = DbRefResolver::new(&state);
+    smart_refs::check_no_cycle(
+        &resolver,
+        RefKind::SmartPlaylist,
+        None,
+        &body.name,
+        &rules_json,
+    )
+    .map_err(AppError::bad_request)?;
+
     let sql = if state.backend.engine() == Engine::Postgres {
         "INSERT INTO smart_playlists (name, rules, match_mode, sort_by, sort_order, max_tracks) VALUES ($1, $2, $3, $4, $5, $6)"
     } else {
@@ -176,6 +189,28 @@ async fn update_smart_playlist(
     Json(body): Json<UpdateSmartPlaylist>,
 ) -> Result<impl IntoResponse, AppError> {
     let pg = state.backend.engine() == Engine::Postgres;
+
+    // Refuse les références circulaires avant d'écrire quoi que ce soit.
+    if let Some(ref rules) = body.rules {
+        let self_name = body
+            .name
+            .clone()
+            .or_else(|| {
+                DbRefResolver::new(&state)
+                    .smart_entity(RefKind::SmartPlaylist, id)
+                    .map(|e| e.name)
+            })
+            .unwrap_or_else(|| format!("#{id}"));
+        let resolver = DbRefResolver::new(&state);
+        smart_refs::check_no_cycle(
+            &resolver,
+            RefKind::SmartPlaylist,
+            Some(id),
+            &self_name,
+            &rules.to_string(),
+        )
+        .map_err(AppError::bad_request)?;
+    }
 
     if let Some(ref name) = body.name {
         let sql = if pg {
@@ -304,12 +339,13 @@ async fn delete_smart_playlist(
 }
 
 /// Build WHERE, ORDER, LIMIT clauses from smart playlist criteria.
-fn build_smart_query(
+pub(crate) fn build_smart_query(
     rules_json: &str,
     match_mode: &str,
     sort_by: &str,
     sort_order: &str,
     max_tracks: Option<i64>,
+    ctx: &RefCtx,
 ) -> (String, String, String) {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
     let joiner = if match_mode == "any" { " OR " } else { " AND " };
@@ -329,6 +365,12 @@ fn build_smart_query(
             other => other,
         };
         let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+        // --- règles « référence » (collection / playlist / favori) ---
+        if smart_refs::is_ref_field(field) {
+            conditions.push(smart_refs::track_ref_condition(field, raw_op, value, ctx));
+            continue;
+        }
 
         let val_clean = value.replace('\'', "''");
         let val_unaccented = strip_accents(&val_clean);
@@ -564,6 +606,7 @@ fn load_smart_criteria(
 
 async fn resolve_tracks(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let Some((rules_json, sort_by, sort_order, match_mode, max_tracks)) =
@@ -572,8 +615,16 @@ async fn resolve_tracks(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let (where_clause, order, limit_clause) =
-        build_smart_query(&rules_json, &match_mode, &sort_by, &sort_order, max_tracks);
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let (where_clause, order, limit_clause) = build_smart_query(
+        &rules_json,
+        &match_mode,
+        &sort_by,
+        &sort_order,
+        max_tracks,
+        &ctx,
+    );
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!(items)).into_response())
@@ -581,6 +632,7 @@ async fn resolve_tracks(
 
 async fn smart_collection_albums(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let Some((rules_json, sort_by, sort_order, match_mode, max_tracks)) =
@@ -589,8 +641,16 @@ async fn smart_collection_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let (where_clause, order, limit_clause) =
-        build_smart_query(&rules_json, &match_mode, &sort_by, &sort_order, max_tracks);
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let (where_clause, order, limit_clause) = build_smart_query(
+        &rules_json,
+        &match_mode,
+        &sort_by,
+        &sort_order,
+        max_tracks,
+        &ctx,
+    );
     let tracks = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     // Group tracks by album_id, dedup albums
@@ -615,6 +675,7 @@ async fn smart_collection_albums(
 
 async fn preview_smart_collection(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
     let rules_json = body.rules.to_string();
@@ -622,12 +683,15 @@ async fn preview_smart_collection(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let (where_clause, order, limit_clause) = build_smart_query(
         &rules_json,
         match_mode,
         sort_by,
         sort_order,
         body.max_tracks,
+        &ctx,
     );
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
@@ -718,9 +782,11 @@ fn strip_accents(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::build_smart_query;
+    use crate::routes::smart_refs::{EmptyResolver, RefCtx};
 
     fn where_of(rules: &str) -> String {
-        let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None);
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None, &ctx);
         w
     }
 
@@ -764,5 +830,25 @@ mod tests {
             "expected a non-empty WHERE, got: {w}"
         );
         assert_eq!(w.matches(" AND ").count(), 2, "three rules → two ANDs: {w}");
+    }
+
+    #[test]
+    fn favorite_track_rule_builds_condition() {
+        let w = where_of(r#"[{"field":"favorite","op":"is","value":"track"}]"#);
+        assert!(w.contains("t.id IN (SELECT item_id FROM favorites"), "{w}");
+        assert!(w.contains("item_type = 'track'"), "{w}");
+    }
+
+    #[test]
+    fn in_playlist_rule_combines_with_genre() {
+        let w = where_of(
+            r#"[{"field":"genre","op":"contains","value":"Rock"},
+                {"field":"in_playlist","op":"not_in","value":"classic:3"}]"#,
+        );
+        assert!(w.contains(" AND "), "{w}");
+        assert!(
+            w.contains("t.id NOT IN (SELECT track_id FROM playlist_tracks"),
+            "{w}"
+        );
     }
 }
