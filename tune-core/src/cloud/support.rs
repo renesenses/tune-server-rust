@@ -73,6 +73,62 @@ pub async fn create_ticket(
     parse(resp).await
 }
 
+/// Une pièce jointe reçue du client web, prête à être relayée à mozaiklabs
+/// telle quelle (le serveur Tune ne la stocke pas — il ne fait que la
+/// transmettre dans le multipart sortant).
+pub struct AttachmentUpload {
+    /// Nom de fichier d'origine (ex. `capture.png`).
+    pub file_name: String,
+    /// Type MIME résolu (déjà validé côté serveur).
+    pub content_type: String,
+    /// Contenu brut du fichier.
+    pub bytes: Vec<u8>,
+}
+
+/// Ouvre un ticket AVEC pièces jointes : relaie un `multipart/form-data` vers
+/// mozaiklabs (mêmes champs que [`create_ticket`], plus `attachments[]`). La
+/// version de Tune et l'OS sont injectés ici, jamais fournis par le client.
+/// Les `fields` (subject/body/category/…) sont transmis tels quels ; l'appelant
+/// (route serveur) a déjà validé nombre, taille et type des fichiers.
+pub async fn create_ticket_multipart(
+    http_client: &reqwest::Client,
+    auth: &SupportAuth,
+    fields: Vec<(String, String)>,
+    files: Vec<AttachmentUpload>,
+) -> SupportResult {
+    let mut form = reqwest::multipart::Form::new()
+        .text("tune_version", crate::version())
+        .text("platform", std::env::consts::OS);
+
+    for (name, value) in fields {
+        form = form.text(name, value);
+    }
+
+    for file in files {
+        let part = reqwest::multipart::Part::bytes(file.bytes)
+            .file_name(file.file_name)
+            .mime_str(&file.content_type)
+            .map_err(|e| {
+                (
+                    400u16,
+                    json!({ "error": "attachment_invalid_mime", "detail": e.to_string() }),
+                )
+            })?;
+        // mozaiklabs attend `attachments[]` (règle Laravel `attachments.*`).
+        form = form.part("attachments[]", part);
+    }
+
+    let resp = auth
+        .apply(http_client.post(SUPPORT_API))
+        .multipart(form)
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(request_error)?;
+
+    parse(resp).await
+}
+
 /// Liste les tickets du compte premium.
 pub async fn list_tickets(http_client: &reqwest::Client, auth: &SupportAuth) -> SupportResult {
     let resp = auth
