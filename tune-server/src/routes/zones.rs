@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use tune_core::audio::formats::AudioFormat;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::{Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
@@ -80,6 +81,46 @@ struct PatchZone {
     /// a renderer with a cold-start under-run buffer before its transport clock
     /// starts (first seconds hachées — Cyrille, Yamaha R-N2000A).
     dlna_play_delay_ms: Option<i64>,
+    /// Marque choisie par l'utilisateur dans le catalogue (ou « Autre »).
+    /// Persistée en setting `zone_{id}_brand`. Chaîne vide = efface l'override.
+    brand: Option<String>,
+    /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
+    /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
+    model: Option<String>,
+}
+
+/// Injecte l'identité appareil d'une zone dans son JSON de sortie :
+/// - `brand` / `model` : override choisi par l'utilisateur (peut être `null`) ;
+/// - `detected_manufacturer` / `detected_model` : détection UPnP du device
+///   assigné (peut être `null`).
+///
+/// Le client affiche en priorité l'override utilisateur, sinon la détection
+/// UPnP (override > détection).
+fn inject_device_identity(
+    obj: &mut serde_json::Map<String, Value>,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    detected: Option<&tune_core::discovery::device::DiscoveredDevice>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let brand = settings
+        .get(&format!("zone_{zone_id}_brand"))
+        .ok()
+        .flatten();
+    let model = settings
+        .get(&format!("zone_{zone_id}_model"))
+        .ok()
+        .flatten();
+    obj.insert("brand".into(), json!(brand));
+    obj.insert("model".into(), json!(model));
+    obj.insert(
+        "detected_manufacturer".into(),
+        json!(detected.and_then(|d| d.manufacturer.clone())),
+    );
+    obj.insert(
+        "detected_model".into(),
+        json!(detected.and_then(|d| d.model.clone())),
+    );
 }
 
 pub fn router() -> Router<AppState> {
@@ -1057,6 +1098,11 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_play_delay_ms".into(),
                 json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
             );
+            let detected_dev = z
+                .output_device_id
+                .as_deref()
+                .and_then(|did| devices.iter().find(|d| d.id == did));
+            inject_device_identity(obj, &state.backend, zone_id, detected_dev);
             let online = match z.output_type.as_deref() {
                 // Browser zones have no output device by design (the web
                 // client pulls stream_url itself) — always online.
@@ -1167,6 +1213,11 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "dlna_play_delay_ms".into(),
                     json!(repo.get_dlna_play_delay_ms(id)),
                 );
+                let detected_dev = zone
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|did| devices.iter().find(|d| d.id == did));
+                inject_device_identity(obj, &state.backend, id, detected_dev);
                 let online = match zone.output_type.as_deref() {
                     // Same rules as list_zones: browser zones need no device;
                     // a local zone without output_device_id is an orphan that
@@ -1321,6 +1372,32 @@ async fn patch_zone(
                     dlna.set_play_delay(effective);
                 }
             }
+        }
+    }
+    // Marque / modèle choisis par l'utilisateur → settings zone_{id}_brand/model.
+    // Chaîne vide = suppression de l'override (retour à la détection UPnP).
+    if let Some(ref brand) = body.brand {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_brand");
+        let r = if brand.trim().is_empty() {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, brand.trim())
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(ref model) = body.model {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_model");
+        let r = if model.trim().is_empty() {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, model.trim())
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
     get_zone(State(state), Path(id)).await.into_response()
