@@ -22,6 +22,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_devices))
         .route("/list", get(list_devices))
+        // Catalogue statique marque→modèles (+ quirks) pour l'UI de config zone.
+        .route("/catalog", get(device_catalog))
         .route("/add", post(add_device))
         .route("/scan", post(scan_devices))
         .route("/rescan", post(rescan_local_devices))
@@ -43,6 +45,13 @@ pub fn router() -> Router<AppState> {
             "/{device_id}/airplay2/pair-pin-start",
             post(airplay2_pair_pin_start),
         )
+}
+
+/// Catalogue statique des appareils (marque → modèles + profils de quirks).
+/// Donnée versionnée embarquée dans le binaire ; sert à peupler les menus
+/// déroulants Marque/Modèle de la config d'une zone.
+async fn device_catalog() -> Json<Value> {
+    Json(json!(tune_core::device_catalog::catalog()))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {

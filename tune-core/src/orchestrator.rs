@@ -2206,7 +2206,16 @@ impl PlaybackOrchestrator {
             .ok()
             .flatten();
         let zone_output_type = zone.as_ref().and_then(|z| z.output_type.clone());
-        let zone_max_sample_rate = zone.as_ref().and_then(|z| z.max_sample_rate);
+        // Quirks catalogue (marque+modèle choisis par l'utilisateur pour la zone).
+        // Additif : n'a d'effet que si l'utilisateur a explicitement sélectionné
+        // un modèle catalogué. Sinon profil neutre (aucun changement).
+        let device_quirks = crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id);
+        // Le plafond catalogue se combine en `min` avec l'override de zone : il
+        // ne peut que rendre la contrainte plus stricte, jamais l'assouplir.
+        let zone_max_sample_rate = crate::device_catalog::combine_max_sample_rate(
+            zone.as_ref().and_then(|z| z.max_sample_rate),
+            device_quirks.max_sample_rate,
+        );
 
         let is_oaat_output = req
             .output_device_id
@@ -2242,7 +2251,8 @@ impl PlaybackOrchestrator {
             if dsd_mode == "native" || dsd_mode == "dop" {
                 let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
                 let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
-                let zone_max_sr = zone.as_ref().and_then(|z| z.max_sample_rate);
+                // Réutilise le plafond déjà combiné avec le quirk catalogue.
+                let zone_max_sr = zone_max_sample_rate;
                 if let Some(max_sr) = zone_max_sr {
                     if dop_rate > max_sr {
                         info!(
@@ -2395,9 +2405,12 @@ impl PlaybackOrchestrator {
         // Forces a 16-bit downconvert (kept as FLAC) instead of direct
         // passthrough, without regressing renderers that genuinely play 24-bit.
         // Only meaningful when the source is deeper than 16-bit.
+        // Flag zone `dlna_cap_16bit` OR quirk catalogue `force_16bit` (additif :
+        // le quirk ne peut que l'activer, jamais le désactiver — Ruark R3 #1137).
         let dlna_cap_16bit = is_network_output
             && bit_depth > 16
-            && ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id);
+            && (ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id)
+                || device_quirks.force_16bit);
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
             && !dlna_force_wav

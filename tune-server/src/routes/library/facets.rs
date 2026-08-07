@@ -473,7 +473,15 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
             .get(2)
             .and_then(|v| v.as_string())
             .unwrap_or_else(|| "all".into());
-        let where_clause = smart_collection_where(&rules, &match_mode, &conds);
+        // Résolveur branché sur la base + profil par défaut (1), cohérent avec
+        // la convention « profil 1 » du reste des facettes ; laisse les
+        // nouveaux critères référence/favori compter correctement.
+        let resolver = crate::routes::smart_refs::DbRefResolver::new(state);
+        let ctx = crate::routes::smart_refs::RefCtx::root(
+            &resolver,
+            Some(crate::routes::active_profile::DEFAULT_PROFILE_ID),
+        );
+        let where_clause = smart_collection_where(&rules, &match_mode, &conds, &ctx);
         // COUNT(DISTINCT t.id): track-level rules count matching tracks;
         // album-level rules (added_at, play_count…) count every track of the
         // matching albums. Same figure as the list endpoint's `track_count`
@@ -504,9 +512,14 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
 /// part is parenthesized so an `any` (OR-joined) collection isn't rebound by
 /// the appended ANDs. An empty rules WHERE means "matches everything" — that is
 /// the engine's semantic for rules it cannot compile.
-fn smart_collection_where(rules_json: &str, match_mode: &str, extra_conds: &[String]) -> String {
+fn smart_collection_where(
+    rules_json: &str,
+    match_mode: &str,
+    extra_conds: &[String],
+    ctx: &crate::routes::smart_refs::RefCtx,
+) -> String {
     let (wc, _, _) = crate::routes::smart_collections::build_album_query(
-        rules_json, match_mode, "title", "asc", None,
+        rules_json, match_mode, "title", "asc", None, ctx,
     );
     if extra_conds.is_empty() {
         return wc;
@@ -540,7 +553,12 @@ pub(super) fn smart_collection_track_ids(state: &AppState, name: &str) -> Option
         .get(2)
         .and_then(|v| v.as_string())
         .unwrap_or_else(|| "all".into());
-    let where_clause = smart_collection_where(&rules, &match_mode, &[]);
+    let resolver = crate::routes::smart_refs::DbRefResolver::new(state);
+    let ctx = crate::routes::smart_refs::RefCtx::root(
+        &resolver,
+        Some(crate::routes::active_profile::DEFAULT_PROFILE_ID),
+    );
+    let where_clause = smart_collection_where(&rules, &match_mode, &[], &ctx);
     let sql = format!(
         "SELECT DISTINCT t.id FROM albums al \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -640,15 +658,17 @@ fn kv_facet(
 #[cfg(test)]
 mod tests {
     use super::smart_collection_where;
+    use crate::routes::smart_refs::{EmptyResolver, RefCtx};
 
     #[test]
     fn smart_where_parenthesizes_any_rules_before_extra_conds() {
         // An `any` collection is OR-joined; the appended facet conditions must
         // not rebind (`a OR b AND c` would read as `a OR (b AND c)`).
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let rules = r#"[{"field":"genre","operator":"contains","value":"soul"},
                         {"field":"genre","operator":"contains","value":"funk"}]"#;
         let conds = vec!["t.year = ?".to_string()];
-        let wc = smart_collection_where(rules, "any", &conds);
+        let wc = smart_collection_where(rules, "any", &conds, &ctx);
         assert!(wc.starts_with("WHERE ("), "{wc}");
         assert!(wc.contains(") AND t.year = ?"), "{wc}");
     }
@@ -657,8 +677,9 @@ mod tests {
     fn smart_where_extra_conds_only() {
         // Rules the engine cannot compile mean "matches everything": the extra
         // facet conditions must still form a valid WHERE on their own.
-        let wc = smart_collection_where("[]", "all", &["t.year = ?".to_string()]);
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let wc = smart_collection_where("[]", "all", &["t.year = ?".to_string()], &ctx);
         assert_eq!(wc, "WHERE t.year = ?");
-        assert_eq!(smart_collection_where("[]", "all", &[]), "");
+        assert_eq!(smart_collection_where("[]", "all", &[], &ctx), "");
     }
 }

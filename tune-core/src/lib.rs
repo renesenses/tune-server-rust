@@ -18,6 +18,7 @@ pub mod dashboard;
 pub mod db;
 pub mod db_backup;
 pub mod deezer_proxy;
+pub mod device_catalog;
 pub mod digest;
 pub mod discovery;
 pub mod event_bus;
