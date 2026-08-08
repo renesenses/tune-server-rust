@@ -1,0 +1,38 @@
+# `cross` configuration — cross-compilation inside Docker (arm64 Linux targets).
+#
+# ## Pourquoi : libopus lié en dynamique dans un binaire statique (#1288)
+#
+# `audiopus_sys` (libopus vendored, feature Opus natif livrée en v0.9.51 #1260)
+# décide statique-vs-dynamique dans son `build.rs` via :
+#
+#     #[cfg(any(windows, target_os = "macos", target_env = "musl"))] -> statique
+#     #[cfg(all(unix, target_env = "gnu"))]                          -> dynamique
+#
+# Piège : un build script est compilé pour l'**hôte**, pas pour la cible. En
+# cross-compilation musl depuis le conteneur `cross` (hôte x86_64-gnu), ces
+# `cfg!` voient `gnu` et retiennent le lien **dynamique** — alors que la cible
+# est musl et que rustc passe `-static` au linker. Résultat : libopus est bien
+# construite (libopus.a via CMake) mais rustc émet `-Wl,-Bdynamic -lopus`, le
+# cross-linker cherche un `libopus.so` inexistant et le job
+# `aarch64-unknown-linux-musl` de release.yml échoue au linkage — seule cible
+# manquante des 7 depuis la v0.9.53.
+#
+# `LIBOPUS_STATIC` est lu depuis l'environnement (pas via `cfg!`), donc il n'est
+# pas affecté par la confusion hôte/cible : il force `rustc-link-lib=static=opus`.
+# `LIBOPUS_NO_PKG` court-circuite la sonde `pkg-config` pour garantir qu'on lie
+# la libopus vendored de la cible et jamais une libopus système de l'hôte.
+#
+# Défini ici (et non dans release.yml) pour que le build musl soit reproductible
+# à l'identique en local (`cross build --target aarch64-unknown-linux-musl`).
+# La cible **gnu** est volontairement laissée telle quelle : elle lie libopus en
+# dynamique depuis toujours et fonctionne (Docker bookworm, images Tune OS RPi).
+[target.aarch64-unknown-linux-musl.env]
+passthrough = [
+    "LIBOPUS_STATIC=1",
+    "LIBOPUS_NO_PKG=1",
+    # Le CMakeLists de la libopus vendored déclare un `cmake_minimum_required`
+    # antérieur à 3.5 ; cf le commentaire détaillé dans .cargo/config.toml.
+    # Cargo applique bien son `[env]`, mais on le répète ici pour que la valeur
+    # soit présente dans l'environnement du conteneur au moment où CMake tourne.
+    "CMAKE_POLICY_VERSION_MINIMUM=3.5",
+]
