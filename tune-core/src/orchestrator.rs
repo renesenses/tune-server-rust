@@ -1661,30 +1661,53 @@ impl PlaybackOrchestrator {
             "pcm" => false,
             "native" => true,
             _ => {
-                // Auto mode: probe renderer
+                // Auto mode: probe renderer.
+                //
+                // Only a CONCLUSIVE probe goes into the cache. `probe_dsd_support`
+                // returns `None` when GetProtocolInfo failed or the Sink was
+                // empty, and a renderer that isn't a DLNA output (or has since
+                // left the map) is just as inconclusive. Caching those would
+                // pin the device to "no DSD" for the whole process lifetime —
+                // a single transient failure right after discovery would
+                // silently force DSD→PCM transcoding on a renderer that plays
+                // DSD natively, with no way to recover short of a restart.
+                // Same rule as `DlnaOutput::supports_mime`.
                 let mut cache = self.dsd_capabilities.lock().await;
                 if let Some(cap) = cache.get(device_id) {
                     return cap.supports_dsf || cap.supports_dff;
                 }
                 let cap = {
                     let arc = { self.outputs.lock().await.get(device_id) };
-                    if let Some(output) = arc {
-                        let locked = output.lock().await;
-                        if let Some(dlna) = locked
-                            .as_any()
-                            .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-                        {
-                            dlna.probe_dsd_support().await
-                        } else {
-                            crate::outputs::dlna::DsdCapability::default()
+                    match arc {
+                        Some(output) => {
+                            let locked = output.lock().await;
+                            match locked
+                                .as_any()
+                                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                            {
+                                Some(dlna) => dlna.probe_dsd_support().await,
+                                None => None,
+                            }
                         }
-                    } else {
-                        crate::outputs::dlna::DsdCapability::default()
+                        None => None,
                     }
                 };
-                let result = cap.supports_dsf || cap.supports_dff;
-                cache.insert(device_id.to_string(), cap);
-                result
+                match cap {
+                    Some(cap) => {
+                        let result = cap.supports_dsf || cap.supports_dff;
+                        cache.insert(device_id.to_string(), cap);
+                        result
+                    }
+                    None => {
+                        // Inconclusive: fall back to the safe path (transcode to
+                        // PCM) for THIS track only, and re-probe next time.
+                        tracing::debug!(
+                            device_id,
+                            "dsd_probe_inconclusive_not_cached_falling_back_to_pcm"
+                        );
+                        false
+                    }
+                }
             }
         }
     }
