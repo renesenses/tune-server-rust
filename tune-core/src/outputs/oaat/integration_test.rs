@@ -239,14 +239,32 @@ mod tests {
             "native DSD must use the local-file gapless path (no transcode session)"
         );
 
-        // PCM direct-file playback: PrepareNext is ignored on that loop, so
-        // NO internal gapless — the poller must advance at natural end
-        // (local→local sur zone OAAT : silence + piste rejouée, 29/07).
+        // PCM direct-file playback: the loop now stages the next local file and
+        // swaps buffers at EOF, so gapless must be armed AND the next track
+        // staged as a local file — a transcode URL would be useless to it.
         output.set_direct_pcm_active_for_test(true);
         assert!(
-            !output.supports_internal_gapless(),
-            "direct PCM playback cannot chain internally — poller must advance"
+            output.supports_internal_gapless(),
+            "direct PCM playback chains internally — gapless must be armed"
         );
+        assert!(
+            output.prefers_local_file_gapless(),
+            "direct PCM playback swaps local PCM buffers, not transcode URLs"
+        );
+
+        // The #1006 guarantee, in its new form: when the loop reaches an end
+        // with nothing to chain into (next track not local, format change,
+        // decode failure) it raises `chain_exhausted`, and the queue returns to
+        // the poller's natural-end advance. Without this the poller would sit
+        // out its guard waiting for a transition that cannot come — silence,
+        // then the same track replayed (local→local on an OAAT zone, 29/07).
+        output.set_direct_chain_exhausted_for_test(true);
+        assert!(
+            !output.supports_internal_gapless(),
+            "an exhausted chain must hand the queue back to the poller"
+        );
+
+        output.set_direct_chain_exhausted_for_test(false);
         output.set_direct_pcm_active_for_test(false);
         assert!(output.supports_internal_gapless());
 

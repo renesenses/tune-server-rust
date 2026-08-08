@@ -101,6 +101,11 @@ pub struct OaatOutput {
     /// dernier est rejoué » — local→local sur zone OAAT, .18, 29/07). Reset
     /// by `stop()` (called at the start of every `play_media`).
     direct_pcm_active: Arc<AtomicBool>,
+    /// Set by the direct-file loop when it reaches the end of a track with
+    /// nothing to chain into. The poller re-reads `supports_internal_gapless()`
+    /// while it waits for a transition, so flipping this releases it on the
+    /// next tick instead of letting it sit out its guard.
+    direct_chain_exhausted: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -136,6 +141,7 @@ impl OaatOutput {
             paused: Arc::new(AtomicBool::new(false)),
             native_dsd_active: Arc::new(AtomicBool::new(false)),
             direct_pcm_active: Arc::new(AtomicBool::new(false)),
+            direct_chain_exhausted: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(800)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
@@ -163,6 +169,11 @@ impl OaatOutput {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_direct_chain_exhausted_for_test(&self, exhausted: bool) {
+        self.direct_chain_exhausted
+            .store(exhausted, Ordering::SeqCst);
+    }
+
     pub(crate) fn set_direct_pcm_active_for_test(&self, active: bool) {
         self.direct_pcm_active.store(active, Ordering::SeqCst);
     }
@@ -326,22 +337,31 @@ impl OutputTarget for OaatOutput {
     ///   (native DSD)"). If the next track isn't a compatible native DSD file,
     ///   the loop ends cleanly and the poller's natural-end fallback advances.
     fn supports_internal_gapless(&self) -> bool {
-        // The PCM/FLAC direct-file loop cannot chain internally (PrepareNext
-        // ignored, ends with Stop + return): the poller must advance at
-        // natural end. Every other path (HTTP stream, native DSD dsf-swap)
-        // transitions internally.
-        !self.direct_pcm_active.load(Ordering::Relaxed)
+        // The direct-file loop now chains internally too: it stages the next
+        // local file while the current one plays and swaps buffers at EOF.
+        // It reports `direct_chain_exhausted` when it reaches an end with
+        // nothing staged (next track not local, format change, decode failure),
+        // which is what returns the queue to the poller's natural-end advance —
+        // the guarantee that #1006 was about, kept intact.
+        !self.direct_chain_exhausted.load(Ordering::Relaxed)
     }
 
-    /// While streaming native DSD, OAAT chains by opening the NEXT track's local
-    /// `.dsf` directly (raw DSD bits) — it cannot consume the orchestrator's
-    /// DSD->PCM transcode URL. Returning true tells the poller's `prepare_gapless`
-    /// to resolve the next track as a LOCAL FILE (no transcode session, so no
-    /// orphaned DSD decode / `dsd_streaming_send_timeout_10s`, the Xavier/Zicmu
-    /// stall) and stage it via `set_next_media(file_path=..)`. False for
-    /// PCM/FLAC/HTTP, which keeps the working URL-prefetch gapless.
+    /// True for the two paths that chain by opening the NEXT track's local file
+    /// rather than consuming a transcode URL:
+    ///
+    /// - **native DSD**, which streams raw DSD bits and cannot read the
+    ///   orchestrator's DSD->PCM transcode URL at all (an armed URL would orphan
+    ///   a decode nobody reads — `dsd_streaming_send_timeout`, the Xavier/Zicmu
+    ///   stall);
+    /// - **direct PCM/FLAC file playback**, which decodes whole files to a PCM
+    ///   buffer and swaps buffers at EOF.
+    ///
+    /// Returning true tells the poller's `prepare_gapless` to resolve the next
+    /// track as a LOCAL FILE and stage it via `set_next_media(file_path=..)`.
+    /// False for the HTTP-stream path, which keeps the URL-prefetch gapless.
     fn prefers_local_file_gapless(&self) -> bool {
         self.native_dsd_active.load(Ordering::Relaxed)
+            || self.direct_pcm_active.load(Ordering::Relaxed)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -381,6 +401,7 @@ impl OutputTarget for OaatOutput {
         let paused = self.paused.clone();
         let native_dsd_active = self.native_dsd_active.clone();
         let direct_pcm_active = self.direct_pcm_active.clone();
+        let direct_chain_exhausted = self.direct_chain_exhausted.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_arc = self.duration_ms.clone();
         let current_title = self.current_title.clone();
@@ -1170,20 +1191,115 @@ impl OutputTarget for OaatOutput {
                     }
 
                     diag.connected.store(true, Ordering::SeqCst);
-                    // Direct PCM playback: no internal gapless — the poller
-                    // takes over at natural end (see `direct_pcm_active`).
+                    // Direct PCM playback chains internally: the next local file
+                    // is staged while this one plays, and swapped in at EOF.
+                    // `direct_pcm_active` makes the poller stage a local FILE
+                    // (a transcode URL would be useless here).
                     direct_pcm_active.store(true, Ordering::SeqCst);
-                    info!(device = %device_name, bytes = pcm_data.len(), "oaat: direct file playback (poller advances at end)");
+                    info!(device = %device_name, bytes = pcm_data.len(), "oaat: direct file playback");
 
                     let mut offset = 0usize;
                     let mut sample_offset: u64 = 0;
                     // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
-                    let stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                    let start = std::time::Instant::now();
+                    let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                    let mut start = std::time::Instant::now();
+                    let mut pcm_data = pcm_data;
+                    let mut staged_next: Option<super::helpers::StagedDirectTrack> = None;
+                    let mut staged_rx: Option<
+                        tokio::sync::oneshot::Receiver<Option<super::helpers::StagedDirectTrack>>,
+                    > = None;
 
-                    while offset < pcm_data.len() && playing.load(Ordering::Relaxed) {
+                    'direct_tracks: loop {
+                        if !playing.load(Ordering::Relaxed) {
+                            break 'direct_tracks;
+                        }
+
+                        // End of the current track. If a next one is staged in a
+                        // matching format, close the track with LAST_PACKET and
+                        // swap buffers WITHOUT tearing the session down — the
+                        // same move the native DSD path makes. The poller sees
+                        // the position reset to 0 while still Playing and
+                        // advances the queue metadata.
+                        //
+                        // Before this, the direct path always stopped here: the
+                        // poller then had to notice the end, stop the zone,
+                        // reconnect, resync the clock and re-convert the next
+                        // file — six to seven seconds of silence between two
+                        // tracks of the same album (Xavier, 8 Aug 2026).
+                        if offset >= pcm_data.len() {
+                            // A user stop breaks out below without ever
+                            // reaching here, so anything staged at this point
+                            // belongs to a track that ended on its own.
+                            let next = staged_next.take().filter(|n| {
+                                super::helpers::staged_track_matches(
+                                    n,
+                                    cur_format,
+                                    cur_sample_rate,
+                                    cur_bits,
+                                    ch,
+                                )
+                            });
+                            match next {
+                                Some(next) => {
+                                    endpoint
+                                        .send_audio(
+                                            stream_num,
+                                            cur_format,
+                                            0,
+                                            sample_offset,
+                                            &[],
+                                            PacketFlags::LAST_PACKET,
+                                        )
+                                        .await
+                                        .ok();
+
+                                    info!(
+                                        device = %device_name,
+                                        title = %next.title,
+                                        "oaat: gapless transition (direct file)"
+                                    );
+
+                                    endpoint
+                                        .send_metadata(oaat_core::message::TrackMetadata {
+                                            title: next.title.clone(),
+                                            artist: next.artist.clone(),
+                                            album: next.album.clone(),
+                                            duration_ms: next.duration_ms,
+                                            artwork_url: next.cover_url.clone(),
+                                            format: Some(format_rate_display(
+                                                cur_sample_rate,
+                                                cur_bits,
+                                                cur_format,
+                                            )),
+                                        })
+                                        .await
+                                        .ok();
+
+                                    pcm_data = next.pcm;
+                                    offset = 0;
+                                    sample_offset = 0;
+                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                    start = std::time::Instant::now();
+                                    position_ms.store(0, Ordering::SeqCst);
+                                    duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
+                                    *current_title.lock().await = Some(next.title.clone());
+                                    *current_artist.lock().await = Some(next.artist.clone());
+                                    continue 'direct_tracks;
+                                }
+                                None => {
+                                    // Nothing to chain into. Tell the poller so it
+                                    // advances on its next tick (it re-reads
+                                    // supports_internal_gapless while waiting)
+                                    // instead of sitting out its guard.
+                                    direct_chain_exhausted.store(true, Ordering::SeqCst);
+                                    break 'direct_tracks;
+                                }
+                            }
+                        }
+
                         if stop_rx.try_recv().is_ok() {
-                            break;
+                            direct_chain_exhausted.store(true, Ordering::SeqCst);
+                            break 'direct_tracks;
                         }
                         // Unlike the HTTP-stream path (which polls command_rx in a
                         // select!), this direct-file loop only reacts to stop/pause
@@ -1201,9 +1317,56 @@ impl OutputTarget for OaatOutput {
                                 }
                                 OaatCommand::Pause => paused.store(true, Ordering::SeqCst),
                                 OaatCommand::Resume => paused.store(false, Ordering::SeqCst),
-                                // Seek/PrepareNext/etc. are not handled on the
-                                // direct path (unchanged from prior behaviour).
+                                // Stage the next track so we can chain into it
+                                // at EOF instead of tearing the session down.
+                                // Decoding runs on the blocking pool: a 190 MB
+                                // FLAC takes over a second through ffmpeg, which
+                                // inline would be an audible dropout.
+                                OaatCommand::PrepareNext {
+                                    title,
+                                    artist,
+                                    album,
+                                    cover_url,
+                                    duration_ms,
+                                    file_path: Some(next_path),
+                                    ..
+                                } => {
+                                    if staged_rx.is_none() && staged_next.is_none() {
+                                        let (tx, rx) = tokio::sync::oneshot::channel();
+                                        staged_rx = Some(rx);
+                                        let dev = device_name.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let staged = super::helpers::stage_direct_track(
+                                                &next_path,
+                                                title,
+                                                artist,
+                                                album,
+                                                cover_url,
+                                                duration_ms,
+                                            );
+                                            if staged.is_none() {
+                                                debug!(device = %dev, path = %next_path, "oaat: direct next track not stageable");
+                                            }
+                                            let _ = tx.send(staged);
+                                        });
+                                    }
+                                }
+                                // Seek and a next track without a local path are
+                                // not handled on the direct path.
                                 _ => {}
+                            }
+                        }
+
+                        // Collect the staged track without ever blocking the
+                        // packet cadence.
+                        if let Some(rx) = staged_rx.as_mut() {
+                            match rx.try_recv() {
+                                Ok(res) => {
+                                    staged_rx = None;
+                                    staged_next = res;
+                                }
+                                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                                Err(_) => staged_rx = None,
                             }
                         }
                         while paused.load(Ordering::Relaxed) {
@@ -2081,6 +2244,7 @@ impl OutputTarget for OaatOutput {
         // path re-sets it if the next track is also native DSD.
         self.native_dsd_active.store(false, Ordering::SeqCst);
         self.direct_pcm_active.store(false, Ordering::SeqCst);
+        self.direct_chain_exhausted.store(false, Ordering::SeqCst);
         *self.current_uri.lock().await = None;
         info!(device = %self.name, "oaat: stop");
         Ok(())
