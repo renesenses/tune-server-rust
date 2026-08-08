@@ -136,11 +136,23 @@ echo "  - $WEB"
 
 # 3 & 4. Clients — OPT-IN ONLY.
 #
-# Flutter and iPadOS run on their OWN release cadence, well behind the server:
-# on 2026-08-08 the server was at 0.9.55 while Flutter sat at 0.9.42+477 and
-# iPadOS at 0.9.28 — 13 and 27 versions apart. Their build numbers feed
-# TestFlight, so bumping them as a side effect of a server release is wrong.
-# Ask Bertrand before passing --clients.
+# Their build numbers feed TestFlight and Firebase, where a number is spent for
+# good: bumping them as a side effect of a server release is not something to
+# decide on the author's behalf. Ask Bertrand before passing --clients.
+#
+# Opt-in, NOT "they lag far behind" — they track the server closely. Verified
+# 2026-08-08: server 0.9.57, both clients bumped 0.9.56 → 0.9.57 in step.
+#
+# ⚠️ An earlier revision of this comment claimed Flutter sat at 0.9.42 and
+# iPadOS at 0.9.28, "13 and 27 versions apart". That was wrong, and worth
+# recording because the mistake is easy to repeat: those numbers were read from
+# the LOCAL working copies of the client repos, which were parked on old
+# branches. Always read a version from the branch that ships:
+#
+#   git -C "$DEV/tune-server-flutter" show origin/main:pubspec.yaml
+#   git -C "$DEV/tune-server-ipados"  show origin/main:Tune/project.yml
+#
+# The same trap applies to tune-web-client's package.json.
 if [ "$WITH_CLIENTS" -eq 1 ]; then
     # pubspec.yaml — version: X.Y.Z+N, build number strictly monotonic.
     CUR_BUILD=$(grep -oE "^version: [0-9]+\.[0-9]+\.[0-9]+\+[0-9]+" "$FLUTTER" | head -1 | sed -E 's/.*\+//')
@@ -166,8 +178,9 @@ if [ "$WITH_CLIENTS" -eq 1 ]; then
     echo "  - $IPAD (build $NEXT_BUILD for Apple targets)"
 else
     echo
-    echo "  Clients NOT bumped (Flutter / iPadOS run their own cadence)."
-    echo "  Pass --clients to include them — ask first."
+    echo "  Clients NOT bumped (Flutter / iPadOS are opt-in)."
+    echo "  Pass --clients to include them — ask first, their build numbers"
+    echo "  are spent for good on TestFlight / Firebase."
 fi
 
 # NOTE — Homebrew is deliberately absent.
