@@ -31,15 +31,41 @@ impl BluosOutput {
 
     async fn api_get(&self, path: &str, params: &[(&str, &str)]) -> Result<String, String> {
         let url = format!("{}/{}", self.base_url(), path);
-        self.client
+        let resp = self
+            .client
             .get(&url)
             .query(params)
             .send()
             .await
-            .map_err(|e| format!("bluos {path}: {e}"))?
+            .map_err(|e| format!("bluos {path}: {e}"))?;
+        // The status was previously ignored: a Node answering 404/500 came back
+        // as Ok(body), so play_media logged `bluos_play` and the orchestrator
+        // logged `output_play_sent` while the Node had in fact refused the
+        // command and never fetched the stream (Bilou, forum #1239 in 0.9.51 —
+        // no stream_request at all after bluos_play). Surface it instead.
+        let status = resp.status();
+        let body = resp
             .text()
             .await
-            .map_err(|e| format!("bluos read {path}: {e}"))
+            .map_err(|e| format!("bluos read {path}: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "bluos {path}: HTTP {status} — {}",
+                truncate_body(&body)
+            ));
+        }
+        Ok(body)
+    }
+}
+
+/// Keep a Node reply short enough to log without flooding the journal.
+fn truncate_body(body: &str) -> String {
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 300 {
+        one_line
+    } else {
+        let cut: String = one_line.chars().take(300).collect();
+        format!("{cut}…")
     }
 }
 
@@ -100,16 +126,32 @@ impl OutputTarget for BluosOutput {
         if let Some(img) = media.cover_url {
             add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
         }
-        self.client
+        let add_resp = self
+            .client
             .get(&add_url)
             .send()
             .await
-            .map_err(|e| format!("bluos Add: {e}"))?
+            .map_err(|e| format!("bluos Add: {e}"))?;
+        let add_status = add_resp.status();
+        let add_body = add_resp
             .text()
             .await
             .map_err(|e| format!("bluos Add read: {e}"))?;
+        if !add_status.is_success() {
+            return Err(format!(
+                "bluos Add: HTTP {add_status} — {}",
+                truncate_body(&add_body)
+            ));
+        }
+        // Both replies used to be discarded, which is why a Node that refused
+        // the queue entry looked identical in the journal to one that accepted
+        // it. The Add reply also carries the id the Node actually assigned —
+        // the `id=0` below is an assumption we have never verified against a
+        // real device, and it is the prime suspect for #1239.
+        info!(device = %self.name, reply = %truncate_body(&add_body), "bluos_add_reply");
         // Start the queue at its (single, freshly added) first entry.
-        self.api_get("Play", &[("id", "0")]).await?;
+        let play_body = self.api_get("Play", &[("id", "0")]).await?;
+        info!(device = %self.name, reply = %truncate_body(&play_body), "bluos_play_reply");
         info!(
             device = %self.name,
             url = media.url,
@@ -289,6 +331,21 @@ mod tests {
         let xml = "<status><state>stop</state><secs></secs></status>";
         assert_eq!(extract_tag(xml, "state"), Some("stop".into()));
         assert_eq!(extract_tag(xml, "secs"), None);
+    }
+
+    #[test]
+    fn truncate_body_collapses_whitespace() {
+        assert_eq!(
+            truncate_body("  <addsong\n  id=\"1\"/>  "),
+            "<addsong id=\"1\"/>"
+        );
+    }
+
+    #[test]
+    fn truncate_body_caps_long_replies() {
+        let out = truncate_body(&"x".repeat(500));
+        assert_eq!(out.chars().count(), 301);
+        assert!(out.ends_with('…'));
     }
 
     #[test]

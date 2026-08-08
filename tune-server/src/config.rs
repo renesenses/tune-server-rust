@@ -505,3 +505,75 @@ pub fn rotate_log_file(path: &std::path::Path, max_bytes: u64) {
         }
     }
 }
+
+/// Socket d'écoute IPv4 seule — comportement historique, et repli quand la
+/// double pile n'est pas disponible.
+pub(crate) fn ipv4_listen_socket() -> socket2::Socket {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("failed to create socket");
+    socket.set_reuse_address(true).ok();
+    socket
+}
+
+/// Socket d'écoute double pile : une socket IPv6 avec `IPV6_V6ONLY` désactivé
+/// accepte aussi les connexions IPv4 (adresses IPv4-mappées).
+///
+/// Firefox résout `localhost` en préférant `::1` et, contrairement à Chrome, ne
+/// retombe pas systématiquement sur `127.0.0.1` : avec une socket IPv4 seule il
+/// reçoit « connexion refusée » alors que le serveur tourne (#1321).
+///
+/// Renvoie `None` si la pile IPv6 est absente ou refuse l'option — l'appelant
+/// retombe alors sur l'IPv4 seule, sans rien changer au comportement connu.
+pub(crate) fn dual_stack_listen_socket(
+    port: u16,
+) -> Option<(socket2::Socket, std::net::SocketAddr)> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .ok()?;
+    socket.set_only_v6(false).ok()?;
+    socket.set_reuse_address(true).ok();
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    Some((socket, addr))
+}
+
+#[cfg(test)]
+mod listen_socket_tests {
+    use super::*;
+
+    /// Le point du correctif #1321 : une seule socket doit servir les clients
+    /// IPv4 (Chrome, 127.0.0.1) ET IPv6 (Firefox, ::1).
+    #[test]
+    fn dual_stack_socket_accepts_both_families() {
+        let Some((socket, addr)) = dual_stack_listen_socket(0) else {
+            eprintln!("pas de pile IPv6 ici — le repli IPv4 s'applique, test sans objet");
+            return;
+        };
+        if socket.bind(&addr.into()).is_err() {
+            eprintln!("bind IPv6 refusé ici — le repli IPv4 s'applique, test sans objet");
+            return;
+        }
+        socket.listen(8).expect("listen");
+        let listener: std::net::TcpListener = socket.into();
+        let port = listener.local_addr().expect("local_addr").port();
+
+        for target in ["127.0.0.1", "::1"] {
+            let client = std::net::TcpStream::connect((target, port));
+            assert!(client.is_ok(), "connexion {target} refusée : {client:?}");
+            drop(listener.accept().expect("accept"));
+        }
+    }
+
+    #[test]
+    fn ipv4_socket_is_always_available_as_fallback() {
+        let socket = ipv4_listen_socket();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        socket.bind(&addr.into()).expect("bind IPv4");
+    }
+}
