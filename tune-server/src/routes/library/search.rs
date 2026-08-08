@@ -186,7 +186,27 @@ pub(super) async fn acoustic_search(
     // renvoyer moins de résultats que demandé.
     let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, limit * 2, None);
     if ranked.is_empty() {
-        return Ok(Json(json!({ "query": query, "tracks": [], "count": 0 })));
+        // Une liste vide couvrait deux situations opposées : bibliothèque pas
+        // encore analysée, ou requête sans correspondance. L'utilisateur ne
+        // pouvait pas savoir s'il devait reformuler ou attendre (retour Fabien).
+        // On le dit, plutôt que de renvoyer un silence ambigu.
+        let analysed = embedding_store::analysed_count(&state.backend);
+        if analysed == 0 {
+            return Ok(Json(json!({
+                "query": query,
+                "tracks": [],
+                "count": 0,
+                "reason": "library_not_analysed",
+                "analysed_tracks": 0,
+            })));
+        }
+        return Ok(Json(json!({
+            "query": query,
+            "tracks": [],
+            "count": 0,
+            "reason": "no_match",
+            "analysed_tracks": analysed,
+        })));
     }
 
     let scores: HashMap<i64, f32> = ranked.iter().copied().collect();
