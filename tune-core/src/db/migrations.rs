@@ -454,8 +454,13 @@ INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP No
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Metal', 'https://icecast.radiofrance.fr/fipmetal-hifi.aac', 'Metal', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Hip-Hop', 'https://icecast.radiofrance.fr/fiphiphop-hifi.aac', 'Hip-Hop', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Sacré français', 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac', 'Chanson française', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Latino', 'https://icecast.radiofrance.fr/fiplatino-hifi.aac', 'Latino', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Tout nouveau', 'https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac', 'Éclectique', 'France');
+-- 'FIP Latino' (fiplatino) and 'FIP Tout nouveau' (fiptoutnouveautoutchaud) used
+-- to be seeded here and are deliberately gone: Radio France no longer serves
+-- either slug. Both answer 404 while every other FIP webradio above answers 200
+-- (checked 2026-08-08, and every plausible spelling — fiplatina, fipsalsa,
+-- fiptoutnouveau — 404s too). They shipped as two stations that could never
+-- play. Migration 70 removes them from databases that already seeded them.
+-- Do not re-add without checking the URL first. Forum #626 (Jean Valjean).
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique', 'https://icecast.radiofrance.fr/francemusique-hifi.aac', 'Classique', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Classique Easy', 'https://icecast.radiofrance.fr/francemusiqueeasyclassique-hifi.aac', 'Classique', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Classique Plus', 'https://icecast.radiofrance.fr/francemusiqueclassiqueplus-hifi.aac', 'Classique', 'France');
@@ -869,6 +874,24 @@ CREATE TABLE IF NOT EXISTS metadata_reports (
     pushed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_metadata_reports_entity ON metadata_reports(entity, entity_id);
+",
+    },
+    Migration {
+        version: 70,
+        name: "drop_dead_fip_webradios",
+        // Two seeded FIP webradios have no stream left: Radio France answers 404
+        // on both slugs while every other seeded FIP answers 200. They were dead
+        // rows in every library created before this migration — a user picking
+        // them got silence and no explanation (forum #626, Jean Valjean).
+        //
+        // Matched on the URL, never on the name: the name is what the user may
+        // have edited, the URL is what identifies the dead stream. A station the
+        // user retargeted to a working URL therefore survives, and a favourite
+        // pointing at one of these rows loses a station that could not play
+        // anyway. Idempotent — a second run deletes nothing.
+        up: "
+DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiplatino-hifi.aac';
+DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac';
 ",
     },
 ];
@@ -1910,6 +1933,88 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
+    /// serves. A fresh library must not carry them, and a library that already
+    /// seeded them must lose them.
+    #[test]
+    fn dead_fip_webradios_are_gone() {
+        const DEAD: [&str; 2] = [
+            "https://icecast.radiofrance.fr/fiplatino-hifi.aac",
+            "https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac",
+        ];
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let count_dead = || {
+            let conn = db.connection().lock().unwrap();
+            DEAD.iter()
+                .map(|url| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM radio_stations WHERE url = ?1",
+                        [url],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                })
+                .sum::<i64>()
+        };
+
+        // Fresh install: never seeded.
+        assert_eq!(count_dead(), 0, "dead FIP webradios seeded on a fresh db");
+
+        // Existing install: re-insert them the way an older seed did, then let
+        // the migration run again. It must clean them out, and leave the living
+        // FIP stations alone.
+        {
+            let conn = db.connection().lock().unwrap();
+            for url in DEAD {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country) VALUES ('x', ?1, 'g', 'France')",
+                    [url],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(count_dead(), 2, "test fixture did not insert");
+
+        let live_before = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url LIKE '%fip%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        // Replaying the migration is what an upgrade does for a db still below
+        // version 70; force it here since this db is already at latest.
+        {
+            let conn = db.connection().lock().unwrap();
+            let m = MIGRATIONS.iter().find(|m| m.version == 70).unwrap();
+            conn.execute_batch(m.up).unwrap();
+            // Idempotent: a second pass must also be a no-op, not an error.
+            conn.execute_batch(m.up).unwrap();
+        }
+
+        assert_eq!(count_dead(), 0, "migration 70 left a dead station behind");
+        let live_after = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url LIKE '%fip%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            live_after,
+            live_before - 2,
+            "migration 70 removed more than the two dead stations"
+        );
     }
 
     #[test]
