@@ -2085,6 +2085,59 @@ impl PositionPoller {
 
             ps.total_polls += 1;
             let poll_start = Instant::now();
+
+            // A push-based output that failed on its own thread reports it
+            // here. Handle it before any status-based reasoning: the stall
+            // heuristics below would eventually stop the zone too, but only
+            // after ~73 s of a track apparently playing in silence, and
+            // without ever telling the user why (Yacine, 8 Aug 2026).
+            {
+                let output_arc = {
+                    let outputs = self.outputs.lock().await;
+                    match outputs.get(&device_id) {
+                        Some(o) => o,
+                        None => continue,
+                    }
+                };
+                let failure = {
+                    let output = output_arc.lock().await;
+                    output.take_output_failure()
+                };
+                if let Some(msg) = failure {
+                    warn!(
+                        zone_id,
+                        device = %device_id,
+                        error = %msg,
+                        "output_reported_failure_stopping_zone"
+                    );
+                    if let Some(ref bus) = self.event_bus {
+                        // `fatal` tells the client this is not worth waiting
+                        // out. It opens a 30 s grace window on every play so a
+                        // slow HI-RES pre-transcode reads as "chargement…"
+                        // rather than a failure (#1146) — but a device that
+                        // refuses to open will never recover, and we now report
+                        // it within a second, i.e. squarely inside that window.
+                        // Without this flag the message would be swallowed and
+                        // the user would be left with a spinner and nothing
+                        // else — worse than the silence this whole change fixes.
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": msg,
+                                "fatal": true,
+                            }),
+                        );
+                    }
+                    poll_states.remove(&zone_id);
+                    let device_id_ref = self.get_zone_device_id(zone_id);
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                    continue;
+                }
+            }
+
             let status = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
