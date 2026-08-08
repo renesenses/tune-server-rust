@@ -197,6 +197,24 @@ pub trait OutputTarget: Send + Sync {
     async fn get_status(&self) -> Result<OutputStatus, String>;
     async fn is_available(&self) -> bool;
 
+    /// A fatal error the output hit on its own, outside any call we made.
+    ///
+    /// Push-based outputs do their work on a background thread: by the time
+    /// the device refuses to open, `play_url()` has long since returned `Ok`.
+    /// Without a channel like this one the failure stays invisible until the
+    /// poller's stall heuristics give up — roughly 73 seconds later — and
+    /// meanwhile the UI shows a track advancing in total silence (Yacine,
+    /// 8 Aug 2026: a DAC his account had no permission to open, and an hour
+    /// spent looking for the cause because nothing said so).
+    ///
+    /// The message is user-facing and returned **once**: the implementation
+    /// clears it, so the caller owns it and no stale error can kill the next
+    /// track. Returning `None` — the default — means "nothing to report",
+    /// which is correct for every output that reports failures synchronously.
+    fn take_output_failure(&self) -> Option<String> {
+        None
+    }
+
     fn host(&self) -> Option<&str> {
         None
     }

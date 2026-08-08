@@ -12,26 +12,96 @@ use tracing::{debug, info, warn};
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 use crate::poller::TRACK_END_NOTIFY;
 
-/// Turn a device-open error into a sentence naming the likely cause.
+/// Why a device refused to open, as far as the backend string lets us tell.
+///
+/// Two audiences need this, and they need different words: the log is read by
+/// us, in English, alongside the raw backend error; the toast is read by
+/// someone whose music just didn't start, in their language, and must say what
+/// to *do*. Classifying once and rendering twice keeps the two from drifting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenFailure {
+    /// The sound server is not reachable, or the account may not open the
+    /// device at all.
+    ServerUnreachable,
+    /// The device disappeared between selection and playback.
+    DeviceGone,
+    /// Another application holds the device exclusively.
+    Busy,
+    /// Nothing matched — say so plainly rather than guess.
+    Unknown,
+}
+
+/// Classify a device-open error.
 ///
 /// The backend strings are written for driver authors, not for the person whose
-/// music stopped: ALSA reports a dead PipeWire daemon as `Host is down (112)`,
-/// which reads like a network fault and sends everyone looking at the wrong
-/// layer (Yacine, 7 Aug 2026 — six failed plays, nothing in the log pointing at
-/// the session). Matching on the text is deliberately loose: cpal wraps the
-/// backend message and the wording varies by platform, so anything unmatched
-/// falls through to a neutral hint rather than a wrong one.
-fn diagnose_open_failure(err: &str) -> &'static str {
+/// music stopped: ALSA reports an unreachable PipeWire daemon as
+/// `Host is down (112)`, which reads like a network fault and sends everyone
+/// looking at the wrong layer. It cost a full morning with Yacine on 8 Aug
+/// 2026 — and the real cause turned out to be a third thing again, an account
+/// missing from the `audio` group on a machine driven over SSH, where logind
+/// grants no device ACL because there is no local seat. Both faults surface as
+/// the same string, hence the deliberately broad wording of that arm.
+///
+/// Matching is loose on purpose: cpal wraps the backend message and the wording
+/// varies by platform, so anything unrecognised falls through to `Unknown`
+/// rather than to a confident wrong answer.
+fn classify_open_failure(err: &str) -> OpenFailure {
     let e = err.to_ascii_lowercase();
-    if e.contains("host is down") || e.contains("connection refused") {
-        "the sound server (PipeWire/PulseAudio) is not reachable from this process \
-         — check that Tune runs inside the user session that owns it"
+    if e.contains("host is down")
+        || e.contains("connection refused")
+        || e.contains("permission denied")
+        || e.contains("access denied")
+    {
+        OpenFailure::ServerUnreachable
     } else if e.contains("no such device") || e.contains("no such file") {
-        "the device is gone — a USB DAC unplugged or powered off since it was selected"
+        OpenFailure::DeviceGone
     } else if e.contains("busy") || e.contains("in use") {
-        "the device is held exclusively by another application"
+        OpenFailure::Busy
     } else {
-        "the device refused every format offered — it may be unavailable or misconfigured"
+        OpenFailure::Unknown
+    }
+}
+
+impl OpenFailure {
+    /// English, for the log, next to the raw backend error.
+    fn log_hint(self) -> &'static str {
+        match self {
+            Self::ServerUnreachable => {
+                "the sound server (PipeWire/PulseAudio) is unreachable, or this account \
+                 cannot open the device — check that Tune runs in the owning user session \
+                 and that the account is in the `audio` group"
+            }
+            Self::DeviceGone => {
+                "the device is gone — a USB DAC unplugged or powered off since it was selected"
+            }
+            Self::Busy => "the device is held exclusively by another application",
+            Self::Unknown => {
+                "the device refused every format offered — it may be unavailable or misconfigured"
+            }
+        }
+    }
+
+    /// French, for the toast. Says what to do, not what failed internally.
+    fn user_message(self) -> &'static str {
+        match self {
+            Self::ServerUnreachable => {
+                "le service audio ne répond pas, ou Tune n'a pas le droit d'ouvrir ce \
+                 périphérique. Vérifiez que le serveur audio est démarré et que le compte \
+                 qui exécute Tune appartient au groupe « audio »"
+            }
+            Self::DeviceGone => {
+                "le périphérique n'est plus là. Vérifiez qu'il est allumé et connecté, \
+                 puis choisissez-le à nouveau dans les réglages de la zone"
+            }
+            Self::Busy => {
+                "un autre programme utilise déjà ce périphérique en exclusivité. \
+                 Fermez-le, puis relancez la lecture"
+            }
+            Self::Unknown => {
+                "le périphérique a refusé tous les formats proposés. Choisissez une autre \
+                 sortie dans les réglages de la zone"
+            }
+        }
     }
 }
 
@@ -705,6 +775,12 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// Set by the playback thread when the audio device refuses to open, so
+    /// the poller can stop the zone and tell the user on the very next tick
+    /// instead of waiting out the stall heuristics. Cleared on every
+    /// `play_url()` — a failure belongs to the track that provoked it, and
+    /// must never travel to the next one.
+    open_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl LocalOutput {
@@ -749,6 +825,7 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            open_failure: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1334,6 +1411,13 @@ impl OutputTarget for LocalOutput {
         // Clear the natural-end flag and generation for the new track.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        // A device-open failure belongs to the track that provoked it. Clearing
+        // it here means a user who fixes the device and presses play again is
+        // never stopped by the previous attempt's error.
+        if let Ok(mut slot) = self.open_failure.lock() {
+            *slot = None;
+        }
+        let open_failure = self.open_failure.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
         let track_ended_generation = self.track_ended_generation.clone();
 
@@ -2738,14 +2822,24 @@ impl OutputTarget for LocalOutput {
                                     // reach the daemon — typically a server
                                     // started outside the user session, or a
                                     // USB DAC that went away.
-                                    let hint = diagnose_open_failure(&first_err.to_string());
+                                    let cause = classify_open_failure(&first_err.to_string());
                                     warn!(
                                         device = %device_name,
                                         first_error = %first_err,
                                         second_error = %second_err,
-                                        hint = %hint,
+                                        hint = %cause.log_hint(),
                                         "audio_stream_build_failed_all_formats"
                                     );
+                                    // Hand the poller something to say. Without
+                                    // this the zone plays on in silence until the
+                                    // stall heuristics fire ~73 s later, with no
+                                    // message anywhere the user can see.
+                                    if let Ok(mut slot) = open_failure.lock() {
+                                        *slot = Some(format!(
+                                            "Sortie « {device_name} » : {}.",
+                                            cause.user_message()
+                                        ));
+                                    }
                                     playing.store(false, Ordering::SeqCst);
                                     return;
                                 }
@@ -3687,6 +3781,10 @@ impl OutputTarget for LocalOutput {
         })
     }
 
+    fn take_output_failure(&self) -> Option<String> {
+        self.open_failure.lock().ok().and_then(|mut s| s.take())
+    }
+
     async fn is_available(&self) -> bool {
         let name = self.device_name.clone();
         let backend = self.audio_backend.clone();
@@ -4613,37 +4711,109 @@ mod tests {
 }
 
 #[cfg(test)]
-mod open_failure_diagnosis_tests {
-    use super::diagnose_open_failure;
+mod open_failure_tests {
+    use super::{OpenFailure, classify_open_failure};
 
     /// The exact string Yacine's log carried, six times, with no other clue.
     #[test]
-    fn pipewire_unreachable_points_at_the_session_not_the_network() {
-        let hint = diagnose_open_failure(
-            "A backend-specific error has occurred: ALSA function 'snd_pcm_open' \
-             failed with error 'Host is down (112)'",
+    fn pipewire_unreachable_is_classified_as_server_or_permission() {
+        assert_eq!(
+            classify_open_failure(
+                "A backend-specific error has occurred: ALSA function 'snd_pcm_open' \
+                 failed with error 'Host is down (112)'"
+            ),
+            OpenFailure::ServerUnreachable
         );
-        assert!(hint.contains("user session"), "got: {hint}");
+    }
+
+    /// The real cause on 8 Aug 2026: an account outside the `audio` group, on a
+    /// machine driven over SSH. It can surface as a plain permission error, so
+    /// that wording must land in the same arm.
+    #[test]
+    fn a_permission_error_lands_in_the_same_arm() {
+        assert_eq!(
+            classify_open_failure("snd_pcm_open failed with error 'Permission denied'"),
+            OpenFailure::ServerUnreachable
+        );
     }
 
     #[test]
-    fn a_vanished_device_is_named_as_such() {
-        assert!(
-            diagnose_open_failure(
+    fn a_vanished_device_is_classified_as_gone() {
+        assert_eq!(
+            classify_open_failure(
                 "ALSA function 'snd_pcm_open' failed with error 'No such device'"
-            )
-            .contains("unplugged")
+            ),
+            OpenFailure::DeviceGone
         );
     }
 
     #[test]
-    fn an_exclusively_held_device_is_named_as_such() {
-        assert!(diagnose_open_failure("Device or resource busy").contains("exclusively"));
+    fn an_exclusively_held_device_is_classified_as_busy() {
+        assert_eq!(
+            classify_open_failure("Device or resource busy"),
+            OpenFailure::Busy
+        );
     }
 
     #[test]
-    fn an_unknown_error_falls_back_to_a_neutral_hint() {
-        let hint = diagnose_open_failure("something nobody has seen before");
-        assert!(hint.contains("refused every format"), "got: {hint}");
+    fn an_unrecognised_error_does_not_guess() {
+        assert_eq!(
+            classify_open_failure("something nobody has seen before"),
+            OpenFailure::Unknown
+        );
+    }
+
+    /// Both renderings must exist for every arm, and stay in their own
+    /// language: the log is ours, the toast is the listener's.
+    #[test]
+    fn every_cause_renders_for_both_audiences() {
+        for c in [
+            OpenFailure::ServerUnreachable,
+            OpenFailure::DeviceGone,
+            OpenFailure::Busy,
+            OpenFailure::Unknown,
+        ] {
+            assert!(!c.log_hint().is_empty(), "{c:?} has no log hint");
+            assert!(!c.user_message().is_empty(), "{c:?} has no user message");
+            // The toast must say what to do, not merely restate the failure.
+            let m = c.user_message();
+            assert!(
+                m.contains("Vérifiez")
+                    || m.contains("Choisissez")
+                    || m.contains("Fermez")
+                    || m.contains("choisissez"),
+                "{c:?} user message gives no action: {m}"
+            );
+        }
+    }
+
+    /// The contract the poller relies on: a failure is delivered once. If it
+    /// stuck around, the very next track would be stopped by the previous
+    /// track's error — a far worse bug than the silence this fixes.
+    #[test]
+    fn a_failure_is_delivered_once_then_cleared() {
+        use super::super::traits::OutputTarget;
+        let out = super::LocalOutput::new("test-device".into());
+        assert!(
+            out.take_output_failure().is_none(),
+            "clean output must report nothing"
+        );
+
+        *out.open_failure.lock().unwrap() = Some("boum".into());
+        assert_eq!(out.take_output_failure().as_deref(), Some("boum"));
+        assert!(
+            out.take_output_failure().is_none(),
+            "a failure must never be reported twice"
+        );
+    }
+
+    /// The `audio` group is the lesson of 8 Aug 2026 — if this hint ever loses
+    /// it, the next person driving Tune over SSH starts the hunt from scratch.
+    #[test]
+    fn the_unreachable_hint_names_the_audio_group() {
+        let h = OpenFailure::ServerUnreachable.log_hint();
+        assert!(h.contains("audio"), "got: {h}");
+        let m = OpenFailure::ServerUnreachable.user_message();
+        assert!(m.contains("audio"), "got: {m}");
     }
 }
