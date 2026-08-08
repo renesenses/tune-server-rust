@@ -12,6 +12,29 @@ use tracing::{debug, info, warn};
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 use crate::poller::TRACK_END_NOTIFY;
 
+/// Turn a device-open error into a sentence naming the likely cause.
+///
+/// The backend strings are written for driver authors, not for the person whose
+/// music stopped: ALSA reports a dead PipeWire daemon as `Host is down (112)`,
+/// which reads like a network fault and sends everyone looking at the wrong
+/// layer (Yacine, 7 Aug 2026 — six failed plays, nothing in the log pointing at
+/// the session). Matching on the text is deliberately loose: cpal wraps the
+/// backend message and the wording varies by platform, so anything unmatched
+/// falls through to a neutral hint rather than a wrong one.
+fn diagnose_open_failure(err: &str) -> &'static str {
+    let e = err.to_ascii_lowercase();
+    if e.contains("host is down") || e.contains("connection refused") {
+        "the sound server (PipeWire/PulseAudio) is not reachable from this process \
+         — check that Tune runs inside the user session that owns it"
+    } else if e.contains("no such device") || e.contains("no such file") {
+        "the device is gone — a USB DAC unplugged or powered off since it was selected"
+    } else if e.contains("busy") || e.contains("in use") {
+        "the device is held exclusively by another application"
+    } else {
+        "the device refused every format offered — it may be unavailable or misconfigured"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Audio host selection (WASAPI vs ASIO on Windows)
 // ---------------------------------------------------------------------------
@@ -2705,9 +2728,22 @@ impl OutputTarget for LocalOutput {
                             match built {
                                 Some(t) => t,
                                 None => {
+                                    // Every format was refused, so the fault is
+                                    // the device itself, not the encoding. Name
+                                    // the likely cause: the raw ALSA string
+                                    // ("Host is down (112)" — Yacine) reads as a
+                                    // network error and sends people hunting in
+                                    // the wrong place, when it is what the
+                                    // PipeWire ALSA plugin returns if it cannot
+                                    // reach the daemon — typically a server
+                                    // started outside the user session, or a
+                                    // USB DAC that went away.
+                                    let hint = diagnose_open_failure(&first_err.to_string());
                                     warn!(
+                                        device = %device_name,
                                         first_error = %first_err,
                                         second_error = %second_err,
+                                        hint = %hint,
                                         "audio_stream_build_failed_all_formats"
                                     );
                                     playing.store(false, Ordering::SeqCst);
@@ -4573,5 +4609,41 @@ mod tests {
         let devices = list_audio_devices();
         // On CI there may be no devices, but on dev machines there should be at least one
         let _ = devices.len();
+    }
+}
+
+#[cfg(test)]
+mod open_failure_diagnosis_tests {
+    use super::diagnose_open_failure;
+
+    /// The exact string Yacine's log carried, six times, with no other clue.
+    #[test]
+    fn pipewire_unreachable_points_at_the_session_not_the_network() {
+        let hint = diagnose_open_failure(
+            "A backend-specific error has occurred: ALSA function 'snd_pcm_open' \
+             failed with error 'Host is down (112)'",
+        );
+        assert!(hint.contains("user session"), "got: {hint}");
+    }
+
+    #[test]
+    fn a_vanished_device_is_named_as_such() {
+        assert!(
+            diagnose_open_failure(
+                "ALSA function 'snd_pcm_open' failed with error 'No such device'"
+            )
+            .contains("unplugged")
+        );
+    }
+
+    #[test]
+    fn an_exclusively_held_device_is_named_as_such() {
+        assert!(diagnose_open_failure("Device or resource busy").contains("exclusively"));
+    }
+
+    #[test]
+    fn an_unknown_error_falls_back_to_a_neutral_hint() {
+        let hint = diagnose_open_failure("something nobody has seen before");
+        assert!(hint.contains("refused every format"), "got: {hint}");
     }
 }
