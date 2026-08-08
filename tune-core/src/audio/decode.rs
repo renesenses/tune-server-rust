@@ -14,6 +14,18 @@ use tracing::{debug, error};
 
 use super::dsd_to_pcm::choose_output_rate;
 
+/// How long a decoder waits for the consumer to take a chunk before giving up.
+///
+/// Generous on purpose: a consumer can legitimately stop reading for a long
+/// while — OAAT prefetches the next track, reads its header, then leaves the
+/// body untouched until the current track ends.
+///
+/// Named rather than spelled out at each site because the value has already
+/// drifted once: the log messages announced `_10s` long after it became 300,
+/// which cost a wrong diagnosis on #1323. A name cannot go stale; a number in
+/// a message can.
+const SEND_TIMEOUT_SECS: u64 = 300;
+
 /// Resolve the actual audio bit depth from codec parameters.
 ///
 /// Symphonia's ISOMP4 demuxer does not populate `bits_per_sample` for ALAC
@@ -771,7 +783,7 @@ fn decode_to_pcm_streaming_inner(
         }
         for chunk in pcm_bytes.chunks(chunk_size) {
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.to_vec()),
             )) {
                 Ok(Ok(())) => {}
@@ -780,7 +792,10 @@ fn decode_to_pcm_streaming_inner(
                     return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
-                    tracing::warn!("streaming_decode_send_timeout (opus)");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "streaming_decode_send_timeout (opus)"
+                    );
                     return Ok((output_bd, source_rate));
                 }
             }
@@ -842,7 +857,7 @@ fn decode_to_pcm_streaming_inner(
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.to_vec()),
             )) {
                 Ok(Ok(())) => {}
@@ -851,7 +866,10 @@ fn decode_to_pcm_streaming_inner(
                     return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
-                    tracing::warn!("streaming_decode_send_timeout_10s (fallback)");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "streaming_decode_send_timeout (fallback)"
+                    );
                     return Ok((output_bd, source_rate));
                 }
             }
@@ -1105,7 +1123,7 @@ fn decode_to_pcm_streaming_inner(
             // floating-point math) and was previously called before send(),
             // introducing micro-pauses that caused Squeezebox/LMS stuttering.
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.clone()),
             )) {
                 Ok(Ok(())) => {}
@@ -1114,7 +1132,10 @@ fn decode_to_pcm_streaming_inner(
                     return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
-                    tracing::warn!("streaming_decode_send_timeout_10s");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "streaming_decode_send_timeout"
+                    );
                     return Ok((output_bd, source_rate));
                 }
             }
@@ -1142,7 +1163,7 @@ fn decode_to_pcm_streaming_inner(
     // Flush remaining bytes
     if !pcm_buf.is_empty() {
         match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
             tx.send(pcm_buf),
         )) {
             Ok(Ok(())) => {}
@@ -1150,7 +1171,10 @@ fn decode_to_pcm_streaming_inner(
                 debug!("streaming_decode_consumer_dropped (final)");
             }
             Err(_) => {
-                tracing::warn!("streaming_decode_send_timeout_10s (final)");
+                tracing::warn!(
+                    timeout_secs = SEND_TIMEOUT_SECS,
+                    "streaming_decode_send_timeout (final)"
+                );
             }
         }
     }
@@ -1878,7 +1902,7 @@ fn decode_dsd_streaming(
                 // Send PCM data first, compute levels after (same rationale
                 // as the symphonia path: avoid delaying the audio stream).
                 match rt.block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                     tx.send(chunk.clone()),
                 )) {
                     Ok(Ok(())) => {}
@@ -1887,7 +1911,10 @@ fn decode_dsd_streaming(
                         return Ok(true); // consumer gone
                     }
                     Err(_) => {
-                        tracing::warn!("dsd_streaming_send_timeout_10s");
+                        tracing::warn!(
+                            timeout_secs = SEND_TIMEOUT_SECS,
+                            "dsd_streaming_send_timeout"
+                        );
                         return Ok(true); // channel stalled
                     }
                 }
@@ -1962,7 +1989,7 @@ fn decode_dsd_streaming(
     // Send any remaining bytes (send first, levels after)
     if !pcm_buf.is_empty() {
         let send_ok = match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
             tx.send(pcm_buf.clone()),
         )) {
             Ok(Ok(())) => true,
@@ -1971,7 +1998,10 @@ fn decode_dsd_streaming(
                 false
             }
             Err(_) => {
-                tracing::warn!("dsd_streaming_send_timeout_10s (final)");
+                tracing::warn!(
+                    timeout_secs = SEND_TIMEOUT_SECS,
+                    "dsd_streaming_send_timeout (final)"
+                );
                 false
             }
         };
@@ -2028,13 +2058,16 @@ pub fn decode_dsd_to_dop_streaming(
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk),
             )) {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Ok(true),
                 Err(_) => {
-                    tracing::warn!("dop_streaming_send_timeout_10s");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "dop_streaming_send_timeout"
+                    );
                     return Ok(true);
                 }
             }
@@ -2069,7 +2102,7 @@ pub fn decode_dsd_to_dop_streaming(
 
     if !pcm_buf.is_empty() {
         let _ = rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
             tx.send(pcm_buf),
         ));
     }
