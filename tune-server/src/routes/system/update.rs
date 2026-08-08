@@ -45,6 +45,21 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
     }
 }
 
+/// Can we actually create a file in `dir`? Permission *bits* are not the
+/// answer: a read-only mount, an ACL, or a SELinux label all deny the write
+/// while the mode still reads 0755. The only honest test is to create a file
+/// and delete it — cheap, and it runs once per update request.
+fn probe_dir_writable(dir: &std::path::Path) -> Result<(), String> {
+    let probe = dir.join(".tune-update-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Best-effort detection of running inside a Docker/OCI container. In a
 /// container the binary lives in a read-only image layer, so the in-app update
 /// can never swap it (`copy new binary: Permission denied` — Yacine); the
@@ -324,6 +339,33 @@ pub(super) async fn update_install(
                 Json(json!({
                     "status": "blocked",
                     "message": "Update blocked: .no-auto-update flag file exists. Remove it to allow updates."
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Guard: the install stages the new binary next to the running one, so a
+    // directory we cannot write to dooms the update — but only after a 45 MB
+    // download, an extraction, and a raw `copy new binary: Permission denied`
+    // that tells the user nothing about what to do (Yacine: two identical
+    // failures 55 minutes apart, still on 0.9.42). Probe it up front and hand
+    // back the path and the account so the fix is a single chown away.
+    if let Some(ref dir) = working_dir {
+        if let Err(e) = probe_dir_writable(dir) {
+            let user = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "the account running Tune".into());
+            warn!(dir = %dir.display(), user = %user, error = %e, "update_blocked_dir_not_writable");
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "not_writable",
+                    "message": format!(
+                        "Tune cannot install the update: the folder holding the binary ({}) is not writable by {user} ({e}). Fix the ownership of that folder — e.g. sudo chown -R {user} {} — or install the new version by hand, then retry.",
+                        dir.display(),
+                        dir.display()
+                    )
                 })),
             )
                 .into_response();

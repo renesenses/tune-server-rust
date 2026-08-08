@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -39,44 +39,63 @@ fn parse_lms_host(state: &AppState) -> (String, u16) {
         .or_else(|| settings.get("squeezebox_host").ok().flatten())
         .unwrap_or_else(|| "localhost".into());
 
+    let (host, port) = split_lms_host(&raw);
+    tracing::debug!(raw = %raw, host = %host, port, "parse_lms_host resolved");
+    (host, port)
+}
+
+/// Split a user-entered LMS address into (host, port).
+///
+/// Kept free of `AppState` so the parsing rules are unit-testable: this field is
+/// typed by hand and every sloppy variant lands here. Whitespace is trimmed on
+/// each side of the `:` separately, not just on the whole string — Yacine had
+/// `"192.168.0.34 :9090"` stored, whose trailing space survived the outer
+/// `trim()`, rode into the host, and made every single CLI call fail with
+/// `invalid socket address syntax` (31 errors in 4 hours of log).
+fn split_lms_host(raw: &str) -> (String, u16) {
     // Strip http:// or https:// prefix if user pasted a URL
     let cleaned = raw
         .trim()
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         // Strip trailing path segments (e.g. "192.168.1.7:9000/")
-        .trim_end_matches('/');
+        .trim_end_matches('/')
+        .trim();
 
-    let (host, port) = if cleaned.contains(':') {
-        let parts: Vec<&str> = cleaned.splitn(2, ':').collect();
-        let mut port = parts[1].parse::<u16>().unwrap_or(LMS_CLI_PORT);
-        // Auto-correct: port 9000 is LMS HTTP, CLI is 9090
-        if port == 9000 {
-            port = LMS_CLI_PORT;
+    match cleaned.split_once(':') {
+        Some((host, port)) => {
+            let mut port = port.trim().parse::<u16>().unwrap_or(LMS_CLI_PORT);
+            // Auto-correct: port 9000 is LMS HTTP, CLI is 9090
+            if port == 9000 {
+                port = LMS_CLI_PORT;
+            }
+            (host.trim().to_string(), port)
         }
-        (parts[0].to_string(), port)
-    } else {
-        (cleaned.to_string(), LMS_CLI_PORT)
-    };
-
-    tracing::debug!(raw = %raw, host = %host, port, "parse_lms_host resolved");
-    (host, port)
+        None => (cleaned.to_string(), LMS_CLI_PORT),
+    }
 }
 
 /// Send a raw CLI command to LMS via TCP and return the response line.
 fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
     let addr = format!("{host}:{port}");
     tracing::debug!(addr = %addr, cmd = %cmd, "lms_cli_command connecting");
-    let stream = TcpStream::connect_timeout(
-        &addr
-            .parse()
-            .map_err(|e| {
-                tracing::error!(addr = %addr, error = %e, "lms_cli_command: invalid address");
-                format!("invalid LMS address {addr}: {e}")
-            })?,
-        Duration::from_secs(5),
-    )
-    .map_err(|e| {
+    // Resolve rather than `str::parse::<SocketAddr>()`: the latter only accepts
+    // an IP literal, so every hostname — including our own "localhost" default
+    // — was rejected as "invalid address" before a single packet was sent.
+    let sock = addr
+        .to_socket_addrs()
+        .map_err(|e| {
+            tracing::warn!(addr = %addr, error = %e, "lms_cli_command: address not resolvable");
+            format!(
+                "Adresse LMS invalide ou introuvable ({addr}) : {e}. Verifiez le champ Serveur Squeezebox dans les reglages."
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            tracing::warn!(addr = %addr, "lms_cli_command: address resolved to nothing");
+            format!("Adresse LMS {addr} ne resout vers aucune adresse IP.")
+        })?;
+    let stream = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).map_err(|e| {
         // An unreachable/refused optional LMS is a warning, not an app-level
         // ERROR — logging it at error! flooded Yacine's log (a Daphile box that
         // refuses :9090 every poll). The Err string still reaches the UI.
@@ -374,4 +393,69 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
     }
 
     Ok(registered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LMS_CLI_PORT, split_lms_host};
+
+    #[test]
+    fn plain_host_gets_the_default_cli_port() {
+        assert_eq!(
+            split_lms_host("192.168.0.34"),
+            ("192.168.0.34".into(), 9090)
+        );
+        assert_eq!(split_lms_host("localhost"), ("localhost".into(), 9090));
+    }
+
+    #[test]
+    fn explicit_port_is_kept() {
+        assert_eq!(
+            split_lms_host("192.168.0.34:9091"),
+            ("192.168.0.34".into(), 9091)
+        );
+    }
+
+    #[test]
+    fn http_port_9000_is_corrected_to_the_cli_port() {
+        assert_eq!(
+            split_lms_host("192.168.0.34:9000"),
+            ("192.168.0.34".into(), LMS_CLI_PORT)
+        );
+    }
+
+    #[test]
+    fn a_url_paste_is_reduced_to_host_and_port() {
+        assert_eq!(
+            split_lms_host("http://192.168.0.34:9000/"),
+            ("192.168.0.34".into(), LMS_CLI_PORT)
+        );
+        assert_eq!(
+            split_lms_host("https://lms.local/"),
+            ("lms.local".into(), LMS_CLI_PORT)
+        );
+    }
+
+    /// Yacine's stored value: the space before the colon survived the outer
+    /// trim(), rode into the host, and made every CLI call fail with
+    /// "invalid socket address syntax".
+    #[test]
+    fn stray_whitespace_around_the_separator_is_dropped() {
+        assert_eq!(
+            split_lms_host("192.168.0.34 :9090"),
+            ("192.168.0.34".into(), 9090)
+        );
+        assert_eq!(
+            split_lms_host("  192.168.0.34 : 9090  "),
+            ("192.168.0.34".into(), 9090)
+        );
+    }
+
+    #[test]
+    fn a_junk_port_falls_back_to_the_default_instead_of_failing() {
+        assert_eq!(
+            split_lms_host("192.168.0.34:abc"),
+            ("192.168.0.34".into(), LMS_CLI_PORT)
+        );
+    }
 }
