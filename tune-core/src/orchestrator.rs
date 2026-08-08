@@ -986,6 +986,120 @@ impl PlaybackOrchestrator {
         self.play_inner(req, false).await
     }
 
+    /// Pick a live output to re-bind a zone to, when its stored
+    /// `output_device_id` has vanished from the registry.
+    ///
+    /// Matches on the zone's display name (case-insensitive) and **prefers a
+    /// `local:` output**: the case this exists for is a zone created long ago
+    /// against a *network* view of a device that is now only reachable locally
+    /// (Alex Campbell's "Mac Studio Speakers", once seen over the network by a
+    /// second server on a Raspberry Pi, today a plain CoreAudio output).
+    ///
+    /// Returns `None` when there is no match **or** when the match is ambiguous
+    /// — several same-name outputs with no single local one. Binding "at
+    /// random" would send audio to the wrong device, which is worse than the
+    /// clear error the caller falls back to.
+    async fn find_rebind_target(&self, zone_name: &str) -> Option<(String, String)> {
+        let candidates = { self.outputs.lock().await.find_by_name(zone_name) };
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut locals: Vec<&(String, String)> = candidates
+            .iter()
+            .filter(|(id, _)| id.starts_with("local:"))
+            .collect();
+        if locals.len() == 1 {
+            return Some(locals.remove(0).clone());
+        }
+        if locals.is_empty() && candidates.len() == 1 {
+            return Some(candidates[0].clone());
+        }
+        warn!(
+            zone_name,
+            candidates = candidates.len(),
+            locals = locals.len(),
+            "zone_rebind_ambiguous_not_rebinding"
+        );
+        None
+    }
+
+    /// Gate playback on a zone whose stored output device may be gone, trying an
+    /// auto-rebind before refusing.
+    ///
+    /// `Ok(None)` — nothing to do, carry on (this is the nominal path).
+    /// `Ok(Some(id))` — the zone was re-bound to `id`, which the caller must use
+    /// as the request's `output_device_id`.
+    /// `Err(msg)` — playback must be refused; `msg` carries the
+    /// `zone_output_unavailable:` sentinel the API maps to a 409.
+    async fn gate_or_rebind_offline_zone(
+        &self,
+        zone_id: i64,
+        zone: &crate::db::zone_repo::Zone,
+    ) -> Result<Option<String>, String> {
+        if zone.online {
+            return Ok(None);
+        }
+        let dev_id = zone.output_device_id.as_deref().unwrap_or("");
+        // Skip zones with no device yet (being configured) and `local:` zones,
+        // which are reputed always available. Then allow a grace window for SSDP
+        // polling gaps: if the device is still in the live registry it is
+        // reachable, whatever the DB says.
+        if dev_id.is_empty()
+            || dev_id.starts_with("local:")
+            || self.outputs.lock().await.contains(dev_id)
+        {
+            return Ok(None);
+        }
+
+        // The stored device really is gone. Before rejecting, look for a live
+        // output carrying the same name (#1287).
+        if let Some((new_id, new_type)) = self.find_rebind_target(&zone.name).await {
+            let repo = ZoneRepo::with_backend(self.db.clone());
+            // Persist so the rebind is sticky — the point is that the user never
+            // has to think about this again. `output_type` must follow the id:
+            // leaving a zone typed `dlna` while pointing at a `local:` output
+            // would take the wrong branch everywhere downstream.
+            repo.update_output_device(zone_id, &new_id)?;
+            repo.update_output_type(zone_id, &new_type)?;
+            repo.update_online(zone_id, true)?;
+            info!(
+                zone_id,
+                zone_name = %zone.name,
+                stale_device_id = dev_id,
+                new_device_id = %new_id,
+                new_output_type = %new_type,
+                "zone_rebound_to_live_output_with_same_name"
+            );
+            if let Some(ref bus) = self.event_bus {
+                bus.emit(
+                    "zone.rebound",
+                    serde_json::json!({
+                        "zone_id": zone_id,
+                        "device_id": new_id,
+                        "output_type": new_type,
+                    }),
+                );
+            }
+            return Ok(Some(new_id));
+        }
+
+        let msg = format!(
+            "zone_output_unavailable:La sortie de cette zone n'est plus disponible. Choisissez une sortie dans les réglages de la zone « {} ».",
+            zone.name
+        );
+        warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": msg,
+                }),
+            );
+        }
+        Err(msg)
+    }
+
     async fn play_inner(
         &self,
         mut req: PlayRequest,
@@ -1002,36 +1116,15 @@ impl PlaybackOrchestrator {
                 .ok()
                 .flatten();
 
-            // Refuse to start playback on a zone whose device is confirmed gone.
-            // Guards: skip local: zones (always available), skip zones with no
-            // device yet (being configured), and allow a grace window for SSDP
-            // polling gaps by checking the live OutputRegistry — if the device is
-            // still registered it is reachable even if the DB says offline.
-            if let Some(ref zone) = zone_db {
-                if !zone.online {
-                    let dev_id = zone.output_device_id.as_deref().unwrap_or("");
-                    let is_local = dev_id.starts_with("local:");
-                    let has_device = !dev_id.is_empty();
-                    let in_registry =
-                        has_device && !is_local && self.outputs.lock().await.contains(dev_id);
-                    if has_device && !is_local && !in_registry {
-                        let msg = format!("Output device offline: {}", zone.name);
-                        warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
-                        if let Some(ref bus) = self.event_bus {
-                            bus.emit(
-                                "zone.playback_error",
-                                serde_json::json!({
-                                    "zone_id": req.zone_id,
-                                    "error": msg,
-                                }),
-                            );
-                        }
-                        return Err(msg);
-                    }
-                }
-            }
+            // Refuse to start playback on a zone whose device is confirmed gone
+            // — unless a live output of the same name can take over (#1287).
+            let rebound = match zone_db {
+                Some(ref zone) => self.gate_or_rebind_offline_zone(req.zone_id, zone).await?,
+                None => None,
+            };
 
-            let looked_up = zone_db.as_ref().and_then(|z| z.output_device_id.clone());
+            let looked_up =
+                rebound.or_else(|| zone_db.as_ref().and_then(|z| z.output_device_id.clone()));
             if looked_up.is_some() {
                 debug!(
                     zone_id = req.zone_id,
@@ -1074,35 +1167,20 @@ impl PlaybackOrchestrator {
             }
             req.output_device_id = looked_up;
         } else {
-            // output_device_id was provided by the caller — still check online status
-            // with the same guards: skip local: zones, skip zones without a device,
-            // and allow if device is still present in the live OutputRegistry.
+            // output_device_id was provided by the caller — run the same gate.
+            // The client's id comes from the same stale zone row, so a rebind
+            // must override it, otherwise we would keep aiming at the dead
+            // device the caller just told us about.
             let zone_db = ZoneRepo::with_backend(self.db.clone())
                 .get(req.zone_id)
                 .ok()
                 .flatten();
-            if let Some(ref zone) = zone_db {
-                if !zone.online {
-                    let dev_id = zone.output_device_id.as_deref().unwrap_or("");
-                    let is_local = dev_id.starts_with("local:");
-                    let has_device = !dev_id.is_empty();
-                    let in_registry =
-                        has_device && !is_local && self.outputs.lock().await.contains(dev_id);
-                    if has_device && !is_local && !in_registry {
-                        let msg = format!("Output device offline: {}", zone.name);
-                        warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
-                        if let Some(ref bus) = self.event_bus {
-                            bus.emit(
-                                "zone.playback_error",
-                                serde_json::json!({
-                                    "zone_id": req.zone_id,
-                                    "error": msg,
-                                }),
-                            );
-                        }
-                        return Err(msg);
-                    }
-                }
+            let rebound = match zone_db {
+                Some(ref zone) => self.gate_or_rebind_offline_zone(req.zone_id, zone).await?,
+                None => None,
+            };
+            if let Some(new_id) = rebound {
+                req.output_device_id = Some(new_id);
             }
         }
 
@@ -1661,30 +1739,53 @@ impl PlaybackOrchestrator {
             "pcm" => false,
             "native" => true,
             _ => {
-                // Auto mode: probe renderer
+                // Auto mode: probe renderer.
+                //
+                // Only a CONCLUSIVE probe goes into the cache. `probe_dsd_support`
+                // returns `None` when GetProtocolInfo failed or the Sink was
+                // empty, and a renderer that isn't a DLNA output (or has since
+                // left the map) is just as inconclusive. Caching those would
+                // pin the device to "no DSD" for the whole process lifetime —
+                // a single transient failure right after discovery would
+                // silently force DSD→PCM transcoding on a renderer that plays
+                // DSD natively, with no way to recover short of a restart.
+                // Same rule as `DlnaOutput::supports_mime`.
                 let mut cache = self.dsd_capabilities.lock().await;
                 if let Some(cap) = cache.get(device_id) {
                     return cap.supports_dsf || cap.supports_dff;
                 }
                 let cap = {
                     let arc = { self.outputs.lock().await.get(device_id) };
-                    if let Some(output) = arc {
-                        let locked = output.lock().await;
-                        if let Some(dlna) = locked
-                            .as_any()
-                            .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-                        {
-                            dlna.probe_dsd_support().await
-                        } else {
-                            crate::outputs::dlna::DsdCapability::default()
+                    match arc {
+                        Some(output) => {
+                            let locked = output.lock().await;
+                            match locked
+                                .as_any()
+                                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                            {
+                                Some(dlna) => dlna.probe_dsd_support().await,
+                                None => None,
+                            }
                         }
-                    } else {
-                        crate::outputs::dlna::DsdCapability::default()
+                        None => None,
                     }
                 };
-                let result = cap.supports_dsf || cap.supports_dff;
-                cache.insert(device_id.to_string(), cap);
-                result
+                match cap {
+                    Some(cap) => {
+                        let result = cap.supports_dsf || cap.supports_dff;
+                        cache.insert(device_id.to_string(), cap);
+                        result
+                    }
+                    None => {
+                        // Inconclusive: fall back to the safe path (transcode to
+                        // PCM) for THIS track only, and re-probe next time.
+                        tracing::debug!(
+                            device_id,
+                            "dsd_probe_inconclusive_not_cached_falling_back_to_pcm"
+                        );
+                        false
+                    }
+                }
             }
         }
     }
@@ -7082,6 +7183,24 @@ fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
 /// Decodes packets progressively and converts to interleaved 16-bit PCM bytes.
 /// The loop runs until the stream ends, the sender is dropped (stop), or an
 /// unrecoverable error occurs.
+/// Choose a renderer-safe WAV output sample rate for a decoded radio stream.
+///
+/// Most DLNA/UPnP renderers only lock onto 44.1/48 kHz (and higher standard
+/// multiples). HE-AAC / aacPlus streams (Radio Morow: `morow_hi.aacp`) decode
+/// at the AAC-LC core rate — typically 22050 Hz — because symphonia does not
+/// apply the SBR extension that would double the rate to 44100. A 22050 Hz WAV
+/// is reported as PLAYING yet emitted as SILENCE by many renderers (Yves,
+/// LHC-60). We upsample any sub-44.1 kHz stream to 44100 Hz so sound is
+/// guaranteed. Streams already at 44.1 kHz or above pass through unchanged, so
+/// stations that already work incur no extra CPU and no quality change.
+pub(crate) fn renderer_safe_wav_rate(source_rate: u32) -> u32 {
+    if source_rate < 44_100 {
+        44_100
+    } else {
+        source_rate
+    }
+}
+
 fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -7243,13 +7362,19 @@ fn decode_radio_stream_to_pcm(
             _ => {}
         }
 
-        // Publish the true decoded format so the HTTP handler advertises the
-        // correct WAV sample rate/channels to the renderer (FIP is 48000, not
-        // the placeholder 44100 in StreamInfo). Set BEFORE first_chunk so the
-        // header, which is emitted after data_ready, reflects the real rate.
+        // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
+        // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
+        // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
+        let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
+        let needs_resample = output_sample_rate != source_sample_rate;
+
+        // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
+        // that matches the PCM we actually feed (FIP is 48000 → advertised as
+        // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
+        // BEFORE first_chunk so the header, emitted after data_ready, is right.
         session
             .detected_sample_rate
-            .store(source_sample_rate, std::sync::atomic::Ordering::Relaxed);
+            .store(output_sample_rate, std::sync::atomic::Ordering::Relaxed);
         session
             .detected_channels
             .store(source_channels, std::sync::atomic::Ordering::Relaxed);
@@ -7260,6 +7385,8 @@ fn decode_radio_stream_to_pcm(
         info!(
             channels = source_channels,
             sample_rate = source_sample_rate,
+            output_sample_rate = output_sample_rate,
+            resampled = needs_resample,
             reconnect = reconnects,
             gap_ms = ?gap_ms,
             "radio_local_decode_started"
@@ -7320,11 +7447,23 @@ fn decode_radio_stream_to_pcm(
             // Convert decoded audio buffer to interleaved 16-bit PCM bytes
             let channels = decoded.spec().channels().count();
             let frames = decoded.frames();
-            let mut packet_buf: Vec<u8> = Vec::with_capacity(frames * channels * 2);
 
             let mut interleaved: Vec<f32> = Vec::with_capacity(frames * channels);
             decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
 
+            // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
+            // before packing to i16, so the bytes match the advertised WAV
+            // header. No-op (single move) when the stream is already 44.1/48.
+            if needs_resample {
+                interleaved = crate::audio::simple_resample(
+                    &interleaved,
+                    source_sample_rate,
+                    output_sample_rate,
+                    channels as u16,
+                );
+            }
+
+            let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
             for sample in &interleaved {
                 let s16: i16 = (*sample).into_sample();
                 packet_buf.extend_from_slice(&s16.to_le_bytes());
@@ -7342,7 +7481,7 @@ fn decode_radio_stream_to_pcm(
                         &chunk,
                         16,
                         channels as u16,
-                        source_sample_rate,
+                        output_sample_rate,
                     );
                 }
                 if rt.block_on(tx.send(chunk)).is_err() {
@@ -7408,7 +7547,46 @@ fn resolve_existing_local_path(stored: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
+
+    /// Le débit WAV servi au renderer DLNA doit être « renderer-safe » : un
+    /// flux HE-AAC/aacPlus décodé à 22050 Hz (Radio Morow) est rééchantillonné
+    /// à 44100 Hz pour être audible ; un flux déjà en 44,1/48 kHz (ou plus)
+    /// passe inchangé, sans rééchantillonnage inutile.
+    #[test]
+    fn renderer_safe_rate_upsamples_low_rates_only() {
+        use super::renderer_safe_wav_rate;
+        // HE-AAC core rate → upsample to 44100
+        assert_eq!(renderer_safe_wav_rate(22050), 44100);
+        // Other low/non-standard rates → 44100
+        assert_eq!(renderer_safe_wav_rate(11025), 44100);
+        assert_eq!(renderer_safe_wav_rate(16000), 44100);
+        assert_eq!(renderer_safe_wav_rate(24000), 44100);
+        assert_eq!(renderer_safe_wav_rate(32000), 44100);
+        // Standard rates pass through unchanged (no needless resample)
+        assert_eq!(renderer_safe_wav_rate(44100), 44100);
+        assert_eq!(renderer_safe_wav_rate(48000), 48000);
+        // Hi-res radio kept as-is
+        assert_eq!(renderer_safe_wav_rate(88200), 88200);
+        assert_eq!(renderer_safe_wav_rate(96000), 96000);
+    }
+
+    /// Le rééchantillonnage 22050→44100 double bien le nombre de trames
+    /// (ratio 2.0) et préserve l'entrelacement stéréo : la sortie doit avoir
+    /// un nombre de trames pair et cohérent avec le ratio.
+    #[test]
+    fn radio_resample_doubles_frames_at_2x() {
+        // 1024 stereo frames of test signal (interleaved f32)
+        let in_frames = 1024usize;
+        let src: Vec<f32> = (0..in_frames * 2).map(|i| (i as f32) * 0.001).collect();
+        let out = crate::audio::simple_resample(&src, 22050, 44100, 2);
+        // 22050 → 44100 is exactly 2x
+        assert_eq!(out.len(), in_frames * 2 * 2);
+        // Identity when rate unchanged (44100 → 44100)
+        let same = crate::audio::simple_resample(&src, 44100, 44100, 2);
+        assert_eq!(same, src);
+    }
 
     /// La sonde de niveaux proxy (VU-mètres Qobuz/Tidal direct) décode un
     /// flux HTTP en fenêtres brutes : 1 s de WAV silencieux servie par un
@@ -7876,6 +8054,203 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    /// Crée une zone offline pointant vers un device réseau disparu, comme la
+    /// « Mac Studio Speakers » d'Alex Campbell (#1287) : la zone avait été créée
+    /// quand un second serveur voyait le Mac sur le réseau ; ce device n'existe
+    /// plus dans le registre du serveur courant.
+    fn stale_network_zone(orch: &PlaybackOrchestrator, name: &str) -> i64 {
+        let repo = ZoneRepo::with_backend(orch.db.clone());
+        let id = repo
+            .create(name, Some("dlna"), Some("dlna-vanished-host"))
+            .unwrap();
+        repo.update_online(id, false).unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn stale_network_zone_rebinds_to_the_local_output_of_the_same_name() {
+        let orch = test_orchestrator();
+        let zone_id = stale_network_zone(&orch, "Mac Studio Speakers");
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new("local:mac-studio-speakers", "Mac Studio Speakers").with_type("local"),
+        ));
+
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        let rebound = orch
+            .gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .expect("le rebind doit réussir, pas rejeter la lecture");
+        assert_eq!(rebound.as_deref(), Some("local:mac-studio-speakers"));
+
+        // Le rebind est persisté et collant : id, type ET online.
+        let after = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.output_device_id.as_deref(),
+            Some("local:mac-studio-speakers")
+        );
+        assert_eq!(
+            after.output_type.as_deref(),
+            Some("local"),
+            "le type doit suivre l'id, sinon la zone reste typée dlna en pointant du local"
+        );
+        assert!(after.online);
+    }
+
+    #[tokio::test]
+    async fn two_outputs_of_the_same_name_are_ambiguous_and_never_auto_bound() {
+        let orch = test_orchestrator();
+        let zone_id = stale_network_zone(&orch, "Salon");
+        {
+            let mut reg = orch.outputs.lock().await;
+            reg.register(Box::new(
+                MockOutput::new("dlna-a", "Salon").with_type("dlna"),
+            ));
+            reg.register(Box::new(
+                MockOutput::new("dlna-b", "Salon").with_type("dlna"),
+            ));
+        }
+
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        let err = orch
+            .gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .expect_err("deux homonymes sans local : binder l'un des deux serait un pari");
+        assert!(err.starts_with("zone_output_unavailable:"), "err = {err}");
+
+        // Rien n'a été touché en base.
+        let after = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.output_device_id.as_deref(),
+            Some("dlna-vanished-host")
+        );
+        assert!(!after.online);
+    }
+
+    #[tokio::test]
+    async fn a_single_local_output_wins_over_other_same_name_candidates() {
+        let orch = test_orchestrator();
+        let zone_id = stale_network_zone(&orch, "Salon");
+        {
+            let mut reg = orch.outputs.lock().await;
+            reg.register(Box::new(
+                MockOutput::new("dlna-a", "Salon").with_type("dlna"),
+            ));
+            reg.register(Box::new(
+                MockOutput::new("local:salon", "Salon").with_type("local"),
+            ));
+        }
+
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        let rebound = orch
+            .gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .unwrap();
+        assert_eq!(
+            rebound.as_deref(),
+            Some("local:salon"),
+            "un local unique tranche l'ambiguïté — c'est la règle « préférer local »"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_matching_output_gives_an_actionable_error_not_a_curt_offline() {
+        let orch = test_orchestrator();
+        let zone_id = stale_network_zone(&orch, "Chambre");
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new("local:autre-chose", "Cuisine").with_type("local"),
+        ));
+
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        let err = orch
+            .gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .expect_err("aucune sortie du même nom");
+        assert!(err.starts_with("zone_output_unavailable:"), "err = {err}");
+        assert!(
+            err.contains("réglages de la zone"),
+            "le message doit dire quoi faire, pas juste « offline » : {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_zone_is_left_completely_alone() {
+        let orch = test_orchestrator();
+        let repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = repo
+            .create("Bureau", Some("local"), Some("local:bureau"))
+            .unwrap();
+        repo.update_online(zone_id, true).unwrap();
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new("local:bureau", "Bureau").with_type("local"),
+        ));
+
+        let zone = repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(
+            orch.gate_or_rebind_offline_zone(zone_id, &zone)
+                .await
+                .unwrap(),
+            None,
+            "chemin nominal : aucun rebind, aucune écriture"
+        );
+    }
+
+    /// Une zone offline dont le device est TOUJOURS dans le registre vivant ne
+    /// doit pas être re-bindée : c'est la fenêtre de grâce pour les trous de
+    /// polling SSDP, le device est joignable même si la DB dit offline.
+    #[tokio::test]
+    async fn an_offline_zone_whose_device_is_still_registered_is_not_touched() {
+        let orch = test_orchestrator();
+        let repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = repo
+            .create("Salon", Some("dlna"), Some("dlna-toujours-la"))
+            .unwrap();
+        repo.update_online(zone_id, false).unwrap();
+        {
+            let mut reg = orch.outputs.lock().await;
+            reg.register(Box::new(
+                MockOutput::new("dlna-toujours-la", "Salon").with_type("dlna"),
+            ));
+            // Un homonyme local qui aurait été choisi si on avait re-bindé.
+            reg.register(Box::new(
+                MockOutput::new("local:salon", "Salon").with_type("local"),
+            ));
+        }
+
+        let zone = repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(
+            orch.gate_or_rebind_offline_zone(zone_id, &zone)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.get(zone_id)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("dlna-toujours-la")
+        );
     }
 
     #[test]

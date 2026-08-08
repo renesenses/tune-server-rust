@@ -32,3 +32,46 @@ pub mod tap;
 pub mod text_embedding;
 pub mod wav;
 pub mod wavpack;
+
+/// Linear (2-tap) resampler over interleaved f32 samples.
+///
+/// Cheap, stateless, and always compiled (no `local-audio` gate) so it can be
+/// shared by the local-output pipeline and the radio→WAV proxy that feeds DLNA
+/// renderers. Quality is sufficient for lossy sources (e.g. HE-AAC radio
+/// upsampled 22050→44100); the local pipeline prefers the rubato sinc path for
+/// hi-res material and only falls back here.
+pub(crate) fn simple_resample(
+    samples: &[f32],
+    from_sr: u32,
+    to_sr: u32,
+    channels: u16,
+) -> Vec<f32> {
+    if from_sr == to_sr {
+        return samples.to_vec();
+    }
+    let ch = channels as usize;
+    if ch == 0 {
+        return Vec::new();
+    }
+    let in_frames = samples.len() / ch;
+    if in_frames == 0 {
+        return Vec::new();
+    }
+    let ratio = to_sr as f64 / from_sr as f64;
+    let out_frames = (in_frames as f64 * ratio) as usize;
+    let mut out = Vec::with_capacity(out_frames * ch);
+
+    for i in 0..out_frames {
+        let src_pos = i as f64 / ratio;
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let idx0 = idx.min(in_frames - 1);
+        let idx1 = (idx + 1).min(in_frames - 1);
+        for c in 0..ch {
+            let s0 = samples[idx0 * ch + c];
+            let s1 = samples[idx1 * ch + c];
+            out.push(s0 + (s1 - s0) * frac);
+        }
+    }
+    out
+}

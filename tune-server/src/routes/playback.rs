@@ -52,6 +52,22 @@ fn play_error_response(e: String) -> axum::response::Response {
         )
             .into_response();
     }
+    // Stale-output sentinel from orchestrator.play(): the zone points at an
+    // output device that has vanished, and no live output of the same name could
+    // be re-bound automatically (#1287 — none found, or several, so binding one
+    // would be a guess). 409 like the orphan-zone case: well-formed request, the
+    // zone's state makes it impossible. The message is already actionable, the
+    // client just surfaces it.
+    if let Some(msg) = e.strip_prefix("zone_output_unavailable:") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zone_output_unavailable",
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
     // Missing-file sentinel from orchestrator.play(): the track's file_path no
     // longer exists on disk (moved/deleted drive, stale scan). 404 so the client
     // shows a real error instead of the track "playing" silently (JP).
@@ -2759,5 +2775,16 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "zone_no_output_device");
         assert_eq!(body["message"], "aucune sortie");
+
+        // #1287 : sortie disparue et rebind impossible (aucun homonyme, ou
+        // plusieurs). Message actionnable relayé tel quel au client.
+        let (status, body) =
+            parts("zone_output_unavailable:La sortie de cette zone n'est plus disponible.").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_output_unavailable");
+        assert_eq!(
+            body["message"],
+            "La sortie de cette zone n'est plus disponible."
+        );
     }
 }

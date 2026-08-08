@@ -79,6 +79,22 @@ impl OutputRegistry {
             .collect()
     }
 
+    /// device_ids of every registered output whose display name matches `name`
+    /// (case-insensitive), paired with its `output_type`.
+    ///
+    /// Used to recover a zone whose stored `output_device_id` has vanished: the
+    /// same physical output may still be present under a different id (e.g. a
+    /// Mac's speakers once seen over the network from another server, now only
+    /// reachable as a `local:` CoreAudio output). Read from the sync `meta`
+    /// sidecar, so no output's async Mutex is locked.
+    pub fn find_by_name(&self, name: &str) -> Vec<(String, String)> {
+        self.meta
+            .iter()
+            .filter(|(_, (n, _, _))| n.eq_ignore_ascii_case(name))
+            .map(|(id, (_, t, _))| (id.clone(), t.clone()))
+            .collect()
+    }
+
     pub fn get(&self, device_id: &str) -> Option<Arc<Mutex<Box<dyn OutputTarget>>>> {
         self.outputs.get(device_id).cloned()
     }
@@ -193,6 +209,28 @@ mod tests {
             reg.conflicting_outputs("DENAFRIPS USB HiRes Audio", "squeezebox")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn find_by_name_is_case_insensitive_and_carries_the_type() {
+        let mut reg = OutputRegistry::new();
+        reg.register(Box::new(
+            MockOutput::new("local:mac-speakers", "Mac Studio Speakers").with_type("local"),
+        ));
+        reg.register(Box::new(
+            MockOutput::new("dlna-1", "Marantz CINEMA 70s").with_type("dlna"),
+        ));
+
+        let found = reg.find_by_name("mac studio speakers");
+        assert_eq!(
+            found,
+            vec![("local:mac-speakers".to_string(), "local".to_string())]
+        );
+        assert!(reg.find_by_name("Zone fantôme").is_empty());
+
+        // remove() purge aussi l'index de noms.
+        reg.remove("local:mac-speakers");
+        assert!(reg.find_by_name("Mac Studio Speakers").is_empty());
     }
 
     #[test]

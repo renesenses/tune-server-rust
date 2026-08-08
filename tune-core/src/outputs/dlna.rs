@@ -728,43 +728,69 @@ pub struct DsdCapability {
     pub dsf_mime: Option<String>,
 }
 
+/// Read native DSD support out of a non-empty GetProtocolInfo Sink.
+///
+/// Split out of `probe_dsd_support` so the parsing can be unit-tested without a
+/// live renderer: the caller owns the "did the probe even succeed" question
+/// (`Option`), this owns "what does the Sink say".
+///
+/// `dsf_mime` keeps the renderer's own spelling of the MIME (3rd colon-separated
+/// field of `http-get:*:audio/dsf:*`), because some renderers only accept the
+/// exact MIME they advertise rather than the generic `application/x-dsd`.
+fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
+    let mut cap = DsdCapability::default();
+    for proto in protocols {
+        let lower = proto.to_lowercase();
+        if lower.contains("x-dsd")
+            || lower.contains("audio/dsf")
+            || lower.contains("audio/x-dsf")
+            || lower.contains("application/x-dsd")
+            || lower.contains("application/dsf")
+            || lower.contains("audio/vnd.dsd")
+        {
+            cap.supports_dsf = true;
+            if cap.dsf_mime.is_none() {
+                let parts: Vec<&str> = proto.split(':').collect();
+                if parts.len() >= 3 {
+                    cap.dsf_mime = Some(parts[2].trim().to_string());
+                }
+            }
+        }
+        if lower.contains("audio/dff") || lower.contains("x-dff") || lower.contains("audio/x-dff") {
+            cap.supports_dff = true;
+        }
+    }
+    cap
+}
+
 impl DlnaOutput {
-    pub async fn probe_dsd_support(&self) -> DsdCapability {
+    /// Probe the renderer's GetProtocolInfo Sink for native DSD support.
+    ///
+    /// `Some(cap)` when the Sink was actually read — including a conclusive
+    /// "this renderer does not do DSD" (all flags false). `None` when the probe
+    /// was **inconclusive**: GetProtocolInfo failed, or the Sink came back
+    /// empty. The caller must fall back conservatively for `None` but must NOT
+    /// cache it — same rule as `supports_mime` below. A transient
+    /// GetProtocolInfo failure (renderer asleep, busy, or slow to answer right
+    /// after discovery) would otherwise pin a DSD-capable renderer to the
+    /// DSD→PCM transcode path for the whole session, with no way to recover
+    /// short of restarting the server.
+    pub async fn probe_dsd_support(&self) -> Option<DsdCapability> {
         let protocols = match self.get_protocol_info().await {
             Ok(p) => p,
             Err(e) => {
                 warn!(device = %self.name, error = %e, "dsd_probe_protocol_info_failed");
-                return DsdCapability::default();
+                return None;
             }
         };
-        debug!(device = %self.name, protocols = ?protocols, "dsd_probe_protocol_info_raw");
-        let mut cap = DsdCapability::default();
-        for proto in &protocols {
-            let lower = proto.to_lowercase();
-            if lower.contains("x-dsd")
-                || lower.contains("audio/dsf")
-                || lower.contains("audio/x-dsf")
-                || lower.contains("application/x-dsd")
-                || lower.contains("application/dsf")
-                || lower.contains("audio/vnd.dsd")
-            {
-                cap.supports_dsf = true;
-                if cap.dsf_mime.is_none() {
-                    let parts: Vec<&str> = proto.split(':').collect();
-                    if parts.len() >= 3 {
-                        cap.dsf_mime = Some(parts[2].trim().to_string());
-                    }
-                }
-            }
-            if lower.contains("audio/dff")
-                || lower.contains("x-dff")
-                || lower.contains("audio/x-dff")
-            {
-                cap.supports_dff = true;
-            }
+        if protocols.is_empty() {
+            debug!(device = %self.name, "dsd_probe_empty_sink");
+            return None;
         }
+        debug!(device = %self.name, protocols = ?protocols, "dsd_probe_protocol_info_raw");
+        let cap = parse_dsd_capability(&protocols);
         info!(device = %self.name, supports_dsf = cap.supports_dsf, supports_dff = cap.supports_dff, dsf_mime = ?cap.dsf_mime, protocols_count = protocols.len(), "dsd_probe_result");
-        cap
+        Some(cap)
     }
 
     /// Probe the renderer's GetProtocolInfo Sink to check if a given MIME type
@@ -1000,6 +1026,47 @@ mod tests {
         assert!(c.lpcm16, "audio/L16 present");
         assert!(!c.lpcm24, "no audio/L24 advertised");
         assert!(c.mp3 && c.aac && c.dsd);
+    }
+
+    #[test]
+    fn parse_dsd_capability_keeps_the_renderer_own_mime() {
+        // Yamaha R-N2000A-shaped Sink: the renderer advertises its own spelling
+        // of the DSD MIME, and we must serve that one back rather than the
+        // generic application/x-dsd (cf. the passthrough path in orchestrator).
+        let sink = vec![
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+            "http-get:*:audio/dsf:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&sink);
+        assert!(cap.supports_dsf);
+        assert!(!cap.supports_dff);
+        assert_eq!(cap.dsf_mime.as_deref(), Some("audio/dsf"));
+    }
+
+    #[test]
+    fn parse_dsd_capability_reports_no_dsd_for_a_pcm_only_sink() {
+        // A conclusive negative — distinct from a failed probe, which never
+        // reaches this function (probe_dsd_support returns None instead).
+        let sink = vec![
+            "http-get:*:audio/mpeg:*".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&sink);
+        assert!(!cap.supports_dsf);
+        assert!(!cap.supports_dff);
+        assert_eq!(cap.dsf_mime, None);
+    }
+
+    #[test]
+    fn parse_dsd_capability_detects_dff_and_x_dsd_variants() {
+        let sink = vec![
+            "http-get:*:audio/x-dsd:*".to_string(),
+            "http-get:*:audio/x-dff:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&sink);
+        assert!(cap.supports_dsf, "x-dsd counts as DSD");
+        assert!(cap.supports_dff);
+        assert_eq!(cap.dsf_mime.as_deref(), Some("audio/x-dsd"));
     }
 
     #[test]

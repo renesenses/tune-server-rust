@@ -120,6 +120,33 @@ jobs:
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
+      # Garde-fou #1288 : la cible musl n'a d'intérêt que si le binaire est
+      # RÉELLEMENT statique (NAS à vieille userland, Alpine ARM). Une dépendance
+      # native qui repasse en lien dynamique — comme libopus l'a fait en v0.9.53,
+      # cf Cross.toml — casse soit le link, soit le binaire à l'exécution chez
+      # l'utilisateur. `file` fonctionne en cross-arch, contrairement à `ldd`.
+      - name: Verify musl binary is statically linked
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          file -b "$BIN"
+          # Le critère qui fait foi est l'absence de dépendance partagée (NEEDED)
+          # et d'interpréteur dynamique, pas le libellé de `file` : rustc produit
+          # des binaires **static-pie** sur musl, que `file` décrit
+          # « static-pie linked » et non « statically linked ». `readelf` est
+          # indépendant de l'architecture, il lit donc l'ELF arm64 sur un runner
+          # x86_64 — contrairement à `ldd`.
+          NEEDED="$(readelf -d "$BIN" 2>/dev/null | grep NEEDED || true)"
+          INTERP="$(readelf -l "$BIN" 2>/dev/null | grep 'program interpreter' || true)"
+          if [ -n "$NEEDED" ] || [ -n "$INTERP" ]; then
+            echo "::error::Le binaire musl arm64 n'est pas statique — il dépend de bibliothèques partagées."
+            echo "$NEEDED"
+            echo "$INTERP"
+            exit 1
+          fi
+          echo "OK — binaire musl arm64 statique (aucun NEEDED, aucun interpréteur dynamique)"
+
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
