@@ -220,6 +220,15 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 #[cfg(feature = "oaat")]
 const MAX_STREAM_RETRY_ATTEMPTS: u32 = 3;
 
+/// How close to the declared duration a body error must land to count as the
+/// end of the track rather than a failure.
+///
+/// The Content-Length of a progressive WAV transcode is predicted from the
+/// library duration, so the real body runs short by the prediction error —
+/// tens of milliseconds in practice. One second leaves ample room for that
+/// while keeping a genuine late-track cut on the resume path, where it belongs.
+const END_OF_TRACK_TOLERANCE_MS: u64 = 1_000;
+
 #[cfg(feature = "oaat")]
 async fn connect_and_setup(
     config: &oaat_controller::ControllerConfig,
@@ -1770,8 +1779,48 @@ impl OutputTarget for OaatOutput {
                                 buf.extend_from_slice(&data);
                             }
                             Some(Err(e)) => {
-                                // Mid-stream body-read error. Rather than ending
-                                // the track (and wedging the zone ~30s in
+                                // First: is this the END of the track rather than
+                                // a failure? A progressive WAV transcode declares
+                                // a Content-Length predicted from the library
+                                // duration, so the body always ends slightly
+                                // short of it and reqwest reports a decode error
+                                // instead of a clean EOF — exactly when the track
+                                // finishes. Read as a mid-stream failure it sends
+                                // us into a Range resume that cannot succeed, and
+                                // we leave by a path that skips the gapless
+                                // transition entirely (Xavier, 7 Aug 2026).
+                                //
+                                // Only on the PCM path: there `sample_offset`
+                                // counts frames, so elapsed time is exact. FLAC
+                                // and DSD track compressed BYTES, which carry no
+                                // reliable mapping to milliseconds — they keep
+                                // the resume path unchanged.
+                                if !uses_byte_offset && cur_sample_rate > 0 && bytes_per_frame > 0 {
+                                    let pending_frames = (buf.len() / bytes_per_frame) as u64;
+                                    let received_ms = (sample_offset + pending_frames) * 1000
+                                        / cur_sample_rate as u64;
+                                    if super::helpers::body_error_is_track_end(
+                                        received_ms,
+                                        cur_stream_info.duration_ms,
+                                        END_OF_TRACK_TOLERANCE_MS,
+                                    ) {
+                                        info!(
+                                            device = %device_name,
+                                            received_ms,
+                                            declared_ms = cur_stream_info.duration_ms,
+                                            "oaat: body ended at track duration, treating as end of track"
+                                        );
+                                        // Hand the loop a finished stream so the
+                                        // normal end-of-track arm runs unchanged:
+                                        // flush the buffer, send LAST_PACKET, then
+                                        // take the gapless transition.
+                                        stream = Box::pin(futures_util::stream::empty());
+                                        continue;
+                                    }
+                                }
+
+                                // Genuine mid-stream body-read error. Rather than
+                                // ending the track (and wedging the zone ~30s in
                                 // stopped_early_waiting), resume the fetch from
                                 // the byte we've streamed so far via HTTP Range.
                                 if stream_retry_attempts >= MAX_STREAM_RETRY_ATTEMPTS {

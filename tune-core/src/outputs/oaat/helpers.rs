@@ -524,3 +524,77 @@ async fn clock_responder_loop(socket: tokio::net::UdpSocket) {
         let _ = socket.send_to(&resp, peer).await;
     }
 }
+
+/// Does a stream body error land at the natural end of the track, rather than
+/// mid-track?
+///
+/// The server advertises `Content-Length` for a progressive WAV transcode from
+/// the **library** duration (`StreamInfo::wav_content_length`), while the
+/// decoder emits the file's exact sample count. The two differ — at 88.2 kHz /
+/// 24-bit / stereo, one millisecond is already ~530 bytes — so the body ends
+/// short of its declared length and reqwest reports `error decoding response
+/// body` instead of a clean EOF, at the precise moment the track ends.
+///
+/// Xavier Joly, 7 Aug 2026: track started 16:31:04, duration 177.9 s, natural
+/// end 16:34:01.9 — body error logged at 16:34:01. Read as a mid-stream
+/// failure, the loop attempted a Range resume that could not succeed, gave up,
+/// and left by a path that skips the gapless transition entirely: 83 seconds of
+/// silence before the next track came back on a cold session.
+///
+/// `tolerance_ms` bounds what we accept as "the end". A genuine failure inside
+/// that window costs at most that much audio; getting it wrong the other way
+/// costs the whole track chain.
+pub(super) fn body_error_is_track_end(
+    received_ms: u64,
+    declared_duration_ms: u64,
+    tolerance_ms: u64,
+) -> bool {
+    declared_duration_ms > 0 && received_ms + tolerance_ms >= declared_duration_ms
+}
+
+#[cfg(test)]
+mod body_error_tests {
+    use super::body_error_is_track_end;
+
+    const TOL: u64 = 1_000;
+
+    /// Xavier's case, in numbers: the body dies a few hundred ms short of the
+    /// declared duration because Content-Length was a prediction.
+    #[test]
+    fn a_body_error_just_short_of_the_declared_duration_is_the_end() {
+        assert!(body_error_is_track_end(177_870, 177_900, TOL));
+    }
+
+    #[test]
+    fn a_body_error_exactly_at_the_declared_duration_is_the_end() {
+        assert!(body_error_is_track_end(177_900, 177_900, TOL));
+    }
+
+    /// Overshooting the declared duration still counts: the prediction can err
+    /// on either side.
+    #[test]
+    fn a_body_error_past_the_declared_duration_is_the_end() {
+        assert!(body_error_is_track_end(178_100, 177_900, TOL));
+    }
+
+    /// A real mid-track cut must keep the Range-resume path — that is what
+    /// rescues a transient network blip without dropping the track.
+    #[test]
+    fn a_failure_mid_track_is_not_the_end() {
+        assert!(!body_error_is_track_end(90_000, 177_900, TOL));
+    }
+
+    /// Just outside the tolerance: still a failure, not an end.
+    #[test]
+    fn a_failure_just_outside_the_tolerance_is_not_the_end() {
+        assert!(!body_error_is_track_end(176_899, 177_900, TOL));
+    }
+
+    /// Without a declared duration there is nothing to compare against, so we
+    /// must not guess — the resume path stays in charge.
+    #[test]
+    fn an_unknown_duration_never_counts_as_the_end() {
+        assert!(!body_error_is_track_end(177_870, 0, TOL));
+        assert!(!body_error_is_track_end(0, 0, TOL));
+    }
+}
