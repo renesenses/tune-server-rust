@@ -97,7 +97,47 @@ fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
     }
 }
 
+/// Traduit le type de favori du client (pluriel) en paramètre attendu par
+/// l'API Qobuz.
+fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
+    match fav_type {
+        "tracks" => Ok("track_ids"),
+        "albums" => Ok("album_ids"),
+        "artists" => Ok("artist_ids"),
+        _ => Err(format!("unknown favorite type: {fav_type}").into()),
+    }
+}
+
+/// Trace le résultat d'une écriture de favori chez Qobuz.
+///
+/// Sans cette trace, un favori qui n'arrive jamais dans l'app Qobuz ne laisse
+/// aucune empreinte exploitable : l'appel HTTP réussit, le cœur bascule dans
+/// Tune, et le rapport du testeur se réduit à « ça ne marche pas ». On veut
+/// pouvoir répondre depuis ses logs (retour Fabien, 08/08/2026).
+fn log_favorite_result(
+    op: &str,
+    fav_type: &str,
+    item_id: &str,
+    res: &Result<serde_json::Value, String>,
+) {
+    match res {
+        Ok(body) => info!(op, fav_type, item_id, response = %body, "qobuz_favorite_ok"),
+        Err(e) => warn!(op, fav_type, item_id, error = %e, "qobuz_favorite_failed"),
+    }
+}
+
 impl QobuzService {
+    /// Écrire un favori exige le jeton utilisateur : l'app_id seul identifie
+    /// l'application, pas le compte. Sans jeton, Qobuz accepte la requête sans
+    /// rien enregistrer — un succès en trompe-l'œil. On refuse avant d'émettre.
+    fn require_user_token(&self, op: &str) -> Result<(), TuneError> {
+        if self.user_auth_token.is_none() {
+            warn!(op, "qobuz_favorite_no_user_token");
+            return Err("session Qobuz non authentifiée : reconnecte le compte Qobuz".into());
+        }
+        Ok(())
+    }
+
     pub fn new(app_id: String, app_secret: String) -> Self {
         Self {
             client: crate::http::client::builder()
@@ -1150,24 +1190,20 @@ impl StreamingService for QobuzService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let key = match fav_type {
-            "tracks" => "track_ids",
-            "albums" => "album_ids",
-            "artists" => "artist_ids",
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_post("/favorite/create", &[(key, item_id)]).await?;
+        let key = favorite_key(fav_type)?;
+        self.require_user_token("favorite/create")?;
+        let res = self.api_post("/favorite/create", &[(key, item_id)]).await;
+        log_favorite_result("create", fav_type, item_id, &res);
+        res?;
         Ok(())
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let key = match fav_type {
-            "tracks" => "track_ids",
-            "albums" => "album_ids",
-            "artists" => "artist_ids",
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_post("/favorite/delete", &[(key, item_id)]).await?;
+        let key = favorite_key(fav_type)?;
+        self.require_user_token("favorite/delete")?;
+        let res = self.api_post("/favorite/delete", &[(key, item_id)]).await;
+        log_favorite_result("delete", fav_type, item_id, &res);
+        res?;
         Ok(())
     }
 
@@ -1470,6 +1506,31 @@ mod tests {
     fn endpoint_order_proxy_first_for_founder() {
         // Founder account (license `qobuz_proxy_first`): proxy first.
         assert_eq!(endpoint_order(true), (API_PROXY, API_BASE));
+    }
+
+    #[test]
+    fn favorite_key_maps_the_plural_types_sent_by_the_client() {
+        assert_eq!(favorite_key("tracks").unwrap(), "track_ids");
+        assert_eq!(favorite_key("albums").unwrap(), "album_ids");
+        assert_eq!(favorite_key("artists").unwrap(), "artist_ids");
+        assert!(
+            favorite_key("track").is_err(),
+            "le singulier n'est pas le contrat"
+        );
+    }
+
+    #[test]
+    fn writing_a_favorite_without_a_user_token_is_refused_up_front() {
+        // Sans jeton utilisateur, Qobuz accepte la requête sans rien
+        // enregistrer : on doit échouer avant de l'émettre, pas rapporter un
+        // succès que l'app Qobuz dément.
+        let svc = QobuzService::new("app".into(), "secret".into());
+        assert!(svc.user_auth_token.is_none());
+        let err = svc.require_user_token("favorite/create").unwrap_err();
+        assert!(
+            err.to_string().contains("Qobuz"),
+            "le message doit désigner le compte à reconnecter, obtenu : {err}"
+        );
     }
 
     #[test]
