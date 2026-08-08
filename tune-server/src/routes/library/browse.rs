@@ -132,17 +132,39 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
     Ok(Json(json!({ "roots": roots })))
 }
 
+/// Résout le chemin demandé en tenant compte de la forme de normalisation
+/// Unicode réellement utilisée par le système de fichiers.
+///
+/// Tune renvoie les chemins en NFC, et le client les lui renvoie tels quels.
+/// Sur APFS la recherche est insensible à la forme, donc NFC suffit — mais pas
+/// sur un partage réseau : un volume SMB monté depuis macOS est sensible à la
+/// forme, et un dossier accentué créé côté NAS (« CDThèque ») peut n'exister
+/// qu'en NFD. Le chemin était alors déclaré invalide et la navigation
+/// s'arrêtait là (retour Yves Corbat, NAS Synology en SMB).
+///
+/// Renvoie le chemin absolu qui existe réellement, ou `None`.
+fn resolve_browse_path(raw: &str) -> Option<String> {
+    let base = tune_core::scanner::walker::normalize_path(raw);
+    let nfc: String = base.nfc().collect();
+    let nfd: String = base.nfd().collect();
+    // La forme brute est essayée aussi : elle est déjà correcte quand le client
+    // renvoie ce que le système de fichiers a fourni.
+    for candidate in [nfc, nfd, base] {
+        let path = std::path::Path::new(&candidate);
+        if path.is_absolute() && path.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 pub(super) async fn browse_directory(
     State(state): State<AppState>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let normalized_query: String = tune_core::scanner::walker::normalize_path(&q.path)
-        .nfc()
-        .collect();
+    let normalized_query =
+        resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
     let resolved = std::path::Path::new(&normalized_query);
-    if !resolved.is_absolute() || !resolved.exists() {
-        return Err(AppError::bad_request("invalid path"));
-    }
 
     // Verify path is under a configured music dir.
     // Use std::path::Path::starts_with for OS-aware prefix matching
@@ -154,9 +176,18 @@ pub(super) async fn browse_directory(
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
+    // Comparaison sur une forme Unicode commune : le chemin résolu peut être en
+    // NFD (ce qu'expose le partage SMB) alors que le dossier musical configuré
+    // est en NFC. Sans cela, un chemin pourtant valide était déclaré hors des
+    // dossiers musicaux — le même défaut que la résolution ci-dessus, une ligne
+    // plus loin.
+    let resolved_nfc: String = normalized_query.nfc().collect();
+    let resolved_nfc = std::path::Path::new(&resolved_nfc);
     let music_root = dirs.iter().find(|d| {
-        let norm_dir = tune_core::scanner::walker::normalize_path(d);
-        resolved.starts_with(&norm_dir)
+        let norm_dir: String = tune_core::scanner::walker::normalize_path(d)
+            .nfc()
+            .collect();
+        resolved_nfc.starts_with(&norm_dir)
     });
     let Some(music_root) = music_root else {
         return Err(AppError::bad_request(
@@ -165,9 +196,11 @@ pub(super) async fn browse_directory(
     };
     let music_root = tune_core::scanner::walker::normalize_path(music_root);
 
-    // List subdirectories
+    // List subdirectories. On lit le chemin RÉSOLU, pas `q.path` brut : c'est
+    // celui dont on vient de vérifier l'existence et l'appartenance à un dossier
+    // musical. Lire l'autre revenait à valider un chemin et en ouvrir un second.
     let mut subdirs: Vec<Value> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&q.path) {
+    if let Ok(entries) = std::fs::read_dir(resolved) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -310,5 +343,44 @@ pub(super) async fn browse_folders(
             let roots_json = browse_roots(State(state)).await;
             roots_json.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod browse_path_tests {
+    use super::resolve_browse_path;
+    use unicode_normalization::UnicodeNormalization;
+
+    /// Le cas Yves : un dossier accentué créé côté NAS doit être atteignable
+    /// que le client renvoie la forme composée ou décomposée.
+    #[test]
+    fn an_accented_directory_resolves_from_either_normalization_form() {
+        let tmp = std::env::temp_dir().join(format!("tune-browse-{}", std::process::id()));
+        let nfd_name: String = "CDThèque Yves".nfd().collect();
+        let dir = tmp.join(&nfd_name);
+        std::fs::create_dir_all(&dir).expect("création du dossier de test");
+
+        let on_disk = dir.to_string_lossy().to_string();
+        let nfc_form: String = on_disk.nfc().collect();
+        let nfd_form: String = on_disk.nfd().collect();
+
+        for form in [&nfc_form, &nfd_form] {
+            assert!(
+                resolve_browse_path(form).is_some(),
+                "forme non résolue : {form:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_is_refused() {
+        assert!(resolve_browse_path("/chemin/qui/nexiste/pas/du/tout").is_none());
+    }
+
+    #[test]
+    fn a_relative_path_is_refused() {
+        assert!(resolve_browse_path("Musique").is_none());
     }
 }
