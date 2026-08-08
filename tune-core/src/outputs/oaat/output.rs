@@ -2046,6 +2046,11 @@ impl OutputTarget for OaatOutput {
                                 if let Some(next) = next_track.take() {
                                     info!(device = %device_name, title = %next.title, "oaat: gapless transition");
 
+                                    // A format change tears the endpoint's output
+                                    // down (`configure()` sets started=false there),
+                                    // so the swapped-in track needs its own Play —
+                                    // see below.
+                                    let renegotiated = !next.same_format;
                                     if !next.same_format {
                                         if let Err(e) = endpoint.propose_format(&stream_id, next.info.format, next.info.sample_rate, ch, layout, next.info.bits_per_sample as u8).await {
                                             error!(device = %device_name, error = %e, "oaat: re-negotiate failed");
@@ -2075,6 +2080,26 @@ impl OutputTarget for OaatOutput {
                                         duration_ms: next.duration_ms, artwork_url: next.cover_url,
                                         format: Some(fmt_str),
                                     }).await.ok();
+
+                                    // Restart the stream after a renegotiation.
+                                    // Proposing a format makes the endpoint tear
+                                    // its output down and clear `started`; from
+                                    // then on it DROPS every packet until a Play
+                                    // arrives. We kept streaming without one, so
+                                    // any gapless transition that changed format
+                                    // killed the sound for good — position still
+                                    // advancing, endpoint silent, nothing in
+                                    // either log saying why (.18, 8 Aug 2026:
+                                    // silent from 15:37:12, the first 44.1->96 kHz
+                                    // transition). Same order as a fresh session:
+                                    // format, metadata, Play, then packets.
+                                    if renegotiated {
+                                        if let Err(e) = endpoint.send_play(&stream_id).await {
+                                            error!(device = %device_name, error = %e, "oaat: play after re-negotiation failed");
+                                            break;
+                                        }
+                                        info!(device = %device_name, sample_rate = cur_sample_rate, bits = cur_bits, "oaat: stream restarted after format change");
+                                    }
 
                                     sample_offset = 0;
                                     byte_offset = 0;
