@@ -99,16 +99,34 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
 
     // --- zones (compact : pas de stream_urls ni d'état de lecture) --------
     // Inclut l'appareil affecté (override utilisateur > détection UPnP) pour la
-    // fiche Support : brand/model = choix utilisateur au catalogue. Réutilise le
-    // `settings` déjà construit en tête de handler.
+    // fiche Support : brand/model = choix utilisateur au catalogue, à défaut ce
+    // que la découverte a lu dans la description du périphérique. Sans ce repli
+    // la fiche affichait « — » même pour les renderers correctement détectés,
+    // alors que /zones, lui, expose bien la détection.
+    // Réutilise le `settings` déjà construit en tête de handler.
+    let devices = state.scanner.lock().await.devices().await;
     let zones: Vec<Value> = ZoneRepo::with_backend(state.backend.clone())
         .list()
         .unwrap_or_default()
         .iter()
         .map(|z| {
             let zid = z.id.unwrap_or(0);
-            let brand = settings.get(&format!("zone_{zid}_brand")).ok().flatten();
-            let model = settings.get(&format!("zone_{zid}_model")).ok().flatten();
+            let detected = z
+                .output_device_id
+                .as_deref()
+                .and_then(|did| devices.iter().find(|d| d.id == did));
+            let brand = settings
+                .get(&format!("zone_{zid}_brand"))
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .or_else(|| detected.and_then(|d| d.manufacturer.clone()));
+            let model = settings
+                .get(&format!("zone_{zid}_model"))
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .or_else(|| detected.and_then(|d| d.model.clone()));
             json!({
                 "name": z.name,
                 "output_type": z.output_type,
