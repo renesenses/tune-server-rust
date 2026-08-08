@@ -524,3 +524,245 @@ async fn clock_responder_loop(socket: tokio::net::UdpSocket) {
         let _ = socket.send_to(&resp, peer).await;
     }
 }
+
+/// Does a stream body error land at the natural end of the track, rather than
+/// mid-track?
+///
+/// The server advertises `Content-Length` for a progressive WAV transcode from
+/// the **library** duration (`StreamInfo::wav_content_length`), while the
+/// decoder emits the file's exact sample count. The two differ — at 88.2 kHz /
+/// 24-bit / stereo, one millisecond is already ~530 bytes — so the body ends
+/// short of its declared length and reqwest reports `error decoding response
+/// body` instead of a clean EOF, at the precise moment the track ends.
+///
+/// Xavier Joly, 7 Aug 2026: track started 16:31:04, duration 177.9 s, natural
+/// end 16:34:01.9 — body error logged at 16:34:01. Read as a mid-stream
+/// failure, the loop attempted a Range resume that could not succeed, gave up,
+/// and left by a path that skips the gapless transition entirely: 83 seconds of
+/// silence before the next track came back on a cold session.
+///
+/// `tolerance_ms` bounds what we accept as "the end". A genuine failure inside
+/// that window costs at most that much audio; getting it wrong the other way
+/// costs the whole track chain.
+pub(super) fn body_error_is_track_end(
+    received_ms: u64,
+    declared_duration_ms: u64,
+    tolerance_ms: u64,
+) -> bool {
+    declared_duration_ms > 0 && received_ms + tolerance_ms >= declared_duration_ms
+}
+
+#[cfg(test)]
+mod body_error_tests {
+    use super::body_error_is_track_end;
+
+    const TOL: u64 = 1_000;
+
+    /// Xavier's case, in numbers: the body dies a few hundred ms short of the
+    /// declared duration because Content-Length was a prediction.
+    #[test]
+    fn a_body_error_just_short_of_the_declared_duration_is_the_end() {
+        assert!(body_error_is_track_end(177_870, 177_900, TOL));
+    }
+
+    #[test]
+    fn a_body_error_exactly_at_the_declared_duration_is_the_end() {
+        assert!(body_error_is_track_end(177_900, 177_900, TOL));
+    }
+
+    /// Overshooting the declared duration still counts: the prediction can err
+    /// on either side.
+    #[test]
+    fn a_body_error_past_the_declared_duration_is_the_end() {
+        assert!(body_error_is_track_end(178_100, 177_900, TOL));
+    }
+
+    /// A real mid-track cut must keep the Range-resume path — that is what
+    /// rescues a transient network blip without dropping the track.
+    #[test]
+    fn a_failure_mid_track_is_not_the_end() {
+        assert!(!body_error_is_track_end(90_000, 177_900, TOL));
+    }
+
+    /// Just outside the tolerance: still a failure, not an end.
+    #[test]
+    fn a_failure_just_outside_the_tolerance_is_not_the_end() {
+        assert!(!body_error_is_track_end(176_899, 177_900, TOL));
+    }
+
+    /// Without a declared duration there is nothing to compare against, so we
+    /// must not guess — the resume path stays in charge.
+    #[test]
+    fn an_unknown_duration_never_counts_as_the_end() {
+        assert!(!body_error_is_track_end(177_870, 0, TOL));
+        assert!(!body_error_is_track_end(0, 0, TOL));
+    }
+}
+
+/// A next track decoded to PCM in the background, ready to be swapped in when
+/// the current one reaches its end.
+pub(super) struct StagedDirectTrack {
+    pub pcm: Vec<u8>,
+    pub format: AudioFormat,
+    pub sample_rate: u32,
+    pub bits_per_sample: u16,
+    pub channels: u8,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub cover_url: Option<String>,
+    pub duration_ms: u64,
+}
+
+/// Decode a local file to PCM for the direct-file path, exactly as the current
+/// track was decoded: read it whole, parse the header, and run FLAC through
+/// ffmpeg preserving bit depth.
+///
+/// Returns `None` for anything the direct path cannot play — DSD, an unparsable
+/// header, a read or conversion failure. The caller then simply doesn't chain,
+/// and the poller advances the queue as it does today.
+///
+/// Blocking by nature (whole-file read + ffmpeg), so callers must run it off the
+/// packet-sending task: a 190 MB FLAC takes well over a second to convert, which
+/// would be an audible dropout if it ran inline.
+pub(super) fn stage_direct_track(
+    file_path: &str,
+    title: String,
+    artist: String,
+    album: String,
+    cover_url: Option<String>,
+    duration_ms: u64,
+) -> Option<StagedDirectTrack> {
+    let mut buf = std::fs::read(file_path).ok()?;
+    let si = detect_and_parse(&mut buf)?;
+    if si.format.is_dsd() {
+        return None;
+    }
+
+    let (pcm, format, sample_rate, bits_per_sample, channels) = if si.format == AudioFormat::Flac {
+        let mut wav = decode_flac_to_pcm(file_path, si.bits_per_sample)?;
+        let wav_si = detect_and_parse(&mut wav)?;
+        (
+            wav,
+            wav_si.format,
+            wav_si.sample_rate,
+            wav_si.bits_per_sample,
+            wav_si.channels.min(8) as u8,
+        )
+    } else {
+        (
+            buf,
+            si.format,
+            si.sample_rate,
+            si.bits_per_sample,
+            si.channels.min(8) as u8,
+        )
+    };
+
+    Some(StagedDirectTrack {
+        pcm,
+        format,
+        sample_rate,
+        bits_per_sample,
+        channels,
+        title,
+        artist,
+        album,
+        cover_url,
+        duration_ms: if duration_ms > 0 {
+            duration_ms
+        } else {
+            si.duration_ms
+        },
+    })
+}
+
+/// Can a staged track be swapped in without renegotiating the OAAT stream?
+///
+/// A format change mid-stream needs a `propose_format` round-trip the direct
+/// path does not implement, so a differing next track falls back to the normal
+/// stop-and-restart. Same format is the common case within an album, which is
+/// precisely where a gap is most audible.
+pub(super) fn staged_track_matches(
+    staged: &StagedDirectTrack,
+    format: AudioFormat,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    channels: u8,
+) -> bool {
+    staged.format == format
+        && staged.sample_rate == sample_rate
+        && staged.bits_per_sample == bits_per_sample
+        && staged.channels == channels
+}
+
+#[cfg(test)]
+mod staged_track_tests {
+    use super::{AudioFormat, StagedDirectTrack, staged_track_matches};
+
+    fn staged(format: AudioFormat, rate: u32, bits: u16, ch: u8) -> StagedDirectTrack {
+        StagedDirectTrack {
+            pcm: Vec::new(),
+            format,
+            sample_rate: rate,
+            bits_per_sample: bits,
+            channels: ch,
+            title: "Atrevido".into(),
+            artist: "Orishas".into(),
+            album: "A Lo Cubano".into(),
+            cover_url: None,
+            duration_ms: 237_265,
+        }
+    }
+
+    /// The common case inside an album — and precisely where a gap is most
+    /// audible.
+    #[test]
+    fn an_identical_format_can_be_swapped_in() {
+        let s = staged(AudioFormat::PcmS16le, 44_100, 16, 2);
+        assert!(staged_track_matches(
+            &s,
+            AudioFormat::PcmS16le,
+            44_100,
+            16,
+            2
+        ));
+    }
+
+    /// Each of these needs a format renegotiation the direct path does not
+    /// implement, so the swap must be refused and the normal restart used.
+    #[test]
+    fn any_format_difference_refuses_the_swap() {
+        let s = staged(AudioFormat::PcmS16le, 44_100, 16, 2);
+        assert!(
+            !staged_track_matches(&s, AudioFormat::PcmS24le, 44_100, 16, 2),
+            "different sample format"
+        );
+        assert!(
+            !staged_track_matches(&s, AudioFormat::PcmS16le, 48_000, 16, 2),
+            "different sample rate"
+        );
+        assert!(
+            !staged_track_matches(&s, AudioFormat::PcmS16le, 44_100, 24, 2),
+            "different bit depth"
+        );
+        assert!(
+            !staged_track_matches(&s, AudioFormat::PcmS16le, 44_100, 16, 1),
+            "different channel count"
+        );
+    }
+
+    /// A 24/192 album track — the case where the whole-file buffer is largest
+    /// and a restart costs the most.
+    #[test]
+    fn a_hires_track_swaps_like_any_other() {
+        let s = staged(AudioFormat::PcmS24le, 192_000, 24, 2);
+        assert!(staged_track_matches(
+            &s,
+            AudioFormat::PcmS24le,
+            192_000,
+            24,
+            2
+        ));
+    }
+}
