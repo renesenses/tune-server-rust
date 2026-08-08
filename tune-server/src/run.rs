@@ -227,20 +227,30 @@ async fn run(opts: RunOptions) {
     // understood (tags "lost", albums split, Next broken). Failing fast on
     // the port keeps the DB untouched. Connections arriving before the
     // router is up simply queue in the backlog.
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    // Écoute en double pile quand la machine le permet, IPv4 seule sinon :
+    // Firefox frappe `[::1]` pour `localhost` et recevait « connexion refusée »
+    // sur une socket IPv4 seule (#1321). Le repli couvre les machines où IPv6
+    // est désactivé, et la reprise de port ci-dessous reste inchangée.
+    let v4_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .expect("failed to create socket");
-        socket.set_reuse_address(true).ok();
+        let (mut socket, mut addr) = crate::config::dual_stack_listen_socket(config.port)
+            .unwrap_or_else(|| (crate::config::ipv4_listen_socket(), v4_addr));
+        let mut ipv6_attempted = addr.is_ipv6();
         #[cfg(unix)]
         let mut reclaim_tried = false;
         for attempt in 1..=10u32 {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,
+                // Premier échec sur la socket IPv6 : la pile est peut-être
+                // désactivée sur la machine. On repasse en IPv4 seule plutôt
+                // que d'épuiser les tentatives puis de sortir en erreur.
+                Err(e) if ipv6_attempted => {
+                    tracing::info!(error = %e, "bind IPv6 impossible, repli sur IPv4 seule");
+                    ipv6_attempted = false;
+                    socket = crate::config::ipv4_listen_socket();
+                    addr = v4_addr;
+                    continue;
+                }
                 Err(e) if attempt < 10 => {
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     // The port is held by another process. If it is a *stale*
@@ -287,6 +297,8 @@ async fn run(opts: RunOptions) {
             .expect("failed to set nonblocking");
         tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
     };
+    // Adresse réellement obtenue : `[::]` en double pile, `0.0.0.0` en repli.
+    let addr = listener.local_addr().unwrap_or(v4_addr);
 
     // Appliance : ne jamais démarrer sur une base vide si le disque de
     // données externe est absent (docs/DATA-RELOCATION.md).
