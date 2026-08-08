@@ -78,6 +78,21 @@ pub fn fetch_all(backend: &Arc<dyn DbBackend>, limit: i64) -> Vec<(i64, Vec<f32>
         .collect()
 }
 
+/// Nombre de pistes déjà analysées acoustiquement.
+///
+/// Sert à distinguer « la bibliothèque n'est pas encore analysée » de « aucun
+/// résultat pour cette recherche » : sans cette distinction, une recherche par
+/// ambiance renvoyait une liste vide dans les deux cas et l'utilisateur ne
+/// pouvait pas savoir s'il devait reformuler ou attendre (retour Fabien).
+pub fn analysed_count(backend: &Arc<dyn DbBackend>) -> i64 {
+    backend
+        .query_one("SELECT COUNT(*) FROM track_audio_embedding", &[])
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 /// Rank the library by cosine similarity to an arbitrary (already-normalised)
 /// query vector, most similar first. `exclude` drops one track id (the seed,
 /// when querying by track). Returns `(track_id, cosine)`. Works for any query in
