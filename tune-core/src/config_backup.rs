@@ -3,8 +3,32 @@
 //! Exports all restorable server configuration (zones, settings, playlists,
 //! favorites, radios, alarms, EQ, room profiles, streaming tokens) into a
 //! single JSON-serialisable [`ConfigSnapshot`].  Sensitive keys (jwt_secret,
-//! api_key, license_key, etc.) are excluded; streaming tokens are stored as
-//! opaque hex-encoded XOR-obfuscated blobs.
+//! api_key, license_key, etc.) are excluded.
+//!
+//! # Streaming tokens
+//!
+//! Streaming credentials are OAuth refresh tokens for paid accounts, and a
+//! snapshot leaves the machine: `cloud-push` PUTs it to mozaiklabs.fr. They
+//! used to be XOR'd with a fixed key compiled into every binary, which is not
+//! encryption — anyone holding a Tune build could read every token in every
+//! snapshot they could reach (audit item 7).
+//!
+//! They are now sealed in a [`Envelope`]: a random data key encrypts them, and
+//! that data key is wrapped under both the user's passphrase and a recovery key
+//! shown once. Without one of those two secrets the tokens are unreadable, so
+//! the cloud store holds an opaque blob.
+//!
+//! Two consequences worth knowing:
+//!
+//! - [`export_config`] produces a snapshot with **no tokens at all**. Sealing
+//!   requires the passphrase, so it is [`export_config_sealed`] that carries
+//!   them. Everything else — zones, playlists, favourites — restores without
+//!   any secret, so an unattended `cloud-pull` onto a fresh machine still
+//!   rebuilds the install and only asks for a passphrase to re-attach the
+//!   streaming services.
+//! - Snapshots written before this change are still readable on import
+//!   ([`deobfuscate`]), because users have them. Nothing produces that format
+//!   any more.
 
 use std::sync::Arc;
 
@@ -15,6 +39,12 @@ use tracing::{debug, info, warn};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
+use crate::secret_envelope::{Envelope, RecoveryKey};
+
+/// Settings key holding this install's token envelope: the wrapped data key
+/// plus the tokens sealed at the last export. Safe at rest — without the
+/// passphrase or the recovery key it is an opaque blob.
+pub const ENVELOPE_SETTING: &str = "config_backup_envelope";
 
 // ── Snapshot ────────────────────────────────────────────────────────
 
@@ -40,8 +70,17 @@ pub struct ConfigSnapshot {
     pub eq_presets: Vec<Value>,
     /// Room correction profiles (stored as settings blobs).
     pub room_profiles: Vec<Value>,
-    /// Streaming service tokens — hex-encoded XOR-obfuscated JSON.
+    /// **Legacy** streaming tokens — hex-encoded XOR-obfuscated JSON, as
+    /// written by builds before the envelope (audit item 7). Read on import so
+    /// existing backups still restore; never written by this build, and
+    /// omitted from the JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming_tokens: Vec<(String, String)>,
+    /// Streaming tokens sealed under the install's passphrase + recovery key.
+    /// `None` when the snapshot carries no tokens — either no envelope is
+    /// configured, or it was produced by [`export_config`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_tokens: Option<Envelope>,
 }
 
 // ── Import report ───────────────────────────────────────────────────
@@ -86,20 +125,101 @@ fn is_room_profile_key(key: &str) -> bool {
     key.starts_with("room_profile_") || key == "room_profile_index"
 }
 
-// ── Token obfuscation ───────────────────────────────────────────────
-// Streaming tokens are XOR-obfuscated with a fixed key before hex
-// encoding so they are not stored as raw secrets in the snapshot JSON.
+// ── Token envelope ──────────────────────────────────────────────────
+
+/// Read this install's stored token envelope, if one has been set up.
+pub fn load_envelope(backend: &Arc<dyn DbBackend>) -> Result<Option<Envelope>, String> {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let Some(raw) = settings.get(ENVELOPE_SETTING)? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| format!("stored envelope is unreadable: {e}"))
+}
+
+fn store_envelope(backend: &Arc<dyn DbBackend>, envelope: &Envelope) -> Result<(), String> {
+    let raw = serde_json::to_string(envelope).map_err(|e| format!("serialize envelope: {e}"))?;
+    SettingsRepo::with_backend(backend.clone()).set(ENVELOPE_SETTING, &raw)
+}
+
+/// Whether a passphrase has been set up for this install's streaming tokens.
+pub fn envelope_configured(backend: &Arc<dyn DbBackend>) -> Result<bool, String> {
+    Ok(load_envelope(backend)?.is_some())
+}
+
+/// Set up the token envelope, sealing the current streaming tokens under
+/// `passphrase`, and return the recovery key.
+///
+/// **The recovery key is returned exactly once and never stored.** Display it
+/// and let the user write it down; there is no way to produce it again.
+///
+/// Refuses to run when an envelope already exists — silently replacing it would
+/// strand every snapshot sealed under the old key, including ones already
+/// pushed to the cloud. Rotating the passphrase is
+/// [`change_envelope_passphrase`]; starting over is [`reset_envelope`].
+pub fn setup_envelope(
+    backend: &Arc<dyn DbBackend>,
+    passphrase: &str,
+) -> Result<RecoveryKey, String> {
+    if load_envelope(backend)?.is_some() {
+        return Err(
+            "a token passphrase is already configured; change it instead of replacing it".into(),
+        );
+    }
+    let tokens = collect_streaming_tokens(backend)?;
+    let plaintext = serde_json::to_vec(&tokens).map_err(|e| format!("serialize tokens: {e}"))?;
+    let (envelope, recovery) = Envelope::seal_new(&plaintext, passphrase)?;
+    store_envelope(backend, &envelope)?;
+    info!(services = tokens.len(), "config_backup_envelope_created");
+    Ok(recovery)
+}
+
+/// Rotate the passphrase. `current_secret` may be the old passphrase *or* the
+/// recovery key — a forgotten passphrase is exactly when this is needed. The
+/// recovery key itself keeps working.
+///
+/// **Rotation is not retroactive.** Each snapshot embeds the key slots as they
+/// stood when it was sealed, so one already written — or already pushed to the
+/// cloud, where we cannot reach it — still opens with the *old* passphrase.
+/// The recovery key opens both old and new. Tell the user this: "change your
+/// passphrase" reads as "the old one stops working everywhere", and here it
+/// does not.
+pub fn change_envelope_passphrase(
+    backend: &Arc<dyn DbBackend>,
+    current_secret: &str,
+    new_passphrase: &str,
+) -> Result<(), String> {
+    let envelope =
+        load_envelope(backend)?.ok_or_else(|| "no token passphrase is configured".to_string())?;
+    let rotated = envelope.change_passphrase(current_secret, new_passphrase)?;
+    store_envelope(backend, &rotated)?;
+    info!("config_backup_envelope_passphrase_changed");
+    Ok(())
+}
+
+/// Discard the envelope and start over with a new passphrase and recovery key.
+///
+/// Every snapshot sealed under the previous key becomes unreadable — including
+/// any already pushed to the cloud. For when both secrets are lost.
+pub fn reset_envelope(
+    backend: &Arc<dyn DbBackend>,
+    passphrase: &str,
+) -> Result<RecoveryKey, String> {
+    SettingsRepo::with_backend(backend.clone()).set(ENVELOPE_SETTING, "")?;
+    warn!("config_backup_envelope_reset");
+    setup_envelope(backend, passphrase)
+}
+
+// ── Legacy token obfuscation ────────────────────────────────────────
+// Pre-envelope snapshots XOR'd tokens with a fixed key compiled into the
+// binary. Kept only so those backups still restore (audit item 7); nothing
+// produces this format any more.
 
 const OBFUSCATION_KEY: &[u8; 32] = b"TuneConfigBackup2026-obfuscate!!";
-
-fn obfuscate(data: &[u8]) -> String {
-    let xored: Vec<u8> = data
-        .iter()
-        .enumerate()
-        .map(|(i, b)| b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()])
-        .collect();
-    xored.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 fn deobfuscate(encoded: &str) -> Result<Vec<u8>, String> {
     if encoded.len() % 2 != 0 {
@@ -121,8 +241,46 @@ fn deobfuscate(encoded: &str) -> Result<Vec<u8>, String> {
 
 // ── Export ───────────────────────────────────────────────────────────
 
-/// Build a full configuration snapshot from the database.
+/// Build a configuration snapshot **without** streaming tokens.
+///
+/// Sealing tokens requires the passphrase, which this signature has no way to
+/// receive — see [`export_config_sealed`]. Everything else is here, so an
+/// unattended push or a restore onto a fresh machine still rebuilds the
+/// install; only the streaming services need re-attaching.
 pub fn export_config(backend: &Arc<dyn DbBackend>) -> Result<ConfigSnapshot, String> {
+    build_snapshot(backend, None)
+}
+
+/// Build a snapshot whose streaming tokens are sealed under this install's
+/// envelope.
+///
+/// `passphrase` may also be the recovery key. Fails when no envelope has been
+/// set up ([`setup_envelope`]) — rather than silently falling back to a
+/// token-less snapshot, which would look like a successful backup while losing
+/// exactly the part the user asked to protect.
+pub fn export_config_sealed(
+    backend: &Arc<dyn DbBackend>,
+    passphrase: &str,
+) -> Result<ConfigSnapshot, String> {
+    let envelope = load_envelope(backend)?.ok_or_else(|| {
+        "no token passphrase is configured — set one up before exporting tokens".to_string()
+    })?;
+
+    // Re-seal under the existing data key so the passphrase and recovery key
+    // the user already holds keep opening this snapshot, while the tokens
+    // themselves are refreshed to what the vault holds right now.
+    let tokens = collect_streaming_tokens(backend)?;
+    let plaintext = serde_json::to_vec(&tokens).map_err(|e| format!("serialize tokens: {e}"))?;
+    let resealed = envelope.reseal(passphrase, &plaintext)?;
+    store_envelope(backend, &resealed)?;
+
+    build_snapshot(backend, Some(resealed))
+}
+
+fn build_snapshot(
+    backend: &Arc<dyn DbBackend>,
+    sealed_tokens: Option<Envelope>,
+) -> Result<ConfigSnapshot, String> {
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let version = crate::version().to_string();
 
@@ -132,7 +290,6 @@ pub fn export_config(backend: &Arc<dyn DbBackend>) -> Result<ConfigSnapshot, Str
     let favorites = export_favorites(backend)?;
     let radio_stations = export_radios(backend)?;
     let alarms = export_alarms(backend)?;
-    let streaming_tokens = export_streaming_tokens(backend)?;
 
     info!(
         zones = zones.len(),
@@ -143,7 +300,7 @@ pub fn export_config(backend: &Arc<dyn DbBackend>) -> Result<ConfigSnapshot, Str
         alarms = alarms.len(),
         eq = eq_presets.len(),
         rooms = room_profiles.len(),
-        tokens = streaming_tokens.len(),
+        tokens_sealed = sealed_tokens.is_some(),
         "config_snapshot_exported"
     );
 
@@ -158,7 +315,8 @@ pub fn export_config(backend: &Arc<dyn DbBackend>) -> Result<ConfigSnapshot, Str
         alarms,
         eq_presets,
         room_profiles,
-        streaming_tokens,
+        streaming_tokens: Vec::new(),
+        sealed_tokens,
     })
 }
 
@@ -348,36 +506,47 @@ fn export_alarms(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     Ok(rows_to_json(rows, cols))
 }
 
-fn export_streaming_tokens(backend: &Arc<dyn DbBackend>) -> Result<Vec<(String, String)>, String> {
+/// The streaming credentials vault, as plain JSON.
+///
+/// Only ever handed to [`Envelope::seal_new`] / [`Envelope::reseal`] — this
+/// value must not reach a snapshot, a log line or an HTTP response.
+fn collect_streaming_tokens(
+    backend: &Arc<dyn DbBackend>,
+) -> Result<serde_json::Map<String, Value>, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
-    let vault_json = settings.get("credentials_vault")?;
-
-    let Some(json_str) = vault_json else {
-        return Ok(Vec::new());
+    let Some(json_str) = settings.get("credentials_vault")? else {
+        return Ok(serde_json::Map::new());
     };
     if json_str.is_empty() {
-        return Ok(Vec::new());
+        return Ok(serde_json::Map::new());
     }
-
-    let vault: serde_json::Map<String, Value> =
-        serde_json::from_str(&json_str).map_err(|e| format!("vault parse: {e}"))?;
-
-    let mut tokens = Vec::new();
-    for (service, cred_value) in &vault {
-        let cred_bytes =
-            serde_json::to_vec(cred_value).map_err(|e| format!("serialize cred: {e}"))?;
-        tokens.push((service.clone(), obfuscate(&cred_bytes)));
-    }
-    Ok(tokens)
+    serde_json::from_str(&json_str).map_err(|e| format!("vault parse: {e}"))
 }
 
 // ── Import ──────────────────────────────────────────────────────────
 
-/// Restore configuration from a snapshot.  Upserts data — does not
-/// delete existing rows, only inserts or updates.
+/// Restore configuration from a snapshot, without unsealing streaming tokens.
+///
+/// Sealed tokens are skipped with a warning — use [`import_config_with_secret`]
+/// to restore them. Everything else comes back, so a restore is useful even
+/// with no secret at hand.
 pub fn import_config(
     backend: &Arc<dyn DbBackend>,
     snapshot: ConfigSnapshot,
+) -> Result<ImportReport, String> {
+    import_config_with_secret(backend, snapshot, None)
+}
+
+/// Restore configuration, unsealing streaming tokens with `secret` — either the
+/// passphrase or the recovery key.
+///
+/// A wrong secret is reported as a warning, not an error: the rest of the
+/// configuration has already been restored by then, and failing the whole
+/// operation would throw that away over a mistyped passphrase.
+pub fn import_config_with_secret(
+    backend: &Arc<dyn DbBackend>,
+    snapshot: ConfigSnapshot,
+    secret: Option<&str>,
 ) -> Result<ImportReport, String> {
     let mut report = ImportReport {
         zones_restored: 0,
@@ -406,10 +575,82 @@ pub fn import_config(
     report.room_profiles_restored =
         import_room_profiles(backend, &snapshot.room_profiles, &mut report.warnings)?;
     report.streaming_tokens_restored =
-        import_streaming_tokens(backend, &snapshot.streaming_tokens, &mut report.warnings)?;
+        restore_tokens(backend, &snapshot, secret, &mut report.warnings)?;
 
     info!(?report, "config_snapshot_imported");
     Ok(report)
+}
+
+/// Restore streaming tokens from whichever form the snapshot carries: the
+/// sealed envelope, or the legacy XOR blobs of a pre-envelope backup.
+fn restore_tokens(
+    backend: &Arc<dyn DbBackend>,
+    snapshot: &ConfigSnapshot,
+    secret: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<usize, String> {
+    if let Some(envelope) = &snapshot.sealed_tokens {
+        let Some(secret) = secret else {
+            warnings.push(
+                "snapshot contains sealed streaming tokens; supply the passphrase or recovery \
+                 key to restore them"
+                    .into(),
+            );
+            return Ok(0);
+        };
+        let plaintext = match envelope.open(secret) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "config_import_token_unseal_failed");
+                warnings.push(format!("streaming tokens: {e}"));
+                return Ok(0);
+            }
+        };
+        let vault: serde_json::Map<String, Value> = serde_json::from_slice(&plaintext)
+            .map_err(|e| format!("sealed tokens are not a credentials vault: {e}"))?;
+
+        // Adopt the envelope so this machine can re-seal on its next export
+        // with the same passphrase and recovery key the user already holds.
+        store_envelope(backend, envelope)?;
+
+        return merge_into_vault(backend, vault);
+    }
+
+    if !snapshot.streaming_tokens.is_empty() {
+        warnings.push(
+            "snapshot uses the legacy obfuscated token format; re-export it to seal the tokens"
+                .into(),
+        );
+        return import_legacy_tokens(backend, &snapshot.streaming_tokens, warnings);
+    }
+
+    Ok(0)
+}
+
+/// Merge restored credentials into the existing vault, keeping services the
+/// snapshot does not mention.
+fn merge_into_vault(
+    backend: &Arc<dyn DbBackend>,
+    incoming: serde_json::Map<String, Value>,
+) -> Result<usize, String> {
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let existing_json = settings.get("credentials_vault")?.unwrap_or_default();
+    let mut vault: serde_json::Map<String, Value> = if existing_json.is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str(&existing_json).unwrap_or_default()
+    };
+
+    let count = incoming.len();
+    for (service, cred) in incoming {
+        vault.insert(service, cred);
+    }
+    let vault_json = serde_json::to_string(&vault).map_err(|e| e.to_string())?;
+    settings.set("credentials_vault", &vault_json)?;
+    Ok(count)
 }
 
 fn import_zones(
@@ -725,7 +966,9 @@ fn import_room_profiles(
     Ok(count)
 }
 
-fn import_streaming_tokens(
+/// Read tokens from a pre-envelope snapshot. Kept so existing backups still
+/// restore; nothing writes this format any more (audit item 7).
+fn import_legacy_tokens(
     backend: &Arc<dyn DbBackend>,
     tokens: &[(String, String)],
     warnings: &mut Vec<String>,
@@ -789,12 +1032,18 @@ impl ConfigSnapshot {
 mod tests {
     use super::*;
 
+    /// The legacy reader must keep working: users hold snapshots in the old
+    /// format and a restore has to accept them. The *writer* is gone — this
+    /// re-creates a blob the way pre-envelope builds did.
     #[test]
-    fn obfuscate_roundtrip() {
+    fn legacy_obfuscated_tokens_still_decode() {
         let data = b"hello streaming token";
-        let encoded = obfuscate(data);
-        let decoded = deobfuscate(&encoded).unwrap();
-        assert_eq!(decoded, data);
+        let encoded: String = data
+            .iter()
+            .enumerate()
+            .map(|(i, b)| format!("{:02x}", b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()]))
+            .collect();
+        assert_eq!(deobfuscate(&encoded).unwrap(), data);
     }
 
     #[test]
@@ -832,6 +1081,7 @@ mod tests {
             eq_presets: vec![],
             room_profiles: vec![],
             streaming_tokens: vec![],
+            sealed_tokens: None,
         };
         let fp1 = snap.fingerprint();
         let fp2 = snap.fingerprint();
@@ -886,5 +1136,205 @@ mod tests {
             )
             .unwrap();
         assert!(row.is_some());
+    }
+
+    // ── Sealed streaming tokens ─────────────────────────────────────
+
+    const VAULT: &str = r#"{"tidal":{"refresh_token":"tidal-refresh-secret"}}"#;
+
+    fn seeded_backend() -> Arc<dyn DbBackend> {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        SettingsRepo::with_backend(backend.clone())
+            .set("credentials_vault", VAULT)
+            .unwrap();
+        backend
+    }
+
+    /// The heart of audit item 7: a snapshot that leaves the machine must not
+    /// carry a recoverable token. Previously `cloud-push` PUT them to
+    /// mozaiklabs.fr XOR'd with a key compiled into every binary.
+    #[test]
+    fn a_sealed_snapshot_leaks_no_token() {
+        let backend = seeded_backend();
+        setup_envelope(&backend, "correct horse").unwrap();
+
+        let snapshot = export_config_sealed(&backend, "correct horse").unwrap();
+        let json = serde_json::to_string(&snapshot).unwrap();
+
+        assert!(!json.contains("tidal-refresh-secret"));
+        assert!(!json.contains("correct horse"));
+        assert!(snapshot.sealed_tokens.is_some());
+        assert!(snapshot.streaming_tokens.is_empty());
+    }
+
+    /// The plain export must never carry tokens: it is what an unattended
+    /// cloud-push sends, with no passphrase to seal them.
+    #[test]
+    fn the_plain_export_carries_no_tokens() {
+        let backend = seeded_backend();
+        setup_envelope(&backend, "pw").unwrap();
+
+        let snapshot = export_config(&backend).unwrap();
+        assert!(snapshot.sealed_tokens.is_none());
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("tidal-refresh-secret"));
+    }
+
+    #[test]
+    fn sealed_tokens_restore_onto_a_fresh_machine() {
+        let backend = seeded_backend();
+        setup_envelope(&backend, "pw").unwrap();
+        let snapshot = export_config_sealed(&backend, "pw").unwrap();
+
+        let fresh = seeded_backend();
+        SettingsRepo::with_backend(fresh.clone())
+            .set("credentials_vault", "")
+            .unwrap();
+
+        let report = import_config_with_secret(&fresh, snapshot, Some("pw")).unwrap();
+        assert_eq!(report.streaming_tokens_restored, 1);
+
+        let vault = SettingsRepo::with_backend(fresh.clone())
+            .get("credentials_vault")
+            .unwrap()
+            .unwrap();
+        assert!(vault.contains("tidal-refresh-secret"));
+    }
+
+    /// The reason JP asked for this scheme: a forgotten passphrase must not
+    /// destroy the backup.
+    #[test]
+    fn the_recovery_key_restores_a_snapshot() {
+        let backend = seeded_backend();
+        let recovery = setup_envelope(&backend, "forgotten").unwrap();
+        let snapshot = export_config_sealed(&backend, "forgotten").unwrap();
+
+        let fresh = seeded_backend();
+        let report = import_config_with_secret(&fresh, snapshot, Some(recovery.display())).unwrap();
+        assert_eq!(report.streaming_tokens_restored, 1);
+    }
+
+    /// Everything except the tokens must restore with no secret at all —
+    /// otherwise a cloud-pull onto a new machine is useless without a
+    /// passphrase.
+    #[test]
+    fn a_restore_without_the_secret_still_rebuilds_the_install() {
+        let backend = seeded_backend();
+        backend
+            .execute(
+                "INSERT INTO zones (name, volume) VALUES (?, ?)",
+                &[
+                    &"Kitchen".to_string() as &dyn ToSqlValue,
+                    &42i64 as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+        setup_envelope(&backend, "pw").unwrap();
+        let snapshot = export_config_sealed(&backend, "pw").unwrap();
+
+        let fresh = seeded_backend();
+        let report = import_config(&fresh, snapshot).unwrap();
+
+        assert_eq!(report.zones_restored, 1);
+        assert_eq!(report.streaming_tokens_restored, 0);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("passphrase")),
+            "the user must be told why the tokens are missing: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn a_wrong_secret_warns_instead_of_losing_the_whole_restore() {
+        let backend = seeded_backend();
+        setup_envelope(&backend, "right").unwrap();
+        let snapshot = export_config_sealed(&backend, "right").unwrap();
+
+        let fresh = seeded_backend();
+        let report = import_config_with_secret(&fresh, snapshot, Some("wrong")).unwrap();
+        assert_eq!(report.streaming_tokens_restored, 0);
+        assert!(!report.warnings.is_empty());
+    }
+
+    #[test]
+    fn sealing_without_a_configured_passphrase_fails_loudly() {
+        let backend = seeded_backend();
+        // No setup_envelope: must error, not quietly drop the tokens and
+        // report a successful backup.
+        assert!(export_config_sealed(&backend, "pw").is_err());
+    }
+
+    #[test]
+    fn an_envelope_is_not_silently_replaced() {
+        let backend = seeded_backend();
+        setup_envelope(&backend, "first").unwrap();
+        assert!(
+            setup_envelope(&backend, "second").is_err(),
+            "replacing the key would strand every snapshot already pushed"
+        );
+    }
+
+    /// Rotating the passphrase does **not** reach back into snapshots already
+    /// written: each one embeds the key slots as they stood when it was
+    /// sealed, and a copy pushed to the cloud is out of our hands anyway. So
+    /// an old snapshot opens with the *old* passphrase — and, crucially, with
+    /// the recovery key, which rotation never invalidates. Snapshots taken
+    /// after the rotation take the new passphrase.
+    #[test]
+    fn rotation_applies_to_new_snapshots_not_old_ones() {
+        let backend = seeded_backend();
+        let recovery = setup_envelope(&backend, "old").unwrap();
+        let before = export_config_sealed(&backend, "old").unwrap();
+
+        change_envelope_passphrase(&backend, "old", "new").unwrap();
+        let after = export_config_sealed(&backend, "new").unwrap();
+
+        let restore = |snap: ConfigSnapshot, secret: &str| {
+            import_config_with_secret(&seeded_backend(), snap, Some(secret))
+                .unwrap()
+                .streaming_tokens_restored
+        };
+
+        // The pre-rotation snapshot keeps its original slots.
+        assert_eq!(restore(before.clone(), "old"), 1);
+        assert_eq!(restore(before.clone(), "new"), 0);
+        // The emergency kit spans the rotation — that is its whole purpose.
+        assert_eq!(restore(before, recovery.display()), 1);
+
+        // Snapshots sealed after the rotation take the new passphrase, and the
+        // recovery key still works on them too.
+        assert_eq!(restore(after.clone(), "new"), 1);
+        assert_eq!(restore(after, recovery.display()), 1);
+    }
+
+    /// A pre-envelope backup must still restore — users have them on disk.
+    #[test]
+    fn a_legacy_snapshot_still_restores() {
+        let backend = seeded_backend();
+        let cred = serde_json::json!({"refresh_token": "legacy-secret"});
+        let bytes = serde_json::to_vec(&cred).unwrap();
+        let encoded: String = bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| format!("{:02x}", b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()]))
+            .collect();
+
+        let mut snapshot = export_config(&backend).unwrap();
+        snapshot.streaming_tokens = vec![("tidal".into(), encoded)];
+
+        let fresh = seeded_backend();
+        let report = import_config(&fresh, snapshot).unwrap();
+        assert_eq!(report.streaming_tokens_restored, 1);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("legacy")),
+            "the user should be nudged to re-export: {:?}",
+            report.warnings
+        );
     }
 }

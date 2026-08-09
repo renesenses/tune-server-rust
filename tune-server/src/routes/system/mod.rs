@@ -186,9 +186,20 @@ pub fn router() -> Router<AppState> {
             "/playlist-hub/{hub_id}/transfer",
             post(playlist_hub::transfer),
         )
-        // Cloud config backup — full server config export/import/push/pull
-        .route("/config-backup/export", get(config_backup::export))
+        // Cloud config backup — full server config export/import/push/pull.
+        // GET export omits streaming tokens; POST takes the passphrase and
+        // returns them sealed (audit item 7).
+        .route(
+            "/config-backup/export",
+            get(config_backup::export).post(config_backup::export_sealed),
+        )
         .route("/config-backup/import", post(config_backup::import))
+        .route(
+            "/config-backup/passphrase",
+            get(config_backup::passphrase_status)
+                .post(config_backup::set_passphrase)
+                .put(config_backup::change_passphrase),
+        )
         .route("/config-backup/cloud-push", post(config_backup::cloud_push))
         .route("/config-backup/cloud-pull", post(config_backup::cloud_pull))
         .route(
