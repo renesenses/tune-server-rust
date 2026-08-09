@@ -313,13 +313,19 @@ pub(super) async fn get_theme(
     Json(json!({ "theme": theme }))
 }
 
-pub(super) async fn get_env() -> Json<Value> {
-    let port = std::env::var("TUNE_PORT").unwrap_or_else(|_| "8085".into());
-    let db = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
-
+pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
+    // Report what the server actually resolved, not the raw environment: the
+    // old version fell back to a hard-coded "tune.db" and to port 8085, so a
+    // support page could confidently name a database the server had never
+    // opened — and named a SQLite file even on a PostgreSQL deployment.
+    let engine = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => "postgres",
+        tune_core::db::engine::Engine::Sqlite => "sqlite",
+    };
     Json(json!({
-        "TUNE_PORT": port,
-        "TUNE_DB_PATH": db,
+        "TUNE_PORT": state.port.to_string(),
+        "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),
+        "engine": engine,
     }))
 }
 

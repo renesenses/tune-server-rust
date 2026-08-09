@@ -24,11 +24,20 @@ use crate::config::TuneConfig;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqliteDb,
-    /// Engine-agnostic backend. Points to the same `SqliteDb` by default,
-    /// or to a `PostgresBackend` when `TUNE_DATABASE_URL` is a postgres://
-    /// DSN and the `postgres` feature is enabled.  Repos ported to
-    /// `Arc<dyn DbBackend>` should use this field via `with_backend()`.
+    /// The raw SQLite handle — `None` in PostgreSQL mode, where no SQLite
+    /// database is opened at all.
+    ///
+    /// Reach for [`Self::backend`] instead. This exists only for the handful of
+    /// operations with no engine-agnostic equivalent: SQLite-specific
+    /// maintenance (`VACUUM`, `wal_checkpoint`), the schema-version readout,
+    /// and the SQLite→PG migration, which needs both stores at once by
+    /// definition. Anything that serves user data must go through `backend`, or
+    /// it will read a different library from the rest of the server.
+    pub db: Option<SqliteDb>,
+    /// Engine-agnostic backend — the single source of truth. Points to the
+    /// `SqliteDb` above in SQLite mode, or to a `PostgresBackend` when
+    /// `TUNE_DATABASE_URL` is a postgres:// DSN and the `postgres` feature is
+    /// enabled.
     pub backend: Arc<dyn DbBackend>,
     pub streamer: Arc<AudioStreamer>,
     pub playback: Arc<PlaybackManager>,
@@ -100,6 +109,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The SQLite handle, for the few operations with no engine-agnostic
+    /// equivalent (FTS rebuild, `VACUUM`, WAL checkpoint, schema version).
+    ///
+    /// Errors in PostgreSQL mode instead of silently doing nothing: these are
+    /// operator-facing endpoints, and "it returned 200 and changed nothing" is
+    /// the failure mode this whole change exists to remove.
+    pub fn sqlite(&self) -> Result<&SqliteDb, String> {
+        self.db.as_ref().ok_or_else(|| {
+            "this operation is SQLite-specific and the server is running on PostgreSQL".to_string()
+        })
+    }
+
     /// The audio backend the local outputs are *displayed* as using: what they
     /// were actually built with, falling back to the stored preference before
     /// they exist.
@@ -159,16 +180,29 @@ impl AppState {
             .map(Engine::from_connection_string)
             .unwrap_or(Engine::Sqlite);
 
-        // Always open SQLite — it serves as the fallback for code paths
-        // not yet ported to Arc<dyn DbBackend> and as the local cache
-        // even when PG is the primary store.
-        let db = SqliteDb::open(db_path)?;
-        db.init_schema()?;
-        tune_core::db::migrations::run_migrations(&db)?;
+        // Open and migrate SQLite only when SQLite is the selected engine.
+        //
+        // This used to run unconditionally, "as the fallback for code paths not
+        // yet ported". In PostgreSQL mode that produced two live databases: the
+        // one the repos wrote to, and a SQLite file that UPnP, the suggestion
+        // store and the backup routes went on reading and writing. Browsing
+        // over UPnP showed a different library from the web client, and a
+        // backup silently archived the wrong database. Every one of those
+        // consumers now goes through `backend`, so there is nothing left to
+        // fall back to and no reason to keep a second store open.
+        let sqlite_db = match selected_engine {
+            Engine::Sqlite => {
+                let db = SqliteDb::open(db_path)?;
+                db.init_schema()?;
+                tune_core::db::migrations::run_migrations(&db)?;
+                Some(db)
+            }
+            Engine::Postgres => None,
+        };
 
         // Build the backend: PG when configured + feature-enabled, else SQLite.
         let backend: Arc<dyn DbBackend> =
-            Self::create_backend(selected_engine, &tune_config, &db, db_path)?;
+            Self::create_backend(selected_engine, &tune_config, sqlite_db.as_ref(), db_path)?;
 
         // Clean up any leftover temp transcode files from a previous crash.
         tune_core::http::streamer::cleanup_leftover_transcode_files();
@@ -235,7 +269,7 @@ impl AppState {
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
         let scanner = Arc::new(Mutex::new(SsdpScanner::new(ssdp_tx)));
 
-        let upnp = UpnpState::new(db.clone(), port);
+        let upnp = UpnpState::new(backend.clone(), port);
 
         let health_config = HealthMonitorConfig {
             db_path: db_path.into(),
@@ -243,7 +277,7 @@ impl AppState {
         };
         let health_monitor = Arc::new(AdvancedHealthMonitor::new(health_config));
 
-        let suggestion_store = Arc::new(SuggestionStore::new(db.clone()));
+        let suggestion_store = Arc::new(SuggestionStore::with_backend(backend.clone()));
         suggestion_store.setup_table().ok();
 
         let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
@@ -268,7 +302,7 @@ impl AppState {
         )));
 
         Ok(Self {
-            db,
+            db: sqlite_db,
             backend,
             streamer,
             playback,
@@ -349,13 +383,15 @@ impl AppState {
     fn create_backend(
         engine: Engine,
         config: &TuneConfig,
-        sqlite_db: &SqliteDb,
+        sqlite_db: Option<&SqliteDb>,
         db_path: &str,
     ) -> Result<Arc<dyn DbBackend>, String> {
         match engine {
             Engine::Sqlite => {
                 info!(engine = "sqlite", path = %db_path, "database_engine_selected");
-                Ok(Arc::new(sqlite_db.clone()))
+                let db = sqlite_db
+                    .ok_or("internal error: SQLite engine selected but no database was opened")?;
+                Ok(Arc::new(db.clone()))
             }
             Engine::Postgres => {
                 #[cfg(feature = "postgres")]

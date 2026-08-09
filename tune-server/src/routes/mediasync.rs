@@ -21,18 +21,17 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn sync_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let track_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
-        .unwrap_or(0);
-    let album_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
-        .unwrap_or(0);
-    drop(conn);
+    let count = |table: &str| -> i64 {
+        state
+            .backend
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .ok()
+            .flatten()
+            .and_then(|row| row.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    };
+    let track_count = count("tracks");
+    let album_count = count("albums");
 
     Ok(Json(json!({
         "local_tracks": track_count,
@@ -188,35 +187,33 @@ async fn push_to_peer(
 }
 
 fn build_manifest(state: &AppState) -> Result<Value, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let tracks: Vec<Value> = conn
-        .prepare(
+    let rows = state
+        .backend
+        .query_many(
             "SELECT id, path, title, artist_name, album_title, genre, year, duration, \
              file_hash, file_size FROM tracks ORDER BY path ASC",
+            &[],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "path": row.get::<_, Option<String>>(1)?,
-                    "title": row.get::<_, Option<String>>(2)?,
-                    "artist_name": row.get::<_, Option<String>>(3)?,
-                    "album_title": row.get::<_, Option<String>>(4)?,
-                    "genre": row.get::<_, Option<String>>(5)?,
-                    "year": row.get::<_, Option<String>>(6)?,
-                    "duration": row.get::<_, Option<f64>>(7)?,
-                    "hash": row.get::<_, Option<String>>(8)?,
-                    "file_size": row.get::<_, Option<i64>>(9)?,
-                }))
+        .map_err(AppError::internal)?;
+
+    let tracks: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let text = |i: usize| row.get(i).and_then(|v| v.as_string());
+            json!({
+                "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                "path": text(1),
+                "title": text(2),
+                "artist_name": text(3),
+                "album_title": text(4),
+                "genre": text(5),
+                "year": text(6),
+                "duration": row.get(7).and_then(|v| v.as_f64()),
+                "hash": text(8),
+                "file_size": row.get(9).and_then(|v| v.as_i64()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(json!(tracks))
 }
 

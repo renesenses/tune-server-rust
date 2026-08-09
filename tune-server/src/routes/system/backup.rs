@@ -1,12 +1,45 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::state::AppState;
 
+/// These routes copy the **SQLite file** at `config.db_path`.
+///
+/// In PostgreSQL mode that file is not the live database — it may be stale or
+/// absent entirely, since the server no longer opens it. Backing it up would
+/// hand the operator an archive of the wrong data and call it a success, which
+/// is worse than refusing: they would only find out at restore time (audit,
+/// volet 1). `pg_dump` is the tool for a PG deployment.
+fn require_sqlite_store(state: &AppState) -> Result<String, Response> {
+    if state.db.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "file backups are SQLite-only; this server runs on PostgreSQL — \
+                          use pg_dump against TUNE_DATABASE_URL",
+            })),
+        )
+            .into_response());
+    }
+    let db_path = state.config.db_path.clone();
+    if db_path == ":memory:" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "cannot back up an in-memory database"})),
+        )
+            .into_response());
+    }
+    Ok(db_path)
+}
+
 pub(super) async fn list_backups(State(state): State<AppState>) -> Json<Value> {
+    if state.db.is_none() {
+        // Nothing to list: the SQLite file is not this server's store.
+        return Json(json!([]));
+    }
     let items = tune_core::db_backup::list_backups(&state.config.db_path);
     Json(json!(items))
 }
@@ -15,15 +48,14 @@ pub(super) async fn create_backup(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let db_path = state.config.db_path.clone();
-    if db_path == ":memory:" {
-        return (StatusCode::BAD_REQUEST, "cannot backup in-memory database").into_response();
-    }
+    let db_path = match require_sqlite_store(&state) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
-    state
-        .db
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .ok();
+    if let Ok(db) = state.sqlite() {
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
 
     match tune_core::db_backup::create_backup(&db_path) {
         Some(info) => Json(json!(info)).into_response(),
@@ -36,14 +68,10 @@ pub(super) async fn restore_backup(
     State(state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let db_path = state.config.db_path.clone();
-    if db_path == ":memory:" {
-        return (
-            StatusCode::BAD_REQUEST,
-            "cannot restore to in-memory database",
-        )
-            .into_response();
-    }
+    let db_path = match require_sqlite_store(&state) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     if tune_core::db_backup::restore_backup(&db_path, &filename) {
         Json(json!({
@@ -73,7 +101,10 @@ pub(super) async fn create_encrypted_backup(
         }
     };
 
-    let db_path = state.config.db_path.clone();
+    let db_path = match require_sqlite_store(&state) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let backup = tune_core::db_backup::create_backup(&db_path);
     let Some(info) = backup else {
         return (
