@@ -3438,7 +3438,20 @@ impl PlaybackOrchestrator {
             let skip_passthrough_levels = source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
-            if !skip_passthrough_levels && self.levels_attach_allowed(req.zone_id) {
+            // Ce decodage parallele n'a de sens que si PERSONNE d'autre ne
+            // decode le fichier cote serveur : sortie reseau ou navigateur, qui
+            // recoivent une URL et lisent eux-memes. Une sortie locale (comme
+            // OAAT, AirPlay, HQPlayer ou le pont) decode deja pour alimenter le
+            // peripherique, et son chemin de lecture emet ses propres niveaux :
+            // on decodait donc la piste ENTIERE une seconde fois pour rien,
+            // ~65 evenements/s au lieu de ~32, avec des horodatages qui
+            // divergent apres un seek (l'un part du seek, l'autre de 0) et,
+            // depuis #1106, des fenetres dupliquees sur le tap PCM (#1110).
+            let output_decodes_server_side = !(is_network_output || is_browser_output);
+            if !skip_passthrough_levels
+                && !output_decodes_server_side
+                && self.levels_attach_allowed(req.zone_id)
+            {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();
                     let playback = self.playback.clone();
