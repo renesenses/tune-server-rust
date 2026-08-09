@@ -78,6 +78,7 @@ async fn transcode_source_to_file(
     target_fmt: String,
     eq: Option<crate::audio::eq::EqProcessor>,
     convolver: Option<crate::audio::convolver::Convolver>,
+    replaygain: Option<f64>,
     dest: String,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // 1. Decode source to PCM (blocking I/O).
@@ -97,12 +98,20 @@ async fn transcode_source_to_file(
         actual_bd = target_bd;
     }
 
-    // 1b. Apply EQ if enabled for this zone.
+    // 1b. Apply ReplayGain BEFORE the tone controls, where a pre-amp belongs:
+    // the level normalisation is what the EQ then works on. A network renderer
+    // gets an already-encoded stream, so unlike a local DAC the gain has to be
+    // baked into the samples here or it never happens at all.
+    if let Some(factor) = replaygain {
+        crate::audio::replaygain::apply_gain_pcm(&mut pcm_bytes, actual_bd, factor);
+    }
+
+    // 1c. Apply EQ if enabled for this zone.
     if let Some(mut eq) = eq {
         eq.process_pcm(&mut pcm_bytes, actual_bd);
     }
 
-    // 1c. Apply the room-correction FIR convolver (after EQ) if the zone has an
+    // 1d. Apply the room-correction FIR convolver (after EQ) if the zone has an
     // uploaded impulse response. This is what brings room correction to network
     // renderers (DLNA/UPnP/AirPlay): the local output has its own convolver, but
     // a streamed zone only gets DSP that runs here, before encoding.
@@ -1495,7 +1504,14 @@ impl PlaybackOrchestrator {
             }
 
             let result = self
-                .send_to_output(device_id, &media, req.seek_ms, zone_audiophile, req.zone_id)
+                .send_to_output(
+                    device_id,
+                    &media,
+                    req.seek_ms,
+                    zone_audiophile,
+                    req.zone_id,
+                    req.track_id,
+                )
                 .await;
             let total_ms = play_start.elapsed().as_millis();
             info!(
@@ -2867,13 +2883,30 @@ impl PlaybackOrchestrator {
                 // is not part of the cache key → a zone with an active IR never
                 // uses the cache (always fresh).
                 let convolver = self.load_convolver(req.zone_id, out_sr, channels);
-                let cache_path_opt = if eq_profile.is_some() || convolver.is_some() {
-                    None
-                } else {
-                    crate::transcode_cache::cache_path(
-                        &file_path, &out_ext, out_sr, out_bd, channels,
-                    )
+                // ReplayGain scales the samples, so like the EQ and the FIR it
+                // changes the encoded bytes without being part of the cache key.
+                // A cached transcode made at a different gain would be served
+                // silently at the wrong level — so a gained transcode is never
+                // cached, and never reads the cache.
+                let replaygain_factor = match (self.zone_audiophile(req.zone_id), req.track_id) {
+                    (false, Some(tid)) => {
+                        let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                        if (f - 1.0).abs() > 1e-6 {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
                 };
+                let cache_path_opt =
+                    if eq_profile.is_some() || convolver.is_some() || replaygain_factor.is_some() {
+                        None
+                    } else {
+                        crate::transcode_cache::cache_path(
+                            &file_path, &out_ext, out_sr, out_bd, channels,
+                        )
+                    };
                 // The transcode always writes to a fresh `tune-transcode-*` file
                 // (subject to the normal cleanup); on success it is atomically
                 // renamed into the cache. A crash mid-transcode therefore can
@@ -3000,6 +3033,7 @@ impl PlaybackOrchestrator {
                             target_format_str.clone(),
                             eq_profile,
                             convolver,
+                            replaygain_factor,
                             tmp_path.clone(),
                         ),
                     )
@@ -5409,6 +5443,7 @@ impl PlaybackOrchestrator {
         start_position_ms: Option<u64>,
         zone_audiophile: bool,
         zone_id: i64,
+        track_id: Option<i64>,
     ) -> (bool, Option<String>) {
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
@@ -5485,6 +5520,17 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    // ReplayGain, applied by the output itself for a local DAC.
+                    // A PURE zone is left strictly alone: applying a gain would
+                    // multiply every sample and the path would no longer be
+                    // bit-perfect, which is the one thing PURE promises.
+                    let rg = match (zone_audiophile, track_id) {
+                        (false, Some(tid)) => {
+                            crate::audio::replaygain::playback_factor(&self.db, tid)
+                        }
+                        _ => 1.0,
+                    };
+                    local_output.set_replaygain_factor(rg);
                     // Headphone crossfeed (local DAC only). Returns None when the
                     // zone has crossfeed disabled OR is in PURE mode, so a PURE
                     // zone stays bit-perfect. Rebuilt per-play at the resolved
@@ -5605,6 +5651,7 @@ impl PlaybackOrchestrator {
                 cur_ch,
                 out_bd,
                 target_fmt,
+                None,
                 None,
                 None,
                 tmp.clone(),
@@ -8500,8 +8547,9 @@ mod tests {
                 mime_type: "audio/flac",
                 ..Default::default()
             };
-            let (output_sent, output_error) =
-                orch.send_to_output(device_id, &media, None, false, 1).await;
+            let (output_sent, output_error) = orch
+                .send_to_output(device_id, &media, None, false, 1, None)
+                .await;
             assert!(!output_sent, "{device_id} : l'envoi doit échouer");
             let err = output_error.expect("une erreur doit être remontée");
 
@@ -8994,8 +9042,9 @@ mod tests {
             mime_type: "audio/wav",
             ..Default::default()
         };
-        let (output_sent, output_error) =
-            orch.send_to_output(device_id, &media, None, false, 1).await;
+        let (output_sent, output_error) = orch
+            .send_to_output(device_id, &media, None, false, 1, None)
+            .await;
         assert!(
             !output_sent,
             "rejecting output must report output_sent=false"

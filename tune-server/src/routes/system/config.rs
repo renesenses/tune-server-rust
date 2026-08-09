@@ -123,6 +123,11 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
         ("prefetch_mode", json!("30s")),
+        // ReplayGain application at playback. Off by default: it multiplies
+        // every sample, so it must be an explicit choice, never a surprise.
+        ("replaygain_mode", json!("off")),
+        ("replaygain_preamp_db", json!(0.0)),
+        ("replaygain_prevent_clipping", json!(true)),
         (
             "local_audio_backend",
             json!(state.config.local_audio_backend),
