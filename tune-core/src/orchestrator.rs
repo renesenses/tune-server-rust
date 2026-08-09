@@ -6593,6 +6593,19 @@ impl PlaybackOrchestrator {
                 );
                 if let Err(e) = output.lock().await.set_volume(volume).await {
                     warn!(zone_id, error = %e, "device_set_volume_failed");
+                    // A refused volume used to stop at this log line: the DB kept
+                    // the new value, the slider stayed where the user left it,
+                    // and the sound never changed. Tell the UI, using the same
+                    // channel an unavailable output already uses.
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": e,
+                            }),
+                        );
+                    }
                 }
             } else {
                 warn!(
