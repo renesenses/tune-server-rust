@@ -577,6 +577,43 @@ pub fn build_signal_path_pub(
 /// fallback is plain 16-bit LPCM unless `dlna_wav24` preserves the full 24 bits,
 /// so it is bit-perfect only when the source already fits 16 bits or the 24-bit
 /// override is on.
+/// L'égaliseur de cette zone modifie-t-il réellement le signal ?
+///
+/// Miroir exact de `Orchestrator::load_eq_processor` : mode PURE d'abord — il
+/// court-circuite tout traitement, donc un profil enregistré n'y change rien —
+/// puis profil activé ET gains audibles. Sans ce miroir, l'indicateur
+/// bit-perfect et le chemin audio répondraient à deux questions différentes.
+fn zone_eq_alters_signal(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> bool {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
+    let pure = settings
+        .get(&format!("zone_{zone_id}_audiophile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+        .unwrap_or(false);
+    if pure {
+        return false;
+    }
+    let Some(profile) = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())
+    else {
+        return false;
+    };
+    if !profile.enabled {
+        return false;
+    }
+    // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
+    tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2).is_enabled()
+}
+
 fn wav_wire_bit_perfect(
     is_lossless: bool,
     source_is_wav: bool,
@@ -692,11 +729,24 @@ fn build_signal_path(
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
 
-    // Determine if DSP is active
+    // Determine if DSP is active.
+    //
+    // Deux sources, et il faut les DEUX : la colonne dsp_preset_id/dsp_enabled
+    // de la zone, et le profil d'égaliseur `zone_{id}_eq_profile`. C'est ce
+    // dernier qu'écrit le panneau EQ de « Lecture en cours » et que lit le
+    // chemin audio (`Orchestrator::zone_has_active_eq`) — l'indicateur ne le
+    // consultait pas.
+    //
+    // Conséquence : Tune pouvait afficher « Bit-Perfect » alors qu'un
+    // égaliseur modifiait réellement le signal. Pour un logiciel dont c'est
+    // l'argument central, promettre une pureté qu'on ne tient pas est le pire
+    // des deux sens possibles de l'erreur (signalement Bilou).
+    let zid = zone.id.unwrap_or(0);
     let dsp_enabled = ZoneRepo::with_backend(backend.clone())
-        .get_dsp_config(zone.id.unwrap_or(0))
+        .get_dsp_config(zid)
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || zone_eq_alters_signal(&backend, zid);
 
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
