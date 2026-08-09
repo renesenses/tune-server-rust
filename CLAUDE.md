@@ -7,6 +7,44 @@ dans `docs/RELEASE-OPERATIONS.md` ; ce fichier-ci dit *où* va le code et
 
 ---
 
+## 0. Check-list de démarrage — AVANT d'ouvrir un éditeur
+
+Ces quatre commandes prennent trente secondes. Les sauter a déjà coûté des
+heures de travail jeté.
+
+```bash
+# 1. Des refs à jour, sinon tout ce qui suit ment.
+git fetch origin --tags --force
+
+# 2. LE CORRECTIF EXISTE-T-IL DÉJÀ ? Sur les DEUX lignes, et par CONTENU.
+git grep "<un symbole/marqueur du correctif>" origin/release/v0.9
+git grep "<un symbole/marqueur du correctif>" origin/main
+gh pr list --state merged --search "<mots-clés du bug>" --limit 10
+
+# 3. Une branche depuis la ligne qui LIVRE, dans un worktree isolé.
+git worktree add ../wt-<sujet> -b fix/<sujet> origin/release/v0.9
+
+# 4. Les versions se lisent sur origin/, JAMAIS dans la copie de travail.
+git show origin/main:package.json | grep '"version"'
+```
+
+**Le point 2 est celui qu'on saute, et c'est le plus cher.** Vécu le
+2026-08-09 : une heure passée à réimplémenter la pochette par piste (#1284)
+alors que le correctif était déjà mergé sur `release/v0.9` sous un autre
+numéro de fil (#1312 → PR #1344). Une seule commande `git grep` l'aurait
+évité.
+
+Cherchez par **contenu**, pas par numéro : le même bug arrive souvent sous
+deux numéros — celui de l'issue GitHub et celui du fil forum.
+
+Et si vous touchez au schéma : une colonne s'ajoute **aux trois endroits**
+(`CORE_SCHEMA` SQLite, migration, schéma PG) et **jamais par un
+`ALTER TABLE ADD COLUMN` dans `up:`** — sur une base neuve la colonne existe
+déjà, l'ALTER échoue en « duplicate column name » et fait planter tout
+`run_migrations` au premier démarrage. Utilisez `add_column_if_missing`.
+
+---
+
 ## 1. Topologie — la seule chose à retenir
 
 ```
