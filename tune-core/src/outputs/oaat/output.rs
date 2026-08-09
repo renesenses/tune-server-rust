@@ -142,7 +142,8 @@ impl OaatOutput {
             native_dsd_active: Arc::new(AtomicBool::new(false)),
             direct_pcm_active: Arc::new(AtomicBool::new(false)),
             direct_chain_exhausted: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(800)),
+            // OAAT volume_set is 0–100 (RFC); store the same scale.
+            volume: Arc::new(AtomicU32::new(100)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             pending_start_ms: Arc::new(AtomicU64::new(0)),
@@ -2315,7 +2316,10 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let level = (volume.clamp(0.0, 1.0) * 255.0) as u8;
+        // Protocol level is 0–100 (same as multiroom / endpoint / RFC).
+        // The old *255 mapping made any UI volume ≥ ~40% clamp to 100% on
+        // the RPi (software vol capped at 1000, amixer at 100).
+        let level = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
         self.volume.store(level as u32, Ordering::SeqCst);
         #[cfg(feature = "oaat")]
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
@@ -2397,7 +2401,7 @@ impl OutputTarget for OaatOutput {
             state,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
-            volume: self.volume.load(Ordering::Relaxed) as f64 / 255.0,
+            volume: self.volume.load(Ordering::Relaxed) as f64 / 100.0,
             muted: self.volume.load(Ordering::Relaxed) == 0,
             current_uri: self.current_uri.lock().await.clone(),
             track_title: self.current_title.lock().await.clone(),
