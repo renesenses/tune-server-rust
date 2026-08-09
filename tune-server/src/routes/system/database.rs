@@ -566,8 +566,25 @@ pub(super) async fn migrate_database(
         if let Err(e) = tune_core::db::pg_migrate::ensure_database(pg_url).await {
             tracing::warn!(error = %e, "pg_database_auto_create_failed_pre_migrate");
         }
+        // The source of the migration is the live SQLite database. When the
+        // server already runs on PostgreSQL there is none — and nothing to
+        // migrate — so say so instead of failing obscurely.
+        let sqlite_source = match state.sqlite() {
+            Ok(db) => db.clone(),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "this server already runs on PostgreSQL — there is no SQLite \
+                                  database to migrate from",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
         let start = Instant::now();
-        match tune_core::db::pg_migrate::migrate_sqlite_to_pg(&state.db, pg_url).await {
+        match tune_core::db::pg_migrate::migrate_sqlite_to_pg(&sqlite_source, pg_url).await {
             Ok(result) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 // The UI promises « le serveur va redémarrer » — deliver it:
