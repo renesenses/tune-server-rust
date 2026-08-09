@@ -901,6 +901,13 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutno
         // re-run on a db that already has it is a no-op rather than an error.
         up: "",
     },
+    Migration {
+        version: 72,
+        name: "add_zones_lyrics_offset_ms",
+        // Colonne ajoutee par add_column_if_missing ci-dessous : un re-passage
+        // sur une base qui l'a deja est alors sans effet plutot qu'en erreur.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1326,6 +1333,15 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 11 {
             add_column_if_missing(db, "albums", "genres", "TEXT");
             add_column_if_missing(db, "tracks", "genres", "TEXT");
+        }
+        if migration.version == 72 {
+            // Décalage des paroles par zone — forum #1328.
+            add_column_if_missing(
+                db,
+                "zones",
+                "lyrics_offset_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            );
         }
         if migration.version == 71 {
             // Per-track cover — see migration 71 and forum #1312.
@@ -1769,6 +1785,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "track_cover_path",
         include_str!("../../migrations/postgres/021_track_cover_path.sql"),
     ),
+    (
+        22,
+        "zone_lyrics_offset",
+        include_str!("../../migrations/postgres/022_zone_lyrics_offset.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -1949,6 +1970,37 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// Forum #1328 : décalage des paroles par zone. Vérifie la colonne ET son
+    /// défaut — un défaut non nul décalerait les paroles de tout le monde.
+    #[test]
+    fn zones_have_a_lyrics_offset_defaulting_to_zero() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(zones)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "lyrics_offset_ms"),
+            "zones.lyrics_offset_ms manquante : {cols:?}"
+        );
+        conn.execute_batch("INSERT INTO zones (name, output_type) VALUES ('z', 'local');")
+            .unwrap();
+        let off: i64 = conn
+            .query_row(
+                "SELECT lyrics_offset_ms FROM zones WHERE name = 'z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(off, 0, "une zone neuve ne doit decaler aucune parole");
     }
 
     /// Forum #1312: a track needs a cover of its own, so a folder the scanner
@@ -2184,7 +2236,7 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 21, "latest PG migration must be 21");
+        assert_eq!(pg_latest_version(), 22, "latest PG migration must be 22");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

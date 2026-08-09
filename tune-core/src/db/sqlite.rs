@@ -446,7 +446,10 @@ CREATE TABLE IF NOT EXISTS zones (
     dsd_mode TEXT DEFAULT 'auto',
     dlna_native_flac INTEGER DEFAULT 0,
     host TEXT,
-    mac TEXT
+    mac TEXT,
+    -- Décalage des paroles synchronisées, en ms (positif = retardées).
+    -- Compense la latence serveur → oreille, propre à chaque appareil (#1328).
+    lyrics_offset_ms INTEGER NOT NULL DEFAULT 0
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both
