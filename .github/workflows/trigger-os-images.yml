@@ -42,6 +42,42 @@ jobs:
     # que le job homebrew de release.yml.
     if: github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-rc')
     steps:
+      # Le tag est poussé ~30 min AVANT que release.yml n'ait publié la release
+      # et ses binaires. Dispatcher tout de suite fait arriver le webhook des
+      # images OS chez mozaiklabs.fr AVANT que la ForumRelease de la version
+      # n'existe — les images sont alors ignorées et /download n'en propose
+      # aucune. Vécu en v0.9.60 : ISO à 08:29, RPi à 08:39, release serveur à
+      # 08:57, et deux images publiées sur GitHub que la page ne montrait pas.
+      #
+      # On attend donc que la release porte ses assets avant de dispatcher.
+      # Cela restaure l'ordre dont dépend le webhook, sans revenir à
+      # `release: published` — qui, lui, ne se déclenche jamais (la release est
+      # créée par le GITHUB_TOKEN, garde anti-récursion de GitHub).
+      #
+      # Les images sont saines même construites tôt : elles épinglent la version
+      # dans le kickstart et téléchargent le binaire à l'INSTALLATION. L'attente
+      # sert au rattachement sur /download, pas à la validité de l'image.
+      - name: Wait for the server release to carry its assets
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 45 min de marge : la cible la plus lente est macOS Intel (build +
+          # notarisation Apple). Au-delà, on abandonne plutôt que de dispatcher
+          # trop tôt — un re-dispatch manuel reste possible.
+          for i in $(seq 1 90); do
+            N=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                  --json assets -q '[.assets[]|select(.name|endswith(".tar.gz"))]|length' 2>/dev/null || echo 0)
+            if [ "${N:-0}" -ge 3 ]; then
+              echo "release $TAG prête ($N archives) après $((i*30))s"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::$TAG n'a toujours pas ses assets après 45 min — dispatch annulé pour ne pas perdre le rattachement /download. Relancer ce workflow à la main une fois la release publiée."
+          exit 1
+
       - name: Resolve version
         id: v
         run: |
