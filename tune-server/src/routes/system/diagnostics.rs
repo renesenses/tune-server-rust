@@ -66,7 +66,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     drop(registry);
 
     // Audio outputs
-    let audio_backend_pref = &state.config.local_audio_backend;
+    let audio_backend_pref = &state.display_audio_backend();
     let (audio_outputs, audio_backend_name, asio_avail) = {
         #[cfg(feature = "local-audio")]
         {

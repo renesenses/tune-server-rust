@@ -229,7 +229,7 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
         #[cfg(feature = "local-audio")]
         let audio_backend =
-            tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+            tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
         let output_container = match zone_state

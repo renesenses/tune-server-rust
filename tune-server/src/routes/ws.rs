@@ -86,7 +86,7 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
     let zones = zone_repo.list().unwrap_or_default();
     #[cfg(feature = "local-audio")]
     let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     let devices = state.scanner.lock().await.devices().await;
