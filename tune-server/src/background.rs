@@ -1235,15 +1235,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // calls abort() internally, killing the process with no panic/error).
     // ASIO devices are detected at startup; the hotplug rescan only needs to
     // track WASAPI device changes (USB DACs plugged/unplugged).
-    let configured_backend = {
-        let settings =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-        settings
-            .get("local_audio_backend")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| state.config.local_audio_backend.clone())
-    };
+    let configured_backend = state.effective_audio_backend();
     // When ASIO is configured, force WASAPI for the periodic rescan
     // (re-probing ASIO during playback can crash the driver).
     // ASIO devices were registered at startup and won't change.

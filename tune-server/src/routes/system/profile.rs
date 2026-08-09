@@ -62,7 +62,7 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
     let audio_backend = {
         #[cfg(feature = "local-audio")]
         {
-            tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend)
+            tune_core::outputs::local::active_backend_name(&state.display_audio_backend())
         }
         #[cfg(not(feature = "local-audio"))]
         {

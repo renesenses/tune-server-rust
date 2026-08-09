@@ -1078,7 +1078,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             .and_then(|s| s.parse().ok());
     #[cfg(feature = "local-audio")]
     let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     let mut result = Vec::new();
@@ -1206,7 +1206,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
     let repo = ZoneRepo::with_backend(state.backend.clone());
     #[cfg(feature = "local-audio")]
     let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     match repo.get(id) {

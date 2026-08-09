@@ -727,7 +727,7 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
 async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
     #[cfg(feature = "local-audio")]
     {
-        let backend = &state.config.local_audio_backend;
+        let backend = &state.display_audio_backend();
         // The web client's sidebar fetches this on every page load. Re-enumerating
         // WASAPI devices probes each device's formats, which can crash the active
         // render stream and stop playback on Windows (DEvir: refresh UI during

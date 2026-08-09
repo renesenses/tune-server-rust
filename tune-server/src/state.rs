@@ -61,6 +61,14 @@ pub struct AppState {
     /// servers it browses on `_tune-server._tcp` (#1273). `None` until the mDNS
     /// daemon starts, or if it failed to start.
     pub mdns_scanner: Arc<std::sync::Mutex<Option<Arc<tune_core::discovery::mdns::MdnsScanner>>>>,
+    /// The backend the registered local outputs were actually built with,
+    /// published by [`crate::startup::register_local_outputs`]. `None` until
+    /// they are registered (or when the build has no local audio).
+    ///
+    /// Distinct from the *stored* preference on purpose: picking ASIO in the
+    /// settings page only takes effect on the next start, so between the two
+    /// the honest answer is still WASAPI.
+    pub active_audio_backend: Arc<std::sync::RwLock<Option<String>>>,
     pub license: Arc<tune_core::license::LicenseManager>,
     pub skin_manager: Arc<tune_core::skins::SkinManager>,
     /// Compiled-in plugins. Empty until [`crate::plugins::init`] runs, which
@@ -92,6 +100,35 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The audio backend the local outputs are *displayed* as using: what they
+    /// were actually built with, falling back to the stored preference before
+    /// they exist.
+    ///
+    /// Reading `config.local_audio_backend` here — as every display path used
+    /// to — means someone who picks ASIO in the settings page is told "WASAPI"
+    /// forever, in the signal path, in the diagnostics and in the device list,
+    /// because the choice is stored in the database, never in the config file
+    /// (forum, Windows).
+    pub fn display_audio_backend(&self) -> String {
+        if let Ok(guard) = self.active_audio_backend.read() {
+            if let Some(b) = guard.as_ref() {
+                return b.clone();
+            }
+        }
+        self.effective_audio_backend()
+    }
+
+    /// The audio backend local outputs *should* be built with: the stored
+    /// setting (written by the settings page) wins over the config file.
+    pub fn effective_audio_backend(&self) -> String {
+        tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+            .get("local_audio_backend")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.config.local_audio_backend.clone())
+    }
+
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
         // Engine selection: check TUNE_DATABASE_URL for PostgreSQL, else
         // default to SQLite.
@@ -235,6 +272,7 @@ impl AppState {
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
+            active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             license,
             skin_manager,
             plugins,
