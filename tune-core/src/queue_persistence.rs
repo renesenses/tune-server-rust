@@ -212,8 +212,15 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
             continue;
         }
 
-        // Check if DB already has a queue for this zone (don't overwrite)
-        let existing = repo.get_queue(zone_id).unwrap_or_default();
+        // Check if DB already has a queue for this zone (don't overwrite).
+        // `get_ordered` and NOT `get_queue` : ce dernier filtre sur
+        // `track_id IS NOT NULL`, donc il ne voit que les pistes LOCALES. Une
+        // file entièrement composée de titres streaming (Qobuz, Tidal…) le
+        // laissait répondre « vide », le garde-fou ne se déclenchait pas, et
+        // l'instantané était réinjecté à CHAQUE démarrage — une copie complète
+        // de la file par redémarrage, sans borne (#1348 : une file de 72 titres
+        // montée à 2 324 lignes, une zone à 91 lignes pour une seule piste).
+        let existing = repo.get_ordered(zone_id).unwrap_or_default();
         if !existing.is_empty() {
             continue;
         }
