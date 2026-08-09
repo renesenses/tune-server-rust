@@ -63,10 +63,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          # 45 min de marge : la cible la plus lente est macOS Intel (build +
-          # notarisation Apple). Au-delà, on abandonne plutôt que de dispatcher
-          # trop tôt — un re-dispatch manuel reste possible.
-          for i in $(seq 1 90); do
+          # 3 h de marge. Le facteur limitant n'est pas la compilation — les
+          # sept cibles finissent en ~15 min — mais la NOTARISATION Apple, qui
+          # est un service tiers sans engagement de délai. Vécu en v0.9.61 :
+          # `Notarize DMG (macOS)` bloquée 1 h 41 sur aarch64-apple-darwin,
+          # 6 cibles vertes sur 7, et cette attente abandonnée à 45 min alors
+          # que la release finissait par sortir. Un plafond trop bas transforme
+          # une lenteur d'Apple en images OS manquantes.
+          #
+          # Le coût d'attendre est un runner ubuntu qui dort ; le coût
+          # d'abandonner est une release sans image sur /download, et personne
+          # ne pense au re-dispatch manuel. On attend donc largement.
+          for i in $(seq 1 360); do
             N=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
                   --json assets -q '[.assets[]|select(.name|endswith(".tar.gz"))]|length' 2>/dev/null || echo 0)
             if [ "${N:-0}" -ge 3 ]; then
@@ -75,7 +83,7 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::$TAG n'a toujours pas ses assets après 45 min — dispatch annulé pour ne pas perdre le rattachement /download. Relancer ce workflow à la main une fois la release publiée."
+          echo "::error::$TAG n'a toujours pas ses assets après 3 h — dispatch annulé pour ne pas perdre le rattachement /download. Relancer ce workflow à la main une fois la release publiée."
           exit 1
 
       - name: Resolve version
