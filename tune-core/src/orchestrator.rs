@@ -149,6 +149,11 @@ use crate::streaming::registry::ServiceRegistry;
 /// Pas d'attente pendant les phases pause / pré-démarrage du forwarder de
 /// niveaux : assez court pour réagir vite, assez long pour ne pas marteler
 /// le mutex des zones.
+/// Taille des blocs du décodage-pour-niveaux (passthrough). Le PCM produit
+/// n'est lu par personne — seul compte le fait de borner la mémoire — mais un
+/// bloc trop petit multiplierait les allers-retours de canal pour rien.
+const LEVELS_DECODE_CHUNK: usize = 64 * 1024;
+
 const LEVELS_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Publie les niveaux audio (`playback.audio_levels`) sur le bus, cadencés
@@ -3414,29 +3419,36 @@ impl PlaybackOrchestrator {
                         // Passthrough : le décodage pour niveaux part de 0.
                         let levels_tx =
                             spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                        // Decode the file to PCM in the background — output is
-                        // discarded, only levels are forwarded via levels_tx.
+                        // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
+                        // matérialisait la piste entière en mémoire avant
+                        // d'émettre la moindre fenêtre : ~1,9 Go pour un
+                        // 24/192 de dix minutes, alloué à chaque début de
+                        // piste et uniquement pour animer des aiguilles.
+                        // C'est la même faute que #1109 (ReplayGain), un cran
+                        // plus loin dans la chaîne. Le décodeur en flux émet
+                        // les niveaux au fil de l'eau ; le PCM produit part
+                        // dans un puits, seul l'ordre de grandeur du tampon
+                        // reste en mémoire.
+                        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                        tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+                        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
                         let result = tokio::task::spawn_blocking(move || {
-                            let decoded = crate::audio::decode::decode_to_pcm(
+                            crate::audio::decode::decode_to_pcm_streaming_with_levels(
                                 &fp,
                                 Some(sr),
                                 Some(ch),
-                                0.0,
-                                0.0,
-                            );
-                            if let Ok(ref dec) = decoded {
-                                crate::audio::tap::send_windowed_pcm(
-                                    &levels_tx,
-                                    &dec.pcm_bytes(),
-                                    dec.bit_depth,
-                                    dec.channels as u16,
-                                    sr,
-                                );
-                            }
+                                None,
+                                sink_tx,
+                                LEVELS_DECODE_CHUNK,
+                                ready,
+                                levels_tx,
+                            )
                         })
                         .await;
-                        if let Err(e) = result {
-                            debug!(error = %e, "passthrough_levels_task_panic");
+                        match result {
+                            Err(e) => debug!(error = %e, "passthrough_levels_task_panic"),
+                            Ok(Err(e)) => debug!(error = %e, "passthrough_levels_decode_failed"),
+                            Ok(Ok(_)) => {}
                         }
                     });
                 }
