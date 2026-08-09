@@ -58,6 +58,10 @@ struct PatchZone {
     autoplay_enabled: Option<bool>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
     dsd_mode: Option<String>,
+    /// Décalage des paroles synchronisées, en ms (positif = paroles retardées).
+    /// Compense la latence entre ce que le serveur sait et ce que l'auditeur
+    /// entend — tampon de Tune puis du renderer (#1328).
+    lyrics_offset_ms: Option<i32>,
     /// Force native FLAC to a DLNA renderer even if it doesn't advertise FLAC
     /// (empty/failed GetProtocolInfo Sink) — for renderers that decode FLAC but
     /// under-report (Denon Ceol N12).
@@ -1078,6 +1082,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
             obj.insert(
+                "lyrics_offset_ms".into(),
+                json!(zone_repo.get_lyrics_offset_ms(zone_id)),
+            );
+            obj.insert(
                 "dlna_native_flac".into(),
                 json!(zone_repo.get_dlna_native_flac(zone_id)),
             );
@@ -1198,6 +1206,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 );
                 obj.insert("signal_path".into(), json!(signal_path));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
+                obj.insert(
+                    "lyrics_offset_ms".into(),
+                    json!(repo.get_lyrics_offset_ms(id)),
+                );
                 obj.insert(
                     "dlna_native_flac".into(),
                     json!(repo.get_dlna_native_flac(id)),
@@ -1321,6 +1333,14 @@ async fn patch_zone(
     }
     if let Some(ref mode) = body.dsd_mode {
         if let Err(e) = repo.update_dsd_mode(id, mode) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(offset) = body.lyrics_offset_ms {
+        // Borne large mais finie : au-dela d'une minute ce n'est plus un
+        // reglage de latence, et une valeur folle desynchroniserait tout.
+        let clamped = offset.clamp(-60_000, 60_000);
+        if let Err(e) = repo.update_lyrics_offset_ms(id, clamped) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
