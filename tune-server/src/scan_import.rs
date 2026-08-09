@@ -576,7 +576,34 @@ impl TrackImporter {
             }
         }
 
-        let track = build_track_row(meta, sf, album_id, artist_id, &track_artist_name);
+        let mut track = build_track_row(meta, sf, album_id, artist_id, &track_artist_name);
+
+        // Per-track cover, ONLY for a folder the scanner had to name itself.
+        //
+        // `use_folder_title` means this folder holds several artists AND several
+        // unrelated album tags, so every file in it was filed under one album
+        // named after the folder. That is right for a hand-made compilation, but
+        // a folder of unrelated files gets the same treatment — and the album
+        // cover above is whichever artwork the FIRST such file happened to carry
+        // (`albums_with_cover` never lets a later track override it). Bebelalu55
+        // played a WAV and saw another artist's sleeve (forum #1312).
+        //
+        // Giving the track its own artwork fixes the display without touching
+        // how the folder is grouped: reads do COALESCE(t.cover_path,
+        // al.cover_path), so a track with no embedded art still falls back to
+        // its album's, exactly as before.
+        //
+        // Only `meta.cover_art` is used — the bytes were already read while
+        // parsing the tags. The `get_or_extract` fallback re-opens the file, and
+        // paying that on every track of every mixed folder is not worth it.
+        if use_folder_title && let Some(cover) = meta.cover_art.as_ref() {
+            track.cover_path = tune_core::library::artwork::save_embedded_cover(
+                std::path::Path::new(&sf.path),
+                &self.cache_dir,
+                cover,
+            );
+        }
+
         Some((track, album_id))
     }
 }

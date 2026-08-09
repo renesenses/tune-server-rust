@@ -377,7 +377,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     bpm REAL,
     label TEXT,
     musicbrainz_recording_id TEXT,
-    comments TEXT
+    comments TEXT,
+    -- Cover embedded in THIS file. The album cover stays the norm; this is the
+    -- override for a track whose album is a folder of unrelated files, where
+    -- one track's artwork must not stand for all the others (forum #1312).
+    cover_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (

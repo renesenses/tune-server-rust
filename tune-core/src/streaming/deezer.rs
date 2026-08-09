@@ -262,13 +262,17 @@ impl DeezerService {
             disc_number: item["disk_number"].as_u64().map(|n| n as u32),
             explicit: item["explicit_lyrics"].as_bool().unwrap_or(false),
             isrc: item["isrc"].as_str().map(Into::into),
-            quality: Some(StreamQuality {
-                codec: "MP3".into(),
-                sample_rate: 44100,
-                bit_depth: 16,
-                bitrate: Some(128), // 30s preview is 128 kbps MP3
-                channels: 2,
-            }),
+            // Le catalogue Deezer ne dit pas sous quel format la piste sera
+            // servie : cette valeur décrivait l'extrait public de 30 s, et était
+            // donc affichée « MP3 44,1/16 » pour TOUTES les pistes, y compris
+            // celles réellement diffusées en FLAC. Un abonné HiFi croyait n'avoir
+            // que du MP3 (retour Fuccaro sur le forum).
+            //
+            // On ne remplit plus ce qu'on ignore : la qualité réelle est celle
+            // que `resolve_stream` renvoie au moment de la lecture, une fois le
+            // format négocié. Même règle que Qobuz, qui ne la remplit que si son
+            // API la donne.
+            quality: None,
         }
     }
 
@@ -969,9 +973,9 @@ mod tests {
         assert_eq!(track.title, "");
         assert_eq!(track.artist, "");
         assert_eq!(track.duration_ms, 0);
-        let q = track.quality.unwrap();
-        assert_eq!(q.codec, "MP3");
-        assert_eq!(q.bitrate, Some(128));
+        // Le catalogue ne dit pas le format de diffusion : ne rien affirmer
+        // vaut mieux qu'annoncer du MP3 sur une piste servie en FLAC.
+        assert!(track.quality.is_none());
     }
 
     #[test]
