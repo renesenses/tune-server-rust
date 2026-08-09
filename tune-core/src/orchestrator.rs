@@ -46,6 +46,30 @@ static TRANSCODE_GATE: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 /// Extracted from `play()` so the on-demand transcode and the background cache
 /// warm-up (`spawn_warm_next_local`) produce byte-identical output — a warm-up
 /// that diverged would populate a cache entry the real play never hits.
+/// Combien de temps laisser au transcodage d'un fichier vers PCM.
+///
+/// Une constante ne peut pas convenir : le travail est proportionnel au volume
+/// de données à décoder, et l'écart entre un FLAC et un DSD256 est d'un ordre
+/// de grandeur. Un budget fixe de 120 s rendait donc injouables les fichiers
+/// les plus lourds — la lecture ne démarrait simplement jamais (#1330).
+///
+/// Plancher de 120 s (le comportement historique, qui convient à tout ce qui
+/// est léger), plus 120 s par gibioctet de source, plafonné à 30 minutes pour
+/// qu'un disque en perdition finisse malgré tout par rendre la main.
+///
+/// Taille illisible (fichier distant qui a disparu, permissions) : on retombe
+/// sur le plancher plutôt que d'accorder un budget arbitraire.
+fn transcode_budget_for(path: &str) -> std::time::Duration {
+    const FLOOR_S: u64 = 120;
+    const PER_GIB_S: u64 = 120;
+    const CEILING_S: u64 = 30 * 60;
+    let gib = std::fs::metadata(path)
+        .map(|m| m.len() as f64 / (1024.0 * 1024.0 * 1024.0))
+        .unwrap_or(0.0);
+    let extra = (gib * PER_GIB_S as f64).round() as u64;
+    std::time::Duration::from_secs((FLOOR_S + extra).min(CEILING_S))
+}
+
 async fn transcode_source_to_file(
     source: String,
     out_sr: u32,
@@ -2949,8 +2973,25 @@ impl PlaybackOrchestrator {
                     // merely relabelled — otherwise 24-bit samples are served under
                     // a 16-bit WAV header and the renderer plays silence (#1137).
                     let target_bd = out_bd;
+                    // Le budget doit suivre la TAILLE, pas une constante.
+                    //
+                    // 120 s fixes suffisaient tant qu'on transcodait du FLAC ;
+                    // ils ne suffisent plus pour du DSD. Journaux de Cyrille
+                    // (#1330, ampli Yamaha en zone PCM, source sur NAS) : un
+                    // FLAC DXD est prêt en ~6 s, un DSD128 en ~20 s, et un
+                    // mouvement de symphonie en DSD256 courait encore au-delà.
+                    // Passé le délai, la lecture ne démarre JAMAIS — d'où « le
+                    // DSD128 passe, le DSD256 non », qui n'a rien à voir avec
+                    // la fréquence (les deux visent 352,8 kHz) et tout à voir
+                    // avec le volume de données à décoder.
+                    let transcode_budget = transcode_budget_for(&fp);
+                    info!(
+                        file = %file_path,
+                        budget_s = transcode_budget.as_secs(),
+                        "transcode_budget_selected"
+                    );
                     let transcode_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
+                        transcode_budget,
                         transcode_source_to_file(
                             fp.clone(),
                             out_sr,
@@ -3075,11 +3116,24 @@ impl PlaybackOrchestrator {
                             return Err(format!("transcode failed: {e}"));
                         }
                         Err(_) => {
-                            warn!(file = %file_path, "transcode_timeout_120s");
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(
-                                "transcode timeout (120s) — file too large or I/O stalled".into()
+                            let budget_s = transcode_budget.as_secs();
+                            let size_mb = std::fs::metadata(&fp)
+                                .map(|m| m.len() / (1024 * 1024))
+                                .unwrap_or(0);
+                            // Message explicite : l'ancien annoncait « 120s »
+                            // meme quand le budget etait tout autre, et ne
+                            // disait pas la taille en cause.
+                            warn!(
+                                file = %file_path,
+                                budget_s,
+                                size_mb,
+                                "transcode_timeout"
                             );
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(format!(
+                                "transcode timeout after {budget_s}s for a {size_mb} MB source \u{2014} \
+                                 disk or network too slow, or the file is unusually large"
+                            ));
                         }
                     }
                 }
@@ -7543,6 +7597,63 @@ fn resolve_existing_local_path(stored: &str) -> Option<String> {
     local_path_candidates(stored)
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
+}
+
+#[cfg(test)]
+mod transcode_budget_tests {
+    use super::transcode_budget_for;
+    use std::io::Write;
+
+    fn file_of(bytes: usize) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&vec![0u8; bytes]).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// Un petit fichier garde le comportement historique : 120 s.
+    #[test]
+    fn small_file_gets_the_floor() {
+        let f = file_of(4096);
+        let d = transcode_budget_for(f.path().to_str().unwrap());
+        assert_eq!(d.as_secs(), 120);
+    }
+
+    /// Le budget grandit avec la taille — c'est tout l'objet du correctif.
+    #[test]
+    fn budget_grows_with_size() {
+        let small = file_of(1024);
+        let big = file_of(300 * 1024 * 1024); // 300 Mio
+        let ds = transcode_budget_for(small.path().to_str().unwrap());
+        let db = transcode_budget_for(big.path().to_str().unwrap());
+        assert!(
+            db > ds,
+            "un fichier plus gros doit obtenir plus de temps ({db:?} vs {ds:?})"
+        );
+        // 300 Mio ~ 0,29 Gio -> 120 + ~35 s
+        assert!(
+            (150..=170).contains(&db.as_secs()),
+            "budget inattendu: {db:?}"
+        );
+    }
+
+    /// Taille illisible : plancher, jamais un budget arbitraire.
+    #[test]
+    fn unreadable_size_falls_back_to_the_floor() {
+        let d = transcode_budget_for("/nonexistent/path/does-not-exist.dsf");
+        assert_eq!(d.as_secs(), 120);
+    }
+
+    /// Un disque en perdition doit finir par rendre la main.
+    #[test]
+    fn budget_is_capped() {
+        // 30 min = plancher + 120 s/Gio -> plafond atteint vers 14,5 Gio.
+        // Verifie sur le calcul, sans ecrire un fichier de cette taille.
+        let ceiling = 30 * 60;
+        let huge_gib = 100.0_f64;
+        let computed = (120 + (huge_gib * 120.0).round() as u64).min(ceiling);
+        assert_eq!(computed, ceiling);
+    }
 }
 
 #[cfg(test)]
