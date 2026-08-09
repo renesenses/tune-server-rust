@@ -101,27 +101,13 @@ pub fn track_gain_db(lufs: f64) -> f64 {
     REFERENCE_LUFS - lufs
 }
 
-/// Is the ReplayGain sweep enabled here?
-///
-/// Absent means ON: Bertrand wants calculated tags filled automatically, so a
-/// library that never touched the setting still gets them. Only an explicit
-/// "false" turns it off. Public so the settings route reports and flips exactly
-/// what the sweep itself reads — one source of truth (forum #1310, where a
-/// tester asked where to switch it off and the answer was "nowhere").
-pub fn is_enabled(settings: &SettingsRepo) -> bool {
+fn enabled(settings: &SettingsRepo) -> bool {
     settings
         .get(ENABLED_KEY)
         .ok()
         .flatten()
         .map(|v| v != "false")
         .unwrap_or(true)
-}
-
-/// Setting key backing [`is_enabled`].
-pub const SETTING_KEY: &str = ENABLED_KEY;
-
-fn enabled(settings: &SettingsRepo) -> bool {
-    is_enabled(settings)
 }
 
 /// True if any zone is currently playing, per the persisted `last_play_state`
@@ -382,32 +368,6 @@ fn now_epoch_secs() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod enable_gate_tests {
-    use super::*;
-    use crate::db::sqlite::SqliteDb;
-
-    fn settings() -> SettingsRepo {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        // `settings` is created by the migrations, not by init_schema.
-        crate::db::migrations::run_migrations(&db).unwrap();
-        SettingsRepo::new(db)
-    }
-
-    /// Absent means ON here — the opposite of the acoustic sweep. A library
-    /// that never touched the setting must keep getting its gain tags.
-    #[test]
-    fn replaygain_is_on_unless_explicitly_disabled() {
-        let s = settings();
-        assert!(is_enabled(&s), "absent setting must mean on");
-        s.set(SETTING_KEY, "false").unwrap();
-        assert!(!is_enabled(&s), "only an explicit false turns it off");
-        s.set(SETTING_KEY, "true").unwrap();
-        assert!(is_enabled(&s));
-    }
 }
 
 #[cfg(test)]
