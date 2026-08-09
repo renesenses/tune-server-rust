@@ -255,9 +255,7 @@ pub async fn analyze_embedding_batch(
 /// Idle wait when disabled or the sweep is drained.
 const IDLE_SLEEP_SECS: u64 = 900;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
-/// Defined in `embedding_store` so the settings route can read it on builds
-/// without the `audio-embedding` feature.
-use crate::audio::embedding_store::ENABLED_KEY;
+const ENABLED_KEY: &str = "audio_embedding_enabled";
 /// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
 const MODEL_PATH_KEY: &str = "audio_embedding_model_path";
 /// Published CLAP **music** audio tower (ONNX, mel in-graph, 512-d;
@@ -270,7 +268,7 @@ const MODEL_URL: &str = "https://github.com/renesenses/tune-server-rust/releases
 const MODEL_SHA256: &str = "d888118262b6144033928e5d7bed57a51bacde7899c4c4a109de1074857b951a";
 
 fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
-    crate::audio::embedding_store::is_enabled(settings)
+    settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
 }
 
 /// The configured model destination (setting → env). Not required to exist —

@@ -168,10 +168,6 @@ pub fn router() -> Router<AppState> {
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
         .route(
-            "/settings/analysis",
-            get(config::get_analysis_settings).put(config::set_analysis_settings),
-        )
-        .route(
             "/settings/prefetch",
             get(config::get_prefetch).put(config::set_prefetch),
         )
