@@ -589,6 +589,48 @@ impl ZoneRepo {
     /// Whether to cap this DLNA zone's output to 16-bit. For renderers that
     /// advertise `audio/flac` but only decode 16-bit (Ruark R3, #1137): forces a
     /// 16-bit downconvert instead of serving hi-res FLAC/ALAC direct (silence).
+    /// Décalage à appliquer aux paroles synchronisées, en millisecondes.
+    ///
+    /// Positif = les paroles sont retardées. Sert à compenser la latence entre
+    /// le moment où le serveur apprend le titre en cours et celui où
+    /// l'auditeur l'entend : tampon de Tune, puis tampon du renderer. Sur une
+    /// radio, la « position » des paroles est l'âge de la métadonnée, donc
+    /// cette latence se voit directement — les paroles défilent en avance
+    /// (forum #1328 : 1 à 2 lignes sur un Node BluOS, 2 à 4 sur un Marantz).
+    ///
+    /// Par zone, parce que la profondeur du tampon appartient à l'appareil et
+    /// qu'aucune valeur unique ne peut convenir. Distinct de `sync_delay_ms`,
+    /// qui décale l'AUDIO pour aligner deux pièces : mélanger les deux ferait
+    /// bouger les paroles en réglant le multiroom, et l'inverse.
+    pub fn get_lyrics_offset_ms(&self, id: i64) -> i32 {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT COALESCE(lyrics_offset_ms, 0) FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0) as i32
+    }
+
+    pub fn update_lyrics_offset_ms(&self, id: i64, offset_ms: i32) -> Result<(), String> {
+        let sql = self.update_field_sql("lyrics_offset_ms");
+        let params: [&dyn ToSqlValue; 2] = [&(offset_ms as i64), &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "lyrics_offset_ms_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn get_dlna_cap_16bit(&self, id: i64) -> bool {
         let placeholder = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),

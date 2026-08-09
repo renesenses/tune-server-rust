@@ -348,7 +348,8 @@ CREATE TABLE IF NOT EXISTS zones (
     host TEXT,
     alac_passthrough TEXT DEFAULT 0,
     dlna_lpcm TEXT DEFAULT 0,
-    dlna_cap_16bit TEXT DEFAULT 0
+    dlna_cap_16bit TEXT DEFAULT 0,
+    lyrics_offset_ms TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (

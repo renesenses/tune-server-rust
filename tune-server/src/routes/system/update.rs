@@ -886,6 +886,20 @@ fn install_windows(
     let pid = std::process::id();
     let err_file = exe_dir.join("tune-update-failed.txt");
 
+    // Le batch se termine par `(goto) 2>nul & del "%~f0"` et non par
+    // `del "%~f0"` suivi de `goto :eof`.
+    //
+    // cmd.exe lit un fichier batch ligne par ligne DEPUIS LE DISQUE, en gardant
+    // une position de lecture. Supprimer le fichier puis continuer le fait donc
+    // échouer sur la lecture suivante : « Le fichier de commandes est
+    // introuvable », et la fenêtre reste ouverte sur le prompt au lieu de se
+    // fermer — alors que la mise à jour, elle, s'est bien déroulée (capture de
+    // Bilou, Windows 11 25H2).
+    //
+    // L'idiome `(goto) 2>nul` provoque une sortie du contexte batch (l'erreur
+    // de syntaxe est avalée par 2>nul) AVANT que `del` ne s'exécute : plus
+    // aucune lecture n'a lieu ensuite, le fichier est supprimé et la fenêtre se
+    // ferme proprement.
     let bat_path = exe_dir.join("tune-update.bat");
     let bat_content = format!(
         "@echo off\r\n\
@@ -916,8 +930,7 @@ fn install_windows(
          echo Starting updated server...\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
          start \"\" \"{exe}\"\r\n\
-         del \"%~f0\"\r\n\
-         goto :eof\r\n\
+         (goto) 2>nul & del \"%~f0\"\r\n\
          :swap_failed\r\n\
          echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
          echo The old binary was still locked by a running process.>> \"{err_file}\"\r\n\
