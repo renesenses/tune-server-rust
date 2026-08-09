@@ -29,6 +29,17 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN", GITHUB_TOKEN)
 REPO = os.environ["GITHUB_REPOSITORY"]
 
 
+def forum_thread_url(slug):
+    """URL publique d'un fil du forum.
+
+    Le segment est « threads » au PLURIEL : `/forum/thread/{slug}` renvoie 404.
+    Le script a écrit la forme au singulier pendant des mois — le champ « Lien »
+    de toutes les issues [Forum] créées jusqu'au 2026-08-09 pointe donc vers une
+    page inexistante. Passer par cette fonction plutôt que de recomposer l'URL.
+    """
+    return f"https://mozaiklabs.fr/forum/threads/{slug}"
+
+
 def http_get(url, headers=None):
     req = Request(url, headers=headers or {})
     with urlopen(req, timeout=30) as resp:
@@ -159,7 +170,7 @@ def main():
         body = (
             f"**Auteur** : {t.get('author','?')}\n"
             f"**Date** : {t.get('created_at','?')}\n"
-            f"**Lien** : https://mozaiklabs.fr/forum/thread/{t.get('slug','')}\n\n"
+            f"**Lien** : {forum_thread_url(t.get('slug',''))}\n\n"
             f"**Extrait** :\n\n> {strip_html(t.get('body',''))[:500]}"
         )
         title = f"[Forum] {t.get('title','(no title)')}"
@@ -175,7 +186,7 @@ def main():
             f"**Réponse de** : {r.get('author','?')}\n"
             f"**Sur le thread** : {t.get('title','(no title)')}\n"
             f"**Date** : {r.get('created_at','?')}\n"
-            f"**Lien** : https://mozaiklabs.fr/forum/thread/{t.get('slug','')}\n\n"
+            f"**Lien** : {forum_thread_url(t.get('slug',''))}\n\n"
             f"**Contenu** :\n\n> {strip_html(r.get('body',''))[:500]}"
         )
         title = f"[Forum reply] {t.get('title','(no title)')[:60]}"
