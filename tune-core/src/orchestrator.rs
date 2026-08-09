@@ -308,6 +308,10 @@ fn spawn_paced_levels_forwarder(
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
+                    // Niveau absolu par bande, en dBFS. `spectrum` reste une
+                    // forme normalisée trame par trame (contrat des clients
+                    // déjà déployés) ; ce champ dit le vrai niveau.
+                    "spectrum_db": lvl.spectrum_db,
                 }),
             );
             next_emit += window;
