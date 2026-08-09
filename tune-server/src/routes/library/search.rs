@@ -186,7 +186,27 @@ pub(super) async fn acoustic_search(
     // renvoyer moins de résultats que demandé.
     let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, limit * 2, None);
     if ranked.is_empty() {
-        return Ok(Json(json!({ "query": query, "tracks": [], "count": 0 })));
+        // Une liste vide couvrait deux situations opposées : bibliothèque pas
+        // encore analysée, ou requête sans correspondance. L'utilisateur ne
+        // pouvait pas savoir s'il devait reformuler ou attendre (retour Fabien).
+        // On le dit, plutôt que de renvoyer un silence ambigu.
+        let analysed = embedding_store::analysed_count(&state.backend);
+        if analysed == 0 {
+            return Ok(Json(json!({
+                "query": query,
+                "tracks": [],
+                "count": 0,
+                "reason": "library_not_analysed",
+                "analysed_tracks": 0,
+            })));
+        }
+        return Ok(Json(json!({
+            "query": query,
+            "tracks": [],
+            "count": 0,
+            "reason": "no_match",
+            "analysed_tracks": analysed,
+        })));
     }
 
     let scores: HashMap<i64, f32> = ranked.iter().copied().collect();
@@ -293,4 +313,36 @@ mod tests {
         let out = dedup_ranked_tracks(tracks);
         assert_eq!(out.len(), 2);
     }
+}
+
+/// GET /library/search/acoustic/status — de quoi décider si l'écran Ambiance a
+/// une chance de servir.
+///
+/// Trois informations distinctes, qu'il ne faut pas confondre :
+/// - `available` : le binaire embarque la brique acoustique ;
+/// - `enabled`   : l'analyse est activée sur ce serveur ;
+/// - `analysed_tracks` : ce qui a déjà été analysé.
+///
+/// Le client masque l'entrée de navigation quand la fonction ne peut pas
+/// marcher, et affiche l'avancement quand l'analyse tourne — plutôt que de
+/// proposer une porte fermée (retour Fabien, arbitrage Bertrand).
+pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value> {
+    let available = cfg!(feature = "audio-embedding");
+    let enabled = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("audio_embedding_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    #[cfg(feature = "audio-embedding")]
+    let analysed = tune_core::audio::embedding_store::analysed_count(&state.backend);
+    #[cfg(not(feature = "audio-embedding"))]
+    let analysed = 0_i64;
+
+    Json(json!({
+        "available": available,
+        "enabled": enabled,
+        "analysed_tracks": analysed,
+    }))
 }

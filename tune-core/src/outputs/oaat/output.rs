@@ -411,10 +411,6 @@ impl OutputTarget for OaatOutput {
         let device_name = self.name.clone();
         let controller_id = self.controller_id.clone();
         let stream_num = self.stream_counter.fetch_add(1, Ordering::SeqCst);
-        // Un changement de format en cours de file impose d'ouvrir un nouveau
-        // flux (cf. transition gapless plus bas) : le compteur doit rester
-        // accessible depuis la tâche de streaming.
-        let stream_counter = self.stream_counter.clone();
 
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         *self.stop_tx.lock().await = Some(stop_tx);
@@ -521,10 +517,7 @@ impl OutputTarget for OaatOutput {
                 .unwrap_or_default();
 
             // Fetch & detect format
-            // Mutables : une transition gapless avec changement de format ferme
-            // le flux courant et en ouvre un nouveau (voir plus bas).
-            let mut stream_num = stream_num;
-            let mut stream_id = format!("tune-{stream_num}");
+            let stream_id = format!("tune-{stream_num}");
 
             // If we have a local file path and it's a format we can parse
             // natively (WAV, FLAC, DSF), read directly instead of HTTP.
@@ -1787,8 +1780,7 @@ impl OutputTarget for OaatOutput {
             // Streaming loop
             let mut sample_offset: u64 = 0;
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
-            // Réarmé à l'ouverture d'un nouveau flux (changement de format).
-            let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+            let stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
             let mut start = std::time::Instant::now();
             let mut pause_offset = std::time::Duration::ZERO;
@@ -2054,18 +2046,12 @@ impl OutputTarget for OaatOutput {
                                 if let Some(next) = next_track.take() {
                                     info!(device = %device_name, title = %next.title, "oaat: gapless transition");
 
-                                    // Un changement de format oblige l'endpoint à
-                                    // rouvrir sa sortie : il n'y a aucun gapless à
-                                    // préserver. Poursuivre sur le flux courant le
-                                    // laissait accepter le format sans jamais rouvrir
-                                    // ALSA — métadonnées à jour, plus un son, et le
-                                    // serveur qui continue d'avancer seul (#1333).
-                                    // On ferme donc le flux et on en ouvre un nouveau.
-                                    let format_changed = !next.same_format;
-                                    if format_changed {
-                                        endpoint.send_stop(&stream_id).await.ok();
-                                        stream_num = stream_counter.fetch_add(1, Ordering::SeqCst);
-                                        stream_id = format!("tune-{stream_num}");
+                                    // A format change tears the endpoint's output
+                                    // down (`configure()` sets started=false there),
+                                    // so the swapped-in track needs its own Play —
+                                    // see below.
+                                    let renegotiated = !next.same_format;
+                                    if !next.same_format {
                                         if let Err(e) = endpoint.propose_format(&stream_id, next.info.format, next.info.sample_rate, ch, layout, next.info.bits_per_sample as u8).await {
                                             error!(device = %device_name, error = %e, "oaat: re-negotiate failed");
                                             break;
@@ -2095,23 +2081,30 @@ impl OutputTarget for OaatOutput {
                                         format: Some(fmt_str),
                                     }).await.ok();
 
+                                    // Restart the stream after a renegotiation.
+                                    // Proposing a format makes the endpoint tear
+                                    // its output down and clear `started`; from
+                                    // then on it DROPS every packet until a Play
+                                    // arrives. We kept streaming without one, so
+                                    // any gapless transition that changed format
+                                    // killed the sound for good — position still
+                                    // advancing, endpoint silent, nothing in
+                                    // either log saying why (.18, 8 Aug 2026:
+                                    // silent from 15:37:12, the first 44.1->96 kHz
+                                    // transition). Same order as a fresh session:
+                                    // format, metadata, Play, then packets.
+                                    if renegotiated {
+                                        if let Err(e) = endpoint.send_play(&stream_id).await {
+                                            error!(device = %device_name, error = %e, "oaat: play after re-negotiation failed");
+                                            break;
+                                        }
+                                        info!(device = %device_name, sample_rate = cur_sample_rate, bits = cur_bits, "oaat: stream restarted after format change");
+                                    }
+
                                     sample_offset = 0;
                                     byte_offset = 0;
                                     position_ms.store(0, Ordering::SeqCst);
                                     start = std::time::Instant::now();
-
-                                    if format_changed {
-                                        // Nouveau flux : l'ancre PTS doit repartir de
-                                        // maintenant + lead, sinon les paquets arrivent
-                                        // avec une échéance déjà passée.
-                                        stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                                        if let Err(e) = endpoint.send_play(&stream_id).await {
-                                            error!(device = %device_name, error = %e, "oaat: send_play failed after format change");
-                                            break;
-                                        }
-                                        info!(device = %device_name, stream_id = %stream_id, "oaat: nouveau flux ouvert (changement de format)");
-                                    }
-
                                     buf = next.buf;
                                     stream = next.stream;
                                     continue;
