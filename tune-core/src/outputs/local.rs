@@ -133,11 +133,13 @@ pub fn select_host(backend: &str) -> cpal::Host {
                             devices = device_count,
                             "local_audio_host_selected"
                         );
+                        note_observed_backend("ASIO");
                         return host;
                     }
                     warn!(
                         "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
                     );
+                    note_observed_backend("WASAPI");
                     return cpal::default_host();
                 }
                 Err(e) => {
@@ -146,6 +148,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
                         "local_audio_asio_host_unavailable — check ASIO driver installation"
                     );
                     info!(backend = "wasapi", "local_audio_host_fallback");
+                    note_observed_backend("WASAPI");
                     return cpal::default_host();
                 }
             },
@@ -154,10 +157,12 @@ pub fn select_host(backend: &str) -> cpal::Host {
                 // abort() when probed, crashing the process silently.
                 // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
+                note_observed_backend("WASAPI");
                 return cpal::default_host();
             }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
+                note_observed_backend("WASAPI");
                 return cpal::default_host();
             }
         }
@@ -176,8 +181,38 @@ pub fn select_host(backend: &str) -> cpal::Host {
     }
 }
 
-/// Returns the name of the audio backend for the given preference.
+/// Backend réellement retenu par le dernier `select_host`, quand il diffère de
+/// ce qui était demandé.
+///
+/// `select_host` peut retomber sur WASAPI en silence : pilote ASIO absent, ou
+/// installé mais sans périphérique de sortie parce qu'une autre application le
+/// tient déjà — un pilote ASIO ne s'ouvre que dans un seul processus. Jusqu'ici
+/// rien ne remontait cette bascule : l'interface continuait d'annoncer le
+/// backend *demandé*, si bien qu'un utilisateur ayant choisi ASIO se voyait
+/// confirmer « ASIO » alors que le son sortait en WASAPI (signalement Bilou).
+static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+
+/// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+fn note_observed_backend(name: &'static str) {
+    if let Ok(mut slot) = OBSERVED_BACKEND.write() {
+        *slot = Some(name);
+    }
+}
+
+/// Nom du backend audio à afficher.
+///
+/// Ce qui a été *observé* prime sur ce qui a été *demandé* : c'est la seule
+/// réponse qui corresponde à ce que l'utilisateur entend réellement.
 pub fn active_backend_name(backend: &str) -> &'static str {
+    backend_display_name(OBSERVED_BACKEND.read().ok().and_then(|g| *g), backend)
+}
+
+/// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
+/// toucher à l'état global ni ouvrir un périphérique.
+fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'static str {
+    if let Some(observed) = observed {
+        return observed;
+    }
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
         match backend.to_lowercase().as_str() {
@@ -4815,5 +4850,37 @@ mod open_failure_tests {
         assert!(h.contains("audio"), "got: {h}");
         let m = OpenFailure::ServerUnreachable.user_message();
         assert!(m.contains("audio"), "got: {m}");
+    }
+}
+
+#[cfg(test)]
+mod backend_display_tests {
+    use super::backend_display_name;
+
+    // Le cas Bilou : l'utilisateur demande ASIO, le pilote n'est pas ouvrable
+    // (absent, ou déjà tenu par une autre application — un pilote ASIO ne
+    // s'ouvre que dans un seul processus), la lecture retombe sur WASAPI.
+    // L'interface annonçait quand même « ASIO ».
+    #[test]
+    fn observed_wins_over_requested() {
+        assert_eq!(backend_display_name(Some("WASAPI"), "asio"), "WASAPI");
+    }
+
+    // Et l'inverse doit tenir aussi : une bascule vers WASAPI observée une fois
+    // ne doit pas figer l'affichage si ASIO s'ouvre ensuite.
+    #[test]
+    fn observed_asio_is_reported_even_when_setting_says_otherwise() {
+        assert_eq!(backend_display_name(Some("ASIO"), "wasapi"), "ASIO");
+    }
+
+    // Sans observation — aucun périphérique encore ouvert — on retombe sur la
+    // déduction d'avant, inchangée.
+    #[test]
+    fn without_observation_falls_back_to_the_setting() {
+        let name = backend_display_name(None, "asio");
+        assert!(
+            matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
+            "nom inattendu: {name}"
+        );
     }
 }
