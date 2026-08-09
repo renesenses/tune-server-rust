@@ -80,20 +80,17 @@ graph LR
         C["<b>tune-cli</b><br/>Outil terminal"]
         D["<b>tune-bridge</b><br/>Relais cloud"]
         E["<b>tune-ffi</b><br/>Interface mobile"]
-        F["<b>tune-pyo3</b><br/>Extension Python"]
     end
 
     B --> A
     C --> A
     E --> A
-    F --> A
 
     style A fill:#1565c0,color:#fff
     style B fill:#1976d2,color:#fff
     style C fill:#64b5f6
     style D fill:#64b5f6
     style E fill:#64b5f6
-    style F fill:#64b5f6
 ```
 
 | Module | Rôle |
@@ -103,7 +100,6 @@ graph LR
 | **tune-cli** | Outil en ligne de commande pour administrer le serveur |
 | **tune-bridge** | Passerelle cloud pour l'accès distant au serveur |
 | **tune-ffi** | Interface C pour embarquer Tune dans les apps mobiles (Flutter, iOS) |
-| **tune-pyo3** | Extension Python pour compatibilité avec l'ancien serveur |
 
 ---
 

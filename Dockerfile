@@ -11,18 +11,17 @@ WORKDIR /build
 
 # Cache dependencies: copy manifests and build with dummy sources
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p tune-core/src tune-pyo3/src tune-server/src/routes tune-cli/src tune-ffi/src tune-bridge/src
+RUN mkdir -p tune-core/src tune-server/src/routes tune-cli/src tune-ffi/src tune-bridge/src
 COPY tune-core/Cargo.toml tune-core/
-COPY tune-pyo3/Cargo.toml tune-pyo3/
 COPY tune-server/Cargo.toml tune-server/
 COPY tune-cli/Cargo.toml tune-cli/
 COPY tune-ffi/Cargo.toml tune-ffi/
 COPY tune-bridge/Cargo.toml tune-bridge/
 RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     echo 'fn main() {}' > tune-cli/src/main.rs && \
-    touch tune-core/src/lib.rs tune-pyo3/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
+    touch tune-core/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
     cargo build --release --package tune-server --no-default-features --features oaat 2>/dev/null || true && \
-    rm -rf tune-core/src tune-pyo3/src tune-server/src tune-cli/src
+    rm -rf tune-core/src tune-server/src tune-cli/src
 
 # Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
 RUN cargo install librespot --no-default-features --features "alsa-backend" \
@@ -38,7 +37,6 @@ RUN cargo install --git https://github.com/renesenses/airplay2-rs \
 
 # Build real source — clean dummy artifacts to force recompilation
 COPY tune-core/ tune-core/
-COPY tune-pyo3/ tune-pyo3/
 COPY tune-server/ tune-server/
 COPY tune-cli/ tune-cli/
 COPY tune-ffi/ tune-ffi/
