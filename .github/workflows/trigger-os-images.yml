@@ -8,9 +8,25 @@ name: Trigger OS image builds
 # repos, stored as the secret TUNE_OS_DISPATCH_TOKEN — the default GITHUB_TOKEN
 # cannot dispatch events to another repository. Without the secret the job just
 # warns and exits (never blocks a release; this workflow is independent of it).
+# Déclenché sur le PUSH DU TAG, surtout pas sur `release: published`.
+#
+# GitHub ne relance pas de workflow sur un événement produit par le
+# GITHUB_TOKEN — garde-fou anti-récursion. Or la release est créée par
+# release.yml (softprops/action-gh-release, GITHUB_TOKEN) : l'événement
+# `release: published` qui en découle n'a donc JAMAIS déclenché ce workflow.
+# Résultat : plus une seule image OS construite automatiquement depuis fin
+# juillet, et un dispatch manuel oublié à chaque release (0.9.54 → 0.9.59
+# livrées sans image, les dernières datant de la 0.9.53).
+#
+# Le push du tag, lui, vient d'un humain (git push origin vX.Y.Z) : il
+# déclenche normalement. Il arrive AVANT que les binaires ne soient publiés,
+# ce qui est sans conséquence — les builds d'image téléchargent la version
+# depuis l'API au moment de leur propre exécution (~15 min plus tard), et
+# `build-iso.yml` échoue clairement si l'asset n'est pas encore là, auquel cas
+# il suffit de relancer.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -21,6 +37,10 @@ on:
 jobs:
   dispatch:
     runs-on: ubuntu-latest
+    # Tags stables uniquement : une pré-release (vX.Y.Z-rcN) ne mérite pas une
+    # image de 1,2 Go, et la page /download ne sert que du stable. Même règle
+    # que le job homebrew de release.yml.
+    if: github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-rc')
     steps:
       - name: Resolve version
         id: v
