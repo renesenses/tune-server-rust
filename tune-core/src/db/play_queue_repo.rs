@@ -17,7 +17,7 @@ pub mod sql {
     use super::SqlDialect;
 
     pub fn queue_select_base() -> &'static str {
-        "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path, t.format, t.sample_rate, t.bit_depth FROM queue_items q LEFT JOIN tracks t ON q.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+        "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, COALESCE(t.cover_path, al.cover_path), t.format, t.sample_rate, t.bit_depth FROM queue_items q LEFT JOIN tracks t ON q.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
 
     pub fn get_queue<D: SqlDialect>(d: &D) -> String {
@@ -187,7 +187,7 @@ pub mod sql {
                 COALESCE(t.title, q.title), COALESCE(ar.name, q.artist), \
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
-                COALESCE(al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
+                COALESCE(t.cover_path, al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
                 q.track_number, q.disc_number \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \

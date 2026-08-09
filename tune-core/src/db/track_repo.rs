@@ -98,7 +98,7 @@ pub mod sql {
         // no album_artist to key on and shows track 1's artist for compilations
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -113,10 +113,10 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path";
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
-        let placeholders: Vec<String> = (1..=27).map(|i| d.placeholder(i)).collect();
+        let placeholders: Vec<String> = (1..=28).map(|i| d.placeholder(i)).collect();
         format!(
             "INSERT INTO tracks ({INSERT_COLS}) VALUES ({})",
             placeholders.join(", ")
@@ -422,7 +422,7 @@ impl TrackRepo {
 
     fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::insert, sql::insert);
-        let params: [&dyn ToSqlValue; 27] = [
+        let params: [&dyn ToSqlValue; 28] = [
             &track.title,
             &track.album_id,
             &track.artist_id,
@@ -450,6 +450,7 @@ impl TrackRepo {
             &track.label,
             &track.musicbrainz_recording_id,
             &track.comments,
+            &track.cover_path,
         ];
         // Capture the new track id atomically, BEFORE the file_first_seen
         // insert below — otherwise `last_insert_rowid()` at the end returns that
@@ -1114,7 +1115,7 @@ impl TrackRepo {
                     "BUG_TRACE_insert_personal_jesus"
                 );
             }
-            let params: [&dyn ToSqlValue; 27] = [
+            let params: [&dyn ToSqlValue; 28] = [
                 &track.title,
                 &track.album_id,
                 &track.artist_id,
@@ -1142,6 +1143,7 @@ impl TrackRepo {
                 &track.label,
                 &track.musicbrainz_recording_id,
                 &track.comments,
+                &track.cover_path,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
@@ -1438,6 +1440,54 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// Forum #1312. A track filed under a folder-named album must be able to
+    /// carry its own artwork, and a track without one must still show its
+    /// album's — the fallback is what keeps every normal album unchanged.
+    #[test]
+    fn track_cover_overrides_album_cover_and_falls_back_to_it() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("Audio Formats", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        albums
+            .update_cover_path(album_id, "album-sleeve-hash")
+            .unwrap();
+
+        let repo = TrackRepo::new(db.clone());
+
+        // The file that lent its artwork to the whole folder before #1312.
+        let mut owned = Track::new("Les grands restaurants".into());
+        owned.album_id = Some(album_id);
+        owned.artist_id = Some(artist_id);
+        owned.file_path = Some("/music/Audio Formats/alliye.flac".into());
+        owned.cover_path = Some("its-own-hash".into());
+        let owned_id = repo.create(&owned).unwrap();
+
+        // A file in the same folder with no embedded artwork.
+        let mut bare = Track::new("Take five".into());
+        bare.album_id = Some(album_id);
+        bare.artist_id = Some(artist_id);
+        bare.file_path = Some("/music/Audio Formats/jarreau.wav".into());
+        let bare_id = repo.create(&bare).unwrap();
+
+        assert_eq!(
+            repo.get(owned_id).unwrap().unwrap().cover_path.as_deref(),
+            Some("its-own-hash"),
+            "a track with its own cover must not show the album's"
+        );
+        assert_eq!(
+            repo.get(bare_id).unwrap().unwrap().cover_path.as_deref(),
+            Some("album-sleeve-hash"),
+            "a track without its own cover must fall back to the album's"
+        );
     }
 
     #[test]
