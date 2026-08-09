@@ -4,13 +4,122 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use tune_core::cloud::plugins::{MarketplacePlugin, PluginMarketplace};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
 
 use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// Plugin artifact signatures (audit item 8)
+// ---------------------------------------------------------------------------
+
+/// Trusted **minisign** public key for marketplace plugin artifacts.
+///
+/// A WASM plugin runs inside this server, so a compromised marketplace pushing
+/// a malicious artifact is code execution. The same construction as the signed
+/// self-update (`system/update.rs`), with a key of its own: an update key
+/// compromise and a plugin key compromise should not imply one another, and
+/// the plugin key has to be usable by whatever signs artifacts in the
+/// marketplace repo.
+///
+/// ROLLOUT: empty until the marketplace actually signs. While it is empty,
+/// enforcement is impossible and [`signature_enforced`] stays false whatever
+/// the setting says.
+const PLUGIN_PUBLIC_KEY: &str = "";
+
+/// Settings key gating enforcement. Default **false**: the marketplace does
+/// not sign anything yet, so refusing unsigned artifacts would break every
+/// install today.
+const REQUIRE_SIGNATURE_SETTING: &str = "plugin_signature_required";
+
+/// Whether an unsigned or badly-signed artifact must be refused.
+///
+/// Requires *both* an embedded key and the operator opting in. Without the key
+/// there is nothing to verify against, and silently "enforcing" with no key
+/// would be security theatre — the worst outcome, since the UI would claim
+/// plugins are verified.
+fn signature_enforced(settings: &SettingsRepo) -> bool {
+    if PLUGIN_PUBLIC_KEY.is_empty() {
+        return false;
+    }
+    settings
+        .get(REQUIRE_SIGNATURE_SETTING)
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Verify a downloaded artifact against its detached minisign signature.
+///
+/// Verification runs whenever a key and a signature are both present, even
+/// when enforcement is off — so a mismatch is visible in the logs during
+/// rollout. Only the *consequence* of a failure depends on the setting.
+async fn verify_plugin_signature(
+    marketplace: &PluginMarketplace,
+    settings: &SettingsRepo,
+    plugin_name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let enforced = signature_enforced(settings);
+
+    if PLUGIN_PUBLIC_KEY.is_empty() {
+        // Nothing to verify against. Never fatal: enforcement is already
+        // impossible, and failing here would brick installs on every build
+        // shipped before the marketplace signs.
+        return Ok(());
+    }
+
+    let signature = match marketplace.download_signature(plugin_name).await {
+        Ok(Some(sig)) => sig,
+        Ok(None) => {
+            if enforced {
+                return Err(format!(
+                    "plugin '{plugin_name}' is not signed and signature verification is required"
+                ));
+            }
+            warn!(plugin = %plugin_name, "marketplace_plugin_unsigned");
+            return Ok(());
+        }
+        Err(e) => {
+            // A transport failure is not proof of absence. Refusing here when
+            // enforcement is on is the safe reading; downgrading it to "no
+            // signature" would let anyone who can break the connection strip
+            // the check.
+            if enforced {
+                return Err(format!("could not fetch plugin signature: {e}"));
+            }
+            warn!(plugin = %plugin_name, error = %e, "marketplace_signature_fetch_failed");
+            return Ok(());
+        }
+    };
+
+    let pk = minisign_verify::PublicKey::from_base64(PLUGIN_PUBLIC_KEY)
+        .map_err(|e| format!("invalid embedded plugin public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(&signature)
+        .map_err(|e| format!("invalid plugin signature: {e}"))?;
+
+    match pk.verify(bytes, &sig, false) {
+        Ok(()) => {
+            info!(plugin = %plugin_name, "marketplace_plugin_signature_verified");
+            Ok(())
+        }
+        Err(_) => {
+            let msg = format!("plugin '{plugin_name}' signature does not match the trusted key");
+            if enforced {
+                Err(msg)
+            } else {
+                // Loud, but not fatal while the setting is off: this is
+                // exactly what the rollout period is for.
+                warn!(plugin = %plugin_name, "marketplace_plugin_signature_mismatch");
+                Ok(())
+            }
+        }
+    }
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -149,6 +258,20 @@ async fn install_plugin(
         Ok(data) => {
             info!(slug = %slug, bytes = data.len(), "marketplace_plugin_downloaded");
 
+            // Authenticate before anything touches disk: a WASM plugin runs
+            // inside this process, so unverified bytes are code execution.
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            if let Err(e) =
+                verify_plugin_signature(&marketplace, &settings, &plugin.name, &data).await
+            {
+                warn!(slug = %slug, error = %e, "marketplace_plugin_signature_rejected");
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "signature_invalid", "detail": e })),
+                )
+                    .into_response();
+            }
+
             // Persist the archive where `load_wasm_plugins` scans at startup.
             // Before this, the downloaded bytes were dropped on the floor and
             // "installed" was nothing but a settings flag — the plugin never
@@ -164,8 +287,8 @@ async fn install_plugin(
                 }
             };
 
-            // Track installation in settings.
-            let settings = SettingsRepo::with_backend(state.backend.clone());
+            // Track installation in settings (`settings` was bound above for
+            // the signature check).
             let mut installed = installed_plugins(&settings);
             // Remove old entry if upgrading.
             installed.retain(|r| r.slug != slug);
@@ -359,6 +482,20 @@ async fn update_plugin(
     // Download new version. Keyed on the package name, like install.
     match marketplace.download(&plugin.name).await {
         Ok(data) => {
+            // Same gate as install: an update is just as good a delivery
+            // vehicle for a malicious artifact, and it overwrites a plugin the
+            // user already trusts.
+            if let Err(e) =
+                verify_plugin_signature(&marketplace, &settings, &plugin.name, &data).await
+            {
+                warn!(slug = %slug, error = %e, "marketplace_plugin_signature_rejected");
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "signature_invalid", "detail": e })),
+                )
+                    .into_response();
+            }
+
             // Overwrite the on-disk plugin with the new version.
             let plugin_id = match crate::plugins::persist_wasm_archive(&data) {
                 Ok(id) => id,
@@ -403,5 +540,53 @@ async fn update_plugin(
             Json(json!({ "error": "update_failed", "detail": e })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::{PLUGIN_PUBLIC_KEY, REQUIRE_SIGNATURE_SETTING};
+
+    /// Mirrors `signature_enforced`, which needs a `SettingsRepo` (and so a
+    /// database) to call directly. The rule under test is the guard that keeps
+    /// the rollout honest, not the settings lookup.
+    fn enforced(key: &str, setting: Option<&str>) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        setting == Some("true")
+    }
+
+    /// The rollout invariant: with no embedded key there is nothing to verify
+    /// against, so enforcement must stay off even if an operator flips the
+    /// setting. Otherwise the UI would claim plugins are verified while every
+    /// install either passes unchecked or fails for the wrong reason.
+    #[test]
+    fn enforcement_is_impossible_without_an_embedded_key() {
+        assert!(!enforced("", Some("true")));
+        assert!(!enforced("", None));
+    }
+
+    #[test]
+    fn enforcement_requires_opting_in() {
+        let key = "RWTestKeyMaterialNotUsedForVerification";
+        assert!(
+            !enforced(key, None),
+            "default must not break installs today"
+        );
+        assert!(!enforced(key, Some("false")));
+        assert!(enforced(key, Some("true")));
+    }
+
+    /// Guards the rollout state itself: while the key is empty this build
+    /// cannot enforce anything, and the accompanying marketplace-side work is
+    /// still outstanding. Filling the key should make this test fail, as a
+    /// prompt to flip the default and update the docs.
+    #[test]
+    fn the_plugin_key_is_still_pending_marketplace_signing() {
+        assert!(
+            PLUGIN_PUBLIC_KEY.is_empty(),
+            "a key is embedded — enable {REQUIRE_SIGNATURE_SETTING} by default and drop this test"
+        );
     }
 }
