@@ -265,7 +265,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     acoustid_fingerprint TEXT,
     acoustid_confidence TEXT,
     trailing_silence_ms TEXT,
-    synced_lyrics TEXT
+    synced_lyrics TEXT,
+    cover_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (

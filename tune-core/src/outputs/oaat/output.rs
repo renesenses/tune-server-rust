@@ -161,19 +161,29 @@ impl OaatOutput {
         self.pending_start_ms.store(ms, Ordering::SeqCst);
     }
 
+    // These three exist only for `integration_test`, which is gated on
+    // `all(test, feature = "oaat")`. Gating them on `test` alone — or not at
+    // all — leaves them compiled but unused in a plain `cargo test`, which is
+    // where the dead_code warnings came from. Matching the consumer's cfg
+    // exactly is what keeps the build quiet in both configurations.
+
     /// Test-only: drive the native-DSD mode flag that gates
     /// `supports_internal_gapless()`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "oaat"))]
     pub(crate) fn set_native_dsd_active_for_test(&self, active: bool) {
         self.native_dsd_active.store(active, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
+    /// Test-only: raise the flag the direct-file loop sets when it reaches an
+    /// end with nothing to chain into.
+    #[cfg(all(test, feature = "oaat"))]
     pub(crate) fn set_direct_chain_exhausted_for_test(&self, exhausted: bool) {
         self.direct_chain_exhausted
             .store(exhausted, Ordering::SeqCst);
     }
 
+    /// Test-only: mark the direct-file playback path as active.
+    #[cfg(all(test, feature = "oaat"))]
     pub(crate) fn set_direct_pcm_active_for_test(&self, active: bool) {
         self.direct_pcm_active.store(active, Ordering::SeqCst);
     }

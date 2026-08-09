@@ -405,7 +405,23 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     Ok(Json(json!(mixes)))
 }
 
-/// Tracks added in the last scan (newest by file_mtime, recent imports).
+/// Albums most recently added to the library, newest first.
+///
+/// Grouped by ALBUM, not by track. Returning tracks meant a freshly imported
+/// 15-track record filled half the row with the same cover — "'New in your
+/// library' can sometimes show 10-20 tracks from the same album" (Alex
+/// Campbell, 9 Aug 2026).
+///
+/// The shape is what the home carousel has always assumed: it calls
+/// `playAlbum(item.id)` and `navigateToAlbum(item.id)` and reads
+/// `item.artist_id`. Sending tracks meant `id` was a TRACK id and `title` a
+/// track title, so the covers were labelled with song names and clicking one
+/// navigated by an id that means something else entirely. No client change is
+/// needed — the server now sends what the client was already reading.
+///
+/// Tracks with no album are left out rather than shown as one-track entries:
+/// this row is about records landing in the library, and a loose file has no
+/// album to open.
 async fn new_in_library(
     State(state): State<AppState>,
     Query(p): Query<HomeParams>,
@@ -413,15 +429,17 @@ async fn new_in_library(
     let limit = p.limit.unwrap_or(30);
     let engine = state.backend.engine();
     let p1 = ph(engine, 1);
+    // MAX(file_mtime) dates an album by its most recently imported track, so a
+    // record whose files arrived together stays together in the ordering.
     let sql = format!(
-        "SELECT t.id, t.title, ar.name, al.title, \
-                CAST(t.duration_ms AS BIGINT), al.cover_path, \
-               t.format, t.sample_rate, t.bit_depth, t.file_mtime \
+        "SELECT al.id, al.title, al.artist_id, ar.name, al.cover_path, al.source, \
+                MAX(t.file_mtime) AS newest \
         FROM tracks t \
-        LEFT JOIN albums al ON t.album_id = al.id \
-        LEFT JOIN artists ar ON t.artist_id = ar.id \
+        JOIN albums al ON t.album_id = al.id \
+        LEFT JOIN artists ar ON al.artist_id = ar.id \
         WHERE t.file_mtime IS NOT NULL \
-        ORDER BY t.file_mtime DESC \
+        GROUP BY al.id, al.title, al.artist_id, ar.name, al.cover_path, al.source \
+        ORDER BY newest DESC \
         LIMIT {p1}"
     );
     let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -434,14 +452,11 @@ async fn new_in_library(
             json!({
                 "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                "artist_name": cols.get(2).and_then(|v| v.as_string()),
-                "album_title": cols.get(3).and_then(|v| v.as_string()),
-                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
-                "cover_path": cols.get(5).and_then(|v| v.as_string()),
-                "format": cols.get(6).and_then(|v| v.as_string()),
-                "sample_rate": cols.get(7).and_then(|v| v.as_i64()),
-                "bit_depth": cols.get(8).and_then(|v| v.as_i64()),
-                "file_mtime": cols.get(9).and_then(|v| v.as_f64()),
+                "artist_id": cols.get(2).and_then(|v| v.as_i64()),
+                "artist_name": cols.get(3).and_then(|v| v.as_string()),
+                "cover_path": cols.get(4).and_then(|v| v.as_string()),
+                "source": cols.get(5).and_then(|v| v.as_string()),
+                "file_mtime": cols.get(6).and_then(|v| v.as_f64()),
             })
         })
         .collect();
