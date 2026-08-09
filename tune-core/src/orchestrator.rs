@@ -2915,7 +2915,15 @@ impl PlaybackOrchestrator {
                 // A cached transcode made at a different gain would be served
                 // silently at the wrong level — so a gained transcode is never
                 // cached, and never reads the cache.
-                let replaygain_factor = match (self.zone_audiophile(req.zone_id), req.track_id) {
+                // NOT for a local zone: the local output applies the gain on
+                // its own render path, and a local zone with a known source
+                // format always comes through here (`local_needs_wav`) — so
+                // baking it in as well multiplied the gain twice. A -6 dB track
+                // played at -12 dB, quietly.
+                let replaygain_factor = match (
+                    is_local_output || self.zone_audiophile(req.zone_id),
+                    req.track_id,
+                ) {
                     (false, Some(tid)) => {
                         let f = crate::audio::replaygain::playback_factor(&self.db, tid);
                         if (f - 1.0).abs() > 1e-6 {
