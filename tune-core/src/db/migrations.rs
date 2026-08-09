@@ -894,6 +894,13 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiplatino
 DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac';
 ",
     },
+    Migration {
+        version: 71,
+        name: "add_tracks_cover_path",
+        // Column added programmatically below (add_column_if_missing) so a
+        // re-run on a db that already has it is a no-op rather than an error.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1319,6 +1326,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 11 {
             add_column_if_missing(db, "albums", "genres", "TEXT");
             add_column_if_missing(db, "tracks", "genres", "TEXT");
+        }
+        if migration.version == 71 {
+            // Per-track cover — see migration 71 and forum #1312.
+            add_column_if_missing(db, "tracks", "cover_path", "TEXT");
         }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
@@ -1753,6 +1764,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "metadata_reports",
         include_str!("../../migrations/postgres/020_metadata_reports.sql"),
     ),
+    (
+        21,
+        "track_cover_path",
+        include_str!("../../migrations/postgres/021_track_cover_path.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -1933,6 +1949,54 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// Forum #1312: a track needs a cover of its own, so a folder the scanner
+    /// had to name itself cannot lend one file's artwork to all the others.
+    #[test]
+    fn tracks_have_their_own_cover_column() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tracks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "cover_path"),
+            "tracks.cover_path missing: {cols:?}"
+        );
+    }
+
+    /// The upgrade path relies on `add_column_if_missing`, so pin its contract:
+    /// it adds the column once and a re-run is a no-op rather than an error.
+    /// Exercised on a throwaway table — mangling `tracks` here would only fight
+    /// its FTS triggers and test nothing extra.
+    #[test]
+    fn add_column_if_missing_is_idempotent() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        add_column_if_missing(&db, "probe", "cover_path", "TEXT");
+        add_column_if_missing(&db, "probe", "cover_path", "TEXT");
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(probe)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            cols.iter().filter(|c| *c == "cover_path").count(),
+            1,
+            "cover_path should be added exactly once: {cols:?}"
+        );
     }
 
     /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
