@@ -1470,7 +1470,86 @@ async fn patch_zone(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
+    // Correction de marque/modele : la remonter a mozaiklabs.fr.
+    //
+    // Le catalogue d'appareils est fige dans le binaire ; ces corrections sont
+    // la seule matiere qui permette de le faire evoluer a partir du parc reel.
+    // Envoi anonyme et sans attente : la reponse HTTP a l'utilisateur ne doit
+    // dependre en rien de la disponibilite du site.
+    if body.brand.is_some() || body.model.is_some() {
+        push_device_correction(&state, id).await;
+    }
+
     get_zone(State(state), Path(id)).await.into_response()
+}
+
+/// Remonte au catalogue communautaire la marque/modele corriges d'une zone.
+///
+/// Ne part que si l'override est complet (marque ET modele) : une correction
+/// partielle n'apprend rien de reutilisable au catalogue.
+///
+/// Soumis au meme consentement que la telemetrie (`TUNE_TELEMETRY`) : c'est la
+/// porte deja etablie pour « cette instance parle-t-elle au cloud », et en
+/// ajouter une seconde pour la meme question fragmenterait le reglage sans
+/// rien clarifier.
+///
+/// Volontairement anonyme : ni identifiant d'instance, ni nom de zone. Le
+/// serveur n'attend pas la reponse et n'echoue jamais la-dessus.
+async fn push_device_correction(state: &AppState, zone_id: i64) {
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+        return;
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let brand = settings
+        .get(&format!("zone_{zone_id}_brand"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    let model = settings
+        .get(&format!("zone_{zone_id}_model"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    let (Some(brand), Some(model)) = (brand, model) else {
+        return;
+    };
+
+    let zone = match ZoneRepo::with_backend(state.backend.clone()).get(zone_id) {
+        Ok(Some(z)) => z,
+        _ => return,
+    };
+    let devices = state.scanner.lock().await.devices().await;
+    let detected = zone
+        .output_device_id
+        .as_deref()
+        .and_then(|did| devices.iter().find(|d| d.id == did));
+
+    let payload = json!({
+        "detected_manufacturer": detected.and_then(|d| d.manufacturer.clone()),
+        "detected_model": detected.and_then(|d| d.model.clone()),
+        "brand": brand,
+        "model": model,
+        "output_type": zone.output_type,
+    });
+
+    tokio::spawn(async move {
+        let Ok(client) = tune_core::http::client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return;
+        };
+        match client
+            .post("https://mozaiklabs.fr/api/v1/community/devices")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::debug!(status = %r.status(), "device_correction_pushed"),
+            Err(e) => tracing::debug!(error = %e, "device_correction_push_failed"),
+        }
+    });
 }
 
 async fn create_zone(
