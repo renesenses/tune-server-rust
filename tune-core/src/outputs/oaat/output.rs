@@ -1972,15 +1972,35 @@ impl OutputTarget for OaatOutput {
                                     let pending_frames = (buf.len() / bytes_per_frame) as u64;
                                     let received_ms = (sample_offset + pending_frames) * 1000
                                         / cur_sample_rate as u64;
+                                    // The track duration comes from the LIBRARY
+                                    // metadata, not from the stream header. A
+                                    // progressive transcode writes its WAV header
+                                    // before it knows the length, with the
+                                    // 0x7FFF_FFFF sentinel — which reads back as a
+                                    // 3.4-hour track, so comparing against it could
+                                    // never match and this whole guard was inert
+                                    // (Xavier Joly, 8 Aug 2026: the ALAC session
+                                    // failed exactly as before the fix).
+                                    // `duration_ms` falls back to the header only
+                                    // when the metadata has nothing.
+                                    // `parse_wav` already reports 0 for a
+                                    // sentinel data size, so the header is a
+                                    // safe fallback when metadata has nothing.
+                                    let track_ms = duration_ms_arc.load(Ordering::Relaxed);
+                                    let declared_ms = if track_ms > 0 {
+                                        track_ms
+                                    } else {
+                                        cur_stream_info.duration_ms
+                                    };
                                     if super::helpers::body_error_is_track_end(
                                         received_ms,
-                                        cur_stream_info.duration_ms,
+                                        declared_ms,
                                         END_OF_TRACK_TOLERANCE_MS,
                                     ) {
                                         info!(
                                             device = %device_name,
                                             received_ms,
-                                            declared_ms = cur_stream_info.duration_ms,
+                                            declared_ms,
                                             "oaat: body ended at track duration, treating as end of track"
                                         );
                                         // Hand the loop a finished stream so the

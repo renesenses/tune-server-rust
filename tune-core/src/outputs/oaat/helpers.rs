@@ -61,8 +61,20 @@ fn parse_wav(buf: &mut Vec<u8>) -> Option<StreamInfo> {
         buf.drain(..44);
     }
 
+    // A progressive transcode writes its header before the length is known and
+    // fills the data chunk with a sentinel: 0x7FFF_FFFF for a bounded stream,
+    // 0xFFFF_FFFF for an open-ended one (see `audio::wav`). Those are not
+    // sizes, and converting them yields a plausible-looking duration that is
+    // pure fiction — 3 h 23 at 44.1/16/2, but only 31 minutes at 192/24/2,
+    // which no duration threshold can tell from a real long track. Reporting 0
+    // (unknown) is the honest answer, and callers already handle it.
+    const DATA_SIZE_UNKNOWN: [u64; 2] = [0x7FFF_FFFF, 0xFFFF_FFFF];
     let bytes_per_frame = (bits_per_sample as u64 / 8) * channels as u64;
-    let duration_ms = if bytes_per_frame > 0 && sample_rate > 0 && data_size > 0 {
+    let duration_ms = if bytes_per_frame > 0
+        && sample_rate > 0
+        && data_size > 0
+        && !DATA_SIZE_UNKNOWN.contains(&data_size)
+    {
         data_size * 1000 / (sample_rate as u64 * bytes_per_frame)
     } else {
         0
@@ -554,12 +566,74 @@ pub(super) fn body_error_is_track_end(
 
 #[cfg(test)]
 mod body_error_tests {
-    use super::body_error_is_track_end;
+    use super::{body_error_is_track_end, detect_and_parse};
 
     const TOL: u64 = 1_000;
 
-    /// Xavier's case, in numbers: the body dies a few hundred ms short of the
-    /// declared duration because Content-Length was a prediction.
+    /// Build a WAV header with an explicit data-chunk size, as a progressive
+    /// transcode does.
+    fn wav_with_data_size(data_size: u32, sample_rate: u32, channels: u16, bits: u16) -> Vec<u8> {
+        let byte_rate = sample_rate * channels as u32 * bits as u32 / 8;
+        let block_align = channels * bits / 8;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&36u32.wrapping_add(data_size).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&sample_rate.to_le_bytes());
+        b.extend_from_slice(&byte_rate.to_le_bytes());
+        b.extend_from_slice(&block_align.to_le_bytes());
+        b.extend_from_slice(&bits.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_size.to_le_bytes());
+        b.resize(b.len() + 256, 0);
+        b
+    }
+
+    /// The sentinel a progressive transcode really writes must parse as
+    /// "unknown", not as a duration. Converted naively it looks plausible —
+    /// 3 h 23 at 44.1/16/2 — and that fiction is what made the end-of-track
+    /// guard compare against nonsense and never fire (Xavier Joly, 8 Aug 2026).
+    #[test]
+    fn a_sentinel_data_size_parses_as_unknown_duration() {
+        for size in [0x7FFF_FFFFu32, 0xFFFF_FFFFu32] {
+            let mut buf = wav_with_data_size(size, 44_100, 2, 16);
+            let si = detect_and_parse(&mut buf).expect("header should parse");
+            assert_eq!(
+                si.duration_ms, 0,
+                "data_size {size:#X} must read as unknown"
+            );
+        }
+    }
+
+    /// The trap that broke my first attempt at a threshold: at 192/24 the same
+    /// sentinel converts to about 31 minutes, a perfectly credible track
+    /// length. No duration cutoff can separate the two — only the byte value
+    /// can, which is why the check belongs here.
+    #[test]
+    fn the_sentinel_is_indistinguishable_by_duration_alone() {
+        let mut buf = wav_with_data_size(0x7FFF_FFFF, 192_000, 2, 24);
+        let si = detect_and_parse(&mut buf).expect("header should parse");
+        assert_eq!(si.duration_ms, 0);
+    }
+
+    #[test]
+    fn a_real_data_size_still_yields_its_duration() {
+        // 10 s at 44.1 kHz / 16-bit / stereo.
+        let mut buf = wav_with_data_size(44_100 * 4 * 10, 44_100, 2, 16);
+        let si = detect_and_parse(&mut buf).expect("header should parse");
+        assert_eq!(si.duration_ms, 10_000);
+    }
+
+    /// An unknown duration must leave the resume path in charge rather than
+    /// guess that every error is the end of the track.
+    #[test]
+    fn an_unknown_duration_never_counts_as_the_end() {
+        assert!(!body_error_is_track_end(195_200, 0, TOL));
+    }
+
     #[test]
     fn a_body_error_just_short_of_the_declared_duration_is_the_end() {
         assert!(body_error_is_track_end(177_870, 177_900, TOL));
@@ -588,14 +662,6 @@ mod body_error_tests {
     #[test]
     fn a_failure_just_outside_the_tolerance_is_not_the_end() {
         assert!(!body_error_is_track_end(176_899, 177_900, TOL));
-    }
-
-    /// Without a declared duration there is nothing to compare against, so we
-    /// must not guess — the resume path stays in charge.
-    #[test]
-    fn an_unknown_duration_never_counts_as_the_end() {
-        assert!(!body_error_is_track_end(177_870, 0, TOL));
-        assert!(!body_error_is_track_end(0, 0, TOL));
     }
 }
 
