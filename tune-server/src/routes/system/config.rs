@@ -937,6 +937,95 @@ pub(super) async fn set_metadata_fields(
 
 // --- Prefetch settings ---
 
+/// Read the state of the two background analyses.
+///
+/// Both were gated by a setting with no way to read or change it: ReplayGain
+/// could not be switched off (forum #1310, Philippe asked where and the honest
+/// answer was nowhere), and the acoustic analysis could not be switched ON at
+/// all (forum #1309, Scordia asked where to launch it — the brick ships in
+/// every release build but its opt-in gate was unreachable).
+///
+/// `available` is about the BINARY, `enabled` about this install. They differ:
+/// a build without the `audio-embedding` feature can never run the acoustic
+/// sweep no matter the setting, and the client must be able to tell the two
+/// apart instead of offering a switch that would do nothing.
+pub(super) async fn get_analysis_settings(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    Json(json!({
+        "replaygain": {
+            "available": true,
+            "enabled": tune_core::audio::replaygain::is_enabled(&settings),
+        },
+        "acoustic": {
+            "available": cfg!(feature = "audio-embedding"),
+            "enabled": tune_core::audio::embedding_store::is_enabled(&settings),
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct AnalysisSettingsBody {
+    replaygain_enabled: Option<bool>,
+    acoustic_enabled: Option<bool>,
+}
+
+/// Flip either analysis. Both fields are optional so a client can change one
+/// without having to know the other's state.
+///
+/// Turning the acoustic analysis on downloads a model (~hundreds of MB) on the
+/// next sweep — hence the strict opt-in, and hence a client should say so.
+/// Refused outright on a build that cannot run it, rather than silently
+/// storing a setting nothing would ever read.
+pub(super) async fn set_analysis_settings(
+    State(state): State<AppState>,
+    Json(body): Json<AnalysisSettingsBody>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    if let Some(on) = body.acoustic_enabled
+        && on
+        && !cfg!(feature = "audio-embedding")
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "this build has no acoustic analysis",
+                "acoustic_available": false,
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(on) = body.replaygain_enabled {
+        settings
+            .set(
+                tune_core::audio::replaygain::SETTING_KEY,
+                if on { "true" } else { "false" },
+            )
+            .ok();
+    }
+    if let Some(on) = body.acoustic_enabled {
+        settings
+            .set(
+                tune_core::audio::embedding_store::ENABLED_KEY,
+                if on { "true" } else { "false" },
+            )
+            .ok();
+    }
+
+    Json(json!({
+        "replaygain": {
+            "available": true,
+            "enabled": tune_core::audio::replaygain::is_enabled(&settings),
+        },
+        "acoustic": {
+            "available": cfg!(feature = "audio-embedding"),
+            "enabled": tune_core::audio::embedding_store::is_enabled(&settings),
+        },
+    }))
+    .into_response()
+}
+
 pub(super) async fn get_prefetch(State(state): State<AppState>) -> Json<Value> {
     let mode = tune_core::prefetch::PrefetchEngine::read_mode(&state.backend);
     let status = state.orchestrator.prefetch.status().await;

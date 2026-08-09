@@ -128,3 +128,48 @@ pub fn acoustic_neighbors(
     };
     rank_by_vector(backend, &seed, limit, Some(seed_track_id))
 }
+
+/// Setting key gating the acoustic (CLAP) analysis sweep.
+///
+/// Lives here rather than in `embedding` because that module only exists in an
+/// `audio-embedding` build, while the settings route must be able to read and
+/// write this on every build.
+pub const ENABLED_KEY: &str = "audio_embedding_enabled";
+
+/// Is the acoustic analysis enabled here?
+///
+/// Strict opt-in — only "true" counts. It is heavy and downloads a model on
+/// first activation, so an absent setting means off (unlike ReplayGain).
+pub fn is_enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
+    settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
+}
+
+#[cfg(test)]
+mod enable_gate_tests {
+    use super::*;
+    use crate::db::settings_repo::SettingsRepo;
+    use crate::db::sqlite::SqliteDb;
+
+    fn settings() -> SettingsRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // `settings` is created by the migrations, not by init_schema.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        SettingsRepo::new(db)
+    }
+
+    /// Strict opt-in, unlike ReplayGain: the sweep is heavy and downloads a
+    /// model, so an untouched library must not start it (forum #1309).
+    #[test]
+    fn acoustic_is_off_until_explicitly_enabled() {
+        let s = settings();
+        assert!(!is_enabled(&s), "absent setting must mean off");
+        s.set(ENABLED_KEY, "true").unwrap();
+        assert!(is_enabled(&s));
+        s.set(ENABLED_KEY, "false").unwrap();
+        assert!(!is_enabled(&s));
+        // Anything that is not exactly "true" is off — no accidental truthiness.
+        s.set(ENABLED_KEY, "1").unwrap();
+        assert!(!is_enabled(&s));
+    }
+}
