@@ -308,6 +308,10 @@ fn spawn_paced_levels_forwarder(
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
+                    // Niveau absolu par bande, en dBFS. `spectrum` reste une
+                    // forme normalisée trame par trame (contrat des clients
+                    // déjà déployés) ; ce champ dit le vrai niveau.
+                    "spectrum_db": lvl.spectrum_db,
                 }),
             );
             next_emit += window;
@@ -473,15 +477,22 @@ fn decode_http_stream_for_levels(
 /// bloquante) + décodage HTTP en tâche bloquante. Détaché de `self` pour être
 /// appelable depuis le funnel d'avance gapless, qui démarre les niveaux même
 /// pendant un pré-chargement (comme la branche locale du funnel).
+///
+/// `play_seq` est celui de la piste POUR LAQUELLE la sonde est créée, lu par
+/// l'appelant. Le lire ici, dans la tâche, le rattachait à ce que la zone
+/// jouait au moment où l'ordonnanceur daignait la démarrer : si la piste avait
+/// changé entre-temps, le forwarder adoptait la génération de la NOUVELLE
+/// piste et survivait au lieu de mourir, publiant le PCM de l'ancienne sur
+/// l'horloge de la nouvelle (#1110).
 fn spawn_proxy_levels_probe_task(
     playback: Arc<PlaybackManager>,
     bus: Arc<EventBus>,
     zone_id: i64,
     url: String,
     codec_hint: String,
+    play_seq: u64,
 ) {
     tokio::spawn(async move {
-        let play_seq = playback.current_play_seq(zone_id).await;
         let levels_tx = spawn_paced_levels_forwarder(bus, playback.clone(), zone_id, play_seq, 0);
         let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
@@ -840,7 +851,7 @@ impl PlaybackOrchestrator {
     /// sœur échantillonne la position rapportée de la zone pour brider la
     /// sonde au rythme de lecture ; les deux s'arrêtent quand le forwarder
     /// disparaît (stop / piste remplacée).
-    fn spawn_proxy_levels_probe(&self, zone_id: i64, url: String, codec_hint: String) {
+    async fn spawn_proxy_levels_probe(&self, zone_id: i64, url: String, codec_hint: String) {
         let Some(bus) = self
             .event_bus
             .clone()
@@ -848,7 +859,17 @@ impl PlaybackOrchestrator {
         else {
             return;
         };
-        spawn_proxy_levels_probe_task(self.playback.clone(), bus, zone_id, url, codec_hint);
+        // Épinglé ICI, pas dans la tâche : c'est la piste dont on vient de
+        // décider les niveaux (#1110).
+        let play_seq = self.playback.current_play_seq(zone_id).await;
+        spawn_proxy_levels_probe_task(
+            self.playback.clone(),
+            bus,
+            zone_id,
+            url,
+            codec_hint,
+            play_seq,
+        );
     }
 
     /// Duplicate-network-play detector. Returns `true` when `(source,
@@ -3048,8 +3069,10 @@ impl PlaybackOrchestrator {
                                 let playback = playback.clone();
                                 let actual_ch = channels;
                                 let sr = out_sr;
+                                // Génération épinglée au moment de la décision,
+                                // pas au démarrage de la tâche (#1110).
+                                let play_seq = playback.current_play_seq(zone_id).await;
                                 tokio::spawn(async move {
-                                    let play_seq = playback.current_play_seq(zone_id).await;
                                     // Temp-file : le PCM décodé part du début
                                     // du fichier (un seek passe par Range HTTP).
                                     let levels_tx = spawn_paced_levels_forwarder(
@@ -3383,8 +3406,11 @@ impl PlaybackOrchestrator {
                     let zone_id = req.zone_id;
                     let sr = sample_rate;
                     let ch = channels as u32;
+                    // Génération épinglée au moment de la décision (#1110) :
+                    // ce décodage complet dure toute la piste, il ne doit pas
+                    // pouvoir se raccrocher à la suivante.
+                    let play_seq = self.playback.current_play_seq(req.zone_id).await;
                     tokio::spawn(async move {
-                        let play_seq = playback.current_play_seq(zone_id).await;
                         // Passthrough : le décodage pour niveaux part de 0.
                         let levels_tx =
                             spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
@@ -4873,7 +4899,8 @@ impl PlaybackOrchestrator {
                     // les octets joués. Le bridage ≤30 s en avance impose une
                     // contre-pression TCP : le proxy ne pré-télécharge pas
                     // toute la piste.
-                    self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone());
+                    self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone())
+                        .await;
 
                     // Report the mime of the codec we actually serve, not the
                     // upstream API's mime_type. Qobuz can return a mime that does
@@ -6882,8 +6909,10 @@ impl PlaybackOrchestrator {
                 .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"));
             if let Some(path) = track.and_then(|t| t.file_path).filter(|_| !is_dsd) {
                 let playback = self.playback.clone();
+                // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
+                // bien la piste devenue courante (#1110).
+                let play_seq = self.playback.current_play_seq(zone_id).await;
                 tokio::spawn(async move {
-                    let play_seq = playback.current_play_seq(zone_id).await;
                     let levels_tx =
                         spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
                     tokio::task::spawn_blocking(move || {
@@ -6919,6 +6948,13 @@ impl PlaybackOrchestrator {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
                 let source = advance_source.clone();
+                // Épinglé AVANT la tâche : la résolution d'URL du service peut
+                // prendre plusieurs secondes, et lire la génération à son issue
+                // rattachait la sonde à ce que la zone jouait ALORS. Si
+                // l'auditeur avait enchaîné entre-temps, le forwarder héritait
+                // de la nouvelle génération et survivait, en publiant le PCM de
+                // la piste précédente sur l'horloge de la nouvelle (#1110).
+                let play_seq = self.playback.current_play_seq(zone_id).await;
                 tokio::spawn(async move {
                     let resolved = {
                         let registry = services.lock().await;
@@ -6958,7 +6994,9 @@ impl PlaybackOrchestrator {
                         .await
                         .ok();
                     } else {
-                        spawn_proxy_levels_probe_task(playback, bus, zone_id, data.url, codec);
+                        spawn_proxy_levels_probe_task(
+                            playback, bus, zone_id, data.url, codec, play_seq,
+                        );
                     }
                 });
             }
@@ -7850,6 +7888,53 @@ mod tests {
         assert!(
             n >= 40,
             "3 s d'audio ⇒ ~75 fenêtres de 40 ms sur le bus ; reçu {n}"
+        );
+    }
+
+    /// #1110 : un forwarder créé pour une piste doit MOURIR quand la zone
+    /// passe à la suivante, au lieu de publier son PCM sur l'horloge de la
+    /// nouvelle. C'est ce que garantit l'épinglage de la génération au moment
+    /// de la décision : ici on simule une génération devenue obsolète.
+    #[tokio::test]
+    async fn levels_forwarder_dies_when_its_track_is_replaced() {
+        let zone_id = 987_656;
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let stale_seq = playback.current_play_seq(zone_id).await;
+
+        // La zone enchaîne : nouvelle génération (ce que fait toute nouvelle
+        // demande de lecture avant de résoudre son flux).
+        playback.bump_generation(zone_id).await;
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        assert_ne!(
+            playback.current_play_seq(zone_id).await,
+            stale_seq,
+            "la lecture suivante doit bumper la génération"
+        );
+
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+        // Forwarder de l'ANCIENNE piste : c'est exactement ce qu'on obtenait en
+        // lisant la génération trop tard, sauf qu'alors il lisait la NOUVELLE
+        // et survivait.
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            stale_seq,
+            0,
+        );
+        let pcm = vec![0u8; 4096];
+        crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, 2, 44_100);
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            got.is_err(),
+            "un forwarder d'une piste remplacée ne doit rien publier, reçu {got:?}"
         );
     }
 
