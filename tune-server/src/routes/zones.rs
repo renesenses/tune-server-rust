@@ -2456,6 +2456,95 @@ mod signal_path_tests {
             .map(String::from)
     }
 
+    // ------------------------------------------------------------------
+    // Garde-fou : le fil prime, quelles que soient les combinaisons.
+    //
+    // Ce module a une raison d'être précise. `build_signal_path` rejouait les
+    // décisions de l'orchestrateur pour deviner ce qui partait sur le réseau, si
+    // bien que chaque évolution du chemin audio devait être répliquée ici à la
+    // main. Le même bug est revenu six fois sous des formes différentes
+    // (ALAC→FLAC fantôme, cap 16 bits, WAV 24, égaliseur ignoré) parce qu'on
+    // ajoutait un miroir de plus à chaque fois, sans jamais supprimer la cause.
+    //
+    // Le test ci-dessous ne simule PAS l'orchestrateur — ce serait un faux
+    // garde-fou, qui ne ferait que dupliquer une troisième fois les mêmes
+    // règles. Il verrouille l'invariant qui rend les miroirs inoffensifs :
+    // **quand la session de flux renseigne le format réellement servi, c'est lui
+    // qui s'affiche, et aucun réglage de zone ne peut le contredire.**
+    //
+    // Concrètement : si quelqu'un rajoute demain une règle qui écrase la valeur
+    // du fil, ce test casse, et il casse en nommant la combinaison fautive.
+    #[test]
+    fn wire_always_wins_over_every_zone_flag_combination() {
+        // Source hi-res ALAC, fil réellement servi en WAV 96 kHz / 24 bits.
+        // Plusieurs de ces réglages « voudraient » plafonner à 16 bits.
+        let served = wire("wav", 96_000, 24);
+        let expected = "ALAC 96kHz/24bit \u{2192} WAV 96kHz/24bit";
+
+        for lpcm in [false, true] {
+            for cap16 in [false, true] {
+                for wav24 in [false, true] {
+                    for alac_direct in [false, true] {
+                        let (backend, zone) = dlna_zone();
+                        let repo = ZoneRepo::with_backend(backend.clone());
+                        let id = zone.id.unwrap();
+                        repo.update_dlna_lpcm(id, lpcm).unwrap();
+                        repo.update_dlna_cap_16bit(id, cap16).unwrap();
+                        repo.update_dlna_wav24(id, wav24).unwrap();
+                        repo.update_alac_passthrough(id, alac_direct).unwrap();
+                        let zone = repo.get(id).unwrap().unwrap();
+
+                        let sp = build_signal_path(
+                            &alac_hires_playing(),
+                            &zone,
+                            &backend,
+                            Some("darTZeel LHC-208"),
+                            "none",
+                            Some(&served),
+                        )
+                        .unwrap();
+
+                        // Une combinaison peut légitimement ne pas afficher
+                        // d'étape Transcodeur ; ce qui ne se pardonne pas, c'est
+                        // d'en afficher une qui contredise le fil.
+                        if let Some(desc) = transcoder_desc(&sp) {
+                            assert_eq!(
+                                desc, expected,
+                                "lpcm={lpcm} cap16={cap16} wav24={wav24} alac_direct={alac_direct} : \
+                                 l'affichage contredit le fil reellement servi"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Second invariant, complémentaire : le CONTENEUR affiché est celui du fil.
+    // C'est le bug d'origine de Sevy (#1043) — le fil était en WAV et le chemin
+    // annonçait FLAC — remis sous test de façon systématique.
+    #[test]
+    fn wire_container_is_never_contradicted() {
+        for (container, label) in [("wav", "WAV"), ("flac", "FLAC")] {
+            let (backend, zone) = dlna_zone();
+            let sp = build_signal_path(
+                &alac_hires_playing(),
+                &zone,
+                &backend,
+                Some("Eversolo DMP-A10"),
+                "none",
+                Some(&wire(container, 96_000, 24)),
+            )
+            .unwrap();
+            if let Some(desc) = transcoder_desc(&sp) {
+                assert!(
+                    desc.contains(label),
+                    "fil={container} mais l'affichage dit: {desc}"
+                );
+            }
+        }
+    }
+
     fn transcoder_desc(v: &Value) -> Option<String> {
         v.get("steps")?
             .as_array()?
