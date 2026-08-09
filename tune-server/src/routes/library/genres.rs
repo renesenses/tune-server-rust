@@ -14,26 +14,23 @@ pub(super) struct GenreQuery {
 }
 
 pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Collect all individual genres from both the `genres` JSON array
     // and the legacy `genre` text column (splitting multi-genre strings).
-    let raw_genres: Vec<(Option<String>, Option<String>)> = conn
-        .prepare("SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '') GROUP BY genre, genres")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0).unwrap_or(None),
-                    row.get::<_, Option<String>>(1).unwrap_or(None),
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    let raw_genres: Vec<(Option<String>, Option<String>)> = state
+        .backend
+        .query_many(
+            "SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '') GROUP BY genre, genres",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            (
+                row.first().and_then(|v| v.as_string()),
+                row.get(1).and_then(|v| v.as_string()),
+            )
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
 
     let mut genre_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (genre_col, genres_col) in &raw_genres {
@@ -301,25 +298,22 @@ pub(super) async fn list_genres(
     State(state): State<AppState>,
     Query(params): Query<GenreQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Collect genre + genres columns from all albums
-    let raw: Vec<(Option<String>, Option<String>)> = conn
-        .prepare("SELECT genre, genres FROM albums WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0).unwrap_or(None),
-                    row.get::<_, Option<String>>(1).unwrap_or(None),
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    let raw: Vec<(Option<String>, Option<String>)> = state
+        .backend
+        .query_many(
+            "SELECT genre, genres FROM albums WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            (
+                row.first().and_then(|v| v.as_string()),
+                row.get(1).and_then(|v| v.as_string()),
+            )
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
 
     // Split multi-genre values and count albums per genre. Genres are grouped
     // by a canonical key that ignores case and the space-vs-hyphen separator,

@@ -170,32 +170,27 @@ async fn kiosk_screensaver(
     Query(params): Query<ScreensaverParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = params.limit.unwrap_or(20);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     // Get random albums with artwork
-    let albums: Vec<Value> = conn
-        .prepare(
+    let albums: Vec<Value> = state
+        .backend
+        .query_many(
             "SELECT id, title, artist_name, cover_path FROM albums \
              WHERE cover_path IS NOT NULL AND cover_path != '' \
-             ORDER BY RANDOM() LIMIT ?1",
+             ORDER BY RANDOM() LIMIT ?",
+            &[&limit as &dyn tune_core::db::backend::ToSqlValue],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map([limit], |row| {
-                Ok(json!({
-                    "album_id": row.get::<_, i64>(0)?,
-                    "title": row.get::<_, Option<String>>(1)?,
-                    "artist_name": row.get::<_, Option<String>>(2)?,
-                    "cover_path": row.get::<_, Option<String>>(3)?,
-                }))
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            json!({
+                "album_id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": row.get(1).and_then(|v| v.as_string()),
+                "artist_name": row.get(2).and_then(|v| v.as_string()),
+                "cover_path": row.get(3).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
 
     Ok(Json(json!({
         "albums": albums,

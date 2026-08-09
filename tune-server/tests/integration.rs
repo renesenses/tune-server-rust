@@ -688,7 +688,7 @@ async fn playback_manager_state_transitions() {
     let (_app, state) = make_app_with_state();
 
     // Create a zone in DB
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_id = zone_repo
         .create("Test", Some("mock"), Some("mock-1"))
         .unwrap();

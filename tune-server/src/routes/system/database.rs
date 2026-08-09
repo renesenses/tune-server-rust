@@ -19,8 +19,12 @@ use crate::state::AppState;
 pub(super) async fn database_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // migration check uses SqliteDb directly (sqlite-specific)
-    let version = migrations::current_version(&state.db).unwrap_or(0);
+    // The migration version is a SQLite notion; PG tracks its own and reports 0.
+    let version = state
+        .db
+        .as_ref()
+        .and_then(|db| migrations::current_version(db).ok())
+        .unwrap_or(0);
     let latest = migrations::latest_version();
     let row = state.backend.query_one(
         "SELECT \
@@ -84,7 +88,15 @@ pub(super) async fn rebuild_fts(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let conn = match state.db.connection().lock() {
+    // The contentless FTS index is a SQLite feature; PostgreSQL has no
+    // equivalent to rebuild.
+    let db = match state.sqlite() {
+        Ok(db) => db,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
+    let conn = match db.connection().lock() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -129,11 +141,8 @@ pub(super) async fn export_database(
     }
 
     // SQLite-specific WAL checkpoint before exporting the DB file
-    if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        state
-            .db
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .ok();
+    if let Ok(db) = state.sqlite() {
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
 
     match tokio::fs::read(&db_path).await {

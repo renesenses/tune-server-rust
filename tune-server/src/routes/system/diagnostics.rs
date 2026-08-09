@@ -35,7 +35,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        migrations::current_version(&state.db).unwrap_or(0)
+        state
+            .db
+            .as_ref()
+            .and_then(|db| migrations::current_version(db).ok())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -563,7 +567,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
     let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        migrations::current_version(&state.db).unwrap_or(0)
+        state
+            .db
+            .as_ref()
+            .and_then(|db| migrations::current_version(db).ok())
+            .unwrap_or(0)
     } else {
         0
     };
