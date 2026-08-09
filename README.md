@@ -56,7 +56,6 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 
 ```
 tune-core/         Business logic (library, DB, streaming, outputs, discovery)
-tune-pyo3/         PyO3 bindings (legacy bridge)
 tune-server/       Axum HTTP server (385 route handlers, 30 modules)
 ```
 
