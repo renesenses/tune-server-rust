@@ -118,6 +118,27 @@ impl AppState {
         self.effective_audio_backend()
     }
 
+    /// Whether local outputs should open the device in exclusive (bit-perfect)
+    /// mode: the stored setting wins over the config file.
+    ///
+    /// Same trap as [`Self::effective_audio_backend`], with teeth: the settings
+    /// page writes this to the database, and the outputs were built from the
+    /// config file — so the "partagé / exclusif" selector did nothing at all,
+    /// restart or not. Selecting ASIO in that page also stores
+    /// `local_exclusive_mode: true`, which is what arms the ASIO exclusive
+    /// path, so it was silently lost too.
+    pub fn effective_exclusive_mode(&self) -> bool {
+        let stored = tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+            .get("local_exclusive_mode")
+            .ok()
+            .flatten()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"));
+        let exclusive = stored.unwrap_or(self.config.local_exclusive_mode);
+        // ASIO is exclusive by nature — the shared path can't drive it.
+        // Mirrors the same rule applied to the config file at load time.
+        exclusive || self.effective_audio_backend().eq_ignore_ascii_case("asio")
+    }
+
     /// The audio backend local outputs *should* be built with: the stored
     /// setting (written by the settings page) wins over the config file.
     pub fn effective_audio_backend(&self) -> String {

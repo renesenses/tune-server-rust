@@ -1310,7 +1310,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // New device found — register it
             let local_out = tune_core::outputs::local::LocalOutput::with_options(
                 dev.name.clone(),
-                state.config.local_exclusive_mode,
+                state.effective_exclusive_mode(),
                 &configured_backend,
             );
             outputs.register(Box::new(local_out));
