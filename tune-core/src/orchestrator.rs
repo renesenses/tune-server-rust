@@ -2639,7 +2639,13 @@ impl PlaybackOrchestrator {
         let eq_forces_transcode = (is_network_output || is_browser_output)
             && !dsd_passthrough
             && !alac_passthrough
-            && (self.zone_has_active_eq(req.zone_id) || self.zone_has_active_ir(req.zone_id));
+            && (self.zone_has_active_eq(req.zone_id)
+                || self.zone_has_active_ir(req.zone_id)
+                // ReplayGain scales the samples, so it lives in the same place
+                // as the EQ — and would be discarded in the same way on a
+                // passthrough. Enabling it is an explicit choice of processing;
+                // PURE zones are excluded upstream.
+                || self.zone_replaygain_changes_audio(req.zone_id, req.track_id));
         // En navigateur, la sortie transcodée doit être du WAV : un FLAC
         // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
         // Range (#1168) — même règle que le bras streaming.
@@ -5828,6 +5834,24 @@ impl PlaybackOrchestrator {
     /// effect (and is not in PURE mode). Cheap settings read used to decide
     /// routing BEFORE the sample rate is known — the actual EqProcessor is
     /// built later by the transcode path at the real rate.
+    /// True when ReplayGain would change the samples for this zone's track.
+    ///
+    /// Same shape as [`Self::zone_has_active_eq`], and needed for the same
+    /// reason: a network renderer served the file raw never runs any of our
+    /// DSP, so without forcing the transcode the gain would be computed,
+    /// logged, and silently thrown away.
+    fn zone_replaygain_changes_audio(&self, zone_id: i64, track_id: Option<i64>) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        match track_id {
+            Some(tid) => {
+                (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
+            }
+            None => false,
+        }
+    }
+
     fn zone_has_active_eq(&self, zone_id: i64) -> bool {
         // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
         // gains, not the rate.
