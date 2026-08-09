@@ -81,6 +81,22 @@ const POLL_INTERVAL_MS: u64 = 1000;
 /// noyer, assez court pour repérer une lecture démarrée depuis sa façade.
 const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
 const GAPLESS_WINDOW_MS: u64 = 30_000;
+
+/// Au-dela de ce delai, une piste mise en attente n'est plus fiable et doit
+/// etre repreparee.
+///
+/// `prepare_gapless` ouvre un flux pour la piste suivante ; ce flux attend
+/// qu'on le lise et abandonne au bout de 300 s (`SEND_TIMEOUT_SECS`, decode.rs)
+/// pour ne pas laisser un decodage tourner dans le vide. L'armement se faisant
+/// dans les 30 dernieres secondes d'un morceau, une pause prise juste avant la
+/// fin suffit a faire mourir la preparation pendant l'absence : au retour, le
+/// morceau se termine, le renderer va chercher une adresse qui ne repond plus,
+/// 0 octet part, et le poller finit par tuer la zone (Progman, 9 aout 2026 —
+/// « Longue pause -> Reprise -> Fin de piste » casse l'enchainement en DLNA).
+///
+/// Confortablement sous les 300 s : repreparer coute un transcodage, se
+/// tromper coute un blanc et une zone arretee.
+const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -182,8 +198,9 @@ const VOLUME_GRACE_SECS: u64 = 5;
 /// `transition` will call exactly these functions.
 pub(crate) mod decisions {
     use super::{
-        GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
-        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS,
+        GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS,
+        MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS, MIN_WALL_FRACTION_FOR_NATURAL_END,
+        POLL_FAIL_END_MIN_ERRORS,
     };
 
     /// Margin (ms) added to the track duration before position-based
@@ -455,6 +472,15 @@ pub(crate) mod decisions {
         !gapless_sent
             && effective_duration_ms > GAPLESS_WINDOW_MS
             && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
+    }
+
+    /// La piste mise en attente a-t-elle expire ?
+    ///
+    /// `age_secs` est le temps ecoule depuis `prepare_gapless`. Au-dela de
+    /// `GAPLESS_STAGE_MAX_AGE_SECS`, le flux ouvert pour elle a ete abandonne
+    /// cote serveur et l'adresse ne repond plus : il faut repreparer.
+    pub fn gapless_stage_expired(gapless_sent: bool, age_secs: Option<u64>) -> bool {
+        gapless_sent && age_secs.is_some_and(|a| a > GAPLESS_STAGE_MAX_AGE_SECS)
     }
 
     /// The renderer-reported duration for the CURRENT track, sanitised against
@@ -3313,12 +3339,30 @@ impl PositionPoller {
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
-                    } else if decisions::should_arm_gapless(
-                        ps.gapless_sent,
-                        status.duration_ms,
-                        track_duration_ms,
-                        status.position_ms,
-                    ) {
+                    } else if {
+                        // Une preparation trop vieille ne vaut plus rien : son
+                        // flux a expire cote serveur. On la jette pour que la
+                        // condition ci-dessous rearme proprement, plutot que de
+                        // laisser le renderer chercher une adresse morte.
+                        if decisions::gapless_stage_expired(
+                            ps.gapless_sent,
+                            ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
+                        ) {
+                            info!(
+                                zone_id,
+                                age_secs = ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
+                                "gapless_stage_expired_rearming"
+                            );
+                            ps.gapless_sent = false;
+                            ps.gapless_sent_at = None;
+                        }
+                        decisions::should_arm_gapless(
+                            ps.gapless_sent,
+                            status.duration_ms,
+                            track_duration_ms,
+                            status.position_ms,
+                        )
+                    } {
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -5404,5 +5448,51 @@ mod status_timeout_tests {
         let out = arc(Box::new(FastOutput));
         let res = get_status_bounded(&out, None).await;
         assert_eq!(res.unwrap().state, TransportState::Playing);
+    }
+}
+
+#[cfg(test)]
+mod gapless_stage_expiry_tests {
+    use super::decisions::gapless_stage_expired;
+
+    /// Le cas de Progman : pause prise dans les 30 dernieres secondes d'un
+    /// morceau, donc APRES l'armement, puis une longue absence. Le flux ouvert
+    /// pour la piste suivante abandonne au bout de 300 s ; a la reprise, le
+    /// renderer va chercher une adresse morte et 0 octet part.
+    #[test]
+    fn a_long_pause_expires_the_staged_track() {
+        assert!(gapless_stage_expired(true, Some(400)));
+        assert!(gapless_stage_expired(true, Some(201)));
+    }
+
+    /// Une pause courte ne doit rien jeter : repreparer coute un transcodage
+    /// complet, inutile tant que le flux est encore vivant.
+    #[test]
+    fn a_short_pause_keeps_the_staged_track() {
+        assert!(!gapless_stage_expired(true, Some(30)));
+        assert!(!gapless_stage_expired(true, Some(200)));
+    }
+
+    /// Rien en attente : il n'y a rien a jeter, quel que soit le temps ecoule.
+    #[test]
+    fn nothing_staged_never_expires() {
+        assert!(!gapless_stage_expired(false, Some(9_999)));
+        assert!(!gapless_stage_expired(false, None));
+    }
+
+    /// Arme sans horodatage connu — le cas `gapless_skipped_exclusive_output`,
+    /// qui marque `gapless_sent` sans jamais renseigner l'instant. On ne doit
+    /// pas le rearmer en boucle a chaque tick.
+    #[test]
+    fn staged_without_a_timestamp_is_left_alone() {
+        assert!(!gapless_stage_expired(true, None));
+    }
+
+    /// La marge sous le delai d'abandon du decodeur (300 s) doit rester : sans
+    /// elle, on rearmerait juste apres que le flux est mort, ou jamais.
+    #[test]
+    fn the_threshold_stays_below_the_decoder_timeout() {
+        assert!(super::GAPLESS_STAGE_MAX_AGE_SECS < 300);
+        assert!(super::GAPLESS_STAGE_MAX_AGE_SECS > 60);
     }
 }
