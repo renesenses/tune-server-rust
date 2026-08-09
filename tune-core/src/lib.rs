@@ -58,6 +58,7 @@ pub mod remote_proxy;
 pub mod room_correction;
 pub mod scanner;
 pub mod scrobble;
+pub mod secret_envelope;
 pub mod services_manager;
 pub mod skins;
 pub mod sleep_timer;
