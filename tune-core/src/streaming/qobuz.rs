@@ -1140,6 +1140,19 @@ impl StreamingService for QobuzService {
         Ok(tags)
     }
 
+    /// Les playlists éditoriales Qobuz, celles composées par leurs équipes.
+    ///
+    /// Le client appelle `GET /streaming/{service}/featured`, donc `get_featured`.
+    /// Qobuz était le seul service à ne pas la surcharger — Tidal, Deezer et
+    /// Spotify le font — et héritait donc de l'implémentation par défaut du
+    /// trait, qui renvoie une liste vide. Le carrousel « Playlists en vedette »
+    /// ne s'affichait jamais pour Qobuz, alors que tout existait par ailleurs :
+    /// la récupération ci-dessous, et même une route dédiée que personne
+    /// n'appelait (retour Fabien).
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        self.get_featured_playlists(None, None).await
+    }
+
     async fn get_featured_playlists(
         &self,
         tag: Option<&str>,

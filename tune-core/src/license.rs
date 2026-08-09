@@ -779,12 +779,34 @@ pub fn is_timestamp_past(timestamp: &str) -> bool {
 }
 
 /// Check whether an ISO-8601 timestamp is older than `days` from now.
+/// Parse a timestamp coming either from our own settings (`...Z`) or from the
+/// licence server, which emits real ISO 8601 **with an offset**
+/// (`2026-09-09T11:22:56+02:00`).
+///
+/// Only the Zulu shape used to be accepted, and an unparseable value was
+/// treated as expired — so a licence carrying a genuine expiry was read as
+/// already over and the server silently fell back to Free. It never showed
+/// because every licence issued so far was `lifetime`, i.e. `expires_at =
+/// null`: the branch was never taken. The first real one-month subscription
+/// (Bruno Lescarret, 2026-08-09) validated fine against the cloud, then
+/// unlocked nothing.
+fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Offset-aware first: that is what the licence server sends.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Naive `...Z`, the shape we persist in settings ourselves.
+    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
 fn is_expired(timestamp: &str, days: i64) -> bool {
-    let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") else {
-        // If we can't parse, treat as expired.
+    let Some(validated) = parse_timestamp(timestamp) else {
+        // Still fail closed on a genuinely unreadable value — but the shapes we
+        // actually receive are now both understood.
         return true;
     };
-    let validated = parsed.and_utc();
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
     validated < cutoff
 }
@@ -796,6 +818,40 @@ fn is_expired(timestamp: &str, days: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le serveur de licences renvoie une date ISO 8601 **avec décalage**
+    /// (`+02:00`), pas du Zulu. Elle n'était pas parsée, et un échec de parsing
+    /// vaut « expirée » : un abonnement d'un mois parfaitement valide faisait
+    /// retomber le serveur en Free juste après une validation réussie.
+    /// Invisible jusqu'ici, toutes les licences émises étant `lifetime` avec
+    /// `expires_at = null`.
+    #[test]
+    fn a_future_expiry_with_offset_is_not_expired() {
+        let future = (chrono::Utc::now() + chrono::Duration::days(30))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        assert!(
+            !is_expired(&future, 0),
+            "un abonnement qui court encore doit être actif : {future}"
+        );
+    }
+
+    #[test]
+    fn both_timestamp_shapes_are_understood() {
+        // Zulu — ce que l'on persiste soi-même dans les settings.
+        assert!(parse_timestamp("2020-01-01T00:00:00Z").is_some());
+        // Avec décalage — ce que le serveur de licences envoie.
+        assert!(parse_timestamp("2026-09-09T11:22:56+02:00").is_some());
+        // Illisible — on continue d'échouer côté sûr.
+        assert!(parse_timestamp("pas une date").is_none());
+    }
+
+    #[test]
+    fn a_past_expiry_is_still_expired_whatever_the_shape() {
+        assert!(is_expired("2020-01-01T00:00:00Z", 0));
+        assert!(is_expired("2020-01-01T00:00:00+02:00", 0));
+        assert!(is_expired("illisible", 0), "illisible ⇒ échec côté sûr");
+    }
 
     #[test]
     fn tier_serde_roundtrip() {

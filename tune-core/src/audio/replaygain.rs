@@ -65,6 +65,28 @@ const PLAYBACK_BACKOFF_SECS: u64 = 30;
 /// The 12 B/sample estimate above, from the DB columns the scan filled.
 /// Unknown rate/channels fall back to CD stereo; unknown duration returns 0
 /// (no basis to refuse — the track is analysed as before).
+/// Au-dela de cette frequence, la valeur stockee ne peut pas etre une cadence
+/// PCM : le maximum rencontre en PCM est 768 kHz. C'est donc une cadence DSD
+/// brute (2,8 MHz pour du DSD64, 11,3 MHz pour du DSD256), et l'analyse ne
+/// decode pas a cette cadence-la.
+const MAX_PLAUSIBLE_PCM_RATE: i64 = 768_000;
+
+/// Cadence a laquelle l'analyse decodera reellement ce fichier.
+///
+/// `tracks.sample_rate` contient, pour du DSD, la cadence DSD BRUTE. La prendre
+/// pour une cadence PCM surestimait l'empreinte memoire d'un facteur 16 a 32 :
+/// le fichier DSD256 de Cyrille (#1330) etait annonce a 100 Go pour 6 minutes
+/// de musique, la ou le decodage PCM en represente 3. Consequence, tout fichier
+/// DSD etait ecarte de l'analyse comme « surdimensionne », y compris ceux qui
+/// tiennent largement dans le budget.
+fn effective_decode_rate(sample_rate: i64) -> i64 {
+    if sample_rate > MAX_PLAUSIBLE_PCM_RATE {
+        crate::audio::formats::AudioFormat::Dsd.dsd_output_sample_rate(sample_rate as u32) as i64
+    } else {
+        sample_rate
+    }
+}
+
 fn estimated_analysis_bytes(
     duration_ms: Option<i64>,
     sample_rate: Option<i64>,
@@ -74,7 +96,10 @@ fn estimated_analysis_bytes(
         Some(ms) if ms > 0 => ms as u64 / 1000,
         _ => return 0,
     };
-    let rate = sample_rate.filter(|&r| r > 0).unwrap_or(44_100) as u64;
+    let rate = sample_rate
+        .filter(|&r| r > 0)
+        .map(effective_decode_rate)
+        .unwrap_or(44_100) as u64;
     let ch = channels.filter(|&c| c > 0).unwrap_or(2) as u64;
     dur_s
         .saturating_mul(rate)
@@ -373,6 +398,43 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// #1330 : la cadence DSD brute etait prise pour une cadence PCM, ce qui
+    /// gonflait l'estimation d'un facteur 16 a 32 et ecartait TOUT fichier DSD
+    /// de l'analyse.
+    #[test]
+    fn dsd_rate_is_converted_to_the_real_decode_rate() {
+        // DSD256 (11,3 MHz) est decode a 352,8 kHz.
+        assert_eq!(effective_decode_rate(11_289_600), 352_800);
+        // DSD64 (2,8 MHz) est decode a 176,4 kHz.
+        assert_eq!(effective_decode_rate(2_822_400), 176_400);
+        // Une vraie cadence PCM n'est jamais touchee, y compris la plus haute.
+        assert_eq!(effective_decode_rate(44_100), 44_100);
+        assert_eq!(effective_decode_rate(768_000), 768_000);
+    }
+
+    /// Le cas exact de Cyrille : 6 minutes de DSD256 annoncees a ~100 Go.
+    #[test]
+    fn dsd256_estimate_is_no_longer_absurd() {
+        let dur_ms = Some(372_000);
+        let est = estimated_analysis_bytes(dur_ms, Some(11_289_600), Some(2));
+        let gb = est as f64 / 1e9;
+        assert!(
+            (2.5..4.0).contains(&gb),
+            "6 min de DSD256 devraient peser ~3 Go decodes, pas {gb} Go"
+        );
+    }
+
+    /// Un DSD64 court entre desormais dans le budget, la ou il etait ecarte.
+    #[test]
+    fn short_dsd64_becomes_analysable() {
+        let est = estimated_analysis_bytes(Some(240_000), Some(2_822_400), Some(2));
+        assert!(
+            est < MAX_ANALYSIS_EST_BYTES,
+            "4 min de DSD64 devraient tenir dans le budget, estime a {est}"
+        );
+    }
 
     #[test]
     fn oversized_estimate_math() {
