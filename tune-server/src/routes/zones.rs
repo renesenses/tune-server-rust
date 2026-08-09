@@ -12,6 +12,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::{Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
+use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
 use tune_core::playback::{PlayState, ZoneState};
 
@@ -544,16 +545,9 @@ pub fn build_signal_path_pub(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
-    output_container: Option<&str>,
+    wire: Option<&StreamInfo>,
 ) -> Option<Value> {
-    build_signal_path(
-        ps,
-        zone,
-        backend,
-        renderer_label,
-        audio_backend,
-        output_container,
-    )
+    build_signal_path(ps, zone, backend, renderer_label, audio_backend, wire)
 }
 
 /// Build the `signal_path` object for a zone's current playback.
@@ -562,12 +556,16 @@ pub fn build_signal_path_pub(
 /// `audio_backend` is the active audio backend name ("ASIO", "WASAPI",
 /// "CoreAudio", "ALSA") used for local zones' signal path display.
 ///
-/// `output_container` is the REAL container currently served on the wire for
-/// this zone's active stream session (`AudioStreamer::stream_output_container`,
-/// e.g. "wav" / "flac"), or `None` when there is no live session. It lets the
-/// DLNA arm show the negotiated WAV/LPCM fallback (`dlna_needs_wav`, decided
-/// async) instead of the statically-guessed FLAC transcode target — Sevy's
-/// LHC-52 was served WAV yet the path claimed "ALAC → FLAC".
+/// `wire` décrit ce qui part RÉELLEMENT sur le fil pour la session en cours
+/// (`AudioStreamer::stream_output_wire`) : conteneur, fréquence, profondeur.
+/// `None` quand il n'y a pas de session vivante (sortie locale, avant démarrage).
+///
+/// C'est la source de vérité, et elle prime sur toute déduction. Cette fonction
+/// rejouait les règles de l'orchestrateur pour deviner ce qui était servi ; à
+/// chaque évolution du chemin audio il fallait répliquer la règle ici, et un
+/// oubli faisait mentir l'affichage. Le renderer, lui, affiche ce qu'il reçoit
+/// — d'où les écarts constatés par Yves sur darTZeel LHC-208 et Eversolo
+/// DMP-A10, tous deux en passthrough natif.
 /// Is a WAV/LPCM wire feed to a DLNA/OpenHome renderer bit-perfect?
 ///
 /// Three cases share the WAV wire: a native WAV source (passthrough), the
@@ -629,13 +627,21 @@ fn build_signal_path(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
-    output_container: Option<&str>,
+    wire: Option<&StreamInfo>,
 ) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
     }
 
     let np = ps.now_playing.as_ref()?;
+
+    // Conteneur réellement servi (None hors session : sortie locale, démarrage).
+    let output_container = wire.map(|w| w.format.as_str());
+    // Fréquence et profondeur réellement émises. Une session fraîchement créée
+    // peut encore porter des zéros (`StreamInfo::default`) : on ne retient que
+    // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
+    let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
+    let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
 
     // Look up track details for format/sample_rate/bit_depth
     let track = np.track_id.and_then(|tid| {
@@ -667,6 +673,12 @@ fn build_signal_path(
         np.sample_rate
             .map(|v| v as i32)
             .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
+            // Dernier recours quand ni la lecture en cours ni la base ne
+            // savent : le fil, qui décrit ce qui part vraiment. Sans lui on
+            // affichait 44100 en dur — une valeur inventée, affirmée avec le
+            // même aplomb qu'une vraie mesure, et fausse dès que le fichier
+            // était en Hi-Res (métadonnées non lues au scan).
+            .or_else(|| wire_sample_rate.map(|v| v as i32))
             .unwrap_or(44100)
     };
     let bit_depth = if is_dsd {
@@ -679,6 +691,7 @@ fn build_signal_path(
         np.bit_depth
             .map(|v| v as i32)
             .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
+            .or_else(|| wire_bit_depth.map(|v| v as i32))
             .unwrap_or(16)
     };
 
@@ -966,17 +979,23 @@ fn build_signal_path(
         // for the opt-in 24-bit WAV path, 16-bit when the zone caps to 16-bit OR
         // serves the plain LPCM fallback (audio/L16 is 16-bit), and the
         // max-sample-rate cap when set.
-        let out_bit_depth = if dlna_wav24 {
+        //
+        // Quand le fil renseigne ces valeurs, elles PRIMENT : elles décrivent
+        // ce que le renderer reçoit, là où les règles ci-dessous ne font que
+        // rejouer les décisions de l'orchestrateur et prennent du retard à
+        // chaque évolution du chemin audio.
+        let out_bit_depth = wire_bit_depth.map(|v| v as i32).unwrap_or(if dlna_wav24 {
             bit_depth.min(24)
         } else if dlna_cap_16bit || wav_output {
             bit_depth.min(16)
         } else {
             bit_depth
-        };
-        let out_sample_rate = zone
-            .max_sample_rate
-            .map(|m| (sample_rate as u32).min(m) as i32)
-            .unwrap_or(sample_rate);
+        });
+        let out_sample_rate = wire_sample_rate.map(|v| v as i32).unwrap_or_else(|| {
+            zone.max_sample_rate
+                .map(|m| (sample_rate as u32).min(m) as i32)
+                .unwrap_or(sample_rate)
+        });
         let out_desc = if out_sample_rate >= 1000 {
             format!(
                 "{output_format_name} {sr}kHz/{out_bit_depth}bit",
@@ -1111,12 +1130,12 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-            let output_container = match ps
+            let wire = match ps
                 .now_playing
                 .as_ref()
                 .and_then(|np| np.stream_id.as_deref())
             {
-                Some(sid) => state.streamer.stream_output_container(sid).await,
+                Some(sid) => state.streamer.stream_output_wire(sid).await,
                 None => None,
             };
             let signal_path = build_signal_path(
@@ -1125,7 +1144,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 &state.backend,
                 renderer_label,
                 audio_backend,
-                output_container.as_deref(),
+                wire.as_ref(),
             );
             obj.insert("signal_path".into(), json!(signal_path));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
@@ -1238,12 +1257,12 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .output_device_id
                     .as_deref()
                     .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-                let output_container = match ps
+                let wire = match ps
                     .now_playing
                     .as_ref()
                     .and_then(|np| np.stream_id.as_deref())
                 {
-                    Some(sid) => state.streamer.stream_output_container(sid).await,
+                    Some(sid) => state.streamer.stream_output_wire(sid).await,
                     None => None,
                 };
                 let signal_path = build_signal_path(
@@ -1252,7 +1271,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     &state.backend,
                     renderer_label,
                     audio_backend,
-                    output_container.as_deref(),
+                    wire.as_ref(),
                 );
                 obj.insert("signal_path".into(), json!(signal_path));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
@@ -2416,6 +2435,116 @@ mod signal_path_tests {
         }
     }
 
+    /// Décrit un fil réel : conteneur + fréquence + profondeur effectivement
+    /// servies. Passer 0 en fréquence ou profondeur simule une session qui ne
+    /// les connaît pas encore — l'affichage doit alors retomber sur les règles.
+    fn wire(format: &str, sample_rate: u32, bit_depth: u16) -> StreamInfo {
+        StreamInfo {
+            format: format.into(),
+            sample_rate,
+            bit_depth,
+            ..Default::default()
+        }
+    }
+
+    fn step_desc(v: &Value, name: &str) -> Option<String> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|s| s.get("description").and_then(|d| d.as_str()))
+            .map(String::from)
+    }
+
+    // ------------------------------------------------------------------
+    // Garde-fou : le fil prime, quelles que soient les combinaisons.
+    //
+    // Ce module a une raison d'être précise. `build_signal_path` rejouait les
+    // décisions de l'orchestrateur pour deviner ce qui partait sur le réseau, si
+    // bien que chaque évolution du chemin audio devait être répliquée ici à la
+    // main. Le même bug est revenu six fois sous des formes différentes
+    // (ALAC→FLAC fantôme, cap 16 bits, WAV 24, égaliseur ignoré) parce qu'on
+    // ajoutait un miroir de plus à chaque fois, sans jamais supprimer la cause.
+    //
+    // Le test ci-dessous ne simule PAS l'orchestrateur — ce serait un faux
+    // garde-fou, qui ne ferait que dupliquer une troisième fois les mêmes
+    // règles. Il verrouille l'invariant qui rend les miroirs inoffensifs :
+    // **quand la session de flux renseigne le format réellement servi, c'est lui
+    // qui s'affiche, et aucun réglage de zone ne peut le contredire.**
+    //
+    // Concrètement : si quelqu'un rajoute demain une règle qui écrase la valeur
+    // du fil, ce test casse, et il casse en nommant la combinaison fautive.
+    #[test]
+    fn wire_always_wins_over_every_zone_flag_combination() {
+        // Source hi-res ALAC, fil réellement servi en WAV 96 kHz / 24 bits.
+        // Plusieurs de ces réglages « voudraient » plafonner à 16 bits.
+        let served = wire("wav", 96_000, 24);
+        let expected = "ALAC 96kHz/24bit \u{2192} WAV 96kHz/24bit";
+
+        for lpcm in [false, true] {
+            for cap16 in [false, true] {
+                for wav24 in [false, true] {
+                    for alac_direct in [false, true] {
+                        let (backend, zone) = dlna_zone();
+                        let repo = ZoneRepo::with_backend(backend.clone());
+                        let id = zone.id.unwrap();
+                        repo.update_dlna_lpcm(id, lpcm).unwrap();
+                        repo.update_dlna_cap_16bit(id, cap16).unwrap();
+                        repo.update_dlna_wav24(id, wav24).unwrap();
+                        repo.update_alac_passthrough(id, alac_direct).unwrap();
+                        let zone = repo.get(id).unwrap().unwrap();
+
+                        let sp = build_signal_path(
+                            &alac_hires_playing(),
+                            &zone,
+                            &backend,
+                            Some("darTZeel LHC-208"),
+                            "none",
+                            Some(&served),
+                        )
+                        .unwrap();
+
+                        // Une combinaison peut légitimement ne pas afficher
+                        // d'étape Transcodeur ; ce qui ne se pardonne pas, c'est
+                        // d'en afficher une qui contredise le fil.
+                        if let Some(desc) = transcoder_desc(&sp) {
+                            assert_eq!(
+                                desc, expected,
+                                "lpcm={lpcm} cap16={cap16} wav24={wav24} alac_direct={alac_direct} : \
+                                 l'affichage contredit le fil reellement servi"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Second invariant, complémentaire : le CONTENEUR affiché est celui du fil.
+    // C'est le bug d'origine de Sevy (#1043) — le fil était en WAV et le chemin
+    // annonçait FLAC — remis sous test de façon systématique.
+    #[test]
+    fn wire_container_is_never_contradicted() {
+        for (container, label) in [("wav", "WAV"), ("flac", "FLAC")] {
+            let (backend, zone) = dlna_zone();
+            let sp = build_signal_path(
+                &alac_hires_playing(),
+                &zone,
+                &backend,
+                Some("Eversolo DMP-A10"),
+                "none",
+                Some(&wire(container, 96_000, 24)),
+            )
+            .unwrap();
+            if let Some(desc) = transcoder_desc(&sp) {
+                assert!(
+                    desc.contains(label),
+                    "fil={container} mais l'affichage dit: {desc}"
+                );
+            }
+        }
+    }
+
     fn transcoder_desc(v: &Value) -> Option<String> {
         v.get("steps")?
             .as_array()?
@@ -2433,8 +2562,15 @@ mod signal_path_tests {
     fn dlna_wav_wire_shows_alac_to_wav() {
         let (backend, zone) = dlna_zone();
         let ps = alac_hires_playing();
-        let sp =
-            build_signal_path(&ps, &zone, &backend, Some("LHC-52"), "none", Some("wav")).unwrap();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("LHC-52"),
+            "none",
+            Some(&wire("wav", 96_000, 16)),
+        )
+        .unwrap();
         assert_eq!(
             transcoder_desc(&sp).as_deref(),
             Some("ALAC 96kHz/24bit \u{2192} WAV 96kHz/16bit")
@@ -2463,8 +2599,15 @@ mod signal_path_tests {
     fn dlna_flac_wire_keeps_flac_target() {
         let (backend, zone) = dlna_zone();
         let ps = alac_hires_playing();
-        let sp =
-            build_signal_path(&ps, &zone, &backend, Some("Node"), "none", Some("flac")).unwrap();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
         assert_eq!(
             transcoder_desc(&sp).as_deref(),
             Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
@@ -2496,10 +2639,107 @@ mod signal_path_tests {
     fn dlna_native_wav24_is_bit_perfect() {
         let (backend, zone) = dlna_zone();
         let ps = wav24_playing();
-        let sp =
-            build_signal_path(&ps, &zone, &backend, Some("Diretta"), "none", Some("wav")).unwrap();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Diretta"),
+            "none",
+            Some(&wire("wav", 96_000, 24)),
+        )
+        .unwrap();
         assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
         assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Yves, darTZeel LHC-208 et Eversolo DMP-A10 : zones en passthrough natif,
+    // donc AUCUNE étape de transcodage — la seule ligne portant une résolution
+    // est « Source ». Quand le scan n'a pas renseigné la piste (bibliothèque
+    // NAS), les valeurs retombaient sur 44100 Hz et 16 bits écrits en dur, et
+    // Tune affichait donc une résolution inventée pendant que le DAC lisait la
+    // vraie. Le fil est maintenant consulté avant d'en arriver là.
+    #[test]
+    fn passthrough_without_metadata_reads_the_wire_not_a_default() {
+        let (backend, zone) = dlna_zone();
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("flac".into()),
+            sample_rate: None,
+            bit_depth: None,
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("darTZeel LHC-208"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("FLAC 96kHz/24bit"),
+            "sans metadonnees, la resolution doit venir du fil et non du repli 44100/16"
+        );
+    }
+
+    // Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
+    // celui d'avant. Ce test existe pour que la suppression du repli soit un
+    // choix explicite si elle a lieu un jour, pas un effet de bord.
+    #[test]
+    fn no_wire_no_metadata_still_falls_back() {
+        let (backend, zone) = dlna_zone();
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("flac".into()),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+        let sp = build_signal_path(&ps, &zone, &backend, Some("LHC"), "none", None).unwrap();
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("FLAC 44kHz/16bit")
+        );
+    }
+
+    // Le fil prime sur la règle. Ici la zone force le LPCM 16 bits, mais la
+    // session sert réellement du 24 bits : c'est le 24 qui doit s'afficher.
+    // Auparavant la règle gagnait et l'affichage annonçait une troncature qui
+    // n'avait pas lieu.
+    #[test]
+    fn wire_resolution_wins_over_mirrored_rule() {
+        let (backend, zone) = dlna_zone();
+        ZoneRepo::with_backend(backend.clone())
+            .update_dlna_lpcm(zone.id.unwrap(), true)
+            .unwrap();
+        let ps = alac_hires_playing();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Eversolo DMP-A10"),
+            "none",
+            Some(&wire("wav", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} WAV 96kHz/24bit")
+        );
     }
 
     #[test]

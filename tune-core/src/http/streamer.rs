@@ -522,12 +522,20 @@ impl AudioStreamer {
     /// `dlna_needs_wav`), which the synchronous `build_signal_path` cannot
     /// replay (Sevy, forum affichage-chemin-du-signal — showed "ALAC → FLAC"
     /// while the wire was WAV). Returns `None` for an unknown session.
-    pub async fn stream_output_container(&self, stream_id: &str) -> Option<String> {
+    /// Format RÉELLEMENT servi sur le fil pour cette session — conteneur,
+    /// fréquence, profondeur, canaux.
+    ///
+    /// C'est la seule source de vérité sur ce que le renderer reçoit : le
+    /// chemin du signal déduisait auparavant ces valeurs en rejouant les règles
+    /// de l'orchestrateur, si bien qu'il pouvait annoncer autre chose que ce
+    /// qui partait vraiment (Yves : darTZeel LHC-208 et Eversolo DMP-A10 en
+    /// passthrough natif affichent la bonne résolution, Tune non).
+    pub async fn stream_output_wire(&self, stream_id: &str) -> Option<StreamInfo> {
         self.sessions
             .lock()
             .await
             .get(stream_id)
-            .map(|s| s.info.format.clone())
+            .map(|s| s.info.clone())
     }
 
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
