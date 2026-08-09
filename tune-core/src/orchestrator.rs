@@ -849,6 +849,37 @@ impl PlaybackOrchestrator {
         ))
     }
 
+    /// Branche le puits de niveaux sur la sortie de la zone, si elle sait
+    /// l'alimenter. Renvoie `true` dans ce cas — l'appelant se dispense alors
+    /// de décoder le morceau une seconde fois (#1110).
+    ///
+    /// Le puits pousse le PCM que la sortie a déjà décodé dans le MÊME
+    /// forwarder cadencé que les autres chemins : même découpage en fenêtres,
+    /// même horloge, même garde de génération. Rien ne change côté client.
+    async fn attach_levels_sink_to_output(&self, req: &PlayRequest, bus: Arc<EventBus>) -> bool {
+        let Some(device_id) = req.output_device_id.clone() else {
+            return false;
+        };
+        let Some(output) = ({ self.outputs.lock().await.get(&device_id) }) else {
+            return false;
+        };
+        let play_seq = self.playback.current_play_seq(req.zone_id).await;
+        let levels_tx =
+            spawn_paced_levels_forwarder(bus, self.playback.clone(), req.zone_id, play_seq, 0);
+        let sink: crate::outputs::traits::LevelsSink = Arc::new(
+            move |pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u32| {
+                crate::audio::tap::send_windowed_pcm(
+                    &levels_tx,
+                    pcm,
+                    bit_depth,
+                    channels,
+                    sample_rate,
+                );
+            },
+        );
+        output.lock().await.set_levels_sink(Some(sink))
+    }
+
     /// VU-mètres d'une session proxy (passthrough streaming Qobuz/Tidal) :
     /// lance en tâche de fond une seconde connexion CDN décodée uniquement
     /// pour les niveaux (voir [`decode_http_stream_for_levels`]). Le flux
@@ -3406,6 +3437,27 @@ impl PlaybackOrchestrator {
             if !skip_passthrough_levels && self.levels_attach_allowed(req.zone_id) {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();
+                    // La sortie décode-t-elle déjà ce qu'on lui sert ? Si oui,
+                    // on lui branche le puits de niveaux et on s'abstient de
+                    // décoder le morceau une SECONDE fois (#1110) : sur une
+                    // zone locale, le même fichier était décodé deux fois en
+                    // parallèle, une fois pour le son, une fois pour les
+                    // aiguilles.
+                    //
+                    // Condition sur le format COMPRESSÉ : c'est le seul cas où
+                    // la sortie locale emprunte à coup sûr son chemin de
+                    // décodage. Pour du PCM nu (WAV/AIFF) elle joue les octets
+                    // sans décodeur, et le décodage parallèle reste la seule
+                    // source de niveaux — on le garde.
+                    let output_feeds_levels =
+                        source_format.as_ref().is_some_and(|f| f.is_compressed())
+                            && self.attach_levels_sink_to_output(&req, bus.clone()).await;
+                    if output_feeds_levels {
+                        debug!(
+                            zone_id = req.zone_id,
+                            "levels_fed_by_output_skipping_parallel_decode"
+                        );
+                    }
                     let playback = self.playback.clone();
                     let fp = file_path.clone();
                     let zone_id = req.zone_id;
@@ -3415,42 +3467,46 @@ impl PlaybackOrchestrator {
                     // ce décodage complet dure toute la piste, il ne doit pas
                     // pouvoir se raccrocher à la suivante.
                     let play_seq = self.playback.current_play_seq(req.zone_id).await;
-                    tokio::spawn(async move {
-                        // Passthrough : le décodage pour niveaux part de 0.
-                        let levels_tx =
-                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                        // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
-                        // matérialisait la piste entière en mémoire avant
-                        // d'émettre la moindre fenêtre : ~1,9 Go pour un
-                        // 24/192 de dix minutes, alloué à chaque début de
-                        // piste et uniquement pour animer des aiguilles.
-                        // C'est la même faute que #1109 (ReplayGain), un cran
-                        // plus loin dans la chaîne. Le décodeur en flux émet
-                        // les niveaux au fil de l'eau ; le PCM produit part
-                        // dans un puits, seul l'ordre de grandeur du tampon
-                        // reste en mémoire.
-                        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                        tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
-                        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
-                        let result = tokio::task::spawn_blocking(move || {
-                            crate::audio::decode::decode_to_pcm_streaming_with_levels(
-                                &fp,
-                                Some(sr),
-                                Some(ch),
-                                None,
-                                sink_tx,
-                                LEVELS_DECODE_CHUNK,
-                                ready,
-                                levels_tx,
-                            )
-                        })
-                        .await;
-                        match result {
-                            Err(e) => debug!(error = %e, "passthrough_levels_task_panic"),
-                            Ok(Err(e)) => debug!(error = %e, "passthrough_levels_decode_failed"),
-                            Ok(Ok(_)) => {}
-                        }
-                    });
+                    if !output_feeds_levels {
+                        tokio::spawn(async move {
+                            // Passthrough : le décodage pour niveaux part de 0.
+                            let levels_tx =
+                                spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
+                            // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
+                            // matérialisait la piste entière en mémoire avant
+                            // d'émettre la moindre fenêtre : ~1,9 Go pour un
+                            // 24/192 de dix minutes, alloué à chaque début de
+                            // piste et uniquement pour animer des aiguilles.
+                            // C'est la même faute que #1109 (ReplayGain), un cran
+                            // plus loin dans la chaîne. Le décodeur en flux émet
+                            // les niveaux au fil de l'eau ; le PCM produit part
+                            // dans un puits, seul l'ordre de grandeur du tampon
+                            // reste en mémoire.
+                            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+                            let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+                            let result = tokio::task::spawn_blocking(move || {
+                                crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                                    &fp,
+                                    Some(sr),
+                                    Some(ch),
+                                    None,
+                                    sink_tx,
+                                    LEVELS_DECODE_CHUNK,
+                                    ready,
+                                    levels_tx,
+                                )
+                            })
+                            .await;
+                            match result {
+                                Err(e) => debug!(error = %e, "passthrough_levels_task_panic"),
+                                Ok(Err(e)) => {
+                                    debug!(error = %e, "passthrough_levels_decode_failed")
+                                }
+                                Ok(Ok(_)) => {}
+                            }
+                        });
+                    }
                 }
             }
 

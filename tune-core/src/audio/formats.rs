@@ -18,6 +18,16 @@ pub enum AudioFormat {
 }
 
 impl AudioFormat {
+    /// Le flux servi tel quel doit-il être DÉCODÉ par le lecteur ?
+    ///
+    /// Sert à savoir si une sortie locale, qui décode ce qu'on lui envoie,
+    /// peut alimenter les VU-mètres elle-même — auquel cas le serveur n'a pas
+    /// à décoder le morceau une seconde fois en parallèle (#1110). Le PCM nu
+    /// (WAV, AIFF) est joué sans décodeur, et le DSD ne se décode pas ainsi.
+    pub fn is_compressed(&self) -> bool {
+        !matches!(self, Self::Wav | Self::Aiff | Self::Dsd)
+    }
+
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.trim_start_matches('.').to_lowercase().as_str() {
             "flac" => Some(Self::Flac),

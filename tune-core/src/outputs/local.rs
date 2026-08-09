@@ -737,6 +737,10 @@ struct PendingNextMedia {
 pub struct LocalOutput {
     device_name: String,
     device_id: String,
+    /// Puits de niveaux branché par l'orchestrateur : le PCM déjà décodé ici
+    /// alimente les VU-mètres, ce qui évite un second décodage complet du
+    /// même morceau côté serveur (#1110).
+    levels_sink: Arc<std::sync::Mutex<Option<super::traits::LevelsSink>>>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
@@ -835,6 +839,7 @@ impl LocalOutput {
         Self {
             device_name,
             device_id,
+            levels_sink: Arc::new(std::sync::Mutex::new(None)),
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
@@ -1322,6 +1327,15 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
 
 #[async_trait::async_trait]
 impl OutputTarget for LocalOutput {
+    /// Cette sortie décode elle-même le flux qu'on lui sert : elle peut donc
+    /// alimenter les niveaux sans second décodage (#1110). L'orchestrateur ne
+    /// branche le puits que sur un flux COMPRESSÉ, seul cas où le chemin de
+    /// décodage ci-dessous est emprunté à coup sûr.
+    fn set_levels_sink(&self, sink: Option<super::traits::LevelsSink>) -> bool {
+        *self.levels_sink.lock().expect("levels_sink lock") = sink;
+        true
+    }
+
     fn name(&self) -> &str {
         &self.device_name
     }
@@ -1490,6 +1504,9 @@ impl OutputTarget for LocalOutput {
         // calling play_url(), and resetting would wipe the known duration.
         // It is cleared in stop() instead.
 
+        // Puits de niveaux (#1110), s'il a été branché pour cette lecture.
+        let levels_sink = self.levels_sink.clone();
+
         let handle = std::thread::spawn(move || {
             // ------- HTTP fetch the audio stream -------
             // No total timeout — long tracks can stream for 30+ minutes.
@@ -1601,6 +1618,34 @@ impl OutputTarget for LocalOutput {
                     playing.store(false, Ordering::SeqCst);
                     return;
                 };
+
+                // VU-mètres alimentés par CE décodage : le serveur n'a plus à
+                // décoder le même morceau une seconde fois en parallèle
+                // (#1110). Converti par tranches en 16 bits — le puits ne sert
+                // qu'à mesurer un niveau, pas à restituer le signal, et la
+                // conversion d'un bloc reste bornée en mémoire.
+                if let Some(sink) = levels_sink
+                    .lock()
+                    .expect("levels_sink lock")
+                    .as_ref()
+                    .cloned()
+                {
+                    let samples = decoded_samples.clone();
+                    let ch = dec_channels;
+                    let sr = dec_sample_rate;
+                    std::thread::spawn(move || {
+                        // ~40 ms par tranche, la granularité qu'attend l'analyseur.
+                        let per_slice = (sr as usize / 25).max(1) * ch as usize;
+                        for slice in samples.chunks(per_slice) {
+                            let mut pcm = Vec::with_capacity(slice.len() * 2);
+                            for &v in slice {
+                                let clamped = (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                                pcm.extend_from_slice(&clamped.to_le_bytes());
+                            }
+                            sink(&pcm, 16, ch, sr);
+                        }
+                    });
+                }
 
                 // Now play the decoded f32 samples using cpal shared mode
                 let dec_ch = dec_channels;
@@ -4400,6 +4445,34 @@ mod tests {
     }
 
     #[test]
+    /// #1110 : la sortie locale accepte un puits de niveaux et le nourrit
+    /// avec le PCM qu'elle décode — c'est ce qui autorise l'orchestrateur à ne
+    /// PAS décoder le morceau une seconde fois.
+    #[test]
+    fn local_output_accepts_a_levels_sink() {
+        let out = LocalOutput::new("test-device".into());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u16, u16, u32)>::new()));
+        let seen_c = seen.clone();
+        let sink: super::super::traits::LevelsSink =
+            std::sync::Arc::new(move |pcm: &[u8], bd: u16, ch: u16, sr: u32| {
+                assert!(!pcm.is_empty());
+                seen_c.lock().unwrap().push((bd, ch, sr));
+            });
+        assert!(
+            out.set_levels_sink(Some(sink.clone())),
+            "la sortie locale doit accepter le puits"
+        );
+        // Le puits stocké est bien celui qu'on a branché.
+        let stored = out.levels_sink.lock().unwrap().clone();
+        let stored = stored.expect("puits absent après branchement");
+        stored(&[0u8, 0, 0, 0], 16, 2, 44_100);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[(16, 2, 44_100)]);
+
+        // Débranchement.
+        assert!(out.set_levels_sink(None));
+        assert!(out.levels_sink.lock().unwrap().is_none());
+    }
+
     fn test_parse_wav_header() {
         let header = crate::audio::wav::build_wav_header(2, 44100, 16);
         let parsed = parse_wav_header(&header);
