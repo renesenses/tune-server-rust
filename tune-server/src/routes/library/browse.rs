@@ -200,44 +200,61 @@ pub(super) async fn browse_directory(
     // celui dont on vient de vérifier l'existence et l'appartenance à un dossier
     // musical. Lire l'autre revenait à valider un chemin et en ouvrir un second.
     let mut subdirs: Vec<Value> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(resolved) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let dir_path: String = path.to_string_lossy().nfc().collect();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let sep = std::path::MAIN_SEPARATOR;
-                let base = dir_path.trim_end_matches(|c| c == '/' || c == '\\');
-                let pattern = format!("{base}{sep}%");
-                let track_count: i64 = match state.backend.query_one(
-                    &format!(
-                        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
-                        if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-                            "$1"
-                        } else {
-                            "?1"
-                        }
-                    ),
-                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-                ) {
-                    Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
-                    Ok(None) => 0,
-                    Err(e) => {
-                        warn!(path = %dir_path, error = %e, "browse_dir_count_failed");
-                        0
-                    }
-                };
-                subdirs.push(json!({ "name": name, "path": dir_path, "track_count": track_count }));
-            }
+    // `read_dir` echouait en silence : le `if let Ok` laissait la liste vide et
+    // l'interface annoncait « Dossier vide » pour un dossier qui n'est pas vide
+    // mais INJOIGNABLE — lecteur reseau non monte, permissions refusees. Sous
+    // Windows le cas est courant : une lettre mappee (`Z:`) appartient a la
+    // session qui l'a creee et reste invisible au processus serveur, a plus
+    // forte raison lance en service (testeur EverSolo, 04/08/2026 : 0 piste
+    // annoncee pour un partage qui en contient 34 169). On remonte desormais la
+    // raison au lieu de mentir (#1190).
+    let mut unreadable: Option<String> = None;
+    match std::fs::read_dir(resolved) {
+        Err(e) => {
+            warn!(path = %resolved.display(), error = %e, "browse_dir_unreadable");
+            unreadable = Some(e.to_string());
         }
-        // conn removed — using state.backend
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let dir_path: String = path.to_string_lossy().nfc().collect();
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let sep = std::path::MAIN_SEPARATOR;
+                    let base = dir_path.trim_end_matches(|c| c == '/' || c == '\\');
+                    let pattern = format!("{base}{sep}%");
+                    let track_count: i64 = match state.backend.query_one(
+                        &format!(
+                            "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
+                            if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                                "$1"
+                            } else {
+                                "?1"
+                            }
+                        ),
+                        &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+                    ) {
+                        Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                        Ok(None) => 0,
+                        Err(e) => {
+                            warn!(path = %dir_path, error = %e, "browse_dir_count_failed");
+                            0
+                        }
+                    };
+                    subdirs.push(
+                        json!({ "name": name, "path": dir_path, "track_count": track_count }),
+                    );
+                }
+            }
+            // conn removed — using state.backend
+        }
     }
     subdirs.sort_by(|a, b| {
         a.get("name")
@@ -324,6 +341,11 @@ pub(super) async fn browse_directory(
         "music_root": music_root,
         "directories": subdirs,
         "tracks": tracks,
+        // `accessible: false` distingue « injoignable » de « vide » : sans lui
+        // le client ne peut pas faire la difference et affiche le mauvais
+        // message (#1190). `access_error` porte la raison systeme.
+        "accessible": unreadable.is_none(),
+        "access_error": unreadable,
     })))
 }
 
