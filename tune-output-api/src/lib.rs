@@ -219,6 +219,15 @@ pub trait OutputTarget: Send + Sync {
         None
     }
 
+    /// Set the ReplayGain factor for the track about to play (1.0 = untouched).
+    ///
+    /// Only outputs that render the audio themselves can honour this: a network
+    /// renderer receives an already-encoded stream, so the gain is baked into
+    /// the PCM before encoding instead. The default is deliberately a no-op —
+    /// an output that ignores it plays at source level, which is the behaviour
+    /// every output had before ReplayGain was applied at all.
+    fn set_replaygain_factor(&self, _factor: f64) {}
+
     async fn set_next_url(
         &self,
         _url: &str,
