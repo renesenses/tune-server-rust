@@ -219,31 +219,6 @@ pub(super) fn format_rate_display(rate: u32, bits: u16, format: AudioFormat) -> 
     }
 }
 
-/// Convert a FLAC file to WAV using ffmpeg, preserving source bit depth.
-pub(super) fn decode_flac_to_pcm(flac_path: &str, source_bits: u16) -> Option<Vec<u8>> {
-    let codec = if source_bits > 16 {
-        "pcm_s24le"
-    } else {
-        "pcm_s16le"
-    };
-    let tmp = std::env::temp_dir()
-        .join(format!("oaat-{}.wav", std::process::id()))
-        .to_string_lossy()
-        .to_string();
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i", flac_path, "-acodec", codec, &tmp])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    let data = std::fs::read(&tmp).ok();
-    let _ = std::fs::remove_file(&tmp);
-    data
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,17 +655,16 @@ pub(super) struct StagedDirectTrack {
     pub duration_ms: u64,
 }
 
-/// Decode a local file to PCM for the direct-file path, exactly as the current
-/// track was decoded: read it whole, parse the header, and run FLAC through
-/// ffmpeg preserving bit depth.
+/// Prépare un fichier local en PCM pour le chemin de lecture directe : lecture
+/// intégrale, analyse de l'en-tête, et c'est tout — le contenu part tel quel.
 ///
-/// Returns `None` for anything the direct path cannot play — DSD, an unparsable
-/// header, a read or conversion failure. The caller then simply doesn't chain,
-/// and the poller advances the queue as it does today.
+/// Renvoie `None` pour tout ce que ce chemin ne sait pas jouer : DSD, FLAC,
+/// en-tête illisible, échec de lecture. L'appelant n'enchaîne alors pas, et le
+/// poller fait avancer la file comme aujourd'hui.
 ///
-/// Blocking by nature (whole-file read + ffmpeg), so callers must run it off the
-/// packet-sending task: a 190 MB FLAC takes well over a second to convert, which
-/// would be an audible dropout if it ran inline.
+/// Bloquante par nature (le fichier est lu en entier), donc à exécuter hors de
+/// la tâche d'envoi des paquets : un fichier de 190 Mo prend un temps sensible,
+/// audible comme une coupure s'il était lu en ligne.
 pub(super) fn stage_direct_track(
     file_path: &str,
     title: String,
@@ -705,17 +679,14 @@ pub(super) fn stage_direct_track(
         return None;
     }
 
-    let (pcm, format, sample_rate, bits_per_sample, channels) = if si.format == AudioFormat::Flac {
-        let mut wav = decode_flac_to_pcm(file_path, si.bits_per_sample)?;
-        let wav_si = detect_and_parse(&mut wav)?;
-        (
-            wav,
-            wav_si.format,
-            wav_si.sample_rate,
-            wav_si.bits_per_sample,
-            wav_si.channels.min(8) as u8,
-        )
-    } else {
+    // Le FLAC n'est pas preparable en direct : sa conversion passait par un
+    // `ffmpeg` externe que Tune ne livre plus. `None` renvoie l'appelant vers
+    // le flux HTTP, ou l'orchestrateur transcode en natif.
+    if si.format == AudioFormat::Flac {
+        return None;
+    }
+
+    let (pcm, format, sample_rate, bits_per_sample, channels) = {
         (
             buf,
             si.format,

@@ -1112,61 +1112,31 @@ impl OutputTarget for OaatOutput {
                         break 'direct false;
                     }
 
-                    // Le FLAC passe par ffmpeg — un binaire externe que Tune ne
-                    // livre plus. Sur une machine qui n'en a pas (Windows), la
-                    // conversion echoue en une milliseconde.
+                    // Le FLAC ne se lit pas en direct : il n'y a pas de chemin
+                    // pour ça ici. L'orchestrateur transcode déjà le FLAC en
+                    // WAV pour OAAT (`oaat_needs_wav`), en natif, et le sert
+                    // sur la session HTTP dont l'endpoint a reçu l'URL juste
+                    // avant. On s'y replie, comme les six autres sorties de ce
+                    // bloc.
                     //
-                    // Les deux echecs ci-dessous se REPLIENT donc sur le flux
-                    // HTTP, comme les six autres sorties de ce bloc. Ils
-                    // faisaient `return` : la sortie abandonnait en silence
-                    // alors que l'orchestrateur avait deja cree la session et
-                    // donne son URL a l'endpoint. Resultat cote utilisateur —
-                    // `state=playing`, `pos=0` fige, aucun son, et pas la
-                    // moindre erreur (forum, .42 sur 0.9.66).
-                    let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = if is_flac {
-                        debug!("converting FLAC to WAV via ffmpeg...");
-                        match super::helpers::decode_flac_to_pcm(fp, si.bits_per_sample) {
-                            Some(wav_data) => {
-                                let mut wav_buf = wav_data;
-                                let wav_si = match detect_and_parse(&mut wav_buf) {
-                                    Some(info) => info,
-                                    None => {
-                                        debug!(
-                                            "WAV parse failed after ffmpeg, falling back to HTTP stream"
-                                        );
-                                        break 'direct false;
-                                    }
-                                };
-                                debug!(
-                                    "OAAT-DEBUG: WAV: {} bytes, {:?} {}Hz {}bit {}ch",
-                                    wav_buf.len(),
-                                    wav_si.format,
-                                    wav_si.sample_rate,
-                                    wav_si.bits_per_sample,
-                                    wav_si.channels
-                                );
-                                (
-                                    wav_buf,
-                                    wav_si.format,
-                                    wav_si.sample_rate,
-                                    wav_si.bits_per_sample,
-                                    wav_si.channels.min(8) as u8,
-                                )
-                            }
-                            None => {
-                                debug!("ffmpeg FLAC->WAV failed, falling back to HTTP stream");
-                                break 'direct false;
-                            }
-                        }
-                    } else {
-                        (
-                            buf,
-                            si.format,
-                            si.sample_rate,
-                            si.bits_per_sample,
-                            si.channels.min(8) as u8,
-                        )
-                    };
+                    // Cette branche appelait un `ffmpeg` externe que Tune ne
+                    // livre plus. Sur une machine qui n'en a pas, l'appel
+                    // échouait en une milliseconde et la sortie abandonnait
+                    // par un `return` — sans repli, alors que le flux HTTP
+                    // était prêt. Côté utilisateur : `state=playing`, `pos=0`
+                    // figé, aucun son, aucune erreur.
+                    if is_flac {
+                        debug!("FLAC: falling back to HTTP stream (native transcode)");
+                        break 'direct false;
+                    }
+
+                    let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = (
+                        buf,
+                        si.format,
+                        si.sample_rate,
+                        si.bits_per_sample,
+                        si.channels.min(8) as u8,
+                    );
                     let layout = ChannelLayout::Stereo;
 
                     let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
@@ -1524,91 +1494,23 @@ impl OutputTarget for OaatOutput {
 
             let mut is_flac = si.format == AudioFormat::Flac;
 
-            // FLAC via UDP causes frame-boundary corruption — decode to PCM on
-            // the server and stream clean PCM to the endpoint instead.
+            // Un flux FLAC ne peut pas partir tel quel : le decoupage UDP
+            // corrompt les frontieres de trame. Ce cas ne doit plus se
+            // presenter — l'orchestrateur transcode le FLAC en WAV pour OAAT
+            // (`oaat_needs_wav`) avant meme de creer la session — et le
+            // decodage de secours passait par un `ffmpeg` externe que Tune ne
+            // livre plus, donc il echouait de toute facon.
+            //
+            // On refuse explicitement plutot que d'emettre un flux qu'on sait
+            // corrompu : une erreur nommee vaut mieux qu'un grésillement dont
+            // personne ne trouvera la cause.
             if is_flac {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-                let pcm_fmt = if si.bits_per_sample >= 24 {
-                    "s32le"
-                } else {
-                    "s16le"
-                };
-                let ffmpeg = tokio::process::Command::new("ffmpeg")
-                    .args([
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-f",
-                        "flac",
-                        "-i",
-                        "pipe:0",
-                        "-f",
-                        pcm_fmt,
-                        "-ar",
-                        &si.sample_rate.to_string(),
-                        "-ac",
-                        &si.channels.to_string(),
-                        "pipe:1",
-                    ])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-
-                match ffmpeg {
-                    Ok(mut child) => {
-                        let mut stdin = child.stdin.take().unwrap();
-                        let stdout = child.stdout.take().unwrap();
-                        let flac_buf = std::mem::take(&mut buf);
-
-                        // Pipe HTTP FLAC stream → ffmpeg stdin in background
-                        tokio::spawn(async move {
-                            let _ = stdin.write_all(&flac_buf).await;
-                            while let Some(Ok(chunk)) = stream.next().await {
-                                if stdin.write_all(&chunk).await.is_err() {
-                                    break;
-                                }
-                            }
-                            drop(stdin);
-                        });
-
-                        // Read PCM from ffmpeg stdout as new stream
-                        let (tx, rx) =
-                            tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(32);
-                        tokio::spawn(async move {
-                            let mut stdout = stdout;
-                            let mut read_buf = vec![0u8; 8192];
-                            loop {
-                                match stdout.read(&mut read_buf).await {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if tx
-                                            .send(Ok(bytes::Bytes::copy_from_slice(&read_buf[..n])))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
-
-                        stream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
-                        buf = Vec::new();
-                        is_flac = false;
-
-                        let decoded_bits: u16 = if si.bits_per_sample >= 24 { 32 } else { 16 };
-                        info!(device = %device_name, original_bits = si.bits_per_sample, decoded_bits, "oaat: FLAC decoded to PCM server-side");
-                    }
-                    Err(e) => {
-                        error!(device = %device_name, error = %e, "oaat: ffmpeg spawn failed for FLAC decode");
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                }
+                error!(
+                    device = %device_name,
+                    "oaat: flux FLAC inattendu sur le chemin HTTP, lecture abandonnee"
+                );
+                playing.store(false, Ordering::SeqCst);
+                return;
             }
 
             // S24LE (3-byte packed) is sent as-is — the endpoint handles it
