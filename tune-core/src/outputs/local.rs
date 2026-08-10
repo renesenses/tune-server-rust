@@ -193,6 +193,13 @@ pub fn select_host(backend: &str) -> cpal::Host {
 static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
 
 /// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+///
+/// Ses seuls appelants vivent dans la branche `windows + feature asio` de
+/// `select_host` : ailleurs, il n'y a aucun choix de backend à observer, donc
+/// aucun appel — d'où un `dead_code` sur toutes les autres cibles. On l'autorise
+/// explicitement plutôt que de placer la fonction sous le même `cfg`, pour
+/// qu'un futur appel depuis une autre plateforme n'ait pas à la ressusciter.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
 fn note_observed_backend(name: &'static str) {
     if let Ok(mut slot) = OBSERVED_BACKEND.write() {
         *slot = Some(name);
