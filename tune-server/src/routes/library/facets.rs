@@ -115,10 +115,15 @@ pub(super) fn build_conditions(
             idx += 1;
         }
     }
-    if let Some(c) = q.composer.as_deref().filter(|s| !s.is_empty()) {
-        conds.push(format!("LOWER(t.composer) LIKE LOWER({})", ph(idx)));
-        params.push(SqlValue::Text(format!("%{c}%")));
-        idx += 1;
+    // `composer` est désormais une facette à part entière : comme les autres,
+    // elle ne doit pas se filtrer elle-même, sinon sélectionner « Bach » ne
+    // laisserait plus que « Bach » dans la liste des compositeurs.
+    if exclude != "composer" {
+        if let Some(c) = q.composer.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!("LOWER(t.composer) LIKE LOWER({})", ph(idx)));
+            params.push(SqlValue::Text(format!("%{c}%")));
+            idx += 1;
+        }
     }
     if exclude != "artist" {
         if let Some(a) = q.artist.as_deref().filter(|s| !s.is_empty()) {
@@ -279,6 +284,9 @@ pub(super) async fn library_facets(
         let rows: Vec<(String, i64)> = match field.as_str() {
             "genre" => column_facet(&state, "genre", limit, &conds, &params),
             "label" => column_facet(&state, "label", limit, &conds, &params),
+            // Le classique se navigue par compositeur avant de se naviguer par
+            // artiste : colonne `tracks` directe, donc même facette de colonne.
+            "composer" => column_facet(&state, "composer", limit, &conds, &params),
             "year" => column_facet(&state, "year", limit, &conds, &params),
             "artist" => artist_facet(&state, limit, &conds, &params),
             // Technical dimensions an audiophile browses by (Bertrand): direct
