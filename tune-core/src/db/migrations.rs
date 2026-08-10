@@ -908,6 +908,14 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutno
         // sur une base qui l'a deja est alors sans effet plutot qu'en erreur.
         up: "",
     },
+    // Compilations déjà indexées, éclatées en un album par artiste (#1440) :
+    // le scanner ne les produit plus, mais les bibliothèques existantes les
+    // gardent. Le travail réel est dans `merge_scattered_compilations`.
+    Migration {
+        version: 73,
+        name: "merge_scattered_compilations",
+        up: "SELECT 1;",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1033,6 +1041,130 @@ fn strip_quality_suffixes_from_album_titles(db: &SqliteDb) {
     }
     if renamed > 0 {
         info!(renamed, "album_quality_suffixes_stripped");
+    }
+}
+
+/// Recolle les compilations déjà indexées en un album par artiste (#1440).
+///
+/// Le rangement Qobuz d'une compilation met chaque piste dans le dossier de SON
+/// artiste : une anthologie de quarante titres devient quarante albums d'une
+/// piste. Le scanner sait désormais l'éviter à l'import, mais les bibliothèques
+/// existantes gardent leurs fausses entrées — 22 familles et 172 lignes sur un
+/// serveur de test de 2 144 albums.
+///
+/// Applique EXACTEMENT les mêmes critères que le chemin de scan
+/// ([`crate::scanner::compilation`]) : même titre, dossiers frères éparpillés,
+/// et numéros de piste qui ne se chevauchent pas. La grappe entière est
+/// abandonnée à la première collision — deux « Greatest Hits » distincts
+/// commencent tous deux à la piste 1, et rien ne doit les rapprocher.
+///
+/// La ligne survivante est le plus petit id, comme pour la fusion par qualité :
+/// c'est la plus ancienne, donc celle dont la pochette et la note sont établies.
+fn merge_scattered_compilations(db: &SqliteDb) {
+    use crate::scanner::compilation::is_scattered_sibling;
+    use std::collections::HashMap;
+
+    // titre normalisé -> [(id, dossier, numéros de piste)]
+    let mut by_title: HashMap<String, Vec<(i64, String, Vec<i32>)>> = HashMap::new();
+    {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT a.id, a.title, a.folder_path FROM albums a \
+             WHERE a.folder_path IS NOT NULL AND a.folder_path <> '' ORDER BY a.id",
+        ) else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        let albums: Vec<(i64, String, String)> = rows.filter_map(Result::ok).collect();
+        drop(stmt);
+        for (id, title, folder) in albums {
+            let mut nums = Vec::new();
+            if let Ok(mut ts) = conn.prepare(
+                "SELECT track_number FROM tracks WHERE album_id = ? AND track_number IS NOT NULL",
+            ) {
+                if let Ok(r) = ts.query_map([id], |row| row.get::<_, i64>(0)) {
+                    nums = r.filter_map(Result::ok).map(|n| n as i32).collect();
+                }
+            }
+            by_title
+                .entry(title.trim().to_lowercase())
+                .or_default()
+                .push((id, folder, nums));
+        }
+    }
+
+    let mut merged = 0usize;
+    for (_, albums) in by_title {
+        if albums.len() < 2 {
+            continue;
+        }
+        // Grappes de dossiers frères éparpillés, par rattachement transitif.
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for (i, (_, folder, _)) in albums.iter().enumerate() {
+            match clusters.iter_mut().find(|c| {
+                c.iter()
+                    .any(|&j| is_scattered_sibling(folder, &albums[j].1))
+            }) {
+                Some(c) => c.push(i),
+                None => clusters.push(vec![i]),
+            }
+        }
+
+        for cluster in clusters.iter().filter(|c| c.len() > 1) {
+            // Un seul numéro en double dans la grappe et on renonce : ce sont
+            // des homonymes, pas les éclats d'un même disque.
+            let mut seen: Vec<i32> = Vec::new();
+            let mut collision = false;
+            for &i in cluster {
+                for n in &albums[i].2 {
+                    if seen.contains(n) {
+                        collision = true;
+                        break;
+                    }
+                    seen.push(*n);
+                }
+                if collision {
+                    break;
+                }
+            }
+            if collision || seen.is_empty() {
+                continue;
+            }
+
+            let mut ids: Vec<i64> = cluster.iter().map(|&i| albums[i].0).collect();
+            ids.sort_unstable();
+            let Some((keep, absorbed)) = ids.split_first() else {
+                continue;
+            };
+            let conn = db.connection().lock().unwrap();
+            for drop_id in absorbed {
+                for sql in [
+                    "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                    "UPDATE listen_history SET album_id = ? WHERE album_id = ?",
+                    "UPDATE OR IGNORE album_ratings SET album_id = ? WHERE album_id = ?",
+                    "UPDATE OR IGNORE metadata_suggestions SET album_id = ? WHERE album_id = ?",
+                ] {
+                    let params: [&dyn rusqlite::types::ToSql; 2] = [keep, drop_id];
+                    conn.execute(sql, &params[..]).ok();
+                }
+                let params: [&dyn rusqlite::types::ToSql; 1] = [drop_id];
+                conn.execute("DELETE FROM albums WHERE id = ?", &params[..])
+                    .ok();
+                merged += 1;
+            }
+        }
+    }
+
+    if merged > 0 {
+        info!(merged, "scattered_compilations_merged");
     }
 }
 
@@ -1469,6 +1601,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 62 {
             merge_albums_split_by_quality(db);
+        }
+        if migration.version == 73 {
+            merge_scattered_compilations(db);
         }
         if migration.version == 64 {
             add_column_if_missing(db, "alarms", "profile_id", "INTEGER");
@@ -2110,6 +2245,7 @@ mod tests {
         // version 70; force it here since this db is already at latest.
         {
             let conn = db.connection().lock().unwrap();
+
             let m = MIGRATIONS.iter().find(|m| m.version == 70).unwrap();
             conn.execute_batch(m.up).unwrap();
             // Idempotent: a second pass must also be a no-op, not an error.
@@ -2243,5 +2379,91 @@ mod tests {
                 "numeric-type heal migration {wanted} must be registered"
             );
         }
+    }
+
+    /// #1440 — cas RÉEL : l'anthologie « OUF », douze lignes issues de douze
+    /// dossiers d'artistes, se replie en une seule.
+    #[test]
+    fn scattered_compilation_rows_are_folded_into_one() {
+        const TITLE: &str = "OUF L'anthologie Souterraine 2015-2017";
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let ids: Vec<i64> = ["Corte Real", "Alligator", "Oulane"]
+            .iter()
+            .enumerate()
+            .map(|(i, artiste)| {
+                let folder = format!("/mnt/recordings_usb/Qobuz/{artiste}/{TITLE}");
+                let conn = db.connection().lock().unwrap();
+                conn.execute(
+                    "INSERT INTO albums (title, folder_path) VALUES (?, ?)",
+                    rusqlite::params![TITLE, folder],
+                )
+                .unwrap();
+                let id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![format!("piste {i}"), id, (i as i64) + 1, format!("{folder}/0{}.flac", i + 1)],
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let restants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title = ?",
+                [TITLE],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restants, 1, "les trois éclats doivent tenir en un album");
+        let sur_le_survivant: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+                [ids[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sur_le_survivant, 3, "les pistes suivent l'album conservé");
+    }
+
+    /// #1440 — cas RÉEL inverse : deux « Greatest Hits » d'artistes différents,
+    /// tous deux numérotés à partir de 1. La collision protège.
+    #[test]
+    fn homonymous_albums_are_never_folded() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        for (artiste, dossier) in [
+            ("Pat Benatar", "/data/music/P/Pat Benatar/Greatest Hits"),
+            ("Police", "/data/music/P/Police/Greatest Hits"),
+        ] {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "INSERT INTO albums (title, folder_path) VALUES (?, ?)",
+                rusqlite::params!["Greatest Hits", dossier],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, 1, ?)",
+                rusqlite::params![artiste, id, format!("{dossier}/01.flac")],
+            )
+            .unwrap();
+        }
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let restants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title = 'Greatest Hits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restants, 2, "deux disques homonymes restent deux albums");
     }
 }
