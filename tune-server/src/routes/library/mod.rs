@@ -1,4 +1,5 @@
 mod albums;
+mod ambiances;
 mod artists;
 mod artwork;
 mod browse;
@@ -268,6 +269,17 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(search::search))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
+        // Ambiances enregistrées : du stockage, pas de la recherche — donc
+        // hors de la feature `audio-embedding`, sinon un serveur sans le
+        // modèle perdrait aussi la liste.
+        .route(
+            "/ambiances",
+            get(ambiances::list_ambiances).post(ambiances::create_ambiance),
+        )
+        .route(
+            "/ambiances/{id}",
+            axum::routing::patch(ambiances::update_ambiance).delete(ambiances::delete_ambiance),
+        )
         .route("/stats", get(stats::library_stats))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
