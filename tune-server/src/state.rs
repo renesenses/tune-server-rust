@@ -44,7 +44,10 @@ pub struct AppState {
     pub services: Arc<Mutex<ServiceRegistry>>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub orchestrator: Arc<PlaybackOrchestrator>,
-    pub scanner: Arc<Mutex<SsdpScanner>>,
+    /// Scanner SSDP partagé SANS mutex englobant : `rescan()` ne prend que
+    /// `&self` et verrouille en interne. Un mutex ici sérialisait tous les
+    /// lecteurs pendant chaque balayage réseau (#1432).
+    pub scanner: Arc<SsdpScanner>,
     pub event_bus: Arc<EventBus>,
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
@@ -267,7 +270,7 @@ impl AppState {
         let orchestrator = Arc::new(orch);
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
-        let scanner = Arc::new(Mutex::new(SsdpScanner::new(ssdp_tx)));
+        let scanner = Arc::new(SsdpScanner::new(ssdp_tx));
 
         let upnp = UpnpState::new(backend.clone(), port);
 

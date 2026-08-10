@@ -222,7 +222,7 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // nextAndSync refreshes via GET /zones/{id}, which does include it
     // (forum #1012, Bilou).
     if let Some(ref zone) = zone_db {
-        let devices = state.scanner.lock().await.devices().await;
+        let devices = state.scanner.devices().await;
         let renderer_label = zone
             .output_device_id
             .as_deref()

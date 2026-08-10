@@ -55,7 +55,7 @@ async fn device_catalog() -> Json<Value> {
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let discovered = scanner.devices().await;
     drop(scanner);
 
@@ -638,7 +638,7 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 }
 
 async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.rescan().await;
     drop(scanner);
 

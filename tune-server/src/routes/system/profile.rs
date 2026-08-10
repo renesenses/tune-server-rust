@@ -104,7 +104,7 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
     // la fiche affichait « — » même pour les renderers correctement détectés,
     // alors que /zones, lui, expose bien la détection.
     // Réutilise le `settings` déjà construit en tête de handler.
-    let devices = state.scanner.lock().await.devices().await;
+    let devices = state.scanner.devices().await;
     let zones: Vec<Value> = ZoneRepo::with_backend(state.backend.clone())
         .list()
         .unwrap_or_default()

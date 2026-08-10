@@ -132,8 +132,10 @@ pub fn spawn_ssdp_handler(
     {
         let scanner = state.scanner.clone();
         tokio::spawn(async move {
-            let mut scanner = scanner.lock().await;
-            *scanner = tune_core::discovery::ssdp::SsdpScanner::new(ssdp_tx);
+            // On injecte le canal au scanner partagé au lieu de le remplacer :
+            // remplacer l'instance imposait un mutex englobant, tenu ensuite à
+            // travers chaque balayage réseau (#1432).
+            scanner.set_event_tx(ssdp_tx).await;
             scanner.start().await;
         });
     }
