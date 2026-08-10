@@ -17,6 +17,16 @@ ignore = [
     # instant 0.1 — unmaintained (RUSTSEC-2024-0384), superseded by web-time.
     # Transitive only. No vulnerability; a native build never hits its wasm path.
     "RUSTSEC-2024-0384",
+    # audiopus_sys 0.2.2 — unmaintained (RUSTSEC-2026-0150). Tiré par audiopus,
+    # lui-même dépendance de tune-ffi et tune-karaoke. C'est une crate `-sys` de
+    # liaison vers libopus : elle n'a pas de code d'exécution propre, et aucune
+    # vulnérabilité n'est signalée — seulement l'absence de mainteneur.
+    #
+    # C'est CET avis qui faisait échouer le preflight de chaque release depuis
+    # la 0.9.58, sans que personne puisse le savoir : le rapport n'affichait que
+    # les avertissements de doublons, jamais l'erreur. À revisiter si audiopus
+    # migre, ou si un jour un CVE tombe dessus — auquel cas cette ligne saute.
+    "RUSTSEC-2026-0150",
     # NOTE: the wasmtime advisories RUSTSEC-2026-0222/0223 were resolved by the
     # bump to wasmtime 47.0.3 and are no longer ignored.
 ]

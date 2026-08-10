@@ -61,7 +61,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test -p tune-server --features oaat,postgres,dj,karaoke,plugins-wasm,audio-embedding
+      # Meme dependance systeme que le job de build : sans elle, la compilation
+      # s'arrete sur « Package alsa was not found in the pkg-config ».
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
