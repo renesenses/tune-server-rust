@@ -89,7 +89,7 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
         tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
-    let devices = state.scanner.lock().await.devices().await;
+    let devices = state.scanner.devices().await;
     let mut zone_snaps = Vec::with_capacity(zones.len());
     for z in &zones {
         let zid = z.id.unwrap_or(0);

@@ -19,7 +19,7 @@ pub fn router() -> Router<AppState> {
 
 /// Return DLNA devices whose manufacturer or model contains "Sonos".
 async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
     drop(scanner);
 

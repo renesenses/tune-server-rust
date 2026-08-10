@@ -43,7 +43,7 @@ async fn sync_status(State(state): State<AppState>) -> Result<Json<Value>, AppEr
 
 async fn sync_peers(State(state): State<AppState>) -> Json<Value> {
     // Use mDNS discovery to find peer Tune servers
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
     drop(scanner);
 

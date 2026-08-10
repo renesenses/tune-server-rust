@@ -64,7 +64,7 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
     // Use timeout to avoid blocking if scanner/outputs mutex is held (e.g. during SSDP scan)
     let devices = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        state.scanner.lock().await.devices().await.len()
+        state.scanner.devices().await.len()
     })
     .await
     .unwrap_or(0);

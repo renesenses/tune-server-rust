@@ -1082,7 +1082,7 @@ fn build_signal_path(
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
-    let devices = state.scanner.lock().await.devices().await;
+    let devices = state.scanner.devices().await;
     // Manually-added devices (e.g. legacy DLNA renderers that never appear in
     // SSDP discovery) are registered as outputs but absent from `devices`.
     // Treat a registered output as online too, otherwise its zone is shown
@@ -1250,7 +1250,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 // whole queue (expensive under a large shuffle queue, #1096).
                 obj.insert("queue_position".into(), json!(ps.queue_position));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
-                let devices = state.scanner.lock().await.devices().await;
+                let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
                     state.outputs.lock().await.list().into_iter().collect();
                 let renderer_label = zone
@@ -1538,7 +1538,7 @@ async fn push_device_correction(state: &AppState, zone_id: i64) {
         Ok(Some(z)) => z,
         _ => return,
     };
-    let devices = state.scanner.lock().await.devices().await;
+    let devices = state.scanner.devices().await;
     let detected = zone
         .output_device_id
         .as_deref()
@@ -1626,7 +1626,7 @@ async fn create_zone(
             };
             if !already_registered {
                 // Look up the discovered device and register its DLNA output
-                let scanner = state.scanner.lock().await;
+                let scanner = &state.scanner;
                 let devices = scanner.devices().await;
                 drop(scanner);
 
@@ -1775,7 +1775,7 @@ async fn renderer_capabilities(
     let mut output = { state.outputs.lock().await.get(device_id) };
     if output.is_none() {
         let disc = {
-            let scanner = state.scanner.lock().await;
+            let scanner = &state.scanner;
             let devices = scanner.devices().await;
             devices.iter().find(|d| d.id == device_id).cloned()
         };

@@ -246,7 +246,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 info!("ssdp_startup_scan_starting");
             }
 
-            let scanner = state.scanner.lock().await;
+            let scanner = &state.scanner;
             let devices = scanner.rescan().await;
             drop(scanner);
 

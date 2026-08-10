@@ -222,7 +222,7 @@ async fn step_zones(
 
     if auto_discover {
         // Trigger SSDP discovery
-        let scanner = state.scanner.lock().await;
+        let scanner = &state.scanner;
         let discovered = scanner.rescan().await;
         tracing::info!(count = discovered.len(), "onboarding_zone_discovery");
         drop(scanner);
