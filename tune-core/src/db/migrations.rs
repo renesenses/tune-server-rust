@@ -1118,9 +1118,36 @@ fn merge_scattered_compilations(db: &SqliteDb) {
             }
         }
 
+        // Une grappe peut contenir PLUSIEURS volumes portant le même titre :
+        // « ALLOPOP » en compte quatre, soit 41 dossiers sous `Qobuz/`. On les
+        // sépare par l'empreinte de la pochette DÉPOSÉE dans le dossier —
+        // copiée à l'identique dans tous les dossiers d'un même volume, alors
+        // que la jaquette extraite des pistes, elle, diffère à chaque fichier
+        // (mesuré sur .18 : 41 dossiers → 4 pochettes → 4 volumes).
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
         for cluster in clusters.iter().filter(|c| c.len() > 1) {
-            // Un seul numéro en double dans la grappe et on renonce : ce sont
-            // des homonymes, pas les éclats d'un même disque.
+            let mut par_pochette: HashMap<Option<String>, Vec<usize>> = HashMap::new();
+            for &i in cluster {
+                let empreinte = crate::scanner::compilation::folder_cover_fingerprint(&albums[i].1);
+                par_pochette.entry(empreinte).or_default().push(i);
+            }
+            // Sans pochette, aucune séparation possible : la grappe reste
+            // entière et c'est le chevauchement des numéros qui tranchera.
+            for (empreinte, membres) in par_pochette {
+                if empreinte.is_none() && membres.len() < cluster.len() {
+                    // Des dossiers sans pochette au milieu d'autres qui en ont :
+                    // on ne devine pas à quel volume les rattacher.
+                    continue;
+                }
+                if membres.len() > 1 {
+                    partitions.push(membres);
+                }
+            }
+        }
+
+        for cluster in &partitions {
+            // Un seul numéro en double dans la partition et on renonce : ce
+            // sont des homonymes, pas les éclats d'un même disque.
             let mut seen: Vec<i32> = Vec::new();
             let mut collision = false;
             for &i in cluster {
@@ -2428,6 +2455,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sur_le_survivant, 3, "les pistes suivent l'album conservé");
+    }
+
+    /// #1440 + #1444 — cas RÉEL : « ALLOPOP », quatre volumes portant le MÊME
+    /// titre, éclatés en 41 dossiers sous `Qobuz/`. Seule la pochette déposée
+    /// dans chaque dossier les sépare ; sans elle, les numéros de piste se
+    /// chevauchent et la grappe entière serait abandonnée.
+    #[test]
+    fn several_volumes_sharing_a_title_are_split_by_their_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Trois artistes du volume 1 (pistes 1, 2, 3) et deux du volume 2
+        // (pistes 1, 2) : les numéros se chevauchent d'un volume à l'autre.
+        let volumes: [(&str, &[(&str, i64)]); 2] = [
+            (
+                "IMAGE-VOLUME-1",
+                &[("Diane", 1), ("Gatien", 2), ("Loup Blaster", 3)],
+            ),
+            (
+                "IMAGE-VOLUME-2",
+                &[("Tristan Savoie", 1), ("Ma Fraisse", 2)],
+            ),
+        ];
+        for (image, membres) in volumes {
+            for (artiste, piste) in membres {
+                let folder = dir.path().join(artiste).join("ALLOPOP");
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("cover.jpg"), image.as_bytes()).unwrap();
+                let folder = folder.to_str().unwrap().to_string();
+                let conn = db.connection().lock().unwrap();
+                conn.execute(
+                    "INSERT INTO albums (title, folder_path) VALUES ('ALLOPOP', ?)",
+                    rusqlite::params![folder],
+                )
+                .unwrap();
+                let id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![artiste, id, piste, format!("{folder}/0{piste}.flac")],
+                )
+                .unwrap();
+            }
+        }
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let restants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title = 'ALLOPOP'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restants, 2,
+            "cinq dossiers, deux pochettes ⇒ deux albums — ni un, ni cinq"
+        );
+        let pistes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pistes, 5, "aucune piste perdue au passage");
     }
 
     /// #1440 — cas RÉEL inverse : deux « Greatest Hits » d'artistes différents,
