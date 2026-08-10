@@ -1112,7 +1112,17 @@ impl OutputTarget for OaatOutput {
                         break 'direct false;
                     }
 
-                    // For FLAC files, convert to WAV via ffmpeg preserving bit depth
+                    // Le FLAC passe par ffmpeg — un binaire externe que Tune ne
+                    // livre plus. Sur une machine qui n'en a pas (Windows), la
+                    // conversion echoue en une milliseconde.
+                    //
+                    // Les deux echecs ci-dessous se REPLIENT donc sur le flux
+                    // HTTP, comme les six autres sorties de ce bloc. Ils
+                    // faisaient `return` : la sortie abandonnait en silence
+                    // alors que l'orchestrateur avait deja cree la session et
+                    // donne son URL a l'endpoint. Resultat cote utilisateur —
+                    // `state=playing`, `pos=0` fige, aucun son, et pas la
+                    // moindre erreur (forum, .42 sur 0.9.66).
                     let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = if is_flac {
                         debug!("converting FLAC to WAV via ffmpeg...");
                         match super::helpers::decode_flac_to_pcm(fp, si.bits_per_sample) {
@@ -1121,9 +1131,10 @@ impl OutputTarget for OaatOutput {
                                 let wav_si = match detect_and_parse(&mut wav_buf) {
                                     Some(info) => info,
                                     None => {
-                                        debug!("WAV parse failed after ffmpeg");
-                                        playing.store(false, Ordering::SeqCst);
-                                        return;
+                                        debug!(
+                                            "WAV parse failed after ffmpeg, falling back to HTTP stream"
+                                        );
+                                        break 'direct false;
                                     }
                                 };
                                 debug!(
@@ -1143,9 +1154,8 @@ impl OutputTarget for OaatOutput {
                                 )
                             }
                             None => {
-                                debug!("ffmpeg FLAC->WAV failed");
-                                playing.store(false, Ordering::SeqCst);
-                                return;
+                                debug!("ffmpeg FLAC->WAV failed, falling back to HTTP stream");
+                                break 'direct false;
                             }
                         }
                     } else {
