@@ -1130,18 +1130,33 @@ impl StreamingService for QobuzService {
                             .map(Into::into)
                             .or_else(|| item["id"].as_u64().map(|i| i.to_string()))
                             .or_else(|| item["slug"].as_str().map(Into::into))?;
-                        // name is a localized object {en, fr, ...} or a plain string.
+                        // Le libellé est, selon les entrées : une chaîne, un
+                        // objet localisé {en, fr, …}, ou — c'est le cas courant
+                        // chez Qobuz — un objet localisé ENCODÉ EN JSON dans
+                        // `name_json`. Sans cette dernière branche, aucune des
+                        // 13 catégories ne trouvait son nom et toutes
+                        // retombaient sur leur slug : les rangées s'appelaient
+                        // « artist », « mood », « label ».
+                        let localized = |v: &serde_json::Value| -> Option<String> {
+                            let obj = v.as_object()?;
+                            obj.get("fr")
+                                .or_else(|| obj.get("en"))
+                                .or_else(|| obj.values().next())
+                                .and_then(|s| s.as_str())
+                                .map(String::from)
+                        };
                         let name = item["name"]
                             .as_str()
                             .map(String::from)
-                            .or_else(|| item["name"]["en"].as_str().map(String::from))
+                            .or_else(|| localized(&item["name"]))
                             .or_else(|| {
-                                item["name"]
-                                    .as_object()
-                                    .and_then(|m| m.values().next())
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
+                                item["name_json"]
+                                    .as_str()
+                                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                                    .as_ref()
+                                    .and_then(localized)
                             })
+                            .or_else(|| localized(&item["name_json"]))
                             .unwrap_or_else(|| id.clone());
                         Some(PlaylistTag { id, name })
                     })
