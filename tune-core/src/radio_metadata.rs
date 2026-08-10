@@ -27,8 +27,12 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
         || station_name.to_lowercase().contains("france musique")
         || station_name.to_lowercase().contains("france inter")
     {
-        let channel = radiofrance_channel_id(station_name, stream_url);
-        return fetch_radiofrance_metadata(station_name, channel).await;
+        // No channel means the live-meta API has nothing for this station.
+        // Fall through to the raw ICY reader rather than querying a channel
+        // that belongs to a different station.
+        if let Some(channel) = radiofrance_channel_id(station_name, stream_url) {
+            return fetch_radiofrance_metadata(station_name, channel).await;
+        }
     }
 
     // Radio Paradise
@@ -47,8 +51,44 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
 // Radio France
 // ---------------------------------------------------------------------------
 
+/// Extract the FIP sub-station qualifier from a station name or stream URL:
+/// `"pop"` for both `FIP Pop` and `.../fippop-hifi.aac`, and an empty string
+/// for the main station.
+///
+/// Everything after the last `fip` is kept, minus the stream-flavour noise
+/// (`-hifi.aac`, `midfi`, the legacy `fipradio.fr` host), so the caller can
+/// tell "this is FIP" from "this is some FIP webradio we do not know".
+fn fip_qualifier(hay: &str) -> String {
+    let Some(index) = hay.rfind("fip") else {
+        return String::new();
+    };
+
+    hay[index + 3..]
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "hifi"
+                    | "midfi"
+                    | "lofi"
+                    | "aac"
+                    | "mp3"
+                    | "radio"
+                    | "fr"
+                    | "com"
+                    | "http"
+                    | "https"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Map a station name / stream URL to the Radio France *station id* used by
-/// their live-meta API.  Default = 7 (FIP).
+/// their live-meta API, or `None` when that API has nothing for it.
 ///
 /// The FIP *webradios* (Rock, Jazz, Groove, …) each have their OWN livemeta
 /// channel — matching only `fip` mapped them all to 7, so FIP, FIP Rock and
@@ -56,46 +96,59 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
 /// substation ids below were verified live against api.radiofrance.fr/livemeta.
 /// Match on the station name too (user-added stations often carry the substation
 /// in the name, e.g. "FIP Rock", not the URL).
-fn radiofrance_channel_id(station_name: &str, stream_url: &str) -> u32 {
+///
+/// Returning `None` matters as much as returning an id. FIP Pop, FIP Hip-Hop,
+/// FIP Sacré français and FIP Cultes stream fine but have **no** livemeta
+/// channel — the whole `1..=260` range was swept on 2026-08-10 and nothing
+/// answers for them — and their AAC streams carry no in-band ICY metadata
+/// either. Falling back to 7 made them display *main FIP's* now-playing:
+/// a confident, wrong answer, which is worse than an empty one (forum: Jean
+/// Valjean, « Mauvaises Métadonnées sur Fip Cultes, FIP Pop, FIP Sacré
+/// français, FIP Hip-Hop »). The same reasoning applies to any Radio France
+/// station we do not recognise at all: guessing FIP would be inventing.
+fn radiofrance_channel_id(station_name: &str, stream_url: &str) -> Option<u32> {
     let hay = format!(
         "{} {}",
         station_name.to_lowercase(),
         stream_url.to_lowercase()
     );
     if hay.contains("franceinter") {
-        1
+        Some(1)
     } else if hay.contains("francemusique") || hay.contains("france-musique") {
-        4
+        Some(4)
     } else if hay.contains("mouv") {
-        6
+        Some(6)
     } else if hay.contains("franceculture") || hay.contains("france-culture") {
-        2
+        Some(2)
     } else if hay.contains("franceinfo") {
-        3
+        Some(3)
     } else if hay.contains("fip") {
-        // FIP webradios: pick the specific substation, else main FIP (7).
-        // `fiprock` (URL) and `fip rock` (name) both match "rock", etc.
-        if hay.contains("rock") {
-            64
-        } else if hay.contains("jazz") {
-            65
-        } else if hay.contains("groove") {
-            66
-        } else if hay.contains("monde") || hay.contains("world") {
-            69
-        } else if hay.contains("nouveau") || hay.contains("nouveaut") {
-            70
-        } else if hay.contains("reggae") {
-            71
-        } else if hay.contains("electro") {
-            74
-        } else if hay.contains("metal") {
-            77
+        // FIP webradios: pick the specific substation, main FIP when there is
+        // no qualifier at all, and nothing when the qualifier is unknown.
+        let qualifier = fip_qualifier(&hay);
+        if qualifier.is_empty() {
+            Some(7)
+        } else if qualifier.contains("rock") {
+            Some(64)
+        } else if qualifier.contains("jazz") {
+            Some(65)
+        } else if qualifier.contains("groove") {
+            Some(66)
+        } else if qualifier.contains("monde") || qualifier.contains("world") {
+            Some(69)
+        } else if qualifier.contains("nouveau") {
+            Some(70)
+        } else if qualifier.contains("reggae") {
+            Some(71)
+        } else if qualifier.contains("electro") {
+            Some(74)
+        } else if qualifier.contains("metal") {
+            Some(77)
         } else {
-            7 // main FIP
+            None
         }
     } else {
-        7 // default to FIP
+        None
     }
 }
 
@@ -327,25 +380,25 @@ mod tests {
     fn radiofrance_channel_detection() {
         assert_eq!(
             radiofrance_channel_id("FIP", "https://icecast.radiofrance.fr/fip-hifi.aac"),
-            7
+            Some(7)
         );
         assert_eq!(
             radiofrance_channel_id(
                 "Inter",
                 "https://icecast.radiofrance.fr/franceinter-hifi.aac"
             ),
-            1
+            Some(1)
         );
         assert_eq!(
             radiofrance_channel_id(
                 "Musique",
                 "https://icecast.radiofrance.fr/francemusique-hifi.aac"
             ),
-            4
+            Some(4)
         );
         assert_eq!(
             radiofrance_channel_id("Mouv", "https://icecast.radiofrance.fr/mouv-hifi.aac"),
-            6
+            Some(6)
         );
     }
 
@@ -355,19 +408,82 @@ mod tests {
         // for FIP / FIP Rock / FIP Cultes (forum). Each must resolve its own
         // livemeta channel — matched via the stream URL...
         let url = |s: &str| format!("https://icecast.radiofrance.fr/{s}-hifi.aac");
-        assert_eq!(radiofrance_channel_id("FIP", &url("fip")), 7);
-        assert_eq!(radiofrance_channel_id("", &url("fiprock")), 64);
-        assert_eq!(radiofrance_channel_id("", &url("fipjazz")), 65);
-        assert_eq!(radiofrance_channel_id("", &url("fipgroove")), 66);
-        assert_eq!(radiofrance_channel_id("", &url("fipworld")), 69);
-        assert_eq!(radiofrance_channel_id("", &url("fipnouveautes")), 70);
-        assert_eq!(radiofrance_channel_id("", &url("fipreggae")), 71);
-        assert_eq!(radiofrance_channel_id("", &url("fipelectro")), 74);
-        assert_eq!(radiofrance_channel_id("", &url("fipmetal")), 77);
+        assert_eq!(radiofrance_channel_id("FIP", &url("fip")), Some(7));
+        assert_eq!(radiofrance_channel_id("", &url("fiprock")), Some(64));
+        assert_eq!(radiofrance_channel_id("", &url("fipjazz")), Some(65));
+        assert_eq!(radiofrance_channel_id("", &url("fipgroove")), Some(66));
+        assert_eq!(radiofrance_channel_id("", &url("fipworld")), Some(69));
+        assert_eq!(radiofrance_channel_id("", &url("fipnouveautes")), Some(70));
+        assert_eq!(radiofrance_channel_id("", &url("fipreggae")), Some(71));
+        assert_eq!(radiofrance_channel_id("", &url("fipelectro")), Some(74));
+        assert_eq!(radiofrance_channel_id("", &url("fipmetal")), Some(77));
         // ...or via the station name alone (user-added radios).
-        assert_eq!(radiofrance_channel_id("FIP Rock", ""), 64);
-        assert_eq!(radiofrance_channel_id("FIP Groove", ""), 66);
-        assert_eq!(radiofrance_channel_id("FIP", ""), 7);
+        assert_eq!(radiofrance_channel_id("FIP Rock", ""), Some(64));
+        assert_eq!(radiofrance_channel_id("FIP Groove", ""), Some(66));
+        assert_eq!(radiofrance_channel_id("FIP", ""), Some(7));
+    }
+
+    #[test]
+    fn fip_webradios_without_livemeta_return_no_channel() {
+        // Regression (forum, Jean Valjean): FIP Pop, FIP Hip-Hop, FIP Sacré
+        // français and FIP Cultes stream fine but Radio France exposes no
+        // livemeta channel for them. Defaulting to 7 displayed *main FIP's*
+        // now-playing on those stations — a confident wrong answer. They must
+        // resolve to nothing so the caller falls back to the raw ICY reader.
+        let url = |s: &str| format!("https://icecast.radiofrance.fr/{s}-hifi.aac");
+        assert_eq!(radiofrance_channel_id("FIP Pop", &url("fippop")), None);
+        assert_eq!(
+            radiofrance_channel_id("FIP Hip-Hop", &url("fiphiphop")),
+            None
+        );
+        assert_eq!(
+            radiofrance_channel_id("FIP Sacré français", &url("fipsacrefrancais")),
+            None
+        );
+        assert_eq!(
+            radiofrance_channel_id("FIP Cultes", &url("fipcultes")),
+            None
+        );
+
+        // A station name alone is enough — user-added radios often carry no
+        // recognisable URL.
+        assert_eq!(radiofrance_channel_id("FIP Pop", ""), None);
+
+        // And a Radio France station we know nothing about is not FIP either.
+        assert_eq!(
+            radiofrance_channel_id("Radio Machin", "https://icecast.radiofrance.fr/machin.aac"),
+            None
+        );
+    }
+
+    #[test]
+    fn fip_qualifier_ignores_stream_flavour() {
+        // The main station must stay recognisable through every URL shape it
+        // ships under, otherwise it would lose its metadata too.
+        assert_eq!(
+            fip_qualifier("fip https://icecast.radiofrance.fr/fip-hifi.aac"),
+            ""
+        );
+        assert_eq!(
+            fip_qualifier(" https://icecast.radiofrance.fr/fip-midfi.mp3"),
+            ""
+        );
+        assert_eq!(
+            fip_qualifier(" http://direct.fipradio.fr/live/fip-midfi.mp3"),
+            ""
+        );
+        assert_eq!(fip_qualifier("fip "), "");
+
+        // …while a substation keeps its qualifier, from the name or the URL.
+        assert_eq!(fip_qualifier("fip pop "), "pop");
+        assert_eq!(
+            fip_qualifier(" https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac"),
+            "sacrefrancais"
+        );
+        assert_eq!(
+            fip_qualifier(" https://icecast.radiofrance.fr/fiprock-hifi.aac"),
+            "rock"
+        );
     }
 
     #[test]
