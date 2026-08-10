@@ -42,6 +42,30 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
 
+  # La CI validait `--features oaat` alors que les binaires publies embarquent
+  # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
+  # depuis au moins la 0.9.61 : `dj_plugin.rs` est derriere
+  # `#![cfg(feature = "dj")]`, jamais compile ici, et `plugin_routes.rs`
+  # comptait les greffons en supposant qu'aucun n'etait compile (#1427).
+  #
+  # Ce job execute la suite avec LE JEU LIVRE. Sans lui, ces tests
+  # redeviennent invisibles a la premiere occasion.
+  test-shipped-features:
+    name: Test (jeu de fonctionnalites livre)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Meme dependance systeme que le job de build : sans elle, la compilation
+      # s'arrete sur « Package alsa was not found in the pkg-config ».
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,plugins-wasm,audio-embedding
+
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
   # job compile-checks it in isolation so a break surfaces on the PR rather than

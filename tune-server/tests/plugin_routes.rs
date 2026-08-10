@@ -343,7 +343,15 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
         vec![Box::new(Loads), Box::new(FailsSetup)],
     )
     .await;
-    assert!(routers.is_empty(), "neither plugin registers a router");
+    // Ni « loads » ni « failssetup » ne monte de routeur ; on ne peut pas
+    // exiger la liste vide, car dj et karaoke — compilés dans le jeu livré —
+    // en contribuent quand ils sont installés.
+    assert!(
+        !routers
+            .iter()
+            .any(|(n, _)| n == "loads" || n == "failssetup"),
+        "aucun de ces deux greffons n'enregistre de routeur"
+    );
 
     let names: Vec<&str> = state
         .plugin_info
@@ -352,23 +360,30 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
         .iter()
         .map(|p| p.name.as_str())
         .collect();
-    assert_eq!(names, vec!["loads"], "a failed setup must not be reported");
+    assert!(names.contains(&"loads"), "loads doit être chargé");
+    assert!(
+        !names.contains(&"failssetup"),
+        "a failed setup must not be reported (chargés : {names:?})"
+    );
 
     // And the REST view agrees.
     let app = tune_server::routes::router(state.clone());
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let list: Value = serde_json::from_str(&body).unwrap();
-    let sdk: Vec<&Value> = list
-        .as_array()
-        .unwrap()
+    // Même raison qu'au-dessus : on isole « loads » au lieu de compter les
+    // entrées SDK, dont dj et karaoke font partie dans le jeu livré.
+    let entries = list.as_array().unwrap();
+    let loads = entries
         .iter()
-        .filter(|p| p["type"] == "sdk")
-        .collect();
-    assert_eq!(sdk.len(), 1);
-    assert_eq!(sdk[0]["name"], "loads");
-    assert_eq!(sdk[0]["version"], "1.2.3");
-    assert_eq!(sdk[0]["url"], "/api/v1/ext/loads");
+        .find(|p| p["type"] == "sdk" && p["name"] == "loads")
+        .unwrap_or_else(|| panic!("« loads » absent de /api/v1/plugins : {entries:?}"));
+    assert_eq!(loads["version"], "1.2.3");
+    assert_eq!(loads["url"], "/api/v1/ext/loads");
+    assert!(
+        !entries.iter().any(|p| p["name"] == "failssetup"),
+        "un setup en échec ne doit pas être publié"
+    );
 }
 
 /// An opt-in plugin (like DJ/Karaoke): compiled in but dormant until the user
@@ -407,16 +422,29 @@ async fn opt_in_plugin_is_listed_as_installable_not_loaded() {
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
 
     // Not among the loaded plugins…
-    assert_eq!(
-        state.plugin_info.get().map(|v| v.len()).unwrap_or_default(),
-        0,
-        "an opt-in plugin must not load by default"
+    //
+    // On cherche « optin » nommément plutôt que de compter : le jeu de
+    // fonctionnalités LIVRÉ compile aussi dj, karaoke et plugins-wasm, qui
+    // s'ajoutent aux deux listes. Compter revenait à supposer qu'aucun greffon
+    // n'est compilé — vrai sous le `--features oaat` de la CI, faux sous ce
+    // qu'on publie, et c'est pourquoi ces tests échouaient sans que personne
+    // ne le voie.
+    let loaded: Vec<&str> = state
+        .plugin_info
+        .get()
+        .map(|v| v.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !loaded.contains(&"optin"),
+        "an opt-in plugin must not load by default (chargés : {loaded:?})"
     );
     // …but surfaced as available so the manager can still offer "Install".
     let available = state.plugin_available.get().expect("init publishes it");
-    assert_eq!(available.len(), 1);
-    assert_eq!(available[0].name, "optin");
-    assert!(available[0].opt_in);
+    let optin = available
+        .iter()
+        .find(|p| p.name == "optin")
+        .expect("optin doit être proposé à l'installation");
+    assert!(optin.opt_in);
 
     let app = tune_server::routes::router(state.clone());
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
@@ -453,14 +481,21 @@ async fn opt_in_plugin_loads_after_install() {
         .iter()
         .map(|p| p.name.as_str())
         .collect();
-    assert_eq!(names, vec!["optin"], "an installed opt-in plugin loads");
     assert!(
-        state
-            .plugin_available
-            .get()
-            .map(|v| v.is_empty())
-            .unwrap_or(true),
-        "nothing left dormant once installed"
+        names.contains(&"optin"),
+        "an installed opt-in plugin loads (chargés : {names:?})"
+    );
+    // « plus rien de dormant » ne vaut que pour CE greffon : dj et karaoke,
+    // compilés dans le jeu livré, restent légitimement dormants ici puisqu'on
+    // ne les a pas installés.
+    let dormant: Vec<&str> = state
+        .plugin_available
+        .get()
+        .map(|v| v.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !dormant.contains(&"optin"),
+        "optin ne doit plus être dormant une fois installé (dormants : {dormant:?})"
     );
 
     let app = tune_server::routes::router(state.clone());
