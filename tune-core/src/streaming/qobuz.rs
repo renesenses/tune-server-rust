@@ -1021,6 +1021,17 @@ impl StreamingService for QobuzService {
                 id: "most-streamed".into(),
                 name: "Most Streamed".into(),
             },
+            // Les deux rangées de l'onglet « Le goût de Qobuz », que Tune
+            // n'exposait pas alors que l'API les sert depuis toujours (Fabien,
+            // comparaison avec Roon).
+            FeaturedSection {
+                id: "ideal-discography".into(),
+                name: "Ideal Discography".into(),
+            },
+            FeaturedSection {
+                id: "qobuzissims".into(),
+                name: "Qobuzissimes".into(),
+            },
         ])
     }
 
@@ -1158,19 +1169,67 @@ impl StreamingService for QobuzService {
         tag: Option<&str>,
         genre: Option<&str>,
     ) -> Result<Vec<StreamPlaylist>, TuneError> {
-        let mut params: Vec<(&str, &str)> = vec![("type", "editor-picks"), ("limit", "50")];
+        // Une seule page de 50 laissait la majorité du catalogue éditorial
+        // dehors — « il manque beaucoup de playlists éditoriales Qobuz »
+        // (Fabien). On pagine, avec un plafond : sans tag, Qobuz en expose
+        // plusieurs milliers, et personne ne fait défiler ça.
+        const MAX: usize = 500;
+        let mut params: Vec<(&str, &str)> = vec![("type", "editor-picks")];
         if let Some(t) = tag {
             params.push(("tags", t));
         }
         if let Some(g) = genre {
             params.push(("genre_ids", g));
         }
-        let data = self.api_get("/playlist/getFeatured", &params).await?;
-        let playlists = data["playlists"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
-            .unwrap_or_default();
-        Ok(playlists)
+        let mut items = self
+            .api_get_all_pages("/playlist/getFeatured", &params, "playlists")
+            .await?;
+        items.truncate(MAX);
+        Ok(items.iter().map(Self::map_featured_playlist).collect())
+    }
+
+    /// Une rangée par tag Qobuz, dans l'ordre où Qobuz les publie.
+    ///
+    /// Les tags sont interrogés en parallèle (une requête chacun, une page) :
+    /// séquentiellement, une dizaine d'allers-retours mettaient la vue à
+    /// plusieurs secondes. Un tag qui échoue ou qui ne renvoie rien est
+    /// simplement absent — une rangée vide n'apprend rien à personne.
+    async fn get_featured_playlists_by_tag(
+        &self,
+        genre: Option<&str>,
+    ) -> Result<Vec<PlaylistTagGroup>, TuneError> {
+        /// Playlists par rangée : au-delà, le carrousel ne sert plus à rien et
+        /// la vue s'alourdit. Le détail d'un tag reste accessible par
+        /// `get_featured_playlists(tag)`, qui pagine.
+        const PER_TAG: usize = 50;
+
+        let tags = self.get_playlist_tags().await?;
+        let rows = futures_util::future::join_all(tags.into_iter().map(|tag| async move {
+            let limit = PER_TAG.to_string();
+            let mut params: Vec<(&str, &str)> = vec![
+                ("type", "editor-picks"),
+                ("tags", tag.id.as_str()),
+                ("limit", &limit),
+            ];
+            if let Some(g) = genre {
+                params.push(("genre_ids", g));
+            }
+            let data = self.api_get("/playlist/getFeatured", &params).await.ok()?;
+            let playlists: Vec<StreamPlaylist> = data["playlists"]["items"]
+                .as_array()
+                .map(|items| items.iter().map(Self::map_featured_playlist).collect())
+                .unwrap_or_default();
+            if playlists.is_empty() {
+                return None;
+            }
+            Some(PlaylistTagGroup {
+                id: tag.id,
+                name: tag.name,
+                playlists,
+            })
+        }))
+        .await;
+        Ok(rows.into_iter().flatten().collect())
     }
 
     async fn get_album_context(&self, album_id: &str) -> Result<AlbumContext, TuneError> {

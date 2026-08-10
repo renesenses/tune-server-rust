@@ -121,6 +121,15 @@ pub struct PlaylistTag {
     pub name: String,
 }
 
+/// Une catégorie de playlists éditoriales avec sa rangée de playlists — la
+/// structure qu'affichent Qobuz et Roon (« Humeurs », « Focus », …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistTagGroup {
+    pub id: String,
+    pub name: String,
+    pub playlists: Vec<StreamPlaylist>,
+}
+
 /// Discovery context of an album/track: its genre and record label. Lets a
 /// client jump from the now-playing track to the genre's expert playlists or
 /// the label's catalogue, without bloating the shared `StreamAlbum` model.
@@ -259,6 +268,19 @@ pub trait StreamingService: Send + Sync {
         _tag: Option<&str>,
         _genre: Option<&str>,
     ) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(vec![])
+    }
+    /// Les playlists éditoriales **rangées par catégorie**, une rangée par tag,
+    /// comme le fait le service lui-même (Qobuz : « Artistes Qobuz »,
+    /// « Humeurs », « Focus », « Histoires de labels »…).
+    ///
+    /// Un seul aller-retour pour le client, qui n'a pas à découvrir les tags
+    /// puis à lancer une requête par tag. Optionnellement narrowé par genre,
+    /// comme le sélecteur « Tous les genres » du service.
+    async fn get_featured_playlists_by_tag(
+        &self,
+        _genre: Option<&str>,
+    ) -> Result<Vec<PlaylistTagGroup>, TuneError> {
         Ok(vec![])
     }
     /// Discovery context (genre + label) of an album, resolved from the album.

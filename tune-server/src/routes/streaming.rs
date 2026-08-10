@@ -138,6 +138,10 @@ pub fn router() -> Router<AppState> {
             "/{service}/featured-playlists",
             get(service_featured_playlists),
         )
+        .route(
+            "/{service}/featured-playlists/by-tag",
+            get(service_featured_playlists_by_tag),
+        )
         .route("/{service}/new-releases", get(service_new_releases))
         .route("/{service}/genres", get(service_genres))
         .route(
@@ -411,6 +415,24 @@ async fn service_featured_playlists(
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
         .get_featured_playlists(q.tag.as_deref(), q.genre.as_deref())
+        .await)
+}
+
+#[derive(Deserialize)]
+struct ByTagQuery {
+    genre: Option<String>,
+}
+
+/// Les playlists éditoriales rangées par catégorie, comme le service les
+/// présente. Un seul appel : le client n'a pas à lire les tags puis à lancer
+/// une requête par tag.
+async fn service_featured_playlists_by_tag(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+    Query(q): Query<ByTagQuery>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_featured_playlists_by_tag(q.genre.as_deref())
         .await)
 }
 
