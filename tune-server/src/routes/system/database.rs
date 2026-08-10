@@ -570,15 +570,23 @@ pub(super) async fn migrate_database(
         // split-brain : il n'y a pas de store SQLite quand le serveur tourne
         // deja sur PostgreSQL. Migrer SQLite -> PG n'a alors aucun sens, et
         // c'est un refus explicite plutot qu'un message obscur.
-        let Some(sqlite) = state.db.as_ref() else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "status": "error",
-                    "error": "no SQLite store to migrate from — this server already runs on PostgreSQL",
-                })),
-            )
-                .into_response();
+        // Passe par l'accesseur introduit avec la suppression du split-brain,
+        // comme les deux autres usages de ce fichier (l.93 et l.144) : le
+        // message d'indisponibilité vit à un seul endroit. Formulation de JP
+        // dans sa PR #1424, que ce correctif rejoint.
+        let sqlite = match state.sqlite() {
+            Ok(db) => db,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "status": "error",
+                        "error": "this server already runs on PostgreSQL — there is no SQLite \
+                                  database to migrate from",
+                    })),
+                )
+                    .into_response();
+            }
         };
 
         let start = Instant::now();
