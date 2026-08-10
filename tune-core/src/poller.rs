@@ -3692,6 +3692,38 @@ impl PositionPoller {
                     .filter_map(|t| t["track_id"].as_i64())
                     .collect();
 
+                // Rien en local : la radio s'arrêtait là, en silence. Pour
+                // quelqu'un qui écoute Qobuz sans bibliothèque locale, c'était
+                // TOUJOURS le cas — la graine streaming était gérée, les
+                // résultats ne pouvaient être que locaux. On va donc chercher
+                // les artistes similaires dans le service de la piste en cours.
+                if track_ids.is_empty()
+                    && let Some(ref artist) = seed_artist
+                    && let Some(source) = zone_state
+                        .now_playing
+                        .as_ref()
+                        .map(|np| np.source.clone())
+                        .filter(|s| s != "local" && !s.is_empty())
+                {
+                    let added = self
+                        .autoplay_streaming_radio(zone_id, artist, &source)
+                        .await;
+                    if added > 0 {
+                        let new_pos = zone_state.queue_position + 1;
+                        info!(
+                            zone_id,
+                            added,
+                            source = %source,
+                            "autoplay_streaming_radio_started"
+                        );
+                        if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                            warn!(zone_id, error = %e, "autoplay_play_failed");
+                            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        }
+                        return;
+                    }
+                }
+
                 if !track_ids.is_empty() {
                     info!(
                         zone_id,
@@ -3985,6 +4017,81 @@ impl PositionPoller {
                 false
             }
         }
+    }
+
+    /// Radio « artistes similaires » servie par le service de streaming.
+    ///
+    /// Le pendant streaming de `auto_dj::generate_similar_artists_queue`, qui
+    /// ne sait produire que des pistes de la bibliothèque locale. Renvoie le
+    /// nombre de pistes ajoutées — 0 si le service est absent, non authentifié,
+    /// ou ne trouve rien : la radio se tait alors comme avant, sans casser la
+    /// lecture.
+    async fn autoplay_streaming_radio(
+        &self,
+        zone_id: i64,
+        seed_artist: &str,
+        source: &str,
+    ) -> usize {
+        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
+        if names.is_empty() {
+            debug!(zone_id, seed_artist, "autoplay_streaming_no_similar_names");
+            return 0;
+        }
+        let Some(service) = self.orchestrator.services.lock().await.get(source) else {
+            debug!(zone_id, source, "autoplay_streaming_service_absent");
+            return 0;
+        };
+        let found =
+            crate::playback::auto_dj::streaming_tracks_for_artist_names(&names, 10, |name| {
+                let service = service.clone();
+                async move {
+                    let svc = service.lock().await;
+                    match svc.search(&name, 5).await {
+                        Ok(res) => res.tracks,
+                        Err(e) => {
+                            debug!(artist = %name, error = %e, "autoplay_streaming_search_failed");
+                            Vec::new()
+                        }
+                    }
+                }
+            })
+            .await;
+        if found.is_empty() {
+            return 0;
+        }
+        let items: Vec<crate::db::play_queue_repo::StreamingQueueItem> = found
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.title.clone(),
+                    t.artist.clone(),
+                    t.album.clone(),
+                    t.cover_path.clone(),
+                    t.duration_ms as i64,
+                    Some(source.to_string()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
+                )
+            })
+            .collect();
+        let queue_repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &items) {
+            warn!(zone_id, error = %e, "autoplay_streaming_append_failed");
+            return 0;
+        }
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "playback.autoplay_tracks_added",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "source": source,
+                    "seed_artist": seed_artist,
+                    "count": items.len(),
+                }),
+            );
+        }
+        items.len()
     }
 
     fn get_zone_device_id(&self, zone_id: i64) -> Option<String> {
