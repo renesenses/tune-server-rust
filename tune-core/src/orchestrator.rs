@@ -767,6 +767,38 @@ fn use_file_transcode_for(
 /// a `device_id` naming convention (a pull output has no reason to prefix its
 /// `device_id` with `"local:"`). Pure so it's unit-testable without an
 /// orchestrator or a registered output.
+/// True when an output receives the stream with none of our DSP applied to it,
+/// so an active EQ / room correction / ReplayGain must force the transcode path
+/// to be heard at all.
+///
+/// The push-URI renderers of [`is_push_uri_output_type`] and browser zones are
+/// handled by their own flags. What this covers is the third family: a PULL
+/// output that fetches the audio itself and is not built in — `diretta`, and
+/// anything an out-of-tree plugin registers. It was silently absent from the
+/// list, so the EQ was computed and thrown away (Eric, forum ; same hole as
+/// #1216 on a Beoplay A9).
+///
+/// Excluded on purpose:
+/// - `local` and `oaat`, which already transcode as soon as the source format
+///   is known, so the DSP reaches them;
+/// - an unknown format, which there is no safe way to transcode;
+/// - DSD, because converting a native DSD stream to PCM in order to apply an
+///   EQ would be a degradation decided on the listener's behalf.
+fn pull_output_needs_dsp_transcode(
+    output_type: Option<&str>,
+    is_local: bool,
+    is_oaat: bool,
+    source_format: Option<AudioFormat>,
+) -> bool {
+    output_type.is_some()
+        && !is_local
+        && !is_oaat
+        && !is_push_uri_output_type(output_type)
+        && output_type != Some("browser")
+        && source_format.is_some()
+        && source_format != Some(AudioFormat::Dsd)
+}
+
 fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
     matches!(
         output_type,
@@ -2657,7 +2689,19 @@ impl PlaybackOrchestrator {
         // local servi direct) : même trou que #1216, mesuré sur .18 — deux
         // captures du flux EQ ±12 dB strictement identiques (md5). L'EQ y
         // force donc aussi le transcodage.
-        let eq_forces_transcode = (is_network_output || is_browser_output)
+        // Une sortie PULL hors dépôt — `diretta`, `oaat` — va chercher le flux
+        // elle-même et n'est ni « réseau » ni « navigateur » au sens ci-dessus.
+        // Elle recevait donc le fichier brut : même trou que #1216, une
+        // troisième fois (Eric, forum : égaliseur sans effet vers un renderer
+        // Diretta). La sortie LOCALE est exclue — elle passe déjà par le
+        // transcodage dès que le format source est connu (`local_needs_wav`).
+        let is_pull_dsp_output = pull_output_needs_dsp_transcode(
+            zone_output_type.as_deref(),
+            is_local_output,
+            is_oaat_output,
+            source_format,
+        );
+        let eq_forces_transcode = (is_network_output || is_browser_output || is_pull_dsp_output)
             && !dsd_passthrough
             && !alac_passthrough
             && (self.zone_has_active_eq(req.zone_id)
@@ -2915,7 +2959,15 @@ impl PlaybackOrchestrator {
                 // A cached transcode made at a different gain would be served
                 // silently at the wrong level — so a gained transcode is never
                 // cached, and never reads the cache.
-                let replaygain_factor = match (self.zone_audiophile(req.zone_id), req.track_id) {
+                // NOT for a local zone: the local output applies the gain on
+                // its own render path, and a local zone with a known source
+                // format always comes through here (`local_needs_wav`) — so
+                // baking it in as well multiplied the gain twice. A -6 dB track
+                // played at -12 dB, quietly.
+                let replaygain_factor = match (
+                    is_local_output || self.zone_audiophile(req.zone_id),
+                    req.track_id,
+                ) {
                     (false, Some(tid)) => {
                         let f = crate::audio::replaygain::playback_factor(&self.db, tid);
                         if (f - 1.0).abs() > 1e-6 {
@@ -8128,7 +8180,7 @@ mod tests {
 
     use super::{
         PlayRequest, PlaybackOrchestrator, is_push_uri_output_type, passthrough_didl_duration_ms,
-        use_file_transcode_for,
+        pull_output_needs_dsp_transcode, use_file_transcode_for,
     };
 
     #[test]
@@ -8147,6 +8199,67 @@ mod tests {
         assert!(!is_push_uri_output_type(Some("local")));
         assert!(!is_push_uri_output_type(Some("oaat")));
         assert!(!is_push_uri_output_type(Some("diretta")));
+    }
+
+    #[test]
+    fn pull_output_dsp_transcode_classification() {
+        use crate::audio::formats::AudioFormat;
+        let flac = Some(AudioFormat::Flac);
+
+        // The case that was silently broken: an out-of-tree pull output was in
+        // none of the lists, so an active EQ never reached it.
+        assert!(pull_output_needs_dsp_transcode(
+            Some("diretta"),
+            false,
+            false,
+            flac
+        ));
+
+        // Already transcoding on their own: forcing again would be redundant.
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("local"),
+            true,
+            false,
+            flac
+        ));
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("oaat"),
+            false,
+            true,
+            flac
+        ));
+
+        // Covered by their own flags.
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("dlna"),
+            false,
+            false,
+            flac
+        ));
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("browser"),
+            false,
+            false,
+            flac
+        ));
+
+        // No format, or DSD: never force a transcode we cannot do safely, and
+        // never turn native DSD into PCM on the listener's behalf.
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("diretta"),
+            false,
+            false,
+            None
+        ));
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("diretta"),
+            false,
+            false,
+            Some(AudioFormat::Dsd)
+        ));
+
+        // Unknown output type: no basis to decide.
+        assert!(!pull_output_needs_dsp_transcode(None, false, false, flac));
 
         // Unregistered device (output_type_of returned None): never coalesce.
         assert!(!is_push_uri_output_type(None));
