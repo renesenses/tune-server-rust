@@ -128,16 +128,6 @@ impl Default for PlayMedia<'_> {
     }
 }
 
-/// Puits de niveaux : reçoit le PCM entier entrelacé (little-endian) qu'une
-/// sortie vient de décoder ou de recevoir, avec son format.
-///
-/// Une sortie qui décode déjà le flux qu'on lui sert peut ainsi alimenter les
-/// VU-mètres sans qu'un second décodage complet tourne en parallèle côté
-/// serveur (#1110). Signature volontairement close sur des types `std` : ce
-/// contrat vit dans une caisse que des greffons hors-arbre embarquent, il ne
-/// peut pas dépendre de `tune-core`.
-pub type LevelsSink = std::sync::Arc<dyn Fn(&[u8], u16, u16, u32) + Send + Sync>;
-
 #[async_trait::async_trait]
 pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;
@@ -157,17 +147,6 @@ pub trait OutputTarget: Send + Sync {
     /// that never consumes `next_media`, so they return false.
     fn supports_internal_gapless(&self) -> bool {
         true
-    }
-
-    /// Branche (ou débranche, avec `None`) un puits de niveaux sur cette
-    /// sortie. Renvoie `true` si la sortie s'engage à l'alimenter pour la
-    /// lecture en cours — l'appelant peut alors se dispenser de décoder le
-    /// morceau une seconde fois juste pour les VU-mètres.
-    ///
-    /// Défaut : `false`, rien n'est branché. Une sortie réseau ne voit jamais
-    /// le PCM, elle n'a rien à offrir ici.
-    fn set_levels_sink(&self, _sink: Option<LevelsSink>) -> bool {
-        false
     }
 
     /// Whether the poller should stage the gapless next track as a LOCAL FILE
