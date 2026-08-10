@@ -115,6 +115,21 @@ pub mod sql {
         )
     }
 
+    /// Albums homonymes déjà rattachés à un AUTRE dossier, avec leur dossier
+    /// et les numéros de piste qu'ils occupent : de quoi décider si le dossier
+    /// courant est l'éclat d'une même compilation (#1440).
+    pub fn scattered_candidates<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT a.id, a.folder_path, \
+             (SELECT GROUP_CONCAT(t.track_number) FROM tracks t WHERE t.album_id = a.id) \
+             FROM albums a \
+             WHERE LOWER(a.title) = LOWER({}) AND a.folder_path IS NOT NULL \
+             AND a.folder_path <> {} LIMIT 50",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn get_folder_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT folder_path FROM albums WHERE id = {}",
@@ -540,8 +555,44 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, TuneError> {
+        self.get_or_create_for_folder_with_track(folder, title, artist_id, year, mbid, None)
+    }
+
+    /// Variante qui connaît le numéro de la piste en cours d'indexation, seule
+    /// information permettant de recoller une compilation éparpillée par
+    /// artiste sans risquer de fusionner deux homonymes (#1440).
+    pub fn get_or_create_for_folder_with_track(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+        track_number: Option<i32>,
+    ) -> Result<Album, TuneError> {
         if folder.is_empty() {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
+        }
+
+        // Le disque a-t-il déjà une entrée, posée par un dossier frère ? Le
+        // rangement Qobuz d'une compilation met chaque piste dans le dossier
+        // de SON artiste ; sans ce rattrapage, une anthologie de 41 titres
+        // produit 41 albums d'une piste.
+        if self.find_id_by_folder(folder)?.is_none() {
+            if let Some(id) = self.find_scattered_compilation(folder, title, track_number)? {
+                let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+                let params: [&dyn ToSqlValue; 1] = [&id];
+                if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                    tracing::debug!(
+                        album_id = id,
+                        folder,
+                        title,
+                        ?track_number,
+                        "scattered_compilation_reattached"
+                    );
+                    return Ok(row_to_album(&row));
+                }
+            }
         }
 
         if let Some(id) = self.find_id_by_folder(folder)? {
@@ -655,6 +706,52 @@ impl AlbumRepo {
     }
 
     /// The id of the album a folder holds, if one is recorded.
+    /// L'album auquel rattacher une piste dont le dossier est l'éclat d'une
+    /// compilation rangée par artiste (#1440).
+    ///
+    /// Trois conditions doivent tenir ENSEMBLE, et la troisième est celle qui
+    /// protège les homonymes : même titre, dossiers frères éparpillés (voir
+    /// [`crate::scanner::compilation::is_scattered_sibling`]), et un numéro de
+    /// piste encore libre dans l'album candidat. Deux « Greatest Hits »
+    /// distincts commencent tous deux à la piste 1 : ils ne fusionnent pas.
+    pub fn find_scattered_compilation(
+        &self,
+        folder: &str,
+        title: &str,
+        track_number: Option<i32>,
+    ) -> Result<Option<i64>, TuneError> {
+        use crate::scanner::compilation::{is_scattered_sibling, track_number_is_free};
+        if track_number.is_none() || folder.is_empty() {
+            return Ok(None);
+        }
+        let sql = self.dialect_sql(sql::scattered_candidates, sql::scattered_candidates);
+        let params: [&dyn ToSqlValue; 2] = [&title, &folder];
+        for row in self.db.query_many_strong(&sql, &params)? {
+            let Some(id) = row.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(cand_folder) = row.get(1).and_then(|v| v.as_str()).map(String::from) else {
+                continue;
+            };
+            if !is_scattered_sibling(folder, &cand_folder) {
+                continue;
+            }
+            let taken: Vec<i32> = row
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|csv| {
+                    csv.split(',')
+                        .filter_map(|n| n.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if track_number_is_free(track_number, &taken) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn find_id_by_folder(&self, folder: &str) -> Result<Option<i64>, TuneError> {
         let sql = self.dialect_sql(sql::get_id_by_folder, sql::get_id_by_folder);
         let params: [&dyn ToSqlValue; 1] = [&folder];
@@ -1361,6 +1458,7 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::Artist;
@@ -1369,6 +1467,105 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// Pose une piste numérotée sur un album, comme le fait le scan.
+    fn seed_track(db: &SqliteDb, album_id: i64, artist_id: i64, n: i32, path: &str) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let mut t = Track::new(format!("piste {n}"));
+        t.album_id = Some(album_id);
+        t.artist_id = Some(artist_id);
+        t.track_number = n;
+        t.file_path = Some(path.into());
+        TrackRepo::new(db.clone()).create(&t).unwrap();
+    }
+
+    /// #1440 — cas RÉEL : l'anthologie « OUF » rangée par artiste de piste
+    /// (chemins relevés sur .18). Deux dossiers frères, deux numéros
+    /// distincts ⇒ un seul album, pas deux.
+    #[test]
+    fn a_scattered_anthology_lands_in_one_album() {
+        const TITLE: &str = "OUF L'anthologie Souterraine 2015-2017";
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("Corte Real".into())).unwrap();
+        let a2 = artists.create(&Artist::new("Alligator".into())).unwrap();
+        let f1 = format!("/mnt/recordings_usb/Qobuz/Corte Real/{TITLE}");
+        let f2 = format!("/mnt/recordings_usb/Qobuz/Alligator/{TITLE}");
+
+        let first = arepo
+            .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1))
+            .unwrap();
+        seed_track(
+            &db,
+            first.id.unwrap(),
+            a1,
+            1,
+            &format!("{f1}/01 - Opium.flac"),
+        );
+
+        let second = arepo
+            .get_or_create_for_folder_with_track(&f2, TITLE, a2, None, None, Some(3))
+            .unwrap();
+        assert_eq!(
+            second.id, first.id,
+            "la piste 3 d'un dossier frère rejoint l'album au lieu d'en créer un second"
+        );
+    }
+
+    /// #1440 — le cas inverse, tout aussi réel : Pat Benatar et Police ont
+    /// chacun leur « Greatest Hits », tous deux numérotés à partir de 1.
+    #[test]
+    fn two_real_greatest_hits_stay_apart() {
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("Pat Benatar".into())).unwrap();
+        let a2 = artists.create(&Artist::new("Police".into())).unwrap();
+        let f1 = "/data/music/NEW_FLAC/POP-ROCK/P/Pat Benatar/2005-Greatest Hits";
+        let f2 = "/data/music/NEW_FLAC/POP-ROCK/P/Police/1992-Greatest Hits";
+
+        let first = arepo
+            .get_or_create_for_folder_with_track(f1, "Greatest Hits", a1, Some(2005), None, Some(1))
+            .unwrap();
+        seed_track(
+            &db,
+            first.id.unwrap(),
+            a1,
+            1,
+            &format!("{f1}/01. Heartbreaker.flac"),
+        );
+
+        let second = arepo
+            .get_or_create_for_folder_with_track(f2, "Greatest Hits", a2, Some(1992), None, Some(1))
+            .unwrap();
+        assert_ne!(
+            second.id, first.id,
+            "deux disques homonymes restent deux albums"
+        );
+    }
+
+    /// Forme fraternelle mais numéro déjà occupé : c'est un homonyme, pas un
+    /// éclat. C'est ce garde-fou qui rend la fusion sûre.
+    #[test]
+    fn a_taken_track_number_blocks_the_merge() {
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("A".into())).unwrap();
+        let a2 = artists.create(&Artist::new("B".into())).unwrap();
+
+        let first = arepo
+            .get_or_create_for_folder_with_track("/r/A/Live", "Live", a1, None, None, Some(1))
+            .unwrap();
+        seed_track(&db, first.id.unwrap(), a1, 1, "/r/A/Live/01.flac");
+
+        let second = arepo
+            .get_or_create_for_folder_with_track("/r/B/Live", "Live", a2, None, None, Some(1))
+            .unwrap();
+        assert_ne!(second.id, first.id);
     }
 
     #[test]
