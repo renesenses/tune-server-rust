@@ -451,12 +451,16 @@ impl TrackImporter {
                 }
                 Some(c)
             } else {
-                let result = self.album_repo.get_or_create_for_folder(
+                let result = self.album_repo.get_or_create_for_folder_with_track(
                     &key.0,
                     &key.1,
                     key.2,
                     key.3,
                     meta.musicbrainz_release_id.as_deref(),
+                    // Le numéro de piste sert UNIQUEMENT à décider si ce
+                    // dossier est l'éclat d'une compilation déjà indexée
+                    // (#1440) : un numéro déjà pris ⇒ homonyme, pas éclat.
+                    meta.track_number.map(|n| n as i32),
                 );
                 if let Err(ref e) = result {
                     tracing::warn!(
