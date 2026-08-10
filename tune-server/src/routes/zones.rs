@@ -794,6 +794,24 @@ fn build_signal_path(
     let dlna_wav24 = is_network_output
         && bit_depth > 16
         && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
+    // Même règle que l'orchestrateur, par la MÊME fonction : sur une source
+    // FLAC dont la zone demande le FLAC natif, le forçage WAV ne s'applique pas
+    // — il vise le décodeur ALAC du renderer. Sans ce miroir, le chemin du
+    // signal annoncerait un transcodage vers WAV là où le fil porte du FLAC,
+    // c'est-à-dire exactement le genre d'affichage inventé que ce dépôt traque.
+    let source_is_flac = source_format == Some(AudioFormat::Flac);
+    let native_flac_opt_in =
+        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_native_flac(zone_id);
+    let dlna_lpcm = tune_core::orchestrator::wav_override_applies(
+        dlna_lpcm,
+        source_is_flac,
+        native_flac_opt_in,
+    );
+    let dlna_wav24 = tune_core::orchestrator::wav_override_applies(
+        dlna_wav24,
+        source_is_flac,
+        native_flac_opt_in,
+    );
     let alac_passthrough = source_format == Some(AudioFormat::Alac)
         && is_network_output
         && !dlna_lpcm

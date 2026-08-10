@@ -155,6 +155,31 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
 
+/// Le forçage WAV d'une zone s'applique-t-il à CETTE source ?
+///
+/// « Forcer le WAV » (`dlna_lpcm` / `dlna_wav24`) existe pour contourner le
+/// décodeur ALAC du renderer — le LHC-56 de Yves claque au démarrage sur de
+/// l'ALAC direct. L'appliquer aussi aux sources FLAC est un dommage
+/// collatéral, jamais l'objectif.
+///
+/// Tant que les deux réglages s'excluaient, « Forcer le WAV » l'emportait en
+/// silence sur « FLAC natif » : un FLAC partait en WAV sans que rien ne
+/// l'explique, et l'utilisateur en déduisait que Tune gardait en mémoire les
+/// réglages du morceau précédent (forum #1437). Les deux cases décrivent en
+/// réalité deux sources différentes et peuvent coexister : l'ALAC part en WAV,
+/// le FLAC reste du FLAC.
+///
+/// L'exception exige l'opt-in `dlna_native_flac`. Sans lui, une source FLAC
+/// continue de suivre le forçage — ce dont ont besoin les renderers qui ne
+/// savent pas lire le FLAC.
+pub fn wav_override_applies(
+    force_wav_requested: bool,
+    source_is_flac: bool,
+    native_flac_opt_in: bool,
+) -> bool {
+    force_wav_requested && !(source_is_flac && native_flac_opt_in)
+}
+
 /// Pas d'attente pendant les phases pause / pré-démarrage du forwarder de
 /// niveaux : assez court pour réagir vite, assez long pour ne pas marteler
 /// le mutex des zones.
@@ -2597,7 +2622,29 @@ impl PlaybackOrchestrator {
             && bit_depth > 16
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
         // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
-        let dlna_force_wav = dlna_lpcm || dlna_wav24;
+        //
+        // …SAUF sur une source FLAC dont la zone demande explicitement le FLAC
+        // natif. Le forçage WAV existe pour contourner le décodeur ALAC du
+        // renderer (LHC-56 qui claque au démarrage, cf. le commentaire de
+        // `dlna_lpcm` ci-dessus) : l'appliquer aussi au FLAC est un dommage
+        // collatéral, jamais l'objectif.
+        //
+        // Sans cette exception, les deux réglages se contredisent et c'est le
+        // WAV qui gagne en silence : Yves a lu un FLAC transcodé en WAV alors
+        // que « FLAC natif » était coché, et en a conclu que Tune gardait en
+        // mémoire les réglages du morceau précédent (forum #1437). Les deux
+        // cases décrivent en fait deux sources différentes, et peuvent donc
+        // coexister — l'ALAC part en WAV, le FLAC reste du FLAC.
+        //
+        // L'exception exige l'opt-in `dlna_native_flac` : sans lui, une source
+        // FLAC continue de suivre le forçage, ce dont ont besoin les renderers
+        // qui ne savent pas lire le FLAC.
+        let dlna_force_wav = wav_override_applies(
+            dlna_lpcm || dlna_wav24,
+            source_format == Some(AudioFormat::Flac),
+            is_network_output
+                && ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id),
+        );
         // Opt-in per zone: cap output to 16-bit. Some renderers advertise
         // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode
         // 16-bit internally — 24-bit direct plays SILENCE (Ruark R3, Yves #1137).
@@ -7852,6 +7899,39 @@ mod transcode_budget_tests {
         let huge_gib = 100.0_f64;
         let computed = (120 + (huge_gib * 120.0).round() as u64).min(ceiling);
         assert_eq!(computed, ceiling);
+    }
+}
+
+#[cfg(test)]
+mod wav_override_tests {
+    use super::wav_override_applies;
+
+    /// Le cas de Yves (#1437) : les deux cases cochées, une source FLAC.
+    /// Avant, le WAV gagnait en silence et le FLAC natif ne servait à rien.
+    #[test]
+    fn flac_source_with_native_flac_opt_in_keeps_flac() {
+        assert!(!wav_override_applies(true, true, true));
+    }
+
+    /// La même zone, une source ALAC : le forçage WAV garde tout son sens,
+    /// c'est même sa raison d'être (décodeur ALAC du renderer).
+    #[test]
+    fn alac_source_still_goes_to_wav() {
+        assert!(wav_override_applies(true, false, true));
+    }
+
+    /// Sans l'opt-in, une source FLAC suit le forçage comme avant — c'est ce
+    /// dont ont besoin les renderers qui ne lisent pas le FLAC.
+    #[test]
+    fn flac_source_without_opt_in_still_follows_the_override() {
+        assert!(wav_override_applies(true, true, false));
+    }
+
+    /// Aucun forçage demandé : rien à neutraliser, dans les deux sens.
+    #[test]
+    fn no_override_requested_stays_off() {
+        assert!(!wav_override_applies(false, true, true));
+        assert!(!wav_override_applies(false, false, false));
     }
 }
 
