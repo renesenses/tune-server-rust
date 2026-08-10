@@ -64,6 +64,20 @@ pub async fn generate_similar_artists_queue(
     seed_artist: &str,
     count: usize,
 ) -> Vec<Value> {
+    let names = similar_artist_names(db, seed_artist, 20).await;
+    if names.is_empty() {
+        return Vec::new();
+    }
+    tracks_for_artist_names(db, &names, 2, count)
+}
+
+/// Similar-artist names for a seed, from the enrichment API. Shared by the
+/// local and streaming radios so they agree on « qui ressemble à qui ».
+pub async fn similar_artist_names(
+    db: &std::sync::Arc<dyn DbBackend>,
+    seed_artist: &str,
+    max: usize,
+) -> Vec<String> {
     let api_base = crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
         .get("artist_enrichment_api")
         .ok()
@@ -78,11 +92,45 @@ pub async fn generate_similar_artists_queue(
         .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_owned))
         .filter(|n| !n.eq_ignore_ascii_case(seed_artist))
         .collect();
-    names.truncate(20);
-    if names.is_empty() {
-        return Vec::new();
+    names.truncate(max);
+    names
+}
+
+/// Pick one track per similar artist from a streaming service's search.
+///
+/// The local radio can only ever queue what the library holds: it turns
+/// artist names into `SELECT ... FROM tracks`. Someone who listens to Qobuz
+/// without a local library therefore got an empty queue and silence at the end
+/// of the album — the seed was handled, the results were not.
+///
+/// `search` is the service's own search, injected rather than taken from the
+/// registry, so this stays testable without a network or a subscription.
+///
+/// A search that returns nothing for an artist is skipped, not fatal: a radio
+/// of nine tracks beats no radio at all.
+pub async fn streaming_tracks_for_artist_names<F, Fut>(
+    names: &[String],
+    count: usize,
+    mut search: F,
+) -> Vec<crate::streaming::traits::StreamTrack>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Vec<crate::streaming::traits::StreamTrack>>,
+{
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in names {
+        if out.len() >= count {
+            break;
+        }
+        let found = search(name.clone()).await;
+        // One track per artist: a radio that plays four titles by the same
+        // artist in a row is a playlist, not a radio.
+        if let Some(t) = found.into_iter().find(|t| seen.insert(t.id.clone())) {
+            out.push(t);
+        }
     }
-    tracks_for_artist_names(db, &names, 2, count)
+    out
 }
 
 pub fn generate_queue(
@@ -183,6 +231,70 @@ pub fn generate_queue(
 mod tests {
     use super::*;
     use crate::db::sqlite::SqliteDb;
+
+    fn stream_track(id: &str, artist: &str) -> crate::streaming::traits::StreamTrack {
+        crate::streaming::traits::StreamTrack {
+            id: id.into(),
+            title: format!("Titre {id}"),
+            artist: artist.into(),
+            album: None,
+            album_id: None,
+            duration_ms: 200_000,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            quality: None,
+            isrc: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_radio_takes_one_track_per_artist() {
+        let names: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+        let got = streaming_tracks_for_artist_names(&names, 10, |name| async move {
+            // Chaque artiste renvoie trois titres : la radio n'en garde qu'un,
+            // sinon elle enchaîne quatre morceaux du même artiste et devient
+            // une playlist.
+            (0..3)
+                .map(|i| stream_track(&format!("{name}{i}"), &name))
+                .collect()
+        })
+        .await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].artist, "A");
+        assert_eq!(got[1].artist, "B");
+        assert_eq!(got[2].artist, "C");
+    }
+
+    #[tokio::test]
+    async fn streaming_radio_stops_at_count_and_skips_empty_results() {
+        let names: Vec<String> = ["A", "B", "C", "D"].iter().map(|s| s.to_string()).collect();
+        // B ne renvoie rien : on saute, on ne s'arrête pas.
+        let got = streaming_tracks_for_artist_names(&names, 2, |name| async move {
+            if name == "B" {
+                Vec::new()
+            } else {
+                vec![stream_track(&format!("{name}0"), &name)]
+            }
+        })
+        .await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].artist, "A");
+        assert_eq!(got[1].artist, "C");
+    }
+
+    #[tokio::test]
+    async fn streaming_radio_never_repeats_the_same_track_id() {
+        // Deux artistes différents qui renvoient le MÊME enregistrement
+        // (compilation, featuring) : il ne doit apparaître qu'une fois.
+        let names: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let got = streaming_tracks_for_artist_names(&names, 10, |name| async move {
+            vec![stream_track("meme-id", &name)]
+        })
+        .await;
+        assert_eq!(got.len(), 1);
+    }
 
     fn test_db() -> std::sync::Arc<dyn crate::db::backend::DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
