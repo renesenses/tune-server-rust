@@ -15,6 +15,7 @@ Required env vars:
 """
 import json
 import os
+import re
 import sys
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -117,8 +118,78 @@ def create_github_issue(title, body, labels):
     )
 
 
+def list_open_forum_issues():
+    """Issues ouvertes portant le label `forum-feedback`, page par page."""
+    out, page = [], 1
+    while True:
+        batch = http_get(
+            f"{GITHUB_API}/repos/{REPO}/issues"
+            f"?state=open&labels=forum-feedback&per_page=100&page={page}",
+            {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+        )
+        if not batch:
+            break
+        # L'API `issues` renvoie aussi les pull requests : on les écarte.
+        out.extend(i for i in batch if "pull_request" not in i)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def close_issue(number, comment):
+    http_post(
+        f"{GITHUB_API}/repos/{REPO}/issues/{number}/comments",
+        {"body": comment},
+        {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+    )
+    http_patch(
+        f"{GITHUB_API}/repos/{REPO}/issues/{number}",
+        {"state": "closed", "state_reason": "completed"},
+        {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+    )
+
+
+def close_issues_for_resolved_threads(threads):
+    """Ferme les issues dont le fil forum est passé à `resolved`.
+
+    Sans cela, le dépôt accumule indéfiniment : le watcher crée une issue par
+    fil mais rien ne la referme jamais. Au 2026-08-10, **309 des 563 issues
+    ouvertes** avaient leur fil déjà résolu — plus d'une sur deux ne
+    correspondait à rien de vivant, et le backlog en devenait inexploitable.
+
+    Seul `resolved` ferme. Un fil `closed` reste ouvert ici volontairement :
+    c'est le statut posé quand on renvoie le suivi vers GitHub en disant au
+    testeur « le sujet n'est pas réglé, il vit désormais dans l'issue » —
+    la fermer trahirait la promesse faite.
+    """
+    resolved = {
+        t.get("slug"): t
+        for t in threads
+        if t.get("slug") and t.get("status") == "resolved"
+    }
+    if not resolved:
+        return 0
+    closed = 0
+    for issue in list_open_forum_issues():
+        m = re.search(r"forum/thread[s]?/([A-Za-z0-9\-]+)", issue.get("body") or "")
+        if not m or m.group(1) not in resolved:
+            continue
+        try:
+            close_issue(
+                issue["number"],
+                "Fermeture automatique : le fil forum d'origine est passé à "
+                "**résolu**.\n\nSi le défaut existe encore, rouvrez cette issue "
+                "ou ouvrez un nouveau fil — le forum reste la porte d'entrée.",
+            )
+            print(f"Closed issue #{issue['number']} (thread resolved)")
+            closed += 1
+        except Exception as e:
+            print(f"Failed to close issue #{issue['number']}: {e}", file=sys.stderr)
+    return closed
+
+
 def strip_html(text):
-    import re
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
@@ -197,10 +268,17 @@ def main():
         except Exception as e:
             print(f"Failed to create issue for reply: {e}", file=sys.stderr)
 
+    # Refermer ce qui a été résolu côté forum, sinon le dépôt accumule.
+    try:
+        closed = close_issues_for_resolved_threads(threads)
+    except Exception as e:
+        closed = 0
+        print(f"close pass failed: {e}", file=sys.stderr)
+
     state = {"last_thread_id": max_thread_id, "thread_reply_counts": new_reply_counts}
     save_state(state)
 
-    print(f"Done. {created} new GitHub issue(s) created.")
+    print(f"Done. {created} new issue(s) created, {closed} closed.")
 
 
 if __name__ == "__main__":
