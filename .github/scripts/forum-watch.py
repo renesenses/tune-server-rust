@@ -23,6 +23,9 @@ from urllib.error import HTTPError
 FORUM_BASE = "https://mozaiklabs.fr/api/v1/forum"
 GITHUB_API = "https://api.github.com"
 
+# Label d'exemption : une issue qui le porte n'est jamais refermée automatiquement.
+KEEP_OPEN_LABEL = "keep-open"
+
 FORUM_TOKEN = os.environ["FORUM_TOKEN"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID", "")
@@ -162,6 +165,12 @@ def close_issues_for_resolved_threads(threads):
     c'est le statut posé quand on renvoie le suivi vers GitHub en disant au
     testeur « le sujet n'est pas réglé, il vit désormais dans l'issue » —
     la fermer trahirait la promesse faite.
+
+    Le label `keep-open` exempte une issue de cette passe. Sans lui, aucune
+    décision humaine ne survivait : garder délibérément une issue ouverte alors
+    que son fil est résolu — le temps d'une relecture, ou parce que le défaut
+    persiste malgré ce qu'en pense l'auteur du fil — était défait à l'exécution
+    suivante, en silence et sans recours.
     """
     resolved = {
         t.get("slug"): t
@@ -172,6 +181,9 @@ def close_issues_for_resolved_threads(threads):
         return 0
     closed = 0
     for issue in list_open_forum_issues():
+        labels = {l.get("name") for l in issue.get("labels") or []}
+        if KEEP_OPEN_LABEL in labels:
+            continue
         m = re.search(r"forum/thread[s]?/([A-Za-z0-9\-]+)", issue.get("body") or "")
         if not m or m.group(1) not in resolved:
             continue
