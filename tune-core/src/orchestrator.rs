@@ -5972,13 +5972,7 @@ impl PlaybackOrchestrator {
     /// convolver (in the local output). Bertrand: "PURE doit désactiver toutes
     /// les modifs".
     fn zone_audiophile(&self, zone_id: i64) -> bool {
-        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
-            .get(&format!("zone_{zone_id}_audiophile"))
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
-            .unwrap_or(false)
+        crate::audio::audiophile::zone_enabled(&self.db, zone_id)
     }
 
     /// True when the zone has an ENABLED equalizer profile with an audible
