@@ -1193,6 +1193,109 @@ fn merge_scattered_compilations(db: &SqliteDb) {
     if merged > 0 {
         info!(merged, "scattered_compilations_merged");
     }
+
+    split_wrongly_merged_albums(db);
+}
+
+/// Redécoupe les albums fusionnés à tort par la régression des 0.9.66/0.9.67
+/// (#1470) : un même album y porte les pistes de plusieurs disques.
+///
+/// Recoller ne suffit pas — les bibliothèques déjà rescannées ont le problème
+/// INVERSE. Sur .18, les quatre volumes « ALLOPOP » tiennent dans un album de
+/// 71 pistes, chaque numéro en quatre exemplaires.
+///
+/// Critère unique, le même que partout ailleurs : la pochette déposée dans le
+/// dossier de chaque piste. Deux pochettes dans un album ⇒ deux disques. Le
+/// plus gros groupe reste sur la ligne d'origine, qui garde ainsi sa pochette,
+/// sa biographie et sa note ; les autres reçoivent une ligne neuve.
+///
+/// Une piste dont le dossier n'a pas de pochette ne bouge pas : on ne devine
+/// pas à quel disque la rattacher.
+fn split_wrongly_merged_albums(db: &SqliteDb) {
+    use crate::scanner::compilation::folder_cover_fingerprint;
+    use std::collections::HashMap;
+
+    // album -> empreinte -> pistes
+    let mut par_album: HashMap<i64, HashMap<String, Vec<i64>>> = HashMap::new();
+    {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT t.id, t.album_id, t.file_path FROM tracks t \
+             WHERE t.album_id IS NOT NULL AND t.file_path IS NOT NULL",
+        ) else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        for (track_id, album_id, path) in rows.filter_map(Result::ok) {
+            let Some(folder) = crate::scanner::album_folder::album_folder(&path) else {
+                continue;
+            };
+            let Some(empreinte) = folder_cover_fingerprint(&folder) else {
+                continue;
+            };
+            par_album
+                .entry(album_id)
+                .or_default()
+                .entry(empreinte)
+                .or_default()
+                .push(track_id);
+        }
+    }
+
+    let mut separes = 0usize;
+    for (album_id, groupes) in par_album {
+        if groupes.len() < 2 {
+            continue;
+        }
+        // Le plus gros groupe garde la ligne d'origine.
+        let mut groupes: Vec<(String, Vec<i64>)> = groupes.into_iter().collect();
+        groupes.sort_by_key(|(_, pistes)| std::cmp::Reverse(pistes.len()));
+        let conn = db.connection().lock().unwrap();
+        let Ok((titre, artist_id, year)) = conn.query_row(
+            "SELECT title, artist_id, year FROM albums WHERE id = ?",
+            [album_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        ) else {
+            continue;
+        };
+        for (_, pistes) in groupes.iter().skip(1) {
+            let params: [&dyn rusqlite::types::ToSql; 3] = [&titre, &artist_id, &year];
+            if conn
+                .execute(
+                    "INSERT INTO albums (title, artist_id, year) VALUES (?, ?, ?)",
+                    &params[..],
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let nouveau = conn.last_insert_rowid();
+            for piste in pistes {
+                let params: [&dyn rusqlite::types::ToSql; 2] = [&nouveau, piste];
+                conn.execute("UPDATE tracks SET album_id = ? WHERE id = ?", &params[..])
+                    .ok();
+            }
+            separes += 1;
+        }
+    }
+
+    if separes > 0 {
+        info!(separes, "wrongly_merged_albums_split");
+    }
 }
 
 /// Fold same-titled albums that share a folder back into one row.
@@ -2518,6 +2621,69 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pistes, 5, "aucune piste perdue au passage");
+    }
+
+    /// LE DÉGÂT DÉJÀ FAIT par les 0.9.66/0.9.67 : quatre volumes écrasés en UN
+    /// SEUL album (#1470). La migration de rattrapage sait recoller ce qui est
+    /// éparpillé — sait-elle SÉPARER ce qui a été fusionné à tort ?
+    ///
+    /// Reproduit l'état de .18 : un album, des pistes venues de dossiers aux
+    /// pochettes différentes, et des numéros en double.
+    #[test]
+    fn an_album_wrongly_merged_is_split_back_by_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Un seul album, quatre volumes dedans, chaque numéro en double.
+        let album_id = {
+            let conn = db.connection().lock().unwrap();
+            let premier = dir.path().join("Diane").join("ALLOPOP");
+            std::fs::create_dir_all(&premier).unwrap();
+            std::fs::write(premier.join("cover.jpg"), b"IMAGE-VOL-0").unwrap();
+            conn.execute(
+                "INSERT INTO albums (title, folder_path) VALUES ('ALLOPOP', ?)",
+                rusqlite::params![premier.to_string_lossy()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        for (vol, artiste, num) in [
+            (0usize, "Diane", 1),
+            (1, "Tristan", 1),
+            (2, "Nina", 1),
+            (3, "Oscar", 1),
+        ] {
+            let d = dir.path().join(artiste).join("ALLOPOP");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("cover.jpg"), format!("IMAGE-VOL-{vol}")).unwrap();
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    artiste,
+                    album_id,
+                    num,
+                    format!("{}/01.flac", d.to_string_lossy())
+                ],
+            )
+            .unwrap();
+        }
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let albums: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title='ALLOPOP'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            albums, 4,
+            "un album fusionné à tort doit être redécoupé selon les pochettes"
+        );
     }
 
     /// #1440 — cas RÉEL inverse : deux « Greatest Hits » d'artistes différents,
