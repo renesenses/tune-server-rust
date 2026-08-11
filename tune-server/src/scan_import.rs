@@ -628,6 +628,54 @@ mod tests {
         }
     }
 
+    /// LE CAS RÉEL de .18, joué au niveau de l'import (#1440).
+    ///
+    /// Quatre volumes « ALLOPOP », un dossier par artiste de piste, tous
+    /// tagués `ALBUMARTIST = La Souterraine` et sans année. Observé en
+    /// production : un seul album de 71 pistes. Le dépôt, lui, sépare
+    /// correctement — donc si ce test échoue, la fusion vient d'ici.
+    #[test]
+    fn four_volumes_of_one_title_do_not_collapse_at_import() {
+        use std::sync::Arc;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let mut imp = TrackImporter::new(backend.clone(), true, tmp.path().to_path_buf());
+
+        let mut fichiers = Vec::new();
+        for (vol, artiste) in ["Diane", "Tristan", "Nina", "Oscar"].iter().enumerate() {
+            let d = tmp.path().join(artiste).join("ALLOPOP");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("cover.jpg"), format!("IMAGE-VOL-{vol}")).unwrap();
+            let chemin = d.join("01 - titre.flac").to_string_lossy().into_owned();
+            let mut f = sf(&chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("titre {vol}")),
+                artist: Some((*artiste).to_string()),
+                album: Some("ALLOPOP".into()),
+                album_artist: Some("La Souterraine".into()),
+                track_number: Some(1),
+                ..Default::default()
+            });
+            fichiers.push(f);
+        }
+
+        let mut albums = std::collections::HashSet::new();
+        for f in &fichiers {
+            let (piste, _) = imp.import(f).expect("import");
+            albums.insert(piste.album_id);
+        }
+
+        assert_eq!(
+            albums.len(),
+            4,
+            "quatre dossiers, quatre pochettes ⇒ quatre albums (obtenu : {albums:?})"
+        );
+    }
+
     #[test]
     fn build_genres_json_prefers_parsed_list() {
         let g = build_genres_json(&["Jazz".into(), "Fusion".into()], Some("ignored"));
