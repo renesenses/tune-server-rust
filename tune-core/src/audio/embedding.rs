@@ -23,6 +23,36 @@ use crate::db::track_metadata_repo::TrackMetadataRepo;
 const TRACK_BATCH: usize = 32;
 /// Pause between files so the background pass never saturates the CPU.
 const PER_FILE_PAUSE_MS: u64 = 50;
+
+/// Réglage de débit de la passe acoustique : combien de machine elle a le droit
+/// de prendre. L'analyse décode dix secondes par piste et fait tourner un
+/// réseau de neurones dessus ; sur un Raspberry Pi ou un serveur qui sert aussi
+/// la musique, la cadence par défaut se remarque à l'oreille comme au
+/// ventilateur.
+///
+/// Le levier est la pause entre deux fichiers, pas un nombre de fils : la passe
+/// est déjà séquentielle, et allonger la pause laisse la main au reste du
+/// serveur sans jamais rien interrompre en cours de route.
+const THROTTLE_KEY: &str = "audio_embedding_throttle";
+
+/// Pause entre deux fichiers selon le réglage. `eco` divise la charge par huit
+/// environ, `rapide` enchaîne sans pause — à réserver à une machine dédiée ou à
+/// une nuit d'analyse.
+fn per_file_pause_ms(settings: &crate::db::settings_repo::SettingsRepo) -> u64 {
+    match settings
+        .get(THROTTLE_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        .unwrap_or("equilibre")
+    {
+        "eco" => 400,
+        "rapide" => 0,
+        // Toute valeur inconnue retombe sur l'équilibre : un réglage mal écrit
+        // ne doit pas mettre la machine à genoux.
+        _ => PER_FILE_PAUSE_MS,
+    }
+}
 /// Sentinel key stamped on every processed track (success OR failure) so an
 /// undecodable file is not retried forever — same idiom as `rg_analyzed`. Its
 /// *value* is the `MODEL_ID` it was analysed under, so a model bump invalidates
@@ -245,7 +275,14 @@ pub async fn analyze_embedding_batch(
         // (until the next model bump) instead of being retried every pass.
         let _ = repo.set(track_id, SENTINEL, MODEL_ID);
         done += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
+        // Relu à chaque fichier : baisser le débit pendant que l'analyse tourne
+        // doit se sentir tout de suite, pas au prochain démarrage du serveur.
+        let pause = per_file_pause_ms(&crate::db::settings_repo::SettingsRepo::with_backend(
+            backend.clone(),
+        ));
+        if pause > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(pause)).await;
+        }
     }
 
     info!(embedded = done, "audio_embedding_batch");
