@@ -31,6 +31,27 @@ pub async fn ensure_loaded(cache_root: &Path) -> Result<(), String> {
     RUNTIME_LOADED
         .get_or_try_init(|| async {
             let dylib = ensure_runtime(cache_root).await?;
+            // Ceinture et bretelles pour le plafond de fils. `ort` documente que
+            // `with_intra_threads` est SANS EFFET si onnxruntime a été compilé
+            // avec OpenMP — et c'est justement les binaires préconstruits de
+            // Microsoft que l'on provisionne. Dans ce cas seule
+            // `OMP_NUM_THREADS` compte, et elle doit être posée AVANT que le
+            // moteur ne crée son pool, donc avant `init_from`.
+            //
+            // On ne l'écrase jamais : un opérateur qui l'a réglée à la main sur
+            // sa machine a le dernier mot. Sinon, la moitié des cœurs — le même
+            // arbitrage que le réglage `equilibre` de la passe acoustique.
+            if std::env::var_os("OMP_NUM_THREADS").is_none() {
+                let half = (std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    / 2)
+                .max(1);
+                // SAFETY: on est avant toute création de pool par onnxruntime,
+                // et `RUNTIME_LOADED` garantit qu'un seul fil passe ici.
+                unsafe { std::env::set_var("OMP_NUM_THREADS", half.to_string()) };
+                tracing::info!(omp_num_threads = half, "audio_runtime_omp_capped");
+            }
             ort::init_from(&dylib)
                 .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
                 .commit();
