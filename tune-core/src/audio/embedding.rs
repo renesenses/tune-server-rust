@@ -30,10 +30,53 @@ const PER_FILE_PAUSE_MS: u64 = 50;
 /// la musique, la cadence par défaut se remarque à l'oreille comme au
 /// ventilateur.
 ///
-/// Le levier est la pause entre deux fichiers, pas un nombre de fils : la passe
-/// est déjà séquentielle, et allonger la pause laisse la main au reste du
-/// serveur sans jamais rien interrompre en cours de route.
+/// Ce réglage tient DEUX leviers, et le second a été ajouté après coup parce que
+/// le premier ne suffisait pas :
+/// - [`per_file_pause_ms`] : la pause entre deux fichiers. Elle laisse la main
+///   au reste du serveur sans jamais rien interrompre en cours de route.
+/// - [`intra_threads_for`] : le nombre de fils qu'onnxruntime a le droit
+///   d'utiliser *pendant* une inférence.
+///
+/// La passe est séquentielle fichier par fichier, mais **une inférence ne l'est
+/// pas** : sans plafond, onnxruntime prend tous les cœurs. La pause seule
+/// laissait donc la machine à genoux entre deux respirations.
 const THROTTLE_KEY: &str = "audio_embedding_throttle";
+
+/// Combien de fils onnxruntime a le droit d'utiliser à l'intérieur d'une
+/// inférence, selon le même réglage que la pause entre fichiers.
+///
+/// **La pause ne bride pas ce qui chauffe.** `per_file_pause_ms` espace les
+/// fichiers ; pendant chaque inférence, onnxruntime prend par défaut *tous* les
+/// cœurs. Sur .18 (8 cœurs) une salve de 32 fichiers dure ~53 s pour 50 ms de
+/// pause par fichier : le rapport cyclique est de ~97 %. `sar` a mesuré 50 % de
+/// 8 cœurs en continu pendant 1 h 25, l'analyse acoustique et ReplayGain
+/// tournant ensemble, avant que la machine ne s'arrête net — journal interrompu
+/// en pleine ligne, aucune trace noyau, mémoire hors de cause (14 Go libres).
+/// La cause exacte de cet arrêt n'est pas établie ; ce qui l'est, c'est qu'une
+/// analyse optionnelle de fond n'a aucune raison de prendre la machine entière.
+///
+/// - `eco` : un seul fil. La machine reste entièrement disponible.
+/// - `equilibre` (défaut) : la moitié des cœurs, au moins un. Laisse de quoi
+///   décoder, servir un flux et répondre à l'interface.
+/// - `rapide` : tous les cœurs — le comportement d'avant, désormais un choix
+///   explicite et non plus le défaut silencieux.
+fn intra_threads_for(settings: &crate::db::settings_repo::SettingsRepo) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    match settings
+        .get(THROTTLE_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        .unwrap_or("equilibre")
+    {
+        "eco" => 1,
+        "rapide" => cores,
+        // Comme pour la pause : une valeur inconnue retombe sur l'équilibre.
+        _ => (cores / 2).max(1),
+    }
+}
 
 /// Pause entre deux fichiers selon le réglage. `eco` divise la charge par huit
 /// environ, `rapide` enchaîne sans pause — à réserver à une machine dédiée ou à
@@ -189,9 +232,14 @@ impl AudioEmbedder {
     /// Load the ONNX model from disk. The onnxruntime shared library must be
     /// resolvable at runtime (bundled/downloaded next to the model on the
     /// opt-in activation path).
-    pub fn load(model_path: &Path) -> Result<Self, String> {
+    /// `intra_threads` caps how many threads onnxruntime may use *inside* a
+    /// single inference. See [`intra_threads_for`] for why that matters more
+    /// than the pause between files.
+    pub fn load(model_path: &Path, intra_threads: usize) -> Result<Self, String> {
         let session = Session::builder()
             .map_err(|e| format!("ort builder: {e}"))?
+            .with_intra_threads(intra_threads)
+            .map_err(|e| format!("ort intra_threads({intra_threads}): {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| format!("ort load {}: {e}", model_path.display()))?;
         Ok(Self { session })
@@ -527,6 +575,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Same latch for "enabled but no model path": say it once, not every
         // 900 s round.
         let mut unconfigured = false;
+        // Le nombre de fils avec lequel la session courante a été bâtie, pour
+        // détecter un changement de réglage.
+        let mut loaded_threads = 0usize;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
@@ -541,24 +592,23 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 // Re-checked every pass round, which is fine-grained enough to
                 // react and coarse enough to be free.
                 let avail = available_memory_mb();
-                if let Some(mb) = avail {
-                    if mb < MIN_AVAILABLE_MB {
-                        // Log the transition, not every retry: this loop comes
-                        // round every LOW_MEMORY_RETRY_SECS and a line each time
-                        // would bury the journal on the very machine that is
-                        // already struggling.
-                        if !low_memory {
-                            low_memory = true;
-                            warn!(
-                                available_mb = mb,
-                                needed_mb = MIN_AVAILABLE_MB,
-                                "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS))
-                            .await;
-                        continue;
+                if let Some(mb) = avail
+                    && mb < MIN_AVAILABLE_MB
+                {
+                    // Log the transition, not every retry: this loop comes
+                    // round every LOW_MEMORY_RETRY_SECS and a line each time
+                    // would bury the journal on the very machine that is
+                    // already struggling.
+                    if !low_memory {
+                        low_memory = true;
+                        warn!(
+                            available_mb = mb,
+                            needed_mb = MIN_AVAILABLE_MB,
+                            "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
+                        );
                     }
+                    tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
+                    continue;
                 }
                 if low_memory {
                     low_memory = false;
@@ -566,6 +616,22 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         available_mb = avail.unwrap_or(0),
                         "audio_embed_resumed_memory_ok"
                     );
+                }
+
+                // Le nombre de fils est figé à la construction de la session.
+                // Si le réglage a changé depuis, on relâche la session pour
+                // qu'elle soit rebâtie juste en dessous — sinon le bouton de
+                // l'interface ne ferait rien tant que le serveur n'a pas
+                // redémarré, ce qui est précisément le genre de réglage qui
+                // ment.
+                let threads = intra_threads_for(&settings);
+                if embedder.is_some() && threads != loaded_threads {
+                    info!(
+                        from = loaded_threads,
+                        to = threads,
+                        "audio_embed_threads_changed_reloading"
+                    );
+                    embedder = None;
                 }
 
                 if embedder.is_none() {
@@ -601,10 +667,15 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         } else if let Err(e) = ensure_runtime_loaded(&p).await {
                             warn!(error = %e, "audio_runtime_unavailable");
                         } else {
-                            match AudioEmbedder::load(&p) {
+                            match AudioEmbedder::load(&p, threads) {
                                 Ok(e) => {
-                                    info!(model = %p.display(), "audio_embedder_loaded");
+                                    info!(
+                                        model = %p.display(),
+                                        intra_threads = threads,
+                                        "audio_embedder_loaded"
+                                    );
                                     embedder = Some(e);
+                                    loaded_threads = threads;
                                 }
                                 Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                             }
@@ -711,6 +782,69 @@ mod tests {
         );
     }
 
+    fn settings_with_throttle(v: Option<&str>) -> crate::db::settings_repo::SettingsRepo {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let repo = crate::db::settings_repo::SettingsRepo::with_backend(std::sync::Arc::new(db));
+        if let Some(v) = v {
+            repo.set(super::THROTTLE_KEY, v).unwrap();
+        }
+        repo
+    }
+
+    fn cores() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    }
+
+    #[test]
+    fn eco_uses_a_single_thread() {
+        // Le point du mode éco : la machine reste entièrement disponible.
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(Some("eco"))),
+            1
+        );
+    }
+
+    #[test]
+    fn fast_uses_every_core() {
+        // L'ancien comportement, désormais un choix explicite.
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(Some("rapide"))),
+            cores()
+        );
+    }
+
+    #[test]
+    fn default_leaves_half_the_machine_free() {
+        // Ni réglage écrit, ni valeur reconnue : la moitié des cœurs. C'est ce
+        // qui laisse de quoi décoder et servir un flux pendant l'analyse.
+        let expected = (cores() / 2).max(1);
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(None)),
+            expected
+        );
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(Some("n'importe quoi"))),
+            expected
+        );
+    }
+
+    #[test]
+    fn never_returns_zero() {
+        // Zéro signifie « débrouille-toi » pour onnxruntime, donc tous les
+        // cœurs — l'exact inverse de ce qu'on demande. Sur une machine à un
+        // seul cœur, la division doit tenir.
+        for v in [None, Some("eco"), Some("rapide"), Some("equilibre")] {
+            assert!(
+                super::intra_threads_for(&settings_with_throttle(v)) >= 1,
+                "{v:?}"
+            );
+        }
+    }
+
     #[test]
     fn quantize_i16_matches_int16_roundtrip() {
         // Exact grid points survive unchanged.
@@ -748,7 +882,7 @@ mod tests {
             .await
             .expect("provision onnxruntime");
 
-        let mut embedder = AudioEmbedder::load(&model).expect("load embedder");
+        let mut embedder = AudioEmbedder::load(&model, 1).expect("load embedder");
         // 1 s of quiet noise → a valid, finite, unit-norm embedding.
         let wav: Vec<f32> = (0..48_000)
             .map(|i| ((i % 97) as f32 / 97.0 - 0.5) * 0.01)
