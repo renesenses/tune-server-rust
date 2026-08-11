@@ -1548,9 +1548,15 @@ async fn push_device_correction(state: &AppState, zone_id: i64) {
         .ok()
         .flatten()
         .filter(|v| !v.trim().is_empty());
-    let (Some(brand), Some(model)) = (brand, model) else {
+    // L'un OU l'autre suffit. Exiger les deux écartait le cas le plus fréquent :
+    // la marque seule est corrigée, parce que c'est elle que la déduction par OUI
+    // se trompe, tandis que le modèle est généralement bien annoncé par
+    // l'appareil. Ces corrections partielles ne partaient jamais, et le catalogue
+    // communautaire — qui n'existe que pour les recueillir — s'en trouvait privé
+    // de sa matière la plus courante.
+    if brand.is_none() && model.is_none() {
         return;
-    };
+    }
 
     let zone = match ZoneRepo::with_backend(state.backend.clone()).get(zone_id) {
         Ok(Some(z)) => z,
@@ -1562,11 +1568,14 @@ async fn push_device_correction(state: &AppState, zone_id: i64) {
         .as_deref()
         .and_then(|did| devices.iter().find(|d| d.id == did));
 
+    // Le champ non corrigé part en chaîne vide et non en null : côté site, ces
+    // colonnes entrent dans la clé d'unicité, où un null est « jamais égal » —
+    // chaque renvoi créerait une ligne de plus au lieu d'incrémenter le compteur.
     let payload = json!({
         "detected_manufacturer": detected.and_then(|d| d.manufacturer.clone()),
         "detected_model": detected.and_then(|d| d.model.clone()),
-        "brand": brand,
-        "model": model,
+        "brand": brand.unwrap_or_default(),
+        "model": model.unwrap_or_default(),
         "output_type": zone.output_type,
     });
 
