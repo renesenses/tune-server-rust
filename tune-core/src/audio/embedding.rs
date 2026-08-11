@@ -66,6 +66,116 @@ const WINDOW_SAMPLES: usize = 480_000;
 /// even for hi-res PCM; anything past this is a stuck decoder, not slowness.
 const DECODE_TIMEOUT_SECS: u64 = 30;
 
+/// Memory the sweep needs available before it will start a batch.
+///
+/// Measured on .18 (2026-08-10, 16 GB, ~25 k tracks): with the sweep running the
+/// process sat between 596 MB and 1224 MB. It oscillated inside that band for
+/// two hours and came back down repeatedly — so this is a **footprint, not a
+/// leak** (#1462, where a 1.1 GB "leak" was chased that never existed). Most of
+/// it is the 287 MB model plus onnxruntime's activation arena for HTSAT-base
+/// over a 480 000-sample window.
+///
+/// 16 GB absorbs that without noticing. A 2 GB Pi or a memory-capped container
+/// does not — and there the OOM killer decides, silently, because
+/// `Restart=always` brings the server straight back with nothing said. So we
+/// decide instead: under this much available memory the sweep pauses and says
+/// why, then resumes when there is room. Set generously above the observed
+/// ceiling: being an hour late to embed costs nothing, being killed mid-write
+/// costs a database.
+const MIN_AVAILABLE_MB: u64 = 1536;
+
+/// Memory available to *this* process, in MB.
+///
+/// Order matters. Inside a container `/proc/meminfo` reports the **host's**
+/// memory, so a 1 GB-capped container would read 32 GB free and get OOM-killed
+/// anyway. The cgroup limit is the honest number when there is one; only when
+/// it is absent or unlimited (`max`) do we fall back to the host view.
+///
+/// `None` means "cannot tell" — on macOS and Windows there is no cheap
+/// equivalent of `MemAvailable`, and a guard that cannot measure must not
+/// pretend to. Those are also not the constrained targets; the Pis, the NAS
+/// boxes and the containers are all Linux.
+#[cfg(target_os = "linux")]
+fn available_memory_mb() -> Option<u64> {
+    fn read(path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    // cgroup v2, then v1, then the host.
+    cgroup_available_mb(
+        read("/sys/fs/cgroup/memory.max").as_deref(),
+        read("/sys/fs/cgroup/memory.current").as_deref(),
+    )
+    .or_else(|| {
+        cgroup_available_mb(
+            read("/sys/fs/cgroup/memory/memory.limit_in_bytes").as_deref(),
+            read("/sys/fs/cgroup/memory/memory.usage_in_bytes").as_deref(),
+        )
+    })
+    .or_else(|| mem_available_mb(read("/proc/meminfo").as_deref()?))
+}
+
+/// Headroom left inside a cgroup memory cap, in MB, from the raw contents of
+/// its limit and usage files.
+///
+/// `None` when there is no usable cap — the file is missing, unparseable, holds
+/// cgroup v2's literal `max`, or holds v1's "unlimited" sentinel (`i64::MAX`
+/// rounded down to a page, so absurdly large rather than a round number). In
+/// all of those cases the caller must fall through to the host's own view
+/// rather than invent a limit.
+/// Only *called* on Linux, but deliberately compiled everywhere so its tests
+/// run on every platform — the parsing is where the bugs live, and gating it
+/// out of the macOS/Windows builds would mean it is only ever exercised on
+/// the one platform nobody develops on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_available_mb(limit: Option<&str>, usage: Option<&str>) -> Option<u64> {
+    let limit: u64 = limit?.trim().parse().ok()?;
+    let usage: u64 = usage?.trim().parse().ok()?;
+    if limit >= (1 << 62) {
+        return None;
+    }
+    Some(limit.saturating_sub(usage) / (1024 * 1024))
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in MB.
+///
+/// `MemAvailable`, not `MemFree`: the kernel's own estimate of what a new
+/// allocation can actually get, page cache included. `MemFree` on a server that
+/// has been up for a week reads near zero and would pause the sweep forever.
+/// Only *called* on Linux, but deliberately compiled everywhere so its tests
+/// run on every platform — the parsing is where the bugs live, and gating it
+/// out of the macOS/Windows builds would mean it is only ever exercised on
+/// the one platform nobody develops on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mem_available_mb(meminfo: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_memory_mb() -> Option<u64> {
+    None
+}
+
+/// Resident size of this process in MB, for the batch log. Diagnostic only —
+/// never a decision input. On 2026-08-10 the absence of this number is what let
+/// a correlation ("memory rises while the pass runs") stand in for a cause.
+#[cfg(target_os = "linux")]
+fn process_rss_mb() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4 / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_mb() -> Option<u64> {
+    None
+}
+
 // Storage layout, constants and cosine live in the always-compiled read side.
 use super::embedding_store::{self, EMBED_DIM, MODEL_ID};
 
@@ -285,12 +395,25 @@ pub async fn analyze_embedding_batch(
         }
     }
 
-    info!(embedded = done, "audio_embedding_batch");
+    // Carry the memory figures on every batch. On 2026-08-10 the sweep's cost
+    // had to be reconstructed after the fact from a 5-minute process-wide RSS
+    // sampler, which is what let "memory rises while the pass runs" pass for a
+    // cause (#1462). Now the pass states its own cost, batch by batch.
+    info!(
+        embedded = done,
+        rss_mb = process_rss_mb().unwrap_or(0),
+        available_mb = available_memory_mb().unwrap_or(0),
+        "audio_embedding_batch"
+    );
     done
 }
 
 /// Idle wait when disabled or the sweep is drained.
 const IDLE_SLEEP_SECS: u64 = 900;
+/// Wait between retries while the memory budget holds the sweep back. Long
+/// enough not to spin, short enough that the sweep resumes on its own once
+/// whatever was using the memory (a scan, a transcode) has finished.
+const LOW_MEMORY_RETRY_SECS: u64 = 300;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
 const ENABLED_KEY: &str = "audio_embedding_enabled";
 /// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
@@ -397,9 +520,51 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         let mut embedder: Option<AudioEmbedder> = None;
+        // Whether we are currently held back by the memory budget, so the
+        // warning is logged on the way in and the recovery on the way out —
+        // once each, not once per retry.
+        let mut low_memory = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
+                // Memory budget, checked BEFORE the model is fetched or the ORT
+                // session built — those are themselves most of the footprint
+                // (287 MB on disk, more once resident), so a box that cannot
+                // afford the sweep must not download a third of a gigabyte and
+                // build a session only to give up afterwards.
+                //
+                // The sweep is the heaviest thing this server does and it is
+                // entirely optional: pausing it always beats being killed.
+                // Re-checked every pass round, which is fine-grained enough to
+                // react and coarse enough to be free.
+                let avail = available_memory_mb();
+                if let Some(mb) = avail {
+                    if mb < MIN_AVAILABLE_MB {
+                        // Log the transition, not every retry: this loop comes
+                        // round every LOW_MEMORY_RETRY_SECS and a line each time
+                        // would bury the journal on the very machine that is
+                        // already struggling.
+                        if !low_memory {
+                            low_memory = true;
+                            warn!(
+                                available_mb = mb,
+                                needed_mb = MIN_AVAILABLE_MB,
+                                "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS))
+                            .await;
+                        continue;
+                    }
+                }
+                if low_memory {
+                    low_memory = false;
+                    info!(
+                        available_mb = avail.unwrap_or(0),
+                        "audio_embed_resumed_memory_ok"
+                    );
+                }
+
                 if embedder.is_none() {
                     if let Some(p) = configured_model_path(&settings) {
                         if let Err(e) = ensure_model(&p).await {
@@ -451,6 +616,70 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!((m[0] - 0.5).abs() < 1e-4);
         assert!((m[1] + 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cgroup_cap_reports_headroom() {
+        // 1 GiB cap, 256 MiB used → 768 MiB left. This is the container case
+        // that /proc/meminfo gets wrong: the host may have 32 GB free while
+        // this process has 768 MB before the OOM killer arrives.
+        let mb = super::cgroup_available_mb(Some("1073741824\n"), Some("268435456\n"));
+        assert_eq!(mb, Some(768));
+    }
+
+    #[test]
+    fn cgroup_unlimited_falls_through() {
+        // cgroup v2 writes the literal "max"...
+        assert_eq!(super::cgroup_available_mb(Some("max\n"), Some("100")), None);
+        // ...and v1 an i64::MAX-ish sentinel. Neither is a real cap, so both
+        // must yield None and let the caller read the host instead.
+        assert_eq!(
+            super::cgroup_available_mb(Some("9223372036854771712"), Some("100")),
+            None
+        );
+    }
+
+    #[test]
+    fn cgroup_usage_over_limit_saturates_to_zero() {
+        // Usage can exceed the limit momentarily under reclaim pressure. That
+        // must read as "no headroom", not wrap around to a huge number and let
+        // the sweep charge ahead.
+        assert_eq!(
+            super::cgroup_available_mb(Some("104857600"), Some("209715200")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn mem_available_is_read_not_mem_free() {
+        let meminfo = "MemTotal:       16316360 kB\n\
+                       MemFree:          201480 kB\n\
+                       MemAvailable:   14765112 kB\n\
+                       Buffers:           21356 kB\n";
+        // 14765112 kB = 14419 MB — and emphatically not MemFree's 196 MB, which
+        // would pause the sweep permanently on any long-running server.
+        assert_eq!(super::mem_available_mb(meminfo), Some(14419));
+    }
+
+    #[test]
+    fn missing_mem_available_is_unknown_not_zero() {
+        // An old kernel without MemAvailable must read as "cannot tell", so the
+        // guard stands aside. Zero would pause the sweep forever.
+        assert_eq!(super::mem_available_mb("MemTotal: 100 kB\n"), None);
+    }
+
+    #[test]
+    fn observed_18_footprint_clears_the_budget() {
+        // .18 on 2026-08-10: 16 GB box, sweep running, RSS peaked at 1224 MB and
+        // MemAvailable stayed around 14.7 GB. The guard must not fire there —
+        // it exists for the 2 GB Pi, not for the machine where the footprint
+        // was measured.
+        let meminfo = "MemAvailable:   14765112 kB\n";
+        assert!(super::mem_available_mb(meminfo).unwrap() > super::MIN_AVAILABLE_MB);
+        // A 2 GB box with ~700 MB left is exactly the case that must pause.
+        assert!(
+            super::mem_available_mb("MemAvailable: 716800 kB\n").unwrap() < super::MIN_AVAILABLE_MB
+        );
     }
 
     #[test]
