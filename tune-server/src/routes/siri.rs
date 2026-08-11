@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::AppError;
+use tune_core::db::backend::ToSqlValue;
+
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -68,26 +70,22 @@ async fn siri_play_radio(
     State(state): State<AppState>,
     Json(body): Json<PlayRadioBody>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-
     let pattern = format!("%{}%", body.name);
-    let station: Option<Value> = conn
-        .prepare("SELECT id, name, url FROM radios WHERE name LIKE ?1 LIMIT 1")
-        .and_then(|mut stmt| {
-            stmt.query_row([&pattern], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?,
-                    "url": row.get::<_, Option<String>>(2)?,
-                }))
+    let station: Option<Value> = state
+        .backend
+        .query_one(
+            "SELECT id, name, url FROM radios WHERE name LIKE ? LIMIT 1",
+            &[&pattern as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .map(|row| {
+            json!({
+                "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                "name": row.get(1).and_then(|v| v.as_string()),
+                "url": row.get(2).and_then(|v| v.as_string()),
             })
-        })
-        .ok();
-    drop(conn);
+        });
 
     match station {
         Some(s) => Ok(Json(json!({
@@ -115,25 +113,21 @@ async fn siri_play_playlist(
     State(state): State<AppState>,
     Json(body): Json<PlayPlaylistBody>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-
     let pattern = format!("%{}%", body.name);
-    let playlist: Option<Value> = conn
-        .prepare("SELECT id, name FROM playlists WHERE name LIKE ?1 LIMIT 1")
-        .and_then(|mut stmt| {
-            stmt.query_row([&pattern], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?,
-                }))
+    let playlist: Option<Value> = state
+        .backend
+        .query_one(
+            "SELECT id, name FROM playlists WHERE name LIKE ? LIMIT 1",
+            &[&pattern as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .map(|row| {
+            json!({
+                "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                "name": row.get(1).and_then(|v| v.as_string()),
             })
-        })
-        .ok();
-    drop(conn);
+        });
 
     match playlist {
         Some(p) => Ok(Json(json!({
@@ -162,42 +156,30 @@ async fn siri_play_album(
     State(state): State<AppState>,
     Json(body): Json<PlayAlbumBody>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-
     let title_pattern = format!("%{}%", body.title);
-    let album: Option<Value> = if let Some(ref artist) = body.artist {
+    let row = if let Some(ref artist) = body.artist {
         let artist_pattern = format!("%{artist}%");
-        conn.prepare(
-            "SELECT id, title, artist_name FROM albums WHERE title LIKE ?1 AND artist_name LIKE ?2 LIMIT 1",
+        state.backend.query_one(
+            "SELECT id, title, artist_name FROM albums \
+             WHERE title LIKE ? AND artist_name LIKE ? LIMIT 1",
+            &[
+                &title_pattern as &dyn ToSqlValue,
+                &artist_pattern as &dyn ToSqlValue,
+            ],
         )
-        .and_then(|mut stmt| {
-            stmt.query_row([&title_pattern, &artist_pattern], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "title": row.get::<_, Option<String>>(1)?,
-                    "artist_name": row.get::<_, Option<String>>(2)?,
-                }))
-            })
-        })
-        .ok()
     } else {
-        conn.prepare("SELECT id, title, artist_name FROM albums WHERE title LIKE ?1 LIMIT 1")
-            .and_then(|mut stmt| {
-                stmt.query_row([&title_pattern], |row| {
-                    Ok(json!({
-                        "id": row.get::<_, i64>(0)?,
-                        "title": row.get::<_, Option<String>>(1)?,
-                        "artist_name": row.get::<_, Option<String>>(2)?,
-                    }))
-                })
-            })
-            .ok()
+        state.backend.query_one(
+            "SELECT id, title, artist_name FROM albums WHERE title LIKE ? LIMIT 1",
+            &[&title_pattern as &dyn ToSqlValue],
+        )
     };
-    drop(conn);
+    let album: Option<Value> = row.ok().flatten().map(|row| {
+        json!({
+            "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+            "title": row.get(1).and_then(|v| v.as_string()),
+            "artist_name": row.get(2).and_then(|v| v.as_string()),
+        })
+    });
 
     match album {
         Some(a) => Ok(Json(json!({
@@ -275,26 +257,27 @@ async fn voice_command(
     // "play X" -> search and play
     if let Some(query) = text.strip_prefix("play ") {
         let query = query.trim();
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
         let pattern = format!("%{query}%");
 
-        let track: Option<Value> = conn
-            .prepare("SELECT id, title, artist_name FROM tracks WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT 1")
-            .and_then(|mut stmt| {
-                stmt.query_row([&pattern], |row| {
-                    Ok(json!({
-                        "id": row.get::<_, i64>(0)?,
-                        "title": row.get::<_, Option<String>>(1)?,
-                        "artist_name": row.get::<_, Option<String>>(2)?,
-                    }))
+        // The pattern is bound twice on purpose: the rusqlite `?1` this
+        // replaces could be reused across both LIKE clauses, but positional
+        // placeholders are consumed one per `?`.
+        let track: Option<Value> = state
+            .backend
+            .query_one(
+                "SELECT id, title, artist_name FROM tracks \
+                 WHERE title LIKE ? OR artist_name LIKE ? LIMIT 1",
+                &[&pattern as &dyn ToSqlValue, &pattern as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .map(|row| {
+                json!({
+                    "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    "title": row.get(1).and_then(|v| v.as_string()),
+                    "artist_name": row.get(2).and_then(|v| v.as_string()),
                 })
-            })
-            .ok();
-        drop(conn);
+            });
 
         return Ok(Json(json!({
             "action": "play_search",

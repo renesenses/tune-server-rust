@@ -49,28 +49,22 @@ async fn detect_mqa(
     State(state): State<AppState>,
     Path(track_id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let track = {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-        conn.prepare("SELECT path, format, sample_rate, bit_depth FROM tracks WHERE id = ?1")
-            .and_then(|mut stmt| {
-                stmt.query_row([track_id], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                })
-            })
-    };
+    let track = state
+        .backend
+        .query_one(
+            "SELECT path, format, sample_rate, bit_depth FROM tracks WHERE id = ?",
+            &[&track_id as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .map_err(AppError::internal)?;
 
     let (path, format, sample_rate, bit_depth) = match track {
-        Ok(t) => t,
-        Err(_) => {
+        Some(row) => (
+            row.first().and_then(|v| v.as_string()),
+            row.get(1).and_then(|v| v.as_string()),
+            row.get(2).and_then(|v| v.as_i64()),
+            row.get(3).and_then(|v| v.as_i64()),
+        ),
+        None => {
             return Ok((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "track not found"})),

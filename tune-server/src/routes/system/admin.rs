@@ -115,7 +115,7 @@ pub(super) async fn admin_connections(State(state): State<AppState>) -> Json<Val
 }
 
 pub(super) async fn admin_discovery(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
 
     Json(json!({

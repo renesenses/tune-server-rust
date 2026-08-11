@@ -9,3 +9,9 @@ __pycache__/
 plugins/recorder/
 
 docs/*.pdf
+
+# Journaux d'exécution. Aucun n'est légitimement versionné, et il en existe de
+# très gros : un contributeur a poussé sans s'en apercevoir un journal de
+# 3,8 Mo listant sa bibliothèque musicale et ses chemins locaux, dans un commit
+# que GitHub conserve ensuite indéfiniment via la référence de la pull request.
+*.log

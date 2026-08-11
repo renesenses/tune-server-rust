@@ -133,11 +133,13 @@ pub fn select_host(backend: &str) -> cpal::Host {
                             devices = device_count,
                             "local_audio_host_selected"
                         );
+                        note_observed_backend("ASIO");
                         return host;
                     }
                     warn!(
                         "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
                     );
+                    note_observed_backend("WASAPI");
                     return cpal::default_host();
                 }
                 Err(e) => {
@@ -146,6 +148,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
                         "local_audio_asio_host_unavailable — check ASIO driver installation"
                     );
                     info!(backend = "wasapi", "local_audio_host_fallback");
+                    note_observed_backend("WASAPI");
                     return cpal::default_host();
                 }
             },
@@ -154,10 +157,12 @@ pub fn select_host(backend: &str) -> cpal::Host {
                 // abort() when probed, crashing the process silently.
                 // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
+                note_observed_backend("WASAPI");
                 return cpal::default_host();
             }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
+                note_observed_backend("WASAPI");
                 return cpal::default_host();
             }
         }
@@ -176,8 +181,45 @@ pub fn select_host(backend: &str) -> cpal::Host {
     }
 }
 
-/// Returns the name of the audio backend for the given preference.
+/// Backend réellement retenu par le dernier `select_host`, quand il diffère de
+/// ce qui était demandé.
+///
+/// `select_host` peut retomber sur WASAPI en silence : pilote ASIO absent, ou
+/// installé mais sans périphérique de sortie parce qu'une autre application le
+/// tient déjà — un pilote ASIO ne s'ouvre que dans un seul processus. Jusqu'ici
+/// rien ne remontait cette bascule : l'interface continuait d'annoncer le
+/// backend *demandé*, si bien qu'un utilisateur ayant choisi ASIO se voyait
+/// confirmer « ASIO » alors que le son sortait en WASAPI (signalement Bilou).
+static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+
+/// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+///
+/// Ses seuls appelants vivent dans la branche `windows + feature asio` de
+/// `select_host` : ailleurs, il n'y a aucun choix de backend à observer, donc
+/// aucun appel — d'où un `dead_code` sur toutes les autres cibles. On l'autorise
+/// explicitement plutôt que de placer la fonction sous le même `cfg`, pour
+/// qu'un futur appel depuis une autre plateforme n'ait pas à la ressusciter.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn note_observed_backend(name: &'static str) {
+    if let Ok(mut slot) = OBSERVED_BACKEND.write() {
+        *slot = Some(name);
+    }
+}
+
+/// Nom du backend audio à afficher.
+///
+/// Ce qui a été *observé* prime sur ce qui a été *demandé* : c'est la seule
+/// réponse qui corresponde à ce que l'utilisateur entend réellement.
 pub fn active_backend_name(backend: &str) -> &'static str {
+    backend_display_name(OBSERVED_BACKEND.read().ok().and_then(|g| *g), backend)
+}
+
+/// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
+/// toucher à l'état global ni ouvrir un périphérique.
+fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'static str {
+    if let Some(observed) = observed {
+        return observed;
+    }
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
         match backend.to_lowercase().as_str() {
@@ -704,7 +746,16 @@ pub struct LocalOutput {
     device_id: String,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    /// What the playback callbacks actually multiply by: the user volume
+    /// scaled by the ReplayGain factor. Composing here means the dozen places
+    /// that read a volume in the render loops need no knowledge of ReplayGain.
     volume: Arc<AtomicU32>,
+    /// The volume the user asked for, in milli-units — what the UI shows and
+    /// what mute restores. Kept apart from `volume` so a ReplayGain
+    /// attenuation never looks like the slider moved on its own.
+    user_volume: Arc<AtomicU32>,
+    /// ReplayGain factor for the current track, in milli-units (1000 = 1.0).
+    rg_factor: Arc<AtomicU32>,
     /// Volume stored before mute, so unmute can restore it
     pre_mute_volume: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
@@ -788,6 +839,31 @@ impl LocalOutput {
         Self::with_options(device_name, false, "auto")
     }
 
+    /// Recompute what the render callbacks multiply by: user volume ×
+    /// ReplayGain factor.
+    ///
+    /// The product is clamped to unity. Going above it would push a track
+    /// whose ReplayGain asks for a boost past full scale on peaks — and the
+    /// user, who never touched the slider, would hear distortion appear out of
+    /// nowhere. `gain_factor` already refuses to clip against the tagged peak;
+    /// this is the second, unconditional guard for a track with no peak tag.
+    /// Set the ReplayGain factor for the track about to play (1.0 = untouched).
+    /// Inherent twin of the trait method so the orchestrator can call it on a
+    /// downcast `LocalOutput` without importing `OutputTarget`.
+    pub fn set_replaygain_factor(&self, factor: f64) {
+        let f = (factor.clamp(0.0, 4.0) * 1000.0).round() as u32;
+        self.rg_factor.store(f, Ordering::SeqCst);
+        self.recompute_effective_volume();
+    }
+
+    fn recompute_effective_volume(&self) {
+        let user = self.user_volume.load(Ordering::SeqCst) as f64 / 1000.0;
+        let rg = self.rg_factor.load(Ordering::SeqCst) as f64 / 1000.0;
+        let effective = (user * rg).clamp(0.0, 1.0);
+        self.volume
+            .store((effective * 1000.0).round() as u32, Ordering::SeqCst);
+    }
+
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
     pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
         Self::with_options(device_name, exclusive_mode, "auto")
@@ -803,6 +879,8 @@ impl LocalOutput {
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
+            user_volume: Arc::new(AtomicU32::new(1000)),
+            rg_factor: Arc::new(AtomicU32::new(1000)),
             pre_mute_volume: Arc::new(AtomicU32::new(1000)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
@@ -3693,27 +3771,33 @@ impl OutputTarget for LocalOutput {
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         let v = (volume.clamp(0.0, 1.0) * 1000.0) as u32;
-        self.volume.store(v, Ordering::SeqCst);
+        self.user_volume.store(v, Ordering::SeqCst);
+        self.recompute_effective_volume();
         if v > 0 {
             self.muted.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
 
+    fn set_replaygain_factor(&self, factor: f64) {
+        LocalOutput::set_replaygain_factor(self, factor);
+    }
+
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
         if muted {
-            let current = self.volume.load(Ordering::SeqCst);
+            let current = self.user_volume.load(Ordering::SeqCst);
             if current > 0 {
                 self.pre_mute_volume.store(current, Ordering::SeqCst);
             }
-            self.volume.store(0, Ordering::SeqCst);
+            self.user_volume.store(0, Ordering::SeqCst);
             self.muted.store(true, Ordering::SeqCst);
         } else {
             let restored = self.pre_mute_volume.load(Ordering::SeqCst);
-            self.volume
+            self.user_volume
                 .store(if restored > 0 { restored } else { 1000 }, Ordering::SeqCst);
             self.muted.store(false, Ordering::SeqCst);
         }
+        self.recompute_effective_volume();
         Ok(())
     }
 
@@ -3745,7 +3829,7 @@ impl OutputTarget for LocalOutput {
                 state: TransportState::Playing,
                 position_ms: duration_ms.saturating_add(5000),
                 duration_ms,
-                volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
+                volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
                 muted: self.muted.load(Ordering::Relaxed),
                 current_uri: self.current_uri.lock().unwrap().clone(),
                 track_title: self.track_title.lock().unwrap().clone(),
@@ -3770,7 +3854,7 @@ impl OutputTarget for LocalOutput {
             state,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms,
-            volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
+            volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().unwrap().clone(),
             track_title: self.track_title.lock().unwrap().clone(),
@@ -4815,5 +4899,37 @@ mod open_failure_tests {
         assert!(h.contains("audio"), "got: {h}");
         let m = OpenFailure::ServerUnreachable.user_message();
         assert!(m.contains("audio"), "got: {m}");
+    }
+}
+
+#[cfg(test)]
+mod backend_display_tests {
+    use super::backend_display_name;
+
+    // Le cas Bilou : l'utilisateur demande ASIO, le pilote n'est pas ouvrable
+    // (absent, ou déjà tenu par une autre application — un pilote ASIO ne
+    // s'ouvre que dans un seul processus), la lecture retombe sur WASAPI.
+    // L'interface annonçait quand même « ASIO ».
+    #[test]
+    fn observed_wins_over_requested() {
+        assert_eq!(backend_display_name(Some("WASAPI"), "asio"), "WASAPI");
+    }
+
+    // Et l'inverse doit tenir aussi : une bascule vers WASAPI observée une fois
+    // ne doit pas figer l'affichage si ASIO s'ouvre ensuite.
+    #[test]
+    fn observed_asio_is_reported_even_when_setting_says_otherwise() {
+        assert_eq!(backend_display_name(Some("ASIO"), "wasapi"), "ASIO");
+    }
+
+    // Sans observation — aucun périphérique encore ouvert — on retombe sur la
+    // déduction d'avant, inchangée.
+    #[test]
+    fn without_observation_falls_back_to_the_setting() {
+        let name = backend_display_name(None, "asio");
+        assert!(
+            matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
+            "nom inattendu: {name}"
+        );
     }
 }

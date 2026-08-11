@@ -34,6 +34,7 @@ use crate::state::AppState;
 const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("community_sync_enabled", || json!(false)),
     ("enrich_on_scan", || json!(true)),
+    ("scan_import_playlists", || json!(true)),
     ("resample_policy", || json!("none")),
     ("prefetch_mode", || json!("30s")),
     ("dsd_lpcm_stream", || json!(false)),
@@ -62,7 +63,7 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
     let audio_backend = {
         #[cfg(feature = "local-audio")]
         {
-            tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend)
+            tune_core::outputs::local::active_backend_name(&state.display_audio_backend())
         }
         #[cfg(not(feature = "local-audio"))]
         {
@@ -104,7 +105,7 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
     // la fiche affichait « — » même pour les renderers correctement détectés,
     // alors que /zones, lui, expose bien la détection.
     // Réutilise le `settings` déjà construit en tête de handler.
-    let devices = state.scanner.lock().await.devices().await;
+    let devices = state.scanner.devices().await;
     let zones: Vec<Value> = ZoneRepo::with_backend(state.backend.clone())
         .list()
         .unwrap_or_default()

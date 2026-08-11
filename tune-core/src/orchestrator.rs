@@ -78,6 +78,7 @@ async fn transcode_source_to_file(
     target_fmt: String,
     eq: Option<crate::audio::eq::EqProcessor>,
     convolver: Option<crate::audio::convolver::Convolver>,
+    replaygain: Option<f64>,
     dest: String,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // 1. Decode source to PCM (blocking I/O).
@@ -97,12 +98,20 @@ async fn transcode_source_to_file(
         actual_bd = target_bd;
     }
 
-    // 1b. Apply EQ if enabled for this zone.
+    // 1b. Apply ReplayGain BEFORE the tone controls, where a pre-amp belongs:
+    // the level normalisation is what the EQ then works on. A network renderer
+    // gets an already-encoded stream, so unlike a local DAC the gain has to be
+    // baked into the samples here or it never happens at all.
+    if let Some(factor) = replaygain {
+        crate::audio::replaygain::apply_gain_pcm(&mut pcm_bytes, actual_bd, factor);
+    }
+
+    // 1c. Apply EQ if enabled for this zone.
     if let Some(mut eq) = eq {
         eq.process_pcm(&mut pcm_bytes, actual_bd);
     }
 
-    // 1c. Apply the room-correction FIR convolver (after EQ) if the zone has an
+    // 1d. Apply the room-correction FIR convolver (after EQ) if the zone has an
     // uploaded impulse response. This is what brings room correction to network
     // renderers (DLNA/UPnP/AirPlay): the local output has its own convolver, but
     // a streamed zone only gets DSP that runs here, before encoding.
@@ -146,9 +155,39 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
 
+/// Le forçage WAV d'une zone s'applique-t-il à CETTE source ?
+///
+/// « Forcer le WAV » (`dlna_lpcm` / `dlna_wav24`) existe pour contourner le
+/// décodeur ALAC du renderer — le LHC-56 de Yves claque au démarrage sur de
+/// l'ALAC direct. L'appliquer aussi aux sources FLAC est un dommage
+/// collatéral, jamais l'objectif.
+///
+/// Tant que les deux réglages s'excluaient, « Forcer le WAV » l'emportait en
+/// silence sur « FLAC natif » : un FLAC partait en WAV sans que rien ne
+/// l'explique, et l'utilisateur en déduisait que Tune gardait en mémoire les
+/// réglages du morceau précédent (forum #1437). Les deux cases décrivent en
+/// réalité deux sources différentes et peuvent coexister : l'ALAC part en WAV,
+/// le FLAC reste du FLAC.
+///
+/// L'exception exige l'opt-in `dlna_native_flac`. Sans lui, une source FLAC
+/// continue de suivre le forçage — ce dont ont besoin les renderers qui ne
+/// savent pas lire le FLAC.
+pub fn wav_override_applies(
+    force_wav_requested: bool,
+    source_is_flac: bool,
+    native_flac_opt_in: bool,
+) -> bool {
+    force_wav_requested && !(source_is_flac && native_flac_opt_in)
+}
+
 /// Pas d'attente pendant les phases pause / pré-démarrage du forwarder de
 /// niveaux : assez court pour réagir vite, assez long pour ne pas marteler
 /// le mutex des zones.
+/// Taille des blocs du décodage-pour-niveaux (passthrough). Le PCM produit
+/// n'est lu par personne — seul compte le fait de borner la mémoire — mais un
+/// bloc trop petit multiplierait les allers-retours de canal pour rien.
+const LEVELS_DECODE_CHUNK: usize = 64 * 1024;
+
 const LEVELS_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Publie les niveaux audio (`playback.audio_levels`) sur le bus, cadencés
@@ -308,6 +347,10 @@ fn spawn_paced_levels_forwarder(
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
+                    // Niveau absolu par bande, en dBFS. `spectrum` reste une
+                    // forme normalisée trame par trame (contrat des clients
+                    // déjà déployés) ; ce champ dit le vrai niveau.
+                    "spectrum_db": lvl.spectrum_db,
                 }),
             );
             next_emit += window;
@@ -473,15 +516,22 @@ fn decode_http_stream_for_levels(
 /// bloquante) + décodage HTTP en tâche bloquante. Détaché de `self` pour être
 /// appelable depuis le funnel d'avance gapless, qui démarre les niveaux même
 /// pendant un pré-chargement (comme la branche locale du funnel).
+///
+/// `play_seq` est celui de la piste POUR LAQUELLE la sonde est créée, lu par
+/// l'appelant. Le lire ici, dans la tâche, le rattachait à ce que la zone
+/// jouait au moment où l'ordonnanceur daignait la démarrer : si la piste avait
+/// changé entre-temps, le forwarder adoptait la génération de la NOUVELLE
+/// piste et survivait au lieu de mourir, publiant le PCM de l'ancienne sur
+/// l'horloge de la nouvelle (#1110).
 fn spawn_proxy_levels_probe_task(
     playback: Arc<PlaybackManager>,
     bus: Arc<EventBus>,
     zone_id: i64,
     url: String,
     codec_hint: String,
+    play_seq: u64,
 ) {
     tokio::spawn(async move {
-        let play_seq = playback.current_play_seq(zone_id).await;
         let levels_tx = spawn_paced_levels_forwarder(bus, playback.clone(), zone_id, play_seq, 0);
         let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
@@ -747,6 +797,38 @@ fn use_file_transcode_for(
 /// a `device_id` naming convention (a pull output has no reason to prefix its
 /// `device_id` with `"local:"`). Pure so it's unit-testable without an
 /// orchestrator or a registered output.
+/// True when an output receives the stream with none of our DSP applied to it,
+/// so an active EQ / room correction / ReplayGain must force the transcode path
+/// to be heard at all.
+///
+/// The push-URI renderers of [`is_push_uri_output_type`] and browser zones are
+/// handled by their own flags. What this covers is the third family: a PULL
+/// output that fetches the audio itself and is not built in — `diretta`, and
+/// anything an out-of-tree plugin registers. It was silently absent from the
+/// list, so the EQ was computed and thrown away (Eric, forum ; same hole as
+/// #1216 on a Beoplay A9).
+///
+/// Excluded on purpose:
+/// - `local` and `oaat`, which already transcode as soon as the source format
+///   is known, so the DSP reaches them;
+/// - an unknown format, which there is no safe way to transcode;
+/// - DSD, because converting a native DSD stream to PCM in order to apply an
+///   EQ would be a degradation decided on the listener's behalf.
+fn pull_output_needs_dsp_transcode(
+    output_type: Option<&str>,
+    is_local: bool,
+    is_oaat: bool,
+    source_format: Option<AudioFormat>,
+) -> bool {
+    output_type.is_some()
+        && !is_local
+        && !is_oaat
+        && !is_push_uri_output_type(output_type)
+        && output_type != Some("browser")
+        && source_format.is_some()
+        && source_format != Some(AudioFormat::Dsd)
+}
+
 fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
     matches!(
         output_type,
@@ -840,7 +922,7 @@ impl PlaybackOrchestrator {
     /// sœur échantillonne la position rapportée de la zone pour brider la
     /// sonde au rythme de lecture ; les deux s'arrêtent quand le forwarder
     /// disparaît (stop / piste remplacée).
-    fn spawn_proxy_levels_probe(&self, zone_id: i64, url: String, codec_hint: String) {
+    async fn spawn_proxy_levels_probe(&self, zone_id: i64, url: String, codec_hint: String) {
         let Some(bus) = self
             .event_bus
             .clone()
@@ -848,7 +930,17 @@ impl PlaybackOrchestrator {
         else {
             return;
         };
-        spawn_proxy_levels_probe_task(self.playback.clone(), bus, zone_id, url, codec_hint);
+        // Épinglé ICI, pas dans la tâche : c'est la piste dont on vient de
+        // décider les niveaux (#1110).
+        let play_seq = self.playback.current_play_seq(zone_id).await;
+        spawn_proxy_levels_probe_task(
+            self.playback.clone(),
+            bus,
+            zone_id,
+            url,
+            codec_hint,
+            play_seq,
+        );
     }
 
     /// Duplicate-network-play detector. Returns `true` when `(source,
@@ -1495,7 +1587,14 @@ impl PlaybackOrchestrator {
             }
 
             let result = self
-                .send_to_output(device_id, &media, req.seek_ms, zone_audiophile, req.zone_id)
+                .send_to_output(
+                    device_id,
+                    &media,
+                    req.seek_ms,
+                    zone_audiophile,
+                    req.zone_id,
+                    req.track_id,
+                )
                 .await;
             let total_ms = play_start.elapsed().as_millis();
             info!(
@@ -2523,7 +2622,29 @@ impl PlaybackOrchestrator {
             && bit_depth > 16
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
         // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
-        let dlna_force_wav = dlna_lpcm || dlna_wav24;
+        //
+        // …SAUF sur une source FLAC dont la zone demande explicitement le FLAC
+        // natif. Le forçage WAV existe pour contourner le décodeur ALAC du
+        // renderer (LHC-56 qui claque au démarrage, cf. le commentaire de
+        // `dlna_lpcm` ci-dessus) : l'appliquer aussi au FLAC est un dommage
+        // collatéral, jamais l'objectif.
+        //
+        // Sans cette exception, les deux réglages se contredisent et c'est le
+        // WAV qui gagne en silence : Yves a lu un FLAC transcodé en WAV alors
+        // que « FLAC natif » était coché, et en a conclu que Tune gardait en
+        // mémoire les réglages du morceau précédent (forum #1437). Les deux
+        // cases décrivent en fait deux sources différentes, et peuvent donc
+        // coexister — l'ALAC part en WAV, le FLAC reste du FLAC.
+        //
+        // L'exception exige l'opt-in `dlna_native_flac` : sans lui, une source
+        // FLAC continue de suivre le forçage, ce dont ont besoin les renderers
+        // qui ne savent pas lire le FLAC.
+        let dlna_force_wav = wav_override_applies(
+            dlna_lpcm || dlna_wav24,
+            source_format == Some(AudioFormat::Flac),
+            is_network_output
+                && ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id),
+        );
         // Opt-in per zone: cap output to 16-bit. Some renderers advertise
         // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode
         // 16-bit internally — 24-bit direct plays SILENCE (Ruark R3, Yves #1137).
@@ -2620,10 +2741,28 @@ impl PlaybackOrchestrator {
         // local servi direct) : même trou que #1216, mesuré sur .18 — deux
         // captures du flux EQ ±12 dB strictement identiques (md5). L'EQ y
         // force donc aussi le transcodage.
-        let eq_forces_transcode = (is_network_output || is_browser_output)
+        // Une sortie PULL hors dépôt — `diretta`, `oaat` — va chercher le flux
+        // elle-même et n'est ni « réseau » ni « navigateur » au sens ci-dessus.
+        // Elle recevait donc le fichier brut : même trou que #1216, une
+        // troisième fois (Eric, forum : égaliseur sans effet vers un renderer
+        // Diretta). La sortie LOCALE est exclue — elle passe déjà par le
+        // transcodage dès que le format source est connu (`local_needs_wav`).
+        let is_pull_dsp_output = pull_output_needs_dsp_transcode(
+            zone_output_type.as_deref(),
+            is_local_output,
+            is_oaat_output,
+            source_format,
+        );
+        let eq_forces_transcode = (is_network_output || is_browser_output || is_pull_dsp_output)
             && !dsd_passthrough
             && !alac_passthrough
-            && (self.zone_has_active_eq(req.zone_id) || self.zone_has_active_ir(req.zone_id));
+            && (self.zone_has_active_eq(req.zone_id)
+                || self.zone_has_active_ir(req.zone_id)
+                // ReplayGain scales the samples, so it lives in the same place
+                // as the EQ — and would be discarded in the same way on a
+                // passthrough. Enabling it is an explicit choice of processing;
+                // PURE zones are excluded upstream.
+                || self.zone_replaygain_changes_audio(req.zone_id, req.track_id));
         // En navigateur, la sortie transcodée doit être du WAV : un FLAC
         // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
         // Range (#1168) — même règle que le bras streaming.
@@ -2867,13 +3006,38 @@ impl PlaybackOrchestrator {
                 // is not part of the cache key → a zone with an active IR never
                 // uses the cache (always fresh).
                 let convolver = self.load_convolver(req.zone_id, out_sr, channels);
-                let cache_path_opt = if eq_profile.is_some() || convolver.is_some() {
-                    None
-                } else {
-                    crate::transcode_cache::cache_path(
-                        &file_path, &out_ext, out_sr, out_bd, channels,
-                    )
+                // ReplayGain scales the samples, so like the EQ and the FIR it
+                // changes the encoded bytes without being part of the cache key.
+                // A cached transcode made at a different gain would be served
+                // silently at the wrong level — so a gained transcode is never
+                // cached, and never reads the cache.
+                // NOT for a local zone: the local output applies the gain on
+                // its own render path, and a local zone with a known source
+                // format always comes through here (`local_needs_wav`) — so
+                // baking it in as well multiplied the gain twice. A -6 dB track
+                // played at -12 dB, quietly.
+                let replaygain_factor = match (
+                    is_local_output || self.zone_audiophile(req.zone_id),
+                    req.track_id,
+                ) {
+                    (false, Some(tid)) => {
+                        let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                        if (f - 1.0).abs() > 1e-6 {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
                 };
+                let cache_path_opt =
+                    if eq_profile.is_some() || convolver.is_some() || replaygain_factor.is_some() {
+                        None
+                    } else {
+                        crate::transcode_cache::cache_path(
+                            &file_path, &out_ext, out_sr, out_bd, channels,
+                        )
+                    };
                 // The transcode always writes to a fresh `tune-transcode-*` file
                 // (subject to the normal cleanup); on success it is atomically
                 // renamed into the cache. A crash mid-transcode therefore can
@@ -3000,6 +3164,7 @@ impl PlaybackOrchestrator {
                             target_format_str.clone(),
                             eq_profile,
                             convolver,
+                            replaygain_factor,
                             tmp_path.clone(),
                         ),
                     )
@@ -3048,8 +3213,10 @@ impl PlaybackOrchestrator {
                                 let playback = playback.clone();
                                 let actual_ch = channels;
                                 let sr = out_sr;
+                                // Génération épinglée au moment de la décision,
+                                // pas au démarrage de la tâche (#1110).
+                                let play_seq = playback.current_play_seq(zone_id).await;
                                 tokio::spawn(async move {
-                                    let play_seq = playback.current_play_seq(zone_id).await;
                                     // Temp-file : le PCM décodé part du début
                                     // du fichier (un seek passe par Range HTTP).
                                     let levels_tx = spawn_paced_levels_forwarder(
@@ -3375,7 +3542,20 @@ impl PlaybackOrchestrator {
             let skip_passthrough_levels = source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
-            if !skip_passthrough_levels && self.levels_attach_allowed(req.zone_id) {
+            // Ce decodage parallele n'a de sens que si PERSONNE d'autre ne
+            // decode le fichier cote serveur : sortie reseau ou navigateur, qui
+            // recoivent une URL et lisent eux-memes. Une sortie locale (comme
+            // OAAT, AirPlay, HQPlayer ou le pont) decode deja pour alimenter le
+            // peripherique, et son chemin de lecture emet ses propres niveaux :
+            // on decodait donc la piste ENTIERE une seconde fois pour rien,
+            // ~65 evenements/s au lieu de ~32, avec des horodatages qui
+            // divergent apres un seek (l'un part du seek, l'autre de 0) et,
+            // depuis #1106, des fenetres dupliquees sur le tap PCM (#1110).
+            let output_decodes_server_side = !(is_network_output || is_browser_output);
+            if !skip_passthrough_levels
+                && !output_decodes_server_side
+                && self.levels_attach_allowed(req.zone_id)
+            {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();
                     let playback = self.playback.clone();
@@ -3383,34 +3563,44 @@ impl PlaybackOrchestrator {
                     let zone_id = req.zone_id;
                     let sr = sample_rate;
                     let ch = channels as u32;
+                    // Génération épinglée au moment de la décision (#1110) :
+                    // ce décodage complet dure toute la piste, il ne doit pas
+                    // pouvoir se raccrocher à la suivante.
+                    let play_seq = self.playback.current_play_seq(req.zone_id).await;
                     tokio::spawn(async move {
-                        let play_seq = playback.current_play_seq(zone_id).await;
                         // Passthrough : le décodage pour niveaux part de 0.
                         let levels_tx =
                             spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                        // Decode the file to PCM in the background — output is
-                        // discarded, only levels are forwarded via levels_tx.
+                        // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
+                        // matérialisait la piste entière en mémoire avant
+                        // d'émettre la moindre fenêtre : ~1,9 Go pour un
+                        // 24/192 de dix minutes, alloué à chaque début de
+                        // piste et uniquement pour animer des aiguilles.
+                        // C'est la même faute que #1109 (ReplayGain), un cran
+                        // plus loin dans la chaîne. Le décodeur en flux émet
+                        // les niveaux au fil de l'eau ; le PCM produit part
+                        // dans un puits, seul l'ordre de grandeur du tampon
+                        // reste en mémoire.
+                        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                        tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+                        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
                         let result = tokio::task::spawn_blocking(move || {
-                            let decoded = crate::audio::decode::decode_to_pcm(
+                            crate::audio::decode::decode_to_pcm_streaming_with_levels(
                                 &fp,
                                 Some(sr),
                                 Some(ch),
-                                0.0,
-                                0.0,
-                            );
-                            if let Ok(ref dec) = decoded {
-                                crate::audio::tap::send_windowed_pcm(
-                                    &levels_tx,
-                                    &dec.pcm_bytes(),
-                                    dec.bit_depth,
-                                    dec.channels as u16,
-                                    sr,
-                                );
-                            }
+                                None,
+                                sink_tx,
+                                LEVELS_DECODE_CHUNK,
+                                ready,
+                                levels_tx,
+                            )
                         })
                         .await;
-                        if let Err(e) = result {
-                            debug!(error = %e, "passthrough_levels_task_panic");
+                        match result {
+                            Err(e) => debug!(error = %e, "passthrough_levels_task_panic"),
+                            Ok(Err(e)) => debug!(error = %e, "passthrough_levels_decode_failed"),
+                            Ok(Ok(_)) => {}
                         }
                     });
                 }
@@ -4873,7 +5063,8 @@ impl PlaybackOrchestrator {
                     // les octets joués. Le bridage ≤30 s en avance impose une
                     // contre-pression TCP : le proxy ne pré-télécharge pas
                     // toute la piste.
-                    self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone());
+                    self.spawn_proxy_levels_probe(req.zone_id, url.clone(), codec_lower.clone())
+                        .await;
 
                     // Report the mime of the codec we actually serve, not the
                     // upstream API's mime_type. Qobuz can return a mime that does
@@ -5409,6 +5600,7 @@ impl PlaybackOrchestrator {
         start_position_ms: Option<u64>,
         zone_audiophile: bool,
         zone_id: i64,
+        track_id: Option<i64>,
     ) -> (bool, Option<String>) {
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
@@ -5485,6 +5677,17 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    // ReplayGain, applied by the output itself for a local DAC.
+                    // A PURE zone is left strictly alone: applying a gain would
+                    // multiply every sample and the path would no longer be
+                    // bit-perfect, which is the one thing PURE promises.
+                    let rg = match (zone_audiophile, track_id) {
+                        (false, Some(tid)) => {
+                            crate::audio::replaygain::playback_factor(&self.db, tid)
+                        }
+                        _ => 1.0,
+                    };
+                    local_output.set_replaygain_factor(rg);
                     // Headphone crossfeed (local DAC only). Returns None when the
                     // zone has crossfeed disabled OR is in PURE mode, so a PURE
                     // zone stays bit-perfect. Rebuilt per-play at the resolved
@@ -5605,6 +5808,7 @@ impl PlaybackOrchestrator {
                 cur_ch,
                 out_bd,
                 target_fmt,
+                None,
                 None,
                 None,
                 tmp.clone(),
@@ -5781,6 +5985,24 @@ impl PlaybackOrchestrator {
     /// effect (and is not in PURE mode). Cheap settings read used to decide
     /// routing BEFORE the sample rate is known — the actual EqProcessor is
     /// built later by the transcode path at the real rate.
+    /// True when ReplayGain would change the samples for this zone's track.
+    ///
+    /// Same shape as [`Self::zone_has_active_eq`], and needed for the same
+    /// reason: a network renderer served the file raw never runs any of our
+    /// DSP, so without forcing the transcode the gain would be computed,
+    /// logged, and silently thrown away.
+    fn zone_replaygain_changes_audio(&self, zone_id: i64, track_id: Option<i64>) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        match track_id {
+            Some(tid) => {
+                (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
+            }
+            None => false,
+        }
+    }
+
     fn zone_has_active_eq(&self, zone_id: i64) -> bool {
         // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
         // gains, not the rate.
@@ -6593,6 +6815,19 @@ impl PlaybackOrchestrator {
                 );
                 if let Err(e) = output.lock().await.set_volume(volume).await {
                     warn!(zone_id, error = %e, "device_set_volume_failed");
+                    // A refused volume used to stop at this log line: the DB kept
+                    // the new value, the slider stayed where the user left it,
+                    // and the sound never changed. Tell the UI, using the same
+                    // channel an unavailable output already uses.
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": e,
+                            }),
+                        );
+                    }
                 }
             } else {
                 warn!(
@@ -6882,8 +7117,10 @@ impl PlaybackOrchestrator {
                 .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"));
             if let Some(path) = track.and_then(|t| t.file_path).filter(|_| !is_dsd) {
                 let playback = self.playback.clone();
+                // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
+                // bien la piste devenue courante (#1110).
+                let play_seq = self.playback.current_play_seq(zone_id).await;
                 tokio::spawn(async move {
-                    let play_seq = playback.current_play_seq(zone_id).await;
                     let levels_tx =
                         spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
                     tokio::task::spawn_blocking(move || {
@@ -6919,6 +7156,13 @@ impl PlaybackOrchestrator {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
                 let source = advance_source.clone();
+                // Épinglé AVANT la tâche : la résolution d'URL du service peut
+                // prendre plusieurs secondes, et lire la génération à son issue
+                // rattachait la sonde à ce que la zone jouait ALORS. Si
+                // l'auditeur avait enchaîné entre-temps, le forwarder héritait
+                // de la nouvelle génération et survivait, en publiant le PCM de
+                // la piste précédente sur l'horloge de la nouvelle (#1110).
+                let play_seq = self.playback.current_play_seq(zone_id).await;
                 tokio::spawn(async move {
                     let resolved = {
                         let registry = services.lock().await;
@@ -6958,7 +7202,9 @@ impl PlaybackOrchestrator {
                         .await
                         .ok();
                     } else {
-                        spawn_proxy_levels_probe_task(playback, bus, zone_id, data.url, codec);
+                        spawn_proxy_levels_probe_task(
+                            playback, bus, zone_id, data.url, codec, play_seq,
+                        );
                     }
                 });
             }
@@ -7657,6 +7903,39 @@ mod transcode_budget_tests {
 }
 
 #[cfg(test)]
+mod wav_override_tests {
+    use super::wav_override_applies;
+
+    /// Le cas de Yves (#1437) : les deux cases cochées, une source FLAC.
+    /// Avant, le WAV gagnait en silence et le FLAC natif ne servait à rien.
+    #[test]
+    fn flac_source_with_native_flac_opt_in_keeps_flac() {
+        assert!(!wav_override_applies(true, true, true));
+    }
+
+    /// La même zone, une source ALAC : le forçage WAV garde tout son sens,
+    /// c'est même sa raison d'être (décodeur ALAC du renderer).
+    #[test]
+    fn alac_source_still_goes_to_wav() {
+        assert!(wav_override_applies(true, false, true));
+    }
+
+    /// Sans l'opt-in, une source FLAC suit le forçage comme avant — c'est ce
+    /// dont ont besoin les renderers qui ne lisent pas le FLAC.
+    #[test]
+    fn flac_source_without_opt_in_still_follows_the_override() {
+        assert!(wav_override_applies(true, true, false));
+    }
+
+    /// Aucun forçage demandé : rien à neutraliser, dans les deux sens.
+    #[test]
+    fn no_override_requested_stays_off() {
+        assert!(!wav_override_applies(false, true, true));
+        assert!(!wav_override_applies(false, false, false));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
@@ -7853,6 +8132,53 @@ mod tests {
         );
     }
 
+    /// #1110 : un forwarder créé pour une piste doit MOURIR quand la zone
+    /// passe à la suivante, au lieu de publier son PCM sur l'horloge de la
+    /// nouvelle. C'est ce que garantit l'épinglage de la génération au moment
+    /// de la décision : ici on simule une génération devenue obsolète.
+    #[tokio::test]
+    async fn levels_forwarder_dies_when_its_track_is_replaced() {
+        let zone_id = 987_656;
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let stale_seq = playback.current_play_seq(zone_id).await;
+
+        // La zone enchaîne : nouvelle génération (ce que fait toute nouvelle
+        // demande de lecture avant de résoudre son flux).
+        playback.bump_generation(zone_id).await;
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        assert_ne!(
+            playback.current_play_seq(zone_id).await,
+            stale_seq,
+            "la lecture suivante doit bumper la génération"
+        );
+
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+        // Forwarder de l'ANCIENNE piste : c'est exactement ce qu'on obtenait en
+        // lisant la génération trop tard, sauf qu'alors il lisait la NOUVELLE
+        // et survivait.
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            stale_seq,
+            0,
+        );
+        let pcm = vec![0u8; 4096];
+        crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, 2, 44_100);
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            got.is_err(),
+            "un forwarder d'une piste remplacée ne doit rien publier, reçu {got:?}"
+        );
+    }
+
     /// Vérification end-to-end de la chaîne VU d'une session proxy, contre
     /// une URL FLAC/HTTP réelle : sonde → forwarder cadencé → bus. Reproduit
     /// exactement le chemin de production (moins le WebSocket) pour une zone
@@ -7946,7 +8272,7 @@ mod tests {
 
     use super::{
         PlayRequest, PlaybackOrchestrator, is_push_uri_output_type, passthrough_didl_duration_ms,
-        use_file_transcode_for,
+        pull_output_needs_dsp_transcode, use_file_transcode_for,
     };
 
     #[test]
@@ -7965,6 +8291,67 @@ mod tests {
         assert!(!is_push_uri_output_type(Some("local")));
         assert!(!is_push_uri_output_type(Some("oaat")));
         assert!(!is_push_uri_output_type(Some("diretta")));
+    }
+
+    #[test]
+    fn pull_output_dsp_transcode_classification() {
+        use crate::audio::formats::AudioFormat;
+        let flac = Some(AudioFormat::Flac);
+
+        // The case that was silently broken: an out-of-tree pull output was in
+        // none of the lists, so an active EQ never reached it.
+        assert!(pull_output_needs_dsp_transcode(
+            Some("diretta"),
+            false,
+            false,
+            flac
+        ));
+
+        // Already transcoding on their own: forcing again would be redundant.
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("local"),
+            true,
+            false,
+            flac
+        ));
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("oaat"),
+            false,
+            true,
+            flac
+        ));
+
+        // Covered by their own flags.
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("dlna"),
+            false,
+            false,
+            flac
+        ));
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("browser"),
+            false,
+            false,
+            flac
+        ));
+
+        // No format, or DSD: never force a transcode we cannot do safely, and
+        // never turn native DSD into PCM on the listener's behalf.
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("diretta"),
+            false,
+            false,
+            None
+        ));
+        assert!(!pull_output_needs_dsp_transcode(
+            Some("diretta"),
+            false,
+            false,
+            Some(AudioFormat::Dsd)
+        ));
+
+        // Unknown output type: no basis to decide.
+        assert!(!pull_output_needs_dsp_transcode(None, false, false, flac));
 
         // Unregistered device (output_type_of returned None): never coalesce.
         assert!(!is_push_uri_output_type(None));
@@ -8500,8 +8887,9 @@ mod tests {
                 mime_type: "audio/flac",
                 ..Default::default()
             };
-            let (output_sent, output_error) =
-                orch.send_to_output(device_id, &media, None, false, 1).await;
+            let (output_sent, output_error) = orch
+                .send_to_output(device_id, &media, None, false, 1, None)
+                .await;
             assert!(!output_sent, "{device_id} : l'envoi doit échouer");
             let err = output_error.expect("une erreur doit être remontée");
 
@@ -8994,8 +9382,9 @@ mod tests {
             mime_type: "audio/wav",
             ..Default::default()
         };
-        let (output_sent, output_error) =
-            orch.send_to_output(device_id, &media, None, false, 1).await;
+        let (output_sent, output_error) = orch
+            .send_to_output(device_id, &media, None, false, 1, None)
+            .await;
         assert!(
             !output_sent,
             "rejecting output must report output_sent=false"

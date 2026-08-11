@@ -576,11 +576,14 @@ async fn resolve_ytdlp(state: &AppState) {
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let db_backend = settings.get("local_audio_backend").ok().flatten();
-    let audio_backend_owned =
-        db_backend.unwrap_or_else(|| state.config.local_audio_backend.clone());
+    let audio_backend_owned = state.effective_audio_backend();
     let audio_backend = &audio_backend_owned;
+    let exclusive_mode = state.effective_exclusive_mode();
+    // Publish it: this is the value the outputs below are built with, and the
+    // only honest answer for the signal path until the next restart.
+    if let Ok(mut slot) = state.active_audio_backend.write() {
+        *slot = Some(audio_backend_owned.clone());
+    }
 
     // Enumerate output devices OFF the async runtime and under a hard timeout.
     //
@@ -642,7 +645,7 @@ pub async fn register_local_outputs(state: &AppState) {
             let device_id = format!("local:{}", dev.name);
             let local_out = tune_core::outputs::local::LocalOutput::with_options(
                 dev.name.clone(),
-                state.config.local_exclusive_mode,
+                exclusive_mode,
                 audio_backend,
             );
             outputs.register(Box::new(local_out));

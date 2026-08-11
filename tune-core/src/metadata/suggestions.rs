@@ -1,5 +1,16 @@
-use crate::db::sqlite::SqliteDb;
+//! Metadata suggestions store.
+//!
+//! Goes through the selected [`DbBackend`], not a raw `SqliteDb`: in
+//! PostgreSQL mode the server no longer opens SQLite at all, so a store bound
+//! to a private SQLite handle would have been writing to a file nothing else
+//! reads (the split-brain the audit flagged).
+
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+
+use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
+use crate::db::engine::Engine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSuggestion {
@@ -13,32 +24,58 @@ pub struct MetadataSuggestion {
     pub status: String,
 }
 
+/// Columns every read below selects, in this order. [`row_to_suggestion`]
+/// depends on it.
+const COLUMNS: &str = "id, track_id, album_id, field, suggested_value, source, confidence, status";
+
+fn row_to_suggestion(row: &[SqlValue]) -> Option<MetadataSuggestion> {
+    Some(MetadataSuggestion {
+        id: row.first()?.as_i64()?,
+        track_id: row.get(1).and_then(|v| v.as_i64()),
+        album_id: row.get(2).and_then(|v| v.as_i64()),
+        field: row.get(3)?.as_string()?,
+        suggested_value: row.get(4)?.as_string()?,
+        source: row.get(5)?.as_string()?,
+        confidence: row.get(6).and_then(|v| v.as_f64()).unwrap_or(0.0),
+        status: row.get(7)?.as_string()?,
+    })
+}
+
 pub struct SuggestionStore {
-    db: SqliteDb,
+    backend: Arc<dyn DbBackend>,
 }
 
 impl SuggestionStore {
-    pub fn new(db: SqliteDb) -> Self {
-        Self { db }
+    pub fn with_backend(backend: Arc<dyn DbBackend>) -> Self {
+        Self { backend }
     }
 
+    /// Create the table if it does not exist.
+    ///
+    /// The DDL is dialect-specific: `INTEGER PRIMARY KEY AUTOINCREMENT` is
+    /// SQLite-only and is a syntax error on PostgreSQL, which is one reason
+    /// this store could never have worked against a PG backend before.
     pub fn setup_table(&self) -> Result<(), String> {
-        self.db.execute_batch(
+        let id_column = match self.backend.engine() {
+            Engine::Postgres => "id BIGSERIAL PRIMARY KEY",
+            Engine::Sqlite => "id INTEGER PRIMARY KEY AUTOINCREMENT",
+        };
+        self.backend.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS metadata_suggestions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                track_id INTEGER,
-                album_id INTEGER,
+                {id_column},
+                track_id BIGINT,
+                album_id BIGINT,
                 field TEXT NOT NULL,
                 suggested_value TEXT NOT NULL,
                 source TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 0.0,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
                 status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_ms_track ON metadata_suggestions(track_id);
             CREATE INDEX IF NOT EXISTS idx_ms_album ON metadata_suggestions(album_id);
-            CREATE INDEX IF NOT EXISTS idx_ms_status ON metadata_suggestions(status);",
-        )
+            CREATE INDEX IF NOT EXISTS idx_ms_status ON metadata_suggestions(status);"
+        ))
     }
 
     pub fn add_track_suggestion(
@@ -49,16 +86,7 @@ impl SuggestionStore {
         source: &str,
         confidence: f64,
     ) -> Result<i64, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO metadata_suggestions \
-             (track_id, field, suggested_value, source, confidence, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
-            rusqlite::params![track_id, field, value, source, confidence],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_rowid())
+        self.add_suggestion("track_id", track_id, field, value, source, confidence)
     }
 
     pub fn add_album_suggestion(
@@ -69,153 +97,122 @@ impl SuggestionStore {
         source: &str,
         confidence: f64,
     ) -> Result<i64, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO metadata_suggestions \
-             (album_id, field, suggested_value, source, confidence, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
-            rusqlite::params![album_id, field, value, source, confidence],
+        self.add_suggestion("album_id", album_id, field, value, source, confidence)
+    }
+
+    /// `owner_column` is a hard-coded `"track_id"` / `"album_id"` from the two
+    /// callers above — never caller input, so interpolating it is safe.
+    fn add_suggestion(
+        &self,
+        owner_column: &str,
+        owner_id: i64,
+        field: &str,
+        value: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<i64, String> {
+        let field = field.to_string();
+        let value = value.to_string();
+        let source = source.to_string();
+        self.backend.execute_returning_id(
+            &format!(
+                "INSERT INTO metadata_suggestions \
+                 ({owner_column}, field, suggested_value, source, confidence, status) \
+                 VALUES (?, ?, ?, ?, ?, 'pending')"
+            ),
+            &[
+                &owner_id as &dyn ToSqlValue,
+                &field as &dyn ToSqlValue,
+                &value as &dyn ToSqlValue,
+                &source as &dyn ToSqlValue,
+                &confidence as &dyn ToSqlValue,
+            ],
         )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_rowid())
     }
 
     pub fn pending_for_track(&self, track_id: i64) -> Result<Vec<MetadataSuggestion>, String> {
         self.query_suggestions(
-            "SELECT id, track_id, album_id, field, suggested_value, source, confidence, status \
-             FROM metadata_suggestions WHERE track_id = ?1 AND status = 'pending' ORDER BY confidence DESC",
+            &format!(
+                "SELECT {COLUMNS} FROM metadata_suggestions \
+                 WHERE track_id = ? AND status = 'pending' ORDER BY confidence DESC"
+            ),
             track_id,
         )
     }
 
     pub fn pending_for_album(&self, album_id: i64) -> Result<Vec<MetadataSuggestion>, String> {
         self.query_suggestions(
-            "SELECT id, track_id, album_id, field, suggested_value, source, confidence, status \
-             FROM metadata_suggestions WHERE album_id = ?1 AND status = 'pending' ORDER BY confidence DESC",
+            &format!(
+                "SELECT {COLUMNS} FROM metadata_suggestions \
+                 WHERE album_id = ? AND status = 'pending' ORDER BY confidence DESC"
+            ),
             album_id,
         )
     }
 
     pub fn accept(&self, suggestion_id: i64) -> Result<Option<MetadataSuggestion>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "UPDATE metadata_suggestions SET status = 'accepted' WHERE id = ?1",
-            [suggestion_id],
-        )
-        .map_err(|e| e.to_string())?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, track_id, album_id, field, suggested_value, source, confidence, status \
-                 FROM metadata_suggestions WHERE id = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let result = stmt
-            .query_row([suggestion_id], |row| {
-                Ok(MetadataSuggestion {
-                    id: row.get(0)?,
-                    track_id: row.get(1)?,
-                    album_id: row.get(2)?,
-                    field: row.get(3)?,
-                    suggested_value: row.get(4)?,
-                    source: row.get(5)?,
-                    confidence: row.get(6)?,
-                    status: row.get(7)?,
-                })
-            })
-            .ok();
-
-        Ok(result)
+        self.set_status(suggestion_id, "accepted")?;
+        let row = self.backend.query_one(
+            &format!("SELECT {COLUMNS} FROM metadata_suggestions WHERE id = ?"),
+            &[&suggestion_id as &dyn ToSqlValue],
+        )?;
+        Ok(row.as_deref().and_then(row_to_suggestion))
     }
 
     pub fn reject(&self, suggestion_id: i64) -> Result<(), String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute(
-            "UPDATE metadata_suggestions SET status = 'rejected' WHERE id = ?1",
-            [suggestion_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        self.set_status(suggestion_id, "rejected")
+    }
+
+    fn set_status(&self, suggestion_id: i64, status: &str) -> Result<(), String> {
+        let status = status.to_string();
+        self.backend
+            .execute(
+                "UPDATE metadata_suggestions SET status = ? WHERE id = ?",
+                &[
+                    &status as &dyn ToSqlValue,
+                    &suggestion_id as &dyn ToSqlValue,
+                ],
+            )
+            .map(|_| ())
     }
 
     pub fn auto_apply_above(&self, threshold: f64) -> Result<Vec<MetadataSuggestion>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, track_id, album_id, field, suggested_value, source, confidence, status \
-                 FROM metadata_suggestions WHERE status = 'pending' AND confidence >= ?1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let suggestions: Vec<MetadataSuggestion> = stmt
-            .query_map([threshold], |row| {
-                Ok(MetadataSuggestion {
-                    id: row.get(0)?,
-                    track_id: row.get(1)?,
-                    album_id: row.get(2)?,
-                    field: row.get(3)?,
-                    suggested_value: row.get(4)?,
-                    source: row.get(5)?,
-                    confidence: row.get(6)?,
-                    status: row.get(7)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+        let rows = self.backend.query_many(
+            &format!(
+                "SELECT {COLUMNS} FROM metadata_suggestions \
+                 WHERE status = 'pending' AND confidence >= ?"
+            ),
+            &[&threshold as &dyn ToSqlValue],
+        )?;
+        let suggestions: Vec<MetadataSuggestion> =
+            rows.iter().filter_map(|r| row_to_suggestion(r)).collect();
 
         for s in &suggestions {
-            conn.execute(
-                "UPDATE metadata_suggestions SET status = 'accepted' WHERE id = ?1",
-                [s.id],
-            )
-            .map_err(|e| e.to_string())?;
+            self.set_status(s.id, "accepted")?;
         }
-
         Ok(suggestions)
     }
 
     pub fn count_pending(&self) -> Result<i64, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM metadata_suggestions WHERE status = 'pending'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())
+        Ok(self
+            .backend
+            .query_one(
+                "SELECT COUNT(*) FROM metadata_suggestions WHERE status = 'pending'",
+                &[],
+            )?
+            .and_then(|row| row.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 
     pub fn clear(&self) -> Result<(), String> {
-        self.db.execute_batch("DELETE FROM metadata_suggestions")
+        self.backend
+            .execute("DELETE FROM metadata_suggestions", &[])
+            .map(|_| ())
     }
 
     fn query_suggestions(&self, sql: &str, param: i64) -> Result<Vec<MetadataSuggestion>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([param], |row| {
-                Ok(MetadataSuggestion {
-                    id: row.get(0)?,
-                    track_id: row.get(1)?,
-                    album_id: row.get(2)?,
-                    field: row.get(3)?,
-                    suggested_value: row.get(4)?,
-                    source: row.get(5)?,
-                    confidence: row.get(6)?,
-                    status: row.get(7)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(rows)
+        let rows = self.backend.query_many(sql, &[&param as &dyn ToSqlValue])?;
+        Ok(rows.iter().filter_map(|r| row_to_suggestion(r)).collect())
     }
 }
 
@@ -224,8 +221,11 @@ mod tests {
     use super::*;
 
     fn setup() -> SuggestionStore {
+        use crate::db::sqlite::SqliteDb;
+
         let db = SqliteDb::open_in_memory().unwrap();
-        let store = SuggestionStore::new(db);
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let store = SuggestionStore::with_backend(backend);
         store.setup_table().unwrap();
         store
     }

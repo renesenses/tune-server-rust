@@ -4,15 +4,11 @@ members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "p
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-# tune-pyo3 is a native Python extension (cdylib) with its own standalone
-# workspace: it links libpython and needs Python headers, which the server CI
-# and build matrix do not provide. Keeping it excluded also means its pyo3
-# dependency is versioned independently of the server tree.
-exclude = ["tune-desktop", "tune-widget", "tune-pyo3"]
+exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.62"
+version = "0.9.68"
 edition = "2024"
 # Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
 # old value misdeclared far broader rights to audit/SBOM tools (issue #1147).
@@ -27,7 +23,6 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
-pyo3 = { version = "0.24", features = ["extension-module"] }
 lofty = "0.24"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "query", "form", "multipart"] }
 walkdir = "2"

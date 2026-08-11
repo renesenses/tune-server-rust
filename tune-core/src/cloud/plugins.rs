@@ -93,13 +93,60 @@ impl PluginMarketplace {
             .find(|p| p.slug == slug || p.name == slug)
     }
 
+    /// Fetch the detached minisign signature for a plugin artifact.
+    ///
+    /// `Ok(None)` means the marketplace does not publish one — the caller
+    /// decides whether that is fatal (see the `plugin_signature_required`
+    /// setting in the server). A transport failure is an `Err`: "the network
+    /// broke" must not be read as "this plugin is unsigned".
+    pub async fn download_signature(&self, name: &str) -> Result<Option<String>, String> {
+        /// A minisign signature is a couple of short base64 lines.
+        const MAX_SIG_BYTES: u64 = 8 * 1024;
+
+        let url = format!(
+            "{}/api/v1/plugins/{}/download.minisig",
+            self.base_url,
+            urlencoding::encode(name)
+        );
+        let client = crate::http::client::long_timeout();
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("plugin signature request failed: {e}"))?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(format!("plugin signature fetch: HTTP {}", resp.status()));
+        }
+        if resp.content_length().unwrap_or(0) > MAX_SIG_BYTES {
+            return Err("plugin signature is implausibly large".into());
+        }
+
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("read plugin signature failed: {e}"))?;
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text))
+    }
+
     /// Download a plugin binary/archive by name.
     ///
     /// The body is read with a hard size cap: `resp.bytes()` buffered the whole
     /// response into memory unbounded, so a compromised or misbehaving
     /// marketplace could OOM the server with an oversized (or endless) payload.
-    /// A WASM plugin is comfortably under the cap. (Cryptographic signature
-    /// verification of the artifact is a separate, larger piece — audit item 8.)
+    /// A WASM plugin is comfortably under the cap.
+    ///
+    /// These bytes are **not** authenticated here. The caller must run them
+    /// past the signature check before they touch disk — see
+    /// `verify_plugin_signature` in the server's marketplace routes (audit
+    /// item 8).
     pub async fn download(&self, name: &str) -> Result<Vec<u8>, String> {
         /// 50 MiB — generous for a WASM plugin, bounds worst-case memory.
         const MAX_PLUGIN_BYTES: usize = 50 * 1024 * 1024;

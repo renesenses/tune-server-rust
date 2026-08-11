@@ -266,11 +266,23 @@ def check_cargo_deny() -> CheckResult:
         # Surface the actual advisory/license/ban so the failure is diagnosable
         # (previously swallowed — a red cargo_deny gave no clue what broke).
         detail = (proc.stderr or proc.stdout or "").strip()
-        deny_lines = [
-            ln
-            for ln in detail.splitlines()
-            if any(k in ln for k in ("error[", "warning[", "RUSTSEC", "= note", "denied"))
-        ]
+        lines = detail.splitlines()
+        # Les ERREURS d'abord, et l'identifiant RUSTSEC avec elles.
+        #
+        # L'ancien filtre prenait les cinq premieres lignes correspondantes,
+        # dans l'ordre du rapport. Or cargo-deny sort ses `warning[duplicate]`
+        # AVANT ses `error[...]` : le message ne montrait donc que des doublons
+        # de crates, parfaitement benins (`multiple-versions = "warn"`), et
+        # jamais la cause reelle. Le preflight a echoue ainsi sur CHAQUE release
+        # de la 0.9.58 a la 0.9.65 — huit versions — sans que le rapport permette
+        # de savoir que le coupable etait un avis RUSTSEC sur audiopus_sys.
+        #
+        # Un controle rouge en permanence est un controle que plus personne ne
+        # lit. C'etait le cas, et c'est ce message qui l'a rendu illisible.
+        errors = [ln for ln in lines if "error[" in ln or "denied" in ln]
+        ids = [ln.strip() for ln in lines if "RUSTSEC" in ln and "ID:" in ln]
+        others = [ln for ln in lines if "warning[" in ln or "= note" in ln]
+        deny_lines = errors + ids + others
         snippet = " | ".join(deny_lines[:5]) or detail[-300:]
         return CheckResult(
             "cargo_deny",

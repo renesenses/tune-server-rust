@@ -60,8 +60,17 @@ struct SsdpResponse {
 pub struct SsdpScanner {
     state: Arc<Mutex<ScannerState>>,
     search_targets: Vec<String>,
-    event_tx: mpsc::Sender<SsdpEvent>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    /// Canal d'événements, remplaçable : le serveur crée le sien après avoir
+    /// construit l'état, et remplaçait jusqu'ici le scanner ENTIER pour
+    /// l'injecter — ce qui imposait le mutex englobant (#1432).
+    event_tx: Mutex<mpsc::Sender<SsdpEvent>>,
+    /// Tâche de balayage, derrière un verrou interne : `start`/`stop`
+    /// n'exigent donc pas `&mut self`, et le scanner peut être partagé en
+    /// `Arc<SsdpScanner>` sans mutex englobant. Ce mutex-là ne protégeait que
+    /// ce champ, mais il était tenu à travers `rescan()` — un balayage réseau
+    /// de plusieurs secondes — pendant lequel toute lecture de `devices()`
+    /// attendait, `GET /zones` compris (#1432).
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct ScannerState {
@@ -99,8 +108,8 @@ impl SsdpScanner {
         Self {
             state: Arc::new(Mutex::new(ScannerState::new())),
             search_targets: targets,
-            event_tx,
-            task: None,
+            event_tx: Mutex::new(event_tx),
+            task: Mutex::new(None),
         }
     }
 
@@ -109,15 +118,21 @@ impl SsdpScanner {
         self
     }
 
-    pub async fn start(&mut self) {
+    /// Remplace le canal d'événements. Le serveur l'appelle une fois, au
+    /// câblage de la découverte, au lieu de remplacer le scanner entier.
+    pub async fn set_event_tx(&self, tx: mpsc::Sender<SsdpEvent>) {
+        *self.event_tx.lock().await = tx;
+    }
+
+    pub async fn start(&self) {
         let state = self.state.clone();
         let targets = self.search_targets.clone();
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.event_tx.lock().await.clone();
 
         let task = tokio::spawn(async move {
             scan_loop(state, targets, event_tx).await;
         });
-        self.task = Some(task);
+        *self.task.lock().await = Some(task);
 
         // Passive SSDP listener: some legacy renderers (e.g. Cyrus Stream X)
         // never answer M-SEARCH, they only multicast periodic NOTIFY
@@ -125,7 +140,7 @@ impl SsdpScanner {
         // active scanner above. Best-effort: if port 1900 can't be bound the
         // task just exits and active discovery still works.
         let notify_state = self.state.clone();
-        let notify_tx = self.event_tx.clone();
+        let notify_tx = self.event_tx.lock().await.clone();
         tokio::spawn(async move {
             notify_listen_loop(notify_state, notify_tx).await;
         });
@@ -133,8 +148,9 @@ impl SsdpScanner {
         info!("ssdp_scanner_started");
     }
 
-    pub async fn stop(&mut self) {
-        if let Some(task) = self.task.take() {
+    pub async fn stop(&self) {
+        let handle = self.task.lock().await.take();
+        if let Some(task) = handle {
             task.abort();
             let _ = task.await;
         }
@@ -143,7 +159,8 @@ impl SsdpScanner {
 
     pub async fn rescan(&self) -> Vec<DiscoveredDevice> {
         let responses = search_all(&self.search_targets).await;
-        process_responses(&self.state, &self.event_tx, responses).await;
+        let event_tx = self.event_tx.lock().await.clone();
+        process_responses(&self.state, &event_tx, responses).await;
         let state = self.state.lock().await;
         state.devices.values().cloned().collect()
     }
@@ -1126,6 +1143,29 @@ mod tests {
         );
         assert!(resp.usn.contains("RINCON_12345"));
         assert!(resp._server.unwrap().contains("Sonos"));
+    }
+
+    /// #1432 : le scanner doit être utilisable derrière un simple `Arc`, sans
+    /// mutex englobant — c'est ce qui permet à `GET /zones` de répondre
+    /// pendant un balayage réseau au lieu d'attendre sa fin.
+    #[tokio::test]
+    async fn scanner_is_shareable_without_an_outer_mutex() {
+        use std::sync::Arc;
+        let (tx, _rx) = mpsc::channel(8);
+        let scanner = Arc::new(SsdpScanner::new(tx));
+
+        // Lecture concurrente pendant qu'une autre tâche tient le scanner :
+        // ne compile QUE si `devices()` prend `&self`.
+        let reader = {
+            let s = scanner.clone();
+            tokio::spawn(async move { s.devices().await.len() })
+        };
+        assert_eq!(reader.await.unwrap(), 0);
+
+        // start/stop sans `&mut` : la mutabilité vit derrière le verrou interne.
+        let (tx2, _rx2) = mpsc::channel(8);
+        scanner.set_event_tx(tx2).await;
+        scanner.stop().await; // aucune tâche lancée : ne doit pas paniquer
     }
 
     #[test]

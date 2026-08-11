@@ -246,9 +246,8 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 info!("ssdp_startup_scan_starting");
             }
 
-            let scanner = state.scanner.lock().await;
+            let scanner = &state.scanner;
             let devices = scanner.rescan().await;
-            drop(scanner);
 
             let mut registered = 0u32;
             let mut outputs = state.outputs.lock().await;
@@ -691,12 +690,36 @@ fn spawn_heartbeat(state: &AppState) {
 
             // Look up friendly names from zones DB
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone());
-            let zone_names: std::collections::HashMap<String, String> = zone_repo
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|z| z.output_device_id.map(|did| (did, z.name)))
+            let zones_for_heartbeat = zone_repo.list().unwrap_or_default();
+            let zone_names: std::collections::HashMap<String, String> = zones_for_heartbeat
+                .iter()
+                .filter_map(|z| z.output_device_id.clone().map(|did| (did, z.name.clone())))
                 .collect();
+            // Marque et modèle CORRIGÉS par l'utilisateur (éditeur « Appareil »).
+            // Ils vivent dans les réglages sous `zone_{id}_brand` / `_model`, pas
+            // dans une colonne de `zones` — d'où le fait qu'ils ne remontaient pas
+            // ici : le heartbeat ne connaissait que la marque déduite du MAC.
+            // Corriger une marque mal détectée n'avait donc aucun effet côté cloud.
+            let zone_overrides: std::collections::HashMap<
+                String,
+                (Option<String>, Option<String>),
+            > = {
+                let settings =
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+                zones_for_heartbeat
+                    .iter()
+                    .filter_map(|z| {
+                        let did = z.output_device_id.clone()?;
+                        let id = z.id?;
+                        let brand = settings.get(&format!("zone_{id}_brand")).ok().flatten();
+                        let model = settings.get(&format!("zone_{id}_model")).ok().flatten();
+                        if brand.is_none() && model.is_none() {
+                            return None;
+                        }
+                        Some((did, (brand, model)))
+                    })
+                    .collect()
+            };
             // Physical identity persisted on zones (Phase B): lets the
             // mozaiklabs admin identify renderer brands by MAC OUI instead
             // of guessing from device names.
@@ -740,11 +763,20 @@ fn spawn_heartbeat(state: &AppState) {
                                 )
                             })
                             .unwrap_or_default();
+                        // La correction de l'utilisateur prime sur la déduction OUI :
+                        // c'est tout l'objet de l'éditeur « Appareil ». `model` n'était
+                        // pas envoyé du tout.
+                        let (user_brand, user_model) =
+                            zone_overrides.get(&id).cloned().unwrap_or((None, None));
+                        let manufacturer = user_brand
+                            .filter(|b| !b.trim().is_empty())
+                            .unwrap_or(manufacturer);
                         serde_json::json!({
                             "name": name,
                             "type": dev_type,
                             "mac": mac,
                             "manufacturer": manufacturer,
+                            "model": user_model.filter(|m| !m.trim().is_empty()),
                         })
                     })
                     .collect(),
@@ -1235,15 +1267,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // calls abort() internally, killing the process with no panic/error).
     // ASIO devices are detected at startup; the hotplug rescan only needs to
     // track WASAPI device changes (USB DACs plugged/unplugged).
-    let configured_backend = {
-        let settings =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-        settings
-            .get("local_audio_backend")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| state.config.local_audio_backend.clone())
-    };
+    let configured_backend = state.effective_audio_backend();
     // When ASIO is configured, force WASAPI for the periodic rescan
     // (re-probing ASIO during playback can crash the driver).
     // ASIO devices were registered at startup and won't change.
@@ -1318,7 +1342,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // New device found — register it
             let local_out = tune_core::outputs::local::LocalOutput::with_options(
                 dev.name.clone(),
-                state.config.local_exclusive_mode,
+                state.effective_exclusive_mode(),
                 &configured_backend,
             );
             outputs.register(Box::new(local_out));

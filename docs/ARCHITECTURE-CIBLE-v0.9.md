@@ -64,7 +64,7 @@ Invariants non négociables sur toute la durée du chantier :
 | 4 | Outputs | `tune-core/src/outputs/*` (15 impls) | 11749 | Capacités implicites (`play_media` défaut = `"not implemented"`), couverture inégale | `OutputCaps` explicites + harnais de conformité |
 | 5 | Plugins | `tune-core/src/plugin_sdk.rs` | — | Compilé en dur via features ; PDF « dynamique/marketplace » = aspirationnel | Contrat `tune-plugin-sdk` semver (voir RFC) |
 | 6 | FFI | `tune-ffi/src/lib.rs` | 213 | 4 fonctions C ; Swift/Flutter réimplémentent la logique | Bus de commandes JSON + flux d'événements |
-| — | Legacy | `tune-pyo3/` | — | **Hors `workspace.members`**, orphelin (serveur Python abandonné) | Sortir du repo |
+| — | Legacy | `tune-pyo3/` | — | ~~Orphelin (serveur Python abandonné)~~ | **Fait** — supprimé du repo (août 2026) |
 | — | Erreurs | transverse | — | `Result<_, String>` aux frontières → intestable | Erreurs typées `thiserror` |
 
 ### Vue d'ensemble cible
@@ -493,9 +493,10 @@ JSON couvre 95 % du besoin à coût quasi nul et sans casser l'ABI existante.
 - **`thiserror`** (déjà en dep) aux frontières de module : `PlayError`, `ResolveError`, `OutputError`,
   `DbError`. Remplace `Result<_, String>` — prérequis de testabilité des axes 1/2/4. Migration
   incrémentale, module par module, `impl From<_> for _` pour ne rien casser côté appelants.
-- **Sortir `tune-pyo3`** du repo (serveur Python abandonné, déjà hors `workspace.members`). Ramène le
-  projet à **5 modules réels** (`tune-core`, `tune-server`, `tune-cli`, `tune-ffi`, `tune-bridge`) —
-  et corrige le PDF qui en annonce 6.
+- ~~**Sortir `tune-pyo3`** du repo~~ — **fait en août 2026** (passe de sécurité, item 10). Le crate
+  ne compilait plus contre `tune-core` courant et son `pyo3` 0.24 épinglé restait dans la plage
+  vulnérable RUSTSEC-2026-0176/0177. Le projet est ramené à **5 modules réels** (`tune-core`,
+  `tune-server`, `tune-cli`, `tune-ffi`, `tune-bridge`) — reste à corriger le PDF qui en annonce 6.
 
 ---
 
@@ -550,7 +551,7 @@ ils héritent d'un socle testé plutôt que de l'aggraver.
 - Harnais `assert_output_contract` passé par les 15 impls.
 - `tune-plugin-sdk` publié, un plugin tiers buildable hors-arbre en < 2h (repris roadmap axe 1).
 - `tune_command` : au moins une feature portée iPad+Flutter sans ajout de fonction C.
-- `tune-pyo3` supprimé ; PDF corrigé (5 modules).
+- ~~`tune-pyo3` supprimé~~ **fait** ; PDF à corriger (5 modules).
 - **Zéro régression** mesurée sur le cahier de recette v0.8.x.
 
 ---

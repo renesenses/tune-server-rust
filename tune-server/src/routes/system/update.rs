@@ -45,6 +45,42 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
     }
 }
 
+/// Query string of `POST /system/update/install`.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct UpdateInstallParams {
+    /// Install even if a deferral guard would otherwise hold the update back.
+    force: Option<bool>,
+}
+
+/// Is any zone actually playing right now?
+///
+/// The update restarts the server — on UNIX by re-exec'ing in place, which
+/// replaces the process image and tears every output down with it. Playback
+/// does not survive: the OAAT endpoint sees its socket close and reconnects,
+/// DLNA renderers stop, and the listener hears the music cut out.
+///
+/// It is silent, which is what makes it expensive. On .18 (2026-08-10) six
+/// updates landed in a single day; two of them re-exec'd while zone 12 was
+/// streaming to the OAAT endpoint — the journal shows `update_reexec` followed
+/// immediately by `mdns_zone_reconnected` and `auto_resume_device_reconnected`.
+/// Bertrand reported it as "micro-coupures du son" and there was nothing to
+/// connect the sound to its cause: no message, no restart in the UI, same PID
+/// in the journal (re-exec keeps it).
+///
+/// So defer, as we already do for a running scan. Every install is a deliberate
+/// call today — `config.auto_update` is declared but read nowhere, so nothing
+/// retries on its own — which is exactly why the UI carries the other half of
+/// this fix: it warns that the music will stop and then passes `?force=true`.
+/// A caller that does NOT say `force` has not been told what it is about to
+/// interrupt, and that is the one we protect against.
+async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -> bool {
+    playback
+        .all_states()
+        .await
+        .iter()
+        .any(|z| z.state == tune_core::playback::PlayState::Playing)
+}
+
 /// Can we actually create a file in `dir`? Permission *bits* are not the
 /// answer: a read-only mount, an ACL, or a SELinux label all deny the write
 /// while the mode still reads 0755. The only honest test is to create a file
@@ -288,10 +324,16 @@ pub(super) async fn update_check() -> Json<Value> {
 /// Validates that an update is available, then spawns the download/extract/install
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
+///
+/// `?force=true` overrides the deferral guards that exist to protect work in
+/// progress (currently: playback). The UI sets it on the install button, which
+/// sits directly under the warning that playback will stop.
 pub(super) async fn update_install(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
 ) -> impl IntoResponse {
+    let force = params.force.unwrap_or(false);
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();
@@ -388,6 +430,23 @@ pub(super) async fn update_install(
                 "status": "blocked",
                 "reason": "scan_in_progress",
                 "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
+            })),
+        )
+            .into_response();
+    }
+
+    // Guard: don't restart while music is playing. The restart re-execs the
+    // process, which kills every output mid-stream — and says so nowhere, so
+    // the listener just hears the music cut out (#1462). An update that lands
+    // after the album is worth more than one that interrupts it.
+    if !force && playback_in_progress(&state.playback).await {
+        warn!("update_deferred_playback_in_progress");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "blocked",
+                "reason": "playback_in_progress",
+                "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
             })),
         )
             .into_response();
@@ -1283,6 +1342,139 @@ pub(super) async fn changelog() -> Json<Value> {
     Json(json!({ "version": tune_core::version(), "entries": entries }))
 }
 
+/// Les trois listes du panneau « Quoi de neuf », telles qu'il les attend.
+#[derive(Default)]
+struct ParsedBody {
+    features: Vec<String>,
+    fixes: Vec<String>,
+    improvements: Vec<String>,
+}
+
+/// À quelle rubrique un titre de section renvoie-t-il ?
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    Features,
+    Fixes,
+    Improvements,
+    /// Rubrique reconnue mais sans destination (« Téléchargements », « Mise à
+    /// jour »…) : ses puces ne sont pas des nouveautés et n'ont rien à faire
+    /// dans le panneau.
+    Other,
+}
+
+/// Classe un intitulé (titre de section) par mots-clés, FR et EN.
+fn section_from_title(title: &str) -> Section {
+    let l = title.to_lowercase();
+    if l.contains("correct") || l.contains("fix") || l.contains("bug") {
+        Section::Fixes
+    } else if l.contains("amélio") || l.contains("ameli") || l.contains("improv") {
+        Section::Improvements
+    } else if l.contains("nouveaut") || l.contains("feature") || l.contains("ajout") {
+        Section::Features
+    } else {
+        Section::Other
+    }
+}
+
+/// Retire le balisage Markdown *en ligne* d'une puce : gras, italique,
+/// `code`, et liens `[texte](url)` réduits à leur texte.
+///
+/// Le panneau affiche ces chaînes en TEXTE BRUT (`{item}` dans un `<li>`), donc
+/// tout marqueur laissé ici s'affiche tel quel — c'est ce qui donnait
+/// « \*\*Accueil — …\*\* » à l'écran (capture d'Alex Campbell, 09/08).
+fn strip_inline_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // ** / __ : marqueurs de gras, avalés par paires ; un seul
+            // caractère isolé (un souligné dans un identifiant) est conservé.
+            '*' | '_' if chars.peek() == Some(&c) => {
+                chars.next();
+            }
+            '*' => {}
+            '`' => {}
+            // [texte](url) → texte
+            '[' => {
+                let text: String = chars.by_ref().take_while(|&c| c != ']').collect();
+                out.push_str(&text);
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Découpe un corps de release GitHub en trois listes d'items.
+///
+/// **La structure prime sur les mots-clés.** L'ancienne version classait
+/// *ligne à ligne* par mots-clés : `## Corrections` contient « correction »,
+/// donc le TITRE lui-même atterrissait en puce sous « Corrections » ; et une
+/// phrase de résumé contenant « nouveautés » devenait une nouveauté. Ici un
+/// titre choisit la rubrique courante, et seules les **puces** deviennent des
+/// items — la prose et les titres n'en sont jamais.
+fn parse_release_body(body: &str) -> ParsedBody {
+    let mut out = ParsedBody::default();
+    // Sans aucun titre, on garde le comportement historique : les puces vont
+    // aux nouveautés, et les mots-clés de la puce peuvent la rediriger.
+    let mut current: Option<Section> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(title) = line.strip_prefix('#') {
+            current = Some(section_from_title(title.trim_start_matches('#')));
+            continue;
+        }
+        // Un titre en gras seul sur sa ligne (**Corrections**) tient lieu de
+        // titre de section : c'est fréquent dans nos notes.
+        let bold_title = line
+            .strip_prefix("**")
+            .and_then(|s| s.strip_suffix("**"))
+            .filter(|s| !s.contains("**"));
+        if let Some(title) = bold_title {
+            current = Some(section_from_title(title));
+            continue;
+        }
+        let Some(item) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("• "))
+        else {
+            continue; // prose, séparateur, image… : jamais un item.
+        };
+        let item = strip_inline_markdown(item);
+        if item.is_empty() {
+            continue;
+        }
+        let dest = match current {
+            Some(Section::Other) => continue,
+            Some(s) => s,
+            // Hors de toute section : les mots-clés de la puce décident.
+            None => match section_from_title(&item) {
+                Section::Other => Section::Features,
+                s => s,
+            },
+        };
+        match dest {
+            Section::Features => out.features.push(item),
+            Section::Fixes => out.fixes.push(item),
+            Section::Improvements => out.improvements.push(item),
+            Section::Other => {}
+        }
+    }
+    out
+}
+
 async fn fetch_github_changelog() -> Result<Value, String> {
     let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -1331,37 +1523,11 @@ async fn fetch_github_changelog() -> Result<Value, String> {
                 .next()
                 .unwrap_or("");
             let body = r["body"].as_str().unwrap_or("");
-            let mut features = Vec::new();
-            let mut fixes = Vec::new();
-            let mut improvements = Vec::new();
-            for line in body.lines() {
-                let trimmed = line
-                    .trim()
-                    .trim_start_matches("- ")
-                    .trim_start_matches("* ");
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let lower = line.to_lowercase();
-                if lower.contains("fix") || lower.contains("correction") || lower.contains("bug") {
-                    fixes.push(trimmed.to_string());
-                } else if lower.contains("feat")
-                    || lower.contains("nouveaut")
-                    || lower.contains("add")
-                {
-                    features.push(trimmed.to_string());
-                } else if lower.contains("improv")
-                    || lower.contains("amélio")
-                    || lower.contains("perf")
-                    || lower.contains("optim")
-                {
-                    improvements.push(trimmed.to_string());
-                } else if trimmed.starts_with("**") || trimmed.starts_with("##") {
-                    continue;
-                } else {
-                    features.push(trimmed.to_string());
-                }
-            }
+            let ParsedBody {
+                mut features,
+                fixes,
+                improvements,
+            } = parse_release_body(body);
             if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
                 features.push(format!("Release {version}"));
             }
@@ -1604,6 +1770,176 @@ mod scan_guard_tests {
         let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
         s.set("scan_started_at", &stale.to_string()).unwrap();
         assert!(!scan_in_progress(&b));
+    }
+}
+
+#[cfg(test)]
+mod playback_guard_tests {
+    use super::playback_in_progress;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    #[tokio::test]
+    async fn idle_server_allows_update() {
+        assert!(!playback_in_progress(&PlaybackManager::new()).await);
+    }
+
+    #[tokio::test]
+    async fn playing_zone_defers_update() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        assert!(playback_in_progress(&pm).await);
+    }
+
+    #[tokio::test]
+    async fn paused_zone_allows_update() {
+        // Paused means nothing is streaming, so the re-exec costs nothing
+        // audible. Only Playing defers — otherwise a zone left paused for days
+        // would block every update, which is the failure mode the scan guard's
+        // staleness window exists to avoid.
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.pause(12).await;
+        assert!(!playback_in_progress(&pm).await);
+    }
+
+    #[tokio::test]
+    async fn stopped_zone_allows_update() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.stop(12).await;
+        assert!(!playback_in_progress(&pm).await);
+    }
+
+    #[tokio::test]
+    async fn one_playing_zone_among_idle_ones_defers_update() {
+        // .18 runs 13-14 zones; the guard must look at all of them, not the
+        // first one it finds.
+        let pm = PlaybackManager::new();
+        pm.play(4, NowPlaying::default()).await;
+        pm.stop(4).await;
+        pm.play(8, NowPlaying::default()).await;
+        pm.pause(8).await;
+        pm.play(12, NowPlaying::default()).await;
+        assert!(playback_in_progress(&pm).await);
+    }
+}
+
+#[cfg(test)]
+mod changelog_parse_tests {
+    use super::{Section, parse_release_body, section_from_title, strip_inline_markdown};
+
+    /// Extrait réel d'une note de version (forme v0.9.60), avec ce qui cassait :
+    /// un titre contenant « Corrections », une puce en gras contenant
+    /// « Nouveautés », et une section « Mise à jour » sans rapport.
+    const BODY: &str = "\
+Une qualité Deezer annoncée à tort, et « Nouveautés » qui listait des morceaux.
+
+## Nouveautés
+
+- **Accueil — « Nouveautés » listait des morceaux au lieu d'albums.** Un même
+- Qualité Deezer affichée depuis le `format` réel
+
+## Corrections
+
+- Pochette erronée dans les compilations maison
+- Lecture qui s'arrêtait au premier morceau
+
+## Mise à jour
+
+- Depuis Tune : **Réglages → Système → Mettre à jour**.
+- Sinon, les binaires de toutes les plateformes sont ci-dessous.
+";
+
+    #[test]
+    fn heading_is_a_section_not_an_item() {
+        // Le bug d'Alex : `## Corrections` contient « correction », donc
+        // l'ancien classement ligne-à-ligne le poussait comme PUCE dans les
+        // corrections. Un titre ne doit jamais devenir un item.
+        let p = parse_release_body(BODY);
+        assert!(
+            !p.fixes.iter().any(|i| i.contains("Corrections")),
+            "le titre de section a été rendu comme une puce : {:?}",
+            p.fixes
+        );
+        assert_eq!(p.fixes.len(), 2);
+        assert!(p.fixes[0].starts_with("Pochette erronée"));
+    }
+
+    #[test]
+    fn inline_markdown_is_stripped() {
+        // Le panneau affiche du texte brut : plus aucun `**` ne doit sortir.
+        let p = parse_release_body(BODY);
+        assert!(
+            p.features
+                .iter()
+                .all(|i| !i.contains("**") && !i.contains('`')),
+            "balisage laissé dans les items : {:?}",
+            p.features
+        );
+        assert!(p.features[0].starts_with("Accueil — « Nouveautés »"));
+    }
+
+    #[test]
+    fn prose_and_unrelated_sections_are_dropped() {
+        let p = parse_release_body(BODY);
+        // La phrase d'introduction contient « Nouveautés » : elle devenait une
+        // nouveauté alors que ce n'est pas une puce.
+        assert!(
+            !p.features
+                .iter()
+                .any(|i| i.contains("Deezer annoncée à tort")),
+            "la prose a été promue en item : {:?}",
+            p.features
+        );
+        // « Mise à jour » n'est pas une rubrique du panneau : ses puces sont
+        // des instructions, pas des nouveautés.
+        assert!(
+            !p.features.iter().any(|i| i.contains("Réglages")),
+            "les instructions de mise à jour ont fui : {:?}",
+            p.features
+        );
+        assert_eq!(p.features.len(), 2);
+        assert!(p.improvements.is_empty());
+    }
+
+    #[test]
+    fn bold_line_acts_as_a_section_title() {
+        let p = parse_release_body("**Corrections**\n\n- Un correctif\n");
+        assert_eq!(p.fixes, vec!["Un correctif"]);
+        assert!(p.features.is_empty());
+    }
+
+    #[test]
+    fn bullets_without_any_heading_fall_back_to_keywords() {
+        // Notes plates (pas de titre) : on garde le classement historique par
+        // mots-clés de la puce, défaut « nouveautés ».
+        let p = parse_release_body("- fix: a crash\n- something else\n");
+        assert_eq!(p.fixes, vec!["fix: a crash"]);
+        assert_eq!(p.features, vec!["something else"]);
+    }
+
+    #[test]
+    fn titles_classify_in_both_languages() {
+        assert!(matches!(section_from_title("Bug fixes"), Section::Fixes));
+        assert!(matches!(section_from_title("Corrections"), Section::Fixes));
+        assert!(matches!(
+            section_from_title("Améliorations"),
+            Section::Improvements
+        ));
+        assert!(matches!(section_from_title("Downloads"), Section::Other));
+    }
+
+    #[test]
+    fn links_keep_their_text_only() {
+        assert_eq!(
+            strip_inline_markdown("voir [le fil](https://exemple.fr/x) pour la suite"),
+            "voir le fil pour la suite"
+        );
+        // Un souligné isolé (identifiant) n'est pas du balisage.
+        assert_eq!(
+            strip_inline_markdown("clé audio_embed_analyzed"),
+            "clé audio_embed_analyzed"
+        );
     }
 }
 

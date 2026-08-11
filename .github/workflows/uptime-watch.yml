@@ -1,0 +1,112 @@
+name: Uptime Watch — mozaiklabs.fr
+
+# Surveille que mozaiklabs.fr répond, et ouvre une issue quand ce n'est plus le
+# cas.
+#
+# Pourquoi : le 2026-08-09, les quatre conteneurs du site se sont retrouvés à
+# l'état `Created` — recréés mais jamais démarrés. Site, forum, page de
+# téléchargement et API de licences étaient inaccessibles, et personne ne l'a su
+# jusqu'à ce que quelqu'un tente d'y écrire par hasard. Sans cette coïncidence,
+# le premier à s'en apercevoir aurait été un utilisateur.
+#
+# Surveillance EXTERNE, volontairement : une tâche planifiée sur le VPS ne peut
+# pas alerter quand c'est le VPS qui est tombé. GitHub est le seul point
+# d'observation qui survit à la panne qu'il surveille.
+#
+# Trois cibles, parce qu'elles tombent séparément :
+#   /            la façade — nginx debout ?
+#   /download    la page servie par l'app — PHP et base de données debout ?
+#   API forum    l'API authentifiée — la couche applicative répond-elle vraiment ?
+#
+# Un 200 sur la racine ne prouve rien du reste : nginx peut répondre pendant que
+# l'app est morte.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sonder les trois cibles
+        id: probe
+        env:
+          FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
+        run: |
+          set -u
+          # Les échecs s'accumulent dans un fichier plutôt que dans une
+          # variable : la liste est multi-lignes, et un fichier la transporte
+          # sans échappement jusqu'à l'étape suivante.
+          FAILED=/tmp/failed.md
+          : > "$FAILED"
+
+          probe() {
+            name="$1"; url="$2"; auth="${3:-}"
+            # Trois tentatives espacées : un hoquet réseau isolé ne doit pas
+            # réveiller qui que ce soit. Seule une panne qui dure compte.
+            for attempt in 1 2 3; do
+              if [ -n "$auth" ]; then
+                code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H "Authorization: Bearer $auth" "$url" || echo 000)
+              else
+                code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$url" || echo 000)
+              fi
+              if [ "$code" = "200" ]; then
+                echo "  $name : $code"
+                return 0
+              fi
+              echo "  $name : $code (tentative $attempt/3)"
+              [ "$attempt" -lt 3 ] && sleep 20
+            done
+            printf -- '- **%s** — dernier code HTTP : `%s` (%s)\n' "$name" "$code" "$url" >> "$FAILED"
+            return 1
+          }
+
+          probe "Accueil"    "https://mozaiklabs.fr/"          || true
+          probe "Téléchargements" "https://mozaiklabs.fr/download" || true
+          probe "API forum"  "https://mozaiklabs.fr/api/v1/forum/threads" "${FORUM_TOKEN:-}" || true
+
+          if [ -s "$FAILED" ]; then
+            echo "down=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ouvrir une issue si le site est tombé
+        if: steps.probe.outputs.down == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Le corps est construit dans un fichier : un heredoc dont les lignes
+          # commencent en colonne 0 casserait le bloc YAML de cette étape.
+          BODY=/tmp/issue.md
+          {
+            printf 'Détecté par `uptime-watch` le %s.\n\n' "$(date -u '+%Y-%m-%d à %H:%M UTC')"
+            cat /tmp/failed.md
+            printf '\n## Quoi regarder en premier\n\n'
+            printf 'Les conteneurs sont-ils **démarrés** ? Ils peuvent être à l’état `Created` —\n'
+            printf 'recréés mais jamais lancés — auquel cas `docker ps` ne les montre pas alors\n'
+            printf 'que `docker ps -a` les liste.\n\n'
+            printf 'Si c’est le cas, les démarrer — surtout PAS `docker compose up`, qui recrée\n'
+            printf 'les conteneurs et perd le code déployé par `docker cp` :\n\n'
+            printf '    docker start mozaiklabs-pgsql-1 mozaiklabs-redis-1\n'
+            printf '    docker start mozaiklabs-app-1 mozaiklabs-nginx-1\n\n'
+            printf 'Cette issue se referme à la main une fois le site rétabli : la sonde ne la\n'
+            printf 'ferme pas toute seule, pour laisser une trace de l’incident.\n'
+          } > "$BODY"
+
+          # Une seule issue ouverte à la fois : une panne qui dure ne doit pas
+          # en produire une toutes les quinze minutes.
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                       --search 'in:title mozaiklabs.fr ne répond plus' \
+                       --json number -q '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file "$BODY"
+            echo "issue #$EXISTING mise à jour"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "🔴 mozaiklabs.fr ne répond plus" --body-file "$BODY"
+            echo "issue créée"
+          fi
+          exit 1

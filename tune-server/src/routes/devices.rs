@@ -55,9 +55,8 @@ async fn device_catalog() -> Json<Value> {
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let discovered = scanner.devices().await;
-    drop(scanner);
 
     let outputs = state.outputs.lock().await;
     let registered_ids: std::collections::HashSet<String> = outputs.list().into_iter().collect();
@@ -638,9 +637,8 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 }
 
 async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.rescan().await;
-    drop(scanner);
 
     let deduped = dedup_devices(devices);
 
@@ -727,7 +725,7 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
 async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
     #[cfg(feature = "local-audio")]
     {
-        let backend = &state.config.local_audio_backend;
+        let backend = &state.display_audio_backend();
         // The web client's sidebar fetches this on every page load. Re-enumerating
         // WASAPI devices probes each device's formats, which can crash the active
         // render stream and stop playback on Windows (DEvir: refresh UI during

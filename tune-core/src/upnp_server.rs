@@ -12,7 +12,10 @@ use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
 use crate::db::models::Track;
 use crate::db::radio_repo::RadioRepo;
-use crate::db::sqlite::SqliteDb;
+use std::sync::Arc;
+
+use crate::db::backend::DbBackend;
+use crate::db::engine::Engine;
 use crate::db::track_repo::TrackRepo;
 use crate::discovery::ssdp;
 
@@ -22,16 +25,16 @@ use crate::discovery::ssdp;
 
 #[derive(Clone)]
 pub struct UpnpState {
-    pub db: SqliteDb,
+    pub backend: Arc<dyn DbBackend>,
     pub server_port: u16,
     pub friendly_name: String,
     pub uuid: String,
 }
 
 impl UpnpState {
-    pub fn new(db: SqliteDb, server_port: u16) -> Self {
+    pub fn new(backend: Arc<dyn DbBackend>, server_port: u16) -> Self {
         Self {
-            db,
+            backend,
             server_port,
             friendly_name: "Tune Server".into(),
             uuid: format!("uuid:{}", uuid::Uuid::new_v4()),
@@ -312,7 +315,7 @@ fn browse_root(_state: &UpnpState) -> DidlResult {
 }
 
 fn browse_artists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
-    let repo = ArtistRepo::new(state.db.clone());
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0) as u64;
     let artists = repo.list(count as i64, start as i64).unwrap_or_default();
 
@@ -336,7 +339,7 @@ fn browse_artists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 }
 
 fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0) as u64;
     let albums = repo.list(count as i64, start as i64).unwrap_or_default();
 
@@ -375,22 +378,28 @@ fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 }
 
 fn browse_genres(state: &UpnpState) -> DidlResult {
-    // Fetch distinct genres from the albums table
-    let Ok(conn) = state.db.connection().lock() else {
-        return DidlResult {
-            xml: didl_wrap(""),
-            total: 0,
-            returned: 0,
-        };
+    // Fetch distinct genres from the albums table.
+    //
+    // `COLLATE NOCASE` is SQLite-only — PostgreSQL rejects it — so the sort is
+    // dialect-specific. `LOWER(genre)` is the portable equivalent and gives
+    // the same ordering on both.
+    let order = match state.backend.engine() {
+        Engine::Postgres => "LOWER(genre)",
+        Engine::Sqlite => "genre COLLATE NOCASE",
     };
-    let genres: Vec<String> = conn
-        .prepare("SELECT DISTINCT genre FROM albums WHERE genre IS NOT NULL AND genre != '' ORDER BY genre COLLATE NOCASE")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_default();
-    drop(conn);
+    let genres: Vec<String> = state
+        .backend
+        .query_many(
+            &format!(
+                "SELECT DISTINCT genre FROM albums \
+                 WHERE genre IS NOT NULL AND genre != '' ORDER BY {order}"
+            ),
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_string()))
+        .collect();
 
     let mut inner = String::new();
     for genre in &genres {
@@ -422,7 +431,7 @@ fn browse_playlists(_state: &UpnpState) -> DidlResult {
 }
 
 fn browse_radios(state: &UpnpState) -> DidlResult {
-    let repo = RadioRepo::new(state.db.clone());
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
     let _base = state.base_url();
 
@@ -463,7 +472,7 @@ fn browse_radios(state: &UpnpState) -> DidlResult {
 }
 
 fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> DidlResult {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let albums = repo.list_by_artist(artist_id).unwrap_or_default();
 
     let parent_id = format!("artist/{artist_id}");
@@ -496,7 +505,7 @@ fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> Di
 }
 
 fn browse_album_tracks(state: &UpnpState, album_id: i64, base_url: &str) -> DidlResult {
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = repo.list_by_album(album_id).unwrap_or_default();
 
     let parent_id = format!("album/{album_id}");

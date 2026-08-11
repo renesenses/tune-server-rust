@@ -215,6 +215,48 @@ impl StreamSession {
 /// Type alias for the shared sessions map, used by both core and server.
 pub type SharedSessions = Arc<Mutex<HashMap<String, Arc<StreamSession>>>>;
 
+// ---------------------------------------------------------------------------
+// Métadonnées ICY en direct — canal latéral entre le poller et le flux
+// ---------------------------------------------------------------------------
+//
+// Le bloc ICY envoyé à un renderer était construit UNE FOIS, à la connexion,
+// puis réémis à l'identique toutes les 16 Ko. Un Marantz branché sur Radio
+// Paradise affichait donc éternellement le morceau qui passait à l'instant du
+// branchement (signalé sur le forum, 10 août).
+//
+// Le titre courant existe pourtant : le poller l'obtient déjà via
+// `radio_metadata::fetch_radio_metadata` et met à jour le now-playing de la
+// zone — c'est ce que l'interface web affiche. Mais les deux sous-systèmes
+// s'ignorent : la session de flux n'a pas de zone, et le poller n'a pas les
+// sessions.
+//
+// Plutôt que de faire traverser `SharedSessions` au constructeur du poller —
+// qui n'en a besoin que pour ça — ce registre étroit fait le lien, par
+// `stream_id`, la seule clé que les deux connaissent déjà. Il est délibérément
+// minuscule : une entrée par flux radio en cours.
+static RADIO_NOW: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Option<String>, String)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Publier le titre courant d'un flux radio. Appelé par le poller quand il
+/// détecte un changement de morceau.
+pub fn publish_radio_now(stream_id: &str, artist: Option<String>, title: String) {
+    if let Ok(mut map) = RADIO_NOW.lock() {
+        map.insert(stream_id.to_string(), (artist, title));
+    }
+}
+
+/// Lire le titre courant d'un flux radio, s'il a été publié.
+pub fn radio_now(stream_id: &str) -> Option<(Option<String>, String)> {
+    RADIO_NOW.lock().ok()?.get(stream_id).cloned()
+}
+
+/// Oublier un flux terminé — sans quoi le registre grossirait indéfiniment.
+pub fn forget_radio_now(stream_id: &str) {
+    if let Ok(mut map) = RADIO_NOW.lock() {
+        map.remove(stream_id);
+    }
+}
+
 pub struct AudioStreamer {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
     port: u16,
@@ -492,6 +534,9 @@ impl AudioStreamer {
             }
         }
         let removed = self.sessions.lock().await.remove(stream_id);
+        // Le registre des titres radio suit la vie de la session : sans ça il
+        // grossirait d'une entree par flux ecoute, et pour toujours.
+        forget_radio_now(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.
         // Only delete files under the system temp dir with the tune-transcode prefix
         // to avoid accidentally removing actual music files.
@@ -522,12 +567,20 @@ impl AudioStreamer {
     /// `dlna_needs_wav`), which the synchronous `build_signal_path` cannot
     /// replay (Sevy, forum affichage-chemin-du-signal — showed "ALAC → FLAC"
     /// while the wire was WAV). Returns `None` for an unknown session.
-    pub async fn stream_output_container(&self, stream_id: &str) -> Option<String> {
+    /// Format RÉELLEMENT servi sur le fil pour cette session — conteneur,
+    /// fréquence, profondeur, canaux.
+    ///
+    /// C'est la seule source de vérité sur ce que le renderer reçoit : le
+    /// chemin du signal déduisait auparavant ces valeurs en rejouant les règles
+    /// de l'orchestrateur, si bien qu'il pouvait annoncer autre chose que ce
+    /// qui partait vraiment (Yves : darTZeel LHC-208 et Eversolo DMP-A10 en
+    /// passthrough natif affichent la bonne résolution, Tune non).
+    pub async fn stream_output_wire(&self, stream_id: &str) -> Option<StreamInfo> {
         self.sessions
             .lock()
             .await
             .get(stream_id)
-            .map(|s| s.info.format.clone())
+            .map(|s| s.info.clone())
     }
 
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
@@ -750,6 +803,46 @@ mod tests {
     }
 
     #[test]
+    /// Le registre des titres radio rend le bloc ICY VIVANT.
+    ///
+    /// C'est tout l'objet du correctif : avant, le bloc etait construit une
+    /// fois a la connexion et reemis a l'identique toutes les 16 Ko — un
+    /// Marantz branche sur Radio Paradise affichait eternellement le morceau
+    /// du moment ou il s'etait branche.
+    #[test]
+    fn radio_now_changes_the_icy_block_between_two_emissions() {
+        let sid = "test-flux-radio-1";
+        forget_radio_now(sid);
+
+        // Rien de publie : le flux se rabat sur le bloc de la connexion.
+        assert!(radio_now(sid).is_none());
+
+        publish_radio_now(sid, Some("Pink Floyd".into()), "Time".into());
+        let (a1, t1) = radio_now(sid).expect("titre publie");
+        let bloc1 = build_icy_metadata(a1.as_deref(), Some(&t1), None);
+
+        // Le morceau suivant passe a l'antenne.
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into());
+        let (a2, t2) = radio_now(sid).expect("titre publie");
+        let bloc2 = build_icy_metadata(a2.as_deref(), Some(&t2), None);
+
+        assert_ne!(bloc1, bloc2, "le bloc ICY doit suivre le morceau courant");
+        assert!(String::from_utf8_lossy(&bloc2).contains("Miles Davis - So What"));
+
+        forget_radio_now(sid);
+    }
+
+    /// Un flux termine ne doit rien laisser derriere lui : sans ca le registre
+    /// grossirait d'une entree par radio ecoutee, indefiniment.
+    #[test]
+    fn forgetting_a_stream_clears_its_entry() {
+        let sid = "test-flux-radio-2";
+        publish_radio_now(sid, None, "Un titre".into());
+        assert!(radio_now(sid).is_some());
+        forget_radio_now(sid);
+        assert!(radio_now(sid).is_none());
+    }
+
     fn icy_metadata_block() {
         let block = build_icy_metadata(Some("Artist"), Some("Title"), None);
         assert!(block.len() > 1);

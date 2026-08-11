@@ -388,6 +388,198 @@ fn parse_gain_db(s: String) -> Option<f64> {
         .ok()
 }
 
+// ---------------------------------------------------------------------------
+// Applying the gain at playback
+// ---------------------------------------------------------------------------
+//
+// Everything above MEASURES and STORES the gain. Nothing used to READ it back:
+// a library could be fully analysed, every `rg_track_gain` in place, and not
+// one decibel was ever applied. This is the consuming half.
+
+/// Setting: `off` (default), `track` or `album`.
+pub const MODE_KEY: &str = "replaygain_mode";
+/// Setting: extra dB applied on top of the tag, e.g. `+3` for a quiet system.
+pub const PREAMP_KEY: &str = "replaygain_preamp_db";
+/// Setting: pull the gain back when the tagged peak says it would clip.
+pub const PREVENT_CLIPPING_KEY: &str = "replaygain_prevent_clipping";
+
+/// How the gain is chosen for a track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayGainMode {
+    /// No gain is applied — the stream stays bit-identical to the source.
+    Off,
+    /// Per-track gain: every track plays at the same loudness.
+    Track,
+    /// Per-album gain: the relative dynamics between tracks of an album are
+    /// preserved, which is what a classical or concept album needs.
+    Album,
+}
+
+impl ReplayGainMode {
+    pub fn from_setting(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "track" => Self::Track,
+            "album" => Self::Album,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// The gain to apply to one track, in dB, plus the peak it was tagged with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackGain {
+    pub gain_db: f64,
+    pub peak: Option<f64>,
+}
+
+/// Resolved playback settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplayGainSettings {
+    pub mode: ReplayGainMode,
+    pub preamp_db: f64,
+    pub prevent_clipping: bool,
+}
+
+impl Default for ReplayGainSettings {
+    fn default() -> Self {
+        Self {
+            mode: ReplayGainMode::Off,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        }
+    }
+}
+
+impl ReplayGainSettings {
+    /// Read the three settings. Anything unreadable falls back to the default,
+    /// which is `Off` — a broken setting must never silently alter the sound.
+    pub fn load(backend: &Arc<dyn DbBackend>) -> Self {
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let get = |k: &str| settings.get(k).ok().flatten();
+        Self {
+            mode: get(MODE_KEY)
+                .map(|v| ReplayGainMode::from_setting(&v))
+                .unwrap_or(ReplayGainMode::Off),
+            preamp_db: get(PREAMP_KEY)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .clamp(-15.0, 15.0),
+            prevent_clipping: get(PREVENT_CLIPPING_KEY)
+                .map(|v| v != "false")
+                .unwrap_or(true),
+        }
+    }
+}
+
+/// Read the gain stored for `track_id`, honouring the mode.
+///
+/// Album mode falls back to the track gain when the album values are missing —
+/// half an album's worth of gain is still better than a jump in level.
+pub fn stored_gain_for(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    mode: ReplayGainMode,
+) -> Option<TrackGain> {
+    if mode == ReplayGainMode::Off {
+        return None;
+    }
+    let meta = TrackMetadataRepo::with_backend(backend.clone())
+        .get_all(track_id)
+        .ok()?;
+    let pick = |gain_key: &str, peak_key: &str| -> Option<TrackGain> {
+        let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
+        let peak = meta
+            .get(peak_key)
+            .and_then(|p| p.trim().parse::<f64>().ok())
+            .filter(|p| *p > 0.0);
+        Some(TrackGain { gain_db, peak })
+    };
+    match mode {
+        ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak")
+            .or_else(|| pick("rg_track_gain", "rg_track_peak")),
+        _ => pick("rg_track_gain", "rg_track_peak"),
+    }
+}
+
+/// The linear factor to multiply samples by: `1.0` means "leave the audio
+/// alone".
+///
+/// Clipping prevention is not cosmetic. A loudness-war master tagged at
+/// `peak = 1.0` with a positive gain would be pushed past full scale and
+/// crunch on every peak — the listener would blame Tune, rightly. When the
+/// tagged peak says the result would exceed full scale, the factor is pulled
+/// back to exactly what fits.
+pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
+    if settings.mode == ReplayGainMode::Off {
+        return 1.0;
+    }
+    let total_db = (gain.gain_db + settings.preamp_db).clamp(-30.0, 30.0);
+    let mut factor = 10f64.powf(total_db / 20.0);
+    if settings.prevent_clipping {
+        if let Some(peak) = gain.peak {
+            if peak > 0.0 && factor * peak > 1.0 {
+                factor = 1.0 / peak;
+            }
+        }
+    }
+    // A factor below this is inaudible attenuation of a signal to nothing; a
+    // factor above is a bug, not a preference.
+    factor.clamp(0.001, 4.0)
+}
+
+/// Scale interleaved PCM in place by a linear factor.
+///
+/// For outputs that receive an encoded stream rather than rendering samples
+/// themselves: the gain has to be baked in here or it never happens.
+/// Saturating on the way out — a sample pushed past full scale wraps around
+/// into a loud click if it is simply truncated.
+pub fn apply_gain_pcm(pcm: &mut [u8], bit_depth: u16, factor: f64) {
+    if pcm.is_empty() || (factor - 1.0).abs() < 1e-9 {
+        return;
+    }
+    match bit_depth {
+        16 => {
+            for s in pcm.chunks_exact_mut(2) {
+                let v = i16::from_le_bytes([s[0], s[1]]) as f64 * factor;
+                let clamped = v.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                s.copy_from_slice(&clamped.to_le_bytes());
+            }
+        }
+        24 => {
+            const MAX: f64 = 8_388_607.0;
+            const MIN: f64 = -8_388_608.0;
+            for s in pcm.chunks_exact_mut(3) {
+                // Sign-extend the 24-bit little-endian sample into an i32.
+                let raw = ((s[2] as i32) << 24 | (s[1] as i32) << 16 | (s[0] as i32) << 8) >> 8;
+                let v = (raw as f64 * factor).clamp(MIN, MAX) as i32;
+                s[0] = (v & 0xFF) as u8;
+                s[1] = ((v >> 8) & 0xFF) as u8;
+                s[2] = ((v >> 16) & 0xFF) as u8;
+            }
+        }
+        32 => {
+            for s in pcm.chunks_exact_mut(4) {
+                let raw = i32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                let v = (raw as f64 * factor).clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                s.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        // 8-bit and anything exotic: leave the audio strictly alone rather
+        // than guess at its encoding.
+        _ => {}
+    }
+}
+
+/// Convenience: the factor to apply for `track_id`, or `1.0` when ReplayGain is
+/// off, unmeasured, or unreadable.
+pub fn playback_factor(backend: &Arc<dyn DbBackend>, track_id: i64) -> f64 {
+    let settings = ReplayGainSettings::load(backend);
+    match stored_gain_for(backend, track_id, settings.mode) {
+        Some(gain) => gain_factor(gain, settings),
+        None => 1.0,
+    }
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -399,7 +591,6 @@ fn now_epoch_secs() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
     /// #1330 : la cadence DSD brute etait prise pour une cadence PCM, ce qui
     /// gonflait l'estimation d'un facteur 16 a 32 et ecartait TOUT fichier DSD
     /// de l'analyse.
@@ -464,6 +655,159 @@ mod tests {
         assert_eq!(format_peak(0.9885534), "0.988553");
         assert_eq!(parse_gain_db("-6.50 dB".into()), Some(-6.5));
         assert_eq!(parse_gain_db("3.20".into()), Some(3.2));
+    }
+
+    #[test]
+    fn factor_is_one_when_off() {
+        let g = TrackGain {
+            gain_db: -6.0,
+            peak: Some(0.9),
+        };
+        let s = ReplayGainSettings::default();
+        assert_eq!(s.mode, ReplayGainMode::Off);
+        assert_eq!(gain_factor(g, s), 1.0);
+    }
+
+    #[test]
+    fn minus_six_db_halves_amplitude() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            ..Default::default()
+        };
+        let f = gain_factor(
+            TrackGain {
+                gain_db: -6.0206,
+                peak: None,
+            },
+            s,
+        );
+        assert!((f - 0.5).abs() < 1e-4, "{f}");
+    }
+
+    #[test]
+    fn preamp_adds_to_the_tag() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 6.0206,
+            prevent_clipping: false,
+        };
+        // -6 dB tag + 6 dB pre-amp ⇒ unity.
+        let f = gain_factor(
+            TrackGain {
+                gain_db: -6.0206,
+                peak: None,
+            },
+            s,
+        );
+        assert!((f - 1.0).abs() < 1e-4, "{f}");
+    }
+
+    #[test]
+    fn clipping_prevention_caps_at_the_peak() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        };
+        // +6 dB on a track already peaking at 0.95 would reach 1.9 — clipped.
+        let f = gain_factor(
+            TrackGain {
+                gain_db: 6.0,
+                peak: Some(0.95),
+            },
+            s,
+        );
+        assert!((f - 1.0 / 0.95).abs() < 1e-9, "{f}");
+        assert!(f * 0.95 <= 1.0 + 1e-9);
+        // Turned off, the same track is allowed to overshoot.
+        let loose = ReplayGainSettings {
+            prevent_clipping: false,
+            ..s
+        };
+        assert!(
+            gain_factor(
+                TrackGain {
+                    gain_db: 6.0,
+                    peak: Some(0.95)
+                },
+                loose
+            ) > 1.9
+        );
+    }
+
+    #[test]
+    fn clipping_prevention_never_boosts_a_quiet_track() {
+        // A track peaking at 0.2 with a -3 dB tag must still be attenuated:
+        // the peak cap is a ceiling, never a floor.
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        };
+        let f = gain_factor(
+            TrackGain {
+                gain_db: -3.0,
+                peak: Some(0.2),
+            },
+            s,
+        );
+        assert!(f < 1.0, "{f}");
+    }
+
+    #[test]
+    fn apply_gain_halves_16bit_samples() {
+        let mut pcm = Vec::new();
+        for v in [1000i16, -1000, 32767, -32768] {
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        apply_gain_pcm(&mut pcm, 16, 0.5);
+        let got: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(got, vec![500, -500, 16383, -16384]);
+    }
+
+    #[test]
+    fn apply_gain_saturates_instead_of_wrapping() {
+        // Without the clamp this wraps to a large negative value — an audible
+        // click on every peak, which is worse than the clipping it replaces.
+        let mut pcm = 30000i16.to_le_bytes().to_vec();
+        apply_gain_pcm(&mut pcm, 16, 2.0);
+        assert_eq!(i16::from_le_bytes([pcm[0], pcm[1]]), i16::MAX);
+    }
+
+    #[test]
+    fn apply_gain_handles_24bit_sign_extension() {
+        // -1000 as a 24-bit little-endian sample.
+        let v: i32 = -1000;
+        let mut pcm = vec![
+            (v & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            ((v >> 16) & 0xFF) as u8,
+        ];
+        apply_gain_pcm(&mut pcm, 24, 0.5);
+        let raw = ((pcm[2] as i32) << 24 | (pcm[1] as i32) << 16 | (pcm[0] as i32) << 8) >> 8;
+        assert_eq!(raw, -500);
+    }
+
+    #[test]
+    fn apply_gain_of_one_is_a_no_op() {
+        let original = vec![1u8, 2, 3, 4, 5, 6];
+        let mut pcm = original.clone();
+        apply_gain_pcm(&mut pcm, 16, 1.0);
+        assert_eq!(pcm, original);
+    }
+
+    #[test]
+    fn mode_parsing_defaults_to_off() {
+        assert_eq!(ReplayGainMode::from_setting("track"), ReplayGainMode::Track);
+        assert_eq!(ReplayGainMode::from_setting("ALBUM"), ReplayGainMode::Album);
+        assert_eq!(ReplayGainMode::from_setting(""), ReplayGainMode::Off);
+        assert_eq!(
+            ReplayGainMode::from_setting("yes please"),
+            ReplayGainMode::Off
+        );
     }
 
     #[test]

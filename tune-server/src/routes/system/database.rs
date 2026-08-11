@@ -19,8 +19,12 @@ use crate::state::AppState;
 pub(super) async fn database_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // migration check uses SqliteDb directly (sqlite-specific)
-    let version = migrations::current_version(&state.db).unwrap_or(0);
+    // The migration version is a SQLite notion; PG tracks its own and reports 0.
+    let version = state
+        .db
+        .as_ref()
+        .and_then(|db| migrations::current_version(db).ok())
+        .unwrap_or(0);
     let latest = migrations::latest_version();
     let row = state.backend.query_one(
         "SELECT \
@@ -84,7 +88,15 @@ pub(super) async fn rebuild_fts(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let conn = match state.db.connection().lock() {
+    // The contentless FTS index is a SQLite feature; PostgreSQL has no
+    // equivalent to rebuild.
+    let db = match state.sqlite() {
+        Ok(db) => db,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
+    let conn = match db.connection().lock() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -129,11 +141,8 @@ pub(super) async fn export_database(
     }
 
     // SQLite-specific WAL checkpoint before exporting the DB file
-    if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        state
-            .db
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .ok();
+    if let Ok(db) = state.sqlite() {
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
 
     match tokio::fs::read(&db_path).await {
@@ -557,8 +566,31 @@ pub(super) async fn migrate_database(
         if let Err(e) = tune_core::db::pg_migrate::ensure_database(pg_url).await {
             tracing::warn!(error = %e, "pg_database_auto_create_failed_pre_migrate");
         }
+        // `state.db` est devenu Option<SqliteDb> avec la suppression du
+        // split-brain : il n'y a pas de store SQLite quand le serveur tourne
+        // deja sur PostgreSQL. Migrer SQLite -> PG n'a alors aucun sens, et
+        // c'est un refus explicite plutot qu'un message obscur.
+        // Passe par l'accesseur introduit avec la suppression du split-brain,
+        // comme les deux autres usages de ce fichier (l.93 et l.144) : le
+        // message d'indisponibilité vit à un seul endroit. Formulation de JP
+        // dans sa PR #1424, que ce correctif rejoint.
+        let sqlite = match state.sqlite() {
+            Ok(db) => db,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "status": "error",
+                        "error": "this server already runs on PostgreSQL — there is no SQLite \
+                                  database to migrate from",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
         let start = Instant::now();
-        match tune_core::db::pg_migrate::migrate_sqlite_to_pg(&state.db, pg_url).await {
+        match tune_core::db::pg_migrate::migrate_sqlite_to_pg(sqlite, pg_url).await {
             Ok(result) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 // The UI promises « le serveur va redémarrer » — deliver it:

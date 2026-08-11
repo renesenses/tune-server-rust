@@ -18,6 +18,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use tune_core::db::models::Track;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_server::state::AppState;
 
@@ -41,13 +42,34 @@ fn new_state() -> AppState {
 /// Build the app with the DJ plugin loaded through the real registration path.
 async fn app_with_dj(state: &AppState) -> axum::Router {
     use_scratch_plugin_data_dir();
+
+    // DJ est OPT-IN depuis le suivi de #917 : `default_enabled()` renvoie
+    // false, et `setup_all` le laisse dormant tant que
+    // `plugin_dj_installed=true` n'est pas posé — c'est ce qui le fait
+    // apparaître dans le gestionnaire de greffons au lieu de tourner d'office.
+    // Sans cette ligne, sur une base `:memory:` neuve, DJ reste dormant et
+    // `init` ne renvoie aucun routeur : ces six tests échouaient depuis, et
+    // personne ne le voyait parce que la CI ne compile pas `--features dj`.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_dj_installed", "true")
+        .expect("marquer DJ installé");
+
     let routers = tune_server::plugins::init(state, "http://127.0.0.1:0", vec![]).await;
-    // The compiled-in `dj` arm must have contributed exactly the DJ router.
-    assert_eq!(routers.len(), 1, "the dj plugin must contribute a router");
+
+    // On cherche DJ par son nom plutôt que d'exiger un routeur unique : le
+    // jeu de fonctionnalités livré compile aussi karaoke et plugins-wasm, qui
+    // en contribuent d'autres. Un test sur DJ ne doit pas échouer parce qu'un
+    // greffon voisin existe.
+    let dj = routers
+        .iter()
+        .find(|(name, _)| name == "dj")
+        .map(|(name, _)| name.clone());
     assert_eq!(
-        routers[0].0, "dj",
-        "mount name comes from the plugin's name()"
+        dj.as_deref(),
+        Some("dj"),
+        "le greffon dj doit contribuer un routeur monté sous son name()"
     );
+
     tune_server::routes::router_with_plugins(state.clone(), routers)
 }
 

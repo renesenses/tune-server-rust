@@ -222,22 +222,22 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // nextAndSync refreshes via GET /zones/{id}, which does include it
     // (forum #1012, Bilou).
     if let Some(ref zone) = zone_db {
-        let devices = state.scanner.lock().await.devices().await;
+        let devices = state.scanner.devices().await;
         let renderer_label = zone
             .output_device_id
             .as_deref()
             .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
         #[cfg(feature = "local-audio")]
         let audio_backend =
-            tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+            tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
-        let output_container = match zone_state
+        let wire = match zone_state
             .now_playing
             .as_ref()
             .and_then(|np| np.stream_id.as_deref())
         {
-            Some(sid) => state.streamer.stream_output_container(sid).await,
+            Some(sid) => state.streamer.stream_output_wire(sid).await,
             None => None,
         };
         let signal_path = crate::routes::zones::build_signal_path_pub(
@@ -246,7 +246,7 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             &state.backend,
             renderer_label,
             audio_backend,
-            output_container.as_deref(),
+            wire.as_ref(),
         );
         v.as_object_mut()
             .unwrap()

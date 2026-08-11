@@ -115,6 +115,21 @@ pub mod sql {
         )
     }
 
+    /// Albums homonymes déjà rattachés à un AUTRE dossier, avec leur dossier
+    /// et les numéros de piste qu'ils occupent : de quoi décider si le dossier
+    /// courant est l'éclat d'une même compilation (#1440).
+    pub fn scattered_candidates<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT a.id, a.folder_path, \
+             (SELECT GROUP_CONCAT(t.track_number) FROM tracks t WHERE t.album_id = a.id) \
+             FROM albums a \
+             WHERE LOWER(a.title) = LOWER({}) AND a.folder_path IS NOT NULL \
+             AND a.folder_path <> {} LIMIT 50",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn get_folder_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT folder_path FROM albums WHERE id = {}",
@@ -540,8 +555,44 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, TuneError> {
+        self.get_or_create_for_folder_with_track(folder, title, artist_id, year, mbid, None)
+    }
+
+    /// Variante qui connaît le numéro de la piste en cours d'indexation, seule
+    /// information permettant de recoller une compilation éparpillée par
+    /// artiste sans risquer de fusionner deux homonymes (#1440).
+    pub fn get_or_create_for_folder_with_track(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+        track_number: Option<i32>,
+    ) -> Result<Album, TuneError> {
         if folder.is_empty() {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
+        }
+
+        // Le disque a-t-il déjà une entrée, posée par un dossier frère ? Le
+        // rangement Qobuz d'une compilation met chaque piste dans le dossier
+        // de SON artiste ; sans ce rattrapage, une anthologie de 41 titres
+        // produit 41 albums d'une piste.
+        if self.find_id_by_folder(folder)?.is_none() {
+            if let Some(id) = self.find_scattered_compilation(folder, title, track_number)? {
+                let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+                let params: [&dyn ToSqlValue; 1] = [&id];
+                if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                    tracing::debug!(
+                        album_id = id,
+                        folder,
+                        title,
+                        ?track_number,
+                        "scattered_compilation_reattached"
+                    );
+                    return Ok(row_to_album(&row));
+                }
+            }
         }
 
         if let Some(id) = self.find_id_by_folder(folder)? {
@@ -655,6 +706,72 @@ impl AlbumRepo {
     }
 
     /// The id of the album a folder holds, if one is recorded.
+    /// L'album auquel rattacher une piste dont le dossier est l'éclat d'une
+    /// compilation rangée par artiste (#1440).
+    ///
+    /// Trois conditions doivent tenir ENSEMBLE, et la troisième est celle qui
+    /// protège les homonymes : même titre, dossiers frères éparpillés (voir
+    /// [`crate::scanner::compilation::is_scattered_sibling`]), et un numéro de
+    /// piste encore libre dans l'album candidat. Deux « Greatest Hits »
+    /// distincts commencent tous deux à la piste 1 : ils ne fusionnent pas.
+    pub fn find_scattered_compilation(
+        &self,
+        folder: &str,
+        title: &str,
+        track_number: Option<i32>,
+    ) -> Result<Option<i64>, TuneError> {
+        use crate::scanner::compilation::{
+            folder_cover_fingerprint, is_scattered_sibling, track_number_is_free,
+        };
+        if track_number.is_none() || folder.is_empty() {
+            return Ok(None);
+        }
+        // La pochette du dossier est le SEUL signal qui identifie un disque.
+        //
+        // Le numéro de piste libre ne suffit pas au scan : l'album se remplit
+        // progressivement, donc la piste 1 d'un second volume arrive quand
+        // l'album ne contient encore que les pistes 5, 12, 18 du premier — elle
+        // est absorbée, et de proche en proche les volumes se confondent.
+        // Constaté sur .18 : les quatre volumes « ALLOPOP » écrasés en un seul
+        // album de 71 pistes, chaque numéro en quatre exemplaires.
+        //
+        // Sans pochette on renonce : mieux vaut deux albums de trop qu'un
+        // disque avalé par un autre.
+        let Some(empreinte) = folder_cover_fingerprint(folder) else {
+            return Ok(None);
+        };
+        let sql = self.dialect_sql(sql::scattered_candidates, sql::scattered_candidates);
+        let params: [&dyn ToSqlValue; 2] = [&title, &folder];
+        for row in self.db.query_many_strong(&sql, &params)? {
+            let Some(id) = row.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(cand_folder) = row.get(1).and_then(|v| v.as_str()).map(String::from) else {
+                continue;
+            };
+            if !is_scattered_sibling(folder, &cand_folder) {
+                continue;
+            }
+            // Même titre, dossiers frères — mais est-ce le MÊME disque ?
+            if folder_cover_fingerprint(&cand_folder).as_deref() != Some(empreinte.as_str()) {
+                continue;
+            }
+            let taken: Vec<i32> = row
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|csv| {
+                    csv.split(',')
+                        .filter_map(|n| n.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if track_number_is_free(track_number, &taken) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn find_id_by_folder(&self, folder: &str) -> Result<Option<i64>, TuneError> {
         let sql = self.dialect_sql(sql::get_id_by_folder, sql::get_id_by_folder);
         let params: [&dyn ToSqlValue; 1] = [&folder];
@@ -1361,6 +1478,7 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::Artist;
@@ -1369,6 +1487,140 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// Pose une piste numérotée sur un album, comme le fait le scan.
+    fn seed_track(db: &SqliteDb, album_id: i64, artist_id: i64, n: i32, path: &str) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let mut t = Track::new(format!("piste {n}"));
+        t.album_id = Some(album_id);
+        t.artist_id = Some(artist_id);
+        t.track_number = n;
+        t.file_path = Some(path.into());
+        TrackRepo::new(db.clone()).create(&t).unwrap();
+    }
+
+    /// Crée un dossier d'album avec sa pochette, comme sur disque.
+    fn dossier_avec_pochette(
+        base: &std::path::Path,
+        artiste: &str,
+        album: &str,
+        image: &[u8],
+    ) -> String {
+        let d = base.join(artiste).join(album);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cover.jpg"), image).unwrap();
+        d.to_string_lossy().into_owned()
+    }
+
+    /// #1440 — cas RÉEL : l'anthologie « OUF » rangée par artiste de piste.
+    /// Même pochette dans chaque dossier ⇒ un seul album.
+    #[test]
+    fn a_scattered_anthology_lands_in_one_album() {
+        const TITLE: &str = "OUF L'anthologie Souterraine 2015-2017";
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("Corte Real".into())).unwrap();
+        let a2 = artists.create(&Artist::new("Alligator".into())).unwrap();
+        let f1 = dossier_avec_pochette(tmp.path(), "Corte Real", TITLE, b"OUF-COVER");
+        let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, b"OUF-COVER");
+
+        let first = arepo
+            .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1))
+            .unwrap();
+        seed_track(&db, first.id.unwrap(), a1, 1, &format!("{f1}/01.flac"));
+
+        let second = arepo
+            .get_or_create_for_folder_with_track(&f2, TITLE, a2, None, None, Some(3))
+            .unwrap();
+        assert_eq!(second.id, first.id, "même disque, même pochette : un album");
+    }
+
+    /// #1440 — deux « Greatest Hits » distincts : pochettes différentes ET
+    /// numéros qui se chevauchent. Aucune fusion.
+    #[test]
+    fn two_real_greatest_hits_stay_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("Pat Benatar".into())).unwrap();
+        let a2 = artists.create(&Artist::new("Police".into())).unwrap();
+        let f1 = dossier_avec_pochette(tmp.path(), "Pat Benatar", "Greatest Hits", b"BENATAR");
+        let f2 = dossier_avec_pochette(tmp.path(), "Police", "Greatest Hits", b"POLICE");
+
+        let first = arepo
+            .get_or_create_for_folder_with_track(
+                &f1,
+                "Greatest Hits",
+                a1,
+                Some(2005),
+                None,
+                Some(1),
+            )
+            .unwrap();
+        seed_track(&db, first.id.unwrap(), a1, 1, &format!("{f1}/01.flac"));
+
+        let second = arepo
+            .get_or_create_for_folder_with_track(
+                &f2,
+                "Greatest Hits",
+                a2,
+                Some(1992),
+                None,
+                Some(1),
+            )
+            .unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    /// LA RÉGRESSION livrée en #1442, reproduite : quatre volumes « ALLOPOP »
+    /// éclatés par artiste, dont les pistes arrivent ENTRELACÉES.
+    ///
+    /// Le seul critère du numéro libre les avalait les uns après les autres —
+    /// la piste 1 du volume 2 se présentait quand l'album ne contenait encore
+    /// que les pistes 5 et 12 du volume 1. Résultat observé sur .18 : un album
+    /// de 71 pistes avec chaque numéro en quatre exemplaires. La pochette du
+    /// dossier est ce qui les sépare.
+    #[test]
+    fn four_interleaved_volumes_never_collapse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+
+        // (artiste, volume, numéro) dans un ordre volontairement entrelacé.
+        let arrivees: [(&str, usize, i32); 8] = [
+            ("Diane", 0, 5),
+            ("Tristan", 1, 12),
+            ("Gatien", 0, 12),
+            ("Ma Fraisse", 2, 5),
+            ("Loup", 1, 1),
+            ("Nina", 2, 1),
+            ("Oscar", 3, 5),
+            ("Pia", 3, 1),
+        ];
+        let images = [b"VOL-1".as_slice(), b"VOL-2", b"VOL-3", b"VOL-4"];
+        let mut vus = std::collections::HashSet::new();
+        for (artiste, vol, num) in arrivees {
+            let f = dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", images[vol]);
+            let aid = artists.create(&Artist::new(artiste.into())).unwrap();
+            let album = arepo
+                .get_or_create_for_folder_with_track(&f, "ALLOPOP", aid, None, None, Some(num))
+                .unwrap();
+            let id = album.id.unwrap();
+            seed_track(&db, id, aid, num, &format!("{f}/{num:02}.flac"));
+            vus.insert(id);
+        }
+
+        assert_eq!(
+            vus.len(),
+            4,
+            "quatre pochettes ⇒ quatre albums, pas un seul (régression #1442)"
+        );
     }
 
     #[test]

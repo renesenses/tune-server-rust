@@ -35,7 +35,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        migrations::current_version(&state.db).unwrap_or(0)
+        state
+            .db
+            .as_ref()
+            .and_then(|db| migrations::current_version(db).ok())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -48,9 +52,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
 
     // Discovered devices grouped by type
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
     let mut devices_by_type: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for d in &devices {
@@ -66,7 +69,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     drop(registry);
 
     // Audio outputs
-    let audio_backend_pref = &state.config.local_audio_backend;
+    let audio_backend_pref = &state.display_audio_backend();
     let (audio_outputs, audio_backend_name, asio_avail) = {
         #[cfg(feature = "local-audio")]
         {
@@ -190,7 +193,7 @@ pub(super) async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Va
 }
 
 pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
@@ -563,7 +566,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
     let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        migrations::current_version(&state.db).unwrap_or(0)
+        state
+            .db
+            .as_ref()
+            .and_then(|db| migrations::current_version(db).ok())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -591,9 +598,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     drop(registry);
 
     // Discovered devices
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);

@@ -93,6 +93,32 @@ pub fn analysed_count(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
+/// Combien de pistes la passe acoustique peut-elle analyser en tout — le
+/// dénominateur honnête d'une barre de progression.
+///
+/// Ce n'est PAS le nombre de pistes de la bibliothèque : la passe ignore les
+/// pistes sans fichier local et saute le DSD (le rééchantillonneur DSD→PCM peut
+/// tourner en boucle sur certains repiquages SACD). Compter toutes les pistes
+/// donnerait une jauge qui n'atteint jamais 100 % sur une discothèque qui
+/// contient du DSD, et personne ne saurait pourquoi.
+///
+/// Les conditions ci-dessous doivent rester le miroir exact de la requête de
+/// candidats de `analyze_embedding_batch`, moins le `NOT EXISTS`.
+pub fn eligible_count(backend: &Arc<dyn DbBackend>) -> i64 {
+    backend
+        .query_one(
+            "SELECT COUNT(*) FROM tracks t \
+             WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+               AND (t.format IS NULL OR \
+                    lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff'))",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 /// Rank the library by cosine similarity to an arbitrary (already-normalised)
 /// query vector, most similar first. `exclude` drops one track id (the seed,
 /// when querying by track). Returns `(track_id, cosine)`. Works for any query in

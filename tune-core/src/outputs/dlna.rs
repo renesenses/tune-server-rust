@@ -578,15 +578,26 @@ impl OutputTarget for DlnaOutput {
                     .await?;
                 if grc_resp.contains("UPnPError") || grc_resp.contains("<errorCode>") {
                     warn!(device = %self.name, level, response = %grc_resp, "sonos_group_volume_rejected");
-                } else {
-                    debug!(device = %self.name, level, "sonos_group_volume_ok");
+                    return Err(format!(
+                        "« {} » a refusé le réglage de volume. Réglez-le sur l'appareil lui-même.",
+                        self.name
+                    ));
                 }
+                debug!(device = %self.name, level, "sonos_group_volume_ok");
                 return Ok(());
             }
+            // The renderer answered, and said no. Reporting Ok() here — as this
+            // did — made the slider move, the value persist, and nothing come
+            // out of the speakers any louder: three layers agreeing on a change
+            // that never happened (Eric, forum, renderer Diretta + PC vu comme
+            // zone DLNA). Say it instead.
             warn!(device = %self.name, level, response = %resp, "dlna_set_volume_rejected");
-        } else {
-            debug!(device = %self.name, level, "dlna_set_volume_ok");
+            return Err(format!(
+                "« {} » a refusé le réglage de volume. Réglez-le sur l'appareil lui-même.",
+                self.name
+            ));
         }
+        debug!(device = %self.name, level, "dlna_set_volume_ok");
         Ok(())
     }
 
