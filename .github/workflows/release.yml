@@ -559,6 +559,27 @@ jobs:
   # Docker Hub publication is handled separately by docker.yml on the
   # same tag, so no docker job here.
 
+  # Image appliance x86-64. Appelée ICI, et pas déclenchée par
+  # `on: release: [published]` dans tune-os.yml : la release est créée avec le
+  # `GITHUB_TOKEN`, et GitHub refuse par conception qu'un évènement émis par ce
+  # jeton déclenche un autre workflow. Le déclencheur existait, n'a jamais
+  # fonctionné, et son silence a coûté six versions sans image (0.9.63 → 0.9.68)
+  # sans un seul run en échec pour l'annoncer.
+  #
+  # `needs: release` garantit que l'asset linux-x86_64 est attaché — l'étape
+  # « Resolve version » de tune-os.yml échoue explicitement s'il manque.
+  tune-os-image:
+    name: Build Tune OS image
+    needs: release
+    # Stables uniquement : une RC n'a pas d'image, comme elle n'a pas de tap.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    uses: ./.github/workflows/tune-os.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ github.ref_name }}
+      attach_to_release: true
+
   homebrew:
     name: Update Homebrew tap
     needs: release
