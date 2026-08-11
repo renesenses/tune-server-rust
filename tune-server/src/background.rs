@@ -248,7 +248,6 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
 
             let scanner = &state.scanner;
             let devices = scanner.rescan().await;
-            drop(scanner);
 
             let mut registered = 0u32;
             let mut outputs = state.outputs.lock().await;
