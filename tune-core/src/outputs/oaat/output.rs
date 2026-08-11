@@ -120,6 +120,19 @@ pub struct OaatOutput {
     stop_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(feature = "oaat")]
     command_tx: Mutex<Option<tokio::sync::mpsc::Sender<OaatCommand>>>,
+    /// Tâche de lecture en cours, gardée pour pouvoir l'ANNULER.
+    ///
+    /// `play_media` détache sa tâche, et celle-ci commence par une boucle de
+    /// connexion de quinze tentatives. Sans ce garde, une nouvelle lecture
+    /// démarrée pendant que la précédente tourne encore laisse DEUX boucles
+    /// courir en parallèle — or l'endpoint OAAT n'accepte qu'un client, donc
+    /// chacune chasse l'autre et le flux repart de zéro à chaque fois.
+    ///
+    /// Observé sur .42 le 2026-08-11 : `attempt=1` et `attempt=9` progressant
+    /// à la même seconde, deux sockets vers le même endpoint, et un
+    /// `format accepted` aussitôt suivi d'un nouveau `connected`. La piste
+    /// reboucle sur ses premières secondes.
+    play_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub diag: Arc<OaatDiagnostics>,
 }
 
@@ -155,6 +168,7 @@ impl OaatOutput {
             stop_tx: Mutex::new(None),
             #[cfg(feature = "oaat")]
             command_tx: Mutex::new(None),
+            play_task: Mutex::new(None),
             diag: Arc::new(OaatDiagnostics::default()),
         }
     }
@@ -454,7 +468,19 @@ impl OutputTarget for OaatOutput {
             .last_packet_epoch_ms
             .store(now_ms, Ordering::SeqCst);
 
-        tokio::spawn(async move {
+        // Une lecture précédente peut encore tourner : sa boucle de connexion
+        // fait quinze tentatives, et rien ne l'arrête. Deux boucles en
+        // parallèle sur un endpoint mono-client se volent la connexion, et la
+        // piste reboucle sur ses premières secondes (#1475). On annule donc
+        // l'ancienne AVANT d'en lancer une nouvelle.
+        if let Some(previous) = self.play_task.lock().await.take() {
+            if !previous.is_finished() {
+                debug!(device = %self.name, "oaat: annulation de la lecture precedente");
+                previous.abort();
+            }
+        }
+
+        let task = tokio::spawn(async move {
             use futures_util::StreamExt;
 
             debug!(device = %device_name, url = %url, "oaat: play_media spawned");
@@ -2170,6 +2196,7 @@ impl OutputTarget for OaatOutput {
             };
             info!(device = %device_name, samples = sample_offset, packets, duration_s = format!("{duration_s:.1}"), "oaat: playback complete");
         });
+        *self.play_task.lock().await = Some(task);
 
         Ok(())
     }
@@ -2202,6 +2229,16 @@ impl OutputTarget for OaatOutput {
     async fn stop(&self) -> Result<(), String> {
         if let Some(tx) = self.stop_tx.lock().await.take() {
             let _ = tx.send(());
+        }
+        // Le signal ci-dessus ne suffit pas pendant la phase de connexion : la
+        // boucle des quinze tentatives ne l'écoute pas, c'est un `for` avec des
+        // pauses. Un `stop` était donc journalisé pendant que la boucle
+        // continuait à réclamer l'endpoint jusqu'à quarante secondes — et
+        // volait la connexion à la lecture suivante (#1475).
+        if let Some(task) = self.play_task.lock().await.take() {
+            if !task.is_finished() {
+                task.abort();
+            }
         }
         #[cfg(feature = "oaat")]
         {
