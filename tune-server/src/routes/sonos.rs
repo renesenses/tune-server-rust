@@ -21,7 +21,6 @@ pub fn router() -> Router<AppState> {
 async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
     let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
 
     let sonos: Vec<Value> = devices
         .iter()

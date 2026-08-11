@@ -1646,7 +1646,6 @@ async fn create_zone(
                 // Look up the discovered device and register its DLNA output
                 let scanner = &state.scanner;
                 let devices = scanner.devices().await;
-                drop(scanner);
 
                 let disc = devices.iter().find(|d| d.id == device_id);
                 if let Some(dev) = disc {

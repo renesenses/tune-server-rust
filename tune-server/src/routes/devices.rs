@@ -57,7 +57,6 @@ async fn device_catalog() -> Json<Value> {
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     let scanner = &state.scanner;
     let discovered = scanner.devices().await;
-    drop(scanner);
 
     let outputs = state.outputs.lock().await;
     let registered_ids: std::collections::HashSet<String> = outputs.list().into_iter().collect();
@@ -640,7 +639,6 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
     let scanner = &state.scanner;
     let devices = scanner.rescan().await;
-    drop(scanner);
 
     let deduped = dedup_devices(devices);
 
