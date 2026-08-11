@@ -690,12 +690,36 @@ fn spawn_heartbeat(state: &AppState) {
 
             // Look up friendly names from zones DB
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone());
-            let zone_names: std::collections::HashMap<String, String> = zone_repo
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|z| z.output_device_id.map(|did| (did, z.name)))
+            let zones_for_heartbeat = zone_repo.list().unwrap_or_default();
+            let zone_names: std::collections::HashMap<String, String> = zones_for_heartbeat
+                .iter()
+                .filter_map(|z| z.output_device_id.clone().map(|did| (did, z.name.clone())))
                 .collect();
+            // Marque et modèle CORRIGÉS par l'utilisateur (éditeur « Appareil »).
+            // Ils vivent dans les réglages sous `zone_{id}_brand` / `_model`, pas
+            // dans une colonne de `zones` — d'où le fait qu'ils ne remontaient pas
+            // ici : le heartbeat ne connaissait que la marque déduite du MAC.
+            // Corriger une marque mal détectée n'avait donc aucun effet côté cloud.
+            let zone_overrides: std::collections::HashMap<
+                String,
+                (Option<String>, Option<String>),
+            > = {
+                let settings =
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+                zones_for_heartbeat
+                    .iter()
+                    .filter_map(|z| {
+                        let did = z.output_device_id.clone()?;
+                        let id = z.id?;
+                        let brand = settings.get(&format!("zone_{id}_brand")).ok().flatten();
+                        let model = settings.get(&format!("zone_{id}_model")).ok().flatten();
+                        if brand.is_none() && model.is_none() {
+                            return None;
+                        }
+                        Some((did, (brand, model)))
+                    })
+                    .collect()
+            };
             // Physical identity persisted on zones (Phase B): lets the
             // mozaiklabs admin identify renderer brands by MAC OUI instead
             // of guessing from device names.
@@ -739,11 +763,20 @@ fn spawn_heartbeat(state: &AppState) {
                                 )
                             })
                             .unwrap_or_default();
+                        // La correction de l'utilisateur prime sur la déduction OUI :
+                        // c'est tout l'objet de l'éditeur « Appareil ». `model` n'était
+                        // pas envoyé du tout.
+                        let (user_brand, user_model) =
+                            zone_overrides.get(&id).cloned().unwrap_or((None, None));
+                        let manufacturer = user_brand
+                            .filter(|b| !b.trim().is_empty())
+                            .unwrap_or(manufacturer);
                         serde_json::json!({
                             "name": name,
                             "type": dev_type,
                             "mac": mac,
                             "manufacturer": manufacturer,
+                            "model": user_model.filter(|m| !m.trim().is_empty()),
                         })
                     })
                     .collect(),
