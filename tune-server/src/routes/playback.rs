@@ -2400,6 +2400,36 @@ async fn set_audiophile(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
     settings.set(&key, &body.to_string()).ok();
+
+    // Activer le mode pousse le volume à 100 %, sur-le-champ.
+    //
+    // Le verrou côté lecture suffit à garantir le bit-perfect, mais il laisse
+    // la valeur STOCKÉE à ce qu'elle était : la zone resterait à 20 % en base,
+    // le chemin du signal l'afficherait, et les autres clients aussi — un
+    // chiffre qui ne correspond plus à ce qui sort. On aligne donc la valeur
+    // sur la réalité au moment où l'utilisateur bascule.
+    if body
+        .get("enabled")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false)
+    {
+        let device_id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+        if let Err(e) = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .update_volume(zone_id, 100)
+        {
+            tracing::warn!(zone_id, error = %e, "audiophile_volume_persist_failed");
+        }
+        state
+            .orchestrator
+            .set_volume(zone_id, 1.0, device_id.as_deref())
+            .await;
+        tracing::info!(zone_id, "audiophile_enabled_volume_pinned_to_full");
+    }
+
     Json(body)
 }
 
