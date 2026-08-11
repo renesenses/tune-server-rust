@@ -97,6 +97,22 @@ pub struct ZoneState {
     /// shuffle track is `shuffle_order[shuffle_index + 1]`.
     #[serde(skip)]
     pub shuffle_index: i64,
+    /// La piste est en cours de résolution : Tune a accepté la demande mais
+    /// n'a pas encore d'URL jouable.
+    ///
+    /// Ajouté pour YouTube, où l'extraction peut prendre très longtemps. Mesuré
+    /// chez un testeur (forum #1359) : **32 secondes** entre le clic et le
+    /// premier son, parce que les deux surfaces natives sont refusées par
+    /// YouTube (« Sign in to confirm you're not a bot ») et que tout repart sur
+    /// `yt-dlp`. Pendant ce temps l'écran ne montrait rien, et il a signalé
+    /// « la lecture ne se lance pas » — ce qui, de son point de vue, était vrai.
+    ///
+    /// Champ ADDITIF volontairement : `PlayState` est traité dans 77 `match`,
+    /// dont dix-huit dans le poller qui pilote la fin de piste et l'enchaînement.
+    /// Y ajouter une variante aurait obligé à trancher son cas partout, pour un
+    /// besoin d'affichage. Ce booléen ne modifie aucune décision de lecture.
+    #[serde(default)]
+    pub resolving: bool,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -197,6 +213,7 @@ impl Default for ZoneState {
             zone_id: 0,
             state: PlayState::Stopped,
             now_playing: None,
+            resolving: false,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -333,6 +350,8 @@ impl PlaybackManager {
             zone_id,
             ..Default::default()
         });
+        // On tient une URL jouable : la recherche est finie.
+        state.resolving = false;
         state.position_ms = position_ms;
         state.now_playing = Some(np);
         state.state = PlayState::Stopped;
@@ -364,6 +383,24 @@ impl PlaybackManager {
             .get(&zone_id)
             .map(|s| s.play_seq)
             .unwrap_or(0)
+    }
+
+    /// Marque la zone comme « en cours de résolution », ou lève le drapeau.
+    ///
+    /// Levé avant une extraction potentiellement longue (YouTube via `yt-dlp` :
+    /// 32 s mesurées), retombé dès que `play()` s'exécute — c'est-à-dire dès
+    /// qu'une URL jouable existe. N'influence aucune décision de lecture : ce
+    /// drapeau ne sert qu'à ce que l'interface puisse dire « je cherche »
+    /// plutôt que de rester muette.
+    pub async fn set_resolving(&self, zone_id: i64, value: bool) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .resolving = value;
     }
 
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {

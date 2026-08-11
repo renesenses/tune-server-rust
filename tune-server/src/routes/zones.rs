@@ -1165,6 +1165,8 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 wire.as_ref(),
             );
             obj.insert("signal_path".into(), json!(signal_path));
+            // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
+            obj.insert("resolving".into(), json!(ps.resolving));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
@@ -1292,6 +1294,8 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     wire.as_ref(),
                 );
                 obj.insert("signal_path".into(), json!(signal_path));
+                // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
+                obj.insert("resolving".into(), json!(ps.resolving));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
                 obj.insert(
                     "lyrics_offset_ms".into(),

@@ -134,6 +134,7 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             "queue_length": ps.queue_length,
             "now_playing": ps.now_playing,
             "signal_path": signal_path,
+            "resolving": ps.resolving,
         }));
     }
 

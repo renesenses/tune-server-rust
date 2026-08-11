@@ -251,6 +251,9 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
+        v.as_object_mut()
+            .unwrap()
+            .insert("resolving".into(), json!(zone_state.resolving));
     }
     v
 }
