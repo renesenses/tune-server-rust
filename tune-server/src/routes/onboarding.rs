@@ -225,7 +225,6 @@ async fn step_zones(
         let scanner = &state.scanner;
         let discovered = scanner.rescan().await;
         tracing::info!(count = discovered.len(), "onboarding_zone_discovery");
-        drop(scanner);
     }
 
     settings
