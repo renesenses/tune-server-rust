@@ -1,13 +1,33 @@
 name: Tune OS Image
 
 # Build de l'image appliance Debian x86-64 (clé USB, Rufus/Etcher).
-# Auto sur `release: published` (l'image télécharge le binaire linux-x86_64 de
-# la release) + dispatch manuel. Si les assets binaires ne sont pas encore
-# attachés au moment du publish, l'étape Resolve échoue clairement → re-lancer
-# le workflow manuellement une fois les assets présents.
+#
+# Appelé par `release.yml` (workflow_call) une fois les assets attachés, plus
+# le dispatch manuel pour reconstruire une image a posteriori.
+#
+# ⚠️ NE PAS remettre `on: release: [published]`. Ce déclencheur était là et
+# n'a JAMAIS fonctionné : `release.yml` crée la release avec le `GITHUB_TOKEN`
+# par défaut, et GitHub refuse par conception qu'un évènement émis par ce jeton
+# déclenche un autre workflow. Résultat : aucune image entre 0.9.62 et 0.9.68,
+# sans le moindre run en échec pour le signaler. Le seul run jamais parti d'un
+# évènement `release` (v0.9.62) correspond à une republication **manuelle**
+# après retrait — donc à un jeton humain.
+#
+# `workflow_call` n'a pas ce problème : le job tourne dans le run de
+# `release.yml`, il n'y a pas de nouvel évènement à filtrer.
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      version:
+        description: "Version Tune (X.Y.Z sans v, ou 'latest')"
+        required: false
+        type: string
+        default: "latest"
+      attach_to_release:
+        description: "Attacher l'image à la release GitHub vX.Y.Z"
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       version:
@@ -36,8 +56,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ inputs.version }}"
-          # On a release:published event, inputs is empty → take the release tag.
-          [ -z "$VERSION" ] && VERSION="${{ github.event.release.tag_name }}"
           VERSION="${VERSION#v}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
             VERSION=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name | sed 's/^v//')
@@ -87,7 +105,7 @@ jobs:
           compression-level: 0
 
       - name: Attach to release
-        if: ${{ github.event_name == 'release' || inputs.attach_to_release }}
+        if: ${{ inputs.attach_to_release }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

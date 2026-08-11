@@ -524,6 +524,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // warning is logged on the way in and the recovery on the way out —
         // once each, not once per retry.
         let mut low_memory = false;
+        // Same latch for "enabled but no model path": say it once, not every
+        // 900 s round.
+        let mut unconfigured = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
@@ -566,7 +569,33 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 }
 
                 if embedder.is_none() {
-                    if let Some(p) = configured_model_path(&settings) {
+                    // No model path configured: `enabled=true` and yet the sweep
+                    // can do nothing at all. Before this, that branch fell
+                    // through in complete silence — no batch, no error, just the
+                    // 900 s idle sleep — which reads exactly like a sweep that
+                    // has finished. Lived on .18 (2026-08-11): the rebuilt
+                    // database had lost `audio_embedding_model_path`, the
+                    // feature was on, and the journal said nothing whatsoever
+                    // for twelve minutes.
+                    //
+                    // Latched like the memory pause: once on the way in, once on
+                    // the way out. This loop comes round every 900 s and a line
+                    // per round would be noise.
+                    let model_path = configured_model_path(&settings);
+                    if model_path.is_none() {
+                        if !unconfigured {
+                            unconfigured = true;
+                            warn!(
+                                setting = MODEL_PATH_KEY,
+                                env = "TUNE_AUDIO_EMBED_MODEL",
+                                "audio_embed_no_model_path — acoustic analysis is enabled but no model path is configured, so nothing will be analysed; set the setting or the environment variable"
+                            );
+                        }
+                    } else if unconfigured {
+                        unconfigured = false;
+                        info!("audio_embed_model_path_configured");
+                    }
+                    if let Some(p) = model_path {
                         if let Err(e) = ensure_model(&p).await {
                             warn!(error = %e, "audio_model_unavailable");
                         } else if let Err(e) = ensure_runtime_loaded(&p).await {
