@@ -19,6 +19,7 @@ use walkdir::WalkDir;
 
 use crate::db::backend::DbBackend;
 use crate::db::playlist_repo::PlaylistRepo;
+use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_repo::TrackRepo;
 use crate::library::importer::{ImportedTrack, match_tracks, parse_m3u, parse_pls};
 
@@ -69,10 +70,43 @@ fn resolve_entry(entry: &str, playlist_dir: &Path) -> Option<String> {
     Some(path_key(&lexical_clean(&abs).to_string_lossy()))
 }
 
+/// Clé de réglage qui coupe cet import. Absente ⇒ import actif : le
+/// comportement d'origine reste celui par défaut, on n'en prive personne
+/// silencieusement.
+pub const SETTING_IMPORT_PLAYLISTS: &str = "scan_import_playlists";
+
+/// L'import des playlists rencontrées au scan est-il actif ?
+///
+/// Opt-out explicite : seule la valeur `"false"` le désactive. Une clé absente,
+/// vide ou illisible laisse l'import en place.
+pub fn playlist_import_enabled(db: &Arc<dyn DbBackend>) -> bool {
+    SettingsRepo::with_backend(db.clone())
+        .get(SETTING_IMPORT_PLAYLISTS)
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false")
+}
+
 /// Scan `dirs` for playlist files and create a local playlist for each one that
 /// resolves to at least one library track. Idempotent by playlist name.
 pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> PlaylistScanReport {
     let mut report = PlaylistScanReport::default();
+
+    // Le garde-fou est ICI, et pas chez les appelants.
+    //
+    // Deux endroits déclenchent cet import — le scan automatique et le scan
+    // manuel. Le poser à chaque appel, c'était garantir qu'un troisième
+    // appelant l'oublie un jour. JP Borderies a vu arriver des playlists
+    // « Cabrel » après avoir ajouté deux dossiers qui n'ont rien à voir : le
+    // scan balaie TOUS les répertoires configurés, pas seulement le nouveau,
+    // et y ramasse de vieux fichiers .m3u oubliés. Comportement voulu, mais
+    // sans moyen de dire non.
+    if !playlist_import_enabled(db) {
+        info!("playlist_scan_disabled_by_setting");
+        return report;
+    }
+
     let track_repo = TrackRepo::with_backend(db.clone());
     let playlist_repo = PlaylistRepo::with_backend(db.clone());
 
@@ -217,6 +251,58 @@ fn find_playlist_files(dirs: &[String]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mem_db() -> Arc<dyn DbBackend> {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().expect("base memoire");
+        db.init_schema().expect("schema");
+        migrations::run_migrations(&db).expect("migrations");
+        Arc::new(db)
+    }
+
+    /// Sans reglage, l'import reste actif : on ne prive personne du
+    /// comportement d'origine en ajoutant un interrupteur.
+    #[test]
+    fn playlist_import_is_on_when_the_setting_is_absent() {
+        assert!(playlist_import_enabled(&mem_db()));
+    }
+
+    /// Seule la chaine « false » coupe. Demande par JP Borderies, qui voyait
+    /// arriver des playlists sans rapport avec les dossiers qu'il venait
+    /// d'ajouter — le scan balaie TOUS les repertoires configures.
+    #[test]
+    fn playlist_import_is_off_only_for_false() {
+        let db = mem_db();
+        let settings = SettingsRepo::with_backend(db.clone());
+
+        settings.set(SETTING_IMPORT_PLAYLISTS, "false").unwrap();
+        assert!(!playlist_import_enabled(&db), "« false » doit couper");
+
+        settings.set(SETTING_IMPORT_PLAYLISTS, "true").unwrap();
+        assert!(playlist_import_enabled(&db));
+
+        // Une valeur inattendue ne doit pas couper par accident : en cas de
+        // doute on garde le comportement d'origine.
+        settings.set(SETTING_IMPORT_PLAYLISTS, "").unwrap();
+        assert!(playlist_import_enabled(&db));
+        settings.set(SETTING_IMPORT_PLAYLISTS, "0").unwrap();
+        assert!(playlist_import_enabled(&db));
+    }
+
+    /// Le garde-fou coupe le travail AVANT de lire la bibliotheque : sinon on
+    /// paierait le balayage complet des repertoires pour rien.
+    #[test]
+    fn disabled_import_returns_an_empty_report() {
+        let db = mem_db();
+        SettingsRepo::with_backend(db.clone())
+            .set(SETTING_IMPORT_PLAYLISTS, "false")
+            .unwrap();
+
+        let report = import_local_playlists(&db, &["/nexiste/pas".to_string()]);
+        assert_eq!(report.playlists_created, 0);
+        assert_eq!(report.tracks_added, 0);
+    }
 
     #[test]
     fn resolve_relative_and_absolute_and_url() {

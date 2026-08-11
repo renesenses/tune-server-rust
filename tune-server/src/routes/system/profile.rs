@@ -34,6 +34,7 @@ use crate::state::AppState;
 const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("community_sync_enabled", || json!(false)),
     ("enrich_on_scan", || json!(true)),
+    ("scan_import_playlists", || json!(true)),
     ("resample_policy", || json!("none")),
     ("prefetch_mode", || json!("30s")),
     ("dsd_lpcm_stream", || json!(false)),
