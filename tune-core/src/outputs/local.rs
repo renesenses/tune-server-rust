@@ -857,6 +857,17 @@ impl LocalOutput {
     }
 
     fn recompute_effective_volume(&self) {
+        // PURE : aucun facteur, jamais. Le mode neutralisait déjà la convolution
+        // et le crossfeed, mais le volume logiciel continuait de multiplier
+        // chaque échantillon — une zone à 20 % n'était donc PAS bit-perfect,
+        // contrairement à ce que l'interface promettait. Le volume se règle sur
+        // l'ampli ou le DAC. L'orchestrateur épingle déjà la valeur à
+        // l'enregistrement ; ce garde-fou-ci couvre une valeur déjà stockée,
+        // qui casserait le bit-perfect dès la lecture suivante.
+        if self.pure_bypass.load(Ordering::Relaxed) {
+            self.volume.store(1000, Ordering::SeqCst);
+            return;
+        }
         let user = self.user_volume.load(Ordering::SeqCst) as f64 / 1000.0;
         let rg = self.rg_factor.load(Ordering::SeqCst) as f64 / 1000.0;
         let effective = (user * rg).clamp(0.0, 1.0);
@@ -925,6 +936,10 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+        // Recompose tout de suite : entrer en PURE doit ramener le gain à 1,0
+        // sans attendre le prochain changement de volume, et en sortir doit
+        // rendre à l'utilisateur le volume qu'il avait choisi.
+        self.recompute_effective_volume();
     }
 
     /// Install (or clear with `None`) the headphone crossfeed processor for the
@@ -4434,6 +4449,54 @@ fn rubato_resample_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le volume EFFECTIF (celui que multiplie le rendu) doit valoir 1,0 en
+    /// mode PURE, quoi qu'ait choisi l'utilisateur — sinon le chemin annoncé
+    /// bit-perfect ne l'est pas.
+    #[test]
+    fn pure_mode_pins_the_effective_gain_to_unity() {
+        let out = LocalOutput::new("test".into());
+        out.user_volume.store(200, Ordering::SeqCst); // 20 %
+        out.recompute_effective_volume();
+        assert_eq!(
+            out.volume.load(Ordering::SeqCst),
+            200,
+            "hors PURE, 20 % s'applique"
+        );
+
+        out.set_pure_bypass(true);
+        assert_eq!(
+            out.volume.load(Ordering::SeqCst),
+            1000,
+            "en PURE, le gain doit être exactement 1,0"
+        );
+
+        // Et le ReplayGain non plus ne doit pas passer.
+        out.set_replaygain_factor(0.5);
+        assert_eq!(
+            out.volume.load(Ordering::SeqCst),
+            1000,
+            "PURE ignore aussi le ReplayGain"
+        );
+    }
+
+    /// Sortir de PURE doit rendre son volume à l'utilisateur, pas le laisser
+    /// bloqué à 100 % : une valeur épinglée qui ne se relâche jamais serait
+    /// un défaut plus gênant que celui qu'on corrige.
+    #[test]
+    fn leaving_pure_restores_the_user_volume() {
+        let out = LocalOutput::new("test".into());
+        out.user_volume.store(300, Ordering::SeqCst); // 30 %
+        out.set_pure_bypass(true);
+        assert_eq!(out.volume.load(Ordering::SeqCst), 1000);
+
+        out.set_pure_bypass(false);
+        assert_eq!(
+            out.volume.load(Ordering::SeqCst),
+            300,
+            "le volume choisi doit revenir tel quel"
+        );
+    }
 
     #[test]
     fn header_read_retries_only_transient_kinds() {

@@ -6797,7 +6797,13 @@ impl PlaybackOrchestrator {
             .get(zone_id)
             .ok()
             .flatten();
-        if zone.as_ref().is_some_and(|z| z.fixed_volume) {
+        // Le mode PURE fait la même promesse, et elle était fausse : il
+        // neutralise la convolution et le crossfeed, mais PAS le volume
+        // logiciel. Une zone PURE à 20 % multipliait donc chaque échantillon
+        // par 0,2 dans le rendu — le chemin n'était plus bit-perfect, pendant
+        // que l'interface affirmait le contraire (testeur Linux, forum).
+        // Le volume se règle alors sur l'ampli ou le DAC, pas ici.
+        if zone.as_ref().is_some_and(|z| z.fixed_volume) || self.zone_audiophile(zone_id) {
             self.playback.set_volume(zone_id, 1.0).await;
             return;
         }
