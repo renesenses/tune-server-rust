@@ -263,6 +263,11 @@ pub async fn handle_stream(
     let dur_ms = session.info.duration_ms;
 
     let has_icy = wants_icy && (session.track_title.is_some() || session.track_artist.is_some());
+    // Bloc ICY de repli : celui de la piste au moment de la connexion. Pour un
+    // fichier il ne changera jamais, et c'est correct. Pour une RADIO il est
+    // reconstruit a chaque emission depuis le titre courant (voir plus bas) —
+    // sans quoi le renderer affiche eternellement le morceau qui passait quand
+    // il s'est branche (Marantz + Radio Paradise, forum du 10 aout).
     let icy_block = if has_icy {
         build_icy_metadata(
             session.track_artist.as_deref(),
@@ -272,6 +277,8 @@ pub async fn handle_stream(
     } else {
         vec![0u8]
     };
+    let icy_cover = session.cover_url.clone();
+    let icy_stream_id = stream_id.to_string();
 
     let wav_header_included = session
         .wav_header_included
@@ -317,7 +324,17 @@ pub async fn handle_stream(
                     bytes_since_meta += end - offset;
                     offset = end;
                     if bytes_since_meta >= ICY_METAINT {
-                        yield Ok(bytes::Bytes::copy_from_slice(&icy_block));
+                        // Relire le titre courant a CHAQUE emission : c'est la
+                        // seule chose que le renderer verra changer.
+                        let block = match tune_core::http::streamer::radio_now(&icy_stream_id) {
+                            Some((artist, title)) => build_icy_metadata(
+                                artist.as_deref(),
+                                Some(&title),
+                                icy_cover.as_deref(),
+                            ),
+                            None => icy_block.clone(),
+                        };
+                        yield Ok(bytes::Bytes::from(block));
                         bytes_since_meta = 0;
                     }
                 }
