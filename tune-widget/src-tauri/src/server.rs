@@ -4,13 +4,22 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::AppState;
 
+/// Live zone updates over WebSocket, with reconnection back-off.
+///
+/// Not spawned at the moment — the widget polls instead — but kept whole rather
+/// than deleted: it is the working implementation, and re-enabling it is one
+/// call, whereas rewriting it from memory is not.
+#[allow(dead_code)]
 pub async fn ws_loop(app: tauri::AppHandle) {
     let mut backoff = 1u64;
     loop {
         let ws_url = {
             let state = app.state::<AppState>();
             let http_url = state.server_url.read().await;
-            http_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+            http_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://")
+                + "/ws"
         };
         match connect_async(&ws_url).await {
             Ok((ws, _)) => {
