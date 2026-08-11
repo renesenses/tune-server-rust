@@ -340,9 +340,30 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let analysed = 0_i64;
 
+    // Dénominateur de la progression : les pistes que la passe peut analyser,
+    // pas la bibliothèque entière (le DSD et les pistes sans fichier local en
+    // sont exclus). Sans lui, l'interface n'avait qu'un compteur qui montait
+    // sans qu'on sache vers quoi.
+    #[cfg(feature = "audio-embedding")]
+    let eligible = tune_core::audio::embedding_store::eligible_count(&state.backend);
+    #[cfg(not(feature = "audio-embedding"))]
+    let eligible = 0_i64;
+
+    let throttle = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("audio_embedding_throttle")
+        .ok()
+        .flatten()
+        .filter(|v| matches!(v.as_str(), "eco" | "equilibre" | "rapide"))
+        .unwrap_or_else(|| "equilibre".to_string());
+
     Json(json!({
         "available": available,
         "enabled": enabled,
         "analysed_tracks": analysed,
+        "eligible_tracks": eligible,
+        // Bornée à 0 : un modèle qui change repart de zéro et l'analyse peut
+        // dépasser brièvement l'ancien dénominateur.
+        "pending_tracks": (eligible - analysed).max(0),
+        "throttle": throttle,
     }))
 }

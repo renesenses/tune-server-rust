@@ -2342,6 +2342,8 @@ impl PositionPoller {
                                     let title_changed =
                                         np.title != meta.title || np.artist_name != meta.artist;
                                     if title_changed {
+                                        let title_for_icy = meta.title.clone();
+                                        let artist_for_icy = meta.artist.clone();
                                         let new_np = crate::playback::NowPlaying {
                                             track_id: None,
                                             title: meta.title,
@@ -2355,6 +2357,20 @@ impl PositionPoller {
                                             ..Default::default()
                                         };
                                         self.playback.update_now_playing(zone_id, new_np).await;
+                                        // Le renderer, lui, ne lit pas le
+                                        // now-playing : il reçoit des blocs ICY
+                                        // dans le flux. On publie donc aussi le
+                                        // titre là où le gestionnaire de flux
+                                        // saura le relire, sinon l'appareil
+                                        // reste figé sur le morceau qui passait
+                                        // à sa connexion.
+                                        if let Some(sid) = np.stream_id.as_deref() {
+                                            crate::http::streamer::publish_radio_now(
+                                                sid,
+                                                artist_for_icy,
+                                                title_for_icy,
+                                            );
+                                        }
                                         debug!(zone_id, station = %station_name, "radio_metadata_updated");
                                     }
                                 }

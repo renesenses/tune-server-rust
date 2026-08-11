@@ -24,13 +24,48 @@ pub fn dlna_flags_for_mime(mime: &str) -> &'static str {
 /// path is only ever reached for the opt-in `dlna_wav24` zones; every existing
 /// LPCM fallback stays 16-bit and keeps the `PN=LPCM` profile unchanged.
 pub fn dlna_flags_for_mime_bd(mime: &str, bit_depth: Option<u32>) -> &'static str {
+    dlna_flags_for_mime_bd_sr(mime, bit_depth, None)
+}
+
+/// Fréquence au-delà de laquelle le profil `LPCM` ne s'applique plus.
+///
+/// Le profil DLNA `LPCM` est défini pour 44,1 et 48 kHz. Au-dessus, la
+/// déclaration est fausse, quelle que soit la profondeur.
+const LPCM_PROFILE_MAX_RATE: u32 = 48_000;
+
+/// Comme [`dlna_flags_for_mime_bd`], mais en tenant compte AUSSI de la
+/// fréquence d'échantillonnage.
+///
+/// Le correctif #1137 a retiré le `PN=LPCM` au-delà de 16 bits, parce qu'un
+/// renderer strict rabat le flux sur le profil annoncé et lit des échantillons
+/// désalignés — donc du SILENCE. La même règle vaut pour la fréquence, et elle
+/// n'avait jamais été appliquée : un WAV 16 bits à 192 kHz sortait annoncé
+/// `PN=LPCM`, un profil auquel il ne se conforme pas.
+///
+/// Le chemin de repli WAV plafonne la PROFONDEUR à 16 bits mais ne touche pas
+/// à la fréquence : une source 192/24 finit donc en 16 bits **à 192 kHz**, avec
+/// une déclaration `LPCM` mensongère. C'est la configuration de Yves — ALAC
+/// 192/24, « Forcer le WAV », aucune fréquence max — et le symptôme rapporté
+/// est exactement celui de la famille #1137 : la lecture démarre, la position
+/// avance, aucun son ne sort (forum #1437, darTZeel LHC).
+///
+/// Retirer le `PN` ne dégrade rien : le renderer lit alors l'en-tête WAV réel
+/// au lieu d'une promesse de profil. C'est une correction de justesse, vraie
+/// indépendamment de ce cas précis.
+pub fn dlna_flags_for_mime_bd_sr(
+    mime: &str,
+    bit_depth: Option<u32>,
+    sample_rate: Option<u32>,
+) -> &'static str {
     // DLNA.ORG_OP=01 : byte-range seek supported
     // DLNA.ORG_CI=0  : no transcoding
     // DLNA.ORG_FLAGS : streaming + interactive + background + v1.5
     const NO_PN: &str =
         "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+    let out_of_lpcm_profile = bit_depth.is_some_and(|bd| bd > 16)
+        || sample_rate.is_some_and(|sr| sr > LPCM_PROFILE_MAX_RATE);
     match mime {
-        "audio/L16" | "audio/wav" | "audio/x-wav" if bit_depth.is_some_and(|bd| bd > 16) => NO_PN,
+        "audio/L16" | "audio/wav" | "audio/x-wav" if out_of_lpcm_profile => NO_PN,
         "audio/L16" | "audio/wav" | "audio/x-wav" => {
             "DLNA.ORG_PN=LPCM;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
         }
@@ -352,7 +387,7 @@ impl DidlBuilder {
                 let flags = if self.live_stream {
                     dlna_flags_for_mime_live(&self.mime_type)
                 } else {
-                    dlna_flags_for_mime_bd(&self.mime_type, self.bit_depth)
+                    dlna_flags_for_mime_bd_sr(&self.mime_type, self.bit_depth, self.sample_rate)
                 };
                 format!("http-get:*:{}:{}", self.mime_type, flags)
             }
@@ -629,6 +664,40 @@ mod tests {
         );
         assert!(f.contains("DLNA.ORG_OP=01"), "still seekable: {f}");
         assert!(!dlna_flags_for_mime_bd("audio/L16", Some(24)).contains("DLNA.ORG_PN"));
+    }
+
+    /// Le pendant de #1137 sur l'axe de la FRÉQUENCE, jamais couvert jusqu'ici.
+    /// Le repli WAV plafonne la profondeur à 16 bits mais laisse la fréquence
+    /// intacte : une source 192/24 sortait donc en 16 bits à 192 kHz, annoncée
+    /// `PN=LPCM` — un profil auquel elle ne se conforme pas (forum #1437).
+    #[test]
+    fn dlna_flags_wav_16bit_above_48k_drops_lpcm_profile() {
+        let f = dlna_flags_for_mime_bd_sr("audio/wav", Some(16), Some(192_000));
+        assert!(
+            !f.contains("DLNA.ORG_PN"),
+            "192 kHz n'est pas du profil LPCM : {f}"
+        );
+        assert!(f.contains("DLNA.ORG_OP=01"), "toujours seekable : {f}");
+        assert!(
+            !dlna_flags_for_mime_bd_sr("audio/L16", Some(16), Some(96_000)).contains("DLNA.ORG_PN")
+        );
+    }
+
+    /// Les fréquences DU profil restent annoncées : ne rien casser chez les
+    /// renderers laxistes qui exigent un `PN` pour accepter le flux.
+    #[test]
+    fn dlna_flags_wav_16bit_within_profile_keeps_lpcm() {
+        for sr in [44_100_u32, 48_000] {
+            let f = dlna_flags_for_mime_bd_sr("audio/wav", Some(16), Some(sr));
+            assert!(
+                f.contains("DLNA.ORG_PN=LPCM"),
+                "{sr} Hz reste du LPCM : {f}"
+            );
+        }
+        // Fréquence inconnue : comportement d'avant, on garde le profil.
+        assert!(
+            dlna_flags_for_mime_bd_sr("audio/wav", Some(16), None).contains("DLNA.ORG_PN=LPCM")
+        );
     }
 
     #[test]

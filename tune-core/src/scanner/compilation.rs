@@ -78,6 +78,46 @@ pub fn track_number_is_free(track_number: Option<i32>, taken: &[i32]) -> bool {
     }
 }
 
+/// Noms de fichier sous lesquels une pochette accompagne un dossier d'album.
+/// Ordre = priorité ; le premier trouvé gagne.
+const COVER_FILE_NAMES: &[&str] = &[
+    "cover.jpg",
+    "cover.jpeg",
+    "cover.png",
+    "folder.jpg",
+    "folder.jpeg",
+    "folder.png",
+    "front.jpg",
+    "front.jpeg",
+    "front.png",
+];
+
+/// Empreinte de la pochette POSÉE DANS le dossier, `None` s'il n'y en a pas.
+///
+/// À ne pas confondre avec la jaquette extraite des pistes, ré-encodée fichier
+/// par fichier par certains fournisseurs (Qobuz) — celle-là diffère d'une piste
+/// à l'autre et ne regroupe rien. Le `cover.jpg` déposé à côté des fichiers,
+/// lui, est copié à l'identique dans tous les dossiers d'un même disque.
+///
+/// C'est ce qui permet de séparer plusieurs VOLUMES portant le même titre :
+/// mesuré sur .18, les 41 dossiers « ALLOPOP » se répartissent exactement en
+/// quatre pochettes distinctes — quatre volumes (idée de Bertrand, #1444).
+pub fn folder_cover_fingerprint(folder: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    for name in COVER_FILE_NAMES {
+        let path = Path::new(folder).join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if bytes.is_empty() {
+                continue;
+            }
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            return Some(format!("{:x}", h.finalize()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +129,36 @@ mod tests {
         "/mnt/recordings_usb/Qobuz/Alligator/OUF L'anthologie Souterraine 2015-2017";
     const GREATEST_BENATAR: &str = "/data/music/NEW_FLAC/POP-ROCK/P/Pat Benatar/2005-Greatest Hits";
     const GREATEST_POLICE: &str = "/data/music/NEW_FLAC/POP-ROCK/P/Police/1992-Greatest Hits";
+
+    #[test]
+    fn a_folder_cover_fingerprints_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("Artiste A/ALLOPOP");
+        let b = dir.path().join("Artiste B/ALLOPOP");
+        let c = dir.path().join("Artiste C/ALLOPOP");
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // A et B : MÊME pochette, octet pour octet (ce que fait Qobuz en
+        // copiant cover.jpg dans chaque dossier d'un volume).
+        std::fs::write(a.join("cover.jpg"), b"VOLUME-1-IMAGE").unwrap();
+        std::fs::write(b.join("cover.jpg"), b"VOLUME-1-IMAGE").unwrap();
+        // C : autre volume, autre pochette.
+        std::fs::write(c.join("cover.jpg"), b"VOLUME-2-IMAGE").unwrap();
+
+        let fa = folder_cover_fingerprint(a.to_str().unwrap());
+        let fb = folder_cover_fingerprint(b.to_str().unwrap());
+        let fc = folder_cover_fingerprint(c.to_str().unwrap());
+        assert!(fa.is_some());
+        assert_eq!(fa, fb, "un même volume donne une même empreinte");
+        assert_ne!(fa, fc, "deux volumes se séparent");
+    }
+
+    #[test]
+    fn a_folder_without_a_cover_has_no_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(folder_cover_fingerprint(dir.path().to_str().unwrap()), None);
+    }
 
     #[test]
     fn the_real_scattered_anthology_is_recognised() {
