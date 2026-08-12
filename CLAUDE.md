@@ -134,9 +134,34 @@ ligne*. Mais une ligne vérifiée présente par contenu **n'est pas** un blocage
    le nouveau tip **et re-gate**. Vérifiez d'abord la nature du delta : s'il
    ne touche aucun `.rs` ni `Cargo.toml/lock`, le résultat se reporte.
 
-4. **Ne courez pas après une branche qui bouge.** Si des PR continuent
-   d'atterrir, taguez ce qui est testé et laissez le reste au train suivant.
-   Poussez branche et tag **dans la même commande** pour réduire la fenêtre.
+4. **Ne courez pas après une branche qui bouge — gelez-la.** Vécu le
+   2026-08-11 sur la v0.9.68 : **quatre gates** ont été nécessaires, chaque
+   passage de ~20 min étant doublé par une PR touchant du `.rs`, donc sans
+   report possible du résultat.
+
+   ⚠️ « Taguer ce qui est testé » ne veut PAS dire taguer un commit dépassé :
+   le tag serait **hors de la ligne**, et c'est exactement ce qui a produit les
+   incidents v0.9.63 et v0.9.66. Le commit tagué doit descendre du tip **au
+   moment du push**.
+
+   ```bash
+   # Geler pendant la fenêtre de release (les admins gardent le droit de pousser)
+   gh api -X PUT repos/renesenses/tune-server-rust/branches/release/v0.9/protection \
+     -f 'lock_branch=true' -F 'enforce_admins=false' \
+     -F 'required_status_checks=null' -F 'required_pull_request_reviews=null' \
+     -F 'restrictions=null'
+
+   # Dégeler DÈS que les assets sont publiés — sinon toute l'équipe est bloquée
+   gh api -X DELETE repos/renesenses/tune-server-rust/branches/release/v0.9/protection
+   ```
+
+   Au push, le serveur confirme l'exemption : *« Bypassed rule violations —
+   Cannot change this locked branch »*. Et enchaînez **gate → re-fetch →
+   vérification du tip → bump → tag → push dans une seule commande**, pour
+   qu'il ne reste aucune fenêtre entre la fin des tests et le push.
+
+   ⚠️ Le dégel **supprime toute la protection**. Si la branche en portait une
+   en régime normal (checks requis, force-push interdit), la reposer après.
 
 ---
 

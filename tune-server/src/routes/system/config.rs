@@ -118,6 +118,13 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("enrich_on_scan", json!(true)),
         // Folder → playlist discovery at scan time — opt-in (Frédéric).
         ("scan_folder_playlists", json!(false)),
+        // Import of .m3u/.pls files found at scan time. A different feature
+        // from the one above, and default ON since it always behaved that way.
+        // The web toggle writes "false" to opt out (JP Borderies).
+        ("scan_import_playlists", json!(true)),
+        // Le mode PURE impose-t-il le volume à 100 % ? Inactif par défaut :
+        // cocher « Audiophile » ne doit pas changer le niveau sans prévenir.
+        ("audiophile_lock_volume", json!(false)),
         ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),

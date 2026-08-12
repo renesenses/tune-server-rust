@@ -45,6 +45,42 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
     }
 }
 
+/// Query string of `POST /system/update/install`.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct UpdateInstallParams {
+    /// Install even if a deferral guard would otherwise hold the update back.
+    force: Option<bool>,
+}
+
+/// Is any zone actually playing right now?
+///
+/// The update restarts the server — on UNIX by re-exec'ing in place, which
+/// replaces the process image and tears every output down with it. Playback
+/// does not survive: the OAAT endpoint sees its socket close and reconnects,
+/// DLNA renderers stop, and the listener hears the music cut out.
+///
+/// It is silent, which is what makes it expensive. On .18 (2026-08-10) six
+/// updates landed in a single day; two of them re-exec'd while zone 12 was
+/// streaming to the OAAT endpoint — the journal shows `update_reexec` followed
+/// immediately by `mdns_zone_reconnected` and `auto_resume_device_reconnected`.
+/// Bertrand reported it as "micro-coupures du son" and there was nothing to
+/// connect the sound to its cause: no message, no restart in the UI, same PID
+/// in the journal (re-exec keeps it).
+///
+/// So defer, as we already do for a running scan. Every install is a deliberate
+/// call today — `config.auto_update` is declared but read nowhere, so nothing
+/// retries on its own — which is exactly why the UI carries the other half of
+/// this fix: it warns that the music will stop and then passes `?force=true`.
+/// A caller that does NOT say `force` has not been told what it is about to
+/// interrupt, and that is the one we protect against.
+async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -> bool {
+    playback
+        .all_states()
+        .await
+        .iter()
+        .any(|z| z.state == tune_core::playback::PlayState::Playing)
+}
+
 /// Can we actually create a file in `dir`? Permission *bits* are not the
 /// answer: a read-only mount, an ACL, or a SELinux label all deny the write
 /// while the mode still reads 0755. The only honest test is to create a file
@@ -288,10 +324,16 @@ pub(super) async fn update_check() -> Json<Value> {
 /// Validates that an update is available, then spawns the download/extract/install
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
+///
+/// `?force=true` overrides the deferral guards that exist to protect work in
+/// progress (currently: playback). The UI sets it on the install button, which
+/// sits directly under the warning that playback will stop.
 pub(super) async fn update_install(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
 ) -> impl IntoResponse {
+    let force = params.force.unwrap_or(false);
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();
@@ -388,6 +430,23 @@ pub(super) async fn update_install(
                 "status": "blocked",
                 "reason": "scan_in_progress",
                 "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
+            })),
+        )
+            .into_response();
+    }
+
+    // Guard: don't restart while music is playing. The restart re-execs the
+    // process, which kills every output mid-stream — and says so nowhere, so
+    // the listener just hears the music cut out (#1462). An update that lands
+    // after the album is worth more than one that interrupts it.
+    if !force && playback_in_progress(&state.playback).await {
+        warn!("update_deferred_playback_in_progress");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "blocked",
+                "reason": "playback_in_progress",
+                "message": "Update deferred: music is playing and installing it would stop playback. It will be applied automatically once playback stops."
             })),
         )
             .into_response();
@@ -729,6 +788,16 @@ pub(super) async fn update_install(
             // ROUVRAIT un onglet alors que l'ancien se reconnecte déjà → deux
             // onglets Tune à chaque mise à jour (Jean, forum #1236).
             unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
+            // Replier le WAL AVANT l'exec. `exec()` remplace l'image sans
+            // dérouler un seul destructeur : aucune connexion n'est fermée,
+            // aucun verrou n'est rendu proprement. Le 10 août, deux re-exec ont
+            // eu lieu pendant que la base était en écriture, et elle s'est
+            // retrouvée corrompue sans qu'on ait pu établir le mécanisme
+            // (#1462). Un checkpoint ici ne prouve rien sur cette cause — il
+            // supprime la fenêtre où elle pouvait jouer.
+            if let Some(db) = state.db.as_ref() {
+                db.checkpoint();
+            }
             info!(exe = %exe.display(), "update_reexec");
             // exec() replaces this process on success and never returns.
             let err = std::process::Command::new(&exe).args(&args).exec();
@@ -1711,6 +1780,57 @@ mod scan_guard_tests {
         let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
         s.set("scan_started_at", &stale.to_string()).unwrap();
         assert!(!scan_in_progress(&b));
+    }
+}
+
+#[cfg(test)]
+mod playback_guard_tests {
+    use super::playback_in_progress;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    #[tokio::test]
+    async fn idle_server_allows_update() {
+        assert!(!playback_in_progress(&PlaybackManager::new()).await);
+    }
+
+    #[tokio::test]
+    async fn playing_zone_defers_update() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        assert!(playback_in_progress(&pm).await);
+    }
+
+    #[tokio::test]
+    async fn paused_zone_allows_update() {
+        // Paused means nothing is streaming, so the re-exec costs nothing
+        // audible. Only Playing defers — otherwise a zone left paused for days
+        // would block every update, which is the failure mode the scan guard's
+        // staleness window exists to avoid.
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.pause(12).await;
+        assert!(!playback_in_progress(&pm).await);
+    }
+
+    #[tokio::test]
+    async fn stopped_zone_allows_update() {
+        let pm = PlaybackManager::new();
+        pm.play(12, NowPlaying::default()).await;
+        pm.stop(12).await;
+        assert!(!playback_in_progress(&pm).await);
+    }
+
+    #[tokio::test]
+    async fn one_playing_zone_among_idle_ones_defers_update() {
+        // .18 runs 13-14 zones; the guard must look at all of them, not the
+        // first one it finds.
+        let pm = PlaybackManager::new();
+        pm.play(4, NowPlaying::default()).await;
+        pm.stop(4).await;
+        pm.play(8, NowPlaying::default()).await;
+        pm.pause(8).await;
+        pm.play(12, NowPlaying::default()).await;
+        assert!(playback_in_progress(&pm).await);
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod aiff;
 pub mod analyzer;
 pub mod ape;
+pub mod audiophile;
 pub mod channels;
 pub mod convolver;
 pub mod crossfeed;

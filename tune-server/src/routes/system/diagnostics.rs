@@ -54,7 +54,6 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     // Discovered devices grouped by type
     let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
     let mut devices_by_type: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for d in &devices {
@@ -601,7 +600,6 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Discovered devices
     let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);

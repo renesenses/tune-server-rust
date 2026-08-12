@@ -744,4 +744,69 @@ mod tests {
         mock.abort();
         audio_rx.abort();
     }
+
+    /// #1475 — la boucle de connexion d'une lecture doit CESSER à l'arrêt.
+    ///
+    /// `play_media` détache une tâche qui tente la connexion quinze fois. Rien
+    /// ne l'arrêtait : `stop()` envoyait bien un signal, mais la boucle ne
+    /// l'écoute pas — c'est un `for` avec des pauses. Elle continuait donc à
+    /// réclamer l'endpoint pendant une quarantaine de secondes, et volait la
+    /// connexion à la lecture suivante. Sur un endpoint mono-client, deux
+    /// boucles concurrentes font repartir la piste de zéro en boucle
+    /// (constaté sur .42 le 2026-08-11 : `attempt=1` et `attempt=9` à la même
+    /// seconde, deux sockets vers le même endpoint).
+    ///
+    /// Le test compte les connexions entrantes : elles doivent se figer après
+    /// `stop()`. Sans le correctif, le compteur continue de monter.
+    #[tokio::test]
+    async fn stop_cancels_the_connection_retry_loop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Un faux endpoint qui ACCEPTE puis raccroche aussitôt : la connexion
+        // échoue vite (pas d'attente de 3 s), et chaque tentative est comptée.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let output = OaatOutput::new("Mock".into(), "127.0.0.1".into(), port, "ep".into());
+        let _ = output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:1/none.wav",
+                mime_type: "audio/wav",
+                title: Some("Test"),
+                ..Default::default()
+            })
+            .await;
+
+        // Laisser la boucle enchaîner quelques tentatives.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let before_stop = attempts.load(Ordering::SeqCst);
+        assert!(
+            before_stop >= 2,
+            "la boucle devrait avoir tenté plusieurs connexions, vu {before_stop}"
+        );
+
+        let _ = output.stop().await;
+
+        // Après l'arrêt, plus AUCUNE nouvelle tentative.
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        let after_stop = attempts.load(Ordering::SeqCst);
+        assert_eq!(
+            after_stop, before_stop,
+            "la boucle a continué après stop() : {before_stop} -> {after_stop}"
+        );
+    }
 }

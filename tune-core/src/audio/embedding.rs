@@ -30,10 +30,53 @@ const PER_FILE_PAUSE_MS: u64 = 50;
 /// la musique, la cadence par défaut se remarque à l'oreille comme au
 /// ventilateur.
 ///
-/// Le levier est la pause entre deux fichiers, pas un nombre de fils : la passe
-/// est déjà séquentielle, et allonger la pause laisse la main au reste du
-/// serveur sans jamais rien interrompre en cours de route.
+/// Ce réglage tient DEUX leviers, et le second a été ajouté après coup parce que
+/// le premier ne suffisait pas :
+/// - [`per_file_pause_ms`] : la pause entre deux fichiers. Elle laisse la main
+///   au reste du serveur sans jamais rien interrompre en cours de route.
+/// - [`intra_threads_for`] : le nombre de fils qu'onnxruntime a le droit
+///   d'utiliser *pendant* une inférence.
+///
+/// La passe est séquentielle fichier par fichier, mais **une inférence ne l'est
+/// pas** : sans plafond, onnxruntime prend tous les cœurs. La pause seule
+/// laissait donc la machine à genoux entre deux respirations.
 const THROTTLE_KEY: &str = "audio_embedding_throttle";
+
+/// Combien de fils onnxruntime a le droit d'utiliser à l'intérieur d'une
+/// inférence, selon le même réglage que la pause entre fichiers.
+///
+/// **La pause ne bride pas ce qui chauffe.** `per_file_pause_ms` espace les
+/// fichiers ; pendant chaque inférence, onnxruntime prend par défaut *tous* les
+/// cœurs. Sur .18 (8 cœurs) une salve de 32 fichiers dure ~53 s pour 50 ms de
+/// pause par fichier : le rapport cyclique est de ~97 %. `sar` a mesuré 50 % de
+/// 8 cœurs en continu pendant 1 h 25, l'analyse acoustique et ReplayGain
+/// tournant ensemble, avant que la machine ne s'arrête net — journal interrompu
+/// en pleine ligne, aucune trace noyau, mémoire hors de cause (14 Go libres).
+/// La cause exacte de cet arrêt n'est pas établie ; ce qui l'est, c'est qu'une
+/// analyse optionnelle de fond n'a aucune raison de prendre la machine entière.
+///
+/// - `eco` : un seul fil. La machine reste entièrement disponible.
+/// - `equilibre` (défaut) : la moitié des cœurs, au moins un. Laisse de quoi
+///   décoder, servir un flux et répondre à l'interface.
+/// - `rapide` : tous les cœurs — le comportement d'avant, désormais un choix
+///   explicite et non plus le défaut silencieux.
+fn intra_threads_for(settings: &crate::db::settings_repo::SettingsRepo) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    match settings
+        .get(THROTTLE_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        .unwrap_or("equilibre")
+    {
+        "eco" => 1,
+        "rapide" => cores,
+        // Comme pour la pause : une valeur inconnue retombe sur l'équilibre.
+        _ => (cores / 2).max(1),
+    }
+}
 
 /// Pause entre deux fichiers selon le réglage. `eco` divise la charge par huit
 /// environ, `rapide` enchaîne sans pause — à réserver à une machine dédiée ou à
@@ -66,6 +109,116 @@ const WINDOW_SAMPLES: usize = 480_000;
 /// even for hi-res PCM; anything past this is a stuck decoder, not slowness.
 const DECODE_TIMEOUT_SECS: u64 = 30;
 
+/// Memory the sweep needs available before it will start a batch.
+///
+/// Measured on .18 (2026-08-10, 16 GB, ~25 k tracks): with the sweep running the
+/// process sat between 596 MB and 1224 MB. It oscillated inside that band for
+/// two hours and came back down repeatedly — so this is a **footprint, not a
+/// leak** (#1462, where a 1.1 GB "leak" was chased that never existed). Most of
+/// it is the 287 MB model plus onnxruntime's activation arena for HTSAT-base
+/// over a 480 000-sample window.
+///
+/// 16 GB absorbs that without noticing. A 2 GB Pi or a memory-capped container
+/// does not — and there the OOM killer decides, silently, because
+/// `Restart=always` brings the server straight back with nothing said. So we
+/// decide instead: under this much available memory the sweep pauses and says
+/// why, then resumes when there is room. Set generously above the observed
+/// ceiling: being an hour late to embed costs nothing, being killed mid-write
+/// costs a database.
+const MIN_AVAILABLE_MB: u64 = 1536;
+
+/// Memory available to *this* process, in MB.
+///
+/// Order matters. Inside a container `/proc/meminfo` reports the **host's**
+/// memory, so a 1 GB-capped container would read 32 GB free and get OOM-killed
+/// anyway. The cgroup limit is the honest number when there is one; only when
+/// it is absent or unlimited (`max`) do we fall back to the host view.
+///
+/// `None` means "cannot tell" — on macOS and Windows there is no cheap
+/// equivalent of `MemAvailable`, and a guard that cannot measure must not
+/// pretend to. Those are also not the constrained targets; the Pis, the NAS
+/// boxes and the containers are all Linux.
+#[cfg(target_os = "linux")]
+fn available_memory_mb() -> Option<u64> {
+    fn read(path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    // cgroup v2, then v1, then the host.
+    cgroup_available_mb(
+        read("/sys/fs/cgroup/memory.max").as_deref(),
+        read("/sys/fs/cgroup/memory.current").as_deref(),
+    )
+    .or_else(|| {
+        cgroup_available_mb(
+            read("/sys/fs/cgroup/memory/memory.limit_in_bytes").as_deref(),
+            read("/sys/fs/cgroup/memory/memory.usage_in_bytes").as_deref(),
+        )
+    })
+    .or_else(|| mem_available_mb(read("/proc/meminfo").as_deref()?))
+}
+
+/// Headroom left inside a cgroup memory cap, in MB, from the raw contents of
+/// its limit and usage files.
+///
+/// `None` when there is no usable cap — the file is missing, unparseable, holds
+/// cgroup v2's literal `max`, or holds v1's "unlimited" sentinel (`i64::MAX`
+/// rounded down to a page, so absurdly large rather than a round number). In
+/// all of those cases the caller must fall through to the host's own view
+/// rather than invent a limit.
+/// Only *called* on Linux, but deliberately compiled everywhere so its tests
+/// run on every platform — the parsing is where the bugs live, and gating it
+/// out of the macOS/Windows builds would mean it is only ever exercised on
+/// the one platform nobody develops on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_available_mb(limit: Option<&str>, usage: Option<&str>) -> Option<u64> {
+    let limit: u64 = limit?.trim().parse().ok()?;
+    let usage: u64 = usage?.trim().parse().ok()?;
+    if limit >= (1 << 62) {
+        return None;
+    }
+    Some(limit.saturating_sub(usage) / (1024 * 1024))
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in MB.
+///
+/// `MemAvailable`, not `MemFree`: the kernel's own estimate of what a new
+/// allocation can actually get, page cache included. `MemFree` on a server that
+/// has been up for a week reads near zero and would pause the sweep forever.
+/// Only *called* on Linux, but deliberately compiled everywhere so its tests
+/// run on every platform — the parsing is where the bugs live, and gating it
+/// out of the macOS/Windows builds would mean it is only ever exercised on
+/// the one platform nobody develops on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mem_available_mb(meminfo: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_memory_mb() -> Option<u64> {
+    None
+}
+
+/// Resident size of this process in MB, for the batch log. Diagnostic only —
+/// never a decision input. On 2026-08-10 the absence of this number is what let
+/// a correlation ("memory rises while the pass runs") stand in for a cause.
+#[cfg(target_os = "linux")]
+fn process_rss_mb() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4 / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_mb() -> Option<u64> {
+    None
+}
+
 // Storage layout, constants and cosine live in the always-compiled read side.
 use super::embedding_store::{self, EMBED_DIM, MODEL_ID};
 
@@ -79,9 +232,14 @@ impl AudioEmbedder {
     /// Load the ONNX model from disk. The onnxruntime shared library must be
     /// resolvable at runtime (bundled/downloaded next to the model on the
     /// opt-in activation path).
-    pub fn load(model_path: &Path) -> Result<Self, String> {
+    /// `intra_threads` caps how many threads onnxruntime may use *inside* a
+    /// single inference. See [`intra_threads_for`] for why that matters more
+    /// than the pause between files.
+    pub fn load(model_path: &Path, intra_threads: usize) -> Result<Self, String> {
         let session = Session::builder()
             .map_err(|e| format!("ort builder: {e}"))?
+            .with_intra_threads(intra_threads)
+            .map_err(|e| format!("ort intra_threads({intra_threads}): {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| format!("ort load {}: {e}", model_path.display()))?;
         Ok(Self { session })
@@ -285,12 +443,25 @@ pub async fn analyze_embedding_batch(
         }
     }
 
-    info!(embedded = done, "audio_embedding_batch");
+    // Carry the memory figures on every batch. On 2026-08-10 the sweep's cost
+    // had to be reconstructed after the fact from a 5-minute process-wide RSS
+    // sampler, which is what let "memory rises while the pass runs" pass for a
+    // cause (#1462). Now the pass states its own cost, batch by batch.
+    info!(
+        embedded = done,
+        rss_mb = process_rss_mb().unwrap_or(0),
+        available_mb = available_memory_mb().unwrap_or(0),
+        "audio_embedding_batch"
+    );
     done
 }
 
 /// Idle wait when disabled or the sweep is drained.
 const IDLE_SLEEP_SECS: u64 = 900;
+/// Wait between retries while the memory budget holds the sweep back. Long
+/// enough not to spin, short enough that the sweep resumes on its own once
+/// whatever was using the memory (a scan, a transcode) has finished.
+const LOW_MEMORY_RETRY_SECS: u64 = 300;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
 const ENABLED_KEY: &str = "audio_embedding_enabled";
 /// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
@@ -397,20 +568,114 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         let mut embedder: Option<AudioEmbedder> = None;
+        // Whether we are currently held back by the memory budget, so the
+        // warning is logged on the way in and the recovery on the way out —
+        // once each, not once per retry.
+        let mut low_memory = false;
+        // Same latch for "enabled but no model path": say it once, not every
+        // 900 s round.
+        let mut unconfigured = false;
+        // Le nombre de fils avec lequel la session courante a été bâtie, pour
+        // détecter un changement de réglage.
+        let mut loaded_threads = 0usize;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
+                // Memory budget, checked BEFORE the model is fetched or the ORT
+                // session built — those are themselves most of the footprint
+                // (287 MB on disk, more once resident), so a box that cannot
+                // afford the sweep must not download a third of a gigabyte and
+                // build a session only to give up afterwards.
+                //
+                // The sweep is the heaviest thing this server does and it is
+                // entirely optional: pausing it always beats being killed.
+                // Re-checked every pass round, which is fine-grained enough to
+                // react and coarse enough to be free.
+                let avail = available_memory_mb();
+                if let Some(mb) = avail
+                    && mb < MIN_AVAILABLE_MB
+                {
+                    // Log the transition, not every retry: this loop comes
+                    // round every LOW_MEMORY_RETRY_SECS and a line each time
+                    // would bury the journal on the very machine that is
+                    // already struggling.
+                    if !low_memory {
+                        low_memory = true;
+                        warn!(
+                            available_mb = mb,
+                            needed_mb = MIN_AVAILABLE_MB,
+                            "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
+                    continue;
+                }
+                if low_memory {
+                    low_memory = false;
+                    info!(
+                        available_mb = avail.unwrap_or(0),
+                        "audio_embed_resumed_memory_ok"
+                    );
+                }
+
+                // Le nombre de fils est figé à la construction de la session.
+                // Si le réglage a changé depuis, on relâche la session pour
+                // qu'elle soit rebâtie juste en dessous — sinon le bouton de
+                // l'interface ne ferait rien tant que le serveur n'a pas
+                // redémarré, ce qui est précisément le genre de réglage qui
+                // ment.
+                let threads = intra_threads_for(&settings);
+                if embedder.is_some() && threads != loaded_threads {
+                    info!(
+                        from = loaded_threads,
+                        to = threads,
+                        "audio_embed_threads_changed_reloading"
+                    );
+                    embedder = None;
+                }
+
                 if embedder.is_none() {
-                    if let Some(p) = configured_model_path(&settings) {
+                    // No model path configured: `enabled=true` and yet the sweep
+                    // can do nothing at all. Before this, that branch fell
+                    // through in complete silence — no batch, no error, just the
+                    // 900 s idle sleep — which reads exactly like a sweep that
+                    // has finished. Lived on .18 (2026-08-11): the rebuilt
+                    // database had lost `audio_embedding_model_path`, the
+                    // feature was on, and the journal said nothing whatsoever
+                    // for twelve minutes.
+                    //
+                    // Latched like the memory pause: once on the way in, once on
+                    // the way out. This loop comes round every 900 s and a line
+                    // per round would be noise.
+                    let model_path = configured_model_path(&settings);
+                    if model_path.is_none() {
+                        if !unconfigured {
+                            unconfigured = true;
+                            warn!(
+                                setting = MODEL_PATH_KEY,
+                                env = "TUNE_AUDIO_EMBED_MODEL",
+                                "audio_embed_no_model_path — acoustic analysis is enabled but no model path is configured, so nothing will be analysed; set the setting or the environment variable"
+                            );
+                        }
+                    } else if unconfigured {
+                        unconfigured = false;
+                        info!("audio_embed_model_path_configured");
+                    }
+                    if let Some(p) = model_path {
                         if let Err(e) = ensure_model(&p).await {
                             warn!(error = %e, "audio_model_unavailable");
                         } else if let Err(e) = ensure_runtime_loaded(&p).await {
                             warn!(error = %e, "audio_runtime_unavailable");
                         } else {
-                            match AudioEmbedder::load(&p) {
+                            match AudioEmbedder::load(&p, threads) {
                                 Ok(e) => {
-                                    info!(model = %p.display(), "audio_embedder_loaded");
+                                    info!(
+                                        model = %p.display(),
+                                        intra_threads = threads,
+                                        "audio_embedder_loaded"
+                                    );
                                     embedder = Some(e);
+                                    loaded_threads = threads;
                                 }
                                 Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                             }
@@ -454,6 +719,133 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_cap_reports_headroom() {
+        // 1 GiB cap, 256 MiB used → 768 MiB left. This is the container case
+        // that /proc/meminfo gets wrong: the host may have 32 GB free while
+        // this process has 768 MB before the OOM killer arrives.
+        let mb = super::cgroup_available_mb(Some("1073741824\n"), Some("268435456\n"));
+        assert_eq!(mb, Some(768));
+    }
+
+    #[test]
+    fn cgroup_unlimited_falls_through() {
+        // cgroup v2 writes the literal "max"...
+        assert_eq!(super::cgroup_available_mb(Some("max\n"), Some("100")), None);
+        // ...and v1 an i64::MAX-ish sentinel. Neither is a real cap, so both
+        // must yield None and let the caller read the host instead.
+        assert_eq!(
+            super::cgroup_available_mb(Some("9223372036854771712"), Some("100")),
+            None
+        );
+    }
+
+    #[test]
+    fn cgroup_usage_over_limit_saturates_to_zero() {
+        // Usage can exceed the limit momentarily under reclaim pressure. That
+        // must read as "no headroom", not wrap around to a huge number and let
+        // the sweep charge ahead.
+        assert_eq!(
+            super::cgroup_available_mb(Some("104857600"), Some("209715200")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn mem_available_is_read_not_mem_free() {
+        let meminfo = "MemTotal:       16316360 kB\n\
+                       MemFree:          201480 kB\n\
+                       MemAvailable:   14765112 kB\n\
+                       Buffers:           21356 kB\n";
+        // 14765112 kB = 14419 MB — and emphatically not MemFree's 196 MB, which
+        // would pause the sweep permanently on any long-running server.
+        assert_eq!(super::mem_available_mb(meminfo), Some(14419));
+    }
+
+    #[test]
+    fn missing_mem_available_is_unknown_not_zero() {
+        // An old kernel without MemAvailable must read as "cannot tell", so the
+        // guard stands aside. Zero would pause the sweep forever.
+        assert_eq!(super::mem_available_mb("MemTotal: 100 kB\n"), None);
+    }
+
+    #[test]
+    fn observed_18_footprint_clears_the_budget() {
+        // .18 on 2026-08-10: 16 GB box, sweep running, RSS peaked at 1224 MB and
+        // MemAvailable stayed around 14.7 GB. The guard must not fire there —
+        // it exists for the 2 GB Pi, not for the machine where the footprint
+        // was measured.
+        let meminfo = "MemAvailable:   14765112 kB\n";
+        assert!(super::mem_available_mb(meminfo).unwrap() > super::MIN_AVAILABLE_MB);
+        // A 2 GB box with ~700 MB left is exactly the case that must pause.
+        assert!(
+            super::mem_available_mb("MemAvailable: 716800 kB\n").unwrap() < super::MIN_AVAILABLE_MB
+        );
+    }
+
+    fn settings_with_throttle(v: Option<&str>) -> crate::db::settings_repo::SettingsRepo {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let repo = crate::db::settings_repo::SettingsRepo::with_backend(std::sync::Arc::new(db));
+        if let Some(v) = v {
+            repo.set(super::THROTTLE_KEY, v).unwrap();
+        }
+        repo
+    }
+
+    fn cores() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    }
+
+    #[test]
+    fn eco_uses_a_single_thread() {
+        // Le point du mode éco : la machine reste entièrement disponible.
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(Some("eco"))),
+            1
+        );
+    }
+
+    #[test]
+    fn fast_uses_every_core() {
+        // L'ancien comportement, désormais un choix explicite.
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(Some("rapide"))),
+            cores()
+        );
+    }
+
+    #[test]
+    fn default_leaves_half_the_machine_free() {
+        // Ni réglage écrit, ni valeur reconnue : la moitié des cœurs. C'est ce
+        // qui laisse de quoi décoder et servir un flux pendant l'analyse.
+        let expected = (cores() / 2).max(1);
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(None)),
+            expected
+        );
+        assert_eq!(
+            super::intra_threads_for(&settings_with_throttle(Some("n'importe quoi"))),
+            expected
+        );
+    }
+
+    #[test]
+    fn never_returns_zero() {
+        // Zéro signifie « débrouille-toi » pour onnxruntime, donc tous les
+        // cœurs — l'exact inverse de ce qu'on demande. Sur une machine à un
+        // seul cœur, la division doit tenir.
+        for v in [None, Some("eco"), Some("rapide"), Some("equilibre")] {
+            assert!(
+                super::intra_threads_for(&settings_with_throttle(v)) >= 1,
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
     fn quantize_i16_matches_int16_roundtrip() {
         // Exact grid points survive unchanged.
         assert_eq!(quantize_i16(0.0), 0.0);
@@ -490,7 +882,7 @@ mod tests {
             .await
             .expect("provision onnxruntime");
 
-        let mut embedder = AudioEmbedder::load(&model).expect("load embedder");
+        let mut embedder = AudioEmbedder::load(&model, 1).expect("load embedder");
         // 1 s of quiet noise → a valid, finite, unit-norm embedding.
         let wav: Vec<f32> = (0..48_000)
             .map(|i| ((i % 97) as f32 / 97.0 - 0.5) * 0.01)
