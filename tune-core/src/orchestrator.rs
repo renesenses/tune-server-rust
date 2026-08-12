@@ -1316,8 +1316,25 @@ impl PlaybackOrchestrator {
         // can run into the 300s timeout from the previous track.
         let play_gen = self.playback.bump_generation(req.zone_id).await;
 
+        // Signaler la recherche AVANT de la lancer : sur YouTube elle peut durer
+        // une trentaine de secondes, et un écran muet pendant ce temps se lit
+        // comme une panne (forum #1359). Le drapeau retombe dans `play()`, dès
+        // qu'une URL jouable existe — y compris sur les chemins d'erreur, qui
+        // passent tous par un `play()` ou un `stop()` ultérieur.
+        self.playback.set_resolving(req.zone_id, true).await;
+
+        // ⚠ TOUTE sortie de ce bloc doit abaisser le drapeau, sinon la zone reste
+        // affichée « recherche en cours » indéfiniment. Trois chemins quittent
+        // ici sans passer par `play()` : l'échec du fichier uploadé, la reprise
+        // par une lecture plus récente, et l'échec de résolution.
         let resolved = if let Some(ref temp_path) = req.temp_file_path {
-            self.resolve_uploaded_file(temp_path, &req).await?
+            match self.resolve_uploaded_file(temp_path, &req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.playback.set_resolving(req.zone_id, false).await;
+                    return Err(e);
+                }
+            }
         } else {
             match self.resolve_stream(&req).await {
                 Ok(r) => r,
@@ -1329,6 +1346,8 @@ impl PlaybackOrchestrator {
                         zone_id = req.zone_id,
                         "orchestrator_play_superseded_before_transcode"
                     );
+                    // La lecture gagnante a pose son propre drapeau : ne pas
+                    // l'abaisser ici, on effacerait SON etat de recherche.
                     return Ok(PlayResult {
                         stream_url: None,
                         output_sent: false,
@@ -1336,7 +1355,10 @@ impl PlaybackOrchestrator {
                         error: Some("superseded by a newer play".into()),
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.playback.set_resolving(req.zone_id, false).await;
+                    return Err(e);
+                }
             }
         };
         let resolve_ms = play_start.elapsed().as_millis();
