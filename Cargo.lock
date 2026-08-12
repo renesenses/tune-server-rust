@@ -5188,6 +5188,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "jsonwebtoken",
+ "libc",
  "lofty",
  "mdns-sd",
  "minisign-verify",

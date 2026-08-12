@@ -399,6 +399,9 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     // Kept for the shutdown hook — `state` is moved into the router below.
     let plugins_handle = state.plugins.clone();
 
+    // Cloné AVANT que le routeur ne consomme `state` : l'arrêt propre en a
+    // besoin pour replier le WAL.
+    let shutdown_state = state.clone();
     let app = routes::router_with_plugins(state, plugin_routers);
 
     // Listener was bound before the DB was opened (see above) — the socket's
@@ -462,7 +465,7 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
         // disambiguate browser zones created by different machines — Bertrand).
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(shutdown_state))
     .await
     {
         tracing::error!(error = %e, "server_fatal_error");
@@ -482,7 +485,7 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     crate::plugins::shutdown(&plugins_handle).await;
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: crate::state::AppState) {
     let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
@@ -500,12 +503,44 @@ async fn shutdown_signal() {
 
     info!("shutdown_signal_received");
 
+    // Replier le WAL tout de suite, avant le reste de l'arrêt. Quand
+    // onnxruntime est chargé, l'arrêt peut se solder par un SEGV pendant le
+    // démontage (#1462) : le processus meurt alors sans que rien ne soit
+    // rabattu. En repliant ici, ce qui suit ne peut plus laisser de WAL à
+    // rejouer, quelle que soit la façon dont le processus se termine.
+    if let Some(db) = state.db.as_ref() {
+        db.checkpoint();
+    }
+
     // Force exit after 3s if graceful shutdown stalls — must use std::thread
     // because tokio runtime may itself be stalling
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(3));
         tracing::warn!("shutdown_timeout_forcing_exit");
-        std::process::exit(0);
+        // `_exit`, PAS `std::process::exit`. Cette minuterie s'arme quand
+        // l'arrêt propre a déjà échoué : d'autres fils tournent encore, par
+        // construction. `exit()` déroule alors `__run_exit_handlers` →
+        // `_dl_fini`, donc les destructeurs statiques de TOUTES les
+        // bibliothèques chargées — dont `libonnxruntime.so`, dont les fils
+        // d'inférence et les arènes sont toujours vivants. Il y meurt.
+        //
+        // Prouvé sur .18 le 11 août (#1462), pile extraite du core :
+        //   #0  libonnxruntime.so
+        //   #3  _dl_call_fini      (dl-call_fini.c:43)
+        //   #4  _dl_fini
+        //   #5  __run_exit_handlers
+        //   #6  __GI_exit
+        // et dans le journal, `shutdown_signal_received` puis, exactement
+        // 3,001 s plus tard, `shutdown_timeout_forcing_exit` suivi de
+        // `status=11/SEGV`. C'est notre propre garde-fou qui tuait le
+        // processus — et un SEGV au milieu de `_dl_fini`, pendant que des
+        // fils écrivent encore, est autrement plus dangereux pour la base
+        // qu'un arrêt franc (lequel, lui, n'a rien corrompu le 11 août).
+        //
+        // `_exit` rend la main au noyau sans dérouler quoi que ce soit. C'est
+        // exactement ce qu'on veut d'une sortie forcée : on a déjà renoncé au
+        // nettoyage, il ne reste qu'à ne pas faire de dégâts.
+        unsafe { libc::_exit(0) };
     });
 }
 
