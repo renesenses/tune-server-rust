@@ -5555,8 +5555,8 @@ impl PlaybackOrchestrator {
         let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
         if let Some(position_ms) = start_position_ms {
             local_out.set_pending_start_position_ms(position_ms);
-            let producer_seeked = media.file_path.is_some();
-            local_out.set_producer_seeked(producer_seeked);
+            // Producer always pre-seeked — see the comment in send_to_output.
+            local_out.set_producer_seeked(true);
         }
         {
             let mut outputs = self.outputs.lock().await;
@@ -5665,12 +5665,17 @@ impl PlaybackOrchestrator {
                         .downcast_ref::<crate::outputs::local::LocalOutput>()
                     {
                         local_output.set_pending_start_position_ms(position_ms);
-                        // Only mark as pre-seeked when the media has a local
-                        // file_path — meaning the decoder used seek_s. For
-                        // streaming sources (TIDAL/Qobuz), the producer always
-                        // starts from 0s and needs consumer-side skip.
-                        let producer_seeked = media.file_path.is_some();
-                        local_output.set_producer_seeked(producer_seeked);
+                        // The WAV a local output receives is ALWAYS pre-seeked:
+                        // since b3a4a79f the streaming (Qobuz/Tidal) transcode
+                        // arm feeds seek_s to decode_to_pcm_streaming_seeked,
+                        // exactly like the local-file arm. Deriving this flag
+                        // from media.file_path (streaming → false → consumer
+                        // byte-skip) made the output skip the seek offset a
+                        // SECOND time on an already-seeked stream: a seek at
+                        // 4:30 discarded the entire remainder of the track —
+                        // silence, then a ~3s restart loop as the poller kept
+                        // recovering the "ended" track (Vincent, #1518).
+                        local_output.set_producer_seeked(true);
                     }
                     drop(output);
                 }
@@ -8912,6 +8917,49 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// #1518 (Vincent) : seek d'une piste STREAMING (Qobuz/Tidal) sur sortie
+    /// locale. Depuis b3a4a79f le transcodage WAV streaming est pré-seeké
+    /// (decode_to_pcm_streaming_seeked reçoit seek_s), comme le chemin fichier
+    /// local. Dériver le drapeau de media.file_path (None en streaming) faisait
+    /// re-sauter l'offset une DEUXIÈME fois côté consommateur : un seek à 4:30
+    /// jetait tout le PCM restant de la piste → silence total, puis boucle de
+    /// redémarrage ~3 s (le poller voit la piste « finie » et la relance).
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn streaming_seek_on_local_output_is_producer_preseeked_no_consumer_skip() {
+        let orch = test_orchestrator();
+        let device_id = "local:Test Device 1518";
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(crate::outputs::local::LocalOutput::new(
+                "Test Device 1518".to_string(),
+            )));
+
+        // Média streaming : PAS de file_path (cas Qobuz/Tidal). L'URL refuse
+        // la connexion, le thread audio s'arrête avant de toucher un device.
+        let media = crate::outputs::traits::PlayMedia {
+            url: "http://127.0.0.1:1/stream",
+            mime_type: "audio/wav",
+            ..Default::default()
+        };
+        let (sent, err) = orch
+            .send_to_output(device_id, &media, Some(270_000), false, 1, None)
+            .await;
+        assert!(sent, "play_media doit partir : {err:?}");
+
+        let arc = orch.outputs.lock().await.get(device_id).unwrap();
+        let out = arc.lock().await;
+        let local = out
+            .as_any()
+            .downcast_ref::<crate::outputs::local::LocalOutput>()
+            .unwrap();
+        assert!(
+            local.producer_seeked(),
+            "flux streaming transcodé = déjà pré-seeké : le consommateur ne doit PAS re-sauter l'offset (#1518)"
+        );
     }
 
     #[test]
