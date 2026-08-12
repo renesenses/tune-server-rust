@@ -17,7 +17,6 @@ pub mod plugins;
 pub mod plugins_host;
 pub mod premium_guard;
 pub mod routes;
-pub mod run;
 pub mod scan_import;
 pub mod startup;
 pub mod state;
