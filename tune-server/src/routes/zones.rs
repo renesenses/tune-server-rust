@@ -539,6 +539,90 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
     }
 }
 
+/// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
+/// tire son flux n'est plus un démarrage lent mais un silence.
+///
+/// Le client web branche son `<audio>` sur `stream_url` dès qu'il a l'état de
+/// la zone ; les premiers octets partent en une seconde ou deux. Douze
+/// secondes laissent de la marge à un poste lent sans laisser l'utilisateur
+/// dans le noir.
+const BROWSER_UNATTENDED_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Où va réellement le son de cette zone, dit au client.
+///
+/// `online` ne suffit pas : il répond « la sortie répond-elle ? », pas « y
+/// a-t-il une sortie ? », et il vaut `true` en permanence pour une zone
+/// navigateur — y compris quand aucun navigateur n'écoute. Or ces deux états
+/// produisent exactement le même tableau qu'une lecture réussie : la file se
+/// remplit, le flux est décodé, la position avance, et rien ne sort.
+///
+/// Ils n'étaient visibles que dans un WARN de journal. Bilou (#1499) a ouvert
+/// **deux** fils forum sur un défaut BluOS inexistant avant qu'on lise ses
+/// logs : neuf lectures sur la zone « Ce PC », `output_sent=false` neuf fois.
+/// L'interface ne lui laissait aucune autre piste que son matériel.
+///
+/// - `"ok"` — le son a une destination.
+/// - `"no_output"` — aucune sortie associée à la zone. La lecture est refusée
+///   en amont (`zone_no_output_device`) ; ce champ le dit **avant** le clic.
+/// - `"browser_unattended"` — zone navigateur en lecture depuis assez
+///   longtemps pour que ce ne soit plus un démarrage, dont pas un octet n'a
+///   été tiré : l'onglet qui devait jouer n'est pas là.
+pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
+    // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
+    // On ne le demande au streamer que pour une zone navigateur en lecture,
+    // pour ne rien changer au coût de la liste des zones.
+    let pulled = if zone.output_type.as_deref() == Some("browser")
+        && matches!(ps.state, PlayState::Playing)
+    {
+        match ps
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => state
+                .streamer
+                .stream_bytes_sent(sid)
+                .await
+                .is_some_and(|n| n > 0),
+            None => false,
+        }
+    } else {
+        false
+    };
+    output_reach_of(zone, ps, pulled)
+}
+
+/// La décision seule, sans I/O — c'est elle que les tests couvrent.
+fn output_reach_of(zone: &Zone, ps: &ZoneState, browser_stream_pulled: bool) -> &'static str {
+    if zone.output_type.as_deref() != Some("browser") {
+        return if zone.output_device_id.is_none() {
+            "no_output"
+        } else {
+            "ok"
+        };
+    }
+
+    // Zone navigateur : la sortie, c'est l'onglet. On ne peut pas la
+    // découvrir, seulement constater qu'elle consomme — ou non.
+    if !matches!(ps.state, PlayState::Playing) {
+        return "ok";
+    }
+    // `last_play_started_at` est `#[serde(skip)]` : après une restauration
+    // d'état il vaut `None`, et on ne conclut rien. Le sens du défaut est le
+    // bon — on préfère taire un silence réel que d'en inventer un.
+    if !ps
+        .last_play_started_at
+        .is_some_and(|t| t.elapsed() >= BROWSER_UNATTENDED_GRACE)
+    {
+        return "ok";
+    }
+    if browser_stream_pulled {
+        "ok"
+    } else {
+        "browser_unattended"
+    }
+}
+
 pub fn build_signal_path_pub(
     ps: &ZoneState,
     zone: &Zone,
@@ -1212,6 +1296,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     .unwrap_or(false),
             };
             obj.insert("online".into(), json!(online));
+            obj.insert(
+                "output_reach".into(),
+                json!(output_reach(&state, z, &ps).await),
+            );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -1330,6 +1418,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                         .unwrap_or(false),
                 };
                 obj.insert("online".into(), json!(online));
+                obj.insert(
+                    "output_reach".into(),
+                    json!(output_reach(&state, &zone, &ps).await),
+                );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
                 if let Some(ref np) = ps.now_playing {
@@ -2782,5 +2874,115 @@ mod signal_path_tests {
     #[test]
     fn wav_wire_lossy_source_never_bit_perfect() {
         assert!(!wav_wire_bit_perfect(false, true, true, 16));
+    }
+}
+
+/// #1499 — une zone qui « joue » sans destination doit le dire.
+///
+/// Deux situations produisent le même symptôme (file remplie, position qui
+/// avance, aucun son) et ne se distinguaient que dans les journaux : la zone
+/// sans sortie associée, et la zone navigateur dont aucun onglet ne tire le
+/// flux. Bilou a ouvert deux fils forum sur un défaut BluOS inexistant faute
+/// de ce signal.
+#[cfg(test)]
+mod output_reach_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::playback::NowPlaying;
+
+    fn zone_with(output_type: Option<&str>, device: Option<&str>) -> Zone {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend);
+        let id = repo.create("Ce PC", output_type, device).unwrap();
+        repo.get(id).unwrap().unwrap()
+    }
+
+    /// Zone navigateur en lecture depuis `started_ago`, avec une session.
+    fn browser_playing_since(started_ago: Duration) -> ZoneState {
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Track".into(),
+                stream_id: Some("sid-1".into()),
+                ..Default::default()
+            }),
+            last_play_started_at: Instant::now().checked_sub(started_ago),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zone_sans_sortie_est_signalee_avant_le_clic() {
+        let zone = zone_with(Some("local"), None);
+        assert_eq!(
+            output_reach_of(&zone, &ZoneState::default(), false),
+            "no_output"
+        );
+    }
+
+    #[test]
+    fn zone_avec_sortie_ne_signale_rien() {
+        let zone = zone_with(Some("dlna"), Some("dev-1"));
+        assert_eq!(output_reach_of(&zone, &ZoneState::default(), false), "ok");
+    }
+
+    #[test]
+    fn zone_navigateur_a_larret_ne_signale_rien() {
+        // Une zone navigateur n'a jamais de périphérique : sans lecture en
+        // cours il n'y a rien à reprocher.
+        let zone = zone_with(Some("browser"), None);
+        assert_eq!(output_reach_of(&zone, &ZoneState::default(), false), "ok");
+    }
+
+    #[test]
+    fn zone_navigateur_qui_demarre_beneficie_du_delai() {
+        let zone = zone_with(Some("browser"), None);
+        let ps = browser_playing_since(Duration::from_secs(2));
+        assert_eq!(
+            output_reach_of(&zone, &ps, false),
+            "ok",
+            "un onglet qui vient de recevoir stream_url n'a pas encore tiré d'octets"
+        );
+    }
+
+    #[test]
+    fn zone_navigateur_ecoutee_ne_signale_rien() {
+        let zone = zone_with(Some("browser"), None);
+        let ps = browser_playing_since(Duration::from_secs(60));
+        assert_eq!(output_reach_of(&zone, &ps, true), "ok");
+    }
+
+    #[test]
+    fn zone_navigateur_sans_personne_au_bout_est_signalee() {
+        let zone = zone_with(Some("browser"), None);
+        let ps = browser_playing_since(Duration::from_secs(60));
+        assert_eq!(
+            output_reach_of(&zone, &ps, false),
+            "browser_unattended",
+            "une minute de lecture sans un octet tiré : personne n'écoute"
+        );
+    }
+
+    #[test]
+    fn etat_restaure_ne_conclut_rien() {
+        // `last_play_started_at` est `#[serde(skip)]` : après un redémarrage il
+        // vaut None. On ne doit pas inventer un silence sur cette absence.
+        let zone = zone_with(Some("browser"), None);
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Track".into(),
+                stream_id: Some("sid-1".into()),
+                ..Default::default()
+            }),
+            last_play_started_at: None,
+            ..Default::default()
+        };
+        assert_eq!(output_reach_of(&zone, &ps, false), "ok");
     }
 }
