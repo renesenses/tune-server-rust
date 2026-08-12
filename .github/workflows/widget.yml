@@ -43,7 +43,11 @@ jobs:
       - name: Install Tauri CLI
         uses: taiki-e/install-action@v2
         with:
-          tool: tauri-cli@^2
+          # Version EXACTE, sans opérateur semver : install-action rejette `^2`
+          # (« semver operators are not supported in 'tool' input option »).
+          # Le workflow n'ayant jamais tourné avant widget-v0.1.0, l'erreur est
+          # restée invisible jusqu'au premier tag.
+          tool: tauri-cli@2.11.4
 
       - name: Import signing certificate
         env:
