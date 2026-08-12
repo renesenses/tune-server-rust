@@ -2574,7 +2574,12 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 22, "latest PG migration must be 22");
+        // Ce nombre se met a jour A LA MAIN, et c'est voulu : il oblige a
+        // constater qu'une migration PG a ete ajoutee. Ajouter le fichier SQL
+        // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
+        // qui est le seul a executer ce test — la feature `postgres` n'est pas
+        // dans le jeu par defaut.
+        assert_eq!(pg_latest_version(), 23, "latest PG migration must be 23");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
