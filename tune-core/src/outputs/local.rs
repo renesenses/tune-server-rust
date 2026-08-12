@@ -954,12 +954,19 @@ impl LocalOutput {
             .store(position_ms, Ordering::SeqCst);
     }
 
-    /// Signal that the producer actually emitted a pre-seeked stream.
-    /// Only call this when the decoder used seek_s (local files).
-    /// Do NOT call for streaming sources (TIDAL/Qobuz) where the
-    /// producer always starts from 0s.
+    /// Signal that the producer actually emitted a pre-seeked stream: the
+    /// consumer must NOT byte-skip seek_offset_ms again (double seek, #1518).
+    /// Since b3a4a79f BOTH transcode arms (local file and Qobuz/Tidal
+    /// streaming) feed seek_s to the decoder, so the orchestrator always
+    /// passes `true` here. `false` remains meaningful only for a producer
+    /// that genuinely starts at 0s.
     pub fn set_producer_seeked(&self, seeked: bool) {
         self.stream_pre_seeked.store(seeked, Ordering::SeqCst);
+    }
+
+    /// Consumer-side view of the pre-seeked flag (regression test for #1518).
+    pub fn producer_seeked(&self) -> bool {
+        self.stream_pre_seeked.load(Ordering::SeqCst)
     }
 }
 
@@ -1447,9 +1454,9 @@ impl OutputTarget for LocalOutput {
             .store(start_position_ms, Ordering::SeqCst);
         self.position_ms.store(start_position_ms, Ordering::SeqCst);
         // stream_pre_seeked is set explicitly by set_producer_seeked()
-        // from the orchestrator — only when the decoder actually applied
-        // the seek (local files). For streaming sources (TIDAL/Qobuz),
-        // the producer starts from 0s and needs consumer-side skip.
+        // from the orchestrator. Both transcode arms (local file AND
+        // Qobuz/Tidal streaming) pre-seek the decoder, so the consumer
+        // must not byte-skip the offset again (#1518).
 
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
