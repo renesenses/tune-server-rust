@@ -236,9 +236,47 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
         match socket.recv_from(&mut buf).await {
             Ok((len, addr)) => {
                 let data = &buf[..len];
-                // Only react to NOTIFY datagrams (ignore our own and others'
-                // M-SEARCH requests, and M-SEARCH replies handled elsewhere).
                 let head = String::from_utf8_lossy(&data[..len.min(256)]);
+
+                // Un M-SEARCH qui vise notre MediaServer reçoit une réponse
+                // unicast — c'est CE chemin qui rend Tune visible du
+                // « Rechercher des appareils » d'un point de contrôle (JPlay
+                // iOS, BubbleUPnP…). Avant, seul un NOTIFY spontané toutes les
+                // dix minutes existait : sauf coïncidence avec la fenêtre
+                // d'écoute du contrôleur, le serveur n'apparaissait jamais
+                // (Stéphane Villerio, 12/08/2026). Les recherches qui ne nous
+                // concernent pas — un contrôleur cherchant des renderers —
+                // restent sans réponse.
+                if head.starts_with("M-SEARCH") {
+                    if let Some(advert) = crate::upnp_server::media_server_advert() {
+                        let full = String::from_utf8_lossy(data);
+                        let st = full
+                            .lines()
+                            .find_map(|l| {
+                                l.trim()
+                                    .strip_prefix("ST:")
+                                    .or_else(|| l.trim().strip_prefix("st:"))
+                            })
+                            .map(str::trim)
+                            .unwrap_or("");
+                        for (st_reply, usn) in
+                            crate::upnp_server::msearch_reply_targets(st, &advert.uuid)
+                        {
+                            let resp = crate::upnp_server::ssdp_msearch_response(
+                                &st_reply,
+                                &usn,
+                                &advert.location,
+                            );
+                            if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
+                                debug!(error = %e, "ssdp_msearch_reply_failed");
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Only react to NOTIFY datagrams (M-SEARCH replies to OUR own
+                // searches are handled elsewhere).
                 if !head.starts_with("NOTIFY") {
                     continue;
                 }

@@ -575,6 +575,28 @@ pub(crate) mod decisions {
     /// True when the playing track differs from the one already latched
     /// (`latched_key`) AND it has genuinely been listened past the Last.fm
     /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
+    /// Faut-il rafraichir les metadonnees radio d'une zone qui n'a AUCUN
+    /// peripherique de sortie ?
+    ///
+    /// Trois conditions, et la troisieme est celle qu'on oublie : la zone joue,
+    /// la source est une radio, et l'etranglement est echu. Sans le dernier
+    /// point on interrogerait l'API de la station a chaque tick du poller,
+    /// c'est-a-dire toutes les secondes.
+    ///
+    /// Le cas `source != "radio"` n'est pas theorique : une zone navigateur qui
+    /// joue un fichier local passe ici a chaque tick et ne doit declencher
+    /// aucun appel reseau.
+    pub fn deviceless_radio_refresh_due(
+        is_playing: bool,
+        source: Option<&str>,
+        since_last_poll: std::time::Duration,
+        interval_secs: u64,
+    ) -> bool {
+        is_playing
+            && source == Some("radio")
+            && since_last_poll >= std::time::Duration::from_secs(interval_secs)
+    }
+
     pub fn should_dispatch_scrobble(
         latched_key: Option<&str>,
         current_key: &str,
@@ -1696,6 +1718,48 @@ struct ZonePollState {
     gapless_arm_logged: Option<bool>,
 }
 
+impl ZonePollState {
+    /// Etat de sondage neuf pour une zone qui vient d'entrer en lecture.
+    ///
+    /// Etait construit en ligne, champ par champ, a un seul endroit. Il en
+    /// faut desormais deux — la zone avec peripherique et celle sans — et
+    /// recopier vingt-neuf champs est le genre de chose qui diverge en
+    /// silence.
+    fn new(track_generation: u64) -> Self {
+        Self {
+            gapless_sent: false,
+            stopped_ticks: 0,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
+            last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
+            peak_position_ms: 0,
+            scrobbled_key: None,
+            ticks_since_db_save: 0,
+            track_started_at: None,
+            last_seek_seen: None,
+            track_generation: track_generation,
+            track_loaded_at: Instant::now(),
+            past_end_ticks: 0,
+            gapless_advance_pending: false,
+            gapless_stuck_ticks: 0,
+            last_bytes_sent: 0,
+            stall_declines: 0,
+            radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
+            last_device_volume: None,
+            wall_clock_end_fired: false,
+            gapless_arm_logged: None,
+        }
+    }
+}
+
 pub struct PositionPoller {
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
@@ -1748,6 +1812,79 @@ impl PositionPoller {
                     .await;
             }
         })
+    }
+
+    /// Rafraichit le titre/interprete d'une zone qui joue une radio.
+    ///
+    /// Extrait de la boucle de sondage pour pouvoir servir DEUX appelants : la
+    /// zone qui a un peripherique de sortie, et celle qui n'en a pas. La
+    /// seconde n'etait servie par personne — voir l'appel dans `tick`.
+    async fn refresh_radio_metadata(&self, zone_id: i64, zone_state: &crate::playback::ZoneState) {
+        // Radio metadata polling (title/artist from ICY or external)
+        if let Some(ref np) = zone_state.now_playing {
+            if np.source == "radio" {
+                if let Some(ref source_id) = np.source_id {
+                    // source_id is either a numeric radio DB id or the stream URL itself
+                    let (station_name, stream_url) = if let Ok(sid) = source_id.parse::<i64>() {
+                        let radio_repo =
+                            crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
+                        if let Ok(Some(station)) = radio_repo.get(sid) {
+                            (station.name.clone(), station.url.clone())
+                        } else {
+                            // Fallback: use album_title (holds station name)
+                            // instead of np.title (holds song title after first update)
+                            let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
+                            (name, source_id.clone())
+                        }
+                    } else {
+                        // source_id is a URL — use album_title which preserves
+                        // the station name across metadata updates (np.title
+                        // gets overwritten with the current song title)
+                        let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
+                        (name, source_id.clone())
+                    };
+
+                    if let Some(meta) =
+                        crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
+                            .await
+                    {
+                        let title_changed = np.title != meta.title || np.artist_name != meta.artist;
+                        if title_changed {
+                            let title_for_icy = meta.title.clone();
+                            let artist_for_icy = meta.artist.clone();
+                            let new_np = crate::playback::NowPlaying {
+                                track_id: None,
+                                title: meta.title,
+                                artist_name: meta.artist,
+                                album_title: Some(station_name.clone()),
+                                cover_path: np.cover_path.clone(),
+                                duration_ms: 0,
+                                source: "radio".into(),
+                                source_id: np.source_id.clone(),
+                                stream_id: np.stream_id.clone(),
+                                ..Default::default()
+                            };
+                            self.playback.update_now_playing(zone_id, new_np).await;
+                            // Le renderer, lui, ne lit pas le
+                            // now-playing : il reçoit des blocs ICY
+                            // dans le flux. On publie donc aussi le
+                            // titre là où le gestionnaire de flux
+                            // saura le relire, sinon l'appareil
+                            // reste figé sur le morceau qui passait
+                            // à sa connexion.
+                            if let Some(sid) = np.stream_id.as_deref() {
+                                crate::http::streamer::publish_radio_now(
+                                    sid,
+                                    artist_for_icy,
+                                    title_for_icy,
+                                );
+                            }
+                            debug!(zone_id, station = %station_name, "radio_metadata_updated");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn tick(
@@ -1961,40 +2098,45 @@ impl PositionPoller {
             let zone_id = zone_state.zone_id;
             let device_id = match self.get_zone_device_id(zone_id) {
                 Some(id) => id,
-                None => continue,
+                // Pas de peripherique de sortie : une zone navigateur, par
+                // conception (le client web tire `stream_url` lui-meme).
+                //
+                // Cette porte renvoyait tout le monde, et le rafraichissement
+                // des metadonnees radio vit 400 lignes plus bas, dans le bloc
+                // qui suit l'interrogation du peripherique. Consequence : sur
+                // « Cet ordinateur », `fetch_radio_metadata` n'etait JAMAIS
+                // appele. Pas d'echec, pas de trace — l'appel n'existait pas.
+                //
+                // Ce n'etait pas une regression : ca n'a jamais marche. D'ou
+                // deux testeurs sur la meme station et la meme version avec
+                // des resultats opposes (Jean Valjean sur une vraie sortie :
+                // titre, interprete et paroles ; Bilou sur « Cet ordinateur » :
+                // rien). Fil forum « Metadonnees radio disparues ? ».
+                //
+                // Le reste de la boucle (transport, gapless, fin de piste) n'a
+                // effectivement rien a faire ici : on garde le `continue`.
+                None => {
+                    let ps = poll_states
+                        .entry(zone_id)
+                        .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
+                    // Meme etranglement que la zone avec peripherique : le tick
+                    // est a la seconde, l'API de la station non.
+                    if decisions::deviceless_radio_refresh_due(
+                        zone_state.state == PlayState::Playing,
+                        zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                        ps.last_radio_poll.elapsed(),
+                        RADIO_POLL_INTERVAL_SECS,
+                    ) {
+                        ps.last_radio_poll = Instant::now();
+                        self.refresh_radio_metadata(zone_id, zone_state).await;
+                    }
+                    continue;
+                }
             };
 
-            let ps = poll_states.entry(zone_id).or_insert_with(|| ZonePollState {
-                gapless_sent: false,
-                stopped_ticks: 0,
-                gapless_cooldown: 0,
-                consecutive_errors: 0,
-                backoff_remaining: 0,
-                total_polls: 0,
-                total_errors: 0,
-                last_latency_ms: 0,
-                max_latency_ms: 0,
-                last_radio_poll: Instant::now(),
-                gapless_sent_at: None,
-                last_position_ms: 0,
-                peak_position_ms: 0,
-                scrobbled_key: None,
-                ticks_since_db_save: 0,
-                track_started_at: None,
-                last_seek_seen: None,
-                track_generation: zone_state.track_generation,
-                track_loaded_at: Instant::now(),
-                past_end_ticks: 0,
-                gapless_advance_pending: false,
-                gapless_stuck_ticks: 0,
-                last_bytes_sent: 0,
-                stall_declines: 0,
-                radio_stopped_ticks: 0,
-                last_radio_position_ms: 0,
-                last_device_volume: None,
-                wall_clock_end_fired: false,
-                gapless_arm_logged: None,
-            });
+            let ps = poll_states
+                .entry(zone_id)
+                .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
 
             // Detect track change: if the generation changed, the orchestrator
             // started a new track (via play() / play_from_queue / next / previous).
@@ -2302,81 +2444,7 @@ impl PositionPoller {
                     }
                     ps.last_device_volume = Some(status.volume);
 
-                    // Radio metadata polling (title/artist from ICY or external)
-                    if let Some(ref np) = zone_state.now_playing {
-                        if np.source == "radio" {
-                            if let Some(ref source_id) = np.source_id {
-                                // source_id is either a numeric radio DB id or the stream URL itself
-                                let (station_name, stream_url) = if let Ok(sid) =
-                                    source_id.parse::<i64>()
-                                {
-                                    let radio_repo = crate::db::radio_repo::RadioRepo::with_backend(
-                                        self.db.clone(),
-                                    );
-                                    if let Ok(Some(station)) = radio_repo.get(sid) {
-                                        (station.name.clone(), station.url.clone())
-                                    } else {
-                                        // Fallback: use album_title (holds station name)
-                                        // instead of np.title (holds song title after first update)
-                                        let name = np
-                                            .album_title
-                                            .clone()
-                                            .unwrap_or_else(|| np.title.clone());
-                                        (name, source_id.clone())
-                                    }
-                                } else {
-                                    // source_id is a URL — use album_title which preserves
-                                    // the station name across metadata updates (np.title
-                                    // gets overwritten with the current song title)
-                                    let name =
-                                        np.album_title.clone().unwrap_or_else(|| np.title.clone());
-                                    (name, source_id.clone())
-                                };
-
-                                if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
-                                    &station_name,
-                                    &stream_url,
-                                )
-                                .await
-                                {
-                                    let title_changed =
-                                        np.title != meta.title || np.artist_name != meta.artist;
-                                    if title_changed {
-                                        let title_for_icy = meta.title.clone();
-                                        let artist_for_icy = meta.artist.clone();
-                                        let new_np = crate::playback::NowPlaying {
-                                            track_id: None,
-                                            title: meta.title,
-                                            artist_name: meta.artist,
-                                            album_title: Some(station_name.clone()),
-                                            cover_path: np.cover_path.clone(),
-                                            duration_ms: 0,
-                                            source: "radio".into(),
-                                            source_id: np.source_id.clone(),
-                                            stream_id: np.stream_id.clone(),
-                                            ..Default::default()
-                                        };
-                                        self.playback.update_now_playing(zone_id, new_np).await;
-                                        // Le renderer, lui, ne lit pas le
-                                        // now-playing : il reçoit des blocs ICY
-                                        // dans le flux. On publie donc aussi le
-                                        // titre là où le gestionnaire de flux
-                                        // saura le relire, sinon l'appareil
-                                        // reste figé sur le morceau qui passait
-                                        // à sa connexion.
-                                        if let Some(sid) = np.stream_id.as_deref() {
-                                            crate::http::streamer::publish_radio_now(
-                                                sid,
-                                                artist_for_icy,
-                                                title_for_icy,
-                                            );
-                                        }
-                                        debug!(zone_id, station = %station_name, "radio_metadata_updated");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.refresh_radio_metadata(zone_id, zone_state).await;
                 }
 
                 // Sync metrics and skip the rest of the loop (no gapless/track-end).
@@ -5617,5 +5685,51 @@ mod gapless_stage_expiry_tests {
     fn the_threshold_stays_below_the_decoder_timeout() {
         assert!(super::GAPLESS_STAGE_MAX_AGE_SECS < 300);
         assert!(super::GAPLESS_STAGE_MAX_AGE_SECS > 60);
+    }
+}
+
+/// Metadonnees radio sur une zone SANS peripherique de sortie.
+///
+/// Le poller quittait toute zone sans peripherique avant d'arriver au
+/// rafraichissement des metadonnees : sur « Cet ordinateur », l'appel n'a
+/// jamais existe. Ce n'etait donc pas une regression, et c'est pourquoi deux
+/// testeurs sur la meme station et la meme version obtenaient des resultats
+/// opposes — l'un sur une vraie sortie, l'autre sur le navigateur.
+#[cfg(test)]
+mod radio_metadata_deviceless_tests {
+    // ── Metadonnees radio sur une zone SANS peripherique (fil « Metadonnees
+    //    radio disparues ? ») ──────────────────────────────────────────────
+    //
+    // Le poller quittait toute zone sans peripherique avant d'arriver au
+    // rafraichissement des metadonnees : sur « Cet ordinateur », l'appel
+    // n'existait pas. Deux testeurs, meme station, meme version, resultats
+    // opposes — l'un sur une vraie sortie, l'autre sur le navigateur.
+
+    use super::decisions::deviceless_radio_refresh_due as due;
+    use std::time::Duration;
+
+    #[test]
+    fn zone_navigateur_qui_joue_une_radio_est_rafraichie() {
+        assert!(due(true, Some("radio"), Duration::from_secs(20), 15));
+    }
+
+    #[test]
+    fn letranglement_est_respecte() {
+        // Le tick est a la seconde, l'API de la station ne doit pas l'etre.
+        assert!(!due(true, Some("radio"), Duration::from_secs(3), 15));
+        // Pile a l'echeance : on y va.
+        assert!(due(true, Some("radio"), Duration::from_secs(15), 15));
+    }
+
+    #[test]
+    fn un_fichier_local_ne_declenche_aucun_appel_reseau() {
+        // Une zone navigateur qui joue un fichier passe ici a chaque tick.
+        assert!(!due(true, Some("local"), Duration::from_secs(600), 15));
+        assert!(!due(true, None, Duration::from_secs(600), 15));
+    }
+
+    #[test]
+    fn zone_a_larret_nest_pas_sondee() {
+        assert!(!due(false, Some("radio"), Duration::from_secs(600), 15));
     }
 }

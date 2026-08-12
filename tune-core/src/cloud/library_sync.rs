@@ -63,6 +63,26 @@ pub fn pending_count(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
+/// Ce qui reste a pousser, par type : (artistes, albums, pistes).
+///
+/// Un total seul ne dit rien de la coherence de ce qui est arrive en face.
+/// « Il reste 18 000 entrees » est une information ; « il reste 18 000 albums
+/// alors que toutes les pistes sont parties » est un diagnostic.
+pub fn pending_by_type(backend: &Arc<dyn DbBackend>) -> (i64, i64, i64) {
+    let lire = |etype: &str| -> i64 {
+        backend
+            .query_one(
+                "SELECT COUNT(*) FROM sync_changelog WHERE synced = 0 AND entity_type = ?",
+                &[&etype as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|row| row.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    };
+    (lire("artist"), lire("album"), lire("track"))
+}
+
 // ---------------------------------------------------------------------------
 // push_changes — incremental sync
 // ---------------------------------------------------------------------------
@@ -87,10 +107,33 @@ pub async fn push_changes(
     loop {
         // 1. Read a batch of unsynced changelog entries
         let batch_limit = SYNC_BATCH_SIZE;
+        // Les parents AVANT les enfants, et cet ordre est explicite : sans le
+        // CASE, `changed_at` seul departageait mal les entrees inserees dans la
+        // meme seconde, et le tri retombait sur l'ordre d'insertion — toutes
+        // les pistes, puis tous les albums.
+        //
+        // Ce que ca a coute (mesure en production le 2026-08-12) : une
+        // bibliotheque de 584 142 pistes a pousse ses pistes pendant 25 heures,
+        // par lots de 200, sans jamais atteindre ses albums. Elle s'est
+        // interrompue et n'a jamais repris : 0 album, 0 artiste, et 584 142
+        // pistes orphelines cote cloud. Les bibliotheques plus petites vidaient
+        // leur phase « pistes » en quelques heures et n'ont rien vu.
+        //
+        // Le defaut etait donc latent pour tout le monde et fatal au-dessus
+        // d'une certaine taille. Avec les parents d'abord, toute interruption
+        // laisse un etat coherent : des albums sans toutes leurs pistes, jamais
+        // des pistes sans album.
         let rows = backend
             .query_many(
                 "SELECT id, entity_type, entity_id, action FROM sync_changelog \
-                 WHERE synced = 0 ORDER BY changed_at ASC LIMIT ?",
+                 WHERE synced = 0 \
+                 ORDER BY CASE entity_type \
+                              WHEN 'artist' THEN 0 \
+                              WHEN 'album'  THEN 1 \
+                              WHEN 'track'  THEN 2 \
+                              ELSE 3 END, \
+                          changed_at ASC, id ASC \
+                 LIMIT ?",
                 &[&batch_limit as &dyn ToSqlValue],
             )
             .map_err(|e| format!("changelog query: {e}"))?;
@@ -433,6 +476,22 @@ pub async fn full_sync(
     }
 
     combined.duration_ms = start.elapsed().as_millis() as u64;
+
+    // Controle de completude. Une synchronisation qui s'arrete en laissant des
+    // parents en attente produit des pistes sans album cote cloud — c'est ce
+    // qui est arrive en juillet 2026, et rien ne l'a signale pendant six
+    // semaines. Le dire ici le rend visible a la source.
+    let (artistes, albums, pistes) = pending_by_type(backend);
+    if artistes > 0 || albums > 0 {
+        warn!(
+            artists_pending = artistes,
+            albums_pending = albums,
+            tracks_pending = pistes,
+            "cloud_library_full_sync_incomplete — des parents restent en attente, \
+             la bibliotheque cloud sera trouee jusqu'au prochain passage"
+        );
+    }
+
     info!(
         tracks = combined.tracks_synced,
         albums = combined.albums_synced,
@@ -534,4 +593,103 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+
+    fn setup() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Alimente le journal dans l'ordre historique — pistes d'abord — pour
+    /// verifier que la LECTURE remet les parents devant, quel que soit l'ordre
+    /// d'insertion.
+    fn journal_desordonne(backend: &Arc<dyn DbBackend>) {
+        backend
+            .execute_batch(
+                "INSERT INTO sync_changelog (entity_type, entity_id, action) VALUES \
+                 ('track', 1, 'upsert'), ('track', 2, 'upsert'), ('track', 3, 'upsert'), \
+                 ('album', 10, 'upsert'), ('album', 11, 'upsert'), \
+                 ('artist', 20, 'upsert');",
+            )
+            .unwrap();
+    }
+
+    fn types_dans_l_ordre(backend: &Arc<dyn DbBackend>, limite: i64) -> Vec<String> {
+        backend
+            .query_many(
+                "SELECT id, entity_type, entity_id, action FROM sync_changelog \
+                 WHERE synced = 0 \
+                 ORDER BY CASE entity_type \
+                              WHEN 'artist' THEN 0 \
+                              WHEN 'album'  THEN 1 \
+                              WHEN 'track'  THEN 2 \
+                              ELSE 3 END, \
+                          changed_at ASC, id ASC \
+                 LIMIT ?",
+                &[&limite as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+            .collect()
+    }
+
+    #[test]
+    fn les_parents_partent_avant_les_enfants() {
+        // Le defaut de juillet 2026 : 584 142 pistes poussees pendant 25 h sans
+        // jamais atteindre les albums. Sur une petite bibliotheque la phase
+        // « pistes » se vidait avant l'interruption, et personne ne voyait rien.
+        let backend = setup();
+        journal_desordonne(&backend);
+
+        let ordre = types_dans_l_ordre(&backend, 100);
+
+        assert_eq!(ordre[0], "artist", "l'artiste doit partir en premier");
+        assert_eq!(&ordre[1..3], &["album", "album"], "puis les albums");
+        assert_eq!(&ordre[3..], &["track", "track", "track"], "puis les pistes");
+    }
+
+    #[test]
+    fn un_premier_lot_tronque_ne_contient_aucune_piste() {
+        // Le cas qui compte vraiment : si la synchronisation s'arrete apres un
+        // seul lot, ce lot doit etre fait de parents. C'est ce qui garantit
+        // qu'une interruption laisse un etat coherent.
+        let backend = setup();
+        journal_desordonne(&backend);
+
+        let premier_lot = types_dans_l_ordre(&backend, 3);
+
+        assert!(
+            !premier_lot.contains(&"track".to_string()),
+            "un lot tronque ne doit pas emporter de pistes avant leurs parents : {premier_lot:?}"
+        );
+    }
+
+    #[test]
+    fn le_compte_par_type_distingue_parents_et_enfants() {
+        let backend = setup();
+        journal_desordonne(&backend);
+
+        assert_eq!(pending_by_type(&backend), (1, 2, 3));
+        assert_eq!(pending_count(&backend), 6);
+    }
+
+    #[test]
+    fn les_entrees_deja_poussees_sortent_du_compte() {
+        let backend = setup();
+        journal_desordonne(&backend);
+        backend
+            .execute_batch("UPDATE sync_changelog SET synced = 1 WHERE entity_type = 'album';")
+            .unwrap();
+
+        assert_eq!(pending_by_type(&backend), (1, 0, 3));
+    }
 }
