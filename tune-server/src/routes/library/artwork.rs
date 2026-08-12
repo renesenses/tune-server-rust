@@ -443,7 +443,20 @@ pub(super) async fn batch_enrich_artist_artwork(
             "status": "accepted",
             "message": "batch artist enrichment started (Phase 1: MBID matching, Phase 2: image fetch)",
             "artists_without_mbid": without_mbid,
-            "artists_without_image": missing.len(),
+            // Les images fantômes COMPTENT. Le travail vient d'être lancé pour
+            // elles — `broken_cache` est justement ce qui empêche le « skipped »
+            // ci-dessus — mais la réponse ne les annonçait pas, et l'interface,
+            // lisant 0, affichait « Tous les artistes ont déjà une image » puis
+            // cessait de suivre l'avancement. L'enrichissement tournait en fond
+            // sans que rien ne le dise (Fabien, 11/08/2026 : bibliothèque
+            // rescannée, aucune vignette d'artiste, ce message à l'écran).
+            //
+            // Du point de vue de l'utilisateur, un artiste dont le fichier a
+            // disparu n'a pas d'image. C'est ce total-là qui doit être annoncé.
+            "artists_without_image": missing.len() + broken_cache,
+            // Détaillé à part pour que l'interface puisse expliquer la
+            // différence entre « jamais eu d'image » et « image perdue ».
+            "artists_with_broken_image": broken_cache,
         })),
     )
         .into_response()
