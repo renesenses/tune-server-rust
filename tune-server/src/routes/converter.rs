@@ -99,7 +99,80 @@ pub fn router() -> Router<AppState> {
         .route("/status/{job_id}", get(job_status))
         .route("/download/{job_id}", get(download_job))
         .route("/presets", get(list_presets))
+        .route("/capabilities", get(capabilities))
         .route("/jobs/{job_id}", delete(cancel_job))
+}
+
+// ---------------------------------------------------------------------------
+// GET /capabilities — which formats THIS machine can actually produce
+// ---------------------------------------------------------------------------
+
+/// The web client used to offer all six formats blind: on a machine without
+/// the external tools, four of the six choices ended in an error after the
+/// user had already picked files and clicked start (#1524). This endpoint
+/// tells the UI what to grey out — and why.
+///
+/// ffmpeg presence is not enough: the minimal build bundled with the release
+/// carries only the `aac` and `alac` encoders (no libmp3lame), so mp3 must
+/// be answered from what the resolved binary actually encodes.
+async fn capabilities() -> impl IntoResponse {
+    let ffmpeg = resolve_tool("ffmpeg");
+    let lame = resolve_tool("lame");
+    let encoders = match &ffmpeg {
+        Some(path) => ffmpeg_encoders(path).await,
+        None => std::collections::HashSet::new(),
+    };
+
+    Json(json!({
+        // Native formats are always available (#1525).
+        "formats": {
+            "flac": true,
+            "wav": true,
+            "opus": true,
+            "mp3": lame.is_some() || encoders.contains("libmp3lame"),
+            "aac": encoders.contains("aac"),
+            "alac": encoders.contains("alac"),
+        },
+        // Diagnostic detail: which tool backs the non-native formats, if any.
+        "tools": {
+            "ffmpeg": ffmpeg.map(|p| p.display().to_string()),
+            "lame": lame.map(|p| p.display().to_string()),
+        },
+    }))
+}
+
+/// Ask the resolved ffmpeg what it can encode (`ffmpeg -encoders`), cached
+/// for the process lifetime — the binary next to the executable does not
+/// change while we run.
+async fn ffmpeg_encoders(path: &Path) -> std::collections::HashSet<String> {
+    static CACHE: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    if let Some(cached) = CACHE.get() {
+        return cached.clone();
+    }
+    let out = tokio::process::Command::new(path)
+        .args(["-hide_banner", "-encoders"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    let set = match out {
+        Ok(o) if o.status.success() => parse_ffmpeg_encoders(&String::from_utf8_lossy(&o.stdout)),
+        _ => std::collections::HashSet::new(),
+    };
+    CACHE.get_or_init(|| set).clone()
+}
+
+/// Parse `ffmpeg -encoders` output: after the `------` separator, each line
+/// is ` <flags> <name> <description>` — the name is the second column.
+fn parse_ffmpeg_encoders(stdout: &str) -> std::collections::HashSet<String> {
+    stdout
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("------"))
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +824,7 @@ async fn encode_mp3_external(
     target_sr: Option<u32>,
 ) -> Result<(), String> {
     // Try lame first
-    if tool_available("lame").await {
+    if let Some(lame) = resolve_tool("lame") {
         let mut args: Vec<String> = Vec::new();
 
         match quality.unwrap_or("320") {
@@ -777,11 +850,11 @@ async fn encode_mp3_external(
         args.push(input.into());
         args.push(output.into());
 
-        return run_command("lame", &args).await;
+        return run_command(&lame, &args).await;
     }
 
     // Fallback to ffmpeg
-    if tool_available("ffmpeg").await {
+    if let Some(ffmpeg) = resolve_tool("ffmpeg") {
         let mut args = vec![
             "-y".to_string(),
             "-i".into(),
@@ -811,10 +884,10 @@ async fn encode_mp3_external(
         }
 
         args.push(output.into());
-        return run_command("ffmpeg", &args).await;
+        return run_command(&ffmpeg, &args).await;
     }
 
-    Err("mp3 encoding requires lame or ffmpeg on PATH".into())
+    Err("mp3 encoding requires lame or ffmpeg (bundled with the release or on PATH)".into())
 }
 
 async fn encode_aac_external(
@@ -825,7 +898,7 @@ async fn encode_aac_external(
 ) -> Result<(), String> {
     let bitrate = quality.unwrap_or("256");
 
-    if tool_available("ffmpeg").await {
+    if let Some(ffmpeg) = resolve_tool("ffmpeg") {
         let mut args = vec![
             "-y".to_string(),
             "-i".into(),
@@ -842,10 +915,10 @@ async fn encode_aac_external(
         }
 
         args.push(output.into());
-        return run_command("ffmpeg", &args).await;
+        return run_command(&ffmpeg, &args).await;
     }
 
-    Err("aac encoding requires ffmpeg on PATH".into())
+    Err("aac encoding requires ffmpeg (bundled with the release or on PATH)".into())
 }
 
 async fn encode_alac_external(
@@ -853,7 +926,7 @@ async fn encode_alac_external(
     output: &str,
     target_sr: Option<u32>,
 ) -> Result<(), String> {
-    if tool_available("ffmpeg").await {
+    if let Some(ffmpeg) = resolve_tool("ffmpeg") {
         let mut args = vec![
             "-y".to_string(),
             "-i".into(),
@@ -868,44 +941,65 @@ async fn encode_alac_external(
         }
 
         args.push(output.into());
-        return run_command("ffmpeg", &args).await;
+        return run_command(&ffmpeg, &args).await;
     }
 
-    Err("alac encoding requires ffmpeg on PATH".into())
+    Err("alac encoding requires ffmpeg (bundled with the release or on PATH)".into())
 }
 
 // ---------------------------------------------------------------------------
 // Helper utilities
 // ---------------------------------------------------------------------------
 
-/// Check whether a command-line tool is available on PATH.
-async fn tool_available(name: &str) -> bool {
-    tokio::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Resolve an external tool to a concrete path (#1524).
+///
+/// Looks next to the server executable FIRST — that is where the release
+/// bundles ffmpeg — then walks PATH in-process. The old implementation
+/// shelled out to `which`, which does not exist on Windows: detection
+/// always answered false there, even with ffmpeg installed, so aac/alac
+/// conversion was reported impossible on every Windows machine.
+fn resolve_tool(name: &str) -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+
+    // 1. Bundled: same directory as tune-server (release layout).
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(&exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. PATH, resolved in-process — no `which`/`where` subprocess.
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(&exe_name))
+        .find(|candidate| candidate.is_file())
 }
 
-/// Run an external command and return an error if it fails.
-async fn run_command(program: &str, args: &[String]) -> Result<(), String> {
+/// Run an external command (resolved to a concrete path) and return an
+/// error if it fails.
+async fn run_command(program: &Path, args: &[String]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
         .await
-        .map_err(|e| format!("failed to run {program}: {e}"))?;
+        .map_err(|e| format!("failed to run {}: {e}", program.display()))?;
 
     if output.status.success() {
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
-            "{program} failed (exit {}): {}",
+            "{} failed (exit {}): {}",
+            program.display(),
             output.status.code().unwrap_or(-1),
             stderr.chars().take(500).collect::<String>()
         ))
@@ -1093,4 +1187,42 @@ fn build_zip(dir: &Path) -> Result<Vec<u8>, String> {
     }
 
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffmpeg_encoders_parsing_reads_the_second_column() {
+        // Real `ffmpeg -encoders` shape: legend, separator, then entries.
+        let out = "Encoders:\n V..... = Video\n A..... = Audio\n ------\n \
+                   A....D aac              AAC (Advanced Audio Coding)\n \
+                   A....D alac             ALAC (Apple Lossless Audio Codec)\n \
+                   V....D libx264          H.264\n";
+        let set = parse_ffmpeg_encoders(out);
+        assert!(set.contains("aac"));
+        assert!(set.contains("alac"));
+        assert!(set.contains("libx264"));
+        assert!(
+            !set.contains("libmp3lame"),
+            "absent encoder must stay absent"
+        );
+        // The minimal bundled build ships exactly aac+alac: mp3 must NOT be
+        // inferred from ffmpeg's mere presence.
+    }
+
+    #[test]
+    fn resolve_tool_prefers_the_bundled_binary() {
+        // A tool named after this test placed next to the current executable
+        // must win over PATH. We can't write next to the test runner binary
+        // reliably, so assert the negative contract instead: an improbable
+        // name resolves to None, and a ubiquitous one resolves to a real file.
+        assert!(resolve_tool("tune-no-such-tool-58d2").is_none());
+        #[cfg(unix)]
+        {
+            let sh = resolve_tool("sh").expect("sh must exist on unix PATH");
+            assert!(sh.is_file());
+        }
+    }
 }

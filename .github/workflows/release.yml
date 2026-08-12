@@ -120,6 +120,29 @@ jobs:
         shell: bash
         run: echo "TUNE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
+      # ffmpeg minimal audio-only (#1524) : produit par ffmpeg-minimal.yml,
+      # publié sur la release `ffmpeg-minimal` du dépôt, livré à côté de
+      # tune-server pour les encodages AAC/ALAC du convertisseur. Absent →
+      # warning, pas d'échec : l'artefact part sans ffmpeg et l'endpoint
+      # /converter/capabilities grise aac/alac côté interface. Pas de build
+      # musl : un binaire gnu n'y tournerait pas (NAS à userland musl).
+      - name: Fetch bundled ffmpeg (minimal)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ffbundle"
+          if gh release download ffmpeg-minimal --repo "$GITHUB_REPOSITORY" \
+               --pattern "ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
+               --dir "$RUNNER_TEMP/ffbundle"; then
+            tar xzf "$RUNNER_TEMP/ffbundle/ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
+              -C "$RUNNER_TEMP/ffbundle"
+            ls -la "$RUNNER_TEMP/ffbundle"
+          else
+            echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
+          fi
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
@@ -237,6 +260,18 @@ jobs:
             cp "$RUNNER_TEMP/apd/bin/airplay-daemon" package/
             DAEMON="airplay-daemon"
           fi
+          # ffmpeg minimal (#1524) : à côté de tune-server, là où resolve_tool()
+          # regarde en premier. Sa licence LGPL voyage avec lui.
+          FFMPEG=""
+          if [ -f "$RUNNER_TEMP/ffbundle/ffmpeg" ]; then
+            cp "$RUNNER_TEMP/ffbundle/ffmpeg" package/
+            chmod 755 package/ffmpeg
+            FFMPEG="ffmpeg"
+            if [ -f "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" ]; then
+              cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" package/
+              FFMPEG="$FFMPEG FFMPEG-LICENSE.txt"
+            fi
+          fi
           # Sign the binaries that ship in the tarball (Homebrew installs these).
           #
           # Without this they keep the linker's ad-hoc signature, whose code
@@ -262,11 +297,16 @@ jobs:
                 --identifier fr.mozaiklabs.airplay-daemon \
                 --sign "$IDENTITY" "package/$DAEMON"
             fi
+            if [ -f package/ffmpeg ]; then
+              codesign --force --options runtime --timestamp \
+                --identifier fr.mozaiklabs.ffmpeg \
+                --sign "$IDENTITY" package/ffmpeg
+            fi
             codesign --verify --strict --verbose=2 package/tune-server
           elif [ "$RUNNER_OS" = "macOS" ]; then
             echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
           fi
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON web/ plugins/
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG web/ plugins/
           cd ..
 
       # ── Signature Authenticode (Windows) ───────────────────────────────────
@@ -330,6 +370,13 @@ jobs:
           if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
             copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" package\
           }
+          # ffmpeg minimal (#1524), a cote de tune-server.exe (resolve_tool).
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            copy "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe" package\
+            if (Test-Path "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt") {
+              copy "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt" package\
+            }
+          }
           xcopy web\* package\web\ /E /I /Q
           # Bundle the Party (WASM) plugin next to tune-server.exe (see unix step).
           mkdir package\plugins\party
@@ -338,6 +385,7 @@ jobs:
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
+          if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
           cd ..
 
       - name: Install NSIS
@@ -356,6 +404,17 @@ jobs:
           if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
             copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" "target\${{ matrix.target }}\release\airplay-daemon.exe"
             $daemonFile = 'File "target\${{ matrix.target }}\release\airplay-daemon.exe"'
+          }
+          # ffmpeg minimal (#1524) : meme motif que le daemon — la directive
+          # File n'apparait que si le binaire existe.
+          $ffmpegFile = ""
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            copy "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe" "target\${{ matrix.target }}\release\ffmpeg.exe"
+            $ffmpegFile = 'File "target\${{ matrix.target }}\release\ffmpeg.exe"'
+            if (Test-Path "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt") {
+              copy "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt" "target\${{ matrix.target }}\release\FFMPEG-LICENSE.txt"
+              $ffmpegFile = $ffmpegFile + "`n            File `"target\${{ matrix.target }}\release\FFMPEG-LICENSE.txt`""
+            }
           }
           # Stage the Party (WASM) plugin so the installer ships it next to
           # tune-server.exe (plugins\ resolves exe-relative at runtime).
@@ -389,6 +448,7 @@ jobs:
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
             $daemonFile
+            $ffmpegFile
             SetOutPath "`$INSTDIR\web"
             File /r "web\*.*"
             ; Bundled Party (WASM) plugin, next to tune-server.exe
@@ -480,6 +540,15 @@ jobs:
           if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
             cp "$RUNNER_TEMP/apd/bin/airplay-daemon" "$APP/Contents/Resources/"
           fi
+          # ffmpeg minimal (#1524) : dans Resources/, à côté de tune-server —
+          # là où resolve_tool() regarde en premier sur une installation DMG.
+          if [ -f "$RUNNER_TEMP/ffbundle/ffmpeg" ]; then
+            cp "$RUNNER_TEMP/ffbundle/ffmpeg" "$APP/Contents/Resources/"
+            chmod 755 "$APP/Contents/Resources/ffmpeg"
+            if [ -f "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" ]; then
+              cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" "$APP/Contents/Resources/"
+            fi
+          fi
           cp -r web/* "$APP/Contents/Resources/web/"
           # Bundle the Party (WASM) plugin beside tune-server inside the .app so
           # the plugins-wasm runtime discovers it (plugins/ resolves exe-relative,
@@ -534,6 +603,9 @@ jobs:
             # an unsigned executable.
             if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
               codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/airplay-daemon"
+            fi
+            if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
+              codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
             fi
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
           fi
