@@ -916,6 +916,39 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutno
         name: "merge_scattered_compilations",
         up: "SELECT 1;",
     },
+    // Corrections que la communauté propose sur les métadonnées de cet
+    // instance. Elles arrivent du cloud et attendent la validation de
+    // l'utilisateur : `decision` NULL = en attente.
+    //
+    // Local d'abord, comme les signalements : la ligne est ce qui fait foi, et
+    // le renvoi de la décision au cloud est un effet de bord au-dessus. Une
+    // décision prise hors ligne n'est pas perdue, elle repart au cycle suivant.
+    Migration {
+        version: 74,
+        name: "add_metadata_proposals_table",
+        up: "
+CREATE TABLE IF NOT EXISTS metadata_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity TEXT NOT NULL,
+    cloud_entity_id INTEGER NOT NULL,
+    local_id INTEGER NOT NULL,
+    title TEXT,
+    artist TEXT,
+    field TEXT NOT NULL,
+    current_value TEXT,
+    proposed_value TEXT,
+    servers_count INTEGER NOT NULL DEFAULT 0,
+    fetched_at TEXT NOT NULL,
+    decision TEXT,
+    decided_at TEXT,
+    pushed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_proposals_key
+    ON metadata_proposals(entity, cloud_entity_id, field);
+CREATE INDEX IF NOT EXISTS idx_metadata_proposals_pending
+    ON metadata_proposals(decision, servers_count);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2088,6 +2121,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         22,
         "zone_lyrics_offset",
         include_str!("../../migrations/postgres/022_zone_lyrics_offset.sql"),
+    ),
+    (
+        23,
+        "metadata_proposals",
+        include_str!("../../migrations/postgres/023_metadata_proposals.sql"),
     ),
 ];
 
