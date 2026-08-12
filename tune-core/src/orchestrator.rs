@@ -1316,8 +1316,25 @@ impl PlaybackOrchestrator {
         // can run into the 300s timeout from the previous track.
         let play_gen = self.playback.bump_generation(req.zone_id).await;
 
+        // Signaler la recherche AVANT de la lancer : sur YouTube elle peut durer
+        // une trentaine de secondes, et un écran muet pendant ce temps se lit
+        // comme une panne (forum #1359). Le drapeau retombe dans `play()`, dès
+        // qu'une URL jouable existe — y compris sur les chemins d'erreur, qui
+        // passent tous par un `play()` ou un `stop()` ultérieur.
+        self.playback.set_resolving(req.zone_id, true).await;
+
+        // ⚠ TOUTE sortie de ce bloc doit abaisser le drapeau, sinon la zone reste
+        // affichée « recherche en cours » indéfiniment. Trois chemins quittent
+        // ici sans passer par `play()` : l'échec du fichier uploadé, la reprise
+        // par une lecture plus récente, et l'échec de résolution.
         let resolved = if let Some(ref temp_path) = req.temp_file_path {
-            self.resolve_uploaded_file(temp_path, &req).await?
+            match self.resolve_uploaded_file(temp_path, &req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.playback.set_resolving(req.zone_id, false).await;
+                    return Err(e);
+                }
+            }
         } else {
             match self.resolve_stream(&req).await {
                 Ok(r) => r,
@@ -1329,6 +1346,8 @@ impl PlaybackOrchestrator {
                         zone_id = req.zone_id,
                         "orchestrator_play_superseded_before_transcode"
                     );
+                    // La lecture gagnante a pose son propre drapeau : ne pas
+                    // l'abaisser ici, on effacerait SON etat de recherche.
                     return Ok(PlayResult {
                         stream_url: None,
                         output_sent: false,
@@ -1336,7 +1355,10 @@ impl PlaybackOrchestrator {
                         error: Some("superseded by a newer play".into()),
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.playback.set_resolving(req.zone_id, false).await;
+                    return Err(e);
+                }
             }
         };
         let resolve_ms = play_start.elapsed().as_millis();
@@ -5316,41 +5338,30 @@ impl PlaybackOrchestrator {
                         .map_err(|e| format!("write wav header: {e}"))?;
                     f.write_all(&pcm_data)
                         .map_err(|e| format!("write wav pcm: {e}"))?;
-                    Ok(())
+                    Ok::<(), String>(())
                 } else {
-                    let tmp_wav = format!("{}.wav", encode_path);
-                    {
-                        let mut f = std::fs::File::create(&tmp_wav)
-                            .map_err(|e| format!("create tmp wav: {e}"))?;
-                        let mut hdr = Vec::with_capacity(44);
-                        hdr.extend_from_slice(b"RIFF");
-                        hdr.extend_from_slice(&(36 + data_size).to_le_bytes());
-                        hdr.extend_from_slice(b"WAVEfmt ");
-                        hdr.extend_from_slice(&16u32.to_le_bytes());
-                        hdr.extend_from_slice(&1u16.to_le_bytes());
-                        hdr.extend_from_slice(&(encode_ch as u16).to_le_bytes());
-                        hdr.extend_from_slice(&encode_sr.to_le_bytes());
-                        hdr.extend_from_slice(&byte_rate.to_le_bytes());
-                        hdr.extend_from_slice(&block_align.to_le_bytes());
-                        hdr.extend_from_slice(&(encode_bd as u16).to_le_bytes());
-                        hdr.extend_from_slice(b"data");
-                        hdr.extend_from_slice(&data_size.to_le_bytes());
-                        f.write_all(&hdr)
-                            .map_err(|e| format!("write wav header: {e}"))?;
-                        f.write_all(&pcm_data)
-                            .map_err(|e| format!("write wav pcm: {e}"))?;
-                    }
-                    let status = std::process::Command::new("ffmpeg")
-                        .args(["-y", "-i", &tmp_wav, "-c:a", "flac", &encode_path])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                    let _ = std::fs::remove_file(&tmp_wav);
-                    match status {
-                        Ok(s) if s.success() => Ok(()),
-                        Ok(s) => Err(format!("ffmpeg exit {s}")),
-                        Err(e) => Err(format!("ffmpeg: {e}")),
-                    }
+                    // Encodage FLAC NATIF. Le chemin precedent ecrivait un WAV
+                    // temporaire puis lancait `ffmpeg -c:a flac` — un binaire
+                    // externe retire du projet en v0.8.46, donc un echec
+                    // systematique partout ou il n'est pas installe par
+                    // ailleurs, et un fichier de cache jamais produit.
+                    //
+                    // `AudioEncoder` est deja dans l'arbre et fait le meme
+                    // travail sans processus externe ni fichier intermediaire.
+                    // On est dans un `spawn_blocking`, donc les variantes
+                    // `_sync` sont exactement ce qu'il faut (cf. leur
+                    // documentation : pas d'await, encodage pur CPU).
+                    let mut enc = crate::audio::encoder::AudioEncoder::new(
+                        "flac",
+                        encode_sr,
+                        encode_bd as u32,
+                        encode_ch as u32,
+                    );
+                    enc.start_sync()?;
+                    enc.write_sync(&pcm_data)?;
+                    let flac = enc.finish_sync()?;
+                    std::fs::write(&encode_path, &flac).map_err(|e| format!("write flac: {e}"))?;
+                    Ok(())
                 }
             })
             .await
