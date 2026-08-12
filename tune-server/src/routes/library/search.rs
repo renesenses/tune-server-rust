@@ -356,9 +356,21 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         .filter(|v| matches!(v.as_str(), "eco" | "equilibre" | "rapide"))
         .unwrap_or_else(|| "equilibre".to_string());
 
+    // La passe peut-elle réellement travailler ? Sans cette information,
+    // l'interface affichait « Analyse en cours — 0 % » aussi bien pour une
+    // analyse qui démarre que pour une analyse incapable de démarrer, et
+    // l'utilisateur concluait à un blocage (Fabien, v0.9.68).
+    #[cfg(feature = "audio-embedding")]
+    let model_ready = tune_core::audio::embedding::model_ready(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+    );
+    #[cfg(not(feature = "audio-embedding"))]
+    let model_ready = false;
+
     Json(json!({
         "available": available,
         "enabled": enabled,
+        "model_ready": model_ready,
         "analysed_tracks": analysed,
         "eligible_tracks": eligible,
         // Bornée à 0 : un modèle qui change repart de zéro et l'analyse peut
