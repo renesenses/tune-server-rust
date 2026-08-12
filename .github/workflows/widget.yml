@@ -17,6 +17,13 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Sans limite explicite, GitHub laisse tourner 6 HEURES. Le 12 aout 2026, une
+    # signature bloquee a consomme 95 min de silence avant une annulation
+    # manuelle — elle en aurait consomme 360 sans intervention. Reference : la
+    # compilation prend ~5 min, la notarisation ~45 s dans release.yml. 30 min
+    # laissent une marge confortable tout en transformant un blocage en echec
+    # rapide et lisible.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: tune-widget/src-tauri
@@ -58,7 +65,19 @@ jobs:
           echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
+          # Le trousseau doit aussi etre dans la LISTE DE RECHERCHE : codesign
+          # parcourt celle-ci, pas seulement le trousseau par defaut.
+          security list-keychains -d user -s build.keychain login.keychain
           security unlock-keychain -p actions build.keychain
+          # SANS CECI, LA SIGNATURE PEND INDEFINIMENT. Un trousseau se
+          # reverrouille tout seul apres quelques minutes d'inactivite ; codesign
+          # attend alors un mot de passe que personne ne saisira jamais, et le job
+          # reste muet jusqu'au timeout. release.yml y echappe par chance : il
+          # signe 5 secondes apres l'import. Ici `cargo tauri build` compile
+          # d'abord ~5 min, et le trousseau a le temps de se refermer — c'est
+          # exactement ce qui est arrive au tag widget-v0.1.0 le 12 aout 2026
+          # (95 min de silence apres « Signing ... », annule a la main).
+          security set-keychain-settings -lut 21600 build.keychain
           security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
           rm /tmp/certificate.p12
