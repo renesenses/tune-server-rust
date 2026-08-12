@@ -374,6 +374,13 @@ pub async fn analyze_embedding_batch(
 
     let mut done = 0usize;
     for r in &rows {
+        // Playback can start mid-batch; yield at once so neither the decode
+        // nor the inference competes with the audio pipeline (#1515) — the
+        // same mid-batch bail as the ReplayGain pass (#1310).
+        if crate::audio::replaygain::any_zone_playing(backend) {
+            info!("audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch");
+            break;
+        }
         let track_id = match r.first().and_then(|v| v.as_i64()) {
             Some(id) => id,
             None => continue,
@@ -594,9 +601,37 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Le nombre de fils avec lequel la session courante a été bâtie, pour
         // détecter un changement de réglage.
         let mut loaded_threads = 0usize;
+        // Latch for the playback hold, same style as `low_memory`: one line on
+        // the way in, one on the way out, silence in between.
+        let mut playback_hold = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
+                // Yield to playback, like the ReplayGain pass (#1310) — this
+                // sweep was the only analysis without the guard (#1515). It
+                // decodes audio AND runs multi-threaded ONNX inference: left
+                // running during an OAAT session on .18 (2026-08-12) it held
+                // the server at ~380 % CPU, the WS event_bus lagged by
+                // thousands of messages and the output pacing jittered into
+                // audible micro-dropouts at the endpoint.
+                if crate::audio::replaygain::any_zone_playing(&backend) {
+                    if !playback_hold {
+                        playback_hold = true;
+                        info!(
+                            "audio_embed_yield_to_playback — zone playing, acoustic analysis paused until playback stops"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+                if playback_hold {
+                    playback_hold = false;
+                    info!("audio_embed_resumed_playback_stopped");
+                }
+
                 // Memory budget, checked BEFORE the model is fetched or the ORT
                 // session built — those are themselves most of the footprint
                 // (287 MB on disk, more once resident), so a box that cannot
