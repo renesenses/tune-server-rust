@@ -270,17 +270,23 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
         .unwrap_or(0);
-    // Artists with images
-    let artists_with_image: i64 = state
-        .backend
-        .query_one(
-            "SELECT COUNT(*) FROM artists WHERE image_path IS NOT NULL AND image_path != ''",
-            &[],
-        )
-        .ok()
-        .flatten()
-        .and_then(|r| r[0].as_i64())
-        .unwrap_or(0);
+    // Artists with images — au sens de l'utilisateur : une image QUI S'AFFICHE.
+    //
+    // La colonne seule ment dès que le cache d'images a été vidé ou déplacé :
+    // la base garde des chemins vers des fichiers disparus, et le panneau
+    // annonçait « tous les artistes ont une vignette » devant une grille vide
+    // (Fabien, 11/08/2026). On retire donc les chemins qui ne pointent plus
+    // sur rien, comme le fait déjà l'enrichissement lui-même.
+    let artist_repo_paths = ArtistRepo::with_backend(state.backend.clone());
+    let artwork_cache = crate::routes::library::artwork_cache_dir();
+    let artists_with_image: i64 = artist_repo_paths
+        .list_with_image_and_mbid()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, _, image_path)| {
+            tune_core::library::artwork::cached_artwork_exists(&artwork_cache, image_path)
+        })
+        .count() as i64;
     // Albums with covers
     let albums_with_cover: i64 = state
         .backend

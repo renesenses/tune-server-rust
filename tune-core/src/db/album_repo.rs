@@ -753,7 +753,7 @@ impl AlbumRepo {
                 continue;
             }
             // Même titre, dossiers frères — mais est-ce le MÊME disque ?
-            if folder_cover_fingerprint(&cand_folder).as_deref() != Some(empreinte.as_str()) {
+            if !folder_cover_fingerprint(&cand_folder).is_some_and(|f| f.matches(&empreinte)) {
                 continue;
             }
             let taken: Vec<i32> = row
@@ -1502,15 +1502,25 @@ mod tests {
     }
 
     /// Crée un dossier d'album avec sa pochette, comme sur disque.
+    ///
+    /// `motif` désigne le disque ; `qualite` fait varier l'encodage d'un
+    /// dossier à l'autre, comme le fait Qobuz. Deux dossiers d'un même disque
+    /// n'ont donc pas un octet en commun — ce qui est exactement le cas que la
+    /// comparaison par SHA-256 ratait (#1470).
     fn dossier_avec_pochette(
         base: &std::path::Path,
         artiste: &str,
         album: &str,
-        image: &[u8],
+        motif: u32,
+        qualite: u8,
     ) -> String {
         let d = base.join(artiste).join(album);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("cover.jpg"), image).unwrap();
+        std::fs::write(
+            d.join("cover.jpg"),
+            crate::scanner::compilation::pochette_de_test(motif, 96, qualite),
+        )
+        .unwrap();
         d.to_string_lossy().into_owned()
     }
 
@@ -1525,8 +1535,8 @@ mod tests {
         let artists = ArtistRepo::new(db.clone());
         let a1 = artists.create(&Artist::new("Corte Real".into())).unwrap();
         let a2 = artists.create(&Artist::new("Alligator".into())).unwrap();
-        let f1 = dossier_avec_pochette(tmp.path(), "Corte Real", TITLE, b"OUF-COVER");
-        let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, b"OUF-COVER");
+        let f1 = dossier_avec_pochette(tmp.path(), "Corte Real", TITLE, 1, 92);
+        let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, 1, 55);
 
         let first = arepo
             .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1))
@@ -1549,8 +1559,8 @@ mod tests {
         let artists = ArtistRepo::new(db.clone());
         let a1 = artists.create(&Artist::new("Pat Benatar".into())).unwrap();
         let a2 = artists.create(&Artist::new("Police".into())).unwrap();
-        let f1 = dossier_avec_pochette(tmp.path(), "Pat Benatar", "Greatest Hits", b"BENATAR");
-        let f2 = dossier_avec_pochette(tmp.path(), "Police", "Greatest Hits", b"POLICE");
+        let f1 = dossier_avec_pochette(tmp.path(), "Pat Benatar", "Greatest Hits", 1, 92);
+        let f2 = dossier_avec_pochette(tmp.path(), "Police", "Greatest Hits", 3, 92);
 
         let first = arepo
             .get_or_create_for_folder_with_track(
@@ -1603,10 +1613,10 @@ mod tests {
             ("Oscar", 3, 5),
             ("Pia", 3, 1),
         ];
-        let images = [b"VOL-1".as_slice(), b"VOL-2", b"VOL-3", b"VOL-4"];
         let mut vus = std::collections::HashSet::new();
         for (artiste, vol, num) in arrivees {
-            let f = dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", images[vol]);
+            let f =
+                dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", vol as u32, 60 + (num as u8));
             let aid = artists.create(&Artist::new(artiste.into())).unwrap();
             let album = arepo
                 .get_or_create_for_folder_with_track(&f, "ALLOPOP", aid, None, None, Some(num))

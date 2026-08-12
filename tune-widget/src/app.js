@@ -148,6 +148,17 @@ $('btn-close').onclick = () => {
   try { window.__TAURI__?.window?.getCurrentWindow()?.hide(); } catch {}
 };
 
+// Bascule vers la fenêtre complète. Le menu de la barre système la propose
+// aussi, mais encore faut-il savoir qu'il existe : le seul endroit où
+// l'utilisateur regarde, c'est la fenêtre qu'il a sous les yeux (Sandro).
+$('btn-expand').onclick = async () => {
+  try {
+    await window.__TAURI__?.core?.invoke('set_display_mode', { full: true });
+  } catch (e) {
+    console.error('set_display_mode', e);
+  }
+};
+
 $('volume-slider').oninput = () => {
   const v = parseInt($('volume-slider').value);
   $('volume-value').textContent = v;
@@ -157,10 +168,7 @@ $('volume-slider').oninput = () => {
 
 $('zone-select').onchange = () => {
   state.zone_id = parseInt($('zone-select').value);
-  // Apply the picked zone directly. Do NOT call init() — it re-picks the
-  // "best" playing/paused zone and would immediately clobber the user's
-  // selection. refresh() just re-renders now-playing for the chosen zone.
-  refresh();
+  init();
 };
 
 // Search
@@ -171,12 +179,9 @@ $('search-input').oninput = () => {
   searchTimeout = setTimeout(async () => {
     try {
       const data = await apiGet(`/api/v1/search?q=${encodeURIComponent(q)}&limit=8`);
-      // The search endpoint nests results under `local` ({local:{tracks,albums,artists}}).
-      // Reading data.tracks/data.albums (top-level) always came back empty → no results.
-      const local = data.local || data;
       const items = [];
-      (local.tracks || []).slice(0, 4).forEach(t => items.push({ title: t.title, artist: t.artist_name, type: 'track', id: t.id }));
-      (local.albums || []).slice(0, 4).forEach(a => items.push({ title: a.title, artist: a.artist_name, type: 'album', id: a.id }));
+      (data.tracks || []).slice(0, 4).forEach(t => items.push({ title: t.title, artist: t.artist_name, type: 'track', id: t.id }));
+      (data.albums || []).slice(0, 4).forEach(a => items.push({ title: a.title, artist: a.artist_name, type: 'album', id: a.id }));
       if (!items.length) { $('search-results').className = ''; return; }
       $('search-results').innerHTML = items.map(i => `
         <div class="search-item" data-type="${i.type}" data-id="${i.id}">

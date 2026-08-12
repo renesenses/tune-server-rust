@@ -3,10 +3,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 #app { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
 
 header { display: flex; justify-content: space-between; align-items: center; }
+/* Le bandeau sert de barre de titre : curseur de déplacement, et pas de
+   sélection de texte qui viendrait parasiter le glissement. */
+header[data-tauri-drag-region] { cursor: grab; user-select: none; }
+header[data-tauri-drag-region]:active { cursor: grabbing; }
+/* Les enfants restent cliquables et gardent leur propre curseur. */
+header[data-tauri-drag-region] > * { cursor: default; }
 #zone-select { background: #1f2937; border: 1px solid #374151; color: #fff; border-radius: 6px; padding: 4px 8px; font-size: 12px; max-width: 220px; cursor: pointer; outline: none; }
 #zone-select:focus { border-color: #6366f1; }
-#btn-close { background: none; border: none; color: #6b7280; font-size: 18px; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
-#btn-close:hover { color: #fff; background: #374151; }
+/* Les deux boutons du bandeau partagent la même apparence : ce sont deux
+   actions de fenêtre, pas une principale et une secondaire. */
+.header-actions { display: flex; align-items: center; gap: 2px; }
+#btn-close, #btn-expand { background: none; border: none; color: #6b7280; font-size: 18px; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+#btn-expand { font-size: 14px; }
+#btn-close:hover, #btn-expand:hover { color: #fff; background: #374151; }
 
 #cover-container { position: relative; width: 200px; height: 200px; margin: 0 auto; border-radius: 10px; overflow: hidden; background: #1f2937; }
 #cover-art { width: 100%; height: 100%; object-fit: cover; display: none; }

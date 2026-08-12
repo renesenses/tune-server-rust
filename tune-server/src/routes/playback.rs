@@ -1417,16 +1417,33 @@ async fn set_volume(
     Path(zone_id): Path<i64>,
     Json(body): Json<VolumeRequest>,
 ) -> Json<Value> {
+    // Le verrou du mode PURE mord ICI, pas seulement dans l'interface : le
+    // volume est un multiplicateur appliqué à chaque échantillon, et une zone
+    // annoncée « bit-perfect » qui atténue ne l'est pas. Un curseur grisé côté
+    // web ne protège de rien — un autre client, une télécommande ou un appel
+    // direct passeraient à côté. La valeur *effective* est renvoyée, ce qui
+    // fait remonter le curseur au lieu de le laisser mentir.
+    let volume =
+        tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, body.volume as f32)
+            as f64;
+    if (volume - body.volume).abs() > f64::EPSILON {
+        tracing::debug!(
+            zone_id,
+            requested = body.volume,
+            applied = volume,
+            "volume_forced_by_audiophile_lock"
+        );
+    }
     let device_id = get_zone_device_id(&state, zone_id);
     state
         .orchestrator
-        .set_volume(zone_id, body.volume, device_id.as_deref())
+        .set_volume(zone_id, volume, device_id.as_deref())
         .await;
-    let vol_int = (body.volume * 100.0).round() as i32;
+    let vol_int = (volume * 100.0).round() as i32;
     tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .update_volume(zone_id, vol_int)
         .ok();
-    Json(json!({ "volume": body.volume }))
+    Json(json!({ "volume": volume }))
 }
 
 async fn toggle_shuffle(
@@ -2403,6 +2420,25 @@ async fn set_audiophile(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
     settings.set(&key, &body.to_string()).ok();
+
+    // Verrou armé : passer en PURE remonte le volume tout de suite. Sans ça,
+    // la zone resterait à 20 % avec un curseur gelé sur 20 % — le pire des
+    // deux mondes, ni bit-perfect ni réglable.
+    if tune_core::audio::audiophile::volume_lock_enabled(&state.backend)
+        && body
+            .get("enabled")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false)
+    {
+        let device_id = get_zone_device_id(&state, zone_id);
+        state
+            .orchestrator
+            .set_volume(zone_id, 1.0, device_id.as_deref())
+            .await;
+        tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .update_volume(zone_id, 100)
+            .ok();
+    }
     Json(body)
 }
 
