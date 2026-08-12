@@ -54,6 +54,41 @@ pub fn record_change(
 // ---------------------------------------------------------------------------
 
 /// Count unsynced changelog entries.
+/// Combien d'albums la synchro aurait DU pousser, et ne peut plus rattraper.
+///
+/// `referenced` = albums distincts cites par les pistes locales. `pushed` =
+/// albums reellement envoyes pendant ce `full_sync`. `pending` = ce qui reste
+/// en file d'attente et repartira au prochain cycle.
+///
+/// L'ecart qui compte est ce qui n'est ni pousse ni en attente : ces
+/// albums-la ne sont dans aucune file et rien ne les renverra jamais. C'est
+/// exactement le motif mesure en production le 11/08/2026 — 18 506 albums
+/// cites par des pistes, jamais recus par le cloud, et 156 296 pistes
+/// orphelines cote utilisateur (soit un quart de la navigation
+/// artiste -> album -> pistes).
+///
+/// Ce qui est en attente n'est PAS compte comme perdu : une synchro
+/// interrompue est un etat normal, pas une anomalie a signaler.
+pub fn completeness_gap(referenced: i64, pushed: i64, pending: i64) -> i64 {
+    (referenced - pushed - pending).max(0)
+}
+
+/// Albums distincts cites par les pistes locales — le denominateur honnete
+/// d'un controle de complétude. On compte ce que les pistes REFERENCENT, pas
+/// la table `albums` : c'est le lien piste -> album qui se retrouve troue cote
+/// utilisateur quand un album manque.
+fn albums_referenced_by_tracks(backend: &Arc<dyn DbBackend>) -> i64 {
+    backend
+        .query_one(
+            "SELECT COUNT(DISTINCT album_id) FROM tracks WHERE album_id IS NOT NULL",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 pub fn pending_count(backend: &Arc<dyn DbBackend>) -> i64 {
     backend
         .query_one("SELECT COUNT(*) FROM sync_changelog WHERE synced = 0", &[])
@@ -500,6 +535,36 @@ pub async fn full_sync(
         duration_ms = combined.duration_ms,
         "cloud_library_full_sync_complete"
     );
+
+    // Controle de complétude — signaler l'ecart A LA SOURCE.
+    //
+    // L'ecart de 18 506 albums a ete decouvert trois mois plus tard, dans un
+    // back-office, en construisant autre chose. Rien, cote serveur, n'avait
+    // signale que la moitie du travail manquait. Ces trois lignes rendent le
+    // probleme visible au moment ou il se produit.
+    let referenced = albums_referenced_by_tracks(backend);
+    // `pending_by_type` vient de #1539 (parents avant enfants) : meme requete,
+    // arrivee en parallele. On consomme la sienne plutot que d'en garder deux.
+    let (_pending_artists, pending_albums, pending_tracks) = pending_by_type(backend);
+    let gap = completeness_gap(referenced, combined.albums_synced, pending_albums);
+    if gap > 0 {
+        warn!(
+            albums_referenced_by_tracks = referenced,
+            albums_pushed = combined.albums_synced,
+            albums_pending = pending_albums,
+            albums_unaccounted = gap,
+            tracks_pending = pending_tracks,
+            "cloud_library_full_sync_incomplete"
+        );
+    } else {
+        debug!(
+            albums_referenced_by_tracks = referenced,
+            albums_pushed = combined.albums_synced,
+            albums_pending = pending_albums,
+            "cloud_library_full_sync_complete_check_ok"
+        );
+    }
+
     Ok(combined)
 }
 
@@ -593,6 +658,50 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
+}
+
+/// Controle de complétude de la synchro cloud (#1500).
+///
+/// Mesure en production le 11/08/2026 : 59 307 albums cites par les pistes,
+/// 40 801 recus par le cloud, soit 18 506 jamais envoyes — et 156 296 pistes
+/// orphelines cote utilisateur. Aucun signal cote serveur ; l'ecart a ete
+/// decouvert trois mois plus tard en construisant autre chose.
+#[cfg(test)]
+mod completeness_tests {
+    use super::completeness_gap;
+
+    #[test]
+    fn une_synchro_complete_ne_signale_rien() {
+        assert_eq!(completeness_gap(40_801, 40_801, 0), 0);
+    }
+
+    #[test]
+    fn ce_qui_reste_en_attente_nest_pas_perdu() {
+        // Une synchro interrompue est un etat normal : ces albums repartiront
+        // au prochain cycle. Les signaler ferait du bruit a chaque coupure,
+        // et le bruit finit par ne plus etre lu.
+        assert_eq!(completeness_gap(59_307, 40_801, 18_506), 0);
+    }
+
+    #[test]
+    fn ni_pousse_ni_en_attente_est_perdu() {
+        // Le motif reel : les albums ne sont dans AUCUNE file. Rien ne les
+        // renverra jamais.
+        assert_eq!(completeness_gap(59_307, 40_801, 0), 18_506);
+    }
+
+    #[test]
+    fn un_ecart_partiel_est_compte_exactement() {
+        assert_eq!(completeness_gap(59_307, 40_801, 10_000), 8_506);
+    }
+
+    #[test]
+    fn jamais_de_negatif() {
+        // Un album pousse sans piste qui le cite (album vide, piste supprimee
+        // entre-temps) ne doit pas produire un ecart negatif.
+        assert_eq!(completeness_gap(10, 12, 3), 0);
+        assert_eq!(completeness_gap(0, 0, 0), 0);
+    }
 }
 
 #[cfg(test)]
