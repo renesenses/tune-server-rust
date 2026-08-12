@@ -572,9 +572,6 @@ pub(crate) mod decisions {
 
     /// Should the poller dispatch a scrobble this tick?
     ///
-    /// True when the playing track differs from the one already latched
-    /// (`latched_key`) AND it has genuinely been listened past the Last.fm
-    /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
     /// Faut-il rafraichir les metadonnees radio d'une zone qui n'a AUCUN
     /// peripherique de sortie ?
     ///
@@ -595,6 +592,28 @@ pub(crate) mod decisions {
         is_playing
             && source == Some("radio")
             && since_last_poll >= std::time::Duration::from_secs(interval_secs)
+    }
+
+    /// True when the playing track differs from the one already latched
+    /// (`latched_key`) AND it has genuinely been listened past the Last.fm
+    /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
+    /// Faut-il rafraichir les metadonnees radio d'une zone qui A un
+    /// peripherique de sortie ?
+    ///
+    /// La question ne comporte volontairement PAS « le renderer joue-t-il ? ».
+    /// Le titre en cours d'une webradio se lit sur une API externe ou dans le
+    /// flux ICY, jamais sur l'appareil : son etat n'a aucun rapport avec la
+    /// disponibilite de l'information.
+    ///
+    /// `renderer_stopped` est donc recu **pour etre ignore**. Ce parametre
+    /// n'existe que pour rendre l'invariant testable : sans lui, rien
+    /// n'empecherait quelqu'un de remettre l'etat du transport dans l'equation,
+    /// comme c'etait le cas jusqu'a #1522 — un appareil qui ne demarrait pas
+    /// figeait alors l'affichage sur le nom de la station, en silence, et le
+    /// bug de lecture se deguisait en bug de metadonnees.
+    pub fn radio_metadata_refresh_due(is_radio: bool, renderer_stopped: bool) -> bool {
+        let _ = renderer_stopped;
+        is_radio
     }
 
     pub fn should_dispatch_scrobble(
@@ -2443,7 +2462,27 @@ impl PositionPoller {
                             .ok();
                     }
                     ps.last_device_volume = Some(status.volume);
+                }
 
+                // Le titre en cours d'une webradio se lit sur une API externe
+                // ou dans le flux ICY — jamais sur le renderer. Rien ne
+                // justifie donc d'attendre qu'il soit vu en lecture, et le
+                // faire coutait cher : cet appel vivait dans le
+                // `if !radio_stopped` ci-dessus, si bien qu'un appareil qui ne
+                // demarre pas figeait l'affichage sur le nom de la station,
+                // en silence.
+                //
+                // Vecu par Bilou (#1522) : son Node Bluesound repond « pause »
+                // et ne tire aucun octet, donc `radio_stopped` est vrai a
+                // chaque tick et la branche n'etait jamais prise. Il a ouvert
+                // deux fils — un pour la lecture, un pour les metadonnees —
+                // sans savoir que c'etait le meme defaut. Un bug de lecture ne
+                // doit pas se deguiser en bug de metadonnees.
+                //
+                // Hors du bloc, donc, mais toujours sous l'etranglement
+                // `RADIO_POLL_INTERVAL_SECS` applique plus haut : l'API de la
+                // station n'est pas sollicitee plus souvent qu'avant.
+                if decisions::radio_metadata_refresh_due(is_radio, radio_stopped) {
                     self.refresh_radio_metadata(zone_id, zone_state).await;
                 }
 
@@ -4351,6 +4390,28 @@ mod tests {
         let first = decisions::scrobble_track_key(3, 0, Some(9), "Title", Some("A"));
         let replay = decisions::scrobble_track_key(4, 0, Some(9), "Title", Some("A"));
         assert_ne!(first, replay);
+    }
+
+    #[test]
+    fn radio_metadata_refresh_ignores_the_renderer_state() {
+        // Le coeur de #1522. Le Node Bluesound de Bilou repond « pause » et ne
+        // tire aucun octet : `radio_stopped` est vrai a chaque tick. Tant que
+        // cet etat gouvernait l'appel, l'affichage restait fige sur le nom de
+        // la station — et son bug de lecture se deguisait en bug de
+        // metadonnees, au point qu'il a ouvert deux fils au lieu d'un.
+        assert!(decisions::radio_metadata_refresh_due(true, true));
+        assert_eq!(
+            decisions::radio_metadata_refresh_due(true, true),
+            decisions::radio_metadata_refresh_due(true, false),
+        );
+    }
+
+    #[test]
+    fn a_zone_that_is_not_playing_radio_triggers_no_lookup() {
+        // L'autre bord : pas de radio, pas d'appel reseau, quel que soit
+        // l'etat du renderer.
+        assert!(!decisions::radio_metadata_refresh_due(false, false));
+        assert!(!decisions::radio_metadata_refresh_due(false, true));
     }
 
     #[test]
