@@ -1,5 +1,5 @@
 use reqwest::Client;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
@@ -56,6 +56,42 @@ impl BluosOutput {
         }
         Ok(body)
     }
+}
+
+/// Valeur d'un attribut XML simple (`length="0"`) ou le texte d'une balise
+/// (`<state>pause</state>`) dans la reponse du Node. Volontairement naif : les
+/// reponses BluOS tiennent en une ligne et on ne veut pas d'un parseur XML
+/// pour deux attributs.
+fn xml_attr<'a>(body: &'a str, tag: &str, attr: &str) -> Option<&'a str> {
+    let tag_pos = body.find(&format!("<{tag}"))?;
+    let rest = &body[tag_pos..];
+    let end = rest.find('>')?;
+    let head = &rest[..end];
+    let at = head.find(&format!("{attr}=\""))? + attr.len() + 2;
+    let val = &head[at..];
+    let close = val.find('"')?;
+    Some(&val[..close])
+}
+
+fn xml_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let len = body[start..].find(&close)?;
+    Some(body[start..start + len].trim())
+}
+
+/// Le Node a-t-il refuse la piste tout en repondant 200 ?
+///
+/// Vrai seulement quand les DEUX reponses concordent : la file annoncee par
+/// `/Add` est vide ET `/Play` laisse l'appareil en pause. Un Node qui joue
+/// annonce une file non vide et un etat `play` / `stream` ; un Node dont on ne
+/// sait pas lire le dialecte ne produit ni l'un ni l'autre et passe donc pour
+/// fonctionnel — c'est le sens de defaut qu'on veut, on ne casse personne.
+fn add_play_rejected(add_body: &str, play_body: &str) -> bool {
+    let queue_empty = xml_attr(add_body, "playlist", "length") == Some("0");
+    let still_paused = xml_text(play_body, "state") == Some("pause");
+    queue_empty && still_paused
 }
 
 /// Keep a Node reply short enough to log without flooding the journal.
@@ -152,6 +188,32 @@ impl OutputTarget for BluosOutput {
         // Start the queue at its (single, freshly added) first entry.
         let play_body = self.api_get("Play", &[("id", "0")]).await?;
         info!(device = %self.name, reply = %truncate_body(&play_body), "bluos_play_reply");
+        // Le Node a repondu 200 aux deux appels, et n'a rien fait.
+        //
+        // Bilou, 12/08/2026, Node en 0.9.68 : trois tentatives, trois fois
+        //   Add  -> <playlist length="0" id="1761">   (rien n'est entre en file)
+        //   Play -> <state>pause</state>              (Play sur une file vide)
+        // Tune declarait `output_sent=true` a chaque fois, parce qu'il ne
+        // regardait que le statut HTTP. Cote utilisateur : la position avance,
+        // aucun son, et le poller finit par tuer la zone au bout des 45 s de
+        // grace — deux fils forum ouverts sur un materiel qui n'a rien.
+        //
+        // On exige les DEUX signaux avant de conclure a l'echec. Chacun pris
+        // seul pourrait mentir sur un Node dont on ne connait pas le dialecte ;
+        // ensemble — file vide ET reste en pause — ils ne laissent pas de place
+        // au doute, et un Node qui joue vraiment n'en produit aucun des deux.
+        if add_play_rejected(&add_body, &play_body) {
+            warn!(
+                device = %self.name,
+                add_reply = %truncate_body(&add_body),
+                play_reply = %truncate_body(&play_body),
+                "bluos_add_rejected_empty_queue"
+            );
+            return Err(format!(
+                "Le lecteur BluOS « {} » a accepte la commande mais n'a rien mis en file : sa file est restee vide et il est reste en pause. Rien ne sera joue.",
+                self.name
+            ));
+        }
         info!(
             device = %self.name,
             url = media.url,
@@ -355,5 +417,55 @@ mod tests {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
             .unwrap_or(false);
         assert!(muted);
+    }
+
+    // ── Le Node repond 200 et ne joue rien (Bilou, 12/08/2026) ──────────
+    //
+    // Trois tentatives, trois fois la meme paire de reponses : file vide et
+    // etat pause. Tune declarait `output_sent=true` a chaque fois.
+
+    const ADD_EMPTY: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <playlist length="0" id="1761" shuffle="0" repeat="2"></playlist>"#;
+    const ADD_OK: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <playlist length="1" id="1762" shuffle="0" repeat="2"></playlist>"#;
+    const PLAY_PAUSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <state>pause</state>"#;
+    const PLAY_STREAM: &str = r#"<?xml version="1.0" encoding="UTF-8"?> <state>stream</state>"#;
+
+    #[test]
+    fn file_vide_et_pause_est_un_refus() {
+        assert!(add_play_rejected(ADD_EMPTY, PLAY_PAUSE));
+    }
+
+    #[test]
+    fn file_remplie_qui_joue_passe() {
+        assert!(!add_play_rejected(ADD_OK, PLAY_STREAM));
+    }
+
+    #[test]
+    fn file_remplie_mais_en_pause_ne_declenche_rien() {
+        // Un Node peut rester une fraction de seconde en pause apres un Play
+        // reussi. Le signal seul ne suffit pas — il faut aussi la file vide.
+        assert!(!add_play_rejected(ADD_OK, PLAY_PAUSE));
+    }
+
+    #[test]
+    fn file_vide_mais_qui_joue_ne_declenche_rien() {
+        assert!(!add_play_rejected(ADD_EMPTY, PLAY_STREAM));
+    }
+
+    #[test]
+    fn dialecte_inconnu_passe_pour_fonctionnel() {
+        // Sens de defaut : un Node dont on ne sait pas lire les reponses ne
+        // doit jamais etre declare en panne sur notre ignorance.
+        assert!(!add_play_rejected("<ok/>", "<ok/>"));
+        assert!(!add_play_rejected("", ""));
+    }
+
+    #[test]
+    fn xml_attr_et_xml_text_lisent_les_reponses_reelles() {
+        assert_eq!(xml_attr(ADD_EMPTY, "playlist", "length"), Some("0"));
+        assert_eq!(xml_attr(ADD_OK, "playlist", "length"), Some("1"));
+        assert_eq!(xml_attr(ADD_OK, "playlist", "absent"), None);
+        assert_eq!(xml_text(PLAY_PAUSE, "state"), Some("pause"));
+        assert_eq!(xml_text(PLAY_STREAM, "state"), Some("stream"));
+        assert_eq!(xml_text("<state>pause", "state"), None);
     }
 }
