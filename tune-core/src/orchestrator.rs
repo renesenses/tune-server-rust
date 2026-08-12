@@ -6809,6 +6809,15 @@ impl PlaybackOrchestrator {
 
         self.playback.set_volume(zone_id, volume).await;
         self.playback.mark_volume_changed(zone_id).await;
+        // Persister AUSSI : les routes HTTP écrivent la base elles-mêmes, mais
+        // les appels internes (alarmes, minuterie de sommeil, IA) passaient
+        // uniquement par ici et laissaient `zone.volume` sur l'ancienne valeur.
+        // La page et le chemin du signal lisent la base : sans cette ligne, ils
+        // divergeaient de la copie mémoire jusqu'au prochain coup de curseur
+        // (#1504). Écriture idempotente quand la route a déjà écrit.
+        ZoneRepo::with_backend(self.db.clone())
+            .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
+            .ok();
         if let Some(did) = device_id {
             let arc = { self.outputs.lock().await.get(did) };
             if let Some(output) = arc {
