@@ -809,4 +809,338 @@ mod tests {
             "la boucle a continué après stop() : {before_stop} -> {after_stop}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // #1513 — fidélité au bit près du chemin DSD natif.
+    //
+    // DEvir : bruit blanc en DSD64 sur endpoint OAAT (0.9.68), DAC affichant
+    // pourtant DSD64, paquets reçus sans FEC/XRUN, fichier local comme UNC.
+    // Le code de ce chemin est identique entre 0.9.64 et 0.9.68 ; ces tests
+    // établissent donc ce que le serveur envoie RÉELLEMENT sur le fil, au
+    // lieu de le supposer : chaque octet DSD reçu en UDP doit être celui du
+    // fichier, dans l'ordre, sans trou ni doublon.
+    // ------------------------------------------------------------------
+
+    /// Écrit un `.dsf` synthétique : blocs par canal de `block_size` octets,
+    /// motif déterministe distinct par octet (tout réordonnancement,
+    /// troncature ou mélange de canaux casse la comparaison exacte).
+    fn write_test_dsf(path: &std::path::Path, blocks_per_channel: usize, seed: u32) -> Vec<u8> {
+        const BLOCK: usize = 4096;
+        let channels = 2usize;
+        let data_len = blocks_per_channel * BLOCK * channels;
+        let mut data = Vec::with_capacity(data_len);
+        for i in 0..data_len {
+            data.push(((i as u32).wrapping_add(seed).wrapping_mul(2654435761) >> 16) as u8);
+        }
+        let total_samples = (blocks_per_channel * BLOCK * 8) as u64; // bits par canal
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&28u64.to_le_bytes());
+        buf.extend_from_slice(&(28 + 52 + 12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&52u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&(channels as u32).to_le_bytes());
+        buf.extend_from_slice(&2_822_400u32.to_le_bytes()); // DSD64
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&total_samples.to_le_bytes());
+        buf.extend_from_slice(&(BLOCK as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data);
+        std::fs::write(path, &buf).unwrap();
+
+        // Vérité terrain : ce que le lecteur produit (entrelacé par octet).
+        let info = crate::audio::dsf::parse_dsf(path.to_str().unwrap()).unwrap();
+        let mut reader =
+            crate::audio::dsf::DsfStreamReader::open(path.to_str().unwrap(), info).unwrap();
+        let mut expected = Vec::with_capacity(data_len);
+        while let Ok(Some(chunk)) = reader.next_chunk() {
+            expected.extend_from_slice(&chunk);
+        }
+        expected
+    }
+
+    /// Faux endpoint compatible DSD : HelloAck (dsd_max_rate 512), accepte
+    /// tout FormatPropose, répond à l'horloge, et capture les datagrammes
+    /// audio (en-tête décodé + payload) jusqu'à `quiet` sans paquet.
+    async fn spawn_dsd_mock(
+        quiet: std::time::Duration,
+    ) -> (
+        u16,
+        tokio::task::JoinHandle<Vec<(oaat_core::wire::AudioPacketHeader, Vec<u8>)>>,
+    ) {
+        use oaat_core::wire::AudioPacketHeader;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            let audio_rx = tokio::spawn(async move {
+                let mut packets: Vec<(AudioPacketHeader, Vec<u8>)> = Vec::new();
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    // La poignée de main (Hello → horloge → FormatPropose) peut
+                    // prendre plusieurs secondes AVANT le premier paquet ; le
+                    // délai court de fin de flux ne vaut qu'après lui.
+                    let wait = if packets.is_empty() {
+                        std::time::Duration::from_secs(15)
+                    } else {
+                        quiet
+                    };
+                    match tokio::time::timeout(wait, audio_udp.recv(&mut buf)).await {
+                        Ok(Ok(n)) if n >= AUDIO_HEADER_SIZE => {
+                            let hdr_bytes: [u8; AUDIO_HEADER_SIZE] =
+                                buf[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                            if let Ok(hdr) = AudioPacketHeader::decode(&hdr_bytes) {
+                                packets.push((hdr, buf[AUDIO_HEADER_SIZE..n].to_vec()));
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                packets
+            });
+
+            let _clock = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    match clock_udp.recv_from(&mut buf).await {
+                        Ok((n, peer)) if n >= 28 => {
+                            let _ = clock_udp.send_to(&buf[..n], peer).await;
+                        }
+                        _ => break,
+                    }
+                }
+            });
+
+            // Contrôle TCP : ce mock accepte les reconnexions successives —
+            // une lecture qui en remplace une autre rouvre une session, comme
+            // le vrai endpoint mono-client.
+            let _control = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = tcp.accept().await else {
+                        break;
+                    };
+                    let audio_port = audio_port;
+                    let clock_port = clock_port;
+                    tokio::spawn(async move {
+                        let mut codec = FrameCodec::new();
+                        let mut read_buf = [0u8; 16384];
+                        loop {
+                            let n = match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                stream.read(&mut read_buf),
+                            )
+                            .await
+                            {
+                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                                Ok(Ok(n)) => n,
+                            };
+                            codec.feed(&read_buf[..n]);
+                            while let Ok(Some(msg)) = codec.decode_next() {
+                                match msg {
+                                    Message::Hello(_) => {
+                                        let ack = Message::HelloAck(HelloAck {
+                                            protocol_version: oaat_core::PROTOCOL_VERSION,
+                                            endpoint_id: "mock-dsd-ep".into(),
+                                            endpoint_name: "Mock DSD DAC".into(),
+                                            capabilities: EndpointCapabilities {
+                                                pcm_max_rate: 384000,
+                                                pcm_max_bits: 32,
+                                                dsd_max_rate: Some(512),
+                                                channels_max: 2,
+                                                formats: vec![
+                                                    oaat_core::format::AudioFormat::PcmS16le,
+                                                    oaat_core::format::AudioFormat::PcmS24le,
+                                                    oaat_core::format::AudioFormat::DsdU8,
+                                                ],
+                                                volume: None,
+                                                gapless: true,
+                                                seek: false,
+                                            },
+                                            audio_port,
+                                            clock_port,
+                                            buffer_size_ms: 100,
+                                        });
+                                        let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+                                    }
+                                    Message::FormatPropose(fp) => {
+                                        let accept = Message::FormatAccept(FormatAccept {
+                                            stream_id: fp.stream_id,
+                                        });
+                                        let _ =
+                                            stream.write_all(&FrameCodec::encode(&accept)).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            audio_rx.await.unwrap_or_default()
+        });
+
+        (control_port, handle)
+    }
+
+    /// #1513 — lecture fraîche : les octets UDP sont EXACTEMENT ceux du
+    /// fichier, dans l'ordre, sans trou ni doublon, et les `sample_offset`
+    /// des en-têtes sont cohérents avec la position réelle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_dsd_bytes_reach_the_endpoint_unaltered() {
+        let dir = std::env::temp_dir().join(format!("tune-dsd-proof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dsf_path = dir.join("proof.dsf");
+        // 9 blocs/canal ≈ 0,21 s de DSD64 : assez court pour un test,
+        // assez long pour plusieurs paquets (73 728 octets ≈ 18 paquets).
+        let expected = write_test_dsf(&dsf_path, 9, 0xD5D_0001);
+
+        let (control_port, mock) = spawn_dsd_mock(std::time::Duration::from_secs(3)).await;
+        let output = OaatOutput::new(
+            "Mock DSD DAC".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-dsd-ep".into(),
+        );
+
+        let path_str = dsf_path.to_str().unwrap();
+        let result = output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:1/unused.wav",
+                mime_type: "audio/x-dsf",
+                title: Some("Proof"),
+                file_path: Some(path_str),
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_ok(), "play_media: {result:?}");
+
+        let packets = tokio::time::timeout(std::time::Duration::from_secs(20), mock)
+            .await
+            .expect("mock timed out")
+            .expect("mock panicked");
+        let _ = output.stop().await;
+
+        assert!(
+            !packets.is_empty(),
+            "aucun paquet audio reçu — le chemin natif ne s'est pas engagé"
+        );
+
+        let mut received = Vec::with_capacity(expected.len());
+        for (i, (hdr, payload)) in packets.iter().enumerate() {
+            assert_eq!(
+                hdr.format,
+                oaat_core::format::AudioFormat::DsdU8,
+                "paquet #{i} : pas du DSD_U8"
+            );
+            // sample_offset = bits par canal déjà envoyés ; les octets reçus
+            // jusqu'ici couvrent received.len()/2 octets par canal.
+            assert_eq!(
+                hdr.sample_offset,
+                (received.len() / 2) as u64 * 8,
+                "sample_offset incohérent au paquet #{i} — trou ou doublon"
+            );
+            received.extend_from_slice(payload);
+        }
+
+        assert_eq!(
+            received.len(),
+            expected.len(),
+            "volume reçu != volume du fichier"
+        );
+        assert_eq!(
+            received, expected,
+            "les octets DSD reçus diffèrent du fichier — corruption sur le chemin d'envoi"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1513 — lectures enchaînées (le vrai usage de DEvir : cinq sessions en
+    /// douze minutes). Depuis #1481, `play_media` ANNULE la tâche précédente ;
+    /// le second flux doit rester exact au bit près malgré l'abort du premier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_dsd_second_play_is_bit_exact_after_aborting_the_first() {
+        let dir = std::env::temp_dir().join(format!("tune-dsd-proof2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_a = dir.join("a.dsf");
+        let path_b = dir.join("b.dsf");
+        // A long (2 s) pour être sûr d'être interrompu en plein envoi ;
+        // B court, au motif distinct.
+        let _expected_a = write_test_dsf(&path_a, 86, 0xAAAA_0001);
+        let expected_b = write_test_dsf(&path_b, 9, 0xBBBB_0002);
+
+        let (control_port, mock) = spawn_dsd_mock(std::time::Duration::from_secs(3)).await;
+        let output = OaatOutput::new(
+            "Mock DSD DAC".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-dsd-ep".into(),
+        );
+
+        let a = path_a.to_str().unwrap().to_owned();
+        let r = output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:1/unused.wav",
+                mime_type: "audio/x-dsf",
+                title: Some("A"),
+                file_path: Some(&a),
+                ..Default::default()
+            })
+            .await;
+        assert!(r.is_ok());
+
+        // Laisser A émettre, puis le remplacer en plein vol.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let b = path_b.to_str().unwrap().to_owned();
+        let r = output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:1/unused.wav",
+                mime_type: "audio/x-dsf",
+                title: Some("B"),
+                file_path: Some(&b),
+                ..Default::default()
+            })
+            .await;
+        assert!(r.is_ok());
+
+        let packets = tokio::time::timeout(std::time::Duration::from_secs(25), mock)
+            .await
+            .expect("mock timed out")
+            .expect("mock panicked");
+        let _ = output.stop().await;
+
+        // Les paquets de B = le dernier stream_id observé.
+        let last_stream = packets.last().expect("aucun paquet").0.stream_id;
+        let received_b: Vec<u8> = packets
+            .iter()
+            .filter(|(h, _)| h.stream_id == last_stream)
+            .flat_map(|(_, p)| p.iter().copied())
+            .collect();
+
+        assert_eq!(
+            received_b.len(),
+            expected_b.len(),
+            "volume du second flux != fichier B (stream {last_stream})"
+        );
+        assert_eq!(
+            received_b, expected_b,
+            "le second flux est corrompu après l'annulation du premier (#1481)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
