@@ -125,6 +125,25 @@ async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, 
     (status, json)
 }
 
+async fn patch_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::patch(path)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, json)
+}
+
 #[tokio::test]
 async fn system_version() {
     let app = make_app();
@@ -178,6 +197,54 @@ async fn zone_crud() {
     let (status, body) = get(&app, &format!("/api/v1/zones/{zone_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["name"], "Salon");
+}
+
+/// The Zone struct's serialized `autoplay_enabled` is a stub (always false):
+/// row_to_zone reads past COLS, where the column is deliberately omitted.
+/// Every zone-returning handler must re-read the real column, otherwise the
+/// web AutoPlay toggle bounces back to "off" on refresh (Sandro, #1552).
+#[tokio::test]
+async fn zone_autoplay_state_round_trips() {
+    let app = make_app();
+
+    let (status, body) = post_json(&app, "/api/v1/zones", json!({"name": "Salon"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let zone_id = body["id"].as_i64().unwrap();
+
+    // Default: off.
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zone_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["autoplay_enabled"], false);
+
+    // Enable — the PATCH response itself must reflect the new state, since
+    // the web client syncs its store from it.
+    let (status, body) = patch_json(
+        &app,
+        &format!("/api/v1/zones/{zone_id}"),
+        json!({"autoplay_enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["autoplay_enabled"], true);
+
+    // GET single and list must agree after a reload.
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zone_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["autoplay_enabled"], true);
+
+    let (status, body) = get(&app, "/api/v1/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body[0]["autoplay_enabled"], true);
+
+    // Disable round-trips too.
+    let (status, body) = patch_json(
+        &app,
+        &format!("/api/v1/zones/{zone_id}"),
+        json!({"autoplay_enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["autoplay_enabled"], false);
 }
 
 #[tokio::test]

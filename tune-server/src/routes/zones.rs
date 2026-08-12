@@ -1246,6 +1246,15 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             obj.insert("resolving".into(), json!(ps.resolving));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+            // The serialized Zone struct always carries autoplay_enabled=false:
+            // row_to_zone reads an index past COLS (the column is deliberately
+            // omitted there, see zone_repo::sql). Re-read it through the safe
+            // getter like the other optional-column flags below, otherwise the
+            // UI toggle falls back to "off" on every zone refresh (#1552).
+            obj.insert(
+                "autoplay_enabled".into(),
+                json!(zone_repo.get_autoplay_enabled(zone_id)),
+            );
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
             obj.insert(
                 "lyrics_offset_ms".into(),
@@ -1393,6 +1402,14 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
                 obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
+                // Same as list_zones: the struct's autoplay_enabled is a stub
+                // (always false) — re-read the real column. patch_zone answers
+                // through this handler, so without it the toggle bounced back
+                // to "off" right after being switched on (#1552).
+                obj.insert(
+                    "autoplay_enabled".into(),
+                    json!(repo.get_autoplay_enabled(id)),
+                );
                 obj.insert(
                     "dlna_play_delay_ms".into(),
                     json!(repo.get_dlna_play_delay_ms(id)),
