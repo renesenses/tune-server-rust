@@ -788,6 +788,16 @@ pub(super) async fn update_install(
             // ROUVRAIT un onglet alors que l'ancien se reconnecte déjà → deux
             // onglets Tune à chaque mise à jour (Jean, forum #1236).
             unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
+            // Replier le WAL AVANT l'exec. `exec()` remplace l'image sans
+            // dérouler un seul destructeur : aucune connexion n'est fermée,
+            // aucun verrou n'est rendu proprement. Le 10 août, deux re-exec ont
+            // eu lieu pendant que la base était en écriture, et elle s'est
+            // retrouvée corrompue sans qu'on ait pu établir le mécanisme
+            // (#1462). Un checkpoint ici ne prouve rien sur cette cause — il
+            // supprime la fenêtre où elle pouvait jouer.
+            if let Some(db) = state.db.as_ref() {
+                db.checkpoint();
+            }
             info!(exe = %exe.display(), "update_reexec");
             // exec() replaces this process on success and never returns.
             let err = std::process::Command::new(&exe).args(&args).exec();
