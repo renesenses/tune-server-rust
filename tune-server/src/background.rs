@@ -1166,6 +1166,9 @@ fn spawn_concert_alerts(state: &AppState) {
 
 fn spawn_cloud_library_sync(state: &AppState) {
     tune_core::cloud::library_sync::spawn(state.backend.clone(), state.license.clone());
+    // L'arbitrage part apres la synchronisation : demander des propositions
+    // sur un catalogue pas encore pousse au cloud ne donnerait rien.
+    tune_core::cloud::metadata_proposals::spawn(state.backend.clone(), state.license.clone());
 }
 
 fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
