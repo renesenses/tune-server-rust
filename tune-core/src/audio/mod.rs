@@ -22,8 +22,10 @@ pub mod formats;
 pub mod iso_sacd;
 pub mod levels;
 pub mod mixer;
+pub mod opus_ogg;
 pub mod pipeline;
 pub mod replaygain;
+pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
