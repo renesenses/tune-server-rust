@@ -399,7 +399,20 @@ impl QobuzService {
         }
     }
 
-    /// Map a Qobuz featured/editorial playlist item to StreamPlaylist.
+    /// Les playlists d'une réponse de `/catalog/search`. Isolé de `search` pour
+    /// être testable : le reste de l'extraction demande un aller-retour HTTP.
+    ///
+    /// `/catalog/search` renvoie ses playlists dans la même forme que les
+    /// sélections éditoriales, d'où le convertisseur partagé.
+    fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
+            .unwrap_or_default()
+    }
+
+    /// Map a Qobuz playlist item (editorial selection or search hit) to
+    /// StreamPlaylist.
     fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
         StreamPlaylist {
             id: item["id"]
@@ -786,7 +799,7 @@ impl StreamingService for QobuzService {
             tracks,
             albums,
             artists,
-            playlists: vec![],
+            playlists: Self::search_playlists(&data),
         })
     }
 
@@ -1582,6 +1595,34 @@ fn md5_hex(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_playlists_read_from_the_search_payload() {
+        // /catalog/search renvoie ses playlists dans la même forme que les
+        // sélections éditoriales — c'est ce que ce test verrouille.
+        let data = json!({
+            "tracks": {"items": []},
+            "albums": {"items": []},
+            "artists": {"items": []},
+            "playlists": {"items": [{
+                "id": 5471203,
+                "name": "Jazz pour la nuit",
+                "tracks_count": 58,
+                "owner": {"name": "Qobuz"}
+            }]}
+        });
+        let found = QobuzService::search_playlists(&data);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "5471203");
+        assert_eq!(found[0].name, "Jazz pour la nuit");
+        assert_eq!(found[0].track_count, 58);
+        assert_eq!(found[0].owner.as_deref(), Some("Qobuz"));
+    }
+
+    #[test]
+    fn search_playlists_absent_is_empty_not_a_panic() {
+        assert!(QobuzService::search_playlists(&json!({"tracks": {"items": []}})).is_empty());
+    }
 
     #[test]
     fn endpoint_order_direct_first_by_default() {
