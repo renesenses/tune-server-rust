@@ -1008,6 +1008,15 @@ impl TidalService {
         }
     }
 
+    /// Les playlists d'une réponse de recherche. Isolé de `search` pour être
+    /// testable : le reste de l'extraction demande un aller-retour HTTP.
+    fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_playlist).collect())
+            .unwrap_or_default()
+    }
+
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -1268,7 +1277,7 @@ impl StreamingService for TidalService {
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let data = self
             .api_get(&format!(
-                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS",
+                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS,PLAYLISTS",
                 urlencoding::encode(query)
             ))
             .await?;
@@ -1290,7 +1299,7 @@ impl StreamingService for TidalService {
             tracks,
             albums,
             artists,
-            playlists: vec![],
+            playlists: Self::search_playlists(&data),
         })
     }
 
@@ -2473,6 +2482,36 @@ fn extract_dash_base_url(mpd: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_playlists_read_from_the_search_payload() {
+        // Forme réelle d'une réponse /search avec types=…,PLAYLISTS.
+        let data = json!({
+            "tracks": {"items": []},
+            "albums": {"items": []},
+            "artists": {"items": []},
+            "playlists": {"items": [{
+                "uuid": "9f2c-77",
+                "title": "Late Night Jazz",
+                "numberOfTracks": 58,
+                "squareImage": "aa-bb-cc-dd",
+                "creator": {"name": "TIDAL"}
+            }]}
+        });
+        let found = TidalService::search_playlists(&data);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "9f2c-77");
+        assert_eq!(found[0].name, "Late Night Jazz");
+        assert_eq!(found[0].track_count, 58);
+        assert_eq!(found[0].owner.as_deref(), Some("TIDAL"));
+    }
+
+    #[test]
+    fn search_playlists_absent_is_empty_not_a_panic() {
+        // Un compte sans droit sur les playlists, ou une API qui omet le bloc :
+        // la recherche doit rendre les autres résultats, pas échouer.
+        assert!(TidalService::search_playlists(&json!({"tracks": {"items": []}})).is_empty());
+    }
 
     #[test]
     fn map_track_basic() {
