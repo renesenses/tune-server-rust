@@ -646,19 +646,96 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
 // SSDP advertisement helper
 // ---------------------------------------------------------------------------
 
-/// Build the SSDP NOTIFY alive payload for the MediaServer.
-pub fn ssdp_notify_alive(uuid: &str, location: &str) -> String {
+/// Ce que le MediaServer annonce, partagé avec le listener SSDP de la
+/// découverte pour qu'il puisse répondre aux M-SEARCH qui nous visent.
+///
+/// Sans cette réponse, Tune était invisible des points de contrôle : le
+/// « Rechercher des appareils » d'un contrôleur (JPlay iOS, BubbleUPnP…)
+/// envoie un M-SEARCH et écoute quelques secondes — or Tune n'émettait que
+/// des NOTIFY spontanés toutes les dix minutes. Sauf coïncidence entre la
+/// fenêtre d'écoute et notre annonce, le serveur n'apparaissait jamais
+/// (Stéphane Villerio, 12/08/2026 : « JPlay iOS ne voit toujours pas
+/// Tune », pendant que femtoServer et DMP-A6 — qui répondent au M-SEARCH —
+/// figurent dans sa liste).
+pub struct MediaServerAdvert {
+    pub uuid: String,
+    pub location: String,
+}
+
+static ADVERT: std::sync::OnceLock<MediaServerAdvert> = std::sync::OnceLock::new();
+
+/// L'annonce du MediaServer, une fois l'annonceur démarré. `None` tant que le
+/// serveur UPnP n'est pas en service — le listener ne répond alors à rien.
+pub fn media_server_advert() -> Option<&'static MediaServerAdvert> {
+    ADVERT.get()
+}
+
+/// Les trois identités UPnP d'un MediaServer racine. Un M-SEARCH peut viser
+/// n'importe laquelle ; `ssdp:all` attend une réponse pour chacune.
+fn usn_targets(uuid: &str) -> [(String, String); 3] {
+    let device = "urn:schemas-upnp-org:device:MediaServer:1";
+    let service = "urn:schemas-upnp-org:service:ContentDirectory:1";
+    [
+        ("upnp:rootdevice".into(), format!("{uuid}::upnp:rootdevice")),
+        (device.into(), format!("{uuid}::{device}")),
+        (service.into(), format!("{uuid}::{service}")),
+    ]
+}
+
+/// Quelles identités répondre à un M-SEARCH dont le ST est `st` — vide si la
+/// recherche ne nous concerne pas (un contrôleur qui cherche des renderers,
+/// par exemple, n'a pas à recevoir notre réponse).
+pub fn msearch_reply_targets(st: &str, uuid: &str) -> Vec<(String, String)> {
+    let st = st.trim();
+    if st.eq_ignore_ascii_case("ssdp:all") {
+        return usn_targets(uuid).into();
+    }
+    if st == uuid {
+        return vec![(uuid.to_string(), uuid.to_string())];
+    }
+    usn_targets(uuid)
+        .into_iter()
+        .filter(|(nt, _)| nt.eq_ignore_ascii_case(st))
+        .collect()
+}
+
+/// Réponse unicast à un M-SEARCH — le pendant « sur demande » du NOTIFY.
+pub fn ssdp_msearch_response(st: &str, usn: &str, location: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         CACHE-CONTROL: max-age=1800\r\n\
+         EXT:\r\n\
+         LOCATION: {location}\r\n\
+         SERVER: Tune/{version} UPnP/1.0\r\n\
+         ST: {st}\r\n\
+         USN: {usn}\r\n\
+         \r\n",
+        version = crate::version(),
+    )
+}
+
+/// Build the SSDP NOTIFY alive payload for one (NT, USN) identity.
+pub fn ssdp_notify_alive_for(nt: &str, usn: &str, location: &str) -> String {
     format!(
         "NOTIFY * HTTP/1.1\r\n\
          HOST: 239.255.255.250:1900\r\n\
          CACHE-CONTROL: max-age=1800\r\n\
          LOCATION: {location}\r\n\
-         NT: urn:schemas-upnp-org:device:MediaServer:1\r\n\
+         NT: {nt}\r\n\
          NTS: ssdp:alive\r\n\
          SERVER: Tune/{version} UPnP/1.0\r\n\
-         USN: {uuid}::urn:schemas-upnp-org:device:MediaServer:1\r\n\
+         USN: {usn}\r\n\
          \r\n",
         version = crate::version(),
+    )
+}
+
+/// Build the SSDP NOTIFY alive payload for the MediaServer.
+pub fn ssdp_notify_alive(uuid: &str, location: &str) -> String {
+    ssdp_notify_alive_for(
+        "urn:schemas-upnp-org:device:MediaServer:1",
+        &format!("{uuid}::urn:schemas-upnp-org:device:MediaServer:1"),
+        location,
     )
 }
 
@@ -691,13 +768,34 @@ pub async fn spawn_ssdp_advertiser(uuid: String, location: String) {
         };
 
         let dest = std::net::SocketAddr::from((Ipv4Addr::new(239, 255, 255, 250), 1900u16));
-        let payload = ssdp_notify_alive(&uuid, &location);
+
+        // Publie l'annonce pour le répondeur M-SEARCH du listener de
+        // découverte : c'est lui qui rend Tune visible d'un « Rechercher des
+        // appareils », le NOTIFY spontané ne couvrant que l'écoute passive.
+        let _ = ADVERT.set(MediaServerAdvert {
+            uuid: uuid.clone(),
+            location: location.clone(),
+        });
+
+        // Les TROIS identités du device (rootdevice, MediaServer,
+        // ContentDirectory) : certains contrôleurs ne retiennent un serveur
+        // que s'ils ont vu l'identité précise qu'ils cherchent.
+        let payloads: Vec<String> = usn_targets(&uuid)
+            .iter()
+            .map(|(nt, usn)| ssdp_notify_alive_for(nt, usn, &location))
+            .collect();
 
         loop {
-            if let Err(e) = socket.send_to(payload.as_bytes(), dest).await {
-                debug!(error = %e, "ssdp_advertise_send_error");
+            for p in &payloads {
+                if let Err(e) = socket.send_to(p.as_bytes(), dest).await {
+                    debug!(error = %e, "ssdp_advertise_send_error");
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            // 300 s, pas 600 : la spec demande de réannoncer bien avant
+            // l'expiration du CACHE-CONTROL (max-age=1800) — et dix minutes
+            // entre deux annonces laissaient les contrôleurs à l'écoute
+            // passive nous croire disparus.
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
 }
@@ -831,5 +929,51 @@ mod tests {
         assert!(xml.contains("bitsPerSample=\"24\""));
         assert!(xml.contains("albumArtURI"));
         assert!(xml.contains("originalTrackNumber"));
+    }
+}
+
+#[cfg(test)]
+mod ssdp_msearch_tests {
+    use super::*;
+
+    const UUID: &str = "uuid:1234";
+
+    #[test]
+    fn ssdp_all_recoit_les_trois_identites() {
+        let t = msearch_reply_targets("ssdp:all", UUID);
+        assert_eq!(t.len(), 3);
+        assert!(t.iter().any(|(nt, _)| nt == "upnp:rootdevice"));
+    }
+
+    #[test]
+    fn recherche_mediaserver_recoit_une_reponse_ciblee() {
+        let t = msearch_reply_targets("urn:schemas-upnp-org:device:MediaServer:1", UUID);
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            t[0].1,
+            "uuid:1234::urn:schemas-upnp-org:device:MediaServer:1"
+        );
+    }
+
+    #[test]
+    fn recherche_de_renderer_reste_sans_reponse() {
+        // Un contrôleur qui cherche des RENDERERS ne doit pas nous voir :
+        // répondre à tout polluerait la liste des autres applications.
+        let t = msearch_reply_targets("urn:schemas-upnp-org:device:MediaRenderer:1", UUID);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn la_reponse_msearch_porte_st_usn_et_location() {
+        let r = ssdp_msearch_response(
+            "upnp:rootdevice",
+            "uuid:1234::upnp:rootdevice",
+            "http://x/d.xml",
+        );
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(r.contains("ST: upnp:rootdevice\r\n"));
+        assert!(r.contains("USN: uuid:1234::upnp:rootdevice\r\n"));
+        assert!(r.contains("LOCATION: http://x/d.xml\r\n"));
+        assert!(r.contains("EXT:\r\n"));
     }
 }
