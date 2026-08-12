@@ -29,6 +29,7 @@ dj = ["dep:tune-dj"]
 karaoke = ["dep:tune-karaoke"]
 
 [dependencies]
+libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }

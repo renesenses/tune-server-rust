@@ -539,7 +539,30 @@ async fn shutdown_signal() {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(3));
         tracing::warn!("shutdown_timeout_forcing_exit");
-        std::process::exit(0);
+        // `_exit`, PAS `std::process::exit`. Cette minuterie s'arme quand
+        // l'arrêt propre a déjà échoué : d'autres fils tournent encore, par
+        // construction. `exit()` déroule alors `__run_exit_handlers` →
+        // `_dl_fini`, donc les destructeurs statiques de TOUTES les
+        // bibliothèques chargées — dont `libonnxruntime.so`, dont les fils
+        // d'inférence et les arènes sont toujours vivants. Il y meurt.
+        //
+        // Prouvé sur .18 le 11 août (#1462), pile extraite du core :
+        //   #0  libonnxruntime.so
+        //   #3  _dl_call_fini      (dl-call_fini.c:43)
+        //   #4  _dl_fini
+        //   #5  __run_exit_handlers
+        //   #6  __GI_exit
+        // et dans le journal, `shutdown_signal_received` puis, exactement
+        // 3,001 s plus tard, `shutdown_timeout_forcing_exit` suivi de
+        // `status=11/SEGV`. C'est notre propre garde-fou qui tuait le
+        // processus — et un SEGV au milieu de `_dl_fini`, pendant que des
+        // fils écrivent encore, est autrement plus dangereux pour la base
+        // qu'un arrêt franc (lequel, lui, n'a rien corrompu le 11 août).
+        //
+        // `_exit` rend la main au noyau sans dérouler quoi que ce soit. C'est
+        // exactement ce qu'on veut d'une sortie forcée : on a déjà renoncé au
+        // nettoyage, il ne reste qu'à ne pas faire de dégâts.
+        unsafe { libc::_exit(0) };
     });
 }
 
