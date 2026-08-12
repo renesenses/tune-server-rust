@@ -248,3 +248,27 @@ jobs:
           # ignored (paste, instant — transitive, no runtime path). Kept in sync
           # with deny.toml. Every vulnerability, wasmtime included, now blocks.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+
+  widget:
+    name: Widget (compilation)
+    # tune-widget echappait a TOUT filet : le Cargo.toml racine l'exclut du
+    # workspace (exclusion voulue — sans elle, cargo fmt --all remonte les deps
+    # GUI/webkit et casse la CI Linux headless), et widget.yml ne se declenche
+    # que sur un tag widget-v*. Aucun tag de ce genre n'ayant jamais existe, ce
+    # workflow n'avait jamais tourne : au premier tag, le 12 aout 2026, il a
+    # echoue des l'installation du CLI Tauri sur une rouille invisible depuis
+    # des mois. Ce job compile le widget a chaque PR pour que le prochain tag
+    # ne soit plus le premier essai.
+    #
+    # macOS et pas ubuntu : le widget ne livre que des DMG (cf la matrice de
+    # widget.yml), et Tauri y compile sans les paquets webkit d'apt.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tune-widget/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --release
+        working-directory: tune-widget/src-tauri
