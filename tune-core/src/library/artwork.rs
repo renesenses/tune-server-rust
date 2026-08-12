@@ -1330,6 +1330,33 @@ pub fn save_embedded_cover(
     None
 }
 
+/// Pochette du DOSSIER d'un fichier, mise en cache — sans jamais regarder les
+/// tags du fichier lui-même.
+///
+/// Sert à choisir la pochette d'un ALBUM, où l'ordre de priorité n'est pas le
+/// même que pour une piste. Une `cover.jpg` posée dans le dossier est un choix
+/// délibéré de l'utilisateur ; une pochette intégrée à UNE piste est un
+/// accident de tag. Sur une compilation « maison », c'est la seconde qui
+/// gagnait et se retrouvait attribuée à tout le répertoire (testeur, forum).
+pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
+    let folder_cover = find_folder_cover(audio_path)?;
+    // Le hachage porte sur le CHEMIN DE LA POCHETTE, pas sur celui de la piste :
+    // toutes les pistes du dossier partagent ainsi la même entrée de cache au
+    // lieu d'en dupliquer une par fichier.
+    let hash = artwork_hash(&folder_cover.to_string_lossy());
+    for ext in ["jpg", "png"] {
+        if cache_dir.join(format!("{hash}.{ext}")).exists() {
+            return Some(hash);
+        }
+    }
+    let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
+    let ext = folder_cover
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg");
+    save_to_cache(&data, cache_dir, &hash, ext).map(|_| hash)
+}
+
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
@@ -1414,6 +1441,23 @@ pub fn backfill_embedded_covers(
     let mut filled = 0usize;
     for (album_id, _title, _artist, _mbid) in &coverless {
         let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
+
+        // La pochette du DOSSIER d'abord : elle décrit l'album, là où une
+        // pochette intégrée ne décrit qu'une piste. Sur une compilation
+        // « maison », la première piste taguée imposait sa jaquette à tout le
+        // répertoire — un disque de Brel illustré par la pochette du seul titre
+        // dont le fichier portait une image.
+        if let Some(hash) = tracks
+            .iter()
+            .filter_map(|t| t.file_path.as_ref())
+            .find_map(|p| folder_cover_hash(Path::new(p), cache_dir))
+        {
+            if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
+                filled += 1;
+            }
+            continue;
+        }
+
         for track in &tracks {
             let Some(ref file_path) = track.file_path else {
                 continue;
@@ -1435,6 +1479,45 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le cas du testeur : une compilation « maison » où UNE seule piste porte
+    /// une pochette intégrée. C'est la pochette du DOSSIER qui doit décrire
+    /// l'album, pas celle d'un fichier isolé.
+    #[test]
+    fn folder_cover_wins_and_is_shared_by_every_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("Compilation maison");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpg"), b"POCHETTE-DU-DOSSIER").unwrap();
+        let t1 = music.join("01 - Brel.flac");
+        let t2 = music.join("02 - Barbara.flac");
+        std::fs::write(&t1, b"").unwrap();
+        std::fs::write(&t2, b"").unwrap();
+
+        let cache = dir.path().join("cache");
+        let h1 = folder_cover_hash(&t1, &cache).expect("pochette de dossier trouvée");
+        let h2 = folder_cover_hash(&t2, &cache).expect("pochette de dossier trouvée");
+
+        // Deux pistes du même dossier partagent LA MÊME entrée de cache : le
+        // hachage porte sur la pochette, pas sur le fichier audio.
+        assert_eq!(h1, h2);
+        assert_eq!(
+            std::fs::read(cache.join(format!("{h1}.jpg"))).unwrap(),
+            b"POCHETTE-DU-DOSSIER"
+        );
+    }
+
+    /// Sans pochette dans le dossier, rien n'est inventé — l'appelant retombe
+    /// alors sur l'extraction des tags, comme avant.
+    #[test]
+    fn no_folder_cover_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("Album nu");
+        std::fs::create_dir_all(&music).unwrap();
+        let t = music.join("01.flac");
+        std::fs::write(&t, b"").unwrap();
+        assert!(folder_cover_hash(&t, &dir.path().join("cache")).is_none());
+    }
 
     #[test]
     fn extended_path_windows_and_noop() {
