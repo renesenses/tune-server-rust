@@ -1824,8 +1824,29 @@ fn decode_symphonia(
         }
     }
 
-    let out_rate = target_sample_rate.unwrap_or(source_rate);
-    let out_channels = target_channels.unwrap_or(source_channels);
+    // On rapporte ce qu'on a REELLEMENT decode, jamais ce qui a ete demande.
+    //
+    // Ce chemin ne reechantillonne pas et ne downmixe pas : les echantillons
+    // restent entrelaces a la cadence source. Etiqueter la sortie avec les
+    // valeurs DEMANDEES transformait une intention en fait, et trois appelants
+    // s'y fiaient (JP Robbe, #1498) :
+    //
+    // - `embedding.rs` passait `d.channels` (donc 1) a `to_mono_f32`, qui
+    //   prenait alors sa branche « deja mono » et ne moyennait rien. Le modele
+    //   acoustique recevait du L/R/L/R a 44,1 kHz presente comme du mono
+    //   48 kHz — la moitie de la duree utile, et un timbre brouille. C'est le
+    //   defaut #1108, que son correctif n'a jamais pu corriger : il etait
+    //   neutralise ici, en amont.
+    // - `pipeline.rs` construisait l'encodeur avec l'etiquette tout en lui
+    //   donnant les vrais echantillons : en-tete annoncant la cadence cible,
+    //   donnees a la cadence source. Lecture a la mauvaise vitesse.
+    // - `analyzer.rs` interpretait les segments avec la mauvaise trame.
+    //
+    // Une fonction qui ment sur ce qu'elle renvoie est un piege permanent :
+    // chaque moitie a l'air juste et la relecture ne voit rien. Dire « voici du
+    // 44,1 stereo » laisse au moins l'appelant verifier et convertir.
+    let out_rate = source_rate;
+    let out_channels = source_channels;
     let total_frames = all_samples.len() as f64 / source_channels as f64;
     let duration_s = total_frames / source_rate as f64;
 
@@ -2464,6 +2485,48 @@ mod decode_integration_tests {
         assert!(
             result.duration_s > 0.9 && result.duration_s < 1.1,
             "duration should be ~1s, got {}",
+            result.duration_s
+        );
+    }
+
+    /// #1498 (JP Robbe) — la sortie doit decrire ce qui a ete DECODE, jamais ce
+    /// qui a ete demande.
+    ///
+    /// Ce chemin ne reechantillonne pas et ne downmixe pas. Etiqueter la sortie
+    /// avec les valeurs demandees transformait une intention en fait, et les
+    /// appelants qui lisent l'etiquette y perdaient :
+    ///
+    /// - la passe acoustique passait `channels` (donc 1) a `to_mono_f32`, qui
+    ///   prenait sa branche « deja mono » et ne moyennait rien : le modele
+    ///   recevait du L/R/L/R pris pour du mono (#1108, jamais corrige parce que
+    ///   son correctif etait neutralise ici) ;
+    /// - `pipeline.rs` construisait son encodeur avec l'etiquette tout en lui
+    ///   donnant les vrais echantillons : en-tete a la cadence cible, donnees a
+    ///   la cadence source.
+    ///
+    /// Le test existant `decode_wav` ne pouvait pas l'attraper : il demande
+    /// `None, None`, donc demande et realite coincident toujours.
+    #[test]
+    fn decode_reports_what_it_decoded_not_what_was_asked() {
+        let path = fixture_path("test.wav"); // 44,1 kHz stereo
+        let result = decode_to_pcm(&path, Some(48_000), Some(1), 0.0, 0.0).unwrap();
+
+        assert_eq!(
+            result.sample_rate, 44100,
+            "la cadence rapportee doit etre celle de la source, pas celle demandee"
+        );
+        assert_eq!(
+            result.channels, 2,
+            "le nombre de canaux rapporte doit etre celui de la source, pas celui demande"
+        );
+
+        // Et la coherence qui compte pour l'appelant : le compte d'echantillons
+        // doit correspondre a l'etiquette. C'est cette equation qui etait fausse.
+        let frames = result.samples_i32.len() as f64 / result.channels as f64;
+        let duration = frames / result.sample_rate as f64;
+        assert!(
+            (duration - result.duration_s).abs() < 0.01,
+            "duree deduite de l'etiquette ({duration:.3} s) et duree rapportee ({:.3} s) doivent concorder",
             result.duration_s
         );
     }

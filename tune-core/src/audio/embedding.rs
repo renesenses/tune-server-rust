@@ -481,6 +481,22 @@ fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
 
 /// The configured model destination (setting → env). Not required to exist —
 /// [`ensure_model`] downloads it there on first run.
+/// La passe peut-elle réellement travailler ? Autrement dit : un chemin de
+/// modèle est-il configuré, et le fichier est-il présent ?
+///
+/// Sans ça, l'interface ne pouvait pas distinguer « analyse en cours, au
+/// début » de « analyse activée mais incapable de démarrer » — les deux
+/// donnaient 0 %. Fabien, v0.9.68 : « Analyse en cours bloqué à 0 % ». Ses
+/// journaux ne contenaient aucune ligne d'analyse audio : la passe n'avait
+/// jamais tourné, et la jauge affichait quand même une progression.
+///
+/// `false` ne veut pas dire « cassé » : au tout premier démarrage le modèle
+/// n'est pas encore téléchargé, et la passe le récupère d'elle-même. Mais
+/// l'interface doit pouvoir le DIRE plutôt que de montrer une barre figée.
+pub fn model_ready(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
+    configured_model_path(settings).is_some_and(|p| p.exists())
+}
+
 fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
     settings
         .get(MODEL_PATH_KEY)
