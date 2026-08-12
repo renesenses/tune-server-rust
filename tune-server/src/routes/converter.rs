@@ -515,30 +515,29 @@ async fn convert_single_file(
         .to_str()
         .ok_or_else(|| "invalid input path".to_string())?;
 
-    // For lossy formats (mp3, aac, opus) and alac, shell out to external tools
-    // since the native Rust encoder only supports WAV and FLAC.
-    // Also use the external path when sample rate conversion is requested for
-    // lossless formats — the native Symphonia decode path does not resample,
-    // so we let ffmpeg handle the full pipeline in that case.
-    let needs_external = match format {
-        "mp3" | "aac" | "opus" | "alac" => true,
-        "flac" | "wav" if target_sr.is_some() => true,
-        _ => false,
-    };
+    // mp3, aac and alac still shell out to external tools (chantier #1523:
+    // lot 1 ships ffmpeg with the release, lots 3/4 make them native).
+    // flac/wav — including resampling (rubato, #1525) — and opus (libopus via
+    // audiopus + native Ogg mux) are fully in-process.
+    let needs_external = matches!(format, "mp3" | "aac" | "alac");
     if needs_external {
         return encode_with_external(input_str, output, format, quality, target_sr, target_bd)
             .await;
     }
 
-    // Lossless formats (FLAC, WAV): use native Rust decoders + encoder
     let input_owned = input_str.to_string();
     let format_owned = format.to_string();
+    let quality_owned = quality.map(str::to_string);
     let sr = target_sr;
     let bd = target_bd;
     let output_owned = output.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        encode_lossless_native(&input_owned, &output_owned, &format_owned, sr, bd)
+        if format_owned == "opus" {
+            encode_opus_native(&input_owned, &output_owned, quality_owned.as_deref())
+        } else {
+            encode_lossless_native(&input_owned, &output_owned, &format_owned, sr, bd)
+        }
     })
     .await
     .map_err(|e| format!("spawn_blocking join error: {e}"))?
@@ -552,18 +551,32 @@ fn encode_lossless_native(
     target_sr: Option<u32>,
     target_bd: Option<u16>,
 ) -> Result<(), String> {
-    // Decode to PCM
+    // Decode to PCM. Only the DSD/WavPack decoders honour target_sr; the
+    // symphonia path returns the source rate — the rubato pass below covers it.
     let decoded = decode_to_pcm(input, target_sr, None, 0.0, f64::MAX)?;
 
     let out_sr = target_sr.unwrap_or(decoded.sample_rate);
     let out_bd = target_bd.unwrap_or(decoded.bit_depth);
 
-    // decode_to_pcm already handled resampling if target_sr was set.
+    // Resample natively when the decoder didn't (#1525) — this used to be
+    // routed to an external ffmpeg that a standard install doesn't have.
+    let samples = if out_sr != decoded.sample_rate {
+        tune_core::audio::resample::resample_i32(
+            &decoded.samples_i32,
+            decoded.bit_depth,
+            decoded.channels as u16,
+            decoded.sample_rate,
+            out_sr,
+        )
+    } else {
+        decoded.samples_i32.clone()
+    };
+
     // Convert bit depth if needed.
-    let pcm_final = if out_bd == decoded.bit_depth {
+    let pcm_final = if out_bd == decoded.bit_depth && out_sr == decoded.sample_rate {
         decoded.pcm_bytes()
     } else {
-        convert_bit_depth(&decoded.samples_i32, decoded.bit_depth, out_bd)
+        convert_bit_depth(&samples, decoded.bit_depth, out_bd)
     };
 
     // Encode
@@ -574,6 +587,46 @@ fn encode_lossless_native(
 
     std::fs::write(output, &encoded)
         .map_err(|e| format!("failed to write {}: {e}", output.display()))
+}
+
+/// Encode to Ogg Opus fully in-process (#1525): native decode → rubato to
+/// 48 kHz → libopus (audiopus) → native Ogg mux. Replaces opusenc/ffmpeg.
+fn encode_opus_native(input: &str, output: &Path, quality: Option<&str>) -> Result<(), String> {
+    let decoded = decode_to_pcm(input, None, None, 0.0, f64::MAX)?;
+    if decoded.channels > 2 {
+        return Err(format!(
+            "opus: {} canaux non pris en charge (mono/stéréo)",
+            decoded.channels
+        ));
+    }
+
+    // Opus is a 48 kHz codec; resample whatever the source rate is.
+    let src_sr = decoded.sample_rate;
+    let samples = tune_core::audio::resample::resample_i32(
+        &decoded.samples_i32,
+        decoded.bit_depth,
+        decoded.channels as u16,
+        src_sr,
+        tune_core::audio::opus_ogg::OPUS_SAMPLE_RATE,
+    );
+
+    // To i16 for the encoder input.
+    let shift = decoded.bit_depth.saturating_sub(16);
+    let pcm16: Vec<i16> = samples
+        .iter()
+        .map(|&s| (s >> shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+        .collect();
+
+    // Same quality contract as the old opusenc path: a plain bitrate in kb/s.
+    let bitrate_kbps: u32 = quality.and_then(|q| q.parse().ok()).unwrap_or(128);
+
+    let bytes = tune_core::audio::opus_ogg::encode_ogg_opus(
+        &pcm16,
+        decoded.channels as u16,
+        bitrate_kbps,
+        src_sr,
+    )?;
+    std::fs::write(output, &bytes).map_err(|e| format!("failed to write {}: {e}", output.display()))
 }
 
 /// Encode PCM bytes to WAV using the existing AudioEncoder from tune-core.
@@ -643,11 +696,12 @@ fn convert_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// External encoder (ffmpeg / lame / opusenc fallback)
+// External encoder (mp3/aac/alac only — chantier #1523 makes them native;
+// flac/wav/opus are fully in-process since #1525)
 // ---------------------------------------------------------------------------
 
 /// Try external tools in preference order.  We first try format-specific
-/// tools (lame, opusenc, fdkaac) and fall back to ffmpeg.
+/// tools (lame) and fall back to ffmpeg.
 async fn encode_with_external(
     input: &str,
     output: &Path,
@@ -679,13 +733,8 @@ async fn encode_with_external(
 
     let result = match format {
         "mp3" => encode_mp3_external(tmp_wav_str, output_str, quality, target_sr).await,
-        "opus" => encode_opus_external(tmp_wav_str, output_str, quality).await,
         "aac" => encode_aac_external(tmp_wav_str, output_str, quality, target_sr).await,
         "alac" => encode_alac_external(tmp_wav_str, output_str, target_sr).await,
-        "flac" => {
-            encode_flac_external(tmp_wav_str, output_str, quality, target_sr, target_bd).await
-        }
-        "wav" => encode_wav_external(tmp_wav_str, output_str, target_sr, target_bd).await,
         _ => Err(format!("unsupported external format: {format}")),
     };
 
@@ -768,42 +817,6 @@ async fn encode_mp3_external(
     Err("mp3 encoding requires lame or ffmpeg on PATH".into())
 }
 
-async fn encode_opus_external(
-    input: &str,
-    output: &str,
-    quality: Option<&str>,
-) -> Result<(), String> {
-    let bitrate = quality.unwrap_or("128");
-
-    // Try opusenc first
-    if tool_available("opusenc").await {
-        let args = vec![
-            "--bitrate".to_string(),
-            bitrate.into(),
-            input.into(),
-            output.into(),
-        ];
-        return run_command("opusenc", &args).await;
-    }
-
-    // Fallback to ffmpeg
-    if tool_available("ffmpeg").await {
-        let args = vec![
-            "-y".to_string(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "libopus".into(),
-            "-b:a".into(),
-            format!("{bitrate}k"),
-            output.into(),
-        ];
-        return run_command("ffmpeg", &args).await;
-    }
-
-    Err("opus encoding requires opusenc or ffmpeg on PATH".into())
-}
-
 async fn encode_aac_external(
     input: &str,
     output: &str,
@@ -859,84 +872,6 @@ async fn encode_alac_external(
     }
 
     Err("alac encoding requires ffmpeg on PATH".into())
-}
-
-async fn encode_flac_external(
-    input: &str,
-    output: &str,
-    quality: Option<&str>,
-    target_sr: Option<u32>,
-    target_bd: Option<u16>,
-) -> Result<(), String> {
-    if tool_available("ffmpeg").await {
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "flac".into(),
-        ];
-
-        // FLAC compression level (0-8)
-        let level = quality.unwrap_or("5");
-        args.push("-compression_level".into());
-        args.push(level.into());
-
-        if let Some(sr) = target_sr {
-            args.push("-ar".into());
-            args.push(sr.to_string());
-        }
-        if let Some(bd) = target_bd {
-            args.push("-sample_fmt".into());
-            args.push(match bd {
-                16 => "s16".into(),
-                24 => "s32".into(), // ffmpeg FLAC uses s32 for 24-bit
-                _ => format!("s{bd}"),
-            });
-        }
-
-        args.push(output.into());
-        return run_command("ffmpeg", &args).await;
-    }
-
-    Err("flac encoding with resampling requires ffmpeg on PATH".into())
-}
-
-async fn encode_wav_external(
-    input: &str,
-    output: &str,
-    target_sr: Option<u32>,
-    target_bd: Option<u16>,
-) -> Result<(), String> {
-    if tool_available("ffmpeg").await {
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "pcm_s16le".into(),
-        ];
-
-        if let Some(bd) = target_bd {
-            // Replace the codec with the right PCM format
-            args[4] = match bd {
-                16 => "pcm_s16le".into(),
-                24 => "pcm_s24le".into(),
-                32 => "pcm_s32le".into(),
-                _ => "pcm_s16le".into(),
-            };
-        }
-
-        if let Some(sr) = target_sr {
-            args.push("-ar".into());
-            args.push(sr.to_string());
-        }
-
-        args.push(output.into());
-        return run_command("ffmpeg", &args).await;
-    }
-
-    Err("wav encoding with resampling requires ffmpeg on PATH".into())
 }
 
 // ---------------------------------------------------------------------------
