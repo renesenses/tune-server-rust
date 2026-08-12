@@ -203,6 +203,22 @@ pub mod sql {
         )
     }
 
+    /// Ecrit l'annee EN ECRASANT la valeur existante.
+    ///
+    /// `update_dates` ci-dessus fait un COALESCE et ne remplace jamais rien :
+    /// c'est ce qu'il faut quand on comble un trou laisse par le scan. Une
+    /// correction validee par l'utilisateur est le cas oppose — la valeur en
+    /// place est justement celle qu'il veut changer. Deux besoins contraires,
+    /// deux requetes ; les confondre rendrait l'arbitrage sans effet, en
+    /// silence.
+    pub fn set_year<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET year = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET cover_path = COALESCE(cover_path, {}) WHERE id = {}",
@@ -881,6 +897,14 @@ impl AlbumRepo {
             &original_date,
             &album_id,
         ];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Ecrit l'annee en ecrasant celle en place — voir `sql::set_year`.
+    pub fn set_year(&self, album_id: i64, year: i32) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_year, sql::set_year);
+        let params: [&dyn ToSqlValue; 2] = [&year, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
