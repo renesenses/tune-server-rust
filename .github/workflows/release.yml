@@ -93,6 +93,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       ARTIFACT: tune-server-${{ github.ref_name }}-${{ matrix.platform }}
+      # Exposé au niveau du job pour être lisible depuis un `if:` d'étape : le
+      # contexte `secrets` n'y est pas disponible, et un `env:` défini DANS une
+      # étape ne l'est pas non plus pour son propre `if:`.
+      WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -265,6 +269,57 @@ jobs:
           cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON web/ plugins/
           cd ..
 
+      # ── Signature Authenticode (Windows) ───────────────────────────────────
+      #
+      # Sans signature, Windows Defender met l'exécutable en quarantaine ou le
+      # tue en silence : un binaire non signé qui fait `taskkill` et sonde le
+      # port 8888 déclenche l'heuristique. Côté utilisateur ça donne « la
+      # fenêtre se ferme après quelques secondes » (Alain Bonnel, Win11, fil
+      # #1313) et « le serveur s'arrête tout seul au bout d'une à deux
+      # minutes » (#1435). Windows 11 avec des définitions récentes est bien
+      # plus agressif que Windows 10 : la population touchée grandit.
+      #
+      # L'étape ne tourne QUE si le certificat est présent. Sans les secrets
+      # elle est ignorée et la release se termine exactement comme aujourd'hui ;
+      # poser `WIN_SIGN_CERT_BASE64` (le .pfx en base64) et `WIN_SIGN_CERT_PWD`
+      # suffit à l'activer, sans autre changement.
+      #
+      # Placée AVANT l'empaquetage : le .zip portable et l'installeur NSIS
+      # embarquent tous deux ce binaire. Le zip est précisément le contournement
+      # donné aux utilisateurs bloqués — le signer aussi est le but même.
+      - name: Sign Windows binaries (si le certificat est présent)
+        if: runner.os == 'Windows' && env.WIN_SIGN_CERT_BASE64 != ''
+        env:
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+
+          # signtool vit dans le SDK Windows, à une version près : prendre la
+          # plus récente plutôt que figer un chemin qui cassera à la prochaine
+          # image de runner.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+
+          $targets = @("target\${{ matrix.target }}\release\tune-server.exe")
+          if (Test-Path "target\${{ matrix.target }}\release\airplay-daemon.exe") {
+            $targets += "target\${{ matrix.target }}\release\airplay-daemon.exe"
+          }
+
+          foreach ($t in $targets) {
+            # /tr = horodatage : c'est lui qui fait qu'une signature reste
+            # valide APRÈS l'expiration du certificat. Sans lui, tout ce qui a
+            # été publié deviendrait non signé le jour de l'expiration.
+            & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+              /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 /v $t
+            if ($LASTEXITCODE -ne 0) { throw "échec de signature : $t" }
+            & $signtool.FullName verify /pa /v $t
+            if ($LASTEXITCODE -ne 0) { throw "signature invalide : $t" }
+          }
+          Remove-Item $pfx -Force
+
       - name: Package (windows zip)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -379,6 +434,27 @@ jobs:
           SectionEnd
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
+
+      # L'installeur porte sa propre signature, distincte de celle du binaire
+      # qu'il contient : c'est CE fichier que l'utilisateur double-clique, et
+      # donc celui que SmartScreen juge en premier.
+      - name: Sign Windows installer (si le certificat est présent)
+        if: runner.os == 'Windows' && env.WIN_SIGN_CERT_BASE64 != ''
+        env:
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+          & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+            /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 /v "${{ env.ARTIFACT }}-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "échec de signature de l'installeur" }
+          & $signtool.FullName verify /pa /v "${{ env.ARTIFACT }}-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signature d'installeur invalide" }
+          Remove-Item $pfx -Force
 
       # The keychain is set up before "Package (unix)" so the tarball binaries
       # get signed too — the DMG below reuses it.
