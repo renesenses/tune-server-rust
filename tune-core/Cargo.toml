@@ -20,6 +20,7 @@ socket2 = { workspace = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
+image = { workspace = true }
 zip = { workspace = true }
 realfft = "3"
 rayon = { workspace = true }

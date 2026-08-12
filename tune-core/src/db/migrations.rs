@@ -1126,21 +1126,22 @@ fn merge_scattered_compilations(db: &SqliteDb) {
         // (mesuré sur .18 : 41 dossiers → 4 pochettes → 4 volumes).
         let mut partitions: Vec<Vec<usize>> = Vec::new();
         for cluster in clusters.iter().filter(|c| c.len() > 1) {
-            let mut par_pochette: HashMap<Option<String>, Vec<usize>> = HashMap::new();
-            for &i in cluster {
-                let empreinte = crate::scanner::compilation::folder_cover_fingerprint(&albums[i].1);
-                par_pochette.entry(empreinte).or_default().push(i);
-            }
+            let empreintes: Vec<_> = cluster
+                .iter()
+                .map(|&i| crate::scanner::compilation::folder_cover_fingerprint(&albums[i].1))
+                .collect();
+            let (groupes, sans_pochette) = crate::scanner::compilation::group_by_cover(&empreintes);
             // Sans pochette, aucune séparation possible : la grappe reste
             // entière et c'est le chevauchement des numéros qui tranchera.
-            for (empreinte, membres) in par_pochette {
-                if empreinte.is_none() && membres.len() < cluster.len() {
-                    // Des dossiers sans pochette au milieu d'autres qui en ont :
-                    // on ne devine pas à quel volume les rattacher.
-                    continue;
-                }
+            // Mais des dossiers sans pochette au milieu d'autres qui en ont ne
+            // se rattachent à rien : on ne devine pas à quel volume ils vont.
+            if sans_pochette.len() == cluster.len() && cluster.len() > 1 {
+                partitions.push(cluster.clone());
+                continue;
+            }
+            for membres in groupes {
                 if membres.len() > 1 {
-                    partitions.push(membres);
+                    partitions.push(membres.into_iter().map(|k| cluster[k]).collect());
                 }
             }
         }
@@ -1212,10 +1213,10 @@ fn merge_scattered_compilations(db: &SqliteDb) {
 /// Une piste dont le dossier n'a pas de pochette ne bouge pas : on ne devine
 /// pas à quel disque la rattacher.
 fn split_wrongly_merged_albums(db: &SqliteDb) {
-    use crate::scanner::compilation::folder_cover_fingerprint;
+    use crate::scanner::compilation::{CoverFingerprint, folder_cover_fingerprint, group_by_cover};
     use std::collections::HashMap;
 
-    // album -> empreinte -> pistes
+    // album -> dossier -> pistes
     let mut par_album: HashMap<i64, HashMap<String, Vec<i64>>> = HashMap::new();
     {
         let conn = db.connection().lock().unwrap();
@@ -1238,26 +1239,59 @@ fn split_wrongly_merged_albums(db: &SqliteDb) {
             let Some(folder) = crate::scanner::album_folder::album_folder(&path) else {
                 continue;
             };
-            let Some(empreinte) = folder_cover_fingerprint(&folder) else {
-                continue;
-            };
             par_album
                 .entry(album_id)
                 .or_default()
-                .entry(empreinte)
+                .entry(folder)
                 .or_default()
                 .push(track_id);
         }
     }
 
+    // Une pochette se décode UNE fois par dossier, pas une fois par piste :
+    // .18 compte 49 000 pistes pour 2 300 albums, soit vingt fois trop de
+    // décodages JPEG si l'on interrogeait le disque piste à piste.
+    let mut empreintes: HashMap<&str, Option<CoverFingerprint>> = HashMap::new();
+    for dossiers in par_album.values() {
+        for dossier in dossiers.keys() {
+            empreintes
+                .entry(dossier.as_str())
+                .or_insert_with(|| folder_cover_fingerprint(dossier));
+        }
+    }
+
     let mut separes = 0usize;
-    for (album_id, groupes) in par_album {
+    for (album_id, par_dossier) in &par_album {
+        if par_dossier.len() < 2 {
+            continue;
+        }
+        // Ordre déterminé par le nom du dossier : l'itération d'une table de
+        // hachage ne l'est pas, et c'est elle qui décide quel groupe garde la
+        // ligne d'origine en cas d'égalité de taille.
+        let mut dossiers: Vec<&String> = par_dossier.keys().collect();
+        dossiers.sort();
+        let cles: Vec<Option<CoverFingerprint>> = dossiers
+            .iter()
+            .map(|d| empreintes.get(d.as_str()).copied().flatten())
+            .collect();
+        // Les dossiers sans pochette ne bougent pas : ils restent sur la ligne
+        // d'origine, faute de savoir à quel disque les rattacher.
+        let (groupes, _sans_pochette) = group_by_cover(&cles);
         if groupes.len() < 2 {
             continue;
         }
         // Le plus gros groupe garde la ligne d'origine.
-        let mut groupes: Vec<(String, Vec<i64>)> = groupes.into_iter().collect();
-        groupes.sort_by_key(|(_, pistes)| std::cmp::Reverse(pistes.len()));
+        let mut groupes: Vec<Vec<i64>> = groupes
+            .into_iter()
+            .map(|membres| {
+                membres
+                    .into_iter()
+                    .flat_map(|k| par_dossier[dossiers[k]].iter().copied())
+                    .collect()
+            })
+            .collect();
+        groupes.sort_by_key(|pistes| std::cmp::Reverse(pistes.len()));
+        let album_id = *album_id;
         let conn = db.connection().lock().unwrap();
         let Ok((titre, artist_id, year)) = conn.query_row(
             "SELECT title, artist_id, year FROM albums WHERE id = ?",
@@ -1272,7 +1306,7 @@ fn split_wrongly_merged_albums(db: &SqliteDb) {
         ) else {
             continue;
         };
-        for (_, pistes) in groupes.iter().skip(1) {
+        for pistes in groupes.iter().skip(1) {
             let params: [&dyn rusqlite::types::ToSql; 3] = [&titre, &artist_id, &year];
             if conn
                 .execute(
@@ -2572,21 +2606,26 @@ mod tests {
 
         // Trois artistes du volume 1 (pistes 1, 2, 3) et deux du volume 2
         // (pistes 1, 2) : les numéros se chevauchent d'un volume à l'autre.
-        let volumes: [(&str, &[(&str, i64)]); 2] = [
-            (
-                "IMAGE-VOLUME-1",
-                &[("Diane", 1), ("Gatien", 2), ("Loup Blaster", 3)],
-            ),
-            (
-                "IMAGE-VOLUME-2",
-                &[("Tristan Savoie", 1), ("Ma Fraisse", 2)],
-            ),
+        let volumes: [(u32, &[(&str, i64)]); 2] = [
+            (1, &[("Diane", 1), ("Gatien", 2), ("Loup Blaster", 3)]),
+            (2, &[("Tristan Savoie", 1), ("Ma Fraisse", 2)]),
         ];
-        for (image, membres) in volumes {
+        for (volume, membres) in volumes {
             for (artiste, piste) in membres {
                 let folder = dir.path().join(artiste).join("ALLOPOP");
                 std::fs::create_dir_all(&folder).unwrap();
-                std::fs::write(folder.join("cover.jpg"), image.as_bytes()).unwrap();
+                // Chaque dossier reçoit la pochette de son volume RÉ-ENCODÉE :
+                // Qobuz ne livre pas deux fois le même fichier, et c'est
+                // précisément ce qui trompait la comparaison par octets.
+                std::fs::write(
+                    folder.join("cover.jpg"),
+                    crate::scanner::compilation::pochette_de_test(
+                        volume,
+                        96,
+                        60 + (*piste as u8) * 8,
+                    ),
+                )
+                .unwrap();
                 let folder = folder.to_str().unwrap().to_string();
                 let conn = db.connection().lock().unwrap();
                 conn.execute(
@@ -2640,7 +2679,11 @@ mod tests {
             let conn = db.connection().lock().unwrap();
             let premier = dir.path().join("Diane").join("ALLOPOP");
             std::fs::create_dir_all(&premier).unwrap();
-            std::fs::write(premier.join("cover.jpg"), b"IMAGE-VOL-0").unwrap();
+            std::fs::write(
+                premier.join("cover.jpg"),
+                crate::scanner::compilation::pochette_de_test(0, 96, 90),
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO albums (title, folder_path) VALUES ('ALLOPOP', ?)",
                 rusqlite::params![premier.to_string_lossy()],
@@ -2656,7 +2699,11 @@ mod tests {
         ] {
             let d = dir.path().join(artiste).join("ALLOPOP");
             std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("cover.jpg"), format!("IMAGE-VOL-{vol}")).unwrap();
+            std::fs::write(
+                d.join("cover.jpg"),
+                crate::scanner::compilation::pochette_de_test(vol as u32, 96, 90),
+            )
+            .unwrap();
             let conn = db.connection().lock().unwrap();
             conn.execute(
                 "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
