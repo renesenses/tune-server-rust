@@ -196,6 +196,13 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // sound comes back").
     let is_browser_zone =
         zone_db.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
+    // Où va le son — même champ que GET /zones et GET /zones/{id} (#1499).
+    if let Some(ref zone) = zone_db {
+        v.as_object_mut().unwrap().insert(
+            "output_reach".into(),
+            json!(crate::routes::zones::output_reach(state, zone, &zone_state).await),
+        );
+    }
     if is_browser_zone {
         if let Some(ref np) = zone_state.now_playing {
             if let Some(ref stream_id) = np.stream_id {
