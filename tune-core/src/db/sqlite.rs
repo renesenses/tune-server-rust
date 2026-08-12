@@ -226,6 +226,31 @@ impl SqliteDb {
             .map_err(|e| format!("execute: {e}"))
     }
 
+    /// Replier le WAL dans la base et le tronquer.
+    ///
+    /// À appeler **avant** que le processus ne soit remplacé ou ne meure : une
+    /// mise à jour se termine par un `exec()` qui écrase l'image sans dérouler
+    /// aucun destructeur, et l'arrêt peut se solder par un SEGV quand
+    /// onnxruntime est chargé (#1462). Dans les deux cas le WAL reste sur le
+    /// disque, et la cohérence dépend alors d'une reprise correcte et d'un
+    /// passage de verrous qu'on ne contrôle pas.
+    ///
+    /// Un checkpoint TRUNCATE ramène le cas au plus simple : plus rien à
+    /// rejouer. Ça ne prouve pas la cause de la corruption du 10 août — elle
+    /// reste inexpliquée — mais ça retire la fenêtre où elle pouvait se
+    /// produire, ce qui vaut mieux qu'une explication.
+    ///
+    /// Silencieux en cas d'échec : c'est une précaution de fin de vie, jamais
+    /// une raison d'empêcher un arrêt ou une mise à jour d'aboutir.
+    pub fn checkpoint(&self) {
+        if let Ok(conn) = self.conn.lock() {
+            match conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                Ok(()) => tracing::info!("sqlite_checkpoint_before_exit"),
+                Err(e) => tracing::warn!(error = %e, "sqlite_checkpoint_failed"),
+            }
+        }
+    }
+
     pub fn execute_batch(&self, sql: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(sql).map_err(|e| format!("batch: {e}"))
