@@ -6,7 +6,7 @@ use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager, State, WebviewUrl, WebviewWindowBuilder,
+    Manager, State,
 };
 use tokio::sync::RwLock;
 
@@ -16,6 +16,10 @@ struct AppState {
     http: reqwest::Client,
 }
 
+/// Shape of the `/api/v1/widget/data` payload. Kept as the written record of
+/// what the endpoint returns, even though the code currently forwards the raw
+/// JSON: deleting it would lose the only place that documents the contract.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 struct WidgetData {
     zones: Vec<serde_json::Value>,
@@ -167,20 +171,38 @@ async fn get_server_url(state: State<'_, AppState>) -> Result<String, String> {
 
 #[tauri::command]
 async fn http_get(state: State<'_, AppState>, url: String) -> Result<serde_json::Value, String> {
-    state.http.get(&url).send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())
+    state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn http_post(state: State<'_, AppState>, url: String) -> Result<(), String> {
-    state.http.post(&url).send().await.map_err(|e| e.to_string())?;
+    state
+        .http
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 async fn http_put(state: State<'_, AppState>, url: String, body: String) -> Result<(), String> {
-    state.http.put(&url).header("Content-Type", "application/json").body(body)
-        .send().await.map_err(|e| e.to_string())?;
+    state
+        .http
+        .put(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -222,6 +244,11 @@ enum ShortcutAction {
     Prev,
     VolUp,
     VolDown,
+    /// Bascule mini ↔ complet. Un raccourci global, parce que la fenêtre
+    /// complète affiche l'interface du serveur : on ne peut pas y greffer de
+    /// bouton depuis le widget, et le menu de la barre système suppose qu'on
+    /// sache qu'il existe.
+    ToggleMode,
 }
 
 const SHORTCUTS: &[(&str, ShortcutAction)] = &[
@@ -230,6 +257,7 @@ const SHORTCUTS: &[(&str, ShortcutAction)] = &[
     ("CmdOrCtrl+Shift+Left", ShortcutAction::Prev),
     ("CmdOrCtrl+Shift+Up", ShortcutAction::VolUp),
     ("CmdOrCtrl+Shift+Down", ShortcutAction::VolDown),
+    ("CmdOrCtrl+Shift+M", ShortcutAction::ToggleMode),
 ];
 
 async fn fetch_widget_data(
@@ -252,6 +280,12 @@ async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
     let zone_id = *state.active_zone_id.read().await;
     let http = state.http.clone();
     match action {
+        // Seule action qui ne parle pas au serveur : elle doit fonctionner même
+        // quand il ne répond pas.
+        ShortcutAction::ToggleMode => {
+            let full = !full_mode_active(&app);
+            set_full_mode(&app, full).await;
+        }
         ShortcutAction::Next => {
             let _ = http
                 .post(format!("{url}/api/v1/zones/{zone_id}/next"))
@@ -279,8 +313,16 @@ async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
             if let Some(data) = fetch_widget_data(&http, &url, zone_id).await {
                 // widget/data reports volume as 0..1 or 0..100 depending on zone.
                 let vol = data["volume"].as_f64().unwrap_or(0.5);
-                let current = if vol > 1.0 { vol as i32 } else { (vol * 100.0) as i32 };
-                let delta = if matches!(action, ShortcutAction::VolUp) { 5 } else { -5 };
+                let current = if vol > 1.0 {
+                    vol as i32
+                } else {
+                    (vol * 100.0) as i32
+                };
+                let delta = if matches!(action, ShortcutAction::VolUp) {
+                    5
+                } else {
+                    -5
+                };
                 let next = (current + delta).clamp(0, 100);
                 let _ = http
                     .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
@@ -292,10 +334,357 @@ async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
     }
 }
 
+/// True if an HTTP server answers at `url` (any response, even an error status,
+/// means the port is up).
+async fn server_reachable(http: &reqwest::Client, url: &str) -> bool {
+    http.get(url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Ensure a tune-server is running. If nothing answers on the configured URL,
+/// spawn the bundled `tune-server` sidecar (Windows installer ships it) and wait
+/// up to ~30 s for it to come up. On a macOS dev build with no bundled sidecar,
+/// the spawn fails gracefully and the widget just uses a separately-started
+/// server.
+async fn ensure_server_running(app: tauri::AppHandle) {
+    use tauri_plugin_shell::ShellExt;
+    let http = app.state::<AppState>().http.clone();
+    let url = app.state::<AppState>().server_url.read().await.clone();
+    if server_reachable(&http, &url).await {
+        return;
+    }
+    match app.shell().sidecar("tune-server").and_then(|c| c.spawn()) {
+        Ok(_) => tracing::info!("tune_server_sidecar_spawned"),
+        Err(e) => {
+            tracing::warn!(error = %e, "tune_server_sidecar_unavailable");
+            return;
+        }
+    }
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if server_reachable(&http, &url).await {
+            tracing::info!("tune_server_ready");
+            return;
+        }
+    }
+    tracing::warn!("tune_server_start_timeout");
+}
+
+/// Ouvre un journal sur disque, à côté de la configuration.
+///
+/// Sans lui, `tracing` était déclaré mais aucun abonné n'était installé : tous
+/// les messages du programme partaient à la poubelle. Un échec au démarrage —
+/// typiquement le WebView2 absent sous Windows, qui laisse le processus vivant
+/// sans jamais ouvrir de fenêtre — ne laissait donc aucune trace, et le testeur
+/// n'avait rien à envoyer (retour Sandro).
+///
+/// Renvoie le chemin du journal et la garde du writer, qui doit vivre aussi
+/// longtemps que le programme sous peine de perdre les derniers messages.
+fn init_logging() -> Option<(
+    std::path::PathBuf,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    let dir = dirs::config_dir()?.join("tune-widget");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("tune-widget.log");
+
+    // Repart de zéro au-delà de 1 Mo : un widget qui tourne des semaines ne doit
+    // pas remplir le disque, et seul le dernier démarrage sert au diagnostic.
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(&path).ok();
+    }
+
+    let (writer, guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::never(&dir, "tune-widget.log"));
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(writer)
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
+    Some((path, guard))
+}
+
+/// Bascule mini ↔ complet depuis l'interface elle-même.
+///
+/// Le menu de la barre système la proposait déjà, mais il faut savoir qu'il
+/// existe : le seul endroit où l'utilisateur regarde, c'est la fenêtre qu'il a
+/// sous les yeux (Sandro).
+#[tauri::command]
+async fn set_display_mode(app: tauri::AppHandle, full: bool) -> Result<(), String> {
+    set_full_mode(&app, full).await;
+    Ok(())
+}
+
+/// First server version whose web interface has the `?mini=1` layout
+/// (tune-web-client `MiniPlayer.svelte`, shipped in v0.9.64).
+const MINI_LAYOUT_MIN_VERSION: (u32, u32, u32) = (0, 9, 64);
+
+fn parse_version(raw: &str) -> Option<(u32, u32, u32)> {
+    // "0.9.64", "v0.9.64", "0.9.64-rc1" — the pre-release suffix is ignored:
+    // an rc of a supporting version supports it too.
+    let cleaned = raw.trim().trim_start_matches('v');
+    let core = cleaned.split(['-', '+']).next()?;
+    let mut it = core.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Does the server's own web interface provide the mini layout?
+///
+/// The answer decides between one window and two. It must be a real question
+/// asked of the running server, not an assumption: Sandro points his widget at
+/// a GentooPlayer on another machine, which upgrades on its own schedule. Get
+/// this wrong and `?mini=1` returns the full interface crammed into 320 px —
+/// worse than what the widget does today.
+///
+/// Anything unclear — unreachable, unparseable, missing field — answers `false`
+/// and keeps the current two-window behaviour. The fallback has to be the one
+/// that already works.
+async fn server_has_mini_layout(http: &reqwest::Client, url: &str) -> bool {
+    let resp = match http
+        .get(format!("{url}/api/v1/system/version"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::info!(url = %url, error = %e, "mini_layout_probe_failed_keeping_two_windows");
+            return false;
+        }
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::info!(url = %url, error = %e, "mini_layout_probe_unparseable");
+            return false;
+        }
+    };
+    let raw = body
+        .get("version")
+        .or_else(|| body.get("server_version"))
+        .and_then(|v| v.as_str());
+    let Some(parsed) = raw.and_then(parse_version) else {
+        tracing::info!(url = %url, body = %body, "mini_layout_probe_no_version_field");
+        return false;
+    };
+    let supported = parsed >= MINI_LAYOUT_MIN_VERSION;
+    tracing::info!(
+        url = %url,
+        version = ?parsed,
+        supported,
+        "mini_layout_probe"
+    );
+    supported
+}
+
+/// Point the single window at one layout or the other.
+///
+/// Returns `false` when the unified path is not available, so the caller can
+/// fall back to the two-window behaviour.
+async fn navigate_unified(app: &tauri::AppHandle, full: bool) -> bool {
+    let (url, http) = {
+        let state = app.state::<AppState>();
+        let url = state.server_url.read().await.clone();
+        (url, state.http.clone())
+    };
+    if !server_has_mini_layout(&http, &url).await {
+        return false;
+    }
+    let target = if full {
+        url.clone()
+    } else {
+        format!("{url}/?mini=1")
+    };
+    let parsed = match target.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(url = %target, error = %e, "unified_bad_url");
+            return false;
+        }
+    };
+    // Reuse the "full" window as THE window: it already exists with the right
+    // close-to-hide behaviour, and it is the one that talks to the server.
+    open_full_window(app).await;
+    let Some(win) = app.get_webview_window("full") else {
+        return false;
+    };
+    if let Err(e) = win.navigate(parsed) {
+        tracing::warn!(url = %target, error = %e, "unified_navigate_failed");
+        return false;
+    }
+    // The two layouts want very different windows. Mini stays on top and out of
+    // the taskbar, like the widget it replaces; full behaves like an app.
+    let (w, h) = if full {
+        (1200.0, 800.0)
+    } else {
+        (380.0, 560.0)
+    };
+    let _ = win.set_size(tauri::LogicalSize::new(w, h));
+    let _ = win.set_resizable(full);
+    let _ = win.set_always_on_top(!full);
+    let _ = win.set_skip_taskbar(!full);
+    let _ = win.set_decorations(true);
+    let _ = win.show();
+    let _ = win.set_focus();
+    // The bundled mini window has no reason to exist in this mode.
+    if let Some(mini) = app.get_webview_window("main") {
+        let _ = mini.hide();
+    }
+    tracing::info!(full, "unified_window_mode");
+    true
+}
+
+/// Switch between the two modes without ever reloading either one.
+///
+/// Both windows stay alive: showing one hides the other. That is the whole
+/// point of keeping two windows at this stage — morphing a single one would
+/// mean navigating between the bundled mini interface and the server's URL,
+/// and every toggle would cost a reload and lose scroll, search and view.
+/// (Once the mini player becomes a layout of the web client, one window that
+/// resizes becomes the better design — that is step 3, not this one.)
+async fn set_full_mode(app: &tauri::AppHandle, full: bool) {
+    // Step 4: one window that switches layout, when the server can serve both.
+    // Falls back to the two-window design below on an older server.
+    if navigate_unified(app, full).await {
+        remember_mode(full);
+        return;
+    }
+    if full {
+        open_full_window(app).await;
+        if let Some(mini) = app.get_webview_window("main") {
+            let _ = mini.hide();
+        }
+    } else {
+        if let Some(win) = app.get_webview_window("full") {
+            let _ = win.hide();
+        }
+        if let Some(mini) = app.get_webview_window("main") {
+            let _ = mini.show();
+            let _ = mini.set_focus();
+        }
+    }
+    remember_mode(full);
+}
+
+/// Which window a tray left-click should act on: the one the user last chose.
+fn full_mode_active(app: &tauri::AppHandle) -> bool {
+    app.get_webview_window("full")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false)
+}
+
+/// Persist the chosen mode next to the server URL, so a restart comes back the
+/// way it was left rather than always in mini.
+fn remember_mode(full: bool) {
+    let Some(dir) = dirs::config_dir() else {
+        return;
+    };
+    let dir = dir.join("tune-widget");
+    let file = dir.join("config.json");
+    let mut cfg: serde_json::Value = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    cfg["full_mode"] = serde_json::json!(full);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&file, cfg.to_string());
+    }
+}
+
+fn saved_full_mode() -> bool {
+    dirs::config_dir()
+        .map(|d| d.join("tune-widget").join("config.json"))
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+        .and_then(|c| c["full_mode"].as_bool())
+        .unwrap_or(false)
+}
+
+/// Open (or focus) the full Tune interface in a real application window.
+///
+/// The interface is NOT bundled: the window loads the server's own web UI over
+/// http. That is deliberate — bundling would mean republishing the app on every
+/// web change and, worse, shipping a UI that can drift from the API of the
+/// server it drives. Sandro points his widget at a GentooPlayer on another
+/// machine, so that drift is a certainty, not a risk.
+///
+/// It also replaces what this menu entry used to do: hand the URL to the
+/// system browser, hardcoded to `localhost:8888` — the wrong machine entirely
+/// for anyone whose server is not the desktop.
+async fn open_full_window(app: &tauri::AppHandle) {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    if let Some(win) = app.get_webview_window("full") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return;
+    }
+
+    let url = {
+        let state = app.state::<AppState>();
+        let guard = state.server_url.read().await;
+        guard.clone()
+    };
+    let parsed = match url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(url = %url, error = %e, "full_window_bad_server_url");
+            return;
+        }
+    };
+
+    match WebviewWindowBuilder::new(app, "full", WebviewUrl::External(parsed))
+        .title("Tune")
+        .inner_size(1200.0, 800.0)
+        .min_inner_size(900.0, 600.0)
+        .resizable(true)
+        .decorations(true)
+        .build()
+    {
+        Ok(win) => {
+            // Closing hides instead of destroying: the web interface stays
+            // loaded, so coming back is instant and nothing is lost. Quitting
+            // is the tray menu's job, as it already was.
+            let handle = win.clone();
+            win.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = handle.hide();
+                }
+            });
+            tracing::info!(url = %url, "full_window_opened");
+        }
+        Err(e) => tracing::error!(url = %url, error = %e, "full_window_open_failed"),
+    }
+}
+
 fn main() {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-    tauri::Builder::default()
+    // En tout premier : ce qui échoue ensuite doit laisser une trace.
+    // La garde est conservée jusqu'à la fin de main, sinon les derniers
+    // messages seraient perdus à l'extinction.
+    let _log_guard = init_logging().map(|(path, guard)| {
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            journal = %path.display(),
+            "tune_widget_starting"
+        );
+        guard
+    });
+
+    let run = tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -328,6 +717,10 @@ fn main() {
                     }
                 }
             }
+            // L'URL retenue explique à elle seule le cas « le widget a lancé un
+            // serveur local » : ensure_server_running ne démarre le sidecar que
+            // si cette adresse ne répond pas.
+            tracing::info!(server_url = %saved_url, "server_url_resolved");
             AppState {
                 server_url: RwLock::new(saved_url),
                 active_zone_id: RwLock::new(1),
@@ -352,6 +745,7 @@ fn main() {
             http_get,
             http_post,
             http_put,
+            set_display_mode,
         ])
         .setup(|app| {
             // Hide from Dock on macOS (accessory app)
@@ -363,8 +757,10 @@ fn main() {
             // Tray menu
             let quit = MenuItem::with_id(app, "quit", "Quitter", true, None::<&str>)?;
             let open_web =
-                MenuItem::with_id(app, "open_web", "Ouvrir Tune Web", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_web, &quit])?;
+                MenuItem::with_id(app, "open_web", "Fenêtre complète", true, None::<&str>)?;
+            let open_mini =
+                MenuItem::with_id(app, "open_mini", "Mini-lecteur", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_web, &open_mini, &quit])?;
 
             let tray_icon_bytes = include_bytes!("../icons/tray-icon.png");
             let tray_img = tauri::image::Image::from_bytes(tray_icon_bytes).expect("tray icon");
@@ -377,25 +773,61 @@ fn main() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => app.exit(0),
                     "open_web" => {
-                        let _ = tauri_plugin_shell::ShellExt::shell(app)
-                            .open("http://localhost:8888", None);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            ensure_server_running(app.clone()).await;
+                            set_full_mode(&app, true).await;
+                        });
+                    }
+                    "open_mini" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            set_full_mode(&app, false).await;
+                        });
                     }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
+                    // `button_state` matters: a tray Click fires TWICE per
+                    // physical click — once on press, once on release. Matching
+                    // both ran this handler twice, so the window was shown and
+                    // hidden again within the same click and nothing appeared.
+                    // Clicking repeatedly "worked" only when the timing left it
+                    // on the visible half (Sandro, 9 Aug 2026: "je dois cliquer
+                    // de façon répétée et frénétique"). Acting on release only
+                    // gives exactly one toggle per click.
                     if let tauri::tray::TrayIconEvent::Click {
                         button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
                         ..
                     } = event
                     {
+                        // Act on the window of the CURRENT mode: someone who
+                        // chose the full window expects the tray icon to bring
+                        // that back, not the mini player they left behind.
                         let app = tray.app_handle();
-                        if let Some(win) = app.get_webview_window("main") {
-                            if win.is_visible().unwrap_or(false) {
+                        let label = if full_mode_active(app) { "full" } else { "main" };
+                        let visible = app
+                            .get_webview_window(label)
+                            .and_then(|w| w.is_visible().ok())
+                            .unwrap_or(false);
+                        if visible {
+                            if let Some(win) = app.get_webview_window(label) {
                                 let _ = win.hide();
-                            } else {
-                                let _ = win.show();
-                                let _ = win.set_focus();
                             }
+                        } else {
+                            // Showing goes through set_full_mode rather than
+                            // straight to the window: that is where the server
+                            // is asked whether it can serve both layouts. A
+                            // widget started before its server was up therefore
+                            // still lands on the unified window at the first
+                            // click, instead of being stuck on the bundled mini
+                            // until the next toggle.
+                            let h = app.clone();
+                            let full = saved_full_mode();
+                            tauri::async_runtime::spawn(async move {
+                                set_full_mode(&h, full).await;
+                            });
                         }
                     }
                 })
@@ -417,8 +849,69 @@ fn main() {
                 }
             }
 
+            // Come back in the mode the user left, rather than always in mini.
+            if saved_full_mode() {
+                let h = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    ensure_server_running(h.clone()).await;
+                    set_full_mode(&h, true).await;
+                });
+            }
+
+            // Auto-start the server on launch so opening the widget = Tune runs
+            // (single-installer launcher UX on Windows). No-op if already up.
+            tauri::async_runtime::spawn(ensure_server_running(app.handle().clone()));
+
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error running tune-widget");
+        .run(tauri::generate_context!());
+
+    // Un échec ici est le cas qu'on cherchait justement à instrumenter : sous
+    // Windows, une fenêtre qui ne s'ouvre pas vient presque toujours du runtime
+    // WebView2 absent. `expect` paniquait vers une sortie d'erreur qu'une
+    // application graphique n'affiche à personne.
+    if let Err(e) = run {
+        tracing::error!(
+            error = %e,
+            "widget_run_failed : impossible de démarrer l'interface. Sous Windows, \
+             vérifier que « Microsoft Edge WebView2 Runtime » est installé."
+        );
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_version, MINI_LAYOUT_MIN_VERSION};
+
+    #[test]
+    fn parses_the_shapes_a_server_actually_returns() {
+        assert_eq!(parse_version("0.9.64"), Some((0, 9, 64)));
+        assert_eq!(parse_version("v0.9.64"), Some((0, 9, 64)));
+        assert_eq!(parse_version(" 0.9.64 "), Some((0, 9, 64)));
+        // A pre-release of a supporting version supports it too.
+        assert_eq!(parse_version("0.9.64-rc1"), Some((0, 9, 64)));
+        assert_eq!(parse_version("0.9.64+build7"), Some((0, 9, 64)));
+        // Two components: patch defaults to 0 rather than failing.
+        assert_eq!(parse_version("1.0"), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_read() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("unknown"), None);
+        assert_eq!(parse_version("0.x.1"), None);
+    }
+
+    #[test]
+    fn the_threshold_sits_where_the_mini_layout_shipped() {
+        // Below: the widget must keep its bundled mini window, because
+        // `?mini=1` on those servers returns the full interface.
+        assert!(parse_version("0.9.63").unwrap() < MINI_LAYOUT_MIN_VERSION);
+        assert!(parse_version("0.8.99").unwrap() < MINI_LAYOUT_MIN_VERSION);
+        // At and above: the server can serve both layouts.
+        assert!(parse_version("0.9.64").unwrap() >= MINI_LAYOUT_MIN_VERSION);
+        assert!(parse_version("0.9.70").unwrap() >= MINI_LAYOUT_MIN_VERSION);
+        assert!(parse_version("1.0.0").unwrap() >= MINI_LAYOUT_MIN_VERSION);
+    }
 }

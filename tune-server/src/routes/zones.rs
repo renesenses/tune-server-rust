@@ -587,14 +587,7 @@ fn zone_eq_alters_signal(
 ) -> bool {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
     // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
-    let pure = settings
-        .get(&format!("zone_{zone_id}_audiophile"))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
-        .unwrap_or(false);
-    if pure {
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return false;
     }
     let Some(profile) = settings
