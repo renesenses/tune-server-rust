@@ -746,6 +746,7 @@ mod tests {
         let mut state = ZoneState {
             zone_id: 1,
             state: PlayState::Playing,
+            resolving: false,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),
