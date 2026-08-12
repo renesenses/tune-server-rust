@@ -60,7 +60,8 @@ const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
 /// on a busy link that starves the same disk/network the player reads from,
 /// stalling the audio pipeline (#1310, « la musique s'arrête au premier
 /// morceau »). The pass yields entirely while anything plays, then rechecks.
-const PLAYBACK_BACKOFF_SECS: u64 = 30;
+/// Shared with the audio-embedding sweep (#1515), which obeys the same rule.
+pub(crate) const PLAYBACK_BACKOFF_SECS: u64 = 30;
 
 /// The 12 B/sample estimate above, from the DB columns the scan filled.
 /// Unknown rate/channels fall back to CD stereo; unknown duration returns 0
@@ -140,8 +141,10 @@ fn enabled(settings: &SettingsRepo) -> bool {
 /// must yield to playback (#1310): decoding whole files — often over a network
 /// mount — otherwise saturates the same disk/network the player reads from and
 /// stalls audio. Fails open (returns `false`) on a query error so a DB hiccup
-/// can never freeze the sweep permanently.
-fn any_zone_playing(backend: &Arc<dyn DbBackend>) -> bool {
+/// can never freeze the sweep permanently. Shared with the audio-embedding
+/// sweep (#1515), which must yield for the same reason and then some: its
+/// batches also run multi-threaded ONNX inference on top of the decode.
+pub(crate) fn any_zone_playing(backend: &Arc<dyn DbBackend>) -> bool {
     matches!(
         backend.query_one(
             "SELECT 1 FROM zones WHERE last_play_state = 'playing' LIMIT 1",
@@ -590,6 +593,31 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le garde-fou lecture partagé par les deux sweeps (#1310, #1515) : il lit
+    /// `zones.last_play_state` et doit tomber en panne OUVERTE (false) si la
+    /// table manque, pour ne jamais geler l'analyse sur un hoquet de base.
+    #[test]
+    fn any_zone_playing_reads_last_play_state_and_fails_open() {
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+
+        // Table absente → erreur de requête → false (panne ouverte).
+        assert!(!any_zone_playing(&backend));
+
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, last_play_state TEXT);
+             INSERT INTO zones (id, last_play_state) VALUES (1, 'stopped'), (2, 'paused');",
+        )
+        .unwrap();
+        assert!(!any_zone_playing(&backend));
+
+        db.execute_batch("UPDATE zones SET last_play_state = 'playing' WHERE id = 2;")
+            .unwrap();
+        assert!(any_zone_playing(&backend));
+    }
 
     /// #1330 : la cadence DSD brute etait prise pour une cadence PCM, ce qui
     /// gonflait l'estimation d'un facteur 16 a 32 et ecartait TOUT fichier DSD
