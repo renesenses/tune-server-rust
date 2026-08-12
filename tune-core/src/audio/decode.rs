@@ -504,8 +504,11 @@ fn decode_opus_to_pcm(
     // 120 ms is the largest Opus frame @ 48 kHz (5760 samples/channel).
     let mut out_buf = vec![0i16; 5760 * ch];
     let mut samples_i32: Vec<i32> = Vec::new();
+    // `as usize` saturates the f64 (e.g. `f64::MAX` from the converter's
+    // "decode everything" call); the multiply must saturate too or debug
+    // builds panic on overflow.
     let max_samples = if max_duration_s > 0.0 {
-        (max_duration_s * 48000.0) as usize * ch
+        ((max_duration_s * 48000.0) as usize).saturating_mul(ch)
     } else {
         usize::MAX
     };
