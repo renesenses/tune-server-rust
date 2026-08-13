@@ -47,6 +47,10 @@ pub struct MediaServerInfo {
     pub location: String,
     pub content_directory_url: String,
     pub host: String,
+    /// Port extrait de la LOCATION — la page « Serveurs multimédia » du web
+    /// affiche `host:port` ; sans ce champ elle rendait « 192.168.1.41: »
+    /// (#1615).
+    pub port: u16,
 }
 
 #[derive(Debug)]
@@ -792,6 +796,7 @@ async fn process_responses(
                             location: resp.location.clone(),
                             content_directory_url: full_cd_url,
                             host,
+                            port,
                         };
                         // Record the media server as known so later SSDP cycles
                         // skip it (see the `!known` gate above). Renderers are

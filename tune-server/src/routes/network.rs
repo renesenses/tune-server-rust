@@ -129,6 +129,7 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 "manufacturer": ms.manufacturer,
                 "model": ms.model,
                 "host": ms.host,
+                "port": ms.port,
                 "location": ms.location,
             })
         })
