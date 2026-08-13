@@ -30,6 +30,20 @@ const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from
 /// lands far later — plays normally; a seek is exempt regardless.
 const RETAP_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Resuming a WEBRADIO after a pause longer than this is treated as a re-play
+/// of the station (new upstream connection, new decode session, new stream URL
+/// to the output) instead of resuming the paused pipeline. A radio stream is
+/// LIVE: while the zone is paused its pipeline keeps ageing — the icecast
+/// connection can die through debug-only exit paths, the output keeps
+/// buffering an unbounded backlog, and OAAT packet timestamps fall behind the
+/// endpoint clock by the whole pause — so a "resume" past a few seconds
+/// renders silence with nothing in the logs (#1629, .42: 19 min pause → total
+/// silence, volume changes ignored). Chosen ABOVE `DUPLICATE_NET_PLAY_WINDOW`
+/// (12 s) so the re-play issued here can never be coalesced as a duplicate
+/// net send; short pauses below the threshold keep today's working in-place
+/// resume.
+const RADIO_RESUME_REPLAY_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
 /// concurrent plays, keyed by source path. A burst of play taps for a
 /// slow-to-decode NAS track otherwise kicks off one full transcode each
@@ -2214,6 +2228,11 @@ impl PlaybackOrchestrator {
             } else {
                 None
             };
+            // Clone kept OUTSIDE the decode task: several of its exit paths
+            // (consumer dropped, reconnect give-up) only log at debug!, so in
+            // production the producer can die invisibly. The flag lets
+            // resume() detect that state and re-play the station (#1629).
+            let session_for_done = session.clone();
             tokio::spawn(async move {
                 // Download + decode in a blocking thread since symphonia and
                 // reqwest::blocking are both synchronous.
@@ -2221,6 +2240,12 @@ impl PlaybackOrchestrator {
                     decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, radio_levels_tx)
                 })
                 .await;
+
+                // Whatever the exit path — clean end, error or panic — nothing
+                // will produce PCM for this session anymore.
+                session_for_done
+                    .producer_done
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
                 match result {
                     Ok(Ok(())) => {
@@ -2309,6 +2334,10 @@ impl PlaybackOrchestrator {
                 } else {
                     None
                 };
+                // Même marquage que le chemin local/OAAT : resume() lit ce
+                // drapeau pour savoir que plus rien n'alimente la session et
+                // rejouer la station (#1629).
+                let session_for_done = session.clone();
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         decode_radio_stream_to_pcm(
@@ -2320,6 +2349,9 @@ impl PlaybackOrchestrator {
                         )
                     })
                     .await;
+                    session_for_done
+                        .producer_done
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     match result {
                         Ok(Ok(())) => debug!("radio_dlna_decode_stream_ended"),
                         Ok(Err(e)) => warn!(error = %e, "radio_dlna_decode_failed"),
@@ -6441,7 +6473,75 @@ impl PlaybackOrchestrator {
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
-        let position_ms = self.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+        let state = self.playback.get_state(zone_id).await;
+        let position_ms = state.position_ms.max(0) as u64;
+
+        // WEBRADIO : une reprise après une pause longue — ou après la mort du
+        // producteur de décodage — est traitée comme un RE-PLAY de la station
+        // (#1629). Un flux radio est un DIRECT : pendant la pause le pipeline
+        // continue de se périmer (la connexion icecast peut mourir par un
+        // chemin qui ne logge qu'en debug!, la sortie accumule un retard sans
+        // borne, les horodatages OAAT prennent toute la durée de la pause de
+        // retard) et la reprise « sur place » rend du silence sans la moindre
+        // erreur (.42 : pause 15:48 → reprise 16:07, aucun son, volume dans le
+        // vide). Rejouer dans CE chemin commun couvre les trois familles de
+        // sorties (locale, OAAT, réseau) — et c'est de toute façon le
+        // comportement attendu d'un direct : on reprend le direct, pas un
+        // différé de 19 minutes.
+        if let Some(np) = state.now_playing.as_ref() {
+            let has_url = np.source_id.as_deref().is_some_and(|s| !s.is_empty());
+            if np.source == "radio" && has_url {
+                let paused_long = state
+                    .paused_at
+                    .is_some_and(|t| t.elapsed() >= RADIO_RESUME_REPLAY_AFTER);
+                // Producteur mort même sous le seuil : plus rien n'alimente la
+                // session WAV, reprendre sur place serait silencieux aussi.
+                let producer_dead = match np.stream_id.as_deref() {
+                    Some(sid) => self.streamer.radio_producer_done(sid).await,
+                    None => false,
+                };
+                if paused_long || producer_dead {
+                    let did = device_id.map(str::to_string).or_else(|| {
+                        ZoneRepo::with_backend(self.db.clone())
+                            .get(zone_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|z| z.output_device_id)
+                    });
+                    if let Some(did) = did {
+                        info!(zone_id, paused_long, producer_dead, "radio_resume_replay");
+                        let req = PlayRequest {
+                            zone_id,
+                            output_device_id: Some(did),
+                            track_id: None,
+                            source: Some("radio".into()),
+                            source_id: np.source_id.clone(),
+                            title: Some(np.title.clone()),
+                            artist_name: np.artist_name.clone(),
+                            album_title: np.album_title.clone(),
+                            cover_url: np.cover_path.clone(),
+                            duration_ms: None,
+                            seek_ms: None,
+                            temp_file_path: None,
+                            sample_rate: None,
+                            bit_depth: None,
+                            media_format: None,
+                        };
+                        // Même station, même écoute logique : pas de nouvelle
+                        // ligne d'historique (même règle que radio_auto_retry).
+                        match self.play_without_history(req).await {
+                            Ok(_) => return,
+                            Err(e) => warn!(
+                                zone_id,
+                                error = %e,
+                                "radio_resume_replay_failed_falling_back"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
         self.playback.resume(zone_id).await;
 
         let Some(did) = device_id else { return };
@@ -8587,6 +8687,144 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    /// Régression #1629 — reprendre une webradio dont le PRODUCTEUR de
+    /// décodage est mort (connexion icecast tombée pendant la pause, chemin de
+    /// sortie sans log) doit déclencher un RE-PLAY de la station — un nouveau
+    /// `play_media` vers la sortie, comme au premier lancement — et non une
+    /// reprise « sur place » qui rend du silence.
+    #[tokio::test]
+    async fn resuming_a_radio_with_a_dead_producer_replays_the_station() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Zone Radio", Some("mock"), Some("mock-radio"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-radio", "Mock Radio")));
+
+        // Session radio dont le producteur s'est terminé (comme après
+        // `radio_reconnect_giving_up` ou un `consumer_dropped` silencieux).
+        let (sid, _tx, _ready, session) = orch
+            .streamer
+            .create_radio_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 48000,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                8,
+            )
+            .await;
+        session
+            .producer_done
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // La zone joue cette radio, puis est mise en pause (pause COURTE :
+        // c'est bien la mort du producteur qui doit déclencher le re-play).
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    source_id: Some("http://icecast.example/fip.aac".into()),
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.pause(zone_id).await;
+
+        orch.resume(zone_id, Some("mock-radio")).await;
+
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get("mock-radio").unwrap();
+        let guard = out.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            1,
+            "producteur mort ⇒ la reprise doit rejouer la station (nouveau play_media)"
+        );
+        // Et la zone doit repartir en lecture avec une NOUVELLE session de flux.
+        let state = orch.playback.get_state(zone_id).await;
+        let np = state.now_playing.expect("now_playing après re-play");
+        assert_eq!(np.source, "radio");
+    }
+
+    /// Contre-épreuve #1629 — pause courte ET producteur vivant : la reprise
+    /// reste une reprise sur place (aucun nouveau `play_media`), le
+    /// comportement d'aujourd'hui qui fonctionne.
+    #[tokio::test]
+    async fn resuming_a_radio_with_a_live_producer_after_a_short_pause_does_not_replay() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Zone Radio", Some("mock"), Some("mock-radio"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-radio", "Mock Radio")));
+
+        // Producteur VIVANT : le tx du décodeur est encore détenu (par le
+        // test) et `producer_done` reste false.
+        let (sid, _tx, _ready, _session) = orch
+            .streamer
+            .create_radio_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 48000,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                8,
+            )
+            .await;
+
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    source_id: Some("http://icecast.example/fip.aac".into()),
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.pause(zone_id).await;
+
+        orch.resume(zone_id, Some("mock-radio")).await;
+
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get("mock-radio").unwrap();
+        let guard = out.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            0,
+            "pause courte + producteur vivant ⇒ reprise sur place, pas de re-play"
+        );
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Playing,
+            "la zone doit être repassée en lecture"
+        );
     }
 
     /// Crée une zone offline pointant vers un device réseau disparu, comme la
