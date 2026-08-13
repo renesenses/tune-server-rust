@@ -1,4 +1,5 @@
 pub mod aiff;
+pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
