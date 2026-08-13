@@ -139,8 +139,12 @@ jobs:
             # tar en chemin relatif : le tar GNU de Git-Bash lit « D: » d'un
             # chemin Windows comme un hote distant (rsh) et echoue —
             # « Cannot connect to D: resolve failed » (vecu v0.9.71).
+            # --force-local UNIQUEMENT sous Windows : le bsdtar de macOS ne
+            # connait pas cette option et sort en erreur (vecu v0.9.72).
+            EXTRA=""
+            if [ "$RUNNER_OS" = "Windows" ]; then EXTRA="--force-local"; fi
             (cd "$RUNNER_TEMP/ffbundle" && \
-              tar --force-local -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
+              tar $EXTRA -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
             ls -la "$RUNNER_TEMP/ffbundle"
           else
             echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
