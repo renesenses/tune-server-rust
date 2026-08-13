@@ -42,6 +42,18 @@ struct RenameZone {
     name: String,
 }
 
+/// Rend un `null` JSON distinguable d'un champ absent : `Deserialize` n'est
+/// appelé que si le champ est PRÉSENT (le `default` couvre l'absence), donc
+/// envelopper son résultat dans `Some` donne `Some(None)` pour `null` et
+/// `Some(Some(v))` pour une valeur.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
 #[derive(Deserialize)]
 struct PatchZone {
     name: Option<String>,
@@ -52,6 +64,14 @@ struct PatchZone {
     gapless_enabled: Option<bool>,
     sync_delay_ms: Option<i32>,
     /// Max output sample rate in Hz (e.g. 96000, 88200). null = no limit (passthrough).
+    ///
+    /// `Option<Option<_>>` seul ne suffit PAS : serde désérialise un `null`
+    /// explicite en `None` extérieur, indistinguable d'un champ absent — le
+    /// handler ne voyait donc jamais la demande d'effacement, et « Aucune »
+    /// dans l'UI n'a jamais été enregistrable (Cyrille, forum 1320). Le
+    /// désérialiseur dédié rétablit les trois états : champ absent → `None`,
+    /// `null` → `Some(None)` (effacer), valeur → `Some(Some(v))`.
+    #[serde(default, deserialize_with = "double_option")]
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
@@ -3054,5 +3074,38 @@ mod output_reach_tests {
             ..Default::default()
         };
         assert_eq!(output_reach_of(&zone, &ps, false), "ok");
+    }
+}
+
+#[cfg(test)]
+mod patch_zone_deserialize_tests {
+    use super::PatchZone;
+
+    // #1320 (Cyrille) — « Aucune » ne persistait jamais : un `null` explicite
+    // sur `max_sample_rate` se désérialisait en `None` extérieur, donc le
+    // handler le confondait avec un champ absent et n'effaçait rien. Ces
+    // trois états sont le contrat du PATCH ; le premier test échoue contre
+    // le code d'avant (sans `deserialize_with = "double_option"`).
+
+    #[test]
+    fn explicit_null_means_clear_the_cap() {
+        let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": null}"#).unwrap();
+        assert_eq!(
+            p.max_sample_rate,
+            Some(None),
+            "un null explicite doit demander l'effacement, pas être ignoré"
+        );
+    }
+
+    #[test]
+    fn absent_field_means_leave_untouched() {
+        let p: PatchZone = serde_json::from_str(r#"{"name": "Salon"}"#).unwrap();
+        assert_eq!(p.max_sample_rate, None);
+    }
+
+    #[test]
+    fn value_means_set_the_cap() {
+        let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": 705600}"#).unwrap();
+        assert_eq!(p.max_sample_rate, Some(Some(705_600)));
     }
 }
