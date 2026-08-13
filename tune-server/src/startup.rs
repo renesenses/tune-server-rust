@@ -324,7 +324,19 @@ async fn restore_zone_volumes(state: &AppState) {
         for zone in &zones {
             if let Some(id) = zone.id {
                 let vol = (zone.volume as f64) / 100.0;
-                if vol >= 0.999 {
+                if zone.fixed_volume {
+                    // Contrat « Volume fixe (bit-perfect) » : 100 % est un
+                    // ENGAGEMENT, pas un oubli — le DoP meurt au moindre gain
+                    // logiciel (les marqueurs 0x05/0xFA ne survivent pas à une
+                    // multiplication). Le garde-fou ci-dessous rabaissait ces
+                    // zones à 20 % à chaque redémarrage, en mémoire seulement :
+                    // la base disait 100, l'effectif était 0.2, et le DSD de
+                    // Cyrille ressortait en grésillement alors que tous ses
+                    // réglages étaient bons (forum 1320, #1504 pour le
+                    // désaccord d'affichage).
+                    state.playback.set_volume(id, 1.0).await;
+                    info!(zone_id = id, zone_name = %zone.name, "zone_volume_fixed_restored_full");
+                } else if vol >= 0.999 {
                     let safe_vol = 0.2;
                     state.playback.set_volume(id, safe_vol).await;
                     info!(zone_id = id, zone_name = %zone.name, volume = safe_vol, "zone_volume_clamped_from_100");
@@ -753,5 +765,61 @@ pub async fn register_local_outputs(state: &AppState) {
         info!(count = devices.len(), "local_audio_devices_registered");
     } else {
         info!("no_local_audio_devices_found");
+    }
+}
+
+#[cfg(test)]
+mod restore_zone_volumes_tests {
+    use super::*;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    fn state_with_zone(volume: i32, fixed: bool) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let id = repo
+            .create("Zone test", Some("local"), Some("local:Test"))
+            .unwrap();
+        repo.update_volume(id, volume).unwrap();
+        repo.update_fixed_volume(id, fixed).unwrap();
+        (state, id)
+    }
+
+    /// Forum 1320 (Cyrille) / #1504 — le garde-fou anti-réveil rabaissait
+    /// AUSSI les zones « Volume fixe (bit-perfect) » à 20 % au redémarrage :
+    /// la base disait 100, l'effectif était 0.2, et le DoP mourait (le
+    /// moindre gain logiciel détruit les marqueurs). Une zone fixed_volume
+    /// doit redémarrer à exactement 1.0. Ce test ÉCHOUE contre le code
+    /// d'avant (0.2 au lieu de 1.0).
+    #[tokio::test]
+    async fn fixed_volume_zone_restarts_at_full_scale() {
+        let (state, id) = state_with_zone(100, true);
+        restore_zone_volumes(&state).await;
+        let vol = state.playback.get_state(id).await.volume;
+        assert!(
+            (vol - 1.0).abs() < 1e-9,
+            "zone bit-perfect restaurée à {vol} au lieu de 1.0"
+        );
+    }
+
+    /// Le garde-fou reste en place pour les zones SANS engagement bit-perfect :
+    /// un 100 % oublié ne doit pas hurler au premier morceau du matin.
+    #[tokio::test]
+    async fn non_fixed_zone_at_full_scale_is_still_clamped() {
+        let (state, id) = state_with_zone(100, false);
+        restore_zone_volumes(&state).await;
+        let vol = state.playback.get_state(id).await.volume;
+        assert!(
+            (vol - 0.2).abs() < 1e-9,
+            "garde-fou attendu à 0.2, volume restauré: {vol}"
+        );
+    }
+
+    /// Un volume ordinaire est restauré tel quel, fixed ou pas.
+    #[tokio::test]
+    async fn ordinary_volume_is_restored_verbatim() {
+        let (state, id) = state_with_zone(55, false);
+        restore_zone_volumes(&state).await;
+        let vol = state.playback.get_state(id).await.volume;
+        assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");
     }
 }
