@@ -828,6 +828,25 @@ pub fn spawn_mdns_handler(
                                     let _ = zone_repo.update_output_type(zid, output_type_str);
                                     set_zone_online(&event_bus, &db, &dev.id, true);
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
+                                } else if let Some(zid) =
+                                    zone_repo.find_hidden_id_by_name(&dev.name)
+                                {
+                                    // Une zone SUPPRIMEE portant ce nom. Le
+                                    // garde-fou `is_device_hidden` en haut de
+                                    // ce bloc ne l'a pas vue : il teste le
+                                    // nouvel identifiant, la ligne masquee
+                                    // porte l'ancien. Et le rattrapage par nom
+                                    // juste au-dessus ne pouvait pas la voir non
+                                    // plus — `list()` filtre les masquees.
+                                    // Sans ce cas, la zone renaissait a neuf a
+                                    // chaque changement d'adresse (#1528).
+                                    //
+                                    // On la re-ancre sur le nouvel identifiant
+                                    // SANS la demasquer : la suppression reste
+                                    // une suppression, et le garde-fou redevient
+                                    // operant des le tour suivant.
+                                    let _ = zone_repo.update_output_device(zid, &dev.id);
+                                    info!(name = %dev.name, id = %dev.id, zone_id = zid, "mdns_hidden_zone_reanchored");
                                 } else {
                                     // Cross-protocol dedup (forum #1183): the
                                     // same physical device may already be a

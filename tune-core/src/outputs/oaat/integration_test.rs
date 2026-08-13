@@ -204,34 +204,40 @@ mod tests {
     ///
     /// The assertion is on the ORDER: a Play must follow the second
     /// FormatPropose, not merely appear somewhere in the session.
+    /// RÉACTIVÉ le 2026-08-13 — la course de #1358 est comprise et corrigée.
+    ///
+    /// Deux défauts distincts, prouvés par sondes horodatées :
+    ///
+    /// 1. LE MOCK (cause principale des échecs) : il ne lisait jamais la
+    ///    requête GET avant d'écrire sa réponse et de lâcher la socket. Fermer
+    ///    avec des octets reçus non lus fait répondre un RST, et un RST
+    ///    détruit les octets de réponse encore en vol : le client perdait la
+    ///    queue du corps (~34 Ko mesurés) et n'obtenait JAMAIS l'EOF —
+    ///    `stream.next()` restait pendu, la transition n'arrivait pas, et le
+    ///    mock rendait son verdict sur son délai d'inactivité (les ~9 s des
+    ///    passes en échec = dernier message + 6 s). La taille de la perte
+    ///    dépendait du retard de consommation (lecture pacée en temps réel) :
+    ///    ~1/5 en local, systématique sur un runner lent. D'où l'échec des
+    ///    tentatives passées : allonger le délai du mock n'apportait rien (la
+    ///    queue ne viendra jamais), et retarder la mise en file aggravait (plus
+    ///    d'octets en attente au moment du close).
+    ///
+    /// 2. LA PRODUCTION (durcie au passage) : le résultat du préchargement
+    ///    transite par un oneshot vers un bras du `select!` ; mesuré prêt 2 s
+    ///    avant l'EOF et jamais consommé — le tirage aléatoire servait le bras
+    ///    flux à chaque itération et l'EOF ne consultait que `next_track`,
+    ///    encore vide. Corrigé par `biased` (bras commande/prefetch avant le
+    ///    flux) + rattrapage borné d'un préchargement en vol à l'EOF.
+    ///
+    /// Validé : 40 passes consécutives vertes (5,02-5,07 s, l'ancien mode 9 s
+    /// a disparu). NE PAS affaiblir les deux assertions : elles gardent une
+    /// panne totale et silencieuse du son (#1333).
     #[tokio::test]
-    // INSTABLE — desactive le 2026-08-09, voir #1358.
-    //
-    // Le test echoue ~1 fois sur 5 en local et systematiquement en CI, sur des
-    // runners plus lents. Il bloquait toute la chaine de build de release/v0.9
-    // (les jobs Build sont sautes quand Test echoue), sans qu'aucun defaut de
-    // production ne soit en cause : le comportement reel a ete valide sur .18
-    // le 2026-08-09, dans les deux sens de changement de format (16/44,1 ->
-    // 24/96 et retour), son a l'appui.
-    //
-    // Ecarte par mesure directe, avec traces posees dans le code :
-    //   - la commande PrepareNext atteint bien son gestionnaire ;
-    //   - le prechargement part et la 2e requete HTTP est servie, y compris
-    //     dans les passes en echec ;
-    //   - il REUSSIT (`prefetch result: ok`) et remplit next_track ;
-    //   - la detection de format est correcte : same_format=false,
-    //     PcmS24le/24 bits face a PcmS16le/16 bits.
-    // Trois correctifs tentes et rejetes car sans effet ou aggravants :
-    // attendre que la lecture soit etablie avant de mettre la piste suivante en
-    // attente (echec 3/6), rattraper le prechargement en vol a la fin de piste
-    // (echec 1/6), porter le delai d'inactivite du mock de 6 s a 30 s
-    // (echec 1/6). Les passes en echec durent ~9 s contre ~5 s pour les
-    // reussites : la course n'est pas identifiee.
-    //
-    // NE PAS reactiver sans avoir compris la course. NE PAS affaiblir les deux
-    // assertions : elles gardent une panne totale et silencieuse du son (#1333).
-    #[ignore = "instable, cf #1358 — comportement valide en production sur .18"]
     async fn oaat_format_change_gapless_transition_restarts_the_stream() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("tune_core::outputs::oaat=debug")
+            .with_test_writer()
+            .try_init();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_port = tcp.local_addr().unwrap().port();
         let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -350,12 +356,38 @@ mod tests {
         let http_handle = tokio::spawn(async move {
             for body in [wav16, wav24] {
                 if let Ok((mut s, _)) = http_tcp.accept().await {
+                    // Consommer la requête AVANT de répondre et de fermer.
+                    // C'était la vraie instabilité de ce test (#1358) : fermer
+                    // une socket avec des octets reçus jamais lus (le GET)
+                    // fait répondre un RST par le noyau, et un RST détruit les
+                    // octets de réponse encore en vol — le client perdait la
+                    // queue du corps (~34 Ko mesurés) et n'obtenait jamais
+                    // l'EOF, donc jamais la transition. Le rythme de
+                    // consommation côté client (pacé en temps réel) décidait
+                    // de la taille de la perte : ~1 passe sur 5 en local,
+                    // systématique sur un runner lent.
+                    let mut req = [0u8; 1024];
+                    let mut head: Vec<u8> = Vec::new();
+                    loop {
+                        match s.read(&mut req).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                head.extend_from_slice(&req[..n]);
+                                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
                         body.len()
                     );
                     let _ = s.write_all(hdr.as_bytes()).await;
                     let _ = s.write_all(&body).await;
+                    // FIN propre (pas de drop brutal) : le client lit tout le
+                    // corps puis voit une fin de flux normale.
+                    let _ = s.shutdown().await;
                 }
             }
         });

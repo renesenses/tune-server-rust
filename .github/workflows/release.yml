@@ -136,8 +136,11 @@ jobs:
           if gh release download ffmpeg-minimal --repo "$GITHUB_REPOSITORY" \
                --pattern "ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
                --dir "$RUNNER_TEMP/ffbundle"; then
-            tar xzf "$RUNNER_TEMP/ffbundle/ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
-              -C "$RUNNER_TEMP/ffbundle"
+            # tar en chemin relatif : le tar GNU de Git-Bash lit « D: » d'un
+            # chemin Windows comme un hote distant (rsh) et echoue —
+            # « Cannot connect to D: resolve failed » (vecu v0.9.71).
+            (cd "$RUNNER_TEMP/ffbundle" && \
+              tar --force-local -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
             ls -la "$RUNNER_TEMP/ffbundle"
           else
             echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
@@ -344,8 +347,26 @@ jobs:
           if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
 
           $targets = @("target\${{ matrix.target }}\release\tune-server.exe")
-          if (Test-Path "target\${{ matrix.target }}\release\airplay-daemon.exe") {
-            $targets += "target\${{ matrix.target }}\release\airplay-daemon.exe"
+          # airplay-daemon vit dans $RUNNER_TEMP\apd\bin (cargo install --root),
+          # JAMAIS dans target\release : l'ancien Test-Path ne matchait jamais
+          # et le daemon serait parti non signé. Signé en place, la copie vers
+          # le zip et l'installeur (toutes deux après cette étape) le propage.
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            $targets += "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe"
+          }
+          # ffmpeg minimal (#1524) : même motif — signé EN PLACE dans ffbundle,
+          # d'où le zip et l'installeur NSIS le copient tous deux APRÈS cette
+          # étape. Sans lui, tune-server.exe signé lancerait un ffmpeg.exe non
+          # signé — la même heuristique Defender que ce que corrige #1521.
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
+          }
+          # ffmpeg minimal (#1524) : signé EN PLACE dans ffbundle, d'où le zip
+          # et l'installeur NSIS le copient tous deux APRÈS cette étape. Sans
+          # lui, tune-server.exe signé lancerait un ffmpeg.exe non signé — la
+          # même heuristique Defender que ce que cette étape corrige (#1521).
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
           foreach ($t in $targets) {
