@@ -5178,6 +5178,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tracing",
+ "tracing-subscriber",
  "tune-output-api",
  "unicode-normalization",
  "urlencoding",
