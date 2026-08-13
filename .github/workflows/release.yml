@@ -766,6 +766,18 @@ jobs:
           sed -i "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
           sed -i "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
 
+          # Garantir le caveat de redémarrage après mise à jour (vécu v0.9.71 :
+          # binaire upgradé mais ancien processus toujours en mémoire → « la
+          # MAJ ne marche pas »). Le job ne fait que des sed ciblés, donc la
+          # ligne posée sur le tap survit normalement — cette étape la répare
+          # si la formule est un jour recréée sans elle. Idempotent.
+          if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+            perl -0pi -e 's/(      Background service: brew services start tune-server\n)/$1\n      Après une mise à jour, redémarrez le serveur :\n      brew services restart tune-server (ou relancez tune-server-launcher).\n/' "$F"
+            if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+              echo "::warning::Caveat de redémarrage introuvable et point d'ancrage absent — à reporter à la main dans le tap"
+            fi
+          fi
+
           # Update all download URLs — use regex to catch ANY old version, not just OLD_VERSION
           # This handles cases where the formula has stale versions from failed previous updates
           sed -i -E "s|/v[0-9]+\.[0-9]+\.[0-9]+/|/v${VERSION}/|g" "$F"
