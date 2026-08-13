@@ -949,6 +949,42 @@ CREATE INDEX IF NOT EXISTS idx_metadata_proposals_pending
     ON metadata_proposals(decision, servers_count);
 ",
     },
+    Migration {
+        version: 75,
+        name: "dsd_replaygain_rescale",
+        up: "
+-- #1638 : le decimateur DSD->PCM applique desormais l'echelle SACD (+6 dB).
+-- Les ReplayGain calcules par NOTRE analyse sur l'ancienne echelle sont faux
+-- de ~6 dB : on les efface pour que le sweep les recalcule. Portee stricte :
+-- 1) les pistes DSD passees par l'analyse (sentinelle rg_analyzed) — les RG
+--    venus des TAGS du fichier (pas de sentinelle) sont preserves ;
+-- 2) les cles d'ALBUM de tout album contenant une telle piste (le gain
+--    d'album mele les LUFS de toutes les pistes) — sans toucher aux gains de
+--    PISTE des voisines PCM.
+DELETE FROM track_metadata
+WHERE key IN ('rg_analyzed','rg_track_gain','rg_track_peak','rg_album_gain','rg_album_peak','rg_skipped_oversized')
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    JOIN track_metadata m ON m.track_id = t.id AND m.key = 'rg_analyzed'
+    WHERE lower(COALESCE(t.format,'')) IN ('dsd','dsf','dff','dsdiff')
+       OR lower(t.file_path) LIKE '%.dsf'
+       OR lower(t.file_path) LIKE '%.dff'
+  );
+
+DELETE FROM track_metadata
+WHERE key IN ('rg_album_gain','rg_album_peak')
+  AND track_id IN (
+    SELECT t2.id FROM tracks t2
+    WHERE t2.album_id IS NOT NULL AND t2.album_id IN (
+      SELECT t.album_id FROM tracks t
+      WHERE (lower(COALESCE(t.format,'')) IN ('dsd','dsf','dff','dsdiff')
+          OR lower(t.file_path) LIKE '%.dsf'
+          OR lower(t.file_path) LIKE '%.dff')
+        AND t.album_id IS NOT NULL
+    )
+  );
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2126,6 +2162,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         23,
         "metadata_proposals",
         include_str!("../../migrations/postgres/023_metadata_proposals.sql"),
+    ),
+    (
+        24,
+        "dsd_replaygain_rescale",
+        include_str!("../../migrations/postgres/024_dsd_replaygain_rescale.sql"),
     ),
 ];
 
