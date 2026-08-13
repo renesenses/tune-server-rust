@@ -1284,6 +1284,19 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_play_delay_ms".into(),
                 json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
             );
+            // `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL
+            // de `ZoneRepo` (migration v36 pouvant echouer en silence sous
+            // Windows), donc `row_to_zone` le met a `false` sans exception —
+            // et la serialisation de la zone propageait ce faux jusqu'au
+            // client. Le bouton AutoPlay retombait donc a chaque
+            // resynchronisation, alors que le reglage etait bien en base et
+            // correctement lu par le poller (Sandro, 0.9.70). On lit la vraie
+            // valeur par l'accesseur prevu pour ca, comme les autres reglages
+            // de zone ci-dessus.
+            obj.insert(
+                "autoplay_enabled".into(),
+                json!(zone_repo.get_autoplay_enabled(zone_id)),
+            );
             let detected_dev = z
                 .output_device_id
                 .as_deref()
@@ -1408,6 +1421,12 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "dlna_play_delay_ms".into(),
                     json!(repo.get_dlna_play_delay_ms(id)),
+                );
+                // Meme correction que dans la liste : la valeur serialisee
+                // depuis la struct vaut toujours `false`.
+                obj.insert(
+                    "autoplay_enabled".into(),
+                    json!(repo.get_autoplay_enabled(id)),
                 );
                 let detected_dev = zone
                     .output_device_id
