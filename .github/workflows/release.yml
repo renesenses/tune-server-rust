@@ -546,7 +546,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          VERSION="${{ env.VERSION }}"
+          VERSION="${{ env.TUNE_VERSION }}"
           APP="Tune Server.app"
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources/web"
