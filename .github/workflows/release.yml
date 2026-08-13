@@ -755,8 +755,22 @@ jobs:
           rm -f minisign.key
           echo "Signed SHA256SUMS -> SHA256SUMS.minisig"
 
+      # `draft: true` — la release naît INVISIBLE des clients.
+      #
+      # Ce job porte `if: always()`, donc il tourne aussi quand des builds ont
+      # échoué : c'est voulu (on veut les artefacts partiels et les journaux),
+      # mais jusqu'ici il publiait ce demi-résultat au monde entier. v0.9.71 :
+      # release visible à 19:15 avec 7 assets sur 13, run terminé en échec le
+      # lendemain à 07:45 — douze heures pendant lesquelles le client de mise à
+      # jour de Jean Valjean a cherché un SHA256SUMS incomplet, et pendant
+      # lesquelles on lui a répondu que son réseau était en cause (#1588).
+      #
+      # La bascule en public est faite par le job `publish`, tout en bas, une
+      # fois TOUT déposé — image Tune OS comprise, elle qui s'attachait
+      # jusqu'ici à une release déjà visible.
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
@@ -795,9 +809,52 @@ jobs:
       version: ${{ github.ref_name }}
       attach_to_release: true
 
+  # ─── La bascule en public ──────────────────────────────────────────────
+  #
+  # Seul endroit du workflow qui rend une release visible des clients. Elle
+  # ne s'ouvre que si TOUT a abouti : les binaires (`build`), leur dépôt et
+  # leurs sommes de contrôle (`release`), et l'image appliance
+  # (`tune-os-image`), qui s'attachait jusqu'ici à une release déjà publique.
+  #
+  # `always()` est nécessaire pour que le job s'évalue malgré un `needs`
+  # SAUTÉ — une RC n'a pas d'image Tune OS, et sans ça la release resterait
+  # en brouillon pour toujours. Les conditions qui suivent font le tri : un
+  # `skipped` est acceptable, un `failure` ne l'est pas.
+  #
+  # Les identifiants de job à tiret ne peuvent pas s'écrire `needs.tune-os-image`
+  # dans une expression — le tiret y serait lu comme une soustraction. D'où
+  # la notation entre crochets.
+  publish:
+    name: Publish release (drop the draft)
+    needs: [build, release, tune-os-image]
+    if: >-
+      always()
+      && needs.build.result == 'success'
+      && needs.release.result == 'success'
+      && (needs['tune-os-image'].result == 'success' || needs['tune-os-image'].result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Vérifier que la release est complète, puis la publier
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Ce qui est publié doit être vérifiable : SHA256SUMS est la
+          # sentinelle que le client de mise à jour va chercher en premier.
+          # S'il manque, ne rien montrer plutôt que montrer un demi-état.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS'; then
+            echo "::error::SHA256SUMS absent de $TAG — la release reste en brouillon."
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Release $TAG publiée."
+
   homebrew:
     name: Update Homebrew tap
-    needs: release
+    needs: publish
     # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
     # or `brew upgrade` would move stable users onto an RC.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -896,7 +953,10 @@ jobs:
 
   notify-website:
     name: Update mozaiklabs.fr/download
-    needs: [release, homebrew]
+    # `publish` et non `release` : la page de téléchargement ne doit annoncer
+    # qu'une release réellement publique et complète. Le webhook exige ≥3
+    # assets, mais rien ne lui disait jusqu'ici que la liste était finie.
+    needs: [publish, homebrew]
     # Stable tags only — a pre-release must not update the public download page.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
