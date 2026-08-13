@@ -503,42 +503,53 @@ fn service_to_device(
 }
 
 fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
-    let local_prefix = detect_local_subnet();
-    let mut ipv4_same_subnet: Option<String> = None;
-    let mut ipv4_private: Option<String> = None;
-    let mut ipv4_any: Option<String> = None;
+    let ips: Vec<std::net::IpAddr> = addrs.iter().map(|a| a.to_ip_addr()).collect();
+    choose_address(&ips, detect_local_subnet().as_deref())
+}
 
-    for addr in addrs {
-        let ip = addr.to_ip_addr();
-        if let std::net::IpAddr::V4(v4) = ip {
-            let s = v4.to_string();
-            if ipv4_any.is_none() {
-                ipv4_any = Some(s.clone());
-            }
-            let octets = v4.octets();
-            let is_private = octets[0] == 192
-                || octets[0] == 10
-                || (octets[0] == 172 && (16..=31).contains(&octets[1]));
-            if is_private && ipv4_private.is_none() {
-                ipv4_private = Some(s.clone());
-            }
-            if let Some(ref prefix) = local_prefix {
-                if s.starts_with(prefix) && ipv4_same_subnet.is_none() {
-                    ipv4_same_subnet = Some(s);
-                }
-            }
-        }
-    }
+/// Choisit l'adresse qui servira d'identité à l'appareil.
+///
+/// Cette fonction **doit rendre le même résultat pour un même jeu d'adresses**,
+/// quel que soit l'ordre dans lequel elles arrivent. `device_id` en est dérivé
+/// (`{type}-{host}-{port}`) et tout le cycle de vie d'une zone repose dessus :
+/// une identité qui change d'un démarrage à l'autre dédouble la zone, et fait
+/// revenir celles que l'utilisateur avait supprimées — le garde-fou
+/// `is_device_hidden` porte sur l'ancien identifiant et ne reconnaît plus le
+/// nouveau (#1528).
+///
+/// Or l'appelant itère un `HashSet`, dont l'ordre n'est pas déterministe. Un
+/// appareil à deux pattes sur le même sous-réseau (Wi-Fi et Ethernet) tombait
+/// donc tantôt sur l'une, tantôt sur l'autre, **sans que rien n'ait bougé sur
+/// le réseau**. D'où le tri, qui ne coûte rien sur trois adresses.
+fn choose_address(addrs: &[std::net::IpAddr], local_prefix: Option<&str>) -> String {
+    let mut v4: Vec<std::net::Ipv4Addr> = addrs
+        .iter()
+        .filter_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => Some(*v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect();
+    v4.sort_unstable();
 
-    ipv4_same_subnet
-        .or(ipv4_private)
-        .or(ipv4_any)
+    let is_private = |v4: &std::net::Ipv4Addr| {
+        let o = v4.octets();
+        o[0] == 192 || o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1]))
+    };
+
+    let same_subnet = local_prefix.and_then(|prefix| {
+        v4.iter()
+            .find(|v| v.to_string().starts_with(prefix))
+            .map(|v| v.to_string())
+    });
+
+    same_subnet
+        .or_else(|| v4.iter().find(|v| is_private(v)).map(|v| v.to_string()))
+        .or_else(|| v4.first().map(|v| v.to_string()))
         .unwrap_or_else(|| {
-            addrs
-                .iter()
-                .next()
-                .map(|a| a.to_ip_addr().to_string())
-                .unwrap_or_default()
+            // Que de l'IPv6 : on trie là aussi plutôt que de prendre au hasard.
+            let mut rest: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            rest.sort();
+            rest.into_iter().next().unwrap_or_default()
         })
 }
 
@@ -599,5 +610,45 @@ mod tests {
             raw.to_string()
         };
         assert_eq!(name, "Mac Studio");
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn choose_address_is_the_same_whatever_the_order() {
+        // Le coeur de #1528 : deux adresses egalement recevables sur le meme
+        // sous-reseau. L'appelant itere un HashSet, donc l'ordre varie d'un
+        // demarrage a l'autre — l'identite de l'appareil, elle, ne doit pas.
+        let a = [ip("192.168.1.42"), ip("192.168.1.77")];
+        let b = [ip("192.168.1.77"), ip("192.168.1.42")];
+        assert_eq!(
+            choose_address(&a, Some("192.168.1.")),
+            choose_address(&b, Some("192.168.1.")),
+        );
+    }
+
+    #[test]
+    fn choose_address_prefers_the_local_subnet_then_private_then_the_rest() {
+        let addrs = [ip("8.8.8.8"), ip("10.0.0.5"), ip("192.168.1.42")];
+        assert_eq!(choose_address(&addrs, Some("192.168.1.")), "192.168.1.42");
+        // Hors sous-reseau connu, une privee vaut mieux qu'une publique.
+        assert_eq!(choose_address(&addrs, Some("172.20.")), "10.0.0.5");
+        // Aucune privee : il reste la publique, plutot que rien.
+        assert_eq!(choose_address(&[ip("8.8.8.8")], None), "8.8.8.8");
+    }
+
+    #[test]
+    fn choose_address_falls_back_to_ipv6_without_drawing_lots() {
+        let a = [ip("fe80::2"), ip("fe80::1")];
+        let b = [ip("fe80::1"), ip("fe80::2")];
+        assert_eq!(choose_address(&a, None), choose_address(&b, None));
+        assert!(!choose_address(&a, None).is_empty());
+    }
+
+    #[test]
+    fn choose_address_without_any_address_is_empty_not_a_panic() {
+        assert_eq!(choose_address(&[], Some("192.168.1.")), "");
     }
 }

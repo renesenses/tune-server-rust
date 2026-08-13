@@ -11,6 +11,7 @@ mod facets;
 mod folder_facet;
 mod genres;
 mod ingest;
+mod proposals;
 mod ratings;
 mod reports;
 mod search;
@@ -235,6 +236,10 @@ pub fn router() -> Router<AppState> {
             "/reports",
             get(reports::list_reports).post(reports::create_report),
         )
+        // Corrections que la communaute propose sur cette bibliotheque.
+        .route("/proposals", get(proposals::list_proposals))
+        .route("/proposals/{id}/decision", post(proposals::decide_proposal))
+        .route("/proposals/auto-apply", post(proposals::set_auto_apply))
         .route("/tracks/{id}/all-tags", get(tracks::track_all_tags))
         .route(
             "/tracks/{id}/metadata",

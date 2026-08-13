@@ -1754,6 +1754,17 @@ impl OutputTarget for OaatOutput {
 
             loop {
                 tokio::select! {
+                    // `biased` : l'ordre des bras est l'ordre de priorité. Sans
+                    // lui, le tirage aléatoire peut servir le bras `stream` à
+                    // chaque itération : un corps HTTP entièrement bufferisé ne
+                    // laisse qu'une poignée d'itérations, et le résultat du
+                    // préchargement reste dans `prefetch_rx` pendant que l'EOF
+                    // est consommé — mesuré en direct (#1358) : résultat prêt
+                    // 2 s avant l'EOF, jamais lu, transition sautée. Les bras
+                    // commande/prefetch sont des événements rares et courts :
+                    // les servir d'abord n'affame jamais le flux.
+                    biased;
+
                     _ = &mut stop_rx => {
                         debug!(device = %device_name, "oaat: stop signal");
                         break;
@@ -1791,26 +1802,12 @@ impl OutputTarget for OaatOutput {
                         }
                     } => {
                         prefetch_rx = None;
-                        if let Some(Some(mut prefetch)) = result {
-                            if prefetch.same_format {
-                                info!(device = %device_name, title = %prefetch.title, "oaat: next track prefetched (gapless ready)");
-                                if let Ok(()) = endpoint.prepare_next_track(
-                                    &stream_id, cur_format, cur_sample_rate, ch, layout, cur_bits as u8,
-                                ).await {
-                                    match tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.response_rx.recv()).await {
-                                        Ok(Some(oaat_controller::EndpointResponse::NextTrackReady(_))) => {
-                                            info!(device = %device_name, "oaat: gapless confirmed");
-                                        }
-                                        Ok(Some(oaat_controller::EndpointResponse::NextTrackReformat(_))) => {
-                                            prefetch.same_format = false;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            } else {
-                                info!(device = %device_name, title = %prefetch.title, "oaat: next track prefetched (format change)");
-                            }
-                            next_track = Some(prefetch);
+                        if let Some(Some(prefetch)) = result {
+                            next_track = settle_prefetch(
+                                &mut endpoint, prefetch, &stream_id, &device_name,
+                                cur_format, cur_sample_rate, ch, layout, cur_bits,
+                            )
+                            .await;
                         }
                     }
 
@@ -1992,6 +1989,31 @@ impl OutputTarget for OaatOutput {
                                 }
                             }
                             None => {
+                                // L'EOF peut griller la politesse à un
+                                // préchargement encore en vol : la chaîne
+                                // PrepareNext → fetch → oneshot est asynchrone,
+                                // et rien ne garantit que le bras `prefetch_rx`
+                                // ait été servi avant que le flux ne s'épuise
+                                // (#1358, mesuré : résultat prêt 2 s avant
+                                // l'EOF et jamais consommé). La fin de piste
+                                // est précisément le moment où la piste
+                                // suivante compte : on attend le résultat —
+                                // borné, un fetch local répond en ms et un
+                                // vrai échec rend None de toute façon.
+                                if next_track.is_none()
+                                    && let Some(rx) = prefetch_rx.take()
+                                    && let Ok(Ok(Some(prefetch))) = tokio::time::timeout(
+                                        std::time::Duration::from_secs(3),
+                                        rx,
+                                    )
+                                    .await
+                                {
+                                    next_track = settle_prefetch(
+                                        &mut endpoint, prefetch, &stream_id, &device_name,
+                                        cur_format, cur_sample_rate, ch, layout, cur_bits,
+                                    )
+                                    .await;
+                                }
                                 // Flush remaining buffer
                                 while buf.len() >= packet_size && playing.load(Ordering::Relaxed) {
                                     let payload: Vec<u8> = buf.drain(..packet_size).collect();
@@ -2417,6 +2439,57 @@ fn open_next_dsd(
 }
 
 #[cfg(feature = "oaat")]
+/// Arme une piste préchargée comme piste suivante : sur un format identique,
+/// négocie le gapless interne de l'endpoint (NextTrackPrepare) ; un
+/// NextTrackReformat rétrograde en changement de format. Partagé entre le bras
+/// `prefetch_rx` du select! et le rattrapage d'un préchargement en vol à l'EOF
+/// (#1358) — les deux chemins doivent traiter le résultat À L'IDENTIQUE.
+#[allow(clippy::too_many_arguments)]
+async fn settle_prefetch(
+    endpoint: &mut oaat_controller::ConnectedEndpoint,
+    mut prefetch: NextTrackPrefetch,
+    stream_id: &str,
+    device_name: &str,
+    cur_format: oaat_core::format::AudioFormat,
+    cur_sample_rate: u32,
+    ch: u8,
+    layout: oaat_core::ChannelLayout,
+    cur_bits: u16,
+) -> Option<NextTrackPrefetch> {
+    if prefetch.same_format {
+        info!(device = %device_name, title = %prefetch.title, "oaat: next track prefetched (gapless ready)");
+        if let Ok(()) = endpoint
+            .prepare_next_track(
+                stream_id,
+                cur_format,
+                cur_sample_rate,
+                ch,
+                layout,
+                cur_bits as u8,
+            )
+            .await
+        {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                endpoint.response_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(oaat_controller::EndpointResponse::NextTrackReady(_))) => {
+                    info!(device = %device_name, "oaat: gapless confirmed");
+                }
+                Ok(Some(oaat_controller::EndpointResponse::NextTrackReformat(_))) => {
+                    prefetch.same_format = false;
+                }
+                _ => {}
+            }
+        }
+    } else {
+        info!(device = %device_name, title = %prefetch.title, "oaat: next track prefetched (format change)");
+    }
+    Some(prefetch)
+}
+
 async fn prefetch_next_track(
     client: &reqwest::Client,
     device_name: &str,
