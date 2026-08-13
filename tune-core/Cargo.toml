@@ -134,3 +134,13 @@ audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
 [build-dependencies]
 cc = "1"
+
+# AAC natif Windows (#1527) : Media Foundation via le crate `windows` —
+# même version 0.62 que celle que cpal tire déjà, donc aucune compilation
+# dupliquée sur les cibles Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }
