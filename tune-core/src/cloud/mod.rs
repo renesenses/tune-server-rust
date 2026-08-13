@@ -4,6 +4,7 @@ pub mod community_sync;
 pub mod concert_alerts;
 pub mod digest;
 pub mod library_sync;
+pub mod metadata_proposals;
 pub mod playlist_hub;
 pub mod plugins;
 pub mod recommendations;
