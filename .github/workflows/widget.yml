@@ -82,14 +82,40 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
           rm /tmp/certificate.p12
 
+      # release.yml notarise via une CLE API App Store Connect et ne retombe sur
+      # le mot de passe applicatif qu'a defaut. Le widget ne connaissait que la
+      # seconde porte — celle qui repond 401. On ecrit donc le .p8 sur disque,
+      # comme le fait release.yml, pour que Tauri emprunte la meme.
+      - name: Write App Store Connect API key
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          # Test en shell, pas dans un `if:` d'etape : le contexte `secrets`
+          # n'y est pas disponible. Meme motif que release.yml.
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            printf '%s' "$ASC_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+            echo "cle API App Store Connect ecrite"
+          else
+            echo "::warning::ASC_API_KEY_P8 absent — repli sur le mot de passe applicatif (APPLE_ID/APPLE_PASSWORD)"
+          fi
+
       - name: Build signed + notarized bundle
         env:
-          # Tauri v2 signs with this identity and — because the notarization
-          # trio below is set — notarizes and staples the DMG automatically.
+          # Tauri v2 signe avec cette identite et, parce que de quoi notariser
+          # est fourni ci-dessous, notarise et tamponne le DMG automatiquement.
           APPLE_SIGNING_IDENTITY: "Developer ID Application: Bertrand Clech (${{ secrets.APPLE_TEAM_ID }})"
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Chemin PRIVILEGIE — cle API App Store Connect. Tauri l'utilise des
+          # que ces trois variables sont posees, et ignore alors APPLE_ID /
+          # APPLE_PASSWORD. Une cle API n'expire pas et ne se revoque pas toute
+          # seule, contrairement a un mot de passe applicatif.
+          APPLE_API_KEY: ${{ secrets.ASC_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          # Repli, conserve pour ne rien casser si la cle API disparait.
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: cargo tauri build --target ${{ matrix.target }}
 
       - name: Collect DMG
