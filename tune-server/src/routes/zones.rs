@@ -840,7 +840,19 @@ fn build_signal_path(
 
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
-    let volume_full = zone.fixed_volume || ps.volume >= 1.0 || ps.volume <= 0.0; // 0.0 means no software vol set
+    //
+    // La valeur affichée est `zone.volume` (la base), PAS `ps.volume` : c'est
+    // elle que la page expose comme curseur (GET /zones/{id}). `ps.volume` est
+    // une copie mémoire qui ment dans deux cas : jamais initialisée depuis la
+    // base au démarrage (0,5 par défaut pour une zone locale/navigateur —
+    // seules les zones réseau sont resemées à la découverte), et modifiée par
+    // les régleurs internes (alarmes, minuterie de sommeil, IA) qui n'écrivaient
+    // pas la base. Résultat : le panneau bit-perfect affichait « Volume 20 % »
+    // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
+    // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
+    // Bebelalu55 #1480). Une seule source pour les deux affichages.
+    let ui_volume = (zone.volume as f64 / 100.0).clamp(0.0, 1.0);
+    let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
@@ -1122,7 +1134,7 @@ fn build_signal_path(
     if !volume_full {
         steps.push(json!({
             "name": "Volume",
-            "description": format!("Volume {}%", (ps.volume * 100.0).round() as i32),
+            "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
             "bit_perfect": true,
         }));
     }
@@ -1272,6 +1284,19 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_play_delay_ms".into(),
                 json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
             );
+            // `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL
+            // de `ZoneRepo` (migration v36 pouvant echouer en silence sous
+            // Windows), donc `row_to_zone` le met a `false` sans exception —
+            // et la serialisation de la zone propageait ce faux jusqu'au
+            // client. Le bouton AutoPlay retombait donc a chaque
+            // resynchronisation, alors que le reglage etait bien en base et
+            // correctement lu par le poller (Sandro, 0.9.70). On lit la vraie
+            // valeur par l'accesseur prevu pour ca, comme les autres reglages
+            // de zone ci-dessus.
+            obj.insert(
+                "autoplay_enabled".into(),
+                json!(zone_repo.get_autoplay_enabled(zone_id)),
+            );
             let detected_dev = z
                 .output_device_id
                 .as_deref()
@@ -1396,6 +1421,12 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "dlna_play_delay_ms".into(),
                     json!(repo.get_dlna_play_delay_ms(id)),
+                );
+                // Meme correction que dans la liste : la valeur serialisee
+                // depuis la struct vaut toujours `false`.
+                obj.insert(
+                    "autoplay_enabled".into(),
+                    json!(repo.get_autoplay_enabled(id)),
                 );
                 let detected_dev = zone
                     .output_device_id
@@ -2727,6 +2758,45 @@ mod signal_path_tests {
             transcoder_desc(&sp).as_deref(),
             Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
         );
+    }
+
+    // #1504 (Jean Valjean) / #1480 (Bebelalu55) : le panneau bit-perfect doit
+    // afficher LE MÊME volume que la page. La page montre `zone.volume` (base) ;
+    // `ps.volume` est une copie mémoire qui peut être périmée (0,5 par défaut
+    // après un redémarrage, ou laissée par une alarme/minuterie qui n'écrivait
+    // pas la base). L'étape Volume se lit donc depuis la base, quelle que soit
+    // la valeur mémoire.
+    #[test]
+    fn volume_step_reads_persisted_zone_volume_not_stale_memory() {
+        let (backend, zone) = dlna_zone();
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = zone.id.unwrap();
+        repo.update_volume(id, 20).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+
+        // Copie mémoire périmée : le défaut 0,5 d'un ZoneState jamais resemé.
+        let mut ps = alac_hires_playing();
+        ps.volume = 0.5;
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
+        assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 20%"));
+    }
+
+    // Réciproque : curseur de la page à 100 % → pas d'étape Volume, même si la
+    // copie mémoire traîne à 20 % (c'était exactement l'affichage signalé).
+    #[test]
+    fn volume_step_hidden_when_persisted_volume_is_full() {
+        let (backend, zone) = dlna_zone();
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = zone.id.unwrap();
+        repo.update_volume(id, 100).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+
+        let mut ps = alac_hires_playing();
+        ps.volume = 0.2;
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
+        assert_eq!(step_desc(&sp, "Volume"), None);
     }
 
     // Native WAV 24-bit source, served byte-for-byte over the WAV wire.

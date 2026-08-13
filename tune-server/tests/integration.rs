@@ -106,6 +106,25 @@ fn assert_not_html(bytes: &[u8], endpoint: &str) {
     );
 }
 
+async fn patch_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::patch(path)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, json)
+}
+
 async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -1257,4 +1276,70 @@ async fn lyrics_embedded_tag_with_lrc_timestamps_is_synced() {
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0]["t_ms"], 1_000);
     assert_eq!(lines[1]["t_ms"], 2_000);
+}
+
+// ── AutoPlay : le reglage persiste, l'API le niait (Sandro, 0.9.70) ────────
+//
+// `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL de ZoneRepo
+// (migration v36 pouvant echouer en silence sous Windows), donc `row_to_zone`
+// le met a `false` sans exception. La serialisation de la zone propageait ce
+// faux jusqu'au client : le bouton retombait a chaque resynchronisation alors
+// que le poller, lui, lisait la bonne valeur en fin de file.
+
+#[tokio::test]
+async fn autoplay_active_est_rapporte_par_la_liste_des_zones() {
+    let app = make_app();
+    let zid = make_zone(&app, "AutoPlay Liste").await;
+
+    let (status, _) = patch_json(
+        &app,
+        &format!("/api/v1/zones/{zid}"),
+        json!({ "autoplay_enabled": true }),
+    )
+    .await;
+    assert!(status.is_success(), "activation refusee : {status}");
+
+    let (status, body) = get(&app, "/api/v1/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zone = body
+        .as_array()
+        .expect("zones array")
+        .iter()
+        .find(|z| z["id"] == zid)
+        .expect("zone presente");
+    assert_eq!(
+        zone["autoplay_enabled"], true,
+        "la liste doit rapporter le reglage persiste : {zone}"
+    );
+}
+
+#[tokio::test]
+async fn autoplay_active_est_rapporte_par_le_detail_de_la_zone() {
+    let app = make_app();
+    let zid = make_zone(&app, "AutoPlay Detail").await;
+
+    patch_json(
+        &app,
+        &format!("/api/v1/zones/{zid}"),
+        json!({ "autoplay_enabled": true }),
+    )
+    .await;
+
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        zone["autoplay_enabled"], true,
+        "le detail doit rapporter le reglage persiste : {zone}"
+    );
+}
+
+#[tokio::test]
+async fn autoplay_inactif_reste_inactif() {
+    // Le defaut ne doit pas basculer dans l'autre sens en corrigeant le bug.
+    let app = make_app();
+    let zid = make_zone(&app, "AutoPlay Defaut").await;
+
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(zone["autoplay_enabled"], false, "defaut attendu : {zone}");
 }

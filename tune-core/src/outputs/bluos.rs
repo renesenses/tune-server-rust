@@ -1,5 +1,5 @@
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
@@ -79,6 +79,15 @@ fn xml_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
     let start = body.find(&open)? + open.len();
     let len = body[start..].find(&close)?;
     Some(body[start..start + len].trim())
+}
+
+/// Le Node annonce-t-il une file VIDE apres un `/Add` ?
+///
+/// `<playlist length="0" …>` : l'entree n'est pas entree en file. Une reponse
+/// qu'on ne sait pas lire ne repond pas `true` — on ne signale que ce qu'on a
+/// effectivement compris.
+fn queue_stayed_empty(add_body: &str) -> bool {
+    xml_attr(add_body, "playlist", "length") == Some("0")
 }
 
 /// Le Node a-t-il refuse la piste tout en repondant 200 ?
@@ -348,11 +357,44 @@ impl OutputTarget for BluosOutput {
         if let Some(img) = media.cover_url {
             add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
         }
-        self.client
+        // La reponse etait jetee en entier — statut ET corps. Un Node qui
+        // repondait 404, ou qui acceptait l'appel sans rien mettre en file,
+        // etait indiscernable d'un Node qui a bien pris la piste suivante.
+        //
+        // C'est le meme angle mort que `play_media` avant #1514, mais sur le
+        // chemin gapless, ou il est PLUS couteux a diagnostiquer : le defaut
+        // ne se voit qu'a la fin du morceau en cours, et se lit comme « le
+        // Node s'arrete entre les pistes » plutot que comme un refus.
+        //
+        // On ne peut pas appliquer ici la regle des deux signaux de #1514 :
+        // `set_next_media` n'envoie pas de `Play`, donc il n'y a pas d'etat de
+        // transport a confronter. On journalise donc la file annoncee, et on
+        // avertit quand elle est vide — sans faire echouer l'appel : une
+        // preparation gapless ratee doit degrader vers une transition normale,
+        // pas interrompre la lecture en cours.
+        let add_resp = self
+            .client
             .get(&add_url)
             .send()
             .await
             .map_err(|e| format!("bluos Add: {e}"))?;
+        let add_status = add_resp.status();
+        let add_body = add_resp.text().await.unwrap_or_default();
+        if !add_status.is_success() {
+            return Err(format!(
+                "bluos Add (gapless): HTTP {add_status} — {}",
+                truncate_body(&add_body)
+            ));
+        }
+        if queue_stayed_empty(&add_body) {
+            warn!(
+                device = %self.name,
+                reply = %truncate_body(&add_body),
+                "bluos_set_next_queue_still_empty"
+            );
+        } else {
+            debug!(device = %self.name, reply = %truncate_body(&add_body), "bluos_set_next_reply");
+        }
         info!(
             device = %self.name,
             url = media.url,
@@ -467,5 +509,29 @@ mod tests {
         assert_eq!(xml_text(PLAY_PAUSE, "state"), Some("pause"));
         assert_eq!(xml_text(PLAY_STREAM, "state"), Some("stream"));
         assert_eq!(xml_text("<state>pause", "state"), None);
+    }
+
+    // ── Chemin gapless : la reponse du Node n'etait pas lue du tout ────────
+    //
+    // Meme angle mort que `play_media` avant #1514, mais plus couteux a
+    // diagnostiquer : le defaut ne se voit qu'a la fin du morceau en cours et
+    // se lit comme « le Node s'arrete entre les pistes ».
+
+    #[test]
+    fn file_vide_apres_add_gapless_est_signalee() {
+        assert!(queue_stayed_empty(ADD_EMPTY));
+    }
+
+    #[test]
+    fn file_remplie_ne_signale_rien() {
+        assert!(!queue_stayed_empty(ADD_OK));
+    }
+
+    #[test]
+    fn reponse_illisible_ne_signale_rien() {
+        // On ne signale que ce qu'on a effectivement compris : un Node dont on
+        // ne connait pas le dialecte ne doit pas remplir le journal.
+        assert!(!queue_stayed_empty("<ok/>"));
+        assert!(!queue_stayed_empty(""));
     }
 }
