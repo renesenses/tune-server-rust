@@ -855,6 +855,22 @@ fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
     )
 }
 
+/// Profondeur de bits admissible par un appareil de lecture, en sortie.
+///
+/// Plancher a 16 : en dessous, plus rien ne lit le PCM de facon fiable.
+/// Plafond a 24 : c'est la limite de la quasi-totalite des lecteurs reseau —
+/// le Marantz ND8006 de Jean Valjean affiche « format non supporte » et reste
+/// muet devant un flux 32 bits, qu'il soit transcode en WAV ou envoye en FLAC
+/// direct (#1610). Le 32 bits venait de `track.bit_depth`, donc du scan : le
+/// format FLAC l'autorise, et rien ne le ramenait a une valeur jouable.
+///
+/// La regle etait deja appliquee a trois endroits, ecrite de trois facons
+/// (`max(16).min(24)`, `min(24).max(16)`) — et oubliee au quatrieme. Une
+/// fonction unique rend l'oubli impossible a reproduire.
+pub(crate) fn cap_output_bit_depth(bit_depth: u16) -> u16 {
+    bit_depth.clamp(16, 24)
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -2927,7 +2943,7 @@ impl PlaybackOrchestrator {
             } else if oaat_needs_wav {
                 // OAAT endpoints (Tune's own RPi renderers) parse the WAV fmt
                 // chunk and handle true 24-bit PCM: cap at 24-bit.
-                bit_depth.max(16).min(24)
+                cap_output_bit_depth(bit_depth)
             } else if dlna_wav24 {
                 // Zone opt-in: serve genuine 24-bit WAV to a renderer that
                 // advertises `audio/L24`. The DIDL drops the 16-bit-only
@@ -2963,9 +2979,9 @@ impl PlaybackOrchestrator {
             } else if src_fmt == AudioFormat::Alac {
                 // ALAC: transcode to FLAC for DLNA (universally supported).
                 // FLAC max is 24-bit; cap at min(source_bd, 24) but at least 16.
-                bit_depth.min(24).max(16)
+                cap_output_bit_depth(bit_depth)
             } else {
-                bit_depth.max(16)
+                cap_output_bit_depth(bit_depth)
             };
             let out_mime = if oaat_needs_wav || local_needs_wav {
                 "audio/wav".to_string()
@@ -3922,7 +3938,7 @@ impl PlaybackOrchestrator {
             let bd = if is_local_stream {
                 32
             } else {
-                stream_data.quality.bit_depth.max(16).min(24)
+                cap_output_bit_depth(stream_data.quality.bit_depth)
             };
 
             let wav_info = StreamInfo {
@@ -9702,5 +9718,44 @@ mod tests {
             PlayState::Stopped,
             "output send error must leave the zone Stopped, not Playing"
         );
+    }
+}
+
+/// Plafond de profondeur en sortie (#1610).
+///
+/// Marantz ND8006 muet, « format non supporte » : le flux partait en 32 bits,
+/// valeur lue dans `track.bit_depth` et jamais ramenee a une profondeur que
+/// l'appareil sait lire. La regle existait a trois endroits et manquait au
+/// quatrieme.
+#[cfg(test)]
+mod bit_depth_cap_tests {
+    use super::cap_output_bit_depth;
+
+    #[test]
+    fn le_32_bits_est_ramene_a_24() {
+        // Le cas de Jean Valjean : un FLAC annonce en 32 bits.
+        assert_eq!(cap_output_bit_depth(32), 24);
+    }
+
+    #[test]
+    fn les_profondeurs_courantes_passent_intactes() {
+        // Ne rien changer pour ceux que ca marchait deja.
+        assert_eq!(cap_output_bit_depth(16), 16);
+        assert_eq!(cap_output_bit_depth(24), 24);
+    }
+
+    #[test]
+    fn en_dessous_de_16_on_remonte() {
+        // Plancher : sous 16 bits, plus rien ne lit le PCM de facon fiable.
+        assert_eq!(cap_output_bit_depth(8), 16);
+        assert_eq!(cap_output_bit_depth(1), 16);
+        assert_eq!(cap_output_bit_depth(0), 16);
+    }
+
+    #[test]
+    fn une_valeur_aberrante_reste_jouable() {
+        // Une metadonnee fantaisiste ne doit pas produire un flux injouable.
+        assert_eq!(cap_output_bit_depth(64), 24);
+        assert_eq!(cap_output_bit_depth(u16::MAX), 24);
     }
 }
