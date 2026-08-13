@@ -106,16 +106,22 @@ jobs:
           # est fourni ci-dessous, notarise et tamponne le DMG automatiquement.
           APPLE_SIGNING_IDENTITY: "Developer ID Application: Bertrand Clech (${{ secrets.APPLE_TEAM_ID }})"
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # Chemin PRIVILEGIE — cle API App Store Connect. Tauri l'utilise des
-          # que ces trois variables sont posees, et ignore alors APPLE_ID /
-          # APPLE_PASSWORD. Une cle API n'expire pas et ne se revoque pas toute
-          # seule, contrairement a un mot de passe applicatif.
+          # Cle API App Store Connect — le SEUL chemin d'authentification pose
+          # ici, et c'est deliberé.
+          #
+          # J'avais d'abord garde APPLE_ID / APPLE_PASSWORD « en repli ». Erreur :
+          # Tauri v2 PREFERE le couple identifiant + mot de passe applicatif
+          # quand il est present, et ne regarde la cle API qu'a defaut. Le repli
+          # prenait donc la main sur le chemin voulu, et la notarisation
+          # continuait de repondre 401 alors que le .p8 etait bien ecrit
+          # (« cle API App Store Connect ecrite » dans le journal du run
+          # 31751355295, suivi du meme 401).
+          #
+          # Ne PAS reintroduire APPLE_ID/APPLE_PASSWORD ici : les reposer, meme
+          # « au cas ou », desactive silencieusement la cle API.
           APPLE_API_KEY: ${{ secrets.ASC_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
-          # Repli, conserve pour ne rien casser si la cle API disparait.
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: cargo tauri build --target ${{ matrix.target }}
 
       - name: Collect DMG
