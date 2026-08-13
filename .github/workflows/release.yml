@@ -658,20 +658,43 @@ jobs:
       - name: Notarize DMG (macOS)
         if: runner.os == 'macOS'
         env:
+          # Preferred path: App Store Connect API key (survives Apple ID
+          # account trouble — the password flow started returning 401s even
+          # after the account was rehabilitated). Falls back to the legacy
+          # Apple ID + app-specific password pair, then to skipping.
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "$APPLE_ID" ]; then echo "No Apple ID, skipping notarization"; exit 0; fi
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          if ! xcrun notarytool submit "$DMG_NAME" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 600; then
+          notarize_failed() {
             echo "::error::Notarisation refusée par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
             rm -f "$DMG_NAME"
             exit 1
+          }
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
+            # printf '%s' via the env var keeps the PEM newlines intact and
+            # avoids any shell interpretation of the key content.
+            printf '%s' "$ASC_API_KEY_P8" > "$KEY_FILE"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            xcrun notarytool submit "$DMG_NAME" \
+              --key "$KEY_FILE" \
+              --key-id "$ASC_API_KEY_ID" \
+              --issuer "$ASC_API_ISSUER_ID" \
+              --wait --timeout 600 || notarize_failed
+          elif [ -n "$APPLE_ID" ]; then
+            xcrun notarytool submit "$DMG_NAME" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 600 || notarize_failed
+          else
+            echo "No notarization credentials, skipping notarization"
+            exit 0
           fi
           xcrun stapler staple "$DMG_NAME"
 
