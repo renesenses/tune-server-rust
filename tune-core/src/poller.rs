@@ -572,9 +572,6 @@ pub(crate) mod decisions {
 
     /// Should the poller dispatch a scrobble this tick?
     ///
-    /// True when the playing track differs from the one already latched
-    /// (`latched_key`) AND it has genuinely been listened past the Last.fm
-    /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
     /// L'echeance de sondage d'une radio est-elle atteinte ?
     ///
     /// Ne prend PAS l'etat du transport en parametre, et c'est tout l'objet du
@@ -620,6 +617,9 @@ pub(crate) mod decisions {
         matches!(source, Some(s) if !s.is_empty() && s != "local")
     }
 
+    /// True when the playing track differs from the one already latched
+    /// (`latched_key`) AND it has genuinely been listened past the Last.fm
+    /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
     pub fn should_dispatch_scrobble(
         latched_key: Option<&str>,
         current_key: &str,
