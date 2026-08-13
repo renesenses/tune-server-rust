@@ -33,6 +33,8 @@ pub fn freq_index(sample_rate: u32) -> Option<u8> {
 
 /// Build the `esds` box for AAC-LC: ES / DecoderConfig / DecSpecificInfo
 /// (the 2-byte AudioSpecificConfig) / SLConfig descriptors.
+/// (macOS only: Media Foundation writes its own container.)
+#[cfg(target_os = "macos")]
 fn esds_box(sample_rate: u32, channels: u16, avg_bitrate: u32) -> Vec<u8> {
     let fi = freq_index(sample_rate).expect("caller resamples to a standard rate");
     // AudioSpecificConfig: 5 bits object type (2 = LC), 4 bits freq index,
@@ -243,9 +245,127 @@ pub fn encode_aac_m4a(
     }))
 }
 
-/// Non-macOS: no system encoder wired yet — the converter falls back to
-/// the bundled ffmpeg (#1524). Windows/Media Foundation is the next step.
-#[cfg(not(target_os = "macos"))]
+/// Windows: Media Foundation `IMFSinkWriter` — the OS encoder writes the
+/// complete `.m4a` itself (no hand muxing). The exact call sequence was
+/// validated on a real Windows 11 machine (.42) with a standalone probe:
+/// the produced file decodes through the project's symphonia chain with
+/// the right rate/channels and the source RMS (2026-08-13).
+#[cfg(windows)]
+pub fn encode_aac_m4a(
+    pcm: &[i16],
+    channels: u16,
+    sample_rate: u32,
+    bitrate_bps: u32,
+) -> Result<Vec<u8>, String> {
+    use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    use windows::core::HSTRING;
+
+    if !(1..=2).contains(&channels) {
+        return Err(format!(
+            "aac: {channels} canaux non pris en charge (mono/stéréo)"
+        ));
+    }
+    if !rate_supported(sample_rate) {
+        return Err(format!(
+            "aac: fréquence {sample_rate} non prise en charge (44100/48000)"
+        ));
+    }
+    let ch = channels as u32;
+
+    // MF's AAC encoder only accepts 12000/16000/20000/24000 bytes/s
+    // (96/128/160/192 kb/s) — snap the request to the nearest.
+    let target = bitrate_bps / 8;
+    let bytes_per_sec = [12000u32, 16000, 20000, 24000]
+        .into_iter()
+        .min_by_key(|&v| v.abs_diff(target))
+        .unwrap();
+
+    // The sink writer writes a file; produce it in a temp path and return
+    // the bytes to keep the same contract as the AudioToolbox path.
+    let tmp = std::env::temp_dir().join(format!(
+        "tune-aac-{}-{}.m4a",
+        std::process::id(),
+        pcm.as_ptr() as usize
+    ));
+    let tmp_str = tmp.to_string_lossy().to_string();
+
+    let result: windows::core::Result<()> = (|| unsafe {
+        // Per-thread COM init: the converter encodes from blocking-pool
+        // threads. S_FALSE (already initialised) is fine.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // MF_VERSION = (MF_SDK_VERSION << 16) | MF_API_VERSION
+        MFStartup(0x0002_0070, MFSTARTUP_FULL)?;
+
+        let writer: IMFSinkWriter =
+            MFCreateSinkWriterFromURL(&HSTRING::from(tmp_str.as_str()), None, None)?;
+
+        let out_type: IMFMediaType = MFCreateMediaType()?;
+        out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        out_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+        out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate)?;
+        out_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, ch)?;
+        out_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        out_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_sec)?;
+        // AAC-LC, level indication the MF encoder expects.
+        out_type.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+        let stream_index = writer.AddStream(&out_type)?;
+
+        let in_type: IMFMediaType = MFCreateMediaType()?;
+        in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        in_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+        in_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate)?;
+        in_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, ch)?;
+        in_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        in_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * ch)?;
+        in_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, sample_rate * 2 * ch)?;
+        writer.SetInputMediaType(stream_index, &in_type, None)?;
+
+        writer.BeginWriting()?;
+
+        // Feed in ~100 ms slices, timestamps in 100 ns units.
+        let bytes: &[u8] = std::slice::from_raw_parts(pcm.as_ptr() as *const u8, pcm.len() * 2);
+        let chunk_bytes = (sample_rate / 10) as usize * 2 * ch as usize;
+        let mut written_frames: u64 = 0;
+        for chunk in bytes.chunks(chunk_bytes) {
+            let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(chunk.len() as u32)?;
+            let mut data = std::ptr::null_mut();
+            buffer.Lock(&mut data, None, None)?;
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), data, chunk.len());
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(chunk.len() as u32)?;
+
+            let sample: IMFSample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            let frames = (chunk.len() / (2 * ch as usize)) as u64;
+            sample.SetSampleTime((written_frames * 10_000_000 / sample_rate as u64) as i64)?;
+            sample.SetSampleDuration((frames * 10_000_000 / sample_rate as u64) as i64)?;
+            writer.WriteSample(stream_index, &sample)?;
+            written_frames += frames;
+        }
+
+        writer.Finalize()?;
+        MFShutdown()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            let bytes = std::fs::read(&tmp)
+                .map_err(|e| format!("aac: relecture du fichier temporaire: {e}"))?;
+            let _ = std::fs::remove_file(&tmp);
+            Ok(bytes)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("aac: Media Foundation a rendu {e}"))
+        }
+    }
+}
+
+/// Other platforms: no system encoder — the converter falls back to the
+/// bundled ffmpeg (#1524).
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn encode_aac_m4a(
     _pcm: &[i16],
     _channels: u16,
@@ -257,7 +377,18 @@ pub fn encode_aac_m4a(
 
 /// Whether THIS build carries a native AAC encoder.
 pub fn native_available() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", windows))
+}
+
+/// Whether the platform encoder accepts this input rate directly — the
+/// converter resamples to 48 kHz otherwise. AudioToolbox takes every
+/// standard MPEG-4 rate; Media Foundation's AAC encoder only 44.1/48 kHz.
+pub fn rate_supported(sample_rate: u32) -> bool {
+    if cfg!(windows) {
+        matches!(sample_rate, 44100 | 48000)
+    } else {
+        freq_index(sample_rate).is_some()
+    }
 }
 
 #[cfg(target_os = "macos")]
