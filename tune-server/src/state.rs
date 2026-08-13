@@ -272,7 +272,7 @@ impl AppState {
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
         let scanner = Arc::new(SsdpScanner::new(ssdp_tx));
 
-        let upnp = UpnpState::new(backend.clone(), port);
+        let upnp = UpnpState::new(backend.clone(), port, tune_config.advertised_ip.clone());
 
         let health_config = HealthMonitorConfig {
             db_path: db_path.into(),
