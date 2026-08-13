@@ -309,6 +309,33 @@ fn quantize_i16(x: f32) -> f32 {
 /// mono, L/R/L/R doubles the effective sample rate and smears the timbre — enough
 /// to preserve same-album structure (Phase 1) yet wreck cross-modal alignment
 /// (text↔audio, Phase 3). Averaging the channels per frame restores true mono.
+/// Cadence d'entrée du front-end mel de CLAP. `decode_to_pcm` la *demande*,
+/// mais le chemin symphonia ne rééchantillonne pas : depuis #1508 il dit la
+/// vérité (`d.sample_rate` = cadence source) au lieu de mentir, et c'est donc
+/// ici que la fenêtre doit être amenée réellement à 48 kHz.
+const CLAP_INPUT_RATE: u32 = 48_000;
+
+/// La fenêtre exactement comme le modèle l'attend : mono (vraie moyenne des
+/// canaux, #1108/#1508) puis VRAI 48 kHz (rubato). Avant ce correctif (#1498),
+/// un FLAC 44,1 stéréo arrivait au modèle en L/R entrelacé étiqueté mono
+/// 48 kHz : ~5,4 s de musique au lieu de 10, timbre brouillé, et des vecteurs
+/// dépendant de l'encodage — rédhibitoire pour toute mutualisation.
+fn prepare_clap_window(
+    samples: &[i32],
+    channels: u32,
+    bit_depth: u16,
+    sample_rate: u32,
+) -> Vec<f32> {
+    let mono = to_mono_f32(samples, channels, bit_depth);
+    if sample_rate == CLAP_INPUT_RATE || sample_rate == 0 || mono.is_empty() {
+        return mono;
+    }
+    // `_exact` : sans elle, la sortie porte le retard de groupe du filtre en
+    // tête et sa vidange en queue (~2× le délai) — du silence et un décalage
+    // que le modèle n'a pas à voir.
+    crate::audio::resample::rubato_resample_batch_exact(&mono, sample_rate, CLAP_INPUT_RATE, 1)
+}
+
 fn to_mono_f32(samples: &[i32], channels: u32, bit_depth: u16) -> Vec<f32> {
     let scale = (1i64 << (bit_depth.saturating_sub(1)).min(31)) as f32;
     let ch = channels.max(1) as usize;
@@ -409,7 +436,7 @@ pub async fn analyze_embedding_batch(
         }
 
         if let Ok(Ok(Ok(d))) = decoded {
-            let wav = to_mono_f32(&d.samples_i32, d.channels, d.bit_depth);
+            let wav = prepare_clap_window(&d.samples_i32, d.channels, d.bit_depth, d.sample_rate);
             match embedder.embed(&wav) {
                 Ok(emb) => {
                     let row = vec![
@@ -750,6 +777,27 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clap_window_resamples_true_source_rate_to_48k() {
+        // 1 s of 44.1 kHz mono must come out ~1 s of 48 kHz (#1498).
+        let samples: Vec<i32> = (0..44_100).map(|i| ((i % 100) * 100) as i32).collect();
+        let out = prepare_clap_window(&samples, 1, 16, 44_100);
+        let ratio = out.len() as f64 / 48_000.0;
+        assert!((0.98..1.02).contains(&ratio), "got {} samples", out.len());
+    }
+
+    #[test]
+    fn clap_window_passthrough_at_48k_and_downmixes() {
+        // Already 48 kHz: untouched. Stereo: averaged first (#1108/#1508).
+        let stereo: Vec<i32> = vec![32767, -32767, 32767, -32767];
+        let out = prepare_clap_window(&stereo, 2, 16, 48_000);
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter().all(|v| v.abs() < 1e-4),
+            "L/R must cancel out: {out:?}"
+        );
+    }
 
     #[test]
     fn to_mono_f32_averages_interleaved_stereo() {
