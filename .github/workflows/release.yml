@@ -644,6 +644,17 @@ jobs:
             codesign --force --sign "$IDENTITY" "$DMG_NAME"
           fi
 
+      # Le .tar.gz macOS n'a RIEN à voir avec la notarisation : il n'est pas
+      # ouvert par Gatekeeper. Tant que l'envoi des artefacts venait après
+      # cette étape, un refus d'Apple l'emportait avec le DMG — v0.9.71, 401
+      # sur un mot de passe applicatif révoqué : quatre fichiers macOS perdus,
+      # dont deux sans aucune raison, et la catégorie macOS a disparu de la
+      # page de téléchargement.
+      #
+      # Un DMG non tamponné, lui, ne doit JAMAIS sortir : Gatekeeper le
+      # refuserait chez l'utilisateur, ce qui est pire qu'un fichier absent.
+      # On le supprime donc plutôt que de le publier à moitié, et l'étape
+      # échoue quand même — la préflight doit continuer de voir le défaut.
       - name: Notarize DMG (macOS)
         if: runner.os == 'macOS'
         env:
@@ -653,14 +664,22 @@ jobs:
         run: |
           if [ -z "$APPLE_ID" ]; then echo "No Apple ID, skipping notarization"; exit 0; fi
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          xcrun notarytool submit "$DMG_NAME" \
+          if ! xcrun notarytool submit "$DMG_NAME" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 600
+            --wait --timeout 600; then
+            echo "::error::Notarisation refusée par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
+            rm -f "$DMG_NAME"
+            exit 1
+          fi
           xcrun stapler staple "$DMG_NAME"
 
+      # `always()` : les artefacts déjà construits partent même si la
+      # notarisation a échoué. Le DMG a été supprimé juste au-dessus dans ce
+      # cas, donc seul ce qui est publiable monte.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ env.ARTIFACT }}
           path: |
@@ -668,6 +687,7 @@ jobs:
             ${{ env.ARTIFACT }}.dmg
             ${{ env.ARTIFACT }}-setup.exe
           retention-days: 1
+          if-no-files-found: warn
 
   release:
     name: Create Release
