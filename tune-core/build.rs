@@ -24,6 +24,9 @@ fn main() {
     let alac = "vendor/alac";
     cc::Build::new()
         .cpp(true)
+        // Le g++ du conteneur cross aarch64 compile en C++03 par défaut :
+        // sans ceci, « 'nullptr' was not declared in this scope ».
+        .std("c++11")
         .include(alac)
         .files([
             format!("{alac}/ALACEncoder.cpp"),
