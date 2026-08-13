@@ -347,8 +347,26 @@ jobs:
           if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
 
           $targets = @("target\${{ matrix.target }}\release\tune-server.exe")
-          if (Test-Path "target\${{ matrix.target }}\release\airplay-daemon.exe") {
-            $targets += "target\${{ matrix.target }}\release\airplay-daemon.exe"
+          # airplay-daemon vit dans $RUNNER_TEMP\apd\bin (cargo install --root),
+          # JAMAIS dans target\release : l'ancien Test-Path ne matchait jamais
+          # et le daemon serait parti non signé. Signé en place, la copie vers
+          # le zip et l'installeur (toutes deux après cette étape) le propage.
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            $targets += "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe"
+          }
+          # ffmpeg minimal (#1524) : même motif — signé EN PLACE dans ffbundle,
+          # d'où le zip et l'installeur NSIS le copient tous deux APRÈS cette
+          # étape. Sans lui, tune-server.exe signé lancerait un ffmpeg.exe non
+          # signé — la même heuristique Defender que ce que corrige #1521.
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
+          }
+          # ffmpeg minimal (#1524) : signé EN PLACE dans ffbundle, d'où le zip
+          # et l'installeur NSIS le copient tous deux APRÈS cette étape. Sans
+          # lui, tune-server.exe signé lancerait un ffmpeg.exe non signé — la
+          # même heuristique Defender que ce que cette étape corrige (#1521).
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
           foreach ($t in $targets) {
