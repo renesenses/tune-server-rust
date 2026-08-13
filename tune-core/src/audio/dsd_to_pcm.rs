@@ -10,6 +10,23 @@
 
 use std::f64::consts::PI;
 
+/// Échelle SACD appliquée à la conversion DSD→PCM : +6,02 dB (×2,0).
+///
+/// La référence 0 dB du DSD (Scarlet Book) est posée 6 dB SOUS la pleine
+/// échelle du domaine ±1 issu du filtre — les crêtes autorisées montent à
+/// +3,1 dB au-dessus de cette référence. Convertir à l'échelle 1:1 rendait
+/// donc tout le parc DSD ~5-6 dB plus bas que les éditions PCM des mêmes
+/// masters — mesuré par Reivax66 (Head Hunters DSD vs 24/96, mêmes ISRC :
+/// crêtes DSD à −5/−7 dBFS, FLAC à 0 dBFS, ~+4,4 dB d'écart album — #1638).
+/// Tous les convertisseurs de place (foobar SACD, Weiss, HQPlayer) appliquent
+/// ce ×2 ; le clamp aval absorbe les crêtes extrêmes au-delà de la pleine
+/// échelle (rarissimes : il faut dépasser la référence de plus de 6 dB).
+///
+/// Les ReplayGain calculés sur l'ancienne échelle sont invalidés par la
+/// migration 75 (SQLite) / 024 (PG) — sans elle, un gain stocké (+2,25 dB
+/// typiquement) cumulé au ×2 sur-amplifierait de 6 dB.
+pub const DSD_SACD_GAIN: f64 = 2.0;
+
 /// DSD-to-PCM decimation converter.
 pub struct DsdToPcmConverter {
     /// How many DSD bits map to one PCM sample.
@@ -128,7 +145,7 @@ impl DsdToPcmConverter {
                 }
 
                 // Clamp to [-1.0, 1.0] and convert to 24-bit signed integer
-                let clamped = sum.clamp(-1.0, 1.0);
+                let clamped = (sum * DSD_SACD_GAIN).clamp(-1.0, 1.0);
                 let pcm_val = (clamped * 8_388_607.0) as i32; // 2^23 - 1
 
                 // Write as 24-bit little-endian
@@ -434,7 +451,7 @@ impl DsdToPcmStreamer {
                             s
                         };
 
-                        let clamped = sum.clamp(-1.0, 1.0);
+                        let clamped = (sum * DSD_SACD_GAIN).clamp(-1.0, 1.0);
                         let pcm_val = (clamped * 8_388_607.0) as i32;
                         let bytes = pcm_val.to_le_bytes();
                         output.push(bytes[0]);
@@ -496,7 +513,7 @@ impl DsdToPcmStreamer {
                     }
                 }
 
-                let clamped = sum.clamp(-1.0, 1.0);
+                let clamped = (sum * DSD_SACD_GAIN).clamp(-1.0, 1.0);
                 let pcm_val = (clamped * 8_388_607.0) as i32;
                 let bytes = pcm_val.to_le_bytes();
                 output.push(bytes[0]);
@@ -599,6 +616,36 @@ mod tests {
             pcm[mid] < -10000,
             "all-zero DSD should produce negative PCM, got {}",
             pcm[mid]
+        );
+    }
+
+    #[test]
+    /// #1638 : l'échelle SACD (+6 dB) doit être appliquée à la conversion.
+    /// Un motif DSD à 62,5 % de uns a une moyenne de +0,25 dans le domaine
+    /// ±1 ; sans le ×2 il sortait à ~25 % de la pleine échelle, il doit
+    /// désormais sortir à ~50 %. Et un DC saturant (tous uns, +1,0 ×2) doit
+    /// être écrêté proprement à la pleine échelle, pas déborder.
+    #[test]
+    fn sacd_scale_doubles_conversion_and_clamps() {
+        let channels = 1;
+        let converter = DsdToPcmConverter::new(2_822_400, 176_400, channels, true);
+
+        // 5 bits à 1 sur 8 => moyenne (5-3)/8 = +0,25 => ~0,5 FS après ×2.
+        let dsd_data = vec![0b0001_1111u8; 4096];
+        let pcm = converter.process_to_i16(&dsd_data);
+        let mid = pcm[pcm.len() / 2] as f64 / 32767.0;
+        assert!(
+            (0.45..0.55).contains(&mid),
+            "attendu ~0,5 FS (échelle SACD ×2 sur une moyenne de 0,25), obtenu {mid:.3}"
+        );
+
+        // DC saturant : clamp à la pleine échelle, sans wrap.
+        let converter = DsdToPcmConverter::new(2_822_400, 176_400, channels, true);
+        let pcm = converter.process_to_i16(&vec![0xFFu8; 4096]);
+        let mid = pcm[pcm.len() / 2];
+        assert!(
+            mid >= 32700,
+            "DC +1,0 doit saturer proprement, obtenu {mid}"
         );
     }
 

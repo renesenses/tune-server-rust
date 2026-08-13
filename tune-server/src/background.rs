@@ -553,14 +553,16 @@ fn spawn_token_refresher(state: &AppState) {
 
 async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
     if let Some(ref upnp) = state.upnp {
-        let location = format!(
-            "http://{}:{}/upnp/description.xml",
-            tune_core::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into()),
+        // La LOCATION n'est plus figée ici : l'annonceur recalcule l'IP à
+        // chaque cycle et n'annonce rien tant qu'aucune IP réseau n'est
+        // disponible — l'ancien repli « 127.0.0.1 » calculé une fois au
+        // démarrage publiait du loopback à vie (#1614).
+        tune_core::upnp_server::spawn_ssdp_advertiser(
+            upnp.uuid.clone(),
             config.port,
-        );
-        tune_core::upnp_server::spawn_ssdp_advertiser(upnp.uuid.clone(), location).await;
+            config.advertised_ip.clone(),
+        )
+        .await;
         info!("upnp_mediaserver_advertiser_started");
     }
 }

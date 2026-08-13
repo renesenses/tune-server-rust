@@ -188,6 +188,10 @@ impl OutputTarget for MockOutput {
         true
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         *self.next_uri.lock().await = Some(media.url.to_string());
         self.set_next_calls.lock().await.push(PlayCall {

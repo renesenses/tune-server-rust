@@ -82,14 +82,42 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
           rm /tmp/certificate.p12
 
+      # release.yml notarise via une CLE API App Store Connect et ne retombe sur
+      # le mot de passe applicatif qu'a defaut. Le widget ne connaissait que la
+      # seconde porte — celle qui repond 401. On ecrit donc le .p8 sur disque,
+      # comme le fait release.yml, pour que Tauri emprunte la meme.
+      - name: Write App Store Connect API key
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          # Test en shell, pas dans un `if:` d'etape : le contexte `secrets`
+          # n'y est pas disponible. Meme motif que release.yml.
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            printf '%s' "$ASC_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+            echo "cle API App Store Connect ecrite"
+          else
+            echo "::error::ASC_API_KEY_P8 absent — la notarisation echouera (pas de repli : voir la priorite de notarize_auth ci-dessous)"
+            exit 1
+          fi
+
       - name: Build signed + notarized bundle
         env:
-          # Tauri v2 signs with this identity and — because the notarization
-          # trio below is set — notarizes and staples the DMG automatically.
+          # Tauri v2 signe avec cette identite et, parce que de quoi notariser
+          # est fourni ci-dessous, notarise et tamponne le DMG automatiquement.
           APPLE_SIGNING_IDENTITY: "Developer ID Application: Bertrand Clech (${{ secrets.APPLE_TEAM_ID }})"
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Cle API App Store Connect. ATTENTION, priorite INVERSE de ce que
+          # croyait #1644 : notarize_auth() de tauri-bundler teste APPLE_ID +
+          # APPLE_PASSWORD + APPLE_TEAM_ID EN PREMIER et ne regarde la cle API
+          # qu'a defaut (crates/tauri-bundler/src/bundle/macos/sign.rs). Poser
+          # APPLE_ID/APPLE_PASSWORD ici court-circuitait donc la cle API et
+          # renvoyait 401 (mot de passe applicatif invalide) — echec du run du
+          # 13 aout 2026 sur widget-v0.1.0. On ne pose QUE la cle API.
+          # (APPLE_TEAM_ID seul ne declenche pas le chemin AppleId.)
+          APPLE_API_KEY: ${{ secrets.ASC_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
         run: cargo tauri build --target ${{ matrix.target }}
 
       - name: Collect DMG
