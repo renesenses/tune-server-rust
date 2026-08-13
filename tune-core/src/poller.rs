@@ -575,6 +575,16 @@ pub(crate) mod decisions {
     /// True when the playing track differs from the one already latched
     /// (`latched_key`) AND it has genuinely been listened past the Last.fm
     /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
+    /// L'echeance de sondage d'une radio est-elle atteinte ?
+    ///
+    /// Ne prend PAS l'etat du transport en parametre, et c'est tout l'objet du
+    /// correctif : le titre diffuse se lit sur une API externe ou dans le flux
+    /// ICY, independamment de ce que fait le renderer. Seul le TEMPS ecoule
+    /// commande — le tick du poller est a la seconde, l'API de la station non.
+    pub fn radio_poll_due(since_last: std::time::Duration, interval_secs: u64) -> bool {
+        since_last >= std::time::Duration::from_secs(interval_secs)
+    }
+
     /// Faut-il rafraichir les metadonnees radio d'une zone qui n'a AUCUN
     /// peripherique de sortie ?
     ///
@@ -592,9 +602,22 @@ pub(crate) mod decisions {
         since_last_poll: std::time::Duration,
         interval_secs: u64,
     ) -> bool {
-        is_playing
-            && source == Some("radio")
-            && since_last_poll >= std::time::Duration::from_secs(interval_secs)
+        is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
+    }
+
+    /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?
+    ///
+    /// Vrai des que l'ecoute vient d'un service de streaming. Le repli
+    /// streaming existait deja (#1443) mais restait conditionne a « rien
+    /// trouve en local » : chez qui possede une bibliotheque locale ET un
+    /// abonnement, le generateur local repondait presque toujours quelque
+    /// chose, et l'autoplay renvoyait donc des titres locaux au milieu d'une
+    /// ecoute Qobuz (Sandro, 0.9.70).
+    ///
+    /// La source de la piste en cours est la meilleure expression de ce que
+    /// l'auditeur ecoute : on la suit, et le local reste le filet.
+    pub fn autoplay_prefers_streaming(source: Option<&str>) -> bool {
+        matches!(source, Some(s) if !s.is_empty() && s != "local")
     }
 
     pub fn should_dispatch_scrobble(
@@ -2244,11 +2267,13 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.source == "radio")
                 .unwrap_or(false);
-            if is_radio {
-                let since_last = ps.last_radio_poll.elapsed();
-                if since_last < std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS) {
-                    continue;
-                }
+            if is_radio
+                && !decisions::radio_poll_due(
+                    ps.last_radio_poll.elapsed(),
+                    RADIO_POLL_INTERVAL_SECS,
+                )
+            {
+                continue;
             }
 
             ps.total_polls += 1;
@@ -2443,9 +2468,25 @@ impl PositionPoller {
                             .ok();
                     }
                     ps.last_device_volume = Some(status.volume);
-
-                    self.refresh_radio_metadata(zone_id, zone_state).await;
                 }
+
+                // Le titre diffuse par une webradio NE DEPEND PAS de l'etat du
+                // renderer : il se lit sur une API externe (Radio Paradise,
+                // Radio France) ou dans le flux ICY, tous deux independants de
+                // ce que fait l'appareil. Rien ne justifiait de conditionner
+                // cette lecture a la bonne sante du transport.
+                //
+                // C'etait pourtant le cas : l'appel vivait dans le
+                // `if !radio_stopped` ci-dessus, aux cotes de la synchro de
+                // volume — qui, elle, a bien besoin d'un renderer en lecture.
+                // Consequence : un renderer qui ne demarre pas figeait
+                // l'affichage sur le nom de la station, et un bug de LECTURE se
+                // deguisait en bug de METADONNEES. Bilou a ouvert deux fils
+                // distincts pour un seul probleme (#1522, #1492).
+                //
+                // La garde sur le peripherique de sortie, elle, est tombee
+                // avec #1536.
+                self.refresh_radio_metadata(zone_id, zone_state).await;
 
                 // Sync metrics and skip the rest of the loop (no gapless/track-end).
                 self.shared_metrics.lock().await.insert(
@@ -3750,6 +3791,37 @@ impl PositionPoller {
                 // aussi l'autoplay. Repli sur le générateur genre/BPM local si
                 // l'API d'enrichissement est injoignable ou ne matche rien dans
                 // la bibliothèque (Tune doit marcher sans mozaiklabs.fr).
+                // La source de l'ecoute en cours passe AVANT le generateur
+                // local. Le repli streaming plus bas ne se declenchait que si
+                // le local n'avait rien rendu — donc jamais, chez qui a une
+                // bibliotheque locale garnie. L'autoplay enchainait alors des
+                // titres locaux au milieu d'une ecoute Qobuz.
+                let seed_source = zone_state.now_playing.as_ref().map(|np| np.source.clone());
+                if decisions::autoplay_prefers_streaming(seed_source.as_deref())
+                    && let Some(ref artist) = seed_artist
+                    && let Some(ref source) = seed_source
+                {
+                    let added = self.autoplay_streaming_radio(zone_id, artist, source).await;
+                    if added > 0 {
+                        let new_pos = zone_state.queue_position + 1;
+                        info!(
+                            zone_id,
+                            added,
+                            source = %source,
+                            "autoplay_streaming_radio_started_preferred"
+                        );
+                        if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                            warn!(zone_id, error = %e, "autoplay_play_failed");
+                            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        }
+                        return;
+                    }
+                    // Le service n'a rien rendu (hors catalogue, API muette) :
+                    // on retombe sur le generateur local plutot que de laisser
+                    // la file s'arreter en silence.
+                    debug!(zone_id, "autoplay_streaming_empty_falling_back_local");
+                }
+
                 let mut generated = Vec::new();
                 if let Some(ref artist) = seed_artist {
                     info!(zone_id, artist = %artist, "autoplay_similar_artists_radio");
@@ -5697,6 +5769,38 @@ mod gapless_stage_expiry_tests {
 /// opposes — l'un sur une vraie sortie, l'autre sur le navigateur.
 #[cfg(test)]
 mod radio_metadata_deviceless_tests {
+    // ── Garde n°2 : l'etat du transport ne commande pas les metadonnees ────
+    //
+    // Le rafraichissement vivait dans le `if !radio_stopped`, aux cotes de la
+    // synchro de volume — qui, elle, a bien besoin d'un renderer en lecture.
+    // Un renderer qui ne demarrait pas figeait donc l'affichage sur le nom de
+    // la station, et un bug de LECTURE se deguisait en bug de METADONNEES.
+
+    #[test]
+    fn seul_le_temps_ecoule_commande_le_sondage_radio() {
+        use super::decisions::radio_poll_due;
+        use std::time::Duration;
+        assert!(!radio_poll_due(Duration::from_secs(3), 15));
+        assert!(radio_poll_due(Duration::from_secs(15), 15));
+        assert!(radio_poll_due(Duration::from_secs(600), 15));
+    }
+
+    #[test]
+    fn les_deux_chemins_partagent_la_meme_cadence() {
+        // La zone SANS peripherique (#1536) et la zone AVEC doivent sonder au
+        // meme rythme : une seule regle de temps, pas deux qui derivent.
+        use super::decisions::{deviceless_radio_refresh_due, radio_poll_due};
+        use std::time::Duration;
+        for secs in [0_u64, 5, 14, 15, 60] {
+            let d = Duration::from_secs(secs);
+            assert_eq!(
+                deviceless_radio_refresh_due(true, Some("radio"), d, 15),
+                radio_poll_due(d, 15),
+                "cadence divergente a {secs}s"
+            );
+        }
+    }
+
     // ── Metadonnees radio sur une zone SANS peripherique (fil « Metadonnees
     //    radio disparues ? ») ──────────────────────────────────────────────
     //
@@ -5731,5 +5835,38 @@ mod radio_metadata_deviceless_tests {
     #[test]
     fn zone_a_larret_nest_pas_sondee() {
         assert!(!due(false, Some("radio"), Duration::from_secs(600), 15));
+    }
+}
+
+/// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
+///
+/// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
+/// ou rien du tout. Le repli streaming existait (#1443) mais restait
+/// conditionne a « rien trouve en local » — donc jamais chez qui possede une
+/// bibliotheque garnie.
+#[cfg(test)]
+mod autoplay_source_tests {
+    use super::decisions::autoplay_prefers_streaming as prefers;
+
+    #[test]
+    fn une_ecoute_qobuz_cherche_dans_qobuz() {
+        assert!(prefers(Some("qobuz")));
+        assert!(prefers(Some("tidal")));
+        assert!(prefers(Some("deezer")));
+    }
+
+    #[test]
+    fn une_ecoute_locale_reste_locale() {
+        // Le generateur local garde la main quand c'est du local qui joue :
+        // ce lot ne doit rien changer pour qui n'a pas d'abonnement.
+        assert!(!prefers(Some("local")));
+    }
+
+    #[test]
+    fn une_source_absente_ou_vide_ne_bascule_rien() {
+        // Sens de defaut : sans source identifiee, on ne va pas interroger un
+        // service au hasard.
+        assert!(!prefers(None));
+        assert!(!prefers(Some("")));
     }
 }
