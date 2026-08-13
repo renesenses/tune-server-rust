@@ -742,6 +742,32 @@ pub fn spawn_mdns_handler(
                         // whole reconnect/create block for hidden devices.
                         if zone_repo.is_device_hidden(&dev.id) {
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_hidden_skipping");
+                        } else if let Some((zid, was_hidden)) =
+                            legacy_zone_to_reanchor(&zone_repo, &dev)
+                        {
+                            // Zone creee AVANT #1528, donc enregistree sous
+                            // l'ancien identifiant derive de l'adresse. On la
+                            // re-ancre sur le nouvel identifiant durable — c'est
+                            // ce qui remplace la migration SQL, qui n'aurait pas
+                            // pu calculer ces identifiants (ils ne sont connus
+                            // qu'a la decouverte) et aurait fait perdre toutes
+                            // les zones d'un coup.
+                            //
+                            // Une zone supprimee reste supprimee : on deplace
+                            // son identifiant sans la remettre en ligne, sinon
+                            // la mise a jour ressusciterait ce que
+                            // l'utilisateur avait efface.
+                            let _ = zone_repo.update_output_device(zid, &dev.id);
+                            if !was_hidden {
+                                set_zone_online(&event_bus, &db, &dev.id, true);
+                            }
+                            info!(
+                                name = %dev.name,
+                                id = %dev.id,
+                                zone_id = zid,
+                                hidden = was_hidden,
+                                "mdns_zone_reanchored_from_legacy_id"
+                            );
                         } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
@@ -1144,6 +1170,39 @@ fn find_cross_protocol_zone_conflict<'a>(
 /// the same zone lifecycle as the mDNS handler: hidden zones stay deleted,
 /// known device_ids reconnect (online + restored volume), renamed device_ids
 /// re-attach by zone name, and new devices honour `zone_auto_create`.
+/// La zone a re-ancrer sur le nouvel identifiant durable, s'il y en a une.
+///
+/// Rend `(zone_id, etait_masquee)`.
+///
+/// Les zones creees avant #1528 sont enregistrees sous l'identifiant derive de
+/// l'adresse (`{type}-{host}-{port}`). Plutot qu'une migration SQL — impossible,
+/// puisque les nouveaux identifiants ne sont connus qu'a la decouverte — chaque
+/// appareil re-ancre sa zone a sa premiere reapparition. Les zones jamais
+/// revues gardent leur ancien identifiant sans dommage.
+///
+/// Deux garde-fous, et le premier est le plus important :
+///
+/// 1. **Ne rien faire si une zone porte deja le nouvel identifiant.** Sans
+///    cela, une zone en double restee sur l'ancienne forme serait re-ancree
+///    par-dessus la bonne, et deux zones partageraient la meme cle.
+/// 2. Ne pas agir quand l'ancienne et la nouvelle forme coincident — cas d'un
+///    appareil qui n'annonce aucun identifiant : il n'y a rien a deplacer.
+fn legacy_zone_to_reanchor(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<(i64, bool)> {
+    let legacy = tune_core::discovery::mdns::legacy_device_id(dev.device_type, &dev.host, dev.port);
+    if legacy == dev.id {
+        return None;
+    }
+    if matches!(zone_repo.get_by_device_id(&dev.id), Ok(Some(_))) {
+        return None;
+    }
+    let zone = zone_repo.get_by_device_id(&legacy).ok().flatten()?;
+    let zid = zone.id?;
+    Some((zid, zone_repo.is_device_hidden(&legacy)))
+}
+
 pub fn spawn_output_providers(
     state: &AppState,
     providers: Vec<Arc<dyn tune_core::outputs::traits::OutputProvider>>,
