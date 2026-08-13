@@ -605,6 +605,21 @@ pub(crate) mod decisions {
         is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
     }
 
+    /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?
+    ///
+    /// Vrai des que l'ecoute vient d'un service de streaming. Le repli
+    /// streaming existait deja (#1443) mais restait conditionne a « rien
+    /// trouve en local » : chez qui possede une bibliotheque locale ET un
+    /// abonnement, le generateur local repondait presque toujours quelque
+    /// chose, et l'autoplay renvoyait donc des titres locaux au milieu d'une
+    /// ecoute Qobuz (Sandro, 0.9.70).
+    ///
+    /// La source de la piste en cours est la meilleure expression de ce que
+    /// l'auditeur ecoute : on la suit, et le local reste le filet.
+    pub fn autoplay_prefers_streaming(source: Option<&str>) -> bool {
+        matches!(source, Some(s) if !s.is_empty() && s != "local")
+    }
+
     pub fn should_dispatch_scrobble(
         latched_key: Option<&str>,
         current_key: &str,
@@ -3776,6 +3791,37 @@ impl PositionPoller {
                 // aussi l'autoplay. Repli sur le générateur genre/BPM local si
                 // l'API d'enrichissement est injoignable ou ne matche rien dans
                 // la bibliothèque (Tune doit marcher sans mozaiklabs.fr).
+                // La source de l'ecoute en cours passe AVANT le generateur
+                // local. Le repli streaming plus bas ne se declenchait que si
+                // le local n'avait rien rendu — donc jamais, chez qui a une
+                // bibliotheque locale garnie. L'autoplay enchainait alors des
+                // titres locaux au milieu d'une ecoute Qobuz.
+                let seed_source = zone_state.now_playing.as_ref().map(|np| np.source.clone());
+                if decisions::autoplay_prefers_streaming(seed_source.as_deref())
+                    && let Some(ref artist) = seed_artist
+                    && let Some(ref source) = seed_source
+                {
+                    let added = self.autoplay_streaming_radio(zone_id, artist, source).await;
+                    if added > 0 {
+                        let new_pos = zone_state.queue_position + 1;
+                        info!(
+                            zone_id,
+                            added,
+                            source = %source,
+                            "autoplay_streaming_radio_started_preferred"
+                        );
+                        if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                            warn!(zone_id, error = %e, "autoplay_play_failed");
+                            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        }
+                        return;
+                    }
+                    // Le service n'a rien rendu (hors catalogue, API muette) :
+                    // on retombe sur le generateur local plutot que de laisser
+                    // la file s'arreter en silence.
+                    debug!(zone_id, "autoplay_streaming_empty_falling_back_local");
+                }
+
                 let mut generated = Vec::new();
                 if let Some(ref artist) = seed_artist {
                     info!(zone_id, artist = %artist, "autoplay_similar_artists_radio");
@@ -5789,5 +5835,38 @@ mod radio_metadata_deviceless_tests {
     #[test]
     fn zone_a_larret_nest_pas_sondee() {
         assert!(!due(false, Some("radio"), Duration::from_secs(600), 15));
+    }
+}
+
+/// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
+///
+/// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
+/// ou rien du tout. Le repli streaming existait (#1443) mais restait
+/// conditionne a « rien trouve en local » — donc jamais chez qui possede une
+/// bibliotheque garnie.
+#[cfg(test)]
+mod autoplay_source_tests {
+    use super::decisions::autoplay_prefers_streaming as prefers;
+
+    #[test]
+    fn une_ecoute_qobuz_cherche_dans_qobuz() {
+        assert!(prefers(Some("qobuz")));
+        assert!(prefers(Some("tidal")));
+        assert!(prefers(Some("deezer")));
+    }
+
+    #[test]
+    fn une_ecoute_locale_reste_locale() {
+        // Le generateur local garde la main quand c'est du local qui joue :
+        // ce lot ne doit rien changer pour qui n'a pas d'abonnement.
+        assert!(!prefers(Some("local")));
+    }
+
+    #[test]
+    fn une_source_absente_ou_vide_ne_bascule_rien() {
+        // Sens de defaut : sans source identifiee, on ne va pas interroger un
+        // service au hasard.
+        assert!(!prefers(None));
+        assert!(!prefers(Some("")));
     }
 }
