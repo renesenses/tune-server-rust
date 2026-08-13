@@ -445,6 +445,37 @@ impl ZoneRepo {
             .unwrap_or(false)
     }
 
+    /// L'identifiant d'une zone MASQUÉE portant ce nom, s'il y en a une.
+    ///
+    /// Supprimer une zone la masque (`is_hidden = 1`) et le garde-fou de la
+    /// découverte teste `is_device_hidden(device_id)`. Mais `device_id` est
+    /// dérivé de l'adresse IP : dès qu'elle change, la ligne masquée porte
+    /// l'ancien identifiant, le garde-fou ne reconnaît plus rien, et le
+    /// rattrapage par nom ne peut pas aider non plus — il lit `list()`, qui
+    /// filtre `is_hidden = 0`. La zone supprimée renaissait donc à neuf
+    /// (#1528).
+    ///
+    /// Cette lecture est le seul chemin qui voit les lignes masquées par leur
+    /// nom. Elle sert à ré-ancrer la zone masquée sur le nouvel identifiant,
+    /// **sans la démasquer** : la suppression reste une suppression, et le
+    /// garde-fou redevient opérant au tour suivant.
+    pub fn find_hidden_id_by_name(&self, name: &str) -> Option<i64> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id FROM zones WHERE name = {placeholder} \
+             AND COALESCE(is_hidden, 0) = 1 ORDER BY id LIMIT 1"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&name];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+    }
+
     /// Safely read autoplay_enabled for a zone.  Returns false (the default)
     /// if the column doesn't exist (pre-v36 database).
     pub fn get_autoplay_enabled(&self, id: i64) -> bool {
@@ -1564,5 +1595,50 @@ mod tests {
         // Zone stays hidden — it does not reappear in the list.
         assert!(repo.list().unwrap().is_empty());
         assert!(repo.is_device_hidden("uuid:jm-dac"));
+    }
+
+    #[test]
+    fn a_deleted_zone_is_findable_by_name_so_it_does_not_come_back() {
+        // Le scenario de #1528 : l'utilisateur supprime une zone, puis
+        // l'adresse IP de l'appareil change. La ligne masquee porte l'ancien
+        // identifiant — c'est par le NOM qu'il faut la retrouver, sinon la
+        // decouverte la recree a neuf.
+        let repo = ZoneRepo::new(test_db());
+        let id = repo
+            .create("Salon", Some("bluos"), Some("bluos-192.168.1.23-11000"))
+            .unwrap();
+        repo.delete(id).unwrap();
+
+        // Elle a bien disparu des listes visibles…
+        assert!(repo.list().unwrap().iter().all(|z| z.name != "Salon"));
+        // …mais elle reste retrouvable par son nom, c'est tout l'objet.
+        assert_eq!(repo.find_hidden_id_by_name("Salon"), Some(id));
+    }
+
+    #[test]
+    fn a_live_zone_is_not_reported_as_deleted() {
+        let repo = ZoneRepo::new(test_db());
+        repo.create("Cuisine", Some("dlna"), Some("dlna-192.168.1.9-8080"))
+            .unwrap();
+        assert_eq!(repo.find_hidden_id_by_name("Cuisine"), None);
+        assert_eq!(repo.find_hidden_id_by_name("Inconnue"), None);
+    }
+
+    #[test]
+    fn reanchoring_a_deleted_zone_keeps_it_deleted() {
+        // Le point delicat du correctif : on re-ancre la zone masquee sur le
+        // nouvel identifiant pour que `is_device_hidden` redevienne operant,
+        // mais elle ne doit surtout pas reapparaitre au passage.
+        let repo = ZoneRepo::new(test_db());
+        let id = repo
+            .create("Salon", Some("bluos"), Some("bluos-192.168.1.23-11000"))
+            .unwrap();
+        repo.delete(id).unwrap();
+
+        repo.update_output_device(id, "bluos-192.168.1.77-11000")
+            .unwrap();
+
+        assert!(repo.list().unwrap().iter().all(|z| z.name != "Salon"));
+        assert!(repo.is_device_hidden("bluos-192.168.1.77-11000"));
     }
 }
