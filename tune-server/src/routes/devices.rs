@@ -464,6 +464,29 @@ pub fn persist_discovered_dlna(
     save_discovered_dlna(backend, &devices);
 }
 
+/// Sentinelle : la reponse de l'appareil est DEFINITIVE, pas une panne
+/// passagere.
+///
+/// `register_discovered_dlna` melange deux natures d'echec dans un meme
+/// `Err(String)`. « Je n'arrive pas a joindre l'appareil » se retente ; « ce
+/// que tu as memorise n'est pas un lecteur » ne se retentera jamais avec
+/// succes, et l'entree doit disparaitre du magasin.
+const DEFINITIVE_MARKERS: [&str; 2] = ["is no longer a DLNA Media Renderer", "UUID mismatch at"];
+
+fn is_definitive_rejection(err: &str) -> bool {
+    DEFINITIVE_MARKERS.iter().any(|m| err.contains(m))
+}
+
+/// Retire un appareil du magasin des DLNA decouverts.
+fn forget_discovered_dlna(backend: &Arc<dyn DbBackend>, uuid: &str) {
+    let mut devices = load_discovered_dlna(backend);
+    let before = devices.len();
+    devices.retain(|d| d.uuid != uuid);
+    if devices.len() != before {
+        save_discovered_dlna(backend, &devices);
+    }
+}
+
 /// Re-probe every persisted auto-discovered DLNA renderer at startup (mirrors
 /// [`reregister_manual_devices`]). Each runs in its own task with backoff so a
 /// briefly-unreachable device neither blocks the others nor delays boot.
@@ -485,6 +508,22 @@ async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) 
         match register_discovered_dlna(state, &dev).await {
             Ok(name) => {
                 info!(uuid = %dev.uuid, name = %name, attempt, "discovered_dlna_reprobed");
+                return;
+            }
+            // L'appareil a REPONDU, et sa reponse est definitive : ce qu'on a
+            // memorise n'est pas un lecteur, ou ce n'est plus le meme. Aucun
+            // reessai ne changera ca. On oublie l'entree, sinon elle revient a
+            // chaque demarrage.
+            //
+            // Un HEOS Denon/Marantz publie plusieurs identifiants UPnP pour un
+            // seul appareil — media, lecteur, services. Tune les persistait
+            // tous : chez Jean Valjean, CINQ entrees pour un materiel, chacune
+            // re-sondee huit fois a chaque demarrage, soit 80 sondages voues a
+            // l'echec (#1528). Quatre d'entre elles n'ont jamais ete des
+            // lecteurs et ne le deviendront pas.
+            Err(e) if is_definitive_rejection(&e) => {
+                warn!(uuid = %dev.uuid, host = %dev.host, error = %e, "discovered_dlna_forgotten_not_a_renderer");
+                forget_discovered_dlna(&state.backend, &dev.uuid);
                 return;
             }
             Err(e) if attempt == REREGISTER_MAX_ATTEMPTS => {
@@ -1142,5 +1181,53 @@ async fn airplay2_pair_pin_start(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod dlna_reprobe_tests {
+    use super::*;
+
+    // ── Rejet definitif contre panne passagere (#1528) ────────────────────
+    //
+    // Un HEOS Denon/Marantz publie plusieurs identifiants UPnP pour un seul
+    // appareil. Tune les persistait tous : chez Jean Valjean, CINQ entrees
+    // pour un materiel, chacune re-sondee huit fois a chaque demarrage.
+    // Quatre n'ont jamais ete des lecteurs et ne le deviendront pas.
+
+    #[test]
+    fn pas_un_lecteur_est_definitif() {
+        assert!(is_definitive_rejection(
+            "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml is no longer a DLNA Media Renderer"
+        ));
+    }
+
+    #[test]
+    fn uuid_qui_ne_correspond_plus_est_definitif() {
+        // L'adresse a ete reprise par un autre appareil : reessayer viserait
+        // le mauvais materiel.
+        assert!(is_definitive_rejection(
+            "UUID mismatch at http://192.168.1.20:8080/desc.xml: descriptor 'uuid:b' != persisted 'uuid:a'"
+        ));
+    }
+
+    #[test]
+    fn une_panne_reseau_reste_reessayable() {
+        // Le cas qu'il ne faut SURTOUT pas oublier : un appareil eteint ou
+        // momentanement injoignable doit garder sa place et son backoff.
+        assert!(!is_definitive_rejection(
+            "cannot fetch DLNA description from http://192.168.1.11:60006/d.xml: connection refused"
+        ));
+        assert!(!is_definitive_rejection(
+            "cannot fetch DLNA description from http://192.168.1.11:60006/d.xml: timed out"
+        ));
+    }
+
+    #[test]
+    fn un_message_inconnu_reste_reessayable() {
+        // Sens de defaut : on n'oublie un appareil que sur une reponse qu'on
+        // a explicitement comprise.
+        assert!(!is_definitive_rejection("boom"));
+        assert!(!is_definitive_rejection(""));
     }
 }
