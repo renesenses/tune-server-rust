@@ -35,6 +35,12 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-15-intel
+          # Windows : reclame par Sandro, qui attendait un widget que la
+          # matrice ne pouvait pas lui produire. Toute la chaine ne sortait que
+          # des .dmg — six pannes reparees pour un artefact inutilisable par le
+          # testeur qui l'avait demande.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -57,6 +63,7 @@ jobs:
           tool: tauri-cli@2.11.4
 
       - name: Import signing certificate
+        if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -87,6 +94,8 @@ jobs:
       # seconde porte — celle qui repond 401. On ecrit donc le .p8 sur disque,
       # comme le fait release.yml, pour que Tauri emprunte la meme.
       - name: Write App Store Connect API key
+        if: runner.os == 'macOS'
+        shell: bash
         env:
           ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
         run: |
@@ -120,15 +129,64 @@ jobs:
           APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
         run: cargo tauri build --target ${{ matrix.target }}
 
-      - name: Collect DMG
+      - name: Collect bundles (macOS)
+        if: runner.os == 'macOS'
         run: |
           mkdir -p ../../dist
           cp target/${{ matrix.target }}/release/bundle/dmg/*.dmg ../../dist/
 
+      # Meme motif que release.yml (#1540) : sans signature, Defender applique
+      # sa reputation heuristique a un installeur inconnu et le bloque chez
+      # l'utilisateur — exactement le probleme de #1313 sur l'installeur du
+      # serveur. L'etape est silencieusement sautee si le certificat n'est pas
+      # configure, pour ne pas bloquer une chaine qui marche par ailleurs.
+      - name: Sign Windows bundles (si le certificat est présent)
+        if: runner.os == 'Windows' && env.WIN_SIGN_CERT_BASE64 != ''
+        shell: pwsh
+        env:
+          WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-widget-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+
+          # signtool vit dans le SDK Windows, a une version pres : prendre la
+          # plus recente plutot que figer un chemin qui cassera a la prochaine
+          # image de runner.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+
+          # On signe les installeurs produits par Tauri. L'executable interne du
+          # MSI est signe par la meme occasion : c'est le conteneur que
+          # l'utilisateur lance.
+          $targets = Get-ChildItem "target\${{ matrix.target }}\release\bundle\msi\*.msi",
+                                   "target\${{ matrix.target }}\release\bundle\nsis\*.exe" `
+                     -ErrorAction SilentlyContinue
+          if (-not $targets) { throw "aucun installeur a signer — le bundle Tauri a-t-il ete produit ?" }
+          foreach ($t in $targets) {
+            & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+              /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $t.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool a echoue sur $($t.Name)" }
+          }
+          Remove-Item $pfx -Force
+
+      - name: Collect bundles (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\..\dist | Out-Null
+          # Tauri produit les deux : un MSI et un installeur NSIS. On publie les
+          # deux, l'un ou l'autre pouvant etre bloque selon la politique de la
+          # machine cible.
+          Get-ChildItem "target\${{ matrix.target }}\release\bundle\msi\*.msi",
+                        "target\${{ matrix.target }}\release\bundle\nsis\*.exe" `
+            -ErrorAction SilentlyContinue | Copy-Item -Destination ..\..\dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: tune-widget-${{ matrix.target }}
-          path: dist/*.dmg
+          path: dist/*
           retention-days: 3
 
   release:
@@ -144,12 +202,18 @@ jobs:
       - name: Checksums
         run: |
           cd artifacts
-          find . -name '*.dmg' -exec sha256sum {} \; > ../SHA256SUMS-widget
+          # -dmg ET Windows : ne chercher que les .dmg laissait les installeurs
+          # Windows hors des sommes de controle ET hors de la release.
+          find . \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) \
+            -exec sha256sum {} \; > ../SHA256SUMS-widget
           cd ..
+          echo "--- contenu publie ---"; cat SHA256SUMS-widget
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/**/*.dmg
+            artifacts/**/*.msi
+            artifacts/**/*.exe
             SHA256SUMS-widget
           generate_release_notes: true
