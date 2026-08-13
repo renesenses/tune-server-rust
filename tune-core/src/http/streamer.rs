@@ -826,7 +826,6 @@ mod tests {
         streamer.remove_session(&id).await;
     }
 
-    #[test]
     /// Le registre des titres radio rend le bloc ICY VIVANT.
     ///
     /// C'est tout l'objet du correctif : avant, le bloc etait construit une
