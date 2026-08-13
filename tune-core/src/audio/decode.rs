@@ -3,7 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
@@ -75,6 +75,61 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
 
     // Ultimate fallback
     16
+}
+
+/// Rebuild the decoder after `Error::ResetRequired` from `next_packet`.
+///
+/// A chained Ogg (an icecast rip, or two files joined with `cat`) contains a
+/// mid-file `is_first_page`: symphonia's OggReader starts a new physical
+/// stream, rebuilds its track list and returns `ResetRequired`. The consumer
+/// must re-fetch the default track, build a fresh decoder and keep pulling
+/// packets. Treating it as EOF truncated playback to the first chain link —
+/// the local output then signalled a natural end a few seconds in and the
+/// poller replayed the track: the « boucle sur les 2-3 premières secondes »
+/// of #1270 (liste Bertrand 13/08).
+///
+/// Returns the new `(track_id, decoder)` when the next link is decodable and
+/// keeps the same sample rate / channel count. A mid-stream parameter change
+/// cannot be represented in the already-announced PCM stream, so those (and
+/// codec init failures) return `None`: stop decoding at the boundary, which is
+/// the pre-fix behaviour.
+fn rebuild_decoder_after_ogg_chain_reset(
+    format: &dyn FormatReader,
+    file_path: &str,
+    expect_rate: u32,
+    expect_channels: u32,
+) -> Option<(u32, Box<dyn AudioDecoder>)> {
+    let track = format.default_track(TrackType::Audio)?;
+    let params = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p.clone(),
+        _ => return None,
+    };
+    let rate = params.sample_rate.unwrap_or(44100);
+    let channels = params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u32)
+        .unwrap_or(2);
+    if rate != expect_rate || channels != expect_channels {
+        tracing::warn!(
+            file = file_path,
+            expect_rate,
+            rate,
+            expect_channels,
+            channels,
+            "ogg_chain_params_changed_stopping_at_boundary"
+        );
+        return None;
+    }
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .ok()?;
+    debug!(
+        file = file_path,
+        track_id = track.id,
+        "ogg_chain_decoder_rebuilt"
+    );
+    Some((track.id, decoder))
 }
 
 pub struct DecodedAudio {
@@ -915,7 +970,7 @@ fn decode_to_pcm_streaming_inner(
         Some(CodecParameters::Audio(params)) => params.clone(),
         _ => return Err("track has no audio codec parameters".into()),
     };
-    let track_id = track.id;
+    let mut track_id = track.id;
     let source_channels = audio_params
         .channels
         .as_ref()
@@ -1025,6 +1080,23 @@ fn decode_to_pcm_streaming_inner(
             {
                 debug!(file = file_path, total_samples, "streaming_decode_eof");
                 break;
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Chained Ogg boundary — rebuild the decoder and keep going
+                // instead of truncating the track at the first link (#1270).
+                match rebuild_decoder_after_ogg_chain_reset(
+                    format.as_ref(),
+                    file_path,
+                    source_rate,
+                    source_channels,
+                ) {
+                    Some((id, dec)) => {
+                        track_id = id;
+                        decoder = dec;
+                        continue;
+                    }
+                    None => break,
+                }
             }
             Err(e) => {
                 tracing::warn!(file = file_path, error = %e, total_samples, source_bd, "streaming_decode_packet_error");
@@ -1588,7 +1660,7 @@ fn decode_symphonia(
         Some(CodecParameters::Audio(params)) => params.clone(),
         _ => return Err("track has no audio codec parameters".into()),
     };
-    let track_id = track.id;
+    let mut track_id = track.id;
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_channels = audio_params
         .channels
@@ -1658,6 +1730,23 @@ fn decode_symphonia(
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
                 break;
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Chained Ogg boundary — rebuild the decoder and keep going
+                // instead of truncating the track at the first link (#1270).
+                match rebuild_decoder_after_ogg_chain_reset(
+                    format.as_ref(),
+                    file_path,
+                    source_rate,
+                    source_channels,
+                ) {
+                    Some((id, dec)) => {
+                        track_id = id;
+                        decoder = dec;
+                        continue;
+                    }
+                    None => break,
+                }
             }
             Err(_) => break,
         };
@@ -2464,6 +2553,38 @@ mod decode_integration_tests {
         assert!(
             result.samples_i32.iter().any(|s| *s != 0),
             "Ogg-Vorbis PCM must not be all silence"
+        );
+    }
+
+    #[test]
+    fn decode_chained_ogg_vorbis_decodes_past_first_link() {
+        // Two Ogg-Vorbis physical streams back-to-back (an icecast rip, or
+        // `cat a.ogg b.ogg`). Symphonia signals the mid-file boundary with
+        // `Error::ResetRequired`; treating it as EOF truncated playback to the
+        // first link, the local output signalled a natural end a few seconds
+        // in and the poller replayed the head of the track over and over —
+        // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
+        let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("tune_chained_vorbis_{}.ogg", std::process::id()));
+        let mut chained = single.clone();
+        chained.extend_from_slice(&single);
+        std::fs::write(&path, &chained).unwrap();
+
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
+        let _ = std::fs::remove_file(&path);
+        let result = result.unwrap();
+
+        // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
+        // stop at the first boundary (~2 s).
+        assert!(
+            result.duration_s > 3.0,
+            "chained Ogg-Vorbis must decode past the first chain boundary, got {} s",
+            result.duration_s
+        );
+        assert!(
+            result.samples_i32.iter().any(|s| *s != 0),
+            "chained Ogg-Vorbis PCM must not be all silence"
         );
     }
 
