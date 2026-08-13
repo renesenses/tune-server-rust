@@ -663,6 +663,39 @@ pub async fn register_local_outputs(state: &AppState) {
             } else {
                 dev.name.clone()
             };
+
+            // « Creer les zones automatiquement » vaut ICI aussi.
+            //
+            // Les trois autres chemins de decouverte — SSDP, mDNS et le chemin
+            // fournisseur — consultent tous `zone_auto_create` avant de creer.
+            // Celui-ci, le seul qui s'execute au DEMARRAGE du serveur, ne le
+            // consultait pas : une sortie audio locale se voyait donc attribuer
+            // une zone a chaque lancement, donc a chaque mise a jour, meme
+            // reglage decoche. Une zone deja existante n'est pas concernee
+            // (`get_or_create` la renvoie telle quelle) : on ne bloque que la
+            // creation, jamais la reconnexion.
+            let auto_create =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                    .get("zone_auto_create")
+                    .ok()
+                    .flatten()
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+            if !auto_create
+                && zone_repo
+                    .get_by_device_id(&device_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                info!(
+                    name = %zone_name,
+                    device_id = %device_id,
+                    "local_audio_zone_auto_create_disabled_skipping"
+                );
+                continue;
+            }
+
             match zone_repo.get_or_create(&zone_name, Some("local"), &device_id) {
                 Ok((zid, true)) => {
                     info!(
