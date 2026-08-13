@@ -1,3 +1,4 @@
+pub mod aac_encoder;
 pub mod aiff;
 pub mod alac_encoder;
 pub mod analyzer;
@@ -22,6 +23,7 @@ pub mod faststart;
 pub mod formats;
 pub mod iso_sacd;
 pub mod levels;
+pub mod m4a;
 pub mod mixer;
 pub mod opus_ogg;
 pub mod pipeline;
