@@ -5187,6 +5187,7 @@ dependencies = [
  "walkdir",
  "wasmtime",
  "webpki-roots 0.26.11",
+ "windows",
  "zip",
 ]
 

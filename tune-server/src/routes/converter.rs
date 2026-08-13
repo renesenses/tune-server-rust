@@ -638,7 +638,7 @@ fn encode_aac_native(
     // fall back to 48 kHz otherwise (hi-res sources included).
     let out_sr = target_sr
         .or(Some(decoded.sample_rate))
-        .filter(|&sr| tune_core::audio::aac_encoder::freq_index(sr).is_some())
+        .filter(|&sr| tune_core::audio::aac_encoder::rate_supported(sr))
         .unwrap_or(48000);
     let samples = if out_sr != decoded.sample_rate {
         tune_core::audio::resample::resample_i32(
