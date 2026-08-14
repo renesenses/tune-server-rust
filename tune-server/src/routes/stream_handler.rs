@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
-    build_wav_header, build_wav_header_streaming, extract_stream_id,
+    build_wav_header, build_wav_header_bounded_live, build_wav_header_streaming, extract_stream_id,
 };
 
 /// Tracks one HTTP consumer of a radio→WAV session for the lifetime of its
@@ -32,24 +32,26 @@ struct RadioConsumerGuard {
     superseded: bool,
 }
 
-/// Does this renderer need the `0xFFFF_FFFF` indeterminate-length WAV header
-/// for a live radio stream?
+/// Can this renderer consume a live radio stream as a chunked, length-less
+/// body?
 ///
-/// The indeterminate marker is a **libavformat-specific accommodation**, not a
-/// universal improvement. Before v0.9.11 every renderer received the finite
-/// "unknown length" (~2 GiB) size; only a `Lavf` renderer misbehaved with it,
-/// treating the transcoded radio as a bounded PCM file, filling its ~64 MiB
-/// read-ahead cache and stopping after ~6 minutes (FIP, .15, commit 3d5a3a8f).
-/// `0xFFFF_FFFF` fixed that — and broke renderers that read the `data` size
-/// into a SIGNED 32-bit integer, where it becomes -1: nothing left to read, so
-/// they never start (Yves, LHC-53 `player/100`, #1689).
+/// A libavformat (`Lavf`) renderer can, and in fact *needs* to: it wants the
+/// `0xFFFF_FFFF` indeterminate-length WAV header, without which it treats the
+/// transcoded radio as a bounded PCM file, fills its ~64 MiB read-ahead cache
+/// and stops after ~6 minutes (FIP, .15, commit 3d5a3a8f).
 ///
-/// The two requirements are contradictory — no single size means "unbounded" to
-/// Lavf *and* "huge" to a naive parser — so the size follows the renderer. An
-/// absent or unreadable User-Agent keeps the current behaviour: we only change
-/// what we send to a renderer that positively identifies itself as something
-/// other than Lavf.
-fn wants_indeterminate_wav_length(user_agent: Option<&str>) -> bool {
+/// Others cannot. The darTZeel LHC-208 refuses chunked transfer outright and
+/// requires `Content-Length` + `Range` (session support JP + Yves, 01/08).
+/// Everything that plays on it carries a length — local files via `serve_file`,
+/// Qobuz tracks via `proxy_stream`. Radio was the only length-less stream, and
+/// the only one that never started: it connected, waited ~7 s, dropped, and
+/// never came back (#1689).
+///
+/// The two contracts are mutually exclusive, so the response follows the
+/// renderer. An absent or unreadable User-Agent keeps the current behaviour:
+/// only a renderer that positively identifies itself as something other than
+/// Lavf gets the file contract.
+fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
     match user_agent {
         Some(ua) if !ua.is_empty() => ua.to_ascii_lowercase().contains("lavf"),
         _ => true,
@@ -104,6 +106,7 @@ impl Drop for RadioConsumerGuard {
 pub async fn handle_head(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
+    req_headers: HeaderMap,
 ) -> Response {
     let stream_id = extract_stream_id(&raw_id);
     // Clone the Arc so we release the sessions lock before any async I/O.
@@ -157,7 +160,19 @@ pub async fn handle_head(
             "transferMode.dlna.org",
             HeaderValue::from_static("Streaming"),
         );
-        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+        // Le HEAD doit annoncer le même contrat que le GET qui suit, sans quoi
+        // un lecteur qui sonde d'abord conclut « pas de longueur » et n'essaie
+        // même pas (#1689).
+        let ua = req_headers.get("User-Agent").and_then(|v| v.to_str().ok());
+        if accepts_chunked_live_stream(ua) {
+            headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+        } else {
+            headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+            headers.insert(
+                "Content-Length",
+                HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
+            );
+        }
     } else {
         headers.insert(
             "transferMode.dlna.org",
@@ -241,15 +256,17 @@ pub async fn handle_stream(
     // (DMP-A6/A8) don't need to probe the stream end with seek requests.
     let is_wav = session.info.format == "wav";
     let is_radio = session.is_radio;
-    // A live radio→WAV stream is infinite: never advertise a Content-Length and
-    // send an explicit chunked, close-delimited body so a Lavf DLNA renderer
-    // reads until the connection closes instead of stopping at a finite size.
+    // A live radio→WAV stream has no length. A Lavf renderer wants it that way
+    // (chunked body + indeterminate WAV header). A renderer that refuses
+    // chunked transfer gets the file contract instead: a large finite
+    // Content-Length, Accept-Ranges, and Range honoured (#1689).
+    let bounded_live = is_wav && is_radio && !accepts_chunked_live_stream(user_agent.as_deref());
     let wav_length = if is_wav && !is_radio {
         session.info.wav_content_length()
     } else {
         None
     };
-    if is_radio {
+    if is_radio && !bounded_live {
         headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
     }
 
@@ -273,6 +290,44 @@ pub async fn handle_stream(
                 HeaderValue::from_str(&format!("bytes 0-{}/{}", len - 1, len)).unwrap(),
             );
         }
+    }
+
+    // Radio servie comme un fichier borné. Le lecteur qui refuse le chunké
+    // repart après l'en-tête WAV (`bytes=44-` sur ses fichiers locaux) : on
+    // honore ce Range en n'émettant que la fin de l'en-tête, puis le direct.
+    // Une radio n'a pas de position — au-delà de l'en-tête, « reprendre à N »
+    // ne peut vouloir dire que « donne-moi le direct maintenant ».
+    let mut bounded_status = StatusCode::OK;
+    let mut header_skip: usize = 0;
+    if bounded_live {
+        let total = tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN;
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        let start = req_headers
+            .get("Range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_range_start)
+            .filter(|s| *s < total);
+        match start {
+            Some(start) if start > 0 => {
+                header_skip = start.min(44) as usize;
+                headers.insert("Content-Length", HeaderValue::from(total - start));
+                headers.insert(
+                    "Content-Range",
+                    HeaderValue::from_str(&format!("bytes {start}-{}/{total}", total - 1)).unwrap(),
+                );
+                bounded_status = StatusCode::PARTIAL_CONTENT;
+            }
+            _ => {
+                headers.insert("Content-Length", HeaderValue::from(total));
+            }
+        }
+        info!(
+            stream_id,
+            total,
+            range_start = ?start,
+            header_skip,
+            "radio_bounded_live_response — renderer refuses chunked, serving the file contract"
+        );
     }
 
     let wants_icy = req_headers
@@ -311,14 +366,13 @@ pub async fn handle_stream(
         .wav_header_included
         .load(std::sync::atomic::Ordering::Relaxed);
     let data_ready = session.data_ready.clone();
-    let indeterminate_wav = wants_indeterminate_wav_length(user_agent.as_deref());
     let body = Body::from_stream(async_stream::stream! {
         if is_wav && !wav_header_included {
-            // Live radio is infinite. A Lavf renderer needs the 0xFFFF_FFFF
+            // Live radio: a Lavf renderer needs the 0xFFFF_FFFF
             // indeterminate-length header to keep reading until the connection
-            // closes; every other renderer gets the finite "unknown length"
-            // size it ran on before v0.9.11 (#1689). Finite tracks keep the
-            // sized header.
+            // closes; a renderer served the file contract gets sizes that match
+            // its Content-Length and stay positive as i32 (#1689). Finite
+            // tracks keep the sized header.
             let hdr = if is_radio {
                 // Wait until the decoder has probed the upstream so the header
                 // advertises the TRUE sample rate/channels (FIP is 48000, not
@@ -336,15 +390,19 @@ pub async fn handle_stream(
                 let det_ch = session.detected_channels.load(Relaxed);
                 let real_sr = if det_sr != 0 { det_sr } else { sr };
                 let real_ch = if det_ch != 0 { det_ch } else { ch };
-                if indeterminate_wav {
-                    build_wav_header_streaming(real_ch, real_sr, bd)
+                if bounded_live {
+                    build_wav_header_bounded_live(real_ch, real_sr, bd)
                 } else {
-                    build_wav_header(real_ch, real_sr, bd, None)
+                    build_wav_header_streaming(real_ch, real_sr, bd)
                 }
             } else {
                 build_wav_header(ch, sr, bd, dur_ms)
             };
-            yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
+            // header_skip n'est non nul que sur une reprise `bytes=N-` d'une
+            // radio bornée : le lecteur a déjà lu l'en-tête et veut le PCM.
+            if header_skip < hdr.len() {
+                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr[header_skip..]));
+            }
         }
 
         if has_icy {
@@ -474,7 +532,8 @@ pub async fn handle_stream(
     let status = if use_partial {
         StatusCode::PARTIAL_CONTENT
     } else {
-        StatusCode::OK
+        // 206 déjà décidé plus haut pour une reprise de radio bornée, sinon 200.
+        bounded_status
     };
 
     (status, headers, body).into_response()
@@ -1060,55 +1119,75 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range_start, wants_indeterminate_wav_length};
-    use tune_core::http::streamer::{build_wav_header, build_wav_header_streaming};
+    use super::{accepts_chunked_live_stream, parse_range_start};
+    use tune_core::http::streamer::{
+        LIVE_BOUNDED_TOTAL_LEN, build_wav_header_bounded_live, build_wav_header_streaming,
+    };
 
     #[test]
-    fn lavf_renderers_keep_the_indeterminate_wav_length() {
+    fn lavf_renderers_keep_the_chunked_contract() {
         // The Eversolo DMP-A10/A8 and every other libavformat renderer: without
-        // 0xFFFF_FFFF they treat the radio as a bounded file and cut every ~6
-        // minutes (FIP, .15, commit 3d5a3a8f).
-        assert!(wants_indeterminate_wav_length(Some("Lavf/58.45.100")));
-        assert!(wants_indeterminate_wav_length(Some("lavf/60.3.100")));
-        assert!(wants_indeterminate_wav_length(Some(
+        // the chunked, length-less body and its 0xFFFF_FFFF header they treat
+        // the radio as a bounded file and cut every ~6 min (FIP, commit 3d5a3a8f).
+        assert!(accepts_chunked_live_stream(Some("Lavf/58.45.100")));
+        assert!(accepts_chunked_live_stream(Some("lavf/60.3.100")));
+        assert!(accepts_chunked_live_stream(Some(
             "SomeRenderer (Lavf/59.27.100)"
         )));
     }
 
     #[test]
-    fn other_renderers_get_the_finite_wav_length() {
-        // Yves' LHC-53 (#1689). It reads the `data` size into a signed 32-bit
-        // integer, so 0xFFFF_FFFF becomes -1 — nothing left to read, and it
-        // drops the connection without ever starting.
-        assert!(!wants_indeterminate_wav_length(Some("player/100")));
-        assert!(!wants_indeterminate_wav_length(Some("Sonos/84.1-56110")));
+    fn other_renderers_get_the_file_contract() {
+        // Yves' darTZeel LHC-208 (#1689): refuses chunked transfer, requires
+        // Content-Length + Range. Everything that plays on it carries a length.
+        assert!(!accepts_chunked_live_stream(Some("player/100")));
+        assert!(!accepts_chunked_live_stream(Some("Sonos/84.1-56110")));
     }
 
     #[test]
     fn unknown_user_agent_keeps_current_behaviour() {
         // Blast radius: only a renderer that positively identifies itself as
-        // something other than Lavf sees a different header.
-        assert!(wants_indeterminate_wav_length(None));
-        assert!(wants_indeterminate_wav_length(Some("")));
+        // something other than Lavf sees a different response.
+        assert!(accepts_chunked_live_stream(None));
+        assert!(accepts_chunked_live_stream(Some("")));
     }
 
     #[test]
-    fn finite_radio_header_stays_positive_as_a_signed_int() {
-        // The whole point of the fix: both sizes a non-Lavf renderer reads must
-        // be positive when parsed as i32.
-        let h = build_wav_header(2, 44100, 16, None);
+    fn bounded_live_header_matches_the_announced_content_length() {
+        // Le lecteur qui reçoit le contrat fichier lit Content-Length ET les
+        // tailles de l'en-tête : les trois doivent concorder et rester
+        // positives en 32 bits signés.
+        let h = build_wav_header_bounded_live(2, 44100, 16);
         let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
         let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
-        assert!(data_size as i32 > 0, "data size must be a positive i32");
-        assert!(riff_size as i32 > 0, "RIFF size must be a positive i32");
-        // …and the format fields still describe the real stream.
-        assert_eq!(u32::from_le_bytes([h[24], h[25], h[26], h[27]]), 44100);
-        assert_eq!(u16::from_le_bytes([h[22], h[23]]), 2);
+        assert_eq!(data_size as u64 + 44, LIVE_BOUNDED_TOTAL_LEN);
+        assert!(data_size as i32 > 0);
+        assert!(riff_size as i32 > 0);
+        assert!(LIVE_BOUNDED_TOTAL_LEN <= i32::MAX as u64);
 
-        // The Lavf header is exactly the one that goes negative — that is why
-        // it cannot be served to everyone.
+        // L'en-tête Lavf est justement celui qui passe en négatif — d'où les
+        // deux contrats.
         let l = build_wav_header_streaming(2, 44100, 16);
         assert_eq!(u32::from_le_bytes([l[40], l[41], l[42], l[43]]) as i32, -1);
+    }
+
+    #[test]
+    fn resume_after_the_wav_header_is_the_range_the_renderer_sends() {
+        // Sur ses fichiers WAV locaux, le LHC repart systématiquement à
+        // l'octet 44 — juste après l'en-tête. C'est ce Range qu'il faut
+        // honorer sur la radio bornée : rien de l'en-tête, puis le direct.
+        assert_eq!(parse_range_start("bytes=44-"), Some(44));
+        let skip = parse_range_start("bytes=44-").unwrap().min(44) as usize;
+        assert_eq!(skip, 44, "l'en-tête entier est sauté");
+
+        // Une reprise au-delà de l'en-tête ne peut pas « chercher » dans un
+        // direct : on plafonne le saut à la taille de l'en-tête et on sert le
+        // direct maintenant.
+        let far = parse_range_start("bytes=1048576-").unwrap().min(44) as usize;
+        assert_eq!(far, 44);
+
+        // Le sondage initial (bytes=0-) ne saute rien.
+        assert_eq!(parse_range_start("bytes=0-").unwrap().min(44), 0);
     }
 
     #[test]
