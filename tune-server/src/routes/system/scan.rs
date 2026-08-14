@@ -34,6 +34,43 @@ pub(crate) fn scan_cancel_requested() -> bool {
     SCAN_CANCEL.load(Ordering::SeqCst)
 }
 
+/// Racines qui CONTENAIENT des pistes et n'en découvrent plus AUCUNE.
+///
+/// Un dossier qui passe de milliers de fichiers à zéro n'est pas vide : il est
+/// absent. C'est la forme exacte que prend un partage réseau non monté —
+/// Dominique COMET, 0.9.73, NAS OpenMediaVault en SMB : « ma bibliothèque
+/// disparaît à chaque redémarrage de Tune » (#1652).
+///
+/// Les gardes existants ne peuvent pas voir ce cas : ils testent
+/// `read_dir(root).is_err()`, c'est-à-dire une racine ILLISIBLE. Or un point de
+/// montage qui existe mais sur lequel rien n'est monté est parfaitement
+/// lisible — et vide. `read_dir` réussit, `missing_dirs` reste vide, et le
+/// nettoyage supprime les pistes comme si les fichiers avaient été effacés.
+///
+/// Zéro n'est donc pas un résultat de scan crédible : c'est une anomalie, et on
+/// refuse d'écrire dessus. Le prix de l'erreur est asymétrique — protéger à
+/// tort laisse des lignes périmées qu'un scan suivant nettoiera, supprimer à
+/// tort détruit la bibliothèque.
+///
+/// Une racine qui n'avait AUCUNE piste n'est pas concernée : elle n'a rien à
+/// perdre, et c'est le cas normal d'un dossier fraîchement configuré.
+pub(crate) fn roots_gone_empty(
+    roots: &[String],
+    existing_paths: &[&str],
+    discovered_paths: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    roots
+        .iter()
+        .filter(|root| {
+            let prefix = format!("{}/", root.trim_end_matches('/'));
+            let had = existing_paths.iter().any(|p| p.starts_with(&prefix));
+            let has = discovered_paths.iter().any(|p| p.starts_with(&prefix));
+            had && !has
+        })
+        .cloned()
+        .collect()
+}
+
 /// Pre-scan skip decision: does `path` need (re)scanning, or is it unchanged
 /// since the last scan and safe to skip?
 ///
@@ -655,6 +692,18 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         if SCAN_CANCEL.load(Ordering::SeqCst) {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
+            // Racines devenues vides : un partage non monté est LISIBLE et
+            // vide, donc invisible pour `missing_dirs`. Sans ce garde, le
+            // nettoyage ci-dessous efface la bibliothèque entière (#1652).
+            let existing_refs: Vec<&str> =
+                existing_tracks.keys().map(|s| s.as_str()).collect();
+            let emptied_roots = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
+            if !emptied_roots.is_empty() {
+                tracing::error!(
+                    roots = ?emptied_roots,
+                    "post_scan_root_went_empty — ce dossier contenait des pistes et n'en présente plus aucune. Montage absent ? Les pistes sont CONSERVÉES."
+                );
+            }
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
@@ -671,6 +720,7 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     let in_unreadable_scope = missing_dirs
                         .iter()
                         .chain(error_dirs.iter())
+                        .chain(emptied_roots.iter())
                         .any(|d| db_path.starts_with(d));
                     if in_unreadable_scope {
                         protected += 1;
@@ -1362,6 +1412,107 @@ pub(super) async fn artist_split_preview(State(state): State<AppState>) -> Json<
         "examples": examples,
         "note": "dry-run, read-only — no data changed",
     }))
+}
+
+#[cfg(test)]
+mod roots_gone_empty_tests {
+    use super::roots_gone_empty;
+    use std::collections::HashSet;
+
+    fn set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    // Le cas de Dominique COMET (#1652) : NAS OpenMediaVault en SMB, le
+    // service démarre avant que le partage soit monté. Le point de montage
+    // existe et se lit — il est simplement vide.
+    const NAS: &str = "/mnt/nas/musique";
+
+    #[test]
+    fn un_partage_non_monte_protege_toute_la_bibliotheque() {
+        let existants = [
+            "/mnt/nas/musique/Bach/01.flac",
+            "/mnt/nas/musique/Bach/02.flac",
+            "/mnt/nas/musique/Mahler/01.flac",
+        ];
+        // Le scan ne découvre RIEN sous cette racine.
+        let decouverts = set(&[]);
+        assert_eq!(
+            roots_gone_empty(&[NAS.to_string()], &existants, &decouverts),
+            vec![NAS.to_string()],
+            "zero fichier la ou il y en avait des milliers doit proteger, pas supprimer"
+        );
+    }
+
+    #[test]
+    fn une_racine_qui_repond_normalement_n_est_pas_protegee() {
+        // Sans ça, plus aucune piste réellement supprimée ne serait nettoyée.
+        let existants = ["/mnt/nas/musique/Bach/01.flac"];
+        let decouverts = set(&["/mnt/nas/musique/Bach/01.flac"]);
+        assert!(roots_gone_empty(&[NAS.to_string()], &existants, &decouverts).is_empty());
+    }
+
+    #[test]
+    fn une_seule_piste_retrouvee_suffit_a_lever_la_protection() {
+        // La racine répond : les autres absences sont de vraies suppressions.
+        let existants = [
+            "/mnt/nas/musique/Bach/01.flac",
+            "/mnt/nas/musique/Bach/02.flac",
+        ];
+        let decouverts = set(&["/mnt/nas/musique/Bach/01.flac"]);
+        assert!(roots_gone_empty(&[NAS.to_string()], &existants, &decouverts).is_empty());
+    }
+
+    #[test]
+    fn un_dossier_neuf_sans_piste_n_est_pas_concerne() {
+        // Cas normal d'une racine fraîchement configurée : rien à perdre.
+        let existants: [&str; 0] = [];
+        let decouverts = set(&[]);
+        assert!(roots_gone_empty(&[NAS.to_string()], &existants, &decouverts).is_empty());
+    }
+
+    #[test]
+    fn seule_la_racine_disparue_est_protegee() {
+        // Un disque local intact ne doit pas cesser d'être nettoyé parce que
+        // le NAS a disparu : la protection est par racine, pas globale.
+        let local = "/home/dom/musique";
+        let existants = [
+            "/mnt/nas/musique/Bach/01.flac",
+            "/home/dom/musique/pop/01.flac",
+            "/home/dom/musique/pop/supprime.flac",
+        ];
+        let decouverts = set(&["/home/dom/musique/pop/01.flac"]);
+        assert_eq!(
+            roots_gone_empty(
+                &[NAS.to_string(), local.to_string()],
+                &existants,
+                &decouverts
+            ),
+            vec![NAS.to_string()]
+        );
+    }
+
+    #[test]
+    fn une_racine_avec_barre_finale_est_traitee_pareil() {
+        let existants = ["/mnt/nas/musique/Bach/01.flac"];
+        let decouverts = set(&[]);
+        assert_eq!(
+            roots_gone_empty(&["/mnt/nas/musique/".to_string()], &existants, &decouverts),
+            vec!["/mnt/nas/musique/".to_string()]
+        );
+    }
+
+    #[test]
+    fn une_racine_voisine_de_meme_prefixe_ne_deteint_pas() {
+        // `/mnt/nas/musique2` ne doit pas être considérée comme couverte par
+        // `/mnt/nas/musique` : c'est la barre finale du préfixe qui l'évite.
+        let existants = ["/mnt/nas/musique2/Bach/01.flac"];
+        let decouverts = set(&["/mnt/nas/musique2/Bach/01.flac"]);
+        assert!(
+            roots_gone_empty(&[NAS.to_string()], &existants, &decouverts).is_empty(),
+            "la racine voisine ne doit ni proteger ni etre protegee a tort"
+        );
+    }
 }
 
 #[cfg(test)]
