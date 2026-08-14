@@ -60,17 +60,28 @@ const THROTTLE_KEY: &str = "audio_embedding_throttle";
 ///   décoder, servir un flux et répondre à l'interface.
 /// - `rapide` : tous les cœurs — le comportement d'avant, désormais un choix
 ///   explicite et non plus le défaut silencieux.
+/// Réglage de débit par défaut, choisi d'après la taille de la machine.
+///
+/// `equilibre` (la moitié des cœurs) était le défaut universel : sur .18
+/// (8 cœurs) cela fait 4 fils ONNX qui, avec ReplayGain en parallèle, ont
+/// éteint la machine deux fois (#1576). Le matériel typique d'un serveur
+/// audio — Pi, NAS, mini-PC — est précisément dans cette gamme, et personne
+/// n'ira changer un réglage qu'il ne sait pas exister. Au-delà de huit cœurs,
+/// la machine a de quoi encaisser et `equilibre` reste le bon compromis.
+fn default_throttle() -> &'static str {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    if cores <= 8 { "eco" } else { "equilibre" }
+}
+
 fn intra_threads_for(settings: &crate::db::settings_repo::SettingsRepo) -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    match settings
-        .get(THROTTLE_KEY)
-        .ok()
-        .flatten()
-        .as_deref()
-        .unwrap_or("equilibre")
-    {
+    let default = default_throttle();
+    let setting = settings.get(THROTTLE_KEY).ok().flatten();
+    match setting.as_deref().unwrap_or(default) {
         "eco" => 1,
         "rapide" => cores,
         // Comme pour la pause : une valeur inconnue retombe sur l'équilibre.
@@ -82,13 +93,9 @@ fn intra_threads_for(settings: &crate::db::settings_repo::SettingsRepo) -> usize
 /// environ, `rapide` enchaîne sans pause — à réserver à une machine dédiée ou à
 /// une nuit d'analyse.
 fn per_file_pause_ms(settings: &crate::db::settings_repo::SettingsRepo) -> u64 {
-    match settings
-        .get(THROTTLE_KEY)
-        .ok()
-        .flatten()
-        .as_deref()
-        .unwrap_or("equilibre")
-    {
+    let default = default_throttle();
+    let setting = settings.get(THROTTLE_KEY).ok().flatten();
+    match setting.as_deref().unwrap_or(default) {
         "eco" => 400,
         "rapide" => 0,
         // Toute valeur inconnue retombe sur l'équilibre : un réglage mal écrit
@@ -492,6 +499,10 @@ pub async fn analyze_embedding_batch(
 
 /// Idle wait when disabled or the sweep is drained.
 const IDLE_SLEEP_SECS: u64 = 900;
+/// Attente entre deux vérifications quand la machine est trop chaude. Assez
+/// long pour lui laisser le temps de redescendre, assez court pour reprendre
+/// d'elle-même sans intervention (#1576).
+const THERMAL_RETRY_SECS: u64 = 120;
 /// Wait between retries while the memory budget holds the sweep back. Long
 /// enough not to spin, short enough that the sweep resumes on its own once
 /// whatever was using the memory (a scan, a transcode) has finished.
@@ -654,6 +665,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // Le nombre de fils avec lequel la session courante a été bâtie, pour
         // détecter un changement de réglage.
         let mut loaded_threads = 0usize;
+        // Garde thermique de CETTE passe : il porte sa propre hystérésis et
+        // journalise ses propres transitions (#1576).
+        let mut thermal = crate::audio::thermal::ThermalGate::new();
         // Latch for the playback hold, same style as `low_memory`: one line on
         // the way in, one on the way out, silence in between.
         let mut playback_hold = false;
@@ -714,6 +728,14 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 if playback_hold {
                     playback_hold = false;
                     info!("audio_embed_resumed_playback_stopped");
+                }
+
+                // Garde thermique (#1576) : avant toute dépense. Comme pour
+                // la mémoire, une analyse facultative ne doit jamais mettre la
+                // machine en danger — et ici le danger est physique.
+                if thermal.should_hold("acoustique") {
+                    tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
+                    continue;
                 }
 
                 // Memory budget, checked BEFORE the model is fetched or the ORT
