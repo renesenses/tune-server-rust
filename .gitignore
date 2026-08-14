@@ -15,3 +15,12 @@ docs/*.pdf
 # 3,8 Mo listant sa bibliothèque musicale et ses chemins locaux, dans un commit
 # que GitHub conserve ensuite indéfiniment via la référence de la pull request.
 *.log
+
+# Base SQLite creee par un serveur lance depuis la racine du depot (tests,
+# essais locaux) et ses sauvegardes horodatees. Rien ne les arretait : elles
+# se sont retrouvees dans une PR (~2,7 Mo de binaire), reperees par Dominique
+# Comet a la relecture de #1676.
+tune_server.db
+tune_server.db-shm
+tune_server.db-wal
+tune_server.db.bak.*
