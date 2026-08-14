@@ -385,7 +385,7 @@ async fn verify_update_signature(
 
 #[cfg(test)]
 mod update_blame_tests {
-    use super::{blame_for_status, UpdateBlame};
+    use super::{UpdateBlame, blame_for_status};
 
     #[test]
     fn une_reponse_recue_n_accuse_jamais_le_reseau_de_l_utilisateur() {
