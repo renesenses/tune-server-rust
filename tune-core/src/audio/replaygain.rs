@@ -136,6 +136,21 @@ fn enabled(settings: &SettingsRepo) -> bool {
         .unwrap_or(true)
 }
 
+/// Verrou GLOBAL des analyses lourdes : UNE seule passe décode à la fois.
+///
+/// ReplayGain et le sweep acoustique décodent tous deux des fichiers entiers ;
+/// ensemble ils ont tenu .18 à ~450 % CPU pendant 75 minutes avant que la
+/// machine ne s'éteigne net (#1576, 2e arrêt de ce type — journal coupé en
+/// pleine ligne). Chaque passe reste bornée et cède déjà à la lecture ; ce
+/// verrou fait qu'elles se succèdent au lieu de s'additionner : le pic de
+/// charge est divisé par deux, la progression totale est identique.
+///
+/// Particulièrement important au premier démarrage après une mise à jour qui
+/// invalide les deux analyses à la fois (échelle SACD #1638 → RG des DSD,
+/// bump de modèle #1498 → tous les embeddings) : sans lui, tout le parc
+/// rejouerait le scénario du crash.
+pub(crate) static ANALYSIS_SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// True if any zone is currently playing, per the persisted `last_play_state`
 /// the orchestrator writes on every play/pause/stop. The ReplayGain track pass
 /// must yield to playback (#1310): decoding whole files — often over a network
@@ -170,7 +185,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 let did = if playing {
                     0
                 } else {
-                    analyze_track_batch(&backend).await
+                    {
+                        // Une passe à la fois (#1576) : si le sweep acoustique
+                        // décode, on attend notre tour plutôt que d'empiler.
+                        let _slot = ANALYSIS_SLOT.lock().await;
+                        analyze_track_batch(&backend).await
+                    }
                 };
                 let albums = analyze_album_batch(&backend);
                 if playing {
@@ -483,6 +503,18 @@ pub fn stored_gain_for(
     track_id: i64,
     mode: ReplayGainMode,
 ) -> Option<TrackGain> {
+    stored_gain_detail(backend, track_id, mode).map(|(gain, _)| gain)
+}
+
+/// Comme [`stored_gain_for`], mais dit AUSSI quelle granularité a fourni la
+/// valeur : en mode album, une piste sans tags d'album retombe sur le gain de
+/// piste, et un affichage (chemin du signal) doit nommer ce qui s'applique
+/// VRAIMENT, pas le réglage demandé.
+pub fn stored_gain_detail(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    mode: ReplayGainMode,
+) -> Option<(TrackGain, ReplayGainMode)> {
     if mode == ReplayGainMode::Off {
         return None;
     }
@@ -499,8 +531,9 @@ pub fn stored_gain_for(
     };
     match mode {
         ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak")
-            .or_else(|| pick("rg_track_gain", "rg_track_peak")),
-        _ => pick("rg_track_gain", "rg_track_peak"),
+            .map(|g| (g, ReplayGainMode::Album))
+            .or_else(|| pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track))),
+        _ => pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track)),
     }
 }
 

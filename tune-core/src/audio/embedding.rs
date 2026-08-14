@@ -810,7 +810,13 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     }
                 }
                 if let Some(emb) = embedder.as_mut() {
-                    let did = analyze_embedding_batch(&backend, emb).await;
+                    // Une passe lourde à la fois (#1576) : si ReplayGain
+                    // décode, on attend notre tour — les deux ensemble ont
+                    // déjà éteint une machine.
+                    let did = {
+                        let _slot = crate::audio::replaygain::ANALYSIS_SLOT.lock().await;
+                        analyze_embedding_batch(&backend, emb).await
+                    };
                     if did > 0 {
                         // More to do — loop promptly; the per-file pauses throttle.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

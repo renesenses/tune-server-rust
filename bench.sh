@@ -60,7 +60,6 @@ try:
     print(f\"  CPUs:     {d.get('cpu_count')}\")
     print(f\"  Uptime:   {d.get('uptime_seconds')}s\")
     print(f\"  PID:      {d.get('pid')}\")
-    print(f\"  FFmpeg:   {d.get('ffmpeg_available')}\")
     db = d.get('db', {})
     print(f\"  DB:       {db.get('engine')} (migration v{db.get('migration_version')})\")
     re = d.get('rust_engines', {})

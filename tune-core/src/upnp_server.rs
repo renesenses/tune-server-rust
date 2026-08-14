@@ -23,25 +23,47 @@ use crate::discovery::ssdp;
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------
 
+/// Préfixe sous lequel `tune-server` monte les routes du MediaServer
+/// (`app.nest("/upnp", …)` dans `routes/mod.rs`). Le description.xml, les
+/// URLs de contrôle qu'il publie et l'annonce SSDP doivent TOUS le porter :
+/// en 0.9.71 le description annonçait `…/ContentDirectory/control` sans ce
+/// préfixe — chaque Browse tombait sur le fallback SPA (405) et tous les
+/// clients voyaient un serveur vide (#1613).
+pub const MOUNT_PATH: &str = "/upnp";
+
 #[derive(Clone)]
 pub struct UpnpState {
     pub backend: Arc<dyn DbBackend>,
     pub server_port: u16,
     pub friendly_name: String,
     pub uuid: String,
+    /// IP forcée par la config (`advertised_ip`), prioritaire sur la
+    /// détection automatique — même contrat que la chaîne de lecture
+    /// (`routes/playback.rs`).
+    pub advertised_ip: Option<String>,
 }
 
 impl UpnpState {
-    pub fn new(backend: Arc<dyn DbBackend>, server_port: u16) -> Self {
+    pub fn new(
+        backend: Arc<dyn DbBackend>,
+        server_port: u16,
+        advertised_ip: Option<String>,
+    ) -> Self {
         Self {
             backend,
             server_port,
             friendly_name: "Tune Server".into(),
             uuid: format!("uuid:{}", uuid::Uuid::new_v4()),
+            advertised_ip,
         }
     }
 
     pub fn server_ip(&self) -> String {
+        if let Some(ref ip) = self.advertised_ip {
+            if !ip.is_empty() {
+                return ip.clone();
+            }
+        }
         ssdp::get_local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into())
@@ -83,16 +105,16 @@ pub fn build_device_description(state: &UpnpState) -> String {
       <service>
         <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
         <serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>
-        <controlURL>{base}/ContentDirectory/control</controlURL>
-        <eventSubURL>{base}/ContentDirectory/event</eventSubURL>
-        <SCPDURL>{base}/ContentDirectory/scpd.xml</SCPDURL>
+        <controlURL>{base}{mount}/ContentDirectory/control</controlURL>
+        <eventSubURL>{base}{mount}/ContentDirectory/event</eventSubURL>
+        <SCPDURL>{base}{mount}/ContentDirectory/scpd.xml</SCPDURL>
       </service>
       <service>
         <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
         <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
-        <controlURL>{base}/ConnectionManager/control</controlURL>
-        <eventSubURL>{base}/ConnectionManager/event</eventSubURL>
-        <SCPDURL>{base}/ConnectionManager/scpd.xml</SCPDURL>
+        <controlURL>{base}{mount}/ConnectionManager/control</controlURL>
+        <eventSubURL>{base}{mount}/ConnectionManager/event</eventSubURL>
+        <SCPDURL>{base}{mount}/ConnectionManager/scpd.xml</SCPDURL>
       </service>
     </serviceList>
   </device>
@@ -101,7 +123,95 @@ pub fn build_device_description(state: &UpnpState) -> String {
         version = crate::version(),
         uuid = state.uuid,
         base = base,
+        mount = MOUNT_PATH,
     )
+}
+
+// ---------------------------------------------------------------------------
+// SCPD (service descriptions)
+// ---------------------------------------------------------------------------
+
+/// SCPD minimal du ContentDirectory. Le description.xml publie une SCPDURL
+/// depuis toujours, mais aucune route ne la servait : les clients recevaient
+/// le fallback SPA (du HTML en 200), et les points de contrôle stricts qui
+/// parsent le SCPD avant de naviguer refusaient le serveur (#1613).
+pub fn content_directory_scpd() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action>
+      <name>Browse</name>
+      <argumentList>
+        <argument><name>ObjectID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>
+        <argument><name>BrowseFlag</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable></argument>
+        <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>
+        <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>
+        <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>
+        <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>
+        <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetSearchCapabilities</name>
+      <argumentList>
+        <argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetSortCapabilities</name>
+      <argumentList>
+        <argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetSystemUpdateID</name>
+      <argumentList>
+        <argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType>
+      <allowedValueList><allowedValue>BrowseMetadata</allowedValue><allowedValue>BrowseDirectChildren</allowedValue></allowedValueList>
+    </stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Filter</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>
+  </serviceStateTable>
+</scpd>"#
+}
+
+/// SCPD minimal du ConnectionManager (GetProtocolInfo, la seule action que
+/// le handler implémente).
+pub fn connection_manager_scpd() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action>
+      <name>GetProtocolInfo</name>
+      <argumentList>
+        <argument><name>Source</name><direction>out</direction><relatedStateVariable>SourceProtocolInfo</relatedStateVariable></argument>
+        <argument><name>Sink</name><direction>out</direction><relatedStateVariable>SinkProtocolInfo</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable>
+    <stateVariable sendEvents="yes"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>
+  </serviceStateTable>
+</scpd>"#
 }
 
 // ---------------------------------------------------------------------------
@@ -657,17 +767,41 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
 /// (Stéphane Villerio, 12/08/2026 : « JPlay iOS ne voit toujours pas
 /// Tune », pendant que femtoServer et DMP-A6 — qui répondent au M-SEARCH —
 /// figurent dans sa liste).
+#[derive(Clone)]
 pub struct MediaServerAdvert {
     pub uuid: String,
     pub location: String,
 }
 
-static ADVERT: std::sync::OnceLock<MediaServerAdvert> = std::sync::OnceLock::new();
+/// `RwLock`, pas `OnceLock` : l'IP annoncée doit pouvoir être rafraîchie.
+/// En 0.9.71 la LOCATION était calculée UNE fois au démarrage avec un repli
+/// « 127.0.0.1 » — un serveur lancé avant que le réseau soit prêt annonçait
+/// du loopback à vie, NOTIFY et réponses M-SEARCH comprises (#1614).
+static ADVERT: std::sync::RwLock<Option<MediaServerAdvert>> = std::sync::RwLock::new(None);
 
 /// L'annonce du MediaServer, une fois l'annonceur démarré. `None` tant que le
-/// serveur UPnP n'est pas en service — le listener ne répond alors à rien.
-pub fn media_server_advert() -> Option<&'static MediaServerAdvert> {
-    ADVERT.get()
+/// serveur UPnP n'est pas en service (ou qu'aucune IP réseau n'est connue) —
+/// le listener ne répond alors à rien.
+pub fn media_server_advert() -> Option<MediaServerAdvert> {
+    ADVERT.read().ok().and_then(|g| g.clone())
+}
+
+/// URL du description.xml pour une IP donnée — partage `MOUNT_PATH` avec les
+/// routes HTTP pour que l'annonce et le montage ne divergent plus.
+pub fn advert_location(ip: &str, port: u16) -> String {
+    format!("http://{ip}:{port}{MOUNT_PATH}/description.xml")
+}
+
+/// L'IP à annoncer : `advertised_ip` de la config si renseignée, sinon la
+/// détection automatique. `None` (et non « 127.0.0.1 ») quand rien n'est
+/// joignable — annoncer du loopback est pire que ne rien annoncer.
+fn current_advert_ip(advertised_ip: Option<&str>) -> Option<String> {
+    if let Some(ip) = advertised_ip {
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    ssdp::get_local_ip().map(|ip| ip.to_string())
 }
 
 /// Les trois identités UPnP d'un MediaServer racine. Un M-SEARCH peut viser
@@ -753,7 +887,12 @@ pub fn ssdp_notify_byebye(uuid: &str) -> String {
 
 /// Spawn a background task that periodically sends SSDP NOTIFY alive
 /// on the multicast group, advertising this server as a MediaServer.
-pub async fn spawn_ssdp_advertiser(uuid: String, location: String) {
+///
+/// La LOCATION est recalculée à CHAQUE cycle (l'IP peut changer : DHCP,
+/// VPN, bascule d'interface), et tant qu'aucune IP réseau n'est détectée on
+/// n'annonce RIEN — retry court en attendant que le réseau monte, plutôt
+/// que d'annoncer un 127.0.0.1 injoignable des autres machines (#1614).
+pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Option<String>) {
     use std::net::{Ipv4Addr, SocketAddrV4};
     use tokio::net::UdpSocket;
 
@@ -768,29 +907,46 @@ pub async fn spawn_ssdp_advertiser(uuid: String, location: String) {
         };
 
         let dest = std::net::SocketAddr::from((Ipv4Addr::new(239, 255, 255, 250), 1900u16));
-
-        // Publie l'annonce pour le répondeur M-SEARCH du listener de
-        // découverte : c'est lui qui rend Tune visible d'un « Rechercher des
-        // appareils », le NOTIFY spontané ne couvrant que l'écoute passive.
-        let _ = ADVERT.set(MediaServerAdvert {
-            uuid: uuid.clone(),
-            location: location.clone(),
-        });
-
-        // Les TROIS identités du device (rootdevice, MediaServer,
-        // ContentDirectory) : certains contrôleurs ne retiennent un serveur
-        // que s'ils ont vu l'identité précise qu'ils cherchent.
-        let payloads: Vec<String> = usn_targets(&uuid)
-            .iter()
-            .map(|(nt, usn)| ssdp_notify_alive_for(nt, usn, &location))
-            .collect();
+        let mut network_was_up = true;
 
         loop {
-            for p in &payloads {
+            let Some(ip) = current_advert_ip(advertised_ip.as_deref()) else {
+                // Pas d'IP réseau (démarrage avant le DHCP, interfaces
+                // toutes virtuelles…) : on garde la dernière annonce connue
+                // pour le répondeur M-SEARCH s'il y en avait une, on
+                // n'émet pas de NOTIFY, et on réessaie vite.
+                if network_was_up {
+                    warn!("ssdp_advertiser_no_network_ip_waiting");
+                    network_was_up = false;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            };
+            network_was_up = true;
+
+            let location = advert_location(&ip, port);
+
+            // Publie l'annonce pour le répondeur M-SEARCH du listener de
+            // découverte : c'est lui qui rend Tune visible d'un « Rechercher
+            // des appareils », le NOTIFY spontané ne couvrant que l'écoute
+            // passive.
+            if let Ok(mut guard) = ADVERT.write() {
+                *guard = Some(MediaServerAdvert {
+                    uuid: uuid.clone(),
+                    location: location.clone(),
+                });
+            }
+
+            // Les TROIS identités du device (rootdevice, MediaServer,
+            // ContentDirectory) : certains contrôleurs ne retiennent un
+            // serveur que s'ils ont vu l'identité précise qu'ils cherchent.
+            for (nt, usn) in usn_targets(&uuid) {
+                let p = ssdp_notify_alive_for(&nt, &usn, &location);
                 if let Err(e) = socket.send_to(p.as_bytes(), dest).await {
                     debug!(error = %e, "ssdp_advertise_send_error");
                 }
             }
+
             // 300 s, pas 600 : la spec demande de réannoncer bien avant
             // l'expiration du CACHE-CONTROL (max-age=1800) — et dix minutes
             // entre deux annonces laissaient les contrôleurs à l'écoute
@@ -867,6 +1023,67 @@ mod tests {
         let xml = didl_container("id", "0", "Rock & Roll", "object.container", Some(42));
         assert!(xml.contains("Rock &amp; Roll"));
         assert!(xml.contains("childCount=\"42\""));
+    }
+
+    fn test_state() -> UpnpState {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        UpnpState::new(Arc::new(db), 8888, None)
+    }
+
+    #[test]
+    fn description_publie_les_urls_sous_le_prefixe_upnp() {
+        // Régression #1613 : les URLs de contrôle publiées doivent porter le
+        // préfixe de montage, sinon chaque Browse tombe sur le fallback SPA.
+        let state = test_state();
+        let xml = build_device_description(&state);
+        assert!(xml.contains(&format!(
+            "{MOUNT_PATH}/ContentDirectory/control</controlURL>"
+        )));
+        assert!(xml.contains(&format!("{MOUNT_PATH}/ContentDirectory/scpd.xml</SCPDURL>")));
+        assert!(xml.contains(&format!(
+            "{MOUNT_PATH}/ConnectionManager/control</controlURL>"
+        )));
+        assert!(!xml.contains(":8888/ContentDirectory/control"));
+    }
+
+    #[test]
+    fn advertised_ip_prioritaire_sur_la_detection() {
+        let mut state = test_state();
+        state.advertised_ip = Some("10.11.12.13".into());
+        assert_eq!(state.server_ip(), "10.11.12.13");
+        assert_eq!(state.base_url(), "http://10.11.12.13:8888");
+    }
+
+    #[test]
+    fn advert_location_porte_le_prefixe_de_montage() {
+        assert_eq!(
+            advert_location("192.168.1.41", 8888),
+            "http://192.168.1.41:8888/upnp/description.xml"
+        );
+    }
+
+    #[test]
+    fn current_advert_ip_honore_la_config() {
+        assert_eq!(
+            current_advert_ip(Some("192.168.1.99")),
+            Some("192.168.1.99".into())
+        );
+    }
+
+    #[test]
+    fn scpd_content_directory_expose_browse() {
+        let scpd = content_directory_scpd();
+        assert!(scpd.starts_with("<?xml"));
+        assert!(scpd.contains("<name>Browse</name>"));
+        assert!(scpd.contains("BrowseDirectChildren"));
+        assert!(scpd.contains("urn:schemas-upnp-org:service-1-0"));
+    }
+
+    #[test]
+    fn scpd_connection_manager_expose_get_protocol_info() {
+        let scpd = connection_manager_scpd();
+        assert!(scpd.contains("<name>GetProtocolInfo</name>"));
     }
 
     #[test]
