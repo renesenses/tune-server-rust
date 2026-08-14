@@ -108,6 +108,20 @@ fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
     }
 }
 
+/// Offsets des pages restant à charger après la première page d'un endpoint
+/// paginé Qobuz.
+///
+/// Reproduit la condition d'arrêt de l'ancienne boucle séquentielle : on ne
+/// continue que si la première page était PLEINE et que `total` annonce des
+/// éléments au-delà. Un `total` incohérent (0 alors que la page est pleine)
+/// arrête la pagination, comme avant.
+fn remaining_page_offsets(first_count: usize, total: usize, page_size: usize) -> Vec<usize> {
+    if first_count < page_size || total <= first_count {
+        return Vec::new();
+    }
+    (page_size..total).step_by(page_size).collect()
+}
+
 /// Trace le résultat d'une écriture de favori chez Qobuz.
 ///
 /// Sans cette trace, un favori qui n'arrive jamais dans l'app Qobuz ne laisse
@@ -248,82 +262,121 @@ impl QobuzService {
             .map_err(|e| AttemptError::Json(e.to_string()))
     }
 
+    /// One page of a paginated Qobuz endpoint.
+    async fn api_get_page(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        offset: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value, String> {
+        let offset_str = offset.to_string();
+        let limit_str = limit.to_string();
+        let mut params: Vec<(&str, &str)> = base_params.to_vec();
+        params.push(("limit", &limit_str));
+        params.push(("offset", &offset_str));
+        self.api_get(path, &params).await
+    }
+
     /// Fetch all pages from a paginated Qobuz endpoint.
     ///
     /// `path` / `base_params` define the request. `items_key` is the top-level
     /// JSON key that wraps the `items` array (e.g. "tracks", "albums", "artists").
     /// The Qobuz API caps each page at 50 items regardless of the requested limit.
+    ///
+    /// Perf: the first page tells us `total`; the remaining pages are fetched
+    /// CONCURRENTLY (capped at `MAX_CONCURRENT_PAGES` so a large favorites
+    /// library doesn't hammer the Qobuz API). Before this, a user with 2000
+    /// favorite tracks paid 40 sequential round-trips per view — the "slow
+    /// favorites display" reports from heavy Qobuz users.
     async fn api_get_all_pages(
         &self,
         path: &str,
         base_params: &[(&str, &str)],
         items_key: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
-        let mut all_items: Vec<serde_json::Value> = Vec::new();
-        let mut offset: usize = 0;
+        const MAX_CONCURRENT_PAGES: usize = 4;
 
-        loop {
-            let offset_str = offset.to_string();
-            let limit_str = PAGE_SIZE.to_string();
-            let mut params: Vec<(&str, &str)> = base_params.to_vec();
-            params.push(("limit", &limit_str));
-            params.push(("offset", &offset_str));
+        // First page: learn `total` and keep the first-page diagnostics.
+        let data = self.api_get_page(path, base_params, 0, PAGE_SIZE).await?;
 
-            let data = self.api_get(path, &params).await?;
+        let mut all_items: Vec<serde_json::Value> = data[items_key]["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let count = all_items.len();
+        let total = data[items_key]["total"].as_u64().unwrap_or(0) as usize;
 
-            let items = data[items_key]["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+        debug!(
+            path,
+            items_key,
+            offset = 0usize,
+            count,
+            total,
+            accumulated = all_items.len(),
+            "qobuz_paginate"
+        );
 
-            let count = items.len();
-            all_items.extend(items);
-
-            let total = data[items_key]["total"].as_u64().unwrap_or(0) as usize;
-
-            debug!(
-                path,
-                items_key,
-                offset,
-                count,
-                total,
-                accumulated = all_items.len(),
-                "qobuz_paginate"
-            );
-
-            // Diagnostic for the "favorites empty while playlists load" reports
-            // (Stéphane): on the FIRST page, surface at INFO the counts so a normal
-            // tester log tells us whether Qobuz returned nothing (total==0 → an
-            // API/account issue) or returned rows we then dropped (total>0 but
-            // count==0 → a response-shape/mapping mismatch on our side). When the
-            // items_key sub-object is entirely absent we log the top-level keys
-            // the response DID carry, to catch Qobuz nesting the data elsewhere.
-            if offset == 0 {
-                let key_present = data.get(items_key).map(|v| !v.is_null()).unwrap_or(false);
-                if total == 0 && count == 0 {
-                    let top_keys: Vec<&str> = data
-                        .as_object()
-                        .map(|m| m.keys().map(String::as_str).collect())
-                        .unwrap_or_default();
-                    warn!(
-                        path,
-                        items_key,
-                        key_present,
-                        response_keys = ?top_keys,
-                        "qobuz_favorites_empty"
-                    );
-                } else {
-                    info!(path, items_key, count, total, "qobuz_favorites_first_page");
-                }
+        // Diagnostic for the "favorites empty while playlists load" reports
+        // (Stéphane): on the FIRST page, surface at INFO the counts so a normal
+        // tester log tells us whether Qobuz returned nothing (total==0 → an
+        // API/account issue) or returned rows we then dropped (total>0 but
+        // count==0 → a response-shape/mapping mismatch on our side). When the
+        // items_key sub-object is entirely absent we log the top-level keys
+        // the response DID carry, to catch Qobuz nesting the data elsewhere.
+        {
+            let key_present = data.get(items_key).map(|v| !v.is_null()).unwrap_or(false);
+            if total == 0 && count == 0 {
+                let top_keys: Vec<&str> = data
+                    .as_object()
+                    .map(|m| m.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                warn!(
+                    path,
+                    items_key,
+                    key_present,
+                    response_keys = ?top_keys,
+                    "qobuz_favorites_empty"
+                );
+            } else {
+                info!(path, items_key, count, total, "qobuz_favorites_first_page");
             }
+        }
 
-            offset += count;
+        let offsets = remaining_page_offsets(count, total, PAGE_SIZE);
+        if offsets.is_empty() {
+            return Ok(all_items);
+        }
 
-            // Stop when we got fewer items than a full page, or we've reached the total
-            if count < PAGE_SIZE || offset >= total {
-                break;
-            }
+        // `buffered` preserves page order, so the merged list matches what the
+        // sequential loop produced.
+        let pages: Vec<Result<Vec<serde_json::Value>, String>> =
+            futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
+                let data = self
+                    .api_get_page(path, base_params, offset, PAGE_SIZE)
+                    .await?;
+                let items = data[items_key]["items"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                debug!(
+                    path,
+                    items_key,
+                    offset,
+                    count = items.len(),
+                    total,
+                    "qobuz_paginate"
+                );
+                Ok(items)
+            }))
+            .buffered(MAX_CONCURRENT_PAGES)
+            .collect()
+            .await;
+
+        for page in pages {
+            all_items.extend(page?);
         }
 
         Ok(all_items)
@@ -1634,6 +1687,36 @@ mod tests {
     fn endpoint_order_proxy_first_for_founder() {
         // Founder account (license `qobuz_proxy_first`): proxy first.
         assert_eq!(endpoint_order(true), (API_PROXY, API_BASE));
+    }
+
+    #[test]
+    fn remaining_page_offsets_stops_on_a_partial_first_page() {
+        // 37 favoris : tout tient dans la première page, rien à précharger.
+        assert!(remaining_page_offsets(37, 37, 50).is_empty());
+        // Page vide (compte sans favoris).
+        assert!(remaining_page_offsets(0, 0, 50).is_empty());
+    }
+
+    #[test]
+    fn remaining_page_offsets_stops_when_total_is_reached_or_inconsistent() {
+        // total == première page : terminé.
+        assert!(remaining_page_offsets(50, 50, 50).is_empty());
+        // total incohérent (0 alors que la page est pleine) : on s'arrête,
+        // comme l'ancienne boucle séquentielle (offset >= total).
+        assert!(remaining_page_offsets(50, 0, 50).is_empty());
+    }
+
+    #[test]
+    fn remaining_page_offsets_covers_the_whole_library_in_page_steps() {
+        // 2000 favoris (cas des rapports de lenteur) : pages 50..1950.
+        let offsets = remaining_page_offsets(50, 2000, 50);
+        assert_eq!(offsets.first(), Some(&50));
+        assert_eq!(offsets.last(), Some(&1950));
+        assert_eq!(offsets.len(), 39);
+        // Dernière page partielle : 230 favoris → 50, 100, 150, 200.
+        assert_eq!(remaining_page_offsets(50, 230, 50), vec![50, 100, 150, 200]);
+        // Un seul élément au-delà de la première page.
+        assert_eq!(remaining_page_offsets(50, 51, 50), vec![50]);
     }
 
     #[test]

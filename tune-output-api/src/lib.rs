@@ -254,7 +254,7 @@ pub trait OutputTarget: Send + Sync {
 /// the Diretta Host SDK cannot ship in a public build) plug into the public
 /// server without the public workspace ever referencing it: the private repo
 /// builds its own composer binary that calls
-/// `tune_server::run::main_blocking(RunOptions { output_providers, .. })`.
+/// `tune_server::bootstrap::run_with(RunOptions { output_providers, .. })`.
 /// The server polls `discover()` at startup and then periodically, registers
 /// each returned output in the output registry, and gives it the same zone
 /// lifecycle as built-in discovery (reconnect, auto-create, hidden zones).
