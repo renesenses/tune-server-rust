@@ -31,6 +31,50 @@ use crate::discovery::ssdp;
 /// clients voyaient un serveur vide (#1613).
 pub const MOUNT_PATH: &str = "/upnp";
 
+/// Préfixe de l'API HTTP publique (`app.nest("/api/v1", api)` dans
+/// `routes/mod.rs`). Les URL de ressource publiées dans le DIDL doivent le
+/// porter, exactement comme `controlURL` doit porter [`MOUNT_PATH`] : en
+/// 0.9.74 le DIDL annonçait `…/artwork/{hash}` et `…/stream/{id}.flac`, deux
+/// chemins qui ne sont montés nulle part. Le premier tombait dans le fallback
+/// SPA — HTTP 200 avec `Content-Type: text/html`, donc une pochette cassée
+/// dans chaque client au lieu d'une erreur visible — et le second en 404
+/// (`/stream/{stream_id}` attend un identifiant de session de rendu, pas un
+/// `track_id`), ce qui rendait le serveur média entièrement injouable (#1681).
+pub const API_PATH: &str = "/api/v1";
+
+/// Un `cover_path` déjà stocké sous forme de condensat (le nom du fichier
+/// dans le cache de pochettes), par opposition à un chemin de fichier.
+fn is_hex_hash(s: &str) -> bool {
+    (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// URL absolue de la pochette correspondant à un `cover_path` de la base.
+///
+/// Reprend à l'identique la normalisation de
+/// `tune-server/src/routes/library/artwork.rs::album_artwork`, qui est la
+/// seule référence : une URL distante est publiée telle quelle, un condensat
+/// est servi directement, et toute autre valeur est un chemin de fichier dont
+/// l'entrée de cache s'adresse par [`crate::library::artwork::artwork_hash`].
+/// Concaténer `cover_path` brut derrière `/artwork/` ne fonctionnait pour
+/// aucune des trois formes.
+pub fn artwork_url(base_url: &str, cover_path: &str) -> String {
+    if cover_path.starts_with("http://") || cover_path.starts_with("https://") {
+        return cover_path.to_string();
+    }
+    let hash = if is_hex_hash(cover_path) {
+        cover_path.to_string()
+    } else {
+        crate::library::artwork::artwork_hash(cover_path)
+    };
+    format!("{base_url}{API_PATH}/library/artwork/{hash}")
+}
+
+/// URL absolue du flux audio d'une piste, telle que servie par
+/// `GET /api/v1/library/tracks/{id}/audio`.
+pub fn track_audio_url(base_url: &str, track_id: i64) -> String {
+    format!("{base_url}{API_PATH}/library/tracks/{track_id}/audio")
+}
+
 #[derive(Clone)]
 pub struct UpnpState {
     pub backend: Arc<dyn DbBackend>,
@@ -465,9 +509,10 @@ fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
             ));
         }
         if let Some(ref cover) = album.cover_path {
-            let base = state.base_url();
+            let url = artwork_url(&state.base_url(), cover);
             extra.push_str(&format!(
-                "<upnp:albumArtURI>{base}/artwork/{cover}</upnp:albumArtURI>"
+                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
+                quick_xml::escape::escape(&url)
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -593,7 +638,8 @@ fn browse_artist_albums(state: &UpnpState, artist_id: i64, base_url: &str) -> Di
         let mut extra = String::new();
         if let Some(ref cover) = album.cover_path {
             extra.push_str(&format!(
-                "<upnp:albumArtURI>{base_url}/artwork/{cover}</upnp:albumArtURI>"
+                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
+                quick_xml::escape::escape(&artwork_url(base_url, cover))
             ));
         }
         inner.push_str(&didl_container_ext(
@@ -684,51 +730,31 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
     let id = format!("track/{track_id}");
     let fmt = track.format.as_deref().unwrap_or("flac");
 
-    // For formats that need transcoding (DSD, AIFF, WavPack, APE, ALAC, WMA),
-    // advertise the transcoded MIME type and extension so that DLNA renderers
-    // see a format they can actually play.
+    // Le `<res>` annonçait un MIME et une extension *transcodés*
+    // (`…/stream/{id}.flac` pour un DSD, par exemple). Cette promesse n'a
+    // jamais été tenue : aucune route ne sert `/stream/{track_id}.{ext}` et le
+    // seul point d'entrée du serveur média, `/api/v1/library/tracks/{id}/audio`
+    // (`routes/library/tracks.rs::stream_track_audio`), renvoie le **fichier
+    // d'origine** tel quel, sans transcodage. On annonce donc le format réel du
+    // fichier, calculé comme le fait ce point d'entrée pour son `Content-Type`,
+    // afin que le DIDL et la réponse HTTP ne se contredisent plus (#1681).
     use crate::audio::formats::AudioFormat;
     let source_format = AudioFormat::from_extension(fmt);
-    let needs_transcode = source_format
-        .as_ref()
-        .is_some_and(|f| f.needs_transcode_for_dlna());
-    let (advertised_ext, mime) = if needs_transcode {
-        // Safety: needs_transcode is only true when source_format.is_some_and(...),
-        // so expect() here documents this invariant rather than risking a silent bug.
-        let target = source_format
-            .expect("needs_transcode implies Some")
-            .dlna_transcode_target();
-        (target.container_format(), target.mime_type())
-    } else {
-        let m = match fmt {
-            "flac" => "audio/flac",
-            "mp3" => "audio/mpeg",
-            "wav" => "audio/wav",
-            "aac" | "m4a" => "audio/mp4",
-            "ogg" => "audio/ogg",
-            _ => "audio/flac",
-        };
-        (fmt, m)
-    };
+    let mime = source_format
+        .map(|f| f.mime_type())
+        .unwrap_or("application/octet-stream");
 
-    let stream_url = format!("{base_url}/stream/{track_id}.{advertised_ext}");
-    let cover_url = track
-        .cover_path
-        .as_ref()
-        .map(|c| format!("{base_url}/artwork/{c}"));
+    let stream_url = track_audio_url(base_url, track_id);
+    let cover_url = track.cover_path.as_ref().map(|c| artwork_url(base_url, c));
 
-    // For DSD tracks, advertise the PCM output sample rate (176.4/352.8 kHz)
-    // and 24-bit depth instead of the raw DSD rate (2.8/5.6 MHz) and 1-bit.
-    let (advertised_sr, advertised_bd) = if source_format == Some(AudioFormat::Dsd) {
-        let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
-        let pcm_rate = AudioFormat::Dsd.dsd_output_sample_rate(dsd_rate);
-        (Some(pcm_rate), Some(24u32))
-    } else {
-        (
-            track.sample_rate.map(|sr| sr as u32),
-            track.bit_depth.map(|bd| bd as u32),
-        )
-    };
+    // Le flux étant celui du fichier source, les caractéristiques annoncées
+    // sont celles du fichier source — y compris pour le DSD, où l'ancien code
+    // publiait la cadence PCM (176,4/352,8 kHz) et 24 bits d'un transcodage
+    // qui n'avait jamais lieu.
+    let (advertised_sr, advertised_bd) = (
+        track.sample_rate.map(|sr| sr as u32),
+        track.bit_depth.map(|bd| bd as u32),
+    );
 
     let mut builder = crate::outputs::didl::DidlBuilder::new(&track.title, &stream_url, mime)
         .item_id(&id)
@@ -1101,9 +1127,8 @@ mod tests {
         assert!(msg.contains("uuid:1234"));
     }
 
-    #[test]
-    fn didl_track_formatting() {
-        let track = Track {
+    fn sample_track() -> Track {
+        Track {
             id: Some(42),
             title: "So What".into(),
             album_id: Some(10),
@@ -1133,19 +1158,92 @@ mod tests {
             bpm: None,
             label: None,
             musicbrainz_recording_id: None,
-            cover_path: Some("abc123".into()),
+            cover_path: Some("ce0a963bb7eb63c3b33b4e00b6ab3427".into()),
             comments: None,
-        };
+        }
+    }
+
+    #[test]
+    fn didl_track_formatting() {
+        let track = sample_track();
         let xml = didl_track_item(&track, "album/10", "http://192.168.1.18:8085");
         assert!(xml.contains("So What"));
         assert!(xml.contains("Miles Davis"));
         assert!(xml.contains("Kind of Blue"));
         assert!(xml.contains("audio/flac"));
-        assert!(xml.contains("stream/42.flac"));
         assert!(xml.contains("sampleFrequency=\"96000\""));
         assert!(xml.contains("bitsPerSample=\"24\""));
-        assert!(xml.contains("albumArtURI"));
         assert!(xml.contains("originalTrackNumber"));
+
+        // Les deux URL publiées doivent viser des routes réellement montées :
+        // `/stream/{id}.{ext}` répondait 404 et `/artwork/{hash}` tombait dans
+        // le fallback SPA (#1681).
+        assert!(
+            xml.contains("http://192.168.1.18:8085/api/v1/library/tracks/42/audio"),
+            "le <res> doit viser /api/v1/library/tracks/{{id}}/audio : {xml}"
+        );
+        assert!(!xml.contains("/stream/42."), "ancienne URL de flux : {xml}");
+        assert!(
+            xml.contains(
+                "<upnp:albumArtURI>http://192.168.1.18:8085/api/v1/library/artwork/ce0a963bb7eb63c3b33b4e00b6ab3427</upnp:albumArtURI>"
+            ),
+            "pochette hors de /api/v1/library/artwork : {xml}"
+        );
+    }
+
+    #[test]
+    fn artwork_url_prefixe_lapi_pour_un_condensat() {
+        // Forme observée en base sur .42 : les 387 albums pourvus d'une
+        // pochette ont un cover_path en condensat md5.
+        assert_eq!(
+            artwork_url(
+                "http://192.168.1.42:8888",
+                "ce0a963bb7eb63c3b33b4e00b6ab3427"
+            ),
+            "http://192.168.1.42:8888/api/v1/library/artwork/ce0a963bb7eb63c3b33b4e00b6ab3427"
+        );
+    }
+
+    #[test]
+    fn artwork_url_condense_un_chemin_de_fichier() {
+        // Un chemin n'est pas le nom de l'entrée de cache : il faut le
+        // condenser, comme le fait `album_artwork` côté API.
+        let path = "/music/Air/Talkie Walkie/cover.jpg";
+        let expected = crate::library::artwork::artwork_hash(path);
+        let url = artwork_url("http://host:8888", path);
+        assert_eq!(
+            url,
+            format!("http://host:8888/api/v1/library/artwork/{expected}")
+        );
+        assert!(!url.contains("cover.jpg"));
+    }
+
+    #[test]
+    fn artwork_url_laisse_passer_une_url_distante() {
+        let remote = "https://coverart.example/release/1.jpg";
+        assert_eq!(artwork_url("http://host:8888", remote), remote);
+    }
+
+    #[test]
+    fn track_audio_url_vise_la_route_montee() {
+        assert_eq!(
+            track_audio_url("http://192.168.1.42:8888", 5239),
+            "http://192.168.1.42:8888/api/v1/library/tracks/5239/audio"
+        );
+    }
+
+    #[test]
+    fn didl_track_annonce_le_format_source_sans_transcodage() {
+        // `/api/v1/library/tracks/{id}/audio` renvoie le fichier d'origine :
+        // annoncer un MIME transcodé contredisait son Content-Type.
+        let mut track = sample_track();
+        track.format = Some("dsf".into());
+        track.sample_rate = Some(2_822_400);
+        track.bit_depth = Some(1);
+        let xml = didl_track_item(&track, "album/10", "http://host:8888");
+        assert!(xml.contains("application/x-dsd"), "{xml}");
+        assert!(!xml.contains("audio/flac"), "{xml}");
+        assert!(xml.contains("sampleFrequency=\"2822400\""), "{xml}");
     }
 }
 
