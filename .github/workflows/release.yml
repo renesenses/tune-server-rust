@@ -138,9 +138,12 @@ jobs:
                --dir "$RUNNER_TEMP/ffbundle"; then
             # tar en chemin relatif : le tar GNU de Git-Bash lit « D: » d'un
             # chemin Windows comme un hote distant (rsh) et echoue —
-            # « Cannot connect to D: resolve failed » (vecu v0.9.71).
+            # « Cannot connect to D: resolve failed » (vecu v0.9.71). Le cd +
+            # chemin RELATIF suffit : plus de deux-points, aucun drapeau requis.
+            # Surtout pas --force-local : le bsdtar de macOS ne le connait pas
+            # et les DEUX jobs macOS sont tombes dessus en v0.9.72.
             (cd "$RUNNER_TEMP/ffbundle" && \
-              tar --force-local -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
+              tar -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
             ls -la "$RUNNER_TEMP/ffbundle"
           else
             echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
@@ -546,7 +549,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          VERSION="${{ env.VERSION }}"
+          VERSION="${{ env.TUNE_VERSION }}"
           APP="Tune Server.app"
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources/web"
@@ -658,20 +661,43 @@ jobs:
       - name: Notarize DMG (macOS)
         if: runner.os == 'macOS'
         env:
+          # Preferred path: App Store Connect API key (survives Apple ID
+          # account trouble — the password flow started returning 401s even
+          # after the account was rehabilitated). Falls back to the legacy
+          # Apple ID + app-specific password pair, then to skipping.
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "$APPLE_ID" ]; then echo "No Apple ID, skipping notarization"; exit 0; fi
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          if ! xcrun notarytool submit "$DMG_NAME" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 600; then
+          notarize_failed() {
             echo "::error::Notarisation refusée par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
             rm -f "$DMG_NAME"
             exit 1
+          }
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
+            # printf '%s' via the env var keeps the PEM newlines intact and
+            # avoids any shell interpretation of the key content.
+            printf '%s' "$ASC_API_KEY_P8" > "$KEY_FILE"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            xcrun notarytool submit "$DMG_NAME" \
+              --key "$KEY_FILE" \
+              --key-id "$ASC_API_KEY_ID" \
+              --issuer "$ASC_API_ISSUER_ID" \
+              --wait --timeout 600 || notarize_failed
+          elif [ -n "$APPLE_ID" ]; then
+            xcrun notarytool submit "$DMG_NAME" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 600 || notarize_failed
+          else
+            echo "No notarization credentials, skipping notarization"
+            exit 0
           fi
           xcrun stapler staple "$DMG_NAME"
 
@@ -806,6 +832,18 @@ jobs:
           # Update version string and caveats
           sed -i "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
           sed -i "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
+
+          # Garantir le caveat de redémarrage après mise à jour (vécu v0.9.71 :
+          # binaire upgradé mais ancien processus toujours en mémoire → « la
+          # MAJ ne marche pas »). Le job ne fait que des sed ciblés, donc la
+          # ligne posée sur le tap survit normalement — cette étape la répare
+          # si la formule est un jour recréée sans elle. Idempotent.
+          if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+            perl -0pi -e 's/(      Background service: brew services start tune-server\n)/$1\n      Après une mise à jour, redémarrez le serveur :\n      brew services restart tune-server (ou relancez tune-server-launcher).\n/' "$F"
+            if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+              echo "::warning::Caveat de redémarrage introuvable et point d'ancrage absent — à reporter à la main dans le tap"
+            fi
+          fi
 
           # Update all download URLs — use regex to catch ANY old version, not just OLD_VERSION
           # This handles cases where the formula has stale versions from failed previous updates

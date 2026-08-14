@@ -161,6 +161,14 @@ pub struct ZoneState {
     /// (server-initiated, no owner) rather than misattributed to a person.
     #[serde(default)]
     pub session_profile_id: Option<i64>,
+    /// Instant de la dernière mise en pause (`None` hors pause). Pour une
+    /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
+    /// un flux live continue de se périmer pendant la pause (connexion
+    /// icecast, tampon de la sortie, horodatage des paquets), et au-delà de
+    /// quelques secondes la reprise doit REJOUER la station comme au premier
+    /// lancement plutôt que de reprendre un pipeline mort (#1629).
+    #[serde(skip)]
+    pub paused_at: Option<Instant>,
     /// Horloge murale (epoch ms UTC) du dernier changement de métadonnée
     /// titre/artiste du now-playing. Pour une radio, c'est l'instant où le
     /// serveur a détecté le changement de morceau dans le flux (ICY / API
@@ -225,6 +233,7 @@ impl Default for ZoneState {
             shuffle_index: -1,
             track_generation: 0,
             play_seq: 0,
+            paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
@@ -421,6 +430,7 @@ impl PlaybackManager {
             .map(|t| t.elapsed().as_secs() < 5)
             .unwrap_or(false);
         state.state = PlayState::Playing;
+        state.paused_at = None;
         if !is_recent_seek {
             state.position_ms = 0;
         }
@@ -452,6 +462,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Paused;
+            state.paused_at = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
             event: "paused".into(),
@@ -464,6 +475,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Playing;
+            state.paused_at = None;
         }
         self.emit(PlaybackEvent {
             event: "resumed".into(),
@@ -476,6 +488,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         let data = if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Stopped;
+            state.paused_at = None;
             state.last_seek_at = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
@@ -496,6 +509,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Stopped;
+            state.paused_at = None;
             state.now_playing = None;
             state.position_ms = 0;
             state.metadata_changed_at_ms = None;
@@ -766,6 +780,7 @@ mod tests {
             shuffle_index: -1,
             track_generation: 7,
             play_seq: 0,
+            paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,

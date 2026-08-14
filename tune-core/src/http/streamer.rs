@@ -119,6 +119,15 @@ pub struct StreamSession {
     pub consumer_supersede: std::sync::Arc<tokio::sync::Notify>,
     pub first_request: std::sync::Arc<tokio::sync::Notify>,
     pub data_ready: std::sync::Arc<tokio::sync::Notify>,
+    /// True once the PRODUCER task feeding this session (the radio decode
+    /// thread) has exited — whatever the exit path: clean upstream EOF,
+    /// `radio_reconnect_giving_up`, consumer dropped, error or panic. Several
+    /// of those paths log only at `debug!`, so in production the producer can
+    /// die with **no visible trace** while the session object stays alive.
+    /// `Orchestrator::resume` reads this to detect that resuming a webradio
+    /// would feed silence (nothing produces PCM anymore) and re-plays the
+    /// station instead (#1629).
+    pub producer_done: std::sync::atomic::AtomicBool,
 }
 
 impl StreamSession {
@@ -151,6 +160,7 @@ impl StreamSession {
             consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
+            producer_done: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -310,6 +320,20 @@ impl AudioStreamer {
         if let Some(s) = session {
             s.close_sender().await;
             info!(stream_id, "stream_session_input_ended");
+        }
+    }
+
+    /// True when the producer task that feeds `stream_id` has exited (see
+    /// `StreamSession::producer_done`), or when the session no longer exists
+    /// at all — both mean nothing will ever produce another PCM chunk, so a
+    /// paused webradio zone resuming on this session would render silence.
+    /// Only meaningful for radio decode sessions; a proxy/file session never
+    /// sets the flag and reports `false` while it exists.
+    pub async fn radio_producer_done(&self, stream_id: &str) -> bool {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(stream_id) {
+            Some(s) => s.producer_done.load(std::sync::atomic::Ordering::Relaxed),
+            None => true,
         }
     }
 
@@ -802,7 +826,6 @@ mod tests {
         streamer.remove_session(&id).await;
     }
 
-    #[test]
     /// Le registre des titres radio rend le bloc ICY VIVANT.
     ///
     /// C'est tout l'objet du correctif : avant, le bloc etait construit une
