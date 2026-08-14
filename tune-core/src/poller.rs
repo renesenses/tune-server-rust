@@ -4220,8 +4220,7 @@ impl PositionPoller {
         // Source 1 : l'API d'enrichissement. Elle ne repond que par MBID, et
         // une piste de streaming n'en transporte aucun — en pratique elle rend
         // toujours zero candidat sur une ecoute Qobuz (#1553).
-        let mut names =
-            crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
+        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
         let from_enrichment = !names.is_empty();
 
         // Source 2 : le service lui-meme. Deux appels reseau, pas un de plus.
