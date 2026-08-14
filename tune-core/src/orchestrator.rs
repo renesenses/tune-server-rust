@@ -21,6 +21,14 @@ const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from
 /// A public `play()` for the track ALREADY playing on a zone that arrives within
 /// this window of the track's start is treated as a redundant controller
 /// double-dispatch (a re-tap) and coalesced at the entry point — BEFORE any
+/// Retard de départ délibéré sur une radio live, en secondes (#1628).
+///
+/// Trois secondes couvrent une frontière de segment entière (~8 s de cadence
+/// observée, arrivées jusqu'à 100 ms en retard) tout en restant imperceptibles
+/// au zapping. En dessous, la réserve se vide à la première irrégularité ;
+/// au-dessus, on ferait attendre l'auditeur pour rien.
+const RADIO_PREBUFFER_SECS: u64 = 3;
+
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
 /// catches an OVERLAPPING second play; when the second play arrives just AFTER
 /// the first fully established playback (sequential, a few seconds apart), that
@@ -1618,22 +1626,45 @@ impl PlaybackOrchestrator {
             //     freezes the start of playback; `Play` is sent regardless.
             // The poller FSM is untouched: its 45s track-load grace already
             // tolerates the few extra seconds before Play.
+            //
+            // La RADIO a besoin de la même barrière quelle que soit la sortie
+            // (#1628). Un flux live n'a pas de réserve par construction : on ne
+            // peut envoyer que ce que la station a déjà émis. En partant sans
+            // retard délibéré, la lecture colle au bord du direct et chaque
+            // frontière de segment arrivant un peu tard passe sous le lead —
+            // mesuré sur FIP → endpoint OAAT le 13/08 : des underruns
+            // rythmiques toutes les ~8 s (la cadence des segments), de 0 à
+            // 96 ms, indéfiniment. Les 2 s de tampon de l'endpoint n'y peuvent
+            // rien : elles ne sont JAMAIS remplies. Accumuler ce retard avant
+            // de lancer la lecture donne au flux la réserve qui lui manque ;
+            // le coût est quelques secondes au zapping d'une station.
             if let Some(ref sid) = resolved.stream_id {
-                if self.output_type_of(device_id).await.as_deref() == Some("dlna") {
+                let is_dlna = self.output_type_of(device_id).await.as_deref() == Some("dlna");
+                let is_radio = resolved.source == "radio";
+                if is_dlna || is_radio {
                     let sr = resolved.sample_rate.unwrap_or(44100) as u64;
                     let ch = (resolved.channels.unwrap_or(2) as u64).max(1);
                     let bytes_per_sample = ((resolved.bit_depth.unwrap_or(16) as u64) / 8).max(1);
-                    let target_bytes = sr * ch * bytes_per_sample * 2; // ~2s of audio
+                    // La radio vise plus large : il faut couvrir une frontière
+                    // de segment entière (~8 s observées) sans jamais toucher
+                    // le fond, là où un fichier n'a qu'un démarrage à froid à
+                    // absorber.
+                    let secs = if is_radio { RADIO_PREBUFFER_SECS } else { 2 };
+                    let target_bytes = sr * ch * bytes_per_sample * secs;
+                    // Plafond : une station lente ou muette ne doit jamais
+                    // geler le départ — `Play` part de toute façon.
+                    let timeout = std::time::Duration::from_secs(if is_radio { 8 } else { 4 });
                     let reached = self
                         .streamer
-                        .wait_prefill_ready(sid, target_bytes, std::time::Duration::from_secs(4))
+                        .wait_prefill_ready(sid, target_bytes, timeout)
                         .await;
                     info!(
                         zone_id = req.zone_id,
                         stream_id = %sid,
                         target_bytes,
                         reached,
-                        "dlna_initial_prebuffer_done"
+                        is_radio,
+                        "initial_prebuffer_done"
                     );
                 }
             }
