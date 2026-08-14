@@ -168,12 +168,18 @@ pub fn pick_seed_artist_id(
 /// Both calls are injected rather than taken from the registry, so this is
 /// testable without a network or a subscription. Exactly two network calls,
 /// whatever happens — one to resolve the seed, one to list its neighbours.
-pub async fn service_similar_artist_names<FS, FutS, FA, FutA>(
+/// Returns the neighbours WITH their catalogue ids, not just their names. The
+/// id is what lets the radio ask for « des titres DE cet artiste » instead of
+/// « des titres qui contiennent son nom » — searching Qobuz for the band
+/// Caravan otherwise queues Duke Ellington's *Caravan*, and Traffic returns
+/// *Traffic Lights*. Four of the first ten picks were the wrong artist before
+/// the ids were carried through.
+pub async fn service_similar_artists<FS, FutS, FA, FutA>(
     seed_artist: &str,
     max: usize,
     search_artists: FS,
     similar_artists: FA,
-) -> Vec<String>
+) -> Vec<crate::streaming::traits::StreamArtist>
 where
     FS: FnOnce(String) -> FutS,
     FutS: std::future::Future<Output = Vec<crate::streaming::traits::StreamArtist>>,
@@ -188,24 +194,25 @@ where
         return Vec::new();
     };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut names: Vec<String> = Vec::new();
-    for artist in similar_artists(seed_id).await {
-        let name = artist.name.trim().to_string();
+    let mut out: Vec<crate::streaming::traits::StreamArtist> = Vec::new();
+    for mut artist in similar_artists(seed_id).await {
+        artist.name = artist.name.trim().to_string();
         // Never seed the radio with the artist we are coming from, and never
-        // twice with the same one — a duplicate name means a duplicate search
+        // twice with the same one — a duplicate name means a duplicate lookup
         // for zero extra candidates.
-        if name.is_empty()
-            || name.eq_ignore_ascii_case(seed_artist.trim())
-            || !seen.insert(name.to_lowercase())
+        if artist.name.is_empty()
+            || artist.id.is_empty()
+            || artist.name.eq_ignore_ascii_case(seed_artist.trim())
+            || !seen.insert(artist.name.to_lowercase())
         {
             continue;
         }
-        names.push(name);
-        if names.len() >= max {
+        out.push(artist);
+        if out.len() >= max {
             break;
         }
     }
-    names
+    out
 }
 
 pub fn generate_queue(
@@ -461,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn service_similar_names_follow_the_catalogue() {
         // Reponse reelle de /artist/getSimilarArtists pour Pink Floyd (38324).
-        let names = service_similar_artist_names(
+        let got = service_similar_artists(
             "Pink Floyd",
             20,
             |q| async move {
@@ -478,12 +485,23 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(names, vec!["King Crimson", "Yes", "Queen"]);
+        // Les identifiants voyagent avec les noms : c'est eux qui permettront
+        // de demander les titres DE l'artiste, pas une recherche par nom.
+        assert_eq!(
+            got.iter()
+                .map(|a| (a.id.as_str(), a.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("1191678", "King Crimson"),
+                ("26718", "Yes"),
+                ("43821", "Queen")
+            ]
+        );
     }
 
     #[tokio::test]
     async fn service_similar_names_drop_the_seed_and_the_duplicates() {
-        let names = service_similar_artist_names(
+        let got = service_similar_artists(
             "Pink Floyd",
             20,
             |_| async { vec![stream_artist("38324", "Pink Floyd")] },
@@ -496,16 +514,21 @@ mod tests {
                     // Meme artiste, deux entrees : une seule recherche.
                     stream_artist("26719", "yes"),
                     stream_artist("0", "   "),
+                    // Sans identifiant de catalogue, on ne peut rien demander.
+                    stream_artist("", "Sans Identifiant"),
                 ]
             },
         )
         .await;
-        assert_eq!(names, vec!["Yes"]);
+        assert_eq!(
+            got.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["Yes"]
+        );
     }
 
     #[tokio::test]
     async fn service_similar_names_bounded_by_max() {
-        let names = service_similar_artist_names(
+        let names = service_similar_artists(
             "A",
             2,
             |_| async { vec![stream_artist("1", "A")] },
@@ -523,7 +546,7 @@ mod tests {
     async fn service_similar_names_stop_before_the_second_call_when_seed_unresolved() {
         // Le service ne connait pas l'artiste : un seul appel reseau, pas deux.
         let called = std::cell::Cell::new(false);
-        let names = service_similar_artist_names(
+        let names = service_similar_artists(
             "Artiste Inconnu",
             20,
             |_| async { Vec::new() },
@@ -540,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn service_similar_names_empty_seed_asks_nothing() {
         let called = std::cell::Cell::new(false);
-        let names = service_similar_artist_names(
+        let names = service_similar_artists(
             "   ",
             20,
             |_| {
