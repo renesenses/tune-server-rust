@@ -876,8 +876,12 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyfour_features() {
-        assert_eq!(Feature::all_premium().len(), 24);
+    fn all_premium_has_twentyfive_features() {
+        // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
+        // premium doit être un acte conscient, pas un effet de bord. Passé de
+        // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
+        // rien et tournait sur des installations gratuites.
+        assert_eq!(Feature::all_premium().len(), 25);
     }
 
     #[test]
