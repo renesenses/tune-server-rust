@@ -29,12 +29,52 @@ use crate::plugins::PluginBuilder;
 use crate::routes;
 use crate::state::AppState;
 
+/// Ce dont un binaire composeur a besoin pour demarrer le serveur.
+///
+/// Cette couture existe pour les caisses de sortie hors-arbre, qui ne peuvent
+/// pas apparaitre dans le graphe de dependances public — le premier
+/// consommateur est `tune-diretta`, prive.
+///
+/// ⚠️ Elle a deja ete supprimee une fois (#1510, entre 0.9.69 et 0.9.70) parce
+/// que rien, DANS CE DEPOT, ne l'appelait ni ne la testait. Le raisonnement
+/// etait juste et la conclusion fausse : un consommateur externe etait casse
+/// pendant deux versions. Le test `run_options_carry_output_providers` existe
+/// pour que le prochain audit trouve un appelant.
+///
+/// `..Default::default()` est deliberement supportable : c'est la forme
+/// d'appel qu'utilisent les binaires composeurs.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Appele une fois, apres construction de [`AppState`] et enregistrement
+    /// des sorties locales, pour produire des greffons a enregistrer aux cotes
+    /// de ceux compiles dans le binaire.
+    pub build_plugins: Option<PluginBuilder>,
+    /// Fournisseurs de sorties hors-arbre. Interroges au demarrage puis
+    /// toutes les 60 s — c'est ce polling, et non un enregistrement statique,
+    /// que reclame une decouverte reseau dynamique doublee d'une
+    /// reverification periodique d'habilitation.
+    pub output_providers: Vec<std::sync::Arc<dyn tune_core::outputs::traits::OutputProvider>>,
+}
+
 /// Start the server and serve until a shutdown signal arrives.
 ///
 /// `build_plugins` is called once, after [`AppState`] is built and local
 /// outputs are registered, to produce plugins to register alongside the
 /// compiled-in ones. Pass `None` for the plain server.
+///
+/// Conserve pour les appelants existants : delegue a [`run_with`].
 pub async fn run(build_plugins: Option<PluginBuilder>) {
+    run_with(RunOptions {
+        build_plugins,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Comme [`run`], mais pour un binaire composeur qui apporte ses propres
+/// fournisseurs de sorties.
+pub async fn run_with(opts: RunOptions) {
+    let build_plugins = opts.build_plugins;
     // Probe-child dispatch FIRST: when spawned as a wasm-load probe, do the
     // one dangerous thing and exit before any server state exists (#1249).
     crate::plugins::maybe_run_wasm_probe();
@@ -365,6 +405,12 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
 
     // mDNS discovery (Chromecast, AirPlay, BluOS, OAAT, Squeezebox)
     let _mdns_handle = crate::discovery_setup::spawn_mdns_handler(&state);
+
+    // Sorties hors-arbre apportees par un binaire composeur (tune-diretta).
+    // Sans effet pour le binaire standard : `RunOptions::default()` n'a aucun
+    // fournisseur. C'est l'appel dont la disparition a casse l'integration
+    // partenaire pendant deux versions (#1510).
+    crate::discovery_setup::spawn_output_providers(&state, opts.output_providers);
 
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag
