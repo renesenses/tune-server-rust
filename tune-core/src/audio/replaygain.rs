@@ -55,6 +55,9 @@ const MAX_ANALYSIS_EST_BYTES: u64 = 1_200_000_000;
 /// up to ~2 min for a very long hi-res track), tight vs. an indefinite hang.
 const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
 
+/// Attente entre deux vérifications quand la machine est trop chaude (#1576).
+const THERMAL_RETRY_SECS: u64 = 120;
+
 /// How long the sweep backs off after finding a zone actively playing. The
 /// track pass fully decodes files — often over a network (SMB/NAS) mount — and
 /// on a busy link that starves the same disk/network the player reads from,
@@ -175,9 +178,16 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
     tokio::spawn(async move {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        // Garde thermique de cette passe (#1576) : ReplayGain décode des
+        // fichiers entiers, c'est l'autre moitié de la charge qui a éteint .18.
+        let mut thermal = crate::audio::thermal::ThermalGate::new();
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             if enabled(&settings) {
+                if thermal.should_hold("replaygain") {
+                    tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
+                    continue;
+                }
                 // Yield the decode-heavy track pass to playback (#1310). The
                 // album pass is pure DB math (no file decode), so it keeps
                 // making progress even while a zone plays.

@@ -36,6 +36,7 @@ pub mod tap;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
+pub mod thermal;
 pub mod wav;
 pub mod wavpack;
 
