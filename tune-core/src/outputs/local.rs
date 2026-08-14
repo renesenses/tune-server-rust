@@ -1597,6 +1597,12 @@ impl OutputTarget for LocalOutput {
             );
             header_buf.truncate(header_read);
 
+            // Set by the cpal stream error callback when the output device
+            // vanishes mid-playback (USB DAC hot-unplugged, #1626). Checked by
+            // the feed and drain loops below so the thread tears down cleanly
+            // instead of waiting forever on a ring buffer nobody drains.
+            let device_gone = Arc::new(AtomicBool::new(false));
+
             let (mut channels, mut sample_rate, mut bit_depth, data_offset) = if let Some(parsed) =
                 parse_wav_header(&header_buf)
             {
@@ -1743,7 +1749,7 @@ impl OutputTarget for LocalOutput {
                             data[read..].fill(0.0);
                         }
                     },
-                    |e| warn!(error = %e, "audio_stream_error"),
+                    make_stream_error_cb(device_gone.clone()),
                     None,
                 ) {
                     Ok(s) => s,
@@ -1811,7 +1817,22 @@ impl OutputTarget for LocalOutput {
                         {
                             std::thread::sleep(std::time::Duration::from_millis(50));
                         }
-                        feed_ring_abortable(&ring, chunk, &stop_rx, &paused, Some(&force_silent));
+                        let fed = feed_ring_abortable(
+                            &ring,
+                            chunk,
+                            &stop_rx,
+                            &paused,
+                            Some(&force_silent),
+                        );
+                        if !fed || device_gone.load(Ordering::Relaxed) {
+                            // Consumer dead (USB DAC unplugged, #1626): stop
+                            // feeding instead of stalling 5s on every chunk.
+                            warn!(
+                                device = %device_name,
+                                "local_audio_compressed_feed_aborted_device_lost"
+                            );
+                            break;
+                        }
                         fed_samples += chunk.len() as u64;
                         let fed_frames = fed_samples / output_ch as u64;
                         let pos =
@@ -1832,7 +1853,17 @@ impl OutputTarget for LocalOutput {
                 track_ended_generation.store(my_generation, Ordering::SeqCst);
                 TRACK_END_NOTIFY.notify_one();
 
-                // Wait for ring buffer to drain
+                // Wait for ring buffer to drain — but NEVER block forever: if
+                // the render callback is dead (USB DAC unplugged, #1626) the
+                // ring stays full and this loop used to spin until restart.
+                // Deadline = queued audio duration + 5s margin, mirroring the
+                // asio_drain_timeout guard of the exclusive path.
+                let drain_deadline = std::time::Duration::from_millis(
+                    (ring.available() as u64 * 1000)
+                        / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
+                        + 5000,
+                );
+                let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1841,6 +1872,17 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        break;
+                    }
+                    if device_gone.load(Ordering::Relaxed)
+                        || drain_started.elapsed() >= drain_deadline
+                    {
+                        warn!(
+                            device = %device_name,
+                            remaining_samples = ring.available(),
+                            device_gone = device_gone.load(Ordering::Relaxed),
+                            "local_audio_compressed_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2718,7 +2760,7 @@ impl OutputTarget for LocalOutput {
                             data[read..].fill(0.0);
                         }
                     },
-                    |e| warn!(error = %e, "audio_stream_error"),
+                    make_stream_error_cb(device_gone.clone()),
                     None,
                 )
             };
@@ -2740,6 +2782,7 @@ impl OutputTarget for LocalOutput {
                 silent_cb: Arc<AtomicBool>,
                 ds_cb: Arc<AtomicBool>,
                 min_buf: usize,
+                device_gone: Arc<AtomicBool>,
             ) -> Result<cpal::Stream, cpal::BuildStreamError>
             where
                 T: cpal::SizedSample + Send + 'static,
@@ -2774,7 +2817,7 @@ impl OutputTarget for LocalOutput {
                         }
                         data[read..].fill(zero);
                     },
-                    |e| warn!(error = %e, "audio_stream_error"),
+                    make_stream_error_cb(device_gone),
                     None,
                 )
             }
@@ -2870,6 +2913,7 @@ impl OutputTarget for LocalOutput {
                                             silent_cb_outer.clone(),
                                             data_started_shared.clone(),
                                             min_buf,
+                                            device_gone.clone(),
                                         )
                                     } else {
                                         build_int_stream::<i16>(
@@ -2881,6 +2925,7 @@ impl OutputTarget for LocalOutput {
                                             silent_cb_outer.clone(),
                                             data_started_shared.clone(),
                                             min_buf,
+                                            device_gone.clone(),
                                         )
                                     };
                                     if let Ok(s) = res {
@@ -3137,6 +3182,18 @@ impl OutputTarget for LocalOutput {
                     );
                     break;
                 }
+                // Device vanished mid-track (USB DAC unplugged, #1626): stop
+                // reading — nobody will ever play these samples. http_eof stays
+                // false so no natural track end is signalled (we must not chain
+                // the queue onto a dead device).
+                if device_gone.load(Ordering::Relaxed) {
+                    warn!(
+                        device = %device_name,
+                        total_bytes_read,
+                        "local_audio_stopped_device_lost"
+                    );
+                    break;
+                }
 
                 let read_start = std::time::Instant::now();
                 let n = match reader.read(&mut read_buf) {
@@ -3235,7 +3292,20 @@ impl OutputTarget for LocalOutput {
                     );
                 }
 
-                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                let fed =
+                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                if !fed {
+                    // Wedge: the render callback stopped draining the ring
+                    // (dead stream after a USB DAC unplug on macOS, where no
+                    // error callback fires, #1626). Without this check the loop
+                    // stalled 5s on EVERY chunk while the position stood still.
+                    warn!(
+                        device = %device_name,
+                        total_bytes_read,
+                        "local_audio_stopped_feed_stall"
+                    );
+                    break;
+                }
 
                 total_frames_fed += (aligned_len / frame_bytes) as u64;
 
@@ -3301,7 +3371,10 @@ impl OutputTarget for LocalOutput {
             // chain into the next track without closing the cpal stream.
             // The audio device stays open — zero gap between tracks.
             // ---------------------------------------------------------------
-            while http_eof && !force_silent.load(Ordering::Relaxed) {
+            while http_eof
+                && !force_silent.load(Ordering::Relaxed)
+                && !device_gone.load(Ordering::Relaxed)
+            {
                 let pending = next_media_ref.lock().unwrap().take();
                 let Some(next) = pending else { break };
 
@@ -3538,6 +3611,17 @@ impl OutputTarget for LocalOutput {
                     if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
                         break;
                     }
+                    // Device lost mid-chain (#1626): abort without signalling
+                    // a natural end, like the main read loop above.
+                    if device_gone.load(Ordering::Relaxed) {
+                        warn!(
+                            device = %device_name,
+                            total_bytes_read,
+                            "local_audio_gapless_stopped_device_lost"
+                        );
+                        http_eof = false;
+                        break;
+                    }
                     match next_reader.read(&mut gapless_read_buf) {
                         Ok(0) => {
                             debug!(
@@ -3569,13 +3653,23 @@ impl OutputTarget for LocalOutput {
                                     &mut resample_leftover,
                                 );
                             }
-                            feed_ring_abortable(
+                            let fed = feed_ring_abortable(
                                 &ring,
                                 &smp,
                                 &stop_rx,
                                 &paused,
                                 Some(&force_silent),
                             );
+                            if !fed {
+                                // Dead consumer (see main loop, #1626).
+                                warn!(
+                                    device = %device_name,
+                                    total_bytes_read,
+                                    "local_audio_gapless_stopped_feed_stall"
+                                );
+                                http_eof = false;
+                                break;
+                            }
                             total_frames_fed += (aligned / frame_bytes) as u64;
                             let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0)
                                 as u64
@@ -3644,6 +3738,18 @@ impl OutputTarget for LocalOutput {
             // this superseded track.
             let fed_position_ms = position_ms.load(Ordering::Relaxed);
             let mut drained_naturally = false;
+            // NEVER drain forever: with a dead render callback (USB DAC hot-
+            // unplugged, #1626 — on macOS no error callback ever fires) the
+            // ring stays full and this loop used to spin until restart, keeping
+            // the zone "Playing" and freezing the hotplug rescan. Deadline =
+            // queued audio duration + 5s margin (same guard as the ASIO
+            // exclusive path's asio_drain_timeout).
+            let drain_deadline = std::time::Duration::from_millis(
+                (ring.available() as u64 * 1000)
+                    / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
+                    + 5000,
+            );
+            let drain_started = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -3654,6 +3760,19 @@ impl OutputTarget for LocalOutput {
                 let remaining = ring.available();
                 if remaining == 0 {
                     drained_naturally = true;
+                    break;
+                }
+                if device_gone.load(Ordering::Relaxed) || drain_started.elapsed() >= drain_deadline
+                {
+                    // No natural end: the tail was never actually played, and
+                    // advancing the queue would immediately hit the same dead
+                    // device.
+                    warn!(
+                        device = %device_name,
+                        remaining_samples = remaining,
+                        device_gone = device_gone.load(Ordering::Relaxed),
+                        "local_audio_drain_timeout"
+                    );
                     break;
                 }
                 // Report real playback: subtract the still-queued ring content
@@ -3675,6 +3794,18 @@ impl OutputTarget for LocalOutput {
                     total_bytes_read,
                     total_frames_fed, "local_audio_track_ended_naturally_post_drain"
                 );
+            }
+
+            // Hand the poller something to say when the device disappeared
+            // mid-playback (#1626) — same channel as the open-failure path, so
+            // the zone shows a clear message instead of silently stopping.
+            if device_gone.load(Ordering::Relaxed) {
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(format!(
+                        "Sortie « {device_name} » : {}.",
+                        OpenFailure::DeviceGone.user_message()
+                    ));
+                }
             }
 
             drop(stream);
@@ -3907,16 +4038,56 @@ impl OutputTarget for LocalOutput {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Build the error callback for a shared-mode cpal stream.
+///
+/// A hot-unplugged USB DAC surfaces here — and used to be merely logged, which
+/// left the feeding thread waiting forever on a ring buffer nobody drains
+/// (issue #1626). Instead:
+///
+/// - `DeviceNotAvailable` (WASAPI raises it when the endpoint is invalidated)
+///   flags `device_gone` so the feeding thread tears down, and is logged once.
+/// - Any other error still flags nothing but is rate-limited to one log line
+///   per second: cpal 0.17's ALSA `output_stream_worker` loops on error
+///   (`error_callback(...); continue`), and with a dead fd `poll()` returns
+///   immediately — unbounded logging floods the log at poll speed until the
+///   stream is dropped.
+///
+/// On macOS CoreAudio the callback typically never fires on unplug (the
+/// AudioUnit just stops rendering); the feed-stall and drain deadlines in the
+/// playback thread cover that case.
+fn make_stream_error_cb(
+    device_gone: Arc<AtomicBool>,
+) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    let mut last_warn: Option<std::time::Instant> = None;
+    move |e: cpal::StreamError| {
+        if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+            if !device_gone.swap(true, Ordering::SeqCst) {
+                warn!(error = %e, "audio_stream_device_lost");
+            }
+            return;
+        }
+        if last_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+            warn!(error = %e, "audio_stream_error");
+            last_warn = Some(std::time::Instant::now());
+        }
+    }
+}
+
 /// Feed samples into the ring buffer, blocking (with sleep) when full.
 /// Checks the stop signal, abort flag, and pause state periodically.
 /// Returns immediately when abort is signaled or stop is received.
+///
+/// Returns `false` ONLY when the wedge detector tripped (the consumer stopped
+/// draining the ring for ≥5s — dead render callback, e.g. unplugged USB DAC);
+/// `true` otherwise, including stop/abort exits which the callers already
+/// detect through their own checks.
 fn feed_ring_abortable(
     ring: &RingBuf,
     samples: &[f32],
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
     abort: Option<&AtomicBool>,
-) {
+) -> bool {
     let mut offset = 0;
     // Wedge detector: if the render callback stops consuming, the ring stays
     // full and `ring.push` returns 0 forever. Bail after a sustained stall so
@@ -3928,18 +4099,18 @@ fn feed_ring_abortable(
     let mut last_progress_at = std::time::Instant::now();
     while offset < samples.len() {
         if stop_rx.try_recv().is_ok() {
-            return;
+            return true;
         }
         if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
-            return;
+            return true;
         }
         // If paused, wait without feeding
         while paused.load(Ordering::Relaxed) {
             if stop_rx.try_recv().is_ok() {
-                return;
+                return true;
             }
             if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
-                return;
+                return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
             // A deliberate pause is not a stall.
@@ -3953,7 +4124,7 @@ fn feed_ring_abortable(
                     remaining_samples = samples.len() - offset,
                     "asio_feed_ring_stall_timeout"
                 );
-                return;
+                return false;
             }
             // Ring buffer full — wait a bit
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3961,6 +4132,7 @@ fn feed_ring_abortable(
             last_progress_at = std::time::Instant::now();
         }
     }
+    true
 }
 
 /// Find an audio output device by name, falling back to the default device if
@@ -4224,6 +4396,87 @@ mod tests {
         assert!(!header_read_should_retry(ErrorKind::BrokenPipe));
         assert!(!header_read_should_retry(ErrorKind::UnexpectedEof));
         assert!(!header_read_should_retry(ErrorKind::NotFound));
+    }
+
+    // -----------------------------------------------------------------------
+    // USB DAC hot-unplug teardown (#1626)
+    // -----------------------------------------------------------------------
+
+    /// A `DeviceNotAvailable` stream error must flag `device_gone` so the
+    /// feeding thread tears down instead of waiting on a ring nobody drains.
+    #[test]
+    fn device_not_available_flags_device_gone() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let mut cb = make_stream_error_cb(gone.clone());
+        cb(cpal::StreamError::DeviceNotAvailable);
+        assert!(gone.load(Ordering::SeqCst));
+        // Repeated invocations (WASAPI fires once, but belt-and-suspenders)
+        // keep the flag set and must not panic.
+        cb(cpal::StreamError::DeviceNotAvailable);
+        assert!(gone.load(Ordering::SeqCst));
+    }
+
+    /// Other stream errors (ALSA underruns are routine) must NOT tear down
+    /// playback.
+    #[test]
+    fn generic_stream_error_does_not_flag_device_gone() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let mut cb = make_stream_error_cb(gone.clone());
+        cb(cpal::StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "underrun".into(),
+            },
+        });
+        assert!(!gone.load(Ordering::SeqCst));
+    }
+
+    /// Happy path: everything fits, the feeder reports success.
+    #[test]
+    fn feed_ring_reports_success_when_fully_fed() {
+        let ring = RingBuf::new(16);
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        assert!(feed_ring_abortable(&ring, &[0.5f32; 8], &rx, &paused, None));
+        assert_eq!(ring.available(), 8);
+    }
+
+    /// An abort (stop/new play) is a clean exit, not a stall: the caller's own
+    /// stop checks handle it, so the feeder must not report a dead consumer.
+    #[test]
+    fn feed_ring_abort_is_not_a_stall() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // full — feeding would block
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let abort = AtomicBool::new(true);
+        assert!(feed_ring_abortable(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            Some(&abort)
+        ));
+    }
+
+    /// Dead consumer (unplugged DAC: the cpal callback stops popping): the
+    /// wedge detector must report the stall so the playback thread stops
+    /// feeding instead of stalling 5s on every chunk forever. Slow test (~5s,
+    /// the real wedge threshold) — the price of exercising the actual guard.
+    #[test]
+    fn feed_ring_reports_stall_when_consumer_dead() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // full, and nobody will ever pop
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert!(!feed_ring_abortable(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            None
+        ));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
     }
 
     #[test]
