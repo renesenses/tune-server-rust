@@ -113,8 +113,8 @@ pub fn router() -> Router<AppState> {
 /// tells the UI what to grey out — and why.
 ///
 /// ffmpeg presence is not enough: the minimal build bundled with the release
-/// carries only the `aac` and `alac` encoders (no libmp3lame), so mp3 must
-/// be answered from what the resolved binary actually encodes.
+/// carries only the `aac` encoder (no libmp3lame), so mp3 must be answered
+/// from what the resolved binary actually encodes.
 async fn capabilities() -> impl IntoResponse {
     let ffmpeg = resolve_tool("ffmpeg");
     let lame = resolve_tool("lame");
@@ -124,14 +124,17 @@ async fn capabilities() -> impl IntoResponse {
     };
 
     Json(json!({
-        // Native formats are always available (#1525).
+        // Native formats are always available: flac/wav/opus (#1525),
+        // alac via Apple's vendored encoder (#1526), aac via the OS
+        // encoder where one exists (#1527 — AudioToolbox on macOS).
         "formats": {
             "flac": true,
             "wav": true,
             "opus": true,
+            "alac": true,
             "mp3": lame.is_some() || encoders.contains("libmp3lame"),
-            "aac": encoders.contains("aac"),
-            "alac": encoders.contains("alac"),
+            "aac": tune_core::audio::aac_encoder::native_available()
+                || encoders.contains("aac"),
         },
         // Diagnostic detail: which tool backs the non-native formats, if any.
         "tools": {
@@ -588,11 +591,16 @@ async fn convert_single_file(
         .to_str()
         .ok_or_else(|| "invalid input path".to_string())?;
 
-    // mp3, aac and alac still shell out to external tools (chantier #1523:
-    // lot 1 ships ffmpeg with the release, lots 3/4 make them native).
-    // flac/wav — including resampling (rubato, #1525) — and opus (libopus via
-    // audiopus + native Ogg mux) are fully in-process.
-    let needs_external = matches!(format, "mp3" | "aac" | "alac");
+    // mp3 — and aac where the OS has no system encoder — still shell out
+    // (chantier #1523: lot 1 ships ffmpeg with the release). Everything
+    // else is fully in-process: flac/wav + resampling (rubato, #1525), opus
+    // (libopus + native Ogg mux, #1525), alac (Apple's vendored encoder +
+    // native m4a mux, #1526), aac via AudioToolbox on macOS (#1527).
+    let needs_external = match format {
+        "mp3" => true,
+        "aac" => !tune_core::audio::aac_encoder::native_available(),
+        _ => false,
+    };
     if needs_external {
         return encode_with_external(input_str, output, format, quality, target_sr, target_bd)
             .await;
@@ -605,15 +613,121 @@ async fn convert_single_file(
     let bd = target_bd;
     let output_owned = output.to_path_buf();
 
-    tokio::task::spawn_blocking(move || {
-        if format_owned == "opus" {
-            encode_opus_native(&input_owned, &output_owned, quality_owned.as_deref())
-        } else {
-            encode_lossless_native(&input_owned, &output_owned, &format_owned, sr, bd)
-        }
+    tokio::task::spawn_blocking(move || match format_owned.as_str() {
+        "opus" => encode_opus_native(&input_owned, &output_owned, quality_owned.as_deref()),
+        "alac" => encode_alac_native(&input_owned, &output_owned, sr, bd),
+        "aac" => encode_aac_native(&input_owned, &output_owned, quality_owned.as_deref(), sr),
+        _ => encode_lossless_native(&input_owned, &output_owned, &format_owned, sr, bd),
     })
     .await
     .map_err(|e| format!("spawn_blocking join error: {e}"))?
+}
+
+/// Encode to AAC (.m4a) via the OS encoder (#1527, macOS/AudioToolbox):
+/// native decode → rubato to a standard AAC rate → system encoder + native
+/// m4a mux. Same quality contract as the ffmpeg path (bitrate in kb/s).
+fn encode_aac_native(
+    input: &str,
+    output: &Path,
+    quality: Option<&str>,
+    target_sr: Option<u32>,
+) -> Result<(), String> {
+    let decoded = decode_to_pcm(input, target_sr, None, 0.0, f64::MAX)?;
+
+    // AAC wants a standard rate; honour the request when it is one, and
+    // fall back to 48 kHz otherwise (hi-res sources included).
+    let out_sr = target_sr
+        .or(Some(decoded.sample_rate))
+        .filter(|&sr| tune_core::audio::aac_encoder::rate_supported(sr))
+        .unwrap_or(48000);
+    let samples = if out_sr != decoded.sample_rate {
+        tune_core::audio::resample::resample_i32(
+            &decoded.samples_i32,
+            decoded.bit_depth,
+            decoded.channels as u16,
+            decoded.sample_rate,
+            out_sr,
+        )
+    } else {
+        decoded.samples_i32.clone()
+    };
+
+    // System encoder input is i16.
+    let shift = decoded.bit_depth.saturating_sub(16);
+    let pcm16: Vec<i16> = samples
+        .iter()
+        .map(|&s| (s >> shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+        .collect();
+
+    let bitrate_kbps: u32 = quality.and_then(|q| q.parse().ok()).unwrap_or(256);
+    let bytes = tune_core::audio::aac_encoder::encode_aac_m4a(
+        &pcm16,
+        decoded.channels as u16,
+        out_sr,
+        bitrate_kbps * 1000,
+    )?;
+    std::fs::write(output, &bytes).map_err(|e| format!("failed to write {}: {e}", output.display()))
+}
+
+/// Encode to ALAC (.m4a) fully in-process (#1526): native decode → rubato
+/// if a target rate is asked → Apple's vendored encoder + native m4a mux.
+/// Replaces the ffmpeg subprocess — ALAC can no longer be missing.
+fn encode_alac_native(
+    input: &str,
+    output: &Path,
+    target_sr: Option<u32>,
+    target_bd: Option<u16>,
+) -> Result<(), String> {
+    let decoded = decode_to_pcm(input, target_sr, None, 0.0, f64::MAX)?;
+
+    let out_sr = target_sr.unwrap_or(decoded.sample_rate);
+    let samples = if out_sr != decoded.sample_rate {
+        tune_core::audio::resample::resample_i32(
+            &decoded.samples_i32,
+            decoded.bit_depth,
+            decoded.channels as u16,
+            decoded.sample_rate,
+            out_sr,
+        )
+    } else {
+        decoded.samples_i32.clone()
+    };
+
+    // ALAC takes 16/24/32-bit input; honour an explicit bit-depth request,
+    // and lift any other depth to the nearest supported one.
+    let out_bd = match target_bd.unwrap_or(decoded.bit_depth) {
+        d if d <= 16 => 16,
+        d if d <= 24 => 24,
+        _ => 32,
+    };
+    let samples = if out_bd != decoded.bit_depth {
+        shift_samples(&samples, decoded.bit_depth, out_bd)
+    } else {
+        samples
+    };
+
+    let bytes = tune_core::audio::alac_encoder::encode_alac_m4a(
+        &samples,
+        out_bd,
+        decoded.channels as u16,
+        out_sr,
+    )?;
+    std::fs::write(output, &bytes).map_err(|e| format!("failed to write {}: {e}", output.display()))
+}
+
+/// Re-scale i32 samples from one bit depth to another (values, not bytes —
+/// unlike `convert_bit_depth`, which packs bytes for the WAV/FLAC encoders).
+fn shift_samples(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<i32> {
+    if from_bd == to_bd {
+        return samples.to_vec();
+    }
+    if to_bd > from_bd {
+        let up = to_bd - from_bd;
+        samples.iter().map(|&s| s << up).collect()
+    } else {
+        let down = from_bd - to_bd;
+        samples.iter().map(|&s| s >> down).collect()
+    }
 }
 
 /// Encode to FLAC or WAV using the native Rust pipeline.
@@ -807,7 +921,6 @@ async fn encode_with_external(
     let result = match format {
         "mp3" => encode_mp3_external(tmp_wav_str, output_str, quality, target_sr).await,
         "aac" => encode_aac_external(tmp_wav_str, output_str, quality, target_sr).await,
-        "alac" => encode_alac_external(tmp_wav_str, output_str, target_sr).await,
         _ => Err(format!("unsupported external format: {format}")),
     };
 
@@ -919,32 +1032,6 @@ async fn encode_aac_external(
     }
 
     Err("aac encoding requires ffmpeg (bundled with the release or on PATH)".into())
-}
-
-async fn encode_alac_external(
-    input: &str,
-    output: &str,
-    target_sr: Option<u32>,
-) -> Result<(), String> {
-    if let Some(ffmpeg) = resolve_tool("ffmpeg") {
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "alac".into(),
-        ];
-
-        if let Some(sr) = target_sr {
-            args.push("-ar".into());
-            args.push(sr.to_string());
-        }
-
-        args.push(output.into());
-        return run_command(&ffmpeg, &args).await;
-    }
-
-    Err("alac encoding requires ffmpeg (bundled with the release or on PATH)".into())
 }
 
 // ---------------------------------------------------------------------------

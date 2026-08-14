@@ -103,6 +103,7 @@ objc2-core-audio = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -130,3 +131,16 @@ postgres = ["dep:sqlx"]
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
+
+[build-dependencies]
+cc = "1"
+
+# AAC natif Windows (#1527) : Media Foundation via le crate `windows` —
+# même version 0.62 que celle que cpal tire déjà, donc aucune compilation
+# dupliquée sur les cibles Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }

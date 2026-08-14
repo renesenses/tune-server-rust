@@ -136,8 +136,14 @@ jobs:
           if gh release download ffmpeg-minimal --repo "$GITHUB_REPOSITORY" \
                --pattern "ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
                --dir "$RUNNER_TEMP/ffbundle"; then
-            tar xzf "$RUNNER_TEMP/ffbundle/ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
-              -C "$RUNNER_TEMP/ffbundle"
+            # tar en chemin relatif : le tar GNU de Git-Bash lit « D: » d'un
+            # chemin Windows comme un hote distant (rsh) et echoue —
+            # « Cannot connect to D: resolve failed » (vecu v0.9.71). Le cd +
+            # chemin RELATIF suffit : plus de deux-points, aucun drapeau requis.
+            # Surtout pas --force-local : le bsdtar de macOS ne le connait pas
+            # et les DEUX jobs macOS sont tombes dessus en v0.9.72.
+            (cd "$RUNNER_TEMP/ffbundle" && \
+              tar -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
             ls -la "$RUNNER_TEMP/ffbundle"
           else
             echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
@@ -344,8 +350,26 @@ jobs:
           if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
 
           $targets = @("target\${{ matrix.target }}\release\tune-server.exe")
-          if (Test-Path "target\${{ matrix.target }}\release\airplay-daemon.exe") {
-            $targets += "target\${{ matrix.target }}\release\airplay-daemon.exe"
+          # airplay-daemon vit dans $RUNNER_TEMP\apd\bin (cargo install --root),
+          # JAMAIS dans target\release : l'ancien Test-Path ne matchait jamais
+          # et le daemon serait parti non signé. Signé en place, la copie vers
+          # le zip et l'installeur (toutes deux après cette étape) le propage.
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            $targets += "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe"
+          }
+          # ffmpeg minimal (#1524) : même motif — signé EN PLACE dans ffbundle,
+          # d'où le zip et l'installeur NSIS le copient tous deux APRÈS cette
+          # étape. Sans lui, tune-server.exe signé lancerait un ffmpeg.exe non
+          # signé — la même heuristique Defender que ce que corrige #1521.
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
+          }
+          # ffmpeg minimal (#1524) : signé EN PLACE dans ffbundle, d'où le zip
+          # et l'installeur NSIS le copient tous deux APRÈS cette étape. Sans
+          # lui, tune-server.exe signé lancerait un ffmpeg.exe non signé — la
+          # même heuristique Defender que ce que cette étape corrige (#1521).
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
           foreach ($t in $targets) {
@@ -525,7 +549,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          VERSION="${{ env.VERSION }}"
+          VERSION="${{ env.TUNE_VERSION }}"
           APP="Tune Server.app"
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources/web"
@@ -623,23 +647,65 @@ jobs:
             codesign --force --sign "$IDENTITY" "$DMG_NAME"
           fi
 
+      # Le .tar.gz macOS n'a RIEN à voir avec la notarisation : il n'est pas
+      # ouvert par Gatekeeper. Tant que l'envoi des artefacts venait après
+      # cette étape, un refus d'Apple l'emportait avec le DMG — v0.9.71, 401
+      # sur un mot de passe applicatif révoqué : quatre fichiers macOS perdus,
+      # dont deux sans aucune raison, et la catégorie macOS a disparu de la
+      # page de téléchargement.
+      #
+      # Un DMG non tamponné, lui, ne doit JAMAIS sortir : Gatekeeper le
+      # refuserait chez l'utilisateur, ce qui est pire qu'un fichier absent.
+      # On le supprime donc plutôt que de le publier à moitié, et l'étape
+      # échoue quand même — la préflight doit continuer de voir le défaut.
       - name: Notarize DMG (macOS)
         if: runner.os == 'macOS'
         env:
+          # Preferred path: App Store Connect API key (survives Apple ID
+          # account trouble — the password flow started returning 401s even
+          # after the account was rehabilitated). Falls back to the legacy
+          # Apple ID + app-specific password pair, then to skipping.
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "$APPLE_ID" ]; then echo "No Apple ID, skipping notarization"; exit 0; fi
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          xcrun notarytool submit "$DMG_NAME" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 600
+          notarize_failed() {
+            echo "::error::Notarisation refusée par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
+            rm -f "$DMG_NAME"
+            exit 1
+          }
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
+            # printf '%s' via the env var keeps the PEM newlines intact and
+            # avoids any shell interpretation of the key content.
+            printf '%s' "$ASC_API_KEY_P8" > "$KEY_FILE"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            xcrun notarytool submit "$DMG_NAME" \
+              --key "$KEY_FILE" \
+              --key-id "$ASC_API_KEY_ID" \
+              --issuer "$ASC_API_ISSUER_ID" \
+              --wait --timeout 600 || notarize_failed
+          elif [ -n "$APPLE_ID" ]; then
+            xcrun notarytool submit "$DMG_NAME" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 600 || notarize_failed
+          else
+            echo "No notarization credentials, skipping notarization"
+            exit 0
+          fi
           xcrun stapler staple "$DMG_NAME"
 
+      # `always()` : les artefacts déjà construits partent même si la
+      # notarisation a échoué. Le DMG a été supprimé juste au-dessus dans ce
+      # cas, donc seul ce qui est publiable monte.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ env.ARTIFACT }}
           path: |
@@ -647,6 +713,7 @@ jobs:
             ${{ env.ARTIFACT }}.dmg
             ${{ env.ARTIFACT }}-setup.exe
           retention-days: 1
+          if-no-files-found: warn
 
   release:
     name: Create Release
@@ -658,11 +725,56 @@ jobs:
         with:
           path: artifacts
 
+      # Les sommes sont calculées sur les artefacts DU RUN COURANT. Sur un
+      # re-run partiel, ce run n'a rejoué qu'une partie des jobs : les fichiers
+      # produits par un run antérieur ne sont pas dans `artifacts/` et
+      # disparaissaient donc du SHA256SUMS republié — écrasé par une version
+      # plus pauvre que la précédente.
+      #
+      # Vécu sur v0.9.71 (#1679) : macOS téléversé à 09:31 par un re-run des
+      # seuls jobs Apple, SHA256SUMS régénéré à 10:30 par un autre re-run
+      # partiel — 5 sommes pour 9 fichiers. Les quatre fichiers macOS étaient
+      # publiés mais invérifiables, faute de ligne à comparer.
+      #
+      # Le fichier ne doit donc JAMAIS rétrécir : on repart de celui déjà
+      # publié pour ce tag et on ne remplace que ce que ce run a réellement
+      # reconstruit. Le défaut ne se déclenchait que sur une release réparée en
+      # deux temps, c'est-à-dire quand quelque chose avait déjà mal tourné.
       - name: Checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS.run
           cd ..
+
+          # Le SHA256SUMS déjà publié, s'il existe (absent au premier run).
+          if gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+               --pattern SHA256SUMS --output SHA256SUMS.published 2>/dev/null; then
+            echo "SHA256SUMS déjà publié récupéré ($(wc -l < SHA256SUMS.published) entrées)"
+          else
+            : > SHA256SUMS.published
+            echo "aucun SHA256SUMS publié pour ${GITHUB_REF_NAME} — premier run"
+          fi
+
+          # Union, le run courant l'emportant : on repart des anciennes lignes
+          # dont le NOM DE FICHIER n'a pas été reconstruit par ce run, puis on
+          # ajoute tout ce que ce run a produit. Comparaison sur le basename :
+          # le chemin porte le nom du répertoire d'artefact, qui varie.
+          awk '{ n = $2; sub(/.*\//, "", n); print n }' SHA256SUMS.run | sort -u > .rebuilt
+          awk 'NR==FNR { rebuilt[$0]=1; next }
+               { n = $2; sub(/.*\//, "", n); if (!(n in rebuilt)) print }' \
+              .rebuilt SHA256SUMS.published > SHA256SUMS.kept
+          cat SHA256SUMS.kept SHA256SUMS.run | sort -k2 > SHA256SUMS
+          rm -f SHA256SUMS.run SHA256SUMS.published SHA256SUMS.kept .rebuilt
+
+          # Garde-fou : republier moins que ce qui existait est toujours une
+          # régression, quelle qu'en soit la cause.
+          before=$(gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+                     --json assets --jq '[.assets[].name | select(test("SHA256SUMS")|not)] | length' 2>/dev/null || echo 0)
+          echo "--- SHA256SUMS republié : $(wc -l < SHA256SUMS) entrées (release : ${before} assets binaires) ---"
+          cat SHA256SUMS
 
       # Sign SHA256SUMS with minisign so the self-update client can verify the
       # release cryptographically (audit item 8). No-ops until MINISIGN_SECRET_KEY
@@ -688,8 +800,22 @@ jobs:
           rm -f minisign.key
           echo "Signed SHA256SUMS -> SHA256SUMS.minisig"
 
+      # `draft: true` — la release naît INVISIBLE des clients.
+      #
+      # Ce job porte `if: always()`, donc il tourne aussi quand des builds ont
+      # échoué : c'est voulu (on veut les artefacts partiels et les journaux),
+      # mais jusqu'ici il publiait ce demi-résultat au monde entier. v0.9.71 :
+      # release visible à 19:15 avec 7 assets sur 13, run terminé en échec le
+      # lendemain à 07:45 — douze heures pendant lesquelles le client de mise à
+      # jour de Jean Valjean a cherché un SHA256SUMS incomplet, et pendant
+      # lesquelles on lui a répondu que son réseau était en cause (#1588).
+      #
+      # La bascule en public est faite par le job `publish`, tout en bas, une
+      # fois TOUT déposé — image Tune OS comprise, elle qui s'attachait
+      # jusqu'ici à une release déjà visible.
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
@@ -728,9 +854,52 @@ jobs:
       version: ${{ github.ref_name }}
       attach_to_release: true
 
+  # ─── La bascule en public ──────────────────────────────────────────────
+  #
+  # Seul endroit du workflow qui rend une release visible des clients. Elle
+  # ne s'ouvre que si TOUT a abouti : les binaires (`build`), leur dépôt et
+  # leurs sommes de contrôle (`release`), et l'image appliance
+  # (`tune-os-image`), qui s'attachait jusqu'ici à une release déjà publique.
+  #
+  # `always()` est nécessaire pour que le job s'évalue malgré un `needs`
+  # SAUTÉ — une RC n'a pas d'image Tune OS, et sans ça la release resterait
+  # en brouillon pour toujours. Les conditions qui suivent font le tri : un
+  # `skipped` est acceptable, un `failure` ne l'est pas.
+  #
+  # Les identifiants de job à tiret ne peuvent pas s'écrire `needs.tune-os-image`
+  # dans une expression — le tiret y serait lu comme une soustraction. D'où
+  # la notation entre crochets.
+  publish:
+    name: Publish release (drop the draft)
+    needs: [build, release, tune-os-image]
+    if: >-
+      always()
+      && needs.build.result == 'success'
+      && needs.release.result == 'success'
+      && (needs['tune-os-image'].result == 'success' || needs['tune-os-image'].result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Vérifier que la release est complète, puis la publier
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Ce qui est publié doit être vérifiable : SHA256SUMS est la
+          # sentinelle que le client de mise à jour va chercher en premier.
+          # S'il manque, ne rien montrer plutôt que montrer un demi-état.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS'; then
+            echo "::error::SHA256SUMS absent de $TAG — la release reste en brouillon."
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Release $TAG publiée."
+
   homebrew:
     name: Update Homebrew tap
-    needs: release
+    needs: publish
     # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
     # or `brew upgrade` would move stable users onto an RC.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -765,6 +934,18 @@ jobs:
           # Update version string and caveats
           sed -i "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
           sed -i "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
+
+          # Garantir le caveat de redémarrage après mise à jour (vécu v0.9.71 :
+          # binaire upgradé mais ancien processus toujours en mémoire → « la
+          # MAJ ne marche pas »). Le job ne fait que des sed ciblés, donc la
+          # ligne posée sur le tap survit normalement — cette étape la répare
+          # si la formule est un jour recréée sans elle. Idempotent.
+          if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+            perl -0pi -e 's/(      Background service: brew services start tune-server\n)/$1\n      Après une mise à jour, redémarrez le serveur :\n      brew services restart tune-server (ou relancez tune-server-launcher).\n/' "$F"
+            if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+              echo "::warning::Caveat de redémarrage introuvable et point d'ancrage absent — à reporter à la main dans le tap"
+            fi
+          fi
 
           # Update all download URLs — use regex to catch ANY old version, not just OLD_VERSION
           # This handles cases where the formula has stale versions from failed previous updates
@@ -817,7 +998,10 @@ jobs:
 
   notify-website:
     name: Update mozaiklabs.fr/download
-    needs: [release, homebrew]
+    # `publish` et non `release` : la page de téléchargement ne doit annoncer
+    # qu'une release réellement publique et complète. Le webhook exige ≥3
+    # assets, mais rien ne lui disait jusqu'ici que la liste était finie.
+    needs: [publish, homebrew]
     # Stable tags only — a pre-release must not update the public download page.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest

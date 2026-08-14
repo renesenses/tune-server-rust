@@ -1,6 +1,6 @@
 {
   "productName": "Tune Widget",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "identifier": "fr.mozaiklabs.tune-widget",
   "build": {
     "frontendDist": "../src"

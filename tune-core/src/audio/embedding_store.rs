@@ -21,7 +21,13 @@ pub const EMBED_DIM: usize = 512;
 /// music-specialised checkpoint. It replaces the generalist `clap-audio-2023`
 /// (`630k-audioset`, HTSAT-tiny) and shares its joint space with the CLAP text
 /// tower, enabling natural-language acoustic search (Phase 3).
-pub const MODEL_ID: &str = "clap-music-2023";
+// Le suffixe `-pcm2` n'est pas un nouveau modèle : c'est la VERSION DU
+// PIPELINE d'entrée. Les vecteurs produits avant #1508+#1498 l'ont été sur du
+// stéréo entrelacé à la cadence source présenté comme du mono 48 kHz — ils ne
+// vivent pas dans le même espace que les vecteurs corrects. Changer cette
+// chaîne invalide la sentinelle `audio_embed_analyzed` et fait ré-analyser la
+// bibliothèque une fois, proprement.
+pub const MODEL_ID: &str = "clap-music-2023-pcm2";
 
 /// Pack a normalised embedding into the `BLOB`/`BYTEA` column (little-endian f32).
 pub fn to_bytes(embedding: &[f32]) -> Vec<u8> {

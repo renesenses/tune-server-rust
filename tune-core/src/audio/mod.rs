@@ -1,4 +1,6 @@
+pub mod aac_encoder;
 pub mod aiff;
+pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
@@ -21,6 +23,7 @@ pub mod faststart;
 pub mod formats;
 pub mod iso_sacd;
 pub mod levels;
+pub mod m4a;
 pub mod mixer;
 pub mod opus_ogg;
 pub mod pipeline;
@@ -33,6 +36,7 @@ pub mod tap;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
+pub mod thermal;
 pub mod wav;
 pub mod wavpack;
 

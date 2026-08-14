@@ -42,6 +42,18 @@ struct RenameZone {
     name: String,
 }
 
+/// Rend un `null` JSON distinguable d'un champ absent : `Deserialize` n'est
+/// appelé que si le champ est PRÉSENT (le `default` couvre l'absence), donc
+/// envelopper son résultat dans `Some` donne `Some(None)` pour `null` et
+/// `Some(Some(v))` pour une valeur.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
 #[derive(Deserialize)]
 struct PatchZone {
     name: Option<String>,
@@ -52,6 +64,14 @@ struct PatchZone {
     gapless_enabled: Option<bool>,
     sync_delay_ms: Option<i32>,
     /// Max output sample rate in Hz (e.g. 96000, 88200). null = no limit (passthrough).
+    ///
+    /// `Option<Option<_>>` seul ne suffit PAS : serde désérialise un `null`
+    /// explicite en `None` extérieur, indistinguable d'un champ absent — le
+    /// handler ne voyait donc jamais la demande d'effacement, et « Aucune »
+    /// dans l'UI n'a jamais été enregistrable (Cyrille, forum 1320). Le
+    /// désérialiseur dédié rétablit les trois états : champ absent → `None`,
+    /// `null` → `Some(None)` (effacer), valeur → `Some(Some(v))`.
+    #[serde(default, deserialize_with = "double_option")]
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
@@ -689,6 +709,48 @@ fn zone_eq_alters_signal(
     tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2).is_enabled()
 }
 
+/// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
+///
+/// Miroir de `Orchestrator::zone_replaygain_changes_audio`, pour la même
+/// raison que `zone_eq_alters_signal` : sans lui, le panneau annoncerait
+/// « Bit-Perfect » pendant qu'un gain multiplie chaque échantillon (même
+/// famille d'écart que l'EQ ignoré du verdict, #1548/#1559 — ici #1627).
+/// Mode PURE d'abord : le gain n'y est jamais appliqué, donc jamais d'étape.
+/// Ensuite le facteur EFFECTIF (tags + pré-ampli + anti-écrêtage) : un mode
+/// « track » sans tag stocké ne change rien au signal et n'affiche donc rien.
+///
+/// Retourne la description de l'étape (« ReplayGain (track, -4.2 dB) ») quand
+/// le gain s'applique, `None` sinon. La granularité affichée est celle qui a
+/// FOURNI la valeur : en mode album sans tags d'album, c'est le gain de piste
+/// qui joue, et c'est lui qu'on nomme.
+fn zone_replaygain_step(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    track_id: Option<i64>,
+) -> Option<String> {
+    use tune_core::audio::replaygain::{ReplayGainSettings, gain_factor, stored_gain_detail};
+    // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return None;
+    }
+    let tid = track_id?;
+    let settings = ReplayGainSettings::load(backend);
+    let (gain, source) = stored_gain_detail(backend, tid, settings.mode)?;
+    let factor = gain_factor(gain, settings);
+    // Même seuil que l'orchestrateur (`zone_replaygain_changes_audio`).
+    if (factor - 1.0).abs() <= 1e-6 {
+        return None;
+    }
+    // Le dB affiché est celui qui multiplie réellement les échantillons
+    // (pré-ampli et anti-écrêtage compris), pas le tag brut.
+    let applied_db = 20.0 * factor.log10();
+    let label = match source {
+        tune_core::audio::replaygain::ReplayGainMode::Album => "album",
+        _ => "track",
+    };
+    Some(format!("ReplayGain ({label}, {applied_db:+.1} dB)"))
+}
+
 fn wav_wire_bit_perfect(
     is_lossless: bool,
     source_is_wav: bool,
@@ -837,6 +899,11 @@ fn build_signal_path(
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
         .unwrap_or(false)
         || zone_eq_alters_signal(&backend, zid);
+
+    // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
+    // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
+    // en tient compte. `None` en PURE, en mode off, ou sans gain stocké.
+    let replaygain_step = zone_replaygain_step(&backend, zid, np.track_id);
 
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
@@ -1022,9 +1089,16 @@ fn build_signal_path(
             .max_sample_rate
             .is_some_and(|max| (sample_rate as u32) > max);
 
-    // Overall bit-perfect: lossless source + no transcoding + no DSP + no resampling.
-    // Volume is excluded — it's a user preference, not a signal degradation.
-    let bit_perfect = is_lossless && transport_bit_perfect && !dsp_enabled && !resampling_active;
+    // Overall bit-perfect: lossless source + no transcoding + no DSP + no
+    // resampling + no ReplayGain. Volume is excluded — it's a user preference,
+    // not a signal degradation. ReplayGain, lui, multiplie chaque échantillon :
+    // l'orchestrateur le traite déjà comme l'EQ (`zone_replaygain_changes_audio`
+    // force le chemin transcodé), le verdict doit dire la même chose (#1627).
+    let bit_perfect = is_lossless
+        && transport_bit_perfect
+        && !dsp_enabled
+        && !resampling_active
+        && replaygain_step.is_none();
 
     // Build steps
     let source_desc = if is_dsd {
@@ -1126,6 +1200,18 @@ fn build_signal_path(
         steps.push(json!({
             "name": "Resampler",
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
+            "bit_perfect": false,
+        }));
+    }
+
+    // ReplayGain step — placé avant Volume/DSP, comme dans le chemin réel
+    // (le gain est appliqué avant l'égaliseur, orchestrator.rs). Jamais en
+    // PURE, jamais en mode off, jamais sans gain stocké : l'étape n'existe
+    // que quand un facteur ≠ 1 multiplie réellement les échantillons.
+    if let Some(desc) = &replaygain_step {
+        steps.push(json!({
+            "name": "ReplayGain",
+            "description": desc,
             "bit_perfect": false,
         }));
     }
@@ -1284,6 +1370,19 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_play_delay_ms".into(),
                 json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
             );
+            // `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL
+            // de `ZoneRepo` (migration v36 pouvant echouer en silence sous
+            // Windows), donc `row_to_zone` le met a `false` sans exception —
+            // et la serialisation de la zone propageait ce faux jusqu'au
+            // client. Le bouton AutoPlay retombait donc a chaque
+            // resynchronisation, alors que le reglage etait bien en base et
+            // correctement lu par le poller (Sandro, 0.9.70). On lit la vraie
+            // valeur par l'accesseur prevu pour ca, comme les autres reglages
+            // de zone ci-dessus.
+            obj.insert(
+                "autoplay_enabled".into(),
+                json!(zone_repo.get_autoplay_enabled(zone_id)),
+            );
             let detected_dev = z
                 .output_device_id
                 .as_deref()
@@ -1408,6 +1507,12 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "dlna_play_delay_ms".into(),
                     json!(repo.get_dlna_play_delay_ms(id)),
+                );
+                // Meme correction que dans la liste : la valeur serialisee
+                // depuis la struct vaut toujours `false`.
+                obj.insert(
+                    "autoplay_enabled".into(),
+                    json!(repo.get_autoplay_enabled(id)),
                 );
                 let detected_dev = zone
                     .output_device_id
@@ -2926,6 +3031,210 @@ mod signal_path_tests {
     fn wav_wire_lossy_source_never_bit_perfect() {
         assert!(!wav_wire_bit_perfect(false, true, true, 16));
     }
+
+    // ------------------------------------------------------------------
+    // ReplayGain dans le chemin du signal (#1627). Miroir de
+    // `Orchestrator::zone_replaygain_changes_audio` : le panneau ne doit pas
+    // annoncer « Bit-Perfect » pendant qu'un gain multiplie chaque
+    // échantillon — même famille d'écart que l'EQ ignoré du verdict
+    // (#1548/#1559, signalement Bilou).
+
+    /// Comme `dlna_zone()`, mais avec les migrations appliquées : les tags
+    /// ReplayGain vivent dans `track_metadata`, table créée par la migration 34
+    /// et NON par `init_schema()`. Sans elle, la lecture du gain échoue et le
+    /// test « pas d'étape » passerait pour la mauvaise raison.
+    fn dlna_zone_migrated() -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    /// Une piste FLAC en base, taguée `rg_track_gain` (et rien d'autre), et
+    /// l'état de lecture qui la joue. Le fil sert du FLAC : sans ReplayGain ce
+    /// chemin est un passthrough bit-perfect — le contraste que les tests
+    /// veulent.
+    fn flac_track_with_rg_tag(backend: &Arc<dyn DbBackend>, gain_tag: &str) -> (i64, ZoneState) {
+        let mut t = tune_core::db::models::Track::new("Piste".into());
+        t.format = Some("flac".into());
+        t.sample_rate = Some(96_000);
+        t.bit_depth = Some(24);
+        let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+            .set(tid, "rg_track_gain", gain_tag)
+            .unwrap();
+        let np = NowPlaying {
+            title: "Piste".into(),
+            track_id: Some(tid),
+            format: Some("flac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+        (tid, ps)
+    }
+
+    // RG actif (mode track, tag -4.2 dB) → étape présente avec le gain
+    // appliqué, et le verdict bit-perfect tombe — alors que le même chemin
+    // sans RG est un passthrough FLAC bit-perfect.
+    #[test]
+    fn replaygain_active_shows_step_and_breaks_bit_perfect() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "ReplayGain").as_deref(),
+            Some("ReplayGain (track, -4.2 dB)")
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+        // Le RG ne rend pas la SOURCE lossy : le badge qualité reste vert.
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // RG off (défaut) : la même piste taguée n'affiche rien et reste
+    // bit-perfect — le réglage, pas le tag, décide.
+    #[test]
+    fn replaygain_off_shows_nothing_and_stays_bit_perfect() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Mode track SANS tag stocké : gain effectif = 1, donc rien — l'étape
+    // suit le facteur réellement appliqué, pas le réglage (miroir du seuil
+    // de `zone_replaygain_changes_audio`).
+    #[test]
+    fn replaygain_mode_on_without_stored_gain_shows_nothing() {
+        let (backend, zone) = dlna_zone_migrated();
+        let mut t = tune_core::db::models::Track::new("Piste".into());
+        t.format = Some("flac".into());
+        let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+        let np = NowPlaying {
+            title: "Piste".into(),
+            track_id: Some(tid),
+            format: Some("flac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // PURE : le gain n'est jamais appliqué (orchestrator.rs, sortie locale et
+    // chemin transcodé), donc jamais d'étape — quel que soit le réglage.
+    #[test]
+    fn replaygain_never_shown_in_pure_mode() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+        settings
+            .set(
+                &format!("zone_{}_audiophile", zone.id.unwrap()),
+                r#"{"enabled":true}"#,
+            )
+            .unwrap();
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Mode album sur une piste qui n'a que le tag de piste : c'est le gain de
+    // piste qui s'applique (repli de `stored_gain_detail`), et l'étape doit
+    // nommer ce qui joue vraiment — « track », pas le réglage « album ».
+    #[test]
+    fn replaygain_album_mode_falls_back_to_track_and_says_so() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "album")
+            .unwrap();
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "ReplayGain").as_deref(),
+            Some("ReplayGain (track, -4.2 dB)")
+        );
+    }
 }
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
@@ -3035,5 +3344,38 @@ mod output_reach_tests {
             ..Default::default()
         };
         assert_eq!(output_reach_of(&zone, &ps, false), "ok");
+    }
+}
+
+#[cfg(test)]
+mod patch_zone_deserialize_tests {
+    use super::PatchZone;
+
+    // #1320 (Cyrille) — « Aucune » ne persistait jamais : un `null` explicite
+    // sur `max_sample_rate` se désérialisait en `None` extérieur, donc le
+    // handler le confondait avec un champ absent et n'effaçait rien. Ces
+    // trois états sont le contrat du PATCH ; le premier test échoue contre
+    // le code d'avant (sans `deserialize_with = "double_option"`).
+
+    #[test]
+    fn explicit_null_means_clear_the_cap() {
+        let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": null}"#).unwrap();
+        assert_eq!(
+            p.max_sample_rate,
+            Some(None),
+            "un null explicite doit demander l'effacement, pas être ignoré"
+        );
+    }
+
+    #[test]
+    fn absent_field_means_leave_untouched() {
+        let p: PatchZone = serde_json::from_str(r#"{"name": "Salon"}"#).unwrap();
+        assert_eq!(p.max_sample_rate, None);
+    }
+
+    #[test]
+    fn value_means_set_the_cap() {
+        let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": 705600}"#).unwrap();
+        assert_eq!(p.max_sample_rate, Some(Some(705_600)));
     }
 }

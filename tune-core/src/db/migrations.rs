@@ -916,6 +916,75 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutno
         name: "merge_scattered_compilations",
         up: "SELECT 1;",
     },
+    // Corrections que la communauté propose sur les métadonnées de cet
+    // instance. Elles arrivent du cloud et attendent la validation de
+    // l'utilisateur : `decision` NULL = en attente.
+    //
+    // Local d'abord, comme les signalements : la ligne est ce qui fait foi, et
+    // le renvoi de la décision au cloud est un effet de bord au-dessus. Une
+    // décision prise hors ligne n'est pas perdue, elle repart au cycle suivant.
+    Migration {
+        version: 74,
+        name: "add_metadata_proposals_table",
+        up: "
+CREATE TABLE IF NOT EXISTS metadata_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity TEXT NOT NULL,
+    cloud_entity_id INTEGER NOT NULL,
+    local_id INTEGER NOT NULL,
+    title TEXT,
+    artist TEXT,
+    field TEXT NOT NULL,
+    current_value TEXT,
+    proposed_value TEXT,
+    servers_count INTEGER NOT NULL DEFAULT 0,
+    fetched_at TEXT NOT NULL,
+    decision TEXT,
+    decided_at TEXT,
+    pushed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_proposals_key
+    ON metadata_proposals(entity, cloud_entity_id, field);
+CREATE INDEX IF NOT EXISTS idx_metadata_proposals_pending
+    ON metadata_proposals(decision, servers_count);
+",
+    },
+    Migration {
+        version: 75,
+        name: "dsd_replaygain_rescale",
+        up: "
+-- #1638 : le decimateur DSD->PCM applique desormais l'echelle SACD (+6 dB).
+-- Les ReplayGain calcules par NOTRE analyse sur l'ancienne echelle sont faux
+-- de ~6 dB : on les efface pour que le sweep les recalcule. Portee stricte :
+-- 1) les pistes DSD passees par l'analyse (sentinelle rg_analyzed) — les RG
+--    venus des TAGS du fichier (pas de sentinelle) sont preserves ;
+-- 2) les cles d'ALBUM de tout album contenant une telle piste (le gain
+--    d'album mele les LUFS de toutes les pistes) — sans toucher aux gains de
+--    PISTE des voisines PCM.
+DELETE FROM track_metadata
+WHERE key IN ('rg_analyzed','rg_track_gain','rg_track_peak','rg_album_gain','rg_album_peak','rg_skipped_oversized')
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    JOIN track_metadata m ON m.track_id = t.id AND m.key = 'rg_analyzed'
+    WHERE lower(COALESCE(t.format,'')) IN ('dsd','dsf','dff','dsdiff')
+       OR lower(t.file_path) LIKE '%.dsf'
+       OR lower(t.file_path) LIKE '%.dff'
+  );
+
+DELETE FROM track_metadata
+WHERE key IN ('rg_album_gain','rg_album_peak')
+  AND track_id IN (
+    SELECT t2.id FROM tracks t2
+    WHERE t2.album_id IS NOT NULL AND t2.album_id IN (
+      SELECT t.album_id FROM tracks t
+      WHERE (lower(COALESCE(t.format,'')) IN ('dsd','dsf','dff','dsdiff')
+          OR lower(t.file_path) LIKE '%.dsf'
+          OR lower(t.file_path) LIKE '%.dff')
+        AND t.album_id IS NOT NULL
+    )
+  );
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2089,6 +2158,16 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "zone_lyrics_offset",
         include_str!("../../migrations/postgres/022_zone_lyrics_offset.sql"),
     ),
+    (
+        23,
+        "metadata_proposals",
+        include_str!("../../migrations/postgres/023_metadata_proposals.sql"),
+    ),
+    (
+        24,
+        "dsd_replaygain_rescale",
+        include_str!("../../migrations/postgres/024_dsd_replaygain_rescale.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -2536,7 +2615,12 @@ mod tests {
                 "PG_MIGRATIONS must be contiguous and 1-based"
             );
         }
-        assert_eq!(pg_latest_version(), 22, "latest PG migration must be 22");
+        // Ce nombre se met a jour A LA MAIN, et c'est voulu : il oblige a
+        // constater qu'une migration PG a ete ajoutee. Ajouter le fichier SQL
+        // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
+        // qui est le seul a executer ce test — la feature `postgres` n'est pas
+        // dans le jeu par defaut.
+        assert_eq!(pg_latest_version(), 24, "latest PG migration must be 24");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
