@@ -768,6 +768,111 @@ pub async fn register_local_outputs(state: &AppState) {
     }
 }
 
+/// Remonte les partages reseau enregistres, avant que quoi que ce soit ne lise
+/// la bibliotheque.
+///
+/// Rien ne les remontait au demarrage. Consequence chez Dominique Comet
+/// (#1692) : apres chaque redemarrage son partage SMB n'etait plus monte, le
+/// repertoire configure existait mais vide, le scan annoncait « 0 fichier », et
+/// il devait re-saisir son partage ET ses identifiants pour retrouver sa
+/// musique.
+///
+/// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
+/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
+/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
+/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
+/// que le serveur ne remplit jamais.
+///
+/// Chaque montage est independant : un partage injoignable est journalise et
+/// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
+/// Tune de servir ce qui est local.
+pub async fn remount_network_shares(state: &AppState) {
+    let rows = match state.backend.query_many(
+        "SELECT server, share, mount_path, username, password \
+         FROM network_mounts WHERE mount_type = 'smb' AND COALESCE(active, 1) = 1",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "remount_network_shares_query_failed");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    info!(count = rows.len(), "remounting_network_shares");
+    for r in rows {
+        let host = r.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let share = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+        let path = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+        if host.is_empty() || share.is_empty() || path.is_empty() {
+            continue;
+        }
+        // Deja monte (redemarrage du seul service, systeme reste debout) :
+        // ne pas empiler un second montage sur le meme point.
+        if std::path::Path::new(&path)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+        {
+            tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_populated_skipping");
+            continue;
+        }
+        let user = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
+        let pass = r.get(4).and_then(|v| v.as_string()).unwrap_or_default();
+
+        // Meme commande que la route de montage — volontairement recopiee
+        // plutot que factorisee : la route rend des erreurs HTTP detaillees a
+        // un humain qui attend, celle-ci journalise et passe au suivant. Les
+        // fusionner obligerait a inventer une abstraction pour deux appelants
+        // aux contrats opposes.
+        let result = if cfg!(target_os = "macos") {
+            let creds = if user.is_empty() {
+                "guest@".to_string()
+            } else if pass.is_empty() {
+                format!("{user}@")
+            } else {
+                format!("{user}:{pass}@")
+            };
+            let unc = format!("//{creds}{host}/{share}");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                tokio::process::Command::new("mount_smbfs")
+                    .args([&unc, &path])
+                    .output(),
+            )
+            .await
+        } else {
+            let u = if user.is_empty() { "guest" } else { &user };
+            let unc = format!("//{host}/{share}");
+            let opts = format!("username={u},password={pass},vers=3.0");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                tokio::process::Command::new("mount.cifs")
+                    .args([&unc, &path, "-o", &opts])
+                    .output(),
+            )
+            .await
+        };
+
+        match result {
+            Ok(Ok(out)) if out.status.success() => {
+                info!(host = %host, share = %share, path = %path, "network_share_remounted")
+            }
+            Ok(Ok(out)) => warn!(
+                host = %host, share = %share,
+                error = %String::from_utf8_lossy(&out.stderr).trim(),
+                "network_share_remount_failed"
+            ),
+            Ok(Err(e)) => {
+                warn!(host = %host, share = %share, error = %e, "network_share_remount_failed")
+            }
+            Err(_) => warn!(host = %host, share = %share, "network_share_remount_timeout"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod restore_zone_volumes_tests {
     use super::*;
