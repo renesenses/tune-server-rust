@@ -32,6 +32,30 @@ struct RadioConsumerGuard {
     superseded: bool,
 }
 
+/// Does this renderer need the `0xFFFF_FFFF` indeterminate-length WAV header
+/// for a live radio stream?
+///
+/// The indeterminate marker is a **libavformat-specific accommodation**, not a
+/// universal improvement. Before v0.9.11 every renderer received the finite
+/// "unknown length" (~2 GiB) size; only a `Lavf` renderer misbehaved with it,
+/// treating the transcoded radio as a bounded PCM file, filling its ~64 MiB
+/// read-ahead cache and stopping after ~6 minutes (FIP, .15, commit 3d5a3a8f).
+/// `0xFFFF_FFFF` fixed that — and broke renderers that read the `data` size
+/// into a SIGNED 32-bit integer, where it becomes -1: nothing left to read, so
+/// they never start (Yves, LHC-53 `player/100`, #1689).
+///
+/// The two requirements are contradictory — no single size means "unbounded" to
+/// Lavf *and* "huge" to a naive parser — so the size follows the renderer. An
+/// absent or unreadable User-Agent keeps the current behaviour: we only change
+/// what we send to a renderer that positively identifies itself as something
+/// other than Lavf.
+fn wants_indeterminate_wav_length(user_agent: Option<&str>) -> bool {
+    match user_agent {
+        Some(ua) if !ua.is_empty() => ua.to_ascii_lowercase().contains("lavf"),
+        _ => true,
+    }
+}
+
 impl RadioConsumerGuard {
     fn new(session: std::sync::Arc<StreamSession>) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
@@ -173,14 +197,17 @@ pub async fn handle_stream(
         .get("Range")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
+    // Possédé, pas emprunté : le corps du flux en a besoin après la réponse,
+    // et c'est lui qui décide de la taille annoncée dans l'en-tête WAV d'une
+    // radio (voir wants_indeterminate_wav_length).
     let user_agent = req_headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+        .map(|s| s.to_string());
     info!(
         stream_id,
         range = range_hdr,
-        agent = user_agent,
+        agent = user_agent.as_deref().unwrap_or("-"),
         format = %session.info.format,
         "stream_request"
     );
@@ -284,11 +311,14 @@ pub async fn handle_stream(
         .wav_header_included
         .load(std::sync::atomic::Ordering::Relaxed);
     let data_ready = session.data_ready.clone();
+    let indeterminate_wav = wants_indeterminate_wav_length(user_agent.as_deref());
     let body = Body::from_stream(async_stream::stream! {
         if is_wav && !wav_header_included {
-            // Live radio is infinite — emit the streaming (0xFFFF_FFFF)
-            // indeterminate-length WAV header so a Lavf renderer keeps reading
-            // until the connection closes. Finite tracks keep the sized header.
+            // Live radio is infinite. A Lavf renderer needs the 0xFFFF_FFFF
+            // indeterminate-length header to keep reading until the connection
+            // closes; every other renderer gets the finite "unknown length"
+            // size it ran on before v0.9.11 (#1689). Finite tracks keep the
+            // sized header.
             let hdr = if is_radio {
                 // Wait until the decoder has probed the upstream so the header
                 // advertises the TRUE sample rate/channels (FIP is 48000, not
@@ -306,7 +336,11 @@ pub async fn handle_stream(
                 let det_ch = session.detected_channels.load(Relaxed);
                 let real_sr = if det_sr != 0 { det_sr } else { sr };
                 let real_ch = if det_ch != 0 { det_ch } else { ch };
-                build_wav_header_streaming(real_ch, real_sr, bd)
+                if indeterminate_wav {
+                    build_wav_header_streaming(real_ch, real_sr, bd)
+                } else {
+                    build_wav_header(real_ch, real_sr, bd, None)
+                }
             } else {
                 build_wav_header(ch, sr, bd, dur_ms)
             };
@@ -1026,7 +1060,56 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range_start;
+    use super::{parse_range_start, wants_indeterminate_wav_length};
+    use tune_core::http::streamer::{build_wav_header, build_wav_header_streaming};
+
+    #[test]
+    fn lavf_renderers_keep_the_indeterminate_wav_length() {
+        // The Eversolo DMP-A10/A8 and every other libavformat renderer: without
+        // 0xFFFF_FFFF they treat the radio as a bounded file and cut every ~6
+        // minutes (FIP, .15, commit 3d5a3a8f).
+        assert!(wants_indeterminate_wav_length(Some("Lavf/58.45.100")));
+        assert!(wants_indeterminate_wav_length(Some("lavf/60.3.100")));
+        assert!(wants_indeterminate_wav_length(Some(
+            "SomeRenderer (Lavf/59.27.100)"
+        )));
+    }
+
+    #[test]
+    fn other_renderers_get_the_finite_wav_length() {
+        // Yves' LHC-53 (#1689). It reads the `data` size into a signed 32-bit
+        // integer, so 0xFFFF_FFFF becomes -1 — nothing left to read, and it
+        // drops the connection without ever starting.
+        assert!(!wants_indeterminate_wav_length(Some("player/100")));
+        assert!(!wants_indeterminate_wav_length(Some("Sonos/84.1-56110")));
+    }
+
+    #[test]
+    fn unknown_user_agent_keeps_current_behaviour() {
+        // Blast radius: only a renderer that positively identifies itself as
+        // something other than Lavf sees a different header.
+        assert!(wants_indeterminate_wav_length(None));
+        assert!(wants_indeterminate_wav_length(Some("")));
+    }
+
+    #[test]
+    fn finite_radio_header_stays_positive_as_a_signed_int() {
+        // The whole point of the fix: both sizes a non-Lavf renderer reads must
+        // be positive when parsed as i32.
+        let h = build_wav_header(2, 44100, 16, None);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert!(data_size as i32 > 0, "data size must be a positive i32");
+        assert!(riff_size as i32 > 0, "RIFF size must be a positive i32");
+        // …and the format fields still describe the real stream.
+        assert_eq!(u32::from_le_bytes([h[24], h[25], h[26], h[27]]), 44100);
+        assert_eq!(u16::from_le_bytes([h[22], h[23]]), 2);
+
+        // The Lavf header is exactly the one that goes negative — that is why
+        // it cannot be served to everyone.
+        let l = build_wav_header_streaming(2, 44100, 16);
+        assert_eq!(u32::from_le_bytes([l[40], l[41], l[42], l[43]]) as i32, -1);
+    }
 
     #[test]
     fn parse_range_start_cases() {
