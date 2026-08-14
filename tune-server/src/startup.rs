@@ -595,11 +595,14 @@ async fn resolve_ytdlp(state: &AppState) {
     }
 }
 
-/// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
-#[cfg(feature = "local-audio")]
 /// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
 /// base dit de sa zone. Une zone « Volume fixe (bit-perfect) » reste à pleine
 /// échelle — c'est son contrat, le DoP ne survit pas à une multiplication.
+///
+/// Volontairement HORS du gate `local-audio` : c'est de l'arithmétique, sans
+/// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
+/// fonctionnalités.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
 fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
     if fixed_volume {
         1.0
@@ -608,6 +611,8 @@ fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
     }
 }
 
+/// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
+#[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
     let audio_backend_owned = state.effective_audio_backend();
