@@ -363,6 +363,41 @@ impl EqProcessor {
         }
     }
 
+    /// Process an **interleaved f32** buffer (`[L0, R0, L1, R1, …]`, normalised
+    /// to -1..1) in place.
+    ///
+    /// Same cascade, same per-channel state and same soft-clip as
+    /// [`Self::process_pcm`] — only the sample representation differs. The
+    /// local output (`outputs/local.rs`) already holds its audio as f32 for
+    /// cpal and runs its convolver / crossfeed on that buffer; going through
+    /// the byte-oriented `process_pcm` there would mean packing to PCM and back
+    /// on every chunk, in the audio hot path.
+    ///
+    /// A buffer that is not a whole number of frames is left untouched rather
+    /// than processed half-way: a partial frame would advance the per-channel
+    /// filter states out of step and every later chunk would be filtered with
+    /// the wrong channel's history.
+    pub fn process_interleaved(&mut self, samples: &mut [f32]) {
+        if !self.enabled || samples.is_empty() || self.channels == 0 {
+            return;
+        }
+        let ch_count = self.channels as usize;
+        if samples.len() % ch_count != 0 {
+            return;
+        }
+
+        for frame in samples.chunks_exact_mut(ch_count) {
+            for (ch, sample) in frame.iter_mut().enumerate() {
+                let state = &mut self.states[ch];
+                let mut s = *sample as f64;
+                for (stage, coeffs) in state.iter_mut().zip(self.filters.iter()) {
+                    s = stage.process(coeffs, s);
+                }
+                *sample = soft_clip(s) as f32;
+            }
+        }
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -555,5 +590,132 @@ mod tests {
     fn soft_clip_limits_overs() {
         assert!(soft_clip(1.5) < 1.0);
         assert!(soft_clip(-1.5) > -1.0);
+    }
+
+    /// Profil de test : -12 dB de plateau aigu à 2 kHz, stéréo.
+    fn shelf_profile() -> EqProfile {
+        EqProfile {
+            enabled: true,
+            bands: vec![EqBandSpec {
+                freq: 2000.0,
+                gain: -12.0,
+                q: 0.71,
+                band_type: "high_shelf".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Sinus stéréo entrelacé, en f32 et en PCM 32 bits, échantillon pour
+    /// échantillon.
+    fn stereo_sine(freq: f64, frames: usize) -> (Vec<f32>, Vec<u8>) {
+        let sr = 44100.0;
+        let mut f32s = Vec::with_capacity(frames * 2);
+        let mut pcm = Vec::with_capacity(frames * 8);
+        for i in 0..frames {
+            let v = (2.0 * PI * freq * i as f64 / sr).sin() * 0.5;
+            // Aller-retour par l'entier 32 bits AVANT de remplir les deux
+            // tampons : sans ça la comparaison mesurerait l'erreur de
+            // quantification du PCM, pas l'égalité des deux chemins.
+            let raw = (v * 2147483648.0) as i32;
+            let q = raw as f64 / 2147483648.0;
+            for _ in 0..2 {
+                f32s.push(q as f32);
+                pcm.extend_from_slice(&raw.to_le_bytes());
+            }
+        }
+        (f32s, pcm)
+    }
+
+    /// Le chemin f32 (sortie locale) et le chemin PCM (transcodage) doivent
+    /// donner le MÊME signal : c'est ce qui permet à une zone d'entendre la
+    /// même correction sur son DAC et vers un renderer réseau.
+    #[test]
+    fn interleaved_matches_pcm_path() {
+        let profile = shelf_profile();
+        let (mut f32s, mut pcm) = stereo_sine(8000.0, 2048);
+
+        EqProcessor::new(&profile, 44100, 2).process_interleaved(&mut f32s);
+        EqProcessor::new(&profile, 44100, 2).process_pcm(&mut pcm, 32);
+
+        assert_eq!(f32s.len() * 4, pcm.len());
+        for (i, (got, chunk)) in f32s.iter().zip(pcm.chunks_exact(4)).enumerate() {
+            let expected =
+                i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32 / 2147483648.0;
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "échantillon {i} : f32={got} pcm={expected}"
+            );
+        }
+    }
+
+    /// Les deux canaux ont leur propre état de biquad : un signal présent à
+    /// gauche seulement ne doit pas colorer la droite. Une erreur d'indice
+    /// dans `process_interleaved` se verrait ici et nulle part ailleurs.
+    #[test]
+    fn interleaved_keeps_channels_independent() {
+        let profile = shelf_profile();
+        let mut eq = EqProcessor::new(&profile, 44100, 2);
+        let mut samples = vec![0.0f32; 2048];
+        for f in 0..1024 {
+            samples[2 * f] = ((2.0 * PI * 8000.0 * f as f64 / 44100.0).sin() * 0.5) as f32;
+        }
+        eq.process_interleaved(&mut samples);
+        for f in 0..1024 {
+            assert_eq!(samples[2 * f + 1], 0.0, "canal droit sali à la trame {f}");
+        }
+        assert!(samples.iter().step_by(2).any(|&s| s != 0.0));
+    }
+
+    /// Un profil désactivé (ou en mode PURE, que `load_eq_processor` traduit
+    /// par `None`) laisse le signal strictement intact — la promesse
+    /// bit-perfect.
+    #[test]
+    fn interleaved_is_identity_when_disabled() {
+        let profile = EqProfile {
+            enabled: false,
+            ..shelf_profile()
+        };
+        let mut eq = EqProcessor::new(&profile, 44100, 2);
+        assert!(!eq.is_enabled());
+        let (mut samples, _) = stereo_sine(1000.0, 256);
+        let before = samples.clone();
+        eq.process_interleaved(&mut samples);
+        assert_eq!(samples, before);
+    }
+
+    /// Un tampon qui ne contient pas un nombre entier de trames est laissé
+    /// intact : le traiter à moitié décalerait l'état des filtres d'un canal
+    /// et toutes les trames suivantes seraient filtrées avec le mauvais
+    /// historique.
+    #[test]
+    fn interleaved_ignores_partial_frame() {
+        let profile = shelf_profile();
+        let mut eq = EqProcessor::new(&profile, 44100, 2);
+        let mut samples = vec![0.5f32; 7]; // 3 trames + 1 échantillon
+        let before = samples.clone();
+        eq.process_interleaved(&mut samples);
+        assert_eq!(samples, before);
+    }
+
+    /// L'état des biquads persiste d'un appel à l'autre : la sortie d'un
+    /// tampon découpé en morceaux est identique à celle du tampon entier.
+    /// C'est la condition pour que la sortie locale, qui reçoit l'audio par
+    /// paquets de taille arbitraire, ne craque pas aux jointures.
+    #[test]
+    fn interleaved_state_persists_across_chunks() {
+        let profile = shelf_profile();
+        let (whole, _) = stereo_sine(8000.0, 1024);
+
+        let mut one_shot = whole.clone();
+        EqProcessor::new(&profile, 44100, 2).process_interleaved(&mut one_shot);
+
+        let mut chunked = whole.clone();
+        let mut eq = EqProcessor::new(&profile, 44100, 2);
+        for chunk in chunked.chunks_mut(200 * 2) {
+            eq.process_interleaved(chunk);
+        }
+
+        assert_eq!(one_shot, chunked);
     }
 }

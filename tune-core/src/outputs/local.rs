@@ -816,6 +816,18 @@ pub struct LocalOutput {
     /// Pending next track for gapless playback.  Set by `set_next_media()`,
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    /// Zone equalizer for the zone currently playing on this output, applied
+    /// BEFORE the room-correction convolver — the same order as the transcoded
+    /// path (`transcode_source_to_file`: ReplayGain → EQ → convolver).
+    ///
+    /// A local (cpal/ASIO/WASAPI) zone never takes the temp-file transcode
+    /// path — `use_file_transcode_for` requires a network output — and the
+    /// streaming pipe it does take never ran the `EqProcessor`. The equalizer
+    /// was therefore applied NOWHERE on a local output: profile saved, curve
+    /// drawn, zero effect on the DAC (Jean Marie, forum #1416, deux zones
+    /// `local:` dans ses journaux ; même famille que #1216 / #1168 / Diretta).
+    /// Set per-play by the orchestrator, exactly like `crossfeed`.
+    eq: Arc<std::sync::Mutex<Option<super::super::audio::eq::EqProcessor>>>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
     /// PURE (audiophile) bypass for the zone currently playing on this output.
     /// When set, the playback loop skips the room-correction convolver so the
@@ -900,11 +912,30 @@ impl LocalOutput {
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
+            eq: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Install (or clear with `None`) the zone equalizer for the zone about to
+    /// play on this output. Set per-play by the orchestrator, mirroring
+    /// `set_crossfeed`: the orchestrator passes `None` when the zone has no
+    /// enabled EQ profile, when the profile is inaudible, or when the zone is
+    /// in PURE mode (`load_eq_processor` already returns `None` in all three
+    /// cases, so PURE stays bit-perfect without a second guard here).
+    ///
+    /// Rebuilt at each play so the biquad coefficients match the resolved
+    /// stream's sample rate and channel count, and so a profile edited between
+    /// two tracks takes effect on the next one.
+    pub fn set_eq(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+        *self.eq.lock().unwrap() = eq;
+    }
+
+    pub fn has_eq(&self) -> bool {
+        self.eq.lock().unwrap().is_some()
     }
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
@@ -1287,14 +1318,20 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
 /// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
 /// in place, at the three playback-loop feed sites.
 ///
-/// Order matches the signal flow: room-correction **convolver** first, then the
-/// headphone **crossfeed**. Both are skipped when `pure_bypass` is set (PURE /
-/// audiophile zone → bit-perfect). Crossfeed additionally requires a stereo
-/// stream (`channels == 2`); on non-stereo it is left untouched. Uses the same
+/// Order matches the signal flow: zone **equalizer** first, then the
+/// room-correction **convolver**, then the headphone **crossfeed**. All three
+/// are skipped when `pure_bypass` is set (PURE / audiophile zone →
+/// bit-perfect). Crossfeed additionally requires a stereo stream
+/// (`channels == 2`); on non-stereo it is left untouched. Uses the same
 /// try-lock pattern as the convolver so a contended lock never blocks audio.
+///
+/// EQ-before-convolver is the order the transcoded path already uses
+/// (`transcode_source_to_file`), so a zone hears the same chain whether it
+/// plays on the DAC or through a network renderer.
 #[inline]
 fn apply_local_dsp(
     samples: &mut [f32],
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
@@ -1302,6 +1339,11 @@ fn apply_local_dsp(
 ) {
     if pure_bypass.load(Ordering::Relaxed) {
         return;
+    }
+    if let Ok(mut e) = eq.lock() {
+        if let Some(ref mut p) = *e {
+            p.process_interleaved(samples);
+        }
     }
     if let Ok(mut conv) = convolver.lock() {
         if let Some(ref mut c) = *conv {
@@ -1519,6 +1561,7 @@ impl OutputTarget for LocalOutput {
         let duration_ms_arc = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
+        let eq = self.eq.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
         let crossfeed = self.crossfeed.clone();
@@ -2019,7 +2062,14 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    apply_local_dsp(&mut samples, &convolver, &crossfeed, &pure_bypass, channels);
+                    apply_local_dsp(
+                        &mut samples,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &pure_bypass,
+                        channels,
+                    );
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -2345,7 +2395,14 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    apply_local_dsp(&mut samples, &convolver, &crossfeed, &pure_bypass, channels);
+                    apply_local_dsp(
+                        &mut samples,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &pure_bypass,
+                        channels,
+                    );
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -3277,7 +3334,14 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                apply_local_dsp(&mut samples, &convolver, &crossfeed, &pure_bypass, channels);
+                apply_local_dsp(
+                    &mut samples,
+                    &eq,
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    channels,
+                );
 
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
@@ -4384,6 +4448,126 @@ pub(crate) use crate::audio::resample::{rubato_resample_batch, rubato_resample_c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Égaliseur de zone sur la sortie locale (#1416, Jean Marie)
+    //
+    // L'`EqProcessor` n'était appliqué que dans `transcode_source_to_file`,
+    // chemin qu'une zone locale ne prend JAMAIS (`use_file_transcode_for`
+    // exige une sortie réseau). L'égaliseur n'agissait donc nulle part sur un
+    // DAC local. Ces tests verrouillent le branchement dans la chaîne DSP.
+    // -----------------------------------------------------------------------
+
+    /// EQ de test : -12 dB de plateau aigu, audible sur un sinus 8 kHz.
+    fn test_eq() -> crate::audio::eq::EqProcessor {
+        let profile = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 2000.0,
+                gain: -12.0,
+                q: 0.71,
+                band_type: "high_shelf".into(),
+            }],
+            ..Default::default()
+        };
+        crate::audio::eq::EqProcessor::new(&profile, 44100, 2)
+    }
+
+    fn stereo_sine_8k(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|i| {
+                let v =
+                    ((2.0 * std::f64::consts::PI * 8000.0 * i as f64 / 44100.0).sin() * 0.5) as f32;
+                [v, v]
+            })
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn local_dsp_applies_the_zone_eq() {
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(4096);
+        let before = rms(&samples);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2);
+        // On saute les 512 premières trames (établissement du filtre).
+        let after = rms(&samples[1024..]);
+
+        let delta_db = 20.0 * (after / before).log10();
+        assert!(
+            delta_db < -8.0,
+            "un plateau -12 dB doit atténuer un 8 kHz ; mesuré {delta_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn local_dsp_skips_the_eq_in_pure_mode() {
+        // PURE promet un chemin bit-perfect : même avec un EQ installé, le
+        // signal doit ressortir strictement identique.
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(true);
+
+        let mut samples = stereo_sine_8k(1024);
+        let before = samples.clone();
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2);
+        assert_eq!(samples, before);
+    }
+
+    #[test]
+    fn local_dsp_without_eq_is_identity() {
+        // Aucune zone sans EQ ne doit changer de son : garde-fou de
+        // non-régression pour tous les utilisateurs qui n'ont rien activé.
+        let eq = std::sync::Mutex::new(None);
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(1024);
+        let before = samples.clone();
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2);
+        assert_eq!(samples, before);
+    }
+
+    #[test]
+    fn local_dsp_eq_runs_on_mono_and_multichannel_too() {
+        // Le crossfeed est réservé au stéréo ; l'égaliseur, lui, doit agir
+        // quel que soit le nombre de canaux (un DAC mono ou 5.1 a droit à sa
+        // correction).
+        let profile = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 2000.0,
+                gain: -12.0,
+                q: 0.71,
+                band_type: "high_shelf".into(),
+            }],
+            ..Default::default()
+        };
+        let eq =
+            std::sync::Mutex::new(Some(crate::audio::eq::EqProcessor::new(&profile, 44100, 1)));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples: Vec<f32> = (0..4096)
+            .map(|i| {
+                ((2.0 * std::f64::consts::PI * 8000.0 * i as f64 / 44100.0).sin() * 0.5) as f32
+            })
+            .collect();
+        let before = rms(&samples);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1);
+        let after = rms(&samples[1024..]);
+        assert!(20.0 * (after / before).log10() < -8.0);
+    }
 
     #[test]
     fn header_read_retries_only_transient_kinds() {
