@@ -508,6 +508,14 @@ const MODEL_URL: &str = "https://github.com/renesenses/tune-server-rust/releases
 /// existing file whose hash differs (e.g. the old `clap-audio-2023` at the same
 /// configured path) is treated as stale and re-fetched.
 const MODEL_SHA256: &str = "d888118262b6144033928e5d7bed57a51bacde7899c4c4a109de1074857b951a";
+/// Répertoire par défaut du modèle, quand ni le réglage ni la variable
+/// d'environnement ne disent où le mettre. Même répertoire que le modèle
+/// **texte** (`text_paths`), pour qu'audio et texte partagent la dylib
+/// onnxruntime au lieu de la télécharger deux fois. Chemin relatif, comme
+/// `artwork_cache` : résolu depuis le répertoire de travail du serveur.
+const DEFAULT_MODEL_DIR: &str = "embedding_models";
+/// Nom de fichier par défaut — celui de l'archive publiée.
+const DEFAULT_MODEL_FILE: &str = "clap-audio-music-2023.onnx";
 
 fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
     settings.get(ENABLED_KEY).ok().flatten().as_deref() == Some("true")
@@ -528,16 +536,33 @@ fn enabled(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
 /// n'est pas encore téléchargé, et la passe le récupère d'elle-même. Mais
 /// l'interface doit pouvoir le DIRE plutôt que de montrer une barre figée.
 pub fn model_ready(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
-    configured_model_path(settings).is_some_and(|p| p.exists())
+    configured_model_path(settings).exists()
 }
 
-fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> Option<PathBuf> {
+/// Emplacement du modèle : réglage, puis variable d'environnement, puis un
+/// défaut.
+///
+/// Le défaut est indispensable, pas cosmétique. Tant que cette fonction pouvait
+/// répondre `None`, activer l'analyse acoustique sur une installation où
+/// `audio_embedding_model_path` n'avait jamais été écrit ne téléchargeait
+/// **rien** : la passe voyait `None`, sautait le bloc entier et repartait
+/// dormir — sans téléchargement, sans avertissement, sans la moindre ligne de
+/// journal. Le réglage semblait actif et il ne se passait rien.
+///
+/// Le côté **texte** avait déjà rencontré la panne et l'avait réglée ainsi
+/// (`text_paths`, repli `embedding_models/`) après le #1288 de Fabien
+/// (« Menu Ambiance → 503 », `audio_embedding_model_path unset`). La passe
+/// audio, elle, était restée avec son `None`. On aligne les deux : même
+/// répertoire, même convention relative que `artwork_cache`, résolue depuis le
+/// répertoire de travail du serveur.
+fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> PathBuf {
     settings
         .get(MODEL_PATH_KEY)
         .ok()
         .flatten()
         .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
         .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR).join(DEFAULT_MODEL_FILE))
 }
 
 /// Make sure the model exists at `dest`, downloading + checksum-verifying it if
@@ -612,7 +637,7 @@ async fn ensure_runtime_loaded(model_path: &Path) -> Result<(), String> {
 /// opt-in via `audio_embedding_enabled`, downloads + checksum-verifies the CLAP
 /// model on first activation (to the configured path), then chips away at the
 /// library in bounded batches. No-ops cheaply while disabled or model-less.
-pub fn spawn(backend: Arc<dyn DbBackend>) {
+pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseManager>) {
     use crate::db::settings_repo::SettingsRepo;
     tokio::spawn(async move {
         // Let startup/scan settle before touching the disk hard.
@@ -622,9 +647,10 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // warning is logged on the way in and the recovery on the way out —
         // once each, not once per retry.
         let mut low_memory = false;
-        // Same latch for "enabled but no model path": say it once, not every
-        // 900 s round.
-        let mut unconfigured = false;
+        // Loquet « licence non premium » : une ligne à l'entrée, une à la
+        // sortie. Cette boucle repasse toutes les 900 s et une ligne par tour
+        // noierait le journal.
+        let mut not_premium = false;
         // Le nombre de fils avec lequel la session courante a été bâtie, pour
         // détecter un changement de réglage.
         let mut loaded_threads = 0usize;
@@ -633,6 +659,37 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         let mut playback_hold = false;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
+            // Garde premium. Vérifié à CHAQUE tour, et non une seule fois au
+            // démarrage : une clé posée ou retirée doit prendre effet sans
+            // redémarrer le serveur — c'est ce que fait déjà la revalidation
+            // périodique côté licence.
+            //
+            // Il n'y avait aucun contrôle jusqu'ici. Constaté sur .18 le
+            // 2026-08-13 : `tier: free`, aucune clé, et pourtant
+            // `audio_embedding_batch embedded=10 rss_mb=1816` — l'analyse
+            // acoustique, la chose la plus lourde que fasse ce serveur,
+            // tournait sur une installation gratuite.
+            if enabled(&settings)
+                && !license
+                    .check_feature(crate::license::Feature::AcousticAnalysis)
+                    .await
+            {
+                if !not_premium {
+                    not_premium = true;
+                    info!(
+                        "audio_embed_requires_premium — l'analyse acoustique est réservée au premium ; le réglage reste actif et la passe reprendra dès qu'une licence sera validée"
+                    );
+                }
+                // On relâche aussi la session ONNX : inutile de garder ~300 Mo
+                // résidents pour une passe qui ne tournera pas.
+                embedder = None;
+                tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
+                continue;
+            }
+            if not_premium {
+                not_premium = false;
+                info!("audio_embed_premium_ok — licence validée, l'analyse acoustique reprend");
+            }
             if enabled(&settings) {
                 // Yield to playback, like the ReplayGain pass (#1310) — this
                 // sweep was the only analysis without the guard (#1515). It
@@ -725,38 +782,30 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     // Latched like the memory pause: once on the way in, once on
                     // the way out. This loop comes round every 900 s and a line
                     // per round would be noise.
-                    let model_path = configured_model_path(&settings);
-                    if model_path.is_none() {
-                        if !unconfigured {
-                            unconfigured = true;
-                            warn!(
-                                setting = MODEL_PATH_KEY,
-                                env = "TUNE_AUDIO_EMBED_MODEL",
-                                "audio_embed_no_model_path — acoustic analysis is enabled but no model path is configured, so nothing will be analysed; set the setting or the environment variable"
-                            );
-                        }
-                    } else if unconfigured {
-                        unconfigured = false;
-                        info!("audio_embed_model_path_configured");
-                    }
-                    if let Some(p) = model_path {
-                        if let Err(e) = ensure_model(&p).await {
-                            warn!(error = %e, "audio_model_unavailable");
-                        } else if let Err(e) = ensure_runtime_loaded(&p).await {
-                            warn!(error = %e, "audio_runtime_unavailable");
-                        } else {
-                            match AudioEmbedder::load(&p, threads) {
-                                Ok(e) => {
-                                    info!(
-                                        model = %p.display(),
-                                        intra_threads = threads,
-                                        "audio_embedder_loaded"
-                                    );
-                                    embedder = Some(e);
-                                    loaded_threads = threads;
-                                }
-                                Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
+                    // Plus de branche « aucun chemin configuré » : le chemin est
+                    // désormais toujours résolu, avec un défaut. Avant, activer
+                    // l'analyse sur une installation dont le réglage n'avait
+                    // jamais été écrit ne téléchargeait RIEN — la passe voyait
+                    // `None` et repartait dormir. Elle le signalait, ce qui
+                    // valait mieux que le silence, mais un avertissement n'a
+                    // jamais téléchargé un modèle.
+                    let p = configured_model_path(&settings);
+                    if let Err(e) = ensure_model(&p).await {
+                        warn!(error = %e, path = %p.display(), "audio_model_unavailable");
+                    } else if let Err(e) = ensure_runtime_loaded(&p).await {
+                        warn!(error = %e, "audio_runtime_unavailable");
+                    } else {
+                        match AudioEmbedder::load(&p, threads) {
+                            Ok(e) => {
+                                info!(
+                                    model = %p.display(),
+                                    intra_threads = threads,
+                                    "audio_embedder_loaded"
+                                );
+                                embedder = Some(e);
+                                loaded_threads = threads;
                             }
+                            Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
                         }
                     }
                 }
@@ -942,6 +991,30 @@ mod tests {
                 "{v:?}"
             );
         }
+    }
+
+    #[test]
+    fn model_path_falls_back_to_a_default_instead_of_nothing() {
+        // Le défaut n'est pas cosmétique : tant que cette résolution pouvait
+        // ne rien rendre, activer l'analyse acoustique sur une installation
+        // dont `audio_embedding_model_path` n'avait jamais été écrit ne
+        // téléchargeait RIEN — la passe sautait le bloc entier et repartait
+        // dormir. Ce test échoue contre l'ancien code, qui rendait `None`.
+        //
+        // On vérifie le répertoire ET le nom : le répertoire doit rester le
+        // même que celui du modèle texte (`text_paths`), pour que les deux
+        // partagent la dylib onnxruntime au lieu de la télécharger deux fois.
+        let p = super::configured_model_path(&settings_with_throttle(None));
+        assert_eq!(
+            p.parent().and_then(|d| d.file_name()),
+            Some(std::ffi::OsStr::new(super::DEFAULT_MODEL_DIR)),
+            "le défaut doit viser {} — partagé avec le modèle texte",
+            super::DEFAULT_MODEL_DIR
+        );
+        assert_eq!(
+            p.file_name(),
+            Some(std::ffi::OsStr::new(super::DEFAULT_MODEL_FILE))
+        );
     }
 
     #[test]

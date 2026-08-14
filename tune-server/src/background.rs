@@ -1157,7 +1157,7 @@ fn spawn_replaygain_analysis(state: &AppState) {
 /// loop no-ops cheaply until enabled and a model is present.
 #[cfg(feature = "audio-embedding")]
 fn spawn_audio_embedding(state: &AppState) {
-    tune_core::audio::embedding::spawn(state.backend.clone());
+    tune_core::audio::embedding::spawn(state.backend.clone(), state.license.clone());
 }
 
 fn spawn_concert_alerts(state: &AppState) {

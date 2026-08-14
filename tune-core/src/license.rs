@@ -56,6 +56,10 @@ pub enum Feature {
     BatchConverter,
     PlaylistsHub,
     Declick,
+    /// Analyse acoustique CLAP : la passe d'embeddings qui alimente la radio
+    /// acoustique. C'est le traitement le plus lourd du serveur (décodage +
+    /// inférence ONNX multi-thread, ~300 Mo résidents).
+    AcousticAnalysis,
 }
 
 impl Feature {
@@ -88,6 +92,7 @@ impl Feature {
             Feature::BatchConverter,
             Feature::PlaylistsHub,
             Feature::Declick,
+            Feature::AcousticAnalysis,
         ]
     }
 
@@ -104,6 +109,7 @@ impl Feature {
             Feature::ListeningStats => "Listening Stats",
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
+            Feature::AcousticAnalysis => "Acoustic Analysis",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
