@@ -725,11 +725,56 @@ jobs:
         with:
           path: artifacts
 
+      # Les sommes sont calculées sur les artefacts DU RUN COURANT. Sur un
+      # re-run partiel, ce run n'a rejoué qu'une partie des jobs : les fichiers
+      # produits par un run antérieur ne sont pas dans `artifacts/` et
+      # disparaissaient donc du SHA256SUMS republié — écrasé par une version
+      # plus pauvre que la précédente.
+      #
+      # Vécu sur v0.9.71 (#1679) : macOS téléversé à 09:31 par un re-run des
+      # seuls jobs Apple, SHA256SUMS régénéré à 10:30 par un autre re-run
+      # partiel — 5 sommes pour 9 fichiers. Les quatre fichiers macOS étaient
+      # publiés mais invérifiables, faute de ligne à comparer.
+      #
+      # Le fichier ne doit donc JAMAIS rétrécir : on repart de celui déjà
+      # publié pour ce tag et on ne remplace que ce que ce run a réellement
+      # reconstruit. Le défaut ne se déclenchait que sur une release réparée en
+      # deux temps, c'est-à-dire quand quelque chose avait déjà mal tourné.
       - name: Checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS.run
           cd ..
+
+          # Le SHA256SUMS déjà publié, s'il existe (absent au premier run).
+          if gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+               --pattern SHA256SUMS --output SHA256SUMS.published 2>/dev/null; then
+            echo "SHA256SUMS déjà publié récupéré ($(wc -l < SHA256SUMS.published) entrées)"
+          else
+            : > SHA256SUMS.published
+            echo "aucun SHA256SUMS publié pour ${GITHUB_REF_NAME} — premier run"
+          fi
+
+          # Union, le run courant l'emportant : on repart des anciennes lignes
+          # dont le NOM DE FICHIER n'a pas été reconstruit par ce run, puis on
+          # ajoute tout ce que ce run a produit. Comparaison sur le basename :
+          # le chemin porte le nom du répertoire d'artefact, qui varie.
+          awk '{ n = $2; sub(/.*\//, "", n); print n }' SHA256SUMS.run | sort -u > .rebuilt
+          awk 'NR==FNR { rebuilt[$0]=1; next }
+               { n = $2; sub(/.*\//, "", n); if (!(n in rebuilt)) print }' \
+              .rebuilt SHA256SUMS.published > SHA256SUMS.kept
+          cat SHA256SUMS.kept SHA256SUMS.run | sort -k2 > SHA256SUMS
+          rm -f SHA256SUMS.run SHA256SUMS.published SHA256SUMS.kept .rebuilt
+
+          # Garde-fou : republier moins que ce qui existait est toujours une
+          # régression, quelle qu'en soit la cause.
+          before=$(gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+                     --json assets --jq '[.assets[].name | select(test("SHA256SUMS")|not)] | length' 2>/dev/null || echo 0)
+          echo "--- SHA256SUMS republié : $(wc -l < SHA256SUMS) entrées (release : ${before} assets binaires) ---"
+          cat SHA256SUMS
 
       # Sign SHA256SUMS with minisign so the self-update client can verify the
       # release cryptographically (audit item 8). No-ops until MINISIGN_SECRET_KEY

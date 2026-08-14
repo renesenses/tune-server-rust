@@ -174,6 +174,98 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
 /// once the CI signing step is live; verification then becomes mandatory.
 const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB7T9aBRwUM";
 
+/// À qui la faute quand une mise à jour ne peut pas être vérifiée.
+///
+/// La question n'est pas cosmétique. En v0.9.71 la release est restée douze
+/// heures visible mais incomplète ; le client a échoué, et la première réponse
+/// au fil forum a envoyé Jean Valjean vérifier SON réseau. Il n'y était pour
+/// rien. Un message qui ne nomme pas la cause fait chercher au mauvais endroit
+/// — et le seul qui puisse trancher, c'est le code qui a vu la réponse HTTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateBlame {
+    /// Rien n'a répondu : réseau, DNS, proxy, coupure. Chez l'utilisateur.
+    Unreachable,
+    /// Le serveur a répondu, mais le fichier n'est pas là. Chez nous.
+    ReleaseIncomplete,
+    /// Le serveur a répondu qu'il allait mal (5xx, quota). Ni l'un ni l'autre.
+    ServerError,
+    /// Signature ou empreinte qui ne concorde pas. On refuse d'installer.
+    Untrusted,
+}
+
+impl UpdateBlame {
+    /// Marqueur de journal — un par cause, pour qu'un `grep` les sépare.
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::Unreachable => "update_server_unreachable",
+            Self::ReleaseIncomplete => "update_release_incomplete",
+            Self::ServerError => "update_server_error",
+            Self::Untrusted => "update_untrusted_archive",
+        }
+    }
+
+    /// Ce que lit l'utilisateur : la cause, puis la conduite à tenir.
+    pub(crate) fn user_message(self) -> &'static str {
+        match self {
+            Self::Unreachable => {
+                "Impossible de joindre le serveur de mises à jour. Vérifiez votre connexion, \
+                 puis réessayez."
+            }
+            Self::ReleaseIncomplete => {
+                "Le serveur a répondu, mais cette version n'est pas complètement publiée. \
+                 Ce n'est pas un problème de votre côté : réessayez plus tard."
+            }
+            Self::ServerError => {
+                "Le serveur de mises à jour est momentanément indisponible. \
+                 Ce n'est pas un problème de votre côté : réessayez plus tard."
+            }
+            Self::Untrusted => {
+                "L'archive téléchargée ne correspond pas à sa signature. Installation refusée."
+            }
+        }
+    }
+}
+
+/// Une cause typée, plus le détail technique destiné aux journaux.
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateError {
+    pub(crate) blame: UpdateBlame,
+    pub(crate) detail: String,
+}
+
+impl UpdateError {
+    fn new(blame: UpdateBlame, detail: impl Into<String>) -> Self {
+        Self {
+            blame,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+/// Un statut HTTP dit-il « ce fichier n'existe pas » ou « le serveur va mal » ?
+///
+/// Dans les deux cas il y a EU une réponse : quel que soit le statut, on ne
+/// renvoie jamais l'utilisateur vérifier son propre réseau. C'est toute la
+/// différence avec l'échec de `send()`.
+pub(crate) fn blame_for_status(status: u16) -> UpdateBlame {
+    match status {
+        // L'artefact n'est pas là — la release est incomplète (cas v0.9.71).
+        404 | 410 => UpdateBlame::ReleaseIncomplete,
+        // Le serveur dit qu'il va mal, ou nous limite. Rien à conclure sur la
+        // complétude de la release.
+        429 | 500..=599 => UpdateBlame::ServerError,
+        // 401/403 : dépôt privé, jeton, quota anonyme épuisé. Là encore une
+        // réponse, donc pas le réseau de l'utilisateur.
+        _ => UpdateBlame::ServerError,
+    }
+}
+
 /// Verify a downloaded update archive against a minisign-signed `SHA256SUMS`
 /// before it is extracted/installed. The signature authenticates `SHA256SUMS`
 /// with the embedded key; the authenticated `SHA256SUMS` authenticates the
@@ -185,40 +277,71 @@ async fn verify_update_signature(
     archive_bytes: &[u8],
     sums_url: Option<&str>,
     sig_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), UpdateError> {
     if UPDATE_PUBLIC_KEY.is_empty() {
         warn!("update_signature_check_skipped_no_key");
         return Ok(());
     }
 
-    let sums_url = sums_url.ok_or("release has no SHA256SUMS — refusing unsigned update")?;
-    let sig_url =
-        sig_url.ok_or("release has no SHA256SUMS.minisig signature — refusing unsigned update")?;
+    // Le fichier n'est même pas annoncé par la release : elle est incomplète,
+    // exactement l'état dans lequel la v0.9.71 est restée douze heures.
+    let sums_url = sums_url.ok_or_else(|| {
+        UpdateError::new(
+            UpdateBlame::ReleaseIncomplete,
+            "release has no SHA256SUMS — refusing unsigned update",
+        )
+    })?;
+    let sig_url = sig_url.ok_or_else(|| {
+        UpdateError::new(
+            UpdateBlame::ReleaseIncomplete,
+            "release has no SHA256SUMS.minisig signature — refusing unsigned update",
+        )
+    })?;
 
     let fetch = |url: String| async move {
+        // `send()` qui échoue = rien n'a répondu. C'est la SEULE branche qui
+        // autorise à parler du réseau de l'utilisateur.
         let resp = client
             .get(&url)
             .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
-            .map_err(|e| format!("fetch {url} failed: {e}"))?;
+            .map_err(|e| {
+                UpdateError::new(UpdateBlame::Unreachable, format!("fetch {url} failed: {e}"))
+            })?;
         if !resp.status().is_success() {
-            return Err(format!("fetch {url}: HTTP {}", resp.status()));
+            let status = resp.status();
+            return Err(UpdateError::new(
+                blame_for_status(status.as_u16()),
+                format!("fetch {url}: HTTP {status}"),
+            ));
         }
-        resp.text()
-            .await
-            .map_err(|e| format!("read {url} failed: {e}"))
+        resp.text().await.map_err(|e| {
+            UpdateError::new(UpdateBlame::Unreachable, format!("read {url} failed: {e}"))
+        })
     };
     let sums = fetch(sums_url.to_string()).await?;
     let sig_str = fetch(sig_url.to_string()).await?;
 
     // 1. Signature over SHA256SUMS with the embedded trusted key.
-    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY)
-        .map_err(|e| format!("invalid embedded update public key: {e}"))?;
-    let sig = minisign_verify::Signature::decode(&sig_str)
-        .map_err(|e| format!("invalid update signature: {e}"))?;
-    pk.verify(sums.as_bytes(), &sig, false)
-        .map_err(|_| "update signature does not match — refusing to install".to_string())?;
+    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY).map_err(|e| {
+        UpdateError::new(
+            UpdateBlame::Untrusted,
+            format!("invalid embedded update public key: {e}"),
+        )
+    })?;
+    let sig = minisign_verify::Signature::decode(&sig_str).map_err(|e| {
+        UpdateError::new(
+            UpdateBlame::Untrusted,
+            format!("invalid update signature: {e}"),
+        )
+    })?;
+    pk.verify(sums.as_bytes(), &sig, false).map_err(|_| {
+        UpdateError::new(
+            UpdateBlame::Untrusted,
+            "update signature does not match — refusing to install",
+        )
+    })?;
 
     // 2. The now-authenticated SHA256SUMS must list our archive with a hash
     //    matching the bytes we downloaded.
@@ -238,13 +361,89 @@ async fn verify_update_signature(
                 None
             }
         })
-        .ok_or_else(|| format!("{archive_name} not listed in signed SHA256SUMS"))?;
+        // Absent de la liste SIGNÉE : la release est incomplète, pas
+        // frauduleuse. C'est exactement l'état de la v0.9.71 — SHA256SUMS
+        // publié en ne couvrant que 5 fichiers sur 13. Accuser la signature
+        // ici ferait croire à une attaque là où il n'y a qu'une publication
+        // inachevée.
+        .ok_or_else(|| {
+            UpdateError::new(
+                UpdateBlame::ReleaseIncomplete,
+                format!("{archive_name} not listed in signed SHA256SUMS"),
+            )
+        })?;
     if want != got {
-        return Err(format!(
-            "archive hash mismatch — signed {want}, downloaded {got}"
+        // Là en revanche, le fichier est listé et son empreinte ne correspond
+        // pas : on refuse d'installer.
+        return Err(UpdateError::new(
+            UpdateBlame::Untrusted,
+            format!("archive hash mismatch — signed {want}, downloaded {got}"),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod update_blame_tests {
+    use super::{UpdateBlame, blame_for_status};
+
+    #[test]
+    fn une_reponse_recue_n_accuse_jamais_le_reseau_de_l_utilisateur() {
+        // Le coeur de #1588 : dès qu'un statut HTTP existe, c'est qu'on a
+        // joint le serveur. Renvoyer l'utilisateur vers sa connexion serait
+        // le faire chercher chez lui un défaut qui est chez nous.
+        for status in [400, 401, 403, 404, 410, 429, 500, 502, 503] {
+            assert_ne!(
+                blame_for_status(status),
+                UpdateBlame::Unreachable,
+                "HTTP {status} ne doit pas accuser le reseau"
+            );
+        }
+    }
+
+    #[test]
+    fn artefact_absent_est_une_release_incomplete() {
+        // Le cas vécu : l'asset macOS n'existait pas sur la v0.9.71.
+        assert_eq!(blame_for_status(404), UpdateBlame::ReleaseIncomplete);
+        assert_eq!(blame_for_status(410), UpdateBlame::ReleaseIncomplete);
+    }
+
+    #[test]
+    fn serveur_en_peine_n_est_pas_une_release_incomplete() {
+        // Un 503 ne dit RIEN sur la complétude de la release : l'annoncer
+        // comme telle serait inventer une cause.
+        for status in [429, 500, 502, 503] {
+            assert_eq!(blame_for_status(status), UpdateBlame::ServerError);
+        }
+    }
+
+    #[test]
+    fn chaque_cause_a_son_marqueur_et_son_message() {
+        let toutes = [
+            UpdateBlame::Unreachable,
+            UpdateBlame::ReleaseIncomplete,
+            UpdateBlame::ServerError,
+            UpdateBlame::Untrusted,
+        ];
+        let mut marqueurs: Vec<&str> = toutes.iter().map(|b| b.marker()).collect();
+        marqueurs.sort_unstable();
+        let avant = marqueurs.len();
+        marqueurs.dedup();
+        assert_eq!(marqueurs.len(), avant, "deux causes partagent un marqueur");
+
+        // Seule la cause « injoignable » a le droit de parler de la connexion
+        // de l'utilisateur. C'est la règle que la v0.9.71 a enfreinte.
+        for b in toutes {
+            let msg = b.user_message();
+            assert!(!msg.is_empty());
+            if b != UpdateBlame::Unreachable {
+                assert!(
+                    !msg.contains("votre connexion"),
+                    "{b:?} ne doit pas renvoyer l'utilisateur a son reseau : {msg}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -574,8 +773,13 @@ pub(super) async fn update_install(
         )
         .await
         {
-            error!(error = %e, "update_signature_verification_failed");
-            set_phase(&format!("failed: {e}"));
+            // Le journal garde le détail technique ET un marqueur par cause,
+            // pour qu'on puisse compter les échecs de publication séparément
+            // des coupures réseau. L'utilisateur, lui, lit une phrase qui
+            // nomme le responsable : c'est ce qui manquait quand on a envoyé
+            // Jean Valjean vérifier son réseau pour un défaut de chez nous.
+            error!(error = %e.detail, blame = ?e.blame, "{}", e.blame.marker());
+            set_phase(&format!("failed: {}", e.blame.user_message()));
             return;
         }
 
