@@ -318,6 +318,21 @@ fn warm_sqlite_cache(state: &AppState) {
 }
 
 /// Initialize PlaybackManager volume from DB-stored zone volumes and mark devices offline.
+///
+/// Une zone stockée à 100 % était ramenée à 20 % ici, « garde-fou contre un
+/// réveil à plein volume » (2fdc2b5e, collatéral d'un défaut DLNA où le poller
+/// écrivait 100 en base pour un renderer à sortie fixe). Ce garde-fou ne
+/// protégeait de rien : `PlaybackManager::set_volume` n'écrit ni la base ni la
+/// sortie. Il laissait trois valeurs pour une seule zone — base 100, mémoire
+/// 0.2, `LocalOutput::user_volume` 1.0 — et envoyait un événement `volume: 0.2`
+/// que personne n'avait demandé (les 20 % de #1504 et #1480, attribués à tort
+/// au défaut 50 % de `ZoneState::default()` dans #1548).
+///
+/// La cause d'origine est traitée à la source : le poller ignore désormais un
+/// renderer qui annonce 100 % (`status.volume < 0.999`), donc un 100 % en base
+/// est aujourd'hui un choix de l'utilisateur. Et la vraie protection contre le
+/// réveil à plein volume est dans `register_local_outputs`, qui ensemence la
+/// sortie avec la valeur stockée — celle-là agit sur le son. Refs #1596.
 async fn restore_zone_volumes(state: &AppState) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     if let Ok(zones) = zone_repo.list() {
@@ -336,10 +351,6 @@ async fn restore_zone_volumes(state: &AppState) {
                     // désaccord d'affichage).
                     state.playback.set_volume(id, 1.0).await;
                     info!(zone_id = id, zone_name = %zone.name, "zone_volume_fixed_restored_full");
-                } else if vol >= 0.999 {
-                    let safe_vol = 0.2;
-                    state.playback.set_volume(id, safe_vol).await;
-                    info!(zone_id = id, zone_name = %zone.name, volume = safe_vol, "zone_volume_clamped_from_100");
                 } else {
                     state.playback.set_volume(id, vol).await;
                     info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
@@ -586,6 +597,17 @@ async fn resolve_ytdlp(state: &AppState) {
 
 /// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
 #[cfg(feature = "local-audio")]
+/// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
+/// base dit de sa zone. Une zone « Volume fixe (bit-perfect) » reste à pleine
+/// échelle — c'est son contrat, le DoP ne survit pas à une multiplication.
+fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+    if fixed_volume {
+        1.0
+    } else {
+        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+    }
+}
+
 pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
     let audio_backend_owned = state.effective_audio_backend();
@@ -660,6 +682,31 @@ pub async fn register_local_outputs(state: &AppState) {
                 exclusive_mode,
                 audio_backend,
             );
+            // Ensemencer la sortie avec le volume stocké.
+            //
+            // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
+            // `restore_zone_volumes` ne touche que la copie mémoire du
+            // PlaybackManager, et depuis le compromis « Fabien » l'orchestrateur
+            // ne réimpose plus le volume enregistré à la lecture. Une zone locale
+            // réglée à 30 % repartait donc à PLEIN VOLUME au premier morceau
+            // après un redémarrage — c'est précisément le réveil brutal que
+            // l'écrêtage à 20 % prétendait empêcher sans jamais y toucher (#1596).
+            //
+            // Ce compromis-là ne s'applique pas ici : il protège le niveau
+            // *physique* d'un appareil externe, que Tune ne connaît pas. Le gain
+            // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
+            // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
+            // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
+            if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
+                let stored = seed_volume_for(zone.volume, zone.fixed_volume);
+                if let Err(e) =
+                    tune_core::outputs::OutputTarget::set_volume(&local_out, stored).await
+                {
+                    warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
+                } else {
+                    info!(device_id = %device_id, volume = stored, "local_output_volume_seeded");
+                }
+            }
             outputs.register(Box::new(local_out));
             info!(
                 name = %dev.name,
@@ -801,17 +848,66 @@ mod restore_zone_volumes_tests {
         );
     }
 
-    /// Le garde-fou reste en place pour les zones SANS engagement bit-perfect :
-    /// un 100 % oublié ne doit pas hurler au premier morceau du matin.
+    /// #1596 — une zone ordinaire stockée à 100 % revient à 100 %.
+    ///
+    /// L'écrêtage à 20 % qui vivait ici ne descendait le son de personne : il
+    /// ne touchait ni la base ni la sortie. Il ne produisait qu'un désaccord à
+    /// trois voix et un événement `volume: 0.2` — les 20 % que Jean Valjean
+    /// (#1504) et Bebelalu55 (#1480) ont vus s'afficher. Ce test ÉCHOUE contre
+    /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
-    async fn non_fixed_zone_at_full_scale_is_still_clamped() {
+    async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
         let (state, id) = state_with_zone(100, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
-            (vol - 0.2).abs() < 1e-9,
-            "garde-fou attendu à 0.2, volume restauré: {vol}"
+            (vol - 1.0).abs() < 1e-9,
+            "un 100 % choisi par l'utilisateur doit revenir à 1.0, obtenu: {vol}"
         );
+    }
+
+    /// La mémoire ne doit jamais contredire la base après restauration : c'est
+    /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
+    #[tokio::test]
+    async fn memory_agrees_with_db_for_every_stored_level() {
+        for stocke in [0, 20, 55, 99, 100] {
+            let (state, id) = state_with_zone(stocke, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = stocke as f64 / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-9,
+                "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
+            );
+        }
+    }
+
+    /// #1596 — la protection réelle contre le réveil à plein volume.
+    ///
+    /// `LocalOutput` naît à 1.0 et personne ne le corrigeait : une zone locale
+    /// à 30 % repartait à fond au premier morceau après un redémarrage. C'est
+    /// le seul endroit où le volume stocké atteint vraiment le son.
+    #[test]
+    fn local_output_is_seeded_with_the_stored_level() {
+        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+    }
+
+    /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
+    /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
+    #[test]
+    fn fixed_volume_output_is_seeded_at_full_scale() {
+        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+    }
+
+    /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
+    /// multiplicateur appliqué à chaque échantillon.
+    #[test]
+    fn out_of_range_stored_level_never_amplifies() {
+        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.
