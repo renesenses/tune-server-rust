@@ -483,6 +483,18 @@ pub fn stored_gain_for(
     track_id: i64,
     mode: ReplayGainMode,
 ) -> Option<TrackGain> {
+    stored_gain_detail(backend, track_id, mode).map(|(gain, _)| gain)
+}
+
+/// Comme [`stored_gain_for`], mais dit AUSSI quelle granularité a fourni la
+/// valeur : en mode album, une piste sans tags d'album retombe sur le gain de
+/// piste, et un affichage (chemin du signal) doit nommer ce qui s'applique
+/// VRAIMENT, pas le réglage demandé.
+pub fn stored_gain_detail(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    mode: ReplayGainMode,
+) -> Option<(TrackGain, ReplayGainMode)> {
     if mode == ReplayGainMode::Off {
         return None;
     }
@@ -499,8 +511,9 @@ pub fn stored_gain_for(
     };
     match mode {
         ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak")
-            .or_else(|| pick("rg_track_gain", "rg_track_peak")),
-        _ => pick("rg_track_gain", "rg_track_peak"),
+            .map(|g| (g, ReplayGainMode::Album))
+            .or_else(|| pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track))),
+        _ => pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track)),
     }
 }
 
