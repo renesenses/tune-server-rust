@@ -108,9 +108,15 @@ pub async fn similar_artist_names(
 ///
 /// A search that returns nothing for an artist is skipped, not fatal: a radio
 /// of nine tracks beats no radio at all.
+///
+/// `exclude_ids` are source ids the radio must not propose: the track that just
+/// ended, and everything already sitting in the queue. Without it the very
+/// first candidate is often the seed itself — a radio that replays the song you
+/// just heard.
 pub async fn streaming_tracks_for_artist_names<F, Fut>(
     names: &[String],
     count: usize,
+    exclude_ids: &std::collections::HashSet<String>,
     mut search: F,
 ) -> Vec<crate::streaming::traits::StreamTrack>
 where
@@ -118,7 +124,7 @@ where
     Fut: std::future::Future<Output = Vec<crate::streaming::traits::StreamTrack>>,
 {
     let mut out = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = exclude_ids.clone();
     for name in names {
         if out.len() >= count {
             break;
@@ -131,6 +137,75 @@ where
         }
     }
     out
+}
+
+/// Among a service's search hits, the artist that IS the seed — not a tribute.
+///
+/// Searching Qobuz for « Pink Floyd » also returns « The Australian Pink Floyd
+/// Show » and « Pink Floyd Floydhead ». Taking the first hit would build the
+/// radio on a cover band, so only an exact name match (case- and
+/// whitespace-insensitive) is accepted. No match is a normal outcome: the
+/// caller falls back rather than guessing.
+pub fn pick_seed_artist_id(
+    artists: &[crate::streaming::traits::StreamArtist],
+    seed_artist: &str,
+) -> Option<String> {
+    let seed = seed_artist.trim();
+    artists
+        .iter()
+        .find(|a| a.name.trim().eq_ignore_ascii_case(seed))
+        .map(|a| a.id.clone())
+}
+
+/// Second source of similar-artist names: the streaming service itself (#1553).
+///
+/// The first source — the mozaiklabs enrichment API — is keyed by MusicBrainz
+/// id. A streaming now-playing carries none, and only ~10 % of artists resolve
+/// to one anyway, so it answered « nobody » every single time and the autoplay
+/// queue stayed empty. The service that is streaming the track knows its own
+/// catalogue: ask it.
+///
+/// Both calls are injected rather than taken from the registry, so this is
+/// testable without a network or a subscription. Exactly two network calls,
+/// whatever happens — one to resolve the seed, one to list its neighbours.
+pub async fn service_similar_artist_names<FS, FutS, FA, FutA>(
+    seed_artist: &str,
+    max: usize,
+    search_artists: FS,
+    similar_artists: FA,
+) -> Vec<String>
+where
+    FS: FnOnce(String) -> FutS,
+    FutS: std::future::Future<Output = Vec<crate::streaming::traits::StreamArtist>>,
+    FA: FnOnce(String) -> FutA,
+    FutA: std::future::Future<Output = Vec<crate::streaming::traits::StreamArtist>>,
+{
+    if seed_artist.trim().is_empty() || max == 0 {
+        return Vec::new();
+    }
+    let hits = search_artists(seed_artist.to_string()).await;
+    let Some(seed_id) = pick_seed_artist_id(&hits, seed_artist) else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for artist in similar_artists(seed_id).await {
+        let name = artist.name.trim().to_string();
+        // Never seed the radio with the artist we are coming from, and never
+        // twice with the same one — a duplicate name means a duplicate search
+        // for zero extra candidates.
+        if name.is_empty()
+            || name.eq_ignore_ascii_case(seed_artist.trim())
+            || !seen.insert(name.to_lowercase())
+        {
+            continue;
+        }
+        names.push(name);
+        if names.len() >= max {
+            break;
+        }
+    }
+    names
 }
 
 pub fn generate_queue(
@@ -252,7 +327,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_radio_takes_one_track_per_artist() {
         let names: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
-        let got = streaming_tracks_for_artist_names(&names, 10, |name| async move {
+        let no_exclusion = std::collections::HashSet::new();
+        let got = streaming_tracks_for_artist_names(&names, 10, &no_exclusion, |name| async move {
             // Chaque artiste renvoie trois titres : la radio n'en garde qu'un,
             // sinon elle enchaîne quatre morceaux du même artiste et devient
             // une playlist.
@@ -271,7 +347,8 @@ mod tests {
     async fn streaming_radio_stops_at_count_and_skips_empty_results() {
         let names: Vec<String> = ["A", "B", "C", "D"].iter().map(|s| s.to_string()).collect();
         // B ne renvoie rien : on saute, on ne s'arrête pas.
-        let got = streaming_tracks_for_artist_names(&names, 2, |name| async move {
+        let no_exclusion = std::collections::HashSet::new();
+        let got = streaming_tracks_for_artist_names(&names, 2, &no_exclusion, |name| async move {
             if name == "B" {
                 Vec::new()
             } else {
@@ -289,11 +366,192 @@ mod tests {
         // Deux artistes différents qui renvoient le MÊME enregistrement
         // (compilation, featuring) : il ne doit apparaître qu'une fois.
         let names: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
-        let got = streaming_tracks_for_artist_names(&names, 10, |name| async move {
+        let no_exclusion = std::collections::HashSet::new();
+        let got = streaming_tracks_for_artist_names(&names, 10, &no_exclusion, |name| async move {
             vec![stream_track("meme-id", &name)]
         })
         .await;
         assert_eq!(got.len(), 1);
+    }
+
+    fn stream_artist(id: &str, name: &str) -> crate::streaming::traits::StreamArtist {
+        crate::streaming::traits::StreamArtist {
+            id: id.into(),
+            name: name.into(),
+            image_path: None,
+            bio: None,
+        }
+    }
+
+    // --- Garde-fous de la radio streaming (#1553) ---
+
+    #[tokio::test]
+    async fn streaming_radio_never_replays_the_track_that_just_ended() {
+        // Sandro : la graine est « Money » (Qobuz 47683556). La recherche par
+        // artiste la renvoie evidemment en premier — sans exclusion, la radio
+        // rejoue la chanson qui vient de se terminer.
+        let names: Vec<String> = vec!["Pink Floyd".into()];
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert("47683556".to_string());
+        let got = streaming_tracks_for_artist_names(&names, 10, &exclude, |name| async move {
+            vec![
+                stream_track("47683556", &name),
+                stream_track("47683557", &name),
+            ]
+        })
+        .await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "47683557");
+    }
+
+    #[tokio::test]
+    async fn streaming_radio_never_duplicates_what_the_queue_already_holds() {
+        // Les ids deja en file sont exclus au meme titre que la graine : une
+        // radio relancee deux fois de suite ne doit pas empiler les doublons.
+        let names: Vec<String> = vec!["A".into(), "B".into()];
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert("deja-en-file".to_string());
+        let got = streaming_tracks_for_artist_names(&names, 10, &exclude, |name| async move {
+            if name == "A" {
+                vec![stream_track("deja-en-file", &name)]
+            } else {
+                vec![stream_track("nouveau", &name)]
+            }
+        })
+        .await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "nouveau");
+    }
+
+    // --- Deuxieme source de candidats : le service (#1553) ---
+
+    #[test]
+    fn seed_artist_id_never_lands_on_a_tribute_band() {
+        // Qobuz, requete « Pink Floyd » : le vrai groupe, puis deux hommages.
+        // Prendre le premier resultat marcherait ici par chance ; exiger le nom
+        // exact protege le cas ou l'hommage sort en tete.
+        let hits = vec![
+            stream_artist("3778014", "The Australian Pink Floyd Show"),
+            stream_artist("38324", "Pink Floyd"),
+            stream_artist("5661969", "Pink Floyd Floydhead"),
+        ];
+        assert_eq!(
+            pick_seed_artist_id(&hits, "Pink Floyd").as_deref(),
+            Some("38324")
+        );
+    }
+
+    #[test]
+    fn seed_artist_id_tolerates_case_and_spacing() {
+        let hits = vec![stream_artist("42", "Dave Brubeck")];
+        assert_eq!(
+            pick_seed_artist_id(&hits, "  dave brubeck ").as_deref(),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn seed_artist_id_absent_rather_than_wrong() {
+        // Aucun nom exact : on rend None et l'appelant retombe, plutot que de
+        // batir la radio sur un artiste au hasard.
+        let hits = vec![stream_artist("3778014", "The Australian Pink Floyd Show")];
+        assert!(pick_seed_artist_id(&hits, "Pink Floyd").is_none());
+    }
+
+    #[tokio::test]
+    async fn service_similar_names_follow_the_catalogue() {
+        // Reponse reelle de /artist/getSimilarArtists pour Pink Floyd (38324).
+        let names = service_similar_artist_names(
+            "Pink Floyd",
+            20,
+            |q| async move {
+                assert_eq!(q, "Pink Floyd");
+                vec![stream_artist("38324", "Pink Floyd")]
+            },
+            |id| async move {
+                assert_eq!(id, "38324");
+                vec![
+                    stream_artist("1191678", "King Crimson"),
+                    stream_artist("26718", "Yes"),
+                    stream_artist("43821", "Queen"),
+                ]
+            },
+        )
+        .await;
+        assert_eq!(names, vec!["King Crimson", "Yes", "Queen"]);
+    }
+
+    #[tokio::test]
+    async fn service_similar_names_drop_the_seed_and_the_duplicates() {
+        let names = service_similar_artist_names(
+            "Pink Floyd",
+            20,
+            |_| async { vec![stream_artist("38324", "Pink Floyd")] },
+            |_| async {
+                vec![
+                    // Le service se cite lui-meme : on ne relance pas la radio
+                    // sur l'artiste dont on sort.
+                    stream_artist("38324", "PINK FLOYD"),
+                    stream_artist("26718", "Yes"),
+                    // Meme artiste, deux entrees : une seule recherche.
+                    stream_artist("26719", "yes"),
+                    stream_artist("0", "   "),
+                ]
+            },
+        )
+        .await;
+        assert_eq!(names, vec!["Yes"]);
+    }
+
+    #[tokio::test]
+    async fn service_similar_names_bounded_by_max() {
+        let names = service_similar_artist_names(
+            "A",
+            2,
+            |_| async { vec![stream_artist("1", "A")] },
+            |_| async {
+                (0..50)
+                    .map(|i| stream_artist(&format!("{i}"), &format!("Artiste {i}")))
+                    .collect()
+            },
+        )
+        .await;
+        assert_eq!(names.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn service_similar_names_stop_before_the_second_call_when_seed_unresolved() {
+        // Le service ne connait pas l'artiste : un seul appel reseau, pas deux.
+        let called = std::cell::Cell::new(false);
+        let names = service_similar_artist_names(
+            "Artiste Inconnu",
+            20,
+            |_| async { Vec::new() },
+            |_| {
+                called.set(true);
+                async { vec![stream_artist("1", "Quelqu'un")] }
+            },
+        )
+        .await;
+        assert!(names.is_empty());
+        assert!(!called.get(), "aucun appel similaires sans graine resolue");
+    }
+
+    #[tokio::test]
+    async fn service_similar_names_empty_seed_asks_nothing() {
+        let called = std::cell::Cell::new(false);
+        let names = service_similar_artist_names(
+            "   ",
+            20,
+            |_| {
+                called.set(true);
+                async { vec![stream_artist("1", "X")] }
+            },
+            |_| async { Vec::new() },
+        )
+        .await;
+        assert!(names.is_empty());
+        assert!(!called.get());
     }
 
     fn test_db() -> std::sync::Arc<dyn crate::db::backend::DbBackend> {
