@@ -362,6 +362,11 @@ pub async fn run_with(opts: RunOptions) {
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
     crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done);
 
+    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
+    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
+    // « 0 fichier » (#1692).
+    crate::startup::remount_network_shares(&state).await;
+
     // Register local audio outputs (USB DAC, headphones, speakers)
     #[cfg(feature = "local-audio")]
     crate::startup::register_local_outputs(&state).await;
