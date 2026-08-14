@@ -540,6 +540,22 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
+            // C'est CE scan-ci qui frappait Dominique : il tourne au démarrage
+            // du service, précisément au moment où un montage SMB peut ne pas
+            // encore être là. Le point de montage existe, il est lisible, il
+            // est vide — et la bibliothèque partait avec (#1652).
+            let existing_refs: Vec<&str> = existing_tracks.keys().map(|s| s.as_str()).collect();
+            let emptied_roots = crate::routes::system::scan::roots_gone_empty(
+                &music_dirs,
+                &existing_refs,
+                &discovered_paths,
+            );
+            if !emptied_roots.is_empty() {
+                tracing::error!(
+                    roots = ?emptied_roots,
+                    "auto_scan_root_went_empty — ce dossier contenait des pistes et n'en présente plus aucune. Montage absent ? Les pistes sont CONSERVÉES."
+                );
+            }
             let mut pruned = 0i64;
             let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
@@ -547,6 +563,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     let in_unreadable_scope = missing_dirs
                         .iter()
                         .chain(error_dirs.iter())
+                        .chain(emptied_roots.iter())
                         .any(|d| db_path.starts_with(d));
                     if in_unreadable_scope {
                         protected += 1;
