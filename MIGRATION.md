@@ -302,7 +302,7 @@ volumes:
   tune-data:
 ```
 
-The Docker image uses a multi-stage build: Rust compilation on `rust:1-slim-bookworm`, runtime on `debian:bookworm-slim` with FFmpeg and ca-certificates.
+The Docker image uses a multi-stage build: Rust compilation on `rust:1-slim-bookworm`, runtime on `debian:bookworm-slim` with ca-certificates (FFmpeg left the project in v0.8.46 — decoding and encoding are native).
 
 ---
 

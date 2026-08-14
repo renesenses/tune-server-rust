@@ -553,14 +553,16 @@ fn spawn_token_refresher(state: &AppState) {
 
 async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
     if let Some(ref upnp) = state.upnp {
-        let location = format!(
-            "http://{}:{}/upnp/description.xml",
-            tune_core::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into()),
+        // La LOCATION n'est plus figée ici : l'annonceur recalcule l'IP à
+        // chaque cycle et n'annonce rien tant qu'aucune IP réseau n'est
+        // disponible — l'ancien repli « 127.0.0.1 » calculé une fois au
+        // démarrage publiait du loopback à vie (#1614).
+        tune_core::upnp_server::spawn_ssdp_advertiser(
+            upnp.uuid.clone(),
             config.port,
-        );
-        tune_core::upnp_server::spawn_ssdp_advertiser(upnp.uuid.clone(), location).await;
+            config.advertised_ip.clone(),
+        )
+        .await;
         info!("upnp_mediaserver_advertiser_started");
     }
 }
@@ -1323,6 +1325,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
     // Phase 1: Register new devices and remove stale ones (hold lock briefly)
     let mut new_devices_to_zone: Vec<(String, String, bool)> = Vec::new();
+    let mut removed_device_ids: Vec<String> = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         let existing_ids: std::collections::HashSet<String> = outputs
@@ -1406,6 +1409,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             if !is_playing {
                 outputs.remove(old_id);
                 info!(device_id = %old_id, "local_audio_device_removed");
+                removed_device_ids.push(old_id.clone());
             }
         }
 
@@ -1417,6 +1421,23 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             );
         }
     } // outputs lock released here
+
+    // Phase 2a: Mark zones of unplugged devices offline and tell the clients
+    // (no lock held). Without this the zone stayed listed as playable after a
+    // USB DAC unplug even though its output was gone (#1626). The zone itself
+    // is kept: when the DAC comes back, the re-registration path below flips
+    // it online again — automatic recovery.
+    if !removed_device_ids.is_empty() {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        for device_id in &removed_device_ids {
+            let _ = zone_repo.set_online_by_device(device_id, false);
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::ZoneUpdated,
+                serde_json::json!({ "device_id": device_id, "online": false }),
+            );
+            info!(device_id = %device_id, "local_audio_zone_set_offline");
+        }
+    }
 
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
