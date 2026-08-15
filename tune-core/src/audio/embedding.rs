@@ -614,7 +614,12 @@ pub(super) async fn ensure_file(
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     info!(url, dest = %dest.display(), what, "asset_downloading");
-    let bytes = reqwest::get(url)
+    // Client partagé et non `reqwest::get` : le client par défaut de reqwest
+    // s'en remet à `rustls-platform-verifier`, que la build FFI Android
+    // n'initialise jamais. Voir `crate::http::client`.
+    let bytes = crate::http::client::long_timeout()
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("download: {e}"))?
         .error_for_status()
