@@ -1031,6 +1031,57 @@ jobs:
             echo "::warning::Webhook returned HTTP $STATUS — /download may not be updated"
           fi
 
+  android:
+    name: Trigger Android build (tune-server-flutter)
+    needs: [publish]
+    # Stable tags only — un client ne se construit pas sur une pre-release.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    steps:
+      # La CI Android existe déjà dans tune-server-flutter (APK signé +
+      # Firebase App Distribution) mais son déclencheur — poser le tag v* —
+      # était MANUEL et régulièrement oublié (point 14, revue 2026-08-15).
+      # Ce job pose le tag automatiquement, avec deux garde-fous :
+      # - le bump reste la décision de Bertrand : si `bump-all.sh --clients`
+      #   n'est pas passé (pubspec ≠ tag serveur), on n'y touche pas ;
+      # - jamais bloquant pour la release serveur : tout échec = warning.
+      - name: Tag tune-server-flutter (déclenche sa release CI)
+        env:
+          TOKEN: ${{ secrets.CLIENTS_REPO_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::CLIENTS_REPO_TOKEN absent — Android non déclenché. Créer un PAT (contents:write sur renesenses/tune-server-flutter) et l'ajouter aux secrets."
+            exit 0
+          fi
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          AUTH="Authorization: Bearer $TOKEN"
+          API="https://api.github.com/repos/renesenses/tune-server-flutter"
+
+          # Garde-fou drift : ne taguer que si le bump clients est passé.
+          FLUTTER_VER=$(curl -sf -H "$AUTH" "$API/contents/pubspec.yaml?ref=main" \
+            | jq -r .content | base64 -d | grep -E '^version:' | sed 's/version: *//; s/+.*//' || echo "")
+          if [ "$FLUTTER_VER" != "$VER" ]; then
+            echo "::warning::pubspec.yaml de tune-server-flutter ($FLUTTER_VER) ≠ tag serveur ($VER) — bump-all.sh --clients n'est pas passé, Android non déclenché."
+            exit 0
+          fi
+
+          SHA=$(curl -sf -H "$AUTH" "$API/git/ref/heads/main" | jq -r .object.sha)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::warning::Impossible de lire le HEAD de tune-server-flutter — Android non déclenché."
+            exit 0
+          fi
+          STATUS=$(curl -s -o /tmp/resp -w "%{http_code}" -X POST -H "$AUTH" \
+            -d "{\"ref\": \"refs/tags/${TAG}\", \"sha\": \"${SHA}\"}" \
+            "$API/git/refs")
+          if [ "$STATUS" = "201" ]; then
+            echo "Tag ${TAG} posé sur tune-server-flutter (${SHA}) — build Android déclenchée."
+          elif [ "$STATUS" = "422" ] && grep -q "already exists" /tmp/resp; then
+            echo "Tag ${TAG} déjà présent sur tune-server-flutter — rien à faire."
+          else
+            echo "::warning::Pose du tag refusée (HTTP $STATUS) : $(cat /tmp/resp)"
+          fi
+
   forum:
     name: Announce on mozaiklabs forum
     needs: release
