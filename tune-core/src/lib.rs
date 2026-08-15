@@ -69,6 +69,7 @@ pub mod stream_cache;
 pub mod streaming;
 pub mod transcode_cache;
 pub mod updater;
+pub mod upnp_renderer;
 pub mod upnp_server;
 pub mod user_profiles;
 pub mod ytdlp;
