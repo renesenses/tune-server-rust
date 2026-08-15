@@ -19,6 +19,33 @@ pub fn folder_like_pattern(prefix: &str) -> String {
     format!("{base}{sep}%")
 }
 
+/// SQL suffix that must follow every `LIKE` whose pattern is a **file path**.
+///
+/// Postgres treats a backslash inside a `LIKE` pattern as the default escape
+/// character; SQLite has no default escape character at all. Folder patterns
+/// are built from absolute paths, so on a Windows host the pattern reads
+/// `G:\Blues 2\%` — Postgres consumes the trailing `\%` as a *literal* percent
+/// sign, the pattern degrades to the literal string `G:Blues 2%`, and it
+/// matches no row. Every folder then reports "0 pistes" while the library is
+/// perfectly scanned (JF, Windows + Postgres: all four roots empty in
+/// Répertoires, and the data-derived fallback root fell to zero too because it
+/// reuses the same pattern).
+///
+/// `ESCAPE ''` selects *no* escape character, which is exactly SQLite's
+/// behaviour — so both engines now read the backslash literally. SQLite rejects
+/// an empty ESCAPE string, hence the bare `LIKE` there: its semantics are
+/// already the target ones, so this is a no-op on SQLite by construction.
+///
+/// Known and unchanged on both engines: `%` and `_` inside a real folder name
+/// still act as wildcards (over-match, never under-match). Escaping them would
+/// require an escape character, which is what we are deliberately giving up.
+pub fn like_escape_clause(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => " ESCAPE ''",
+        Engine::Sqlite => "",
+    }
+}
+
 /// The longest common directory prefix of all `tracks.file_path` — the real
 /// library root inferred from the data. Fallback for the folder views (Oxygen
 /// facet, browse "Répertoires") when `music_dirs` is stale and its configured
@@ -78,6 +105,33 @@ mod common_root_tests {
         assert_eq!(common_prefix("same", "same"), "same");
         // Multibyte: must cut on a char boundary, never mid-codepoint.
         assert_eq!(common_prefix("/muské/a", "/muskà/b"), "/musk");
+    }
+}
+
+#[cfg(test)]
+mod like_escape_tests {
+    use super::{Engine, like_escape_clause};
+
+    /// Regression guard for the Windows + Postgres "Dossier vide" bug: a folder
+    /// pattern built from `G:\Blues 2` ends in `\%`, which Postgres reads as an
+    /// escaped — hence literal — percent sign unless the escape mechanism is
+    /// switched off. Verified against PostgreSQL 15: without the clause the
+    /// count is 0, with it the count is right. Deleting this suffix silently
+    /// empties the Répertoires view and the Oxygen folder drill-down for every
+    /// Windows user on Postgres — and only for them, which is why it went
+    /// unnoticed.
+    #[test]
+    fn postgres_disables_the_backslash_escape() {
+        assert_eq!(like_escape_clause(Engine::Postgres), " ESCAPE ''");
+    }
+
+    /// SQLite has no default escape character, so a bare LIKE already reads the
+    /// backslash literally — and it *rejects* an empty ESCAPE string
+    /// ("ESCAPE expression must be a single character"). The clause must stay
+    /// empty here: this is a correctness constraint, not a style choice.
+    #[test]
+    fn sqlite_keeps_the_bare_like() {
+        assert_eq!(like_escape_clause(Engine::Sqlite), "");
     }
 }
 
@@ -721,7 +775,11 @@ impl TrackRepo {
         // under the selected directory subtree. The current breadcrumb path IS
         // the filter — recursive so a parent folder includes its sub-folders.
         if let Some(fld) = folder.filter(|s| !s.is_empty()) {
-            conditions.push(format!("t.file_path LIKE {}", make_ph(idx)));
+            conditions.push(format!(
+                "t.file_path LIKE {}{}",
+                make_ph(idx),
+                like_escape_clause(self.db.engine())
+            ));
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
             idx += 1;
         }
@@ -952,7 +1010,9 @@ impl TrackRepo {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
-        let sql = format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}");
+        let esc = like_escape_clause(self.db.engine());
+        let sql =
+            format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}{esc}");
         let like = format!("{dir_prefix}%");
         let params: [&dyn ToSqlValue; 1] = [&like];
         let rows = self.db.query_many(&sql, &params)?;

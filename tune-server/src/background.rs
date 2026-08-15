@@ -1475,6 +1475,49 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             } else {
                 dev_name.clone()
             };
+
+            // « Creer les zones automatiquement » vaut ICI aussi.
+            //
+            // Ce chemin etait le SEUL des cinq a ne pas consulter le reglage :
+            // `startup.rs`, et les trois chemins de decouverte de
+            // `discovery_setup.rs` (SSDP, mDNS, fournisseur) le lisent tous.
+            // #1577 n'avait couvert que le demarrage.
+            //
+            // Le defaut se voit surtout au basculement ASIO -> WASAPI (#1770,
+            // DEvir). Tant qu'ASIO est configure, le `continue` ci-dessus
+            // suspend la creation : les endpoints WASAPI sont enregistres dans
+            // l'`OutputRegistry` mais n'obtiennent AUCUNE ligne en base. Au
+            // premier tick apres la bascule, la retenue saute d'un coup et
+            // chaque endpoint reclame sa zone. Supprimer toutes les zones juste
+            // avant ne protege de rien : `delete_all` masque des lignes, or il
+            // n'y en avait aucune a masquer. L'utilisateur cree UNE zone et en
+            // voit apparaitre une par peripherique dans les deux minutes.
+            //
+            // On ne bloque que la CREATION : une zone deja existante est
+            // renvoyee telle quelle par `get_or_create`, donc la reconnexion
+            // d'un peripherique connu reste intacte, reglage decoche ou non.
+            let auto_create =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                    .get("zone_auto_create")
+                    .ok()
+                    .flatten()
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+            if !auto_create
+                && zone_repo
+                    .get_by_device_id(device_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                info!(
+                    name = %zone_name,
+                    device_id = %device_id,
+                    "local_audio_hotplug_zone_auto_create_disabled_skipping"
+                );
+                continue;
+            }
+
             match zone_repo.get_or_create(&zone_name, Some("local"), device_id) {
                 Ok((zid, true)) => {
                     info!(
