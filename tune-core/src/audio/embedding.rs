@@ -459,7 +459,7 @@ pub async fn analyze_embedding_batch(
                              (track_id, model, embedding, analyzed_at) VALUES (?, ?, ?, ?) \
                              ON CONFLICT (track_id) DO UPDATE SET \
                              model = excluded.model, embedding = excluded.embedding, \
-                             analyzed_at = excluded.analyzed_at",
+                             analyzed_at = excluded.analyzed_at, source = NULL",
                             &[row],
                         )
                         .into_iter()
@@ -843,6 +843,23 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         // More to do — loop promptly; the per-file pauses throttle.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         continue;
+                    }
+                    // Passe drainée : héritage vers les formats exclus (#1732
+                    // phase 1). Le DSD n'est jamais analysé — quand la même
+                    // piste existe en FLAC analysé, on copie son vecteur pour
+                    // qu'elle remonte dans les ambiances. Pur SQL, pas de
+                    // décodage : sa place est APRÈS l'analyse, jamais à la
+                    // place d'un lot.
+                    let inherited = {
+                        let backend = backend.clone();
+                        tokio::task::spawn_blocking(move || {
+                            embedding_store::inherit_from_local_twins(&backend)
+                        })
+                        .await
+                        .unwrap_or(0)
+                    };
+                    if inherited > 0 {
+                        info!(inherited, "audio_embed_inherited_from_twins");
                     }
                 }
             }

@@ -1950,6 +1950,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "favorites", "item_artist", "TEXT");
     add_column_if_missing(db, "favorites", "item_path", "TEXT");
 
+    // Provenance d'un embedding CLAP (#1732 phase 1) : NULL = analysé sur le
+    // fichier, 'inherited:<id>' = copié depuis une jumelle (le DSD est exclu
+    // de l'analyse ; l'héritage est sa seule voie vers les ambiances). Passe
+    // de sûreté idempotente, PG : migration 025.
+    add_column_if_missing(db, "track_audio_embedding", "source", "TEXT");
+
     // Persistent "date added" side table (survives full rescan). CREATE IF NOT
     // EXISTS here too so DBs from any prior version get it regardless of which
     // migration version they came from.
@@ -2167,6 +2173,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         24,
         "dsd_replaygain_rescale",
         include_str!("../../migrations/postgres/024_dsd_replaygain_rescale.sql"),
+    ),
+    (
+        25,
+        "embedding_source",
+        include_str!("../../migrations/postgres/025_embedding_source.sql"),
     ),
 ];
 
