@@ -30,12 +30,39 @@ struct RendererSession {
     title: Option<String>,
     artist: Option<String>,
     duration_ms: Option<i64>,
+    /// Piste suivante (SetNextAVTransportURI) — enchaînée par le watcher
+    /// quand la courante se termine. Un Stop commandé ou un nouveau
+    /// SetAVTransportURI l'efface : enchaîner après un arrêt voulu serait
+    /// une surprise, pas du gapless.
+    next: Option<NextItem>,
+}
+
+#[derive(Debug, Clone)]
+struct NextItem {
+    uri: String,
+    title: Option<String>,
+    artist: Option<String>,
+    duration_ms: Option<i64>,
 }
 
 fn sessions() -> &'static Mutex<HashMap<i64, RendererSession>> {
     static SESSIONS: std::sync::OnceLock<Mutex<HashMap<i64, RendererSession>>> =
         std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Zones dont le watcher d'enchaînement tourne déjà — un seul par zone.
+fn watchers() -> &'static Mutex<std::collections::HashSet<i64>> {
+    static WATCHERS: std::sync::OnceLock<Mutex<std::collections::HashSet<i64>>> =
+        std::sync::OnceLock::new();
+    WATCHERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Réveil de l'annonceur SSDP : un opt-in fraîchement activé doit s'annoncer
+/// tout de suite, pas au prochain cycle de 10 minutes.
+pub fn advertiser_wakeup() -> &'static tokio::sync::Notify {
+    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
 }
 
 pub fn router() -> Router<AppState> {
@@ -228,6 +255,8 @@ async fn avtransport_control(
             duration_ms,
         } => {
             if let Ok(mut s) = sessions().lock() {
+                // Nouveau contexte de lecture : la suivante en attente est
+                // celle de l'ANCIEN contexte, elle ne survit pas.
                 s.insert(
                     zone_id,
                     RendererSession {
@@ -235,10 +264,28 @@ async fn avtransport_control(
                         title,
                         artist,
                         duration_ms,
+                        next: None,
                     },
                 );
             }
             upnp_renderer::empty_response("SetAVTransportURI")
+        }
+        RendererCommand::SetNextUri {
+            uri,
+            title,
+            artist,
+            duration_ms,
+        } => {
+            if let Ok(mut s) = sessions().lock() {
+                s.entry(zone_id).or_default().next = Some(NextItem {
+                    uri,
+                    title,
+                    artist,
+                    duration_ms,
+                });
+            }
+            spawn_gapless_watcher(state.clone(), zone_id);
+            upnp_renderer::empty_response("SetNextAVTransportURI")
         }
         RendererCommand::Play => {
             let session = sessions()
@@ -283,6 +330,13 @@ async fn avtransport_control(
             upnp_renderer::empty_response("Pause")
         }
         RendererCommand::Stop => {
+            // Arrêt COMMANDÉ : la suivante en attente s'efface AVANT le stop,
+            // sinon le watcher lirait « stoppé + next posée » et relancerait.
+            if let Ok(mut s) = sessions().lock()
+                && let Some(session) = s.get_mut(&zone_id)
+            {
+                session.next = None;
+            }
             state.orchestrator.stop(zone_id, device_id.as_deref()).await;
             upnp_renderer::empty_response("Stop")
         }
@@ -355,6 +409,84 @@ async fn renderingcontrol_control(
     xml_response(xml)
 }
 
+/// Enchaîne la piste posée par SetNextAVTransportURI quand la courante se
+/// termine (#1750, gapless v1). Aucun événement de fin de piste n'existe sur
+/// le bus (`playback.stopped` n'est jamais émis) : on observe l'état toutes
+/// les 2 s. Enchaînement = la zone était en LECTURE avec une suivante posée,
+/// et passe à STOPPED — un arrêt commandé via notre Stop a déjà effacé la
+/// suivante, donc ne relance rien.
+///
+/// v1 assumée : l'enchaînement passe par un play complet — le contrat UPnP
+/// (le point de contrôle n'a pas à re-commander) est tenu, le zéro-gap réel
+/// viendra avec le préchargement orchestrateur.
+fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
+    {
+        let Ok(mut w) = watchers().lock() else { return };
+        if !w.insert(zone_id) {
+            return; // déjà un watcher sur cette zone
+        }
+    }
+    tokio::spawn(async move {
+        let mut was_playing = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let pending = sessions()
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&zone_id).and_then(|x| x.next.clone()));
+            let Some(next) = pending else { break };
+
+            let ps = state.playback.get_state(zone_id).await;
+            match ps.state {
+                tune_core::playback::PlayState::Playing => was_playing = true,
+                tune_core::playback::PlayState::Paused => {}
+                tune_core::playback::PlayState::Stopped if was_playing => {
+                    // Fin naturelle : promouvoir la suivante et relancer.
+                    if let Ok(mut s) = sessions().lock() {
+                        s.insert(
+                            zone_id,
+                            RendererSession {
+                                uri: next.uri.clone(),
+                                title: next.title.clone(),
+                                artist: next.artist.clone(),
+                                duration_ms: next.duration_ms,
+                                next: None,
+                            },
+                        );
+                    }
+                    let device_id = ZoneRepo::with_backend(state.backend.clone())
+                        .get(zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id);
+                    let req = tune_core::orchestrator::PlayRequest {
+                        zone_id,
+                        output_device_id: device_id,
+                        track_id: None,
+                        source: Some("upnp".into()),
+                        source_id: Some(next.uri.clone()),
+                        title: next.title,
+                        artist_name: next.artist,
+                        duration_ms: next.duration_ms,
+                        ..Default::default()
+                    };
+                    match state.orchestrator.play(req).await {
+                        Ok(_) => info!(zone_id, uri = %next.uri, "upnp_renderer_gapless_advance"),
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed")
+                        }
+                    }
+                    break;
+                }
+                tune_core::playback::PlayState::Stopped => {}
+            }
+        }
+        if let Ok(mut w) = watchers().lock() {
+            w.remove(&zone_id);
+        }
+    });
+}
+
 /// Annonceur SSDP des renderers de zones opt-in. Relit la liste à CHAQUE
 /// cycle (une zone activée/désactivée prend effet sans redémarrage) et
 /// alimente le registre lu par le répondeur M-SEARCH.
@@ -398,7 +530,12 @@ pub fn spawn_renderer_advertiser(state: AppState) {
                 }
             }
             tune_core::upnp_renderer::set_renderer_adverts(adverts);
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            // Cycle standard de 10 min, mais un opt-in fraîchement activé
+            // (PATCH upnp_renderer) réveille la boucle tout de suite.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {}
+                _ = advertiser_wakeup().notified() => {}
+            }
         }
     });
 }
