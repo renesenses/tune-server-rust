@@ -165,7 +165,11 @@ pub(super) fn build_conditions(
     // endpoint (exclude = a real field name) always applies it.
     if exclude != "folder" {
         if let Some(fld) = q.folder.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!("t.file_path LIKE {}", ph(idx)));
+            conds.push(format!(
+                "t.file_path LIKE {}{}",
+                ph(idx),
+                tune_core::db::track_repo::like_escape_clause(engine)
+            ));
             params.push(SqlValue::Text(
                 tune_core::db::track_repo::folder_like_pattern(fld),
             ));
