@@ -18,6 +18,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_position_poller(state);
     spawn_token_refresher(state);
     spawn_upnp_advertiser(state, config).await;
+    // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
+    // cycle — l'opt-in d'une zone prend effet sans redémarrage.
+    crate::routes::upnp_media_renderer::spawn_renderer_advertiser(state.clone());
     configure_deezer_proxy(state, config).await;
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);

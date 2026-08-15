@@ -173,6 +173,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
+        .route("/{id}/device-presets", get(get_device_presets))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
@@ -1773,6 +1774,10 @@ async fn patch_zone(
     // dependre en rien de la disponibilite du site.
     if body.brand.is_some() || body.model.is_some() {
         push_device_correction(&state, id).await;
+        // Dans la foulée : les réglages qui marchent chez cet utilisateur pour
+        // cet appareil identifié (#1743) — c'est au moment où il nomme son
+        // appareil qu'on sait à quoi rattacher le préréglage.
+        push_device_preset(&state, id).await;
     }
 
     get_zone(State(state), Path(id)).await.into_response()
@@ -1790,6 +1795,169 @@ async fn patch_zone(
 ///
 /// Volontairement anonyme : ni identifiant d'instance, ni nom de zone. Le
 /// serveur n'attend pas la reponse et n'echoue jamais la-dessus.
+/// Réglages de renderer non-défaut d'une zone, sous la forme partagée avec le
+/// catalogue communautaire (clés du RendererConfig + trim). Vide quand la zone
+/// est aux défauts — un préréglage qui ne règle rien n'apprend rien.
+fn renderer_settings_snapshot(state: &AppState, zone_id: i64) -> serde_json::Map<String, Value> {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let mut out = serde_json::Map::new();
+    if repo.get_dlna_native_flac(zone_id) {
+        out.insert("dlna_native_flac".into(), json!(true));
+    }
+    if repo.get_alac_passthrough(zone_id) {
+        out.insert("alac_passthrough".into(), json!(true));
+    }
+    if repo.get_dlna_lpcm(zone_id) {
+        out.insert("dlna_lpcm".into(), json!(true));
+    }
+    if repo.get_dlna_cap_16bit(zone_id) {
+        out.insert("dlna_cap_16bit".into(), json!(true));
+    }
+    if repo.get_dlna_wav24(zone_id) {
+        out.insert("dlna_wav24".into(), json!(true));
+    }
+    let delay = repo.get_dlna_play_delay_ms(zone_id);
+    if delay > 0 {
+        out.insert("dlna_play_delay_ms".into(), json!(delay));
+    }
+    let trim = settings
+        .get(&format!("zone_{zone_id}_gain_trim_db"))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if trim != 0.0 {
+        out.insert("gain_trim_db".into(), json!(trim));
+    }
+    out
+}
+
+/// Identité (marque, modèle) d'une zone pour le catalogue communautaire :
+/// override utilisateur d'abord, sinon détection UPnP de l'appareil assigné.
+async fn zone_identity_for_catalog(state: &AppState, zone_id: i64) -> Option<(String, String)> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let key = |k: &str| {
+        settings
+            .get(&format!("zone_{zone_id}_{k}"))
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+    };
+    let (mut brand, mut model) = (key("brand"), key("model"));
+    if brand.is_none() || model.is_none() {
+        let zone = ZoneRepo::with_backend(state.backend.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()?;
+        let devices = state.scanner.devices().await;
+        let detected = zone
+            .output_device_id
+            .as_deref()
+            .and_then(|did| devices.iter().find(|d| d.id == did));
+        if brand.is_none() {
+            brand = detected.and_then(|d| d.manufacturer.clone());
+        }
+        if model.is_none() {
+            model = detected.and_then(|d| d.model.clone());
+        }
+    }
+    match (brand, model) {
+        (Some(b), Some(m)) => Some((b, m)),
+        _ => None,
+    }
+}
+
+/// GET /zones/{id}/device-presets — les préréglages communautaires pour
+/// l'appareil de la zone (#1743). Proxy serveur vers mozaiklabs : le
+/// navigateur ne parle jamais au site (CORS, vie privée), et un site
+/// injoignable rend une liste vide — jamais une erreur, la page Appareils
+/// n'a pas à dépendre du réseau extérieur.
+async fn get_device_presets(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let empty = || Json(json!({"presets": []})).into_response();
+    let Some((brand, model)) = zone_identity_for_catalog(&state, id).await else {
+        return empty();
+    };
+    let zone = ZoneRepo::with_backend(state.backend.clone())
+        .get(id)
+        .ok()
+        .flatten();
+    let Ok(client) = tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return empty();
+    };
+    let mut req = client
+        .get("https://mozaiklabs.fr/api/v1/community/devices/presets")
+        .query(&[("brand", brand.as_str()), ("model", model.as_str())]);
+    if let Some(ot) = zone.as_ref().and_then(|z| z.output_type.clone()) {
+        req = req.query(&[("output_type", ot)]);
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+            Ok(v) => Json(v).into_response(),
+            Err(_) => empty(),
+        },
+        Ok(r) => {
+            tracing::debug!(status = %r.status(), "device_presets_fetch_non_success");
+            empty()
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "device_presets_fetch_failed");
+            empty()
+        }
+    }
+}
+
+/// Partage les réglages de renderer d'une zone identifiée avec le catalogue
+/// communautaire (#1743). Mêmes principes que push_device_correction :
+/// anonyme, gaté télémétrie, best-effort en tâche de fond. Ne part que si
+/// marque ET modèle sont connus et qu'au moins un réglage diffère des
+/// défauts.
+async fn push_device_preset(state: &AppState, zone_id: i64) {
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+        return;
+    }
+    let Some((brand, model)) = zone_identity_for_catalog(state, zone_id).await else {
+        return;
+    };
+    let settings_map = renderer_settings_snapshot(state, zone_id);
+    if settings_map.is_empty() {
+        return;
+    }
+    let zone = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten();
+    let payload = json!({
+        "brand": brand,
+        "model": model,
+        "output_type": zone.and_then(|z| z.output_type),
+        "settings": Value::Object(settings_map),
+    });
+    tokio::spawn(async move {
+        let Ok(client) = tune_core::http::client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return;
+        };
+        match client
+            .post("https://mozaiklabs.fr/api/v1/community/devices/presets")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::debug!(status = %r.status(), "device_preset_pushed"),
+            Err(e) => tracing::debug!(error = %e, "device_preset_push_failed"),
+        }
+    });
+}
+
 async fn push_device_correction(state: &AppState, zone_id: i64) {
     if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
         return;
