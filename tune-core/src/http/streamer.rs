@@ -6,8 +6,11 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
 use crate::audio::wav::{
+    build_wav_header_bounded_live as wav_header_bounded_live,
     build_wav_header_streaming as wav_header_streaming, build_wav_header_with_duration,
 };
+
+pub use crate::audio::wav::{LIVE_BOUNDED_DATA_SIZE, LIVE_BOUNDED_TOTAL_LEN};
 
 pub const ICY_METAINT: usize = 16384;
 
@@ -732,6 +735,13 @@ pub fn build_wav_header(
 /// buffered the finite `data` size.
 pub fn build_wav_header_streaming(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
     wav_header_streaming(channels, sample_rate, bit_depth)
+}
+
+/// Build a WAV header for a live radio stream served with the *file* contract
+/// (`Content-Length` + `Range`) that chunked-hostile renderers require — the
+/// darTZeel LHC-208 will not start without it (#1689).
+pub fn build_wav_header_bounded_live(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    wav_header_bounded_live(channels, sample_rate, bit_depth)
 }
 
 /// Check if a file path is a temporary transcode file created by the

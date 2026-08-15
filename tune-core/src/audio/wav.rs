@@ -1,6 +1,38 @@
+/// Largest `data` chunk size we advertise when the real length is unknown.
+///
+/// Not `0x7FFF_FFFF`: the RIFF size is `data_size + 36`, so the obvious
+/// `i32::MAX` makes the RIFF field `0x8000_0023` — **negative** for any parser
+/// that reads it into a signed 32-bit integer. Backing off by 36 bytes puts the
+/// RIFF size at exactly `i32::MAX` and keeps both fields positive (#1689). The
+/// 36 bytes lost out of 2 GiB are ~0.2 ms of CD audio.
+const UNKNOWN_DATA_SIZE: u32 = 0x7FFF_FFFF - 36;
+
+/// Total response length announced for a live stream served with the *file*
+/// contract — `Content-Length` + `Range` — instead of a chunked, length-less
+/// body.
+///
+/// Some renderers refuse chunked transfer outright and will not start without a
+/// length (darTZeel LHC-208, session support du 01/08 ; #1689). A live stream
+/// has no length, so we announce one: as large as possible while staying
+/// positive in a signed 32-bit integer, header included. `i32::MAX` is ~2 GiB
+/// ≈ 3 h 22 of 44.1/16/2 — longer than any listening session, and the stream
+/// simply ends early if the station stops, exactly as it does today.
+pub const LIVE_BOUNDED_TOTAL_LEN: u64 = i32::MAX as u64;
+
+/// `data` chunk size matching [`LIVE_BOUNDED_TOTAL_LEN`], header deducted.
+pub const LIVE_BOUNDED_DATA_SIZE: u32 = (LIVE_BOUNDED_TOTAL_LEN - 44) as u32;
+
+/// Build the 44-byte WAV header for a live stream served as a bounded file.
+/// Sizes are finite and positive as `i32`, so a renderer that parses the header
+/// to plan a ranged fetch can do so (see [`LIVE_BOUNDED_TOTAL_LEN`]).
+pub fn build_wav_header_bounded_live(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    build_wav_header_with_data_size(channels, sample_rate, bit_depth, LIVE_BOUNDED_DATA_SIZE)
+}
+
 /// Build a 44-byte WAV header. When `duration_ms` is provided, the header
 /// contains the correct data size so DLNA renderers don't need to probe
-/// the stream end. Falls back to max u32 for unknown-length streams.
+/// the stream end. Falls back to [`UNKNOWN_DATA_SIZE`] for unknown-length
+/// streams.
 pub fn build_wav_header(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
     build_wav_header_with_duration(channels, sample_rate, bit_depth, None)
 }
@@ -12,10 +44,16 @@ pub fn build_wav_header_with_duration(
     duration_ms: Option<u64>,
 ) -> [u8; 44] {
     let data_size: u32 = if let Some(dur) = duration_ms {
-        let bytes = dur * sample_rate as u64 * channels as u64 * (bit_depth as u64 / 8) / 1000;
-        bytes.min(0x7FFF_FFFF) as u32
+        // Saturant : une durée aberrante (tag corrompu) débordait le produit et
+        // faisait paniquer le constructeur d'en-tête en debug.
+        let bytes = dur
+            .saturating_mul(sample_rate as u64)
+            .saturating_mul(channels as u64)
+            .saturating_mul(bit_depth as u64 / 8)
+            / 1000;
+        bytes.min(UNKNOWN_DATA_SIZE as u64) as u32
     } else {
-        0x7FFF_FFFF
+        UNKNOWN_DATA_SIZE
     };
     build_wav_header_with_data_size(channels, sample_rate, bit_depth, data_size)
 }
@@ -131,7 +169,59 @@ mod tests {
     fn wav_header_data_size() {
         let h = build_wav_header(2, 44100, 16);
         let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
-        assert_eq!(data_size, 0x7FFF_FFFF);
+        assert_eq!(data_size, UNKNOWN_DATA_SIZE);
+    }
+
+    #[test]
+    fn unknown_length_header_stays_positive_as_a_signed_int() {
+        // Un lecteur qui lit ces deux champs dans un entier 32 bits SIGNÉ doit
+        // y voir une taille positive. Avec 0x7FFF_FFFF, le champ RIFF valait
+        // data + 36 = 0x8000_0023, soit -2147483613 : « plus rien à lire »
+        // avant même d'avoir commencé (#1689).
+        let h = build_wav_header(2, 44100, 16);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert!(data_size as i32 > 0, "data size must be a positive i32");
+        assert!(riff_size as i32 > 0, "RIFF size must be a positive i32");
+        assert_eq!(riff_size, i32::MAX as u32);
+    }
+
+    #[test]
+    fn bounded_live_header_and_content_length_agree_and_stay_positive() {
+        // Le lecteur lit Content-Length ET les tailles de l'en-tête. Les trois
+        // doivent rester positives en 32 bits signés, et l'en-tête doit décrire
+        // exactement le nombre d'octets annoncé par Content-Length (#1689).
+        let h = build_wav_header_bounded_live(2, 44100, 16);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert_eq!(data_size, LIVE_BOUNDED_DATA_SIZE);
+        assert_eq!(
+            data_size as u64 + 44,
+            LIVE_BOUNDED_TOTAL_LEN,
+            "en-tête + data doivent faire exactement le Content-Length annoncé"
+        );
+        assert!(LIVE_BOUNDED_TOTAL_LEN <= i32::MAX as u64);
+        assert!(data_size as i32 > 0);
+        assert!(riff_size as i32 > 0);
+        // Le format décrit toujours le vrai flux.
+        assert_eq!(u32::from_le_bytes([h[24], h[25], h[26], h[27]]), 44100);
+        assert_eq!(u16::from_le_bytes([h[22], h[23]]), 2);
+    }
+
+    #[test]
+    fn bounded_live_covers_a_long_listening_session() {
+        // ~3 h 22 en 44,1/16/2 : plus long que n'importe quelle écoute.
+        let secs = LIVE_BOUNDED_DATA_SIZE as u64 / (44100 * 2 * 2);
+        assert!(secs > 3 * 3600, "seulement {secs} s de direct annoncées");
+    }
+
+    #[test]
+    fn wav_header_with_duration_is_clamped_below_the_signed_limit() {
+        // Même garantie quand une durée absurde est fournie : le plafond doit
+        // laisser la place aux 36 octets d'en-tête.
+        let h = build_wav_header_with_duration(2, 192_000, 24, Some(u64::MAX / 1_000_000));
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert!(riff_size as i32 > 0, "RIFF size must be a positive i32");
     }
 
     #[test]
@@ -148,7 +238,7 @@ mod tests {
     fn wav_header_without_duration_uses_max() {
         let h = build_wav_header_with_duration(2, 44100, 16, None);
         let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
-        assert_eq!(data_size, 0x7FFF_FFFF);
+        assert_eq!(data_size, UNKNOWN_DATA_SIZE);
     }
 
     #[test]
