@@ -101,8 +101,10 @@
       "name": "Bluesound",
       "models": [
         { "name": "Node", "quirks": {} },
+        { "name": "Node N130", "quirks": {} },
         { "name": "Node Icon", "quirks": {} },
         { "name": "Powernode", "quirks": {} },
+        { "name": "Vault", "quirks": {} },
         { "name": "Pulse Flex", "quirks": { "max_sample_rate": 48000 } }
       ]
     },
