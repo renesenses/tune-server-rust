@@ -86,16 +86,24 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 truncate -s "$IMAGE_SIZE" "$IMAGE_FILE"
 
-# Partition: 512M EFI + rest ext4
+# Partition: 1M BIOS boot (Legacy/CSM grub embedding) + 512M EFI + rest ext4.
+# The BIOS boot partition is what lets grub-install --target=i386-pc work at
+# all on a GPT disk: without a partition flagged bios_grub, grub has nowhere
+# to embed its core.img and refuses ("this GPT partition label has no BIOS
+# Boot Partition"), which is exactly why a Legacy/CSM-configured machine
+# could never boot this image before — there was no fallback for it, only
+# UEFI (--target=x86_64-efi).
 parted -s "$IMAGE_FILE" mklabel gpt
-parted -s "$IMAGE_FILE" mkpart ESP fat32 1MiB 513MiB
-parted -s "$IMAGE_FILE" set 1 esp on
-parted -s "$IMAGE_FILE" mkpart root ext4 513MiB 100%
+parted -s "$IMAGE_FILE" mkpart biosboot 1MiB 2MiB
+parted -s "$IMAGE_FILE" set 1 bios_grub on
+parted -s "$IMAGE_FILE" mkpart ESP fat32 2MiB 514MiB
+parted -s "$IMAGE_FILE" set 2 esp on
+parted -s "$IMAGE_FILE" mkpart root ext4 514MiB 100%
 
 # Setup loop device
 LOOP_DEV=$(losetup --find --show --partscan "$IMAGE_FILE")
-PART_EFI="${LOOP_DEV}p1"
-PART_ROOT="${LOOP_DEV}p2"
+PART_EFI="${LOOP_DEV}p2"
+PART_ROOT="${LOOP_DEV}p3"
 
 # Wait for partitions to appear
 sleep 1
@@ -151,7 +159,7 @@ chroot "$ROOTFS" bash -ec "
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq \
-        dbus udev kmod linux-image-amd64 grub-efi-amd64 sudo curl \
+        dbus udev kmod linux-image-amd64 grub-efi-amd64 grub-pc-bin sudo curl \
         ca-certificates avahi-daemon libnss-mdns alsa-utils wpasupplicant \
         network-manager openssh-server \
         firmware-iwlwifi firmware-realtek firmware-atheros firmware-brcm80211 \
@@ -482,20 +490,51 @@ exit 0
 EOF
 chmod +x "${ROOTFS}/etc/NetworkManager/dispatcher.d/50-tune-issue"
 
-# --- Install GRUB ---
-log "Installing GRUB bootloader..."
-chroot "$ROOTFS" grub-install --target=x86_64-efi \
-    --efi-directory=/boot/efi \
-    --bootloader-id=tune \
-    --removable \
-    --no-nvram 2>/dev/null || {
-    # Fallback: copy EFI binary manually
+# --- Install GRUB (UEFI, required + BIOS/Legacy, best-effort) ---
+#
+# Previously UEFI-only, and every failure (grub-install itself, the manual
+# EFI-binary fallback, update-grub) was swallowed with `|| true` with no
+# check afterward that a bootloader actually ended up on disk — an image
+# with NO bootloader at all could reach "ok GRUB installed" and get
+# published as a working build. Two independent testers reported images
+# that don't boot; this is very likely why, and would have been invisible
+# without actually mounting a published image to look (see PR discussion).
+#
+# Now: UEFI failure is FATAL (that's the regression — this used to work),
+# real errors are shown instead of hidden, and a post-install check
+# confirms EFI/BOOT/BOOTX64.EFI actually exists before declaring success.
+# BIOS/Legacy (--target=i386-pc, into the new bios_grub partition above) is
+# best-effort on top: a failure there is a warning, not a build-breaker,
+# since it's a net-new capability that didn't exist before this fix either.
+log "Installing GRUB bootloader (UEFI + BIOS/Legacy)..."
+
+UEFI_OK=1
+if ! chroot "$ROOTFS" grub-install --target=x86_64-efi \
+        --efi-directory=/boot/efi \
+        --bootloader-id=tune \
+        --removable \
+        --no-nvram; then
+    err "grub-install --target=x86_64-efi failed — trying the manual EFI binary fallback"
     mkdir -p "${ROOTFS}/boot/efi/EFI/BOOT"
     cp "${ROOTFS}/usr/lib/grub/x86_64-efi/monolithic/grubx64.efi" \
-       "${ROOTFS}/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null || true
-}
+       "${ROOTFS}/boot/efi/EFI/BOOT/BOOTX64.EFI" || UEFI_OK=0
+fi
+[[ -f "${ROOTFS}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || UEFI_OK=0
 
-# GRUB config
+if [[ "$UEFI_OK" -ne 1 ]]; then
+    err "EFI/BOOT/BOOTX64.EFI is absent after install + fallback — this image would NOT boot on real UEFI hardware. Aborting instead of publishing it."
+    exit 1
+fi
+ok "UEFI bootloader confirmed present (EFI/BOOT/BOOTX64.EFI)"
+
+if chroot "$ROOTFS" grub-install --target=i386-pc "$LOOP_DEV"; then
+    ok "BIOS/Legacy bootloader installed"
+else
+    err "grub-install --target=i386-pc failed — this image won't boot on a machine set to Legacy/CSM (UEFI boot still works)"
+fi
+
+# GRUB config — single grub.cfg under /boot/grub, used by both the UEFI and
+# the BIOS/Legacy core.img (each just locates it differently at early boot).
 cat > "${ROOTFS}/etc/default/grub" <<EOF
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=3
@@ -503,7 +542,7 @@ GRUB_CMDLINE_LINUX_DEFAULT="quiet"
 GRUB_CMDLINE_LINUX=""
 GRUB_DISABLE_OS_PROBER=true
 EOF
-chroot "$ROOTFS" update-grub 2>/dev/null || true
+chroot "$ROOTFS" update-grub
 
 ok "GRUB installed"
 
