@@ -914,6 +914,12 @@ async fn create_playlist_from_favorites(
         }
     };
 
+    // Même matcher que la cible streaming : l'ancien chemin prenait LE PREMIER
+    // résultat de la recherche plein-texte sans aucun scoring — « Nightswimming »
+    // capté sur FIP pouvait atterrir sur n'importe quelle piste dont le titre
+    // contient le mot. On score les 10 premiers candidats et on refuse sous le
+    // plancher approximatif (0.6), comme côté Qobuz.
+    use tune_core::library::track_matcher::{MatchCandidate, find_best_match};
     let mut matched = 0i64;
     for (title, artist) in &favorites {
         let q = if artist.is_empty() {
@@ -921,9 +927,27 @@ async fn create_playlist_from_favorites(
         } else {
             format!("{artist} {title}")
         };
-        if let Ok(results) = track_repo.search(&q, 1) {
-            if let Some(track) = results.first() {
-                if let Some(id) = track.id {
+        if let Ok(results) = track_repo.search(&q, 10) {
+            let candidates: Vec<MatchCandidate> = results
+                .iter()
+                .filter(|t| t.id.is_some())
+                .map(|t| MatchCandidate {
+                    title: t.title.clone(),
+                    artist_name: t.artist_name.clone().unwrap_or_default(),
+                    album_title: t.album_title.clone().unwrap_or_default(),
+                    source_id: t.id.unwrap_or(0).to_string(),
+                    duration_ms: t.duration_ms,
+                    isrc: String::new(),
+                    score: 0.0,
+                    match_method: String::new(),
+                    confidence: String::new(),
+                })
+                .collect();
+            let best = find_best_match(title, artist, "", 0, &candidates)
+                .best_match
+                .filter(|m| m.score >= tune_core::streaming::matching::MATCH_APPROX_SCORE);
+            if let Some(m) = best {
+                if let Ok(id) = m.source_id.parse::<i64>() {
                     repo.add_tracks(playlist_id, &[id], None).ok();
                     matched += 1;
                 }
@@ -973,13 +997,41 @@ async fn create_streaming_playlist_from_favorites(
     let mut matched_ids: Vec<String> = Vec::new();
     let mut details: Vec<Value> = Vec::new();
     for (title, artist) in favorites {
-        let q = if artist.is_empty() {
-            title.clone()
-        } else {
-            format!("{artist} {title}")
-        };
         // radio favorites carry no ISRC/duration, so match on normalized title+artist.
         //
+        // Requêtes essayées dans l'ordre : « artiste titre », puis titre seul,
+        // puis titre tronqué avant « ( » ou « - ». Le matcher normalise déjà les
+        // suffixes « (feat. X) / (Live) » pour SCORER, mais la REQUÊTE envoyée
+        // au service les contenait encore, et Qobuz ne renvoyait alors aucun
+        // candidat (#1235 : une recherche manuelle sans le suffixe trouvait la
+        // piste). On s'arrête à la première requête qui produit un match sûr ;
+        // à défaut, on garde le meilleur match approximatif (0.6–0.7) rencontré,
+        // exposé `status: "approximate"` — avant, cette bande était jetée et
+        // devenait « not_found ».
+        let mut queries: Vec<String> = Vec::new();
+        if artist.is_empty() {
+            queries.push(title.clone());
+        } else {
+            queries.push(format!("{artist} {title}"));
+            queries.push(title.clone());
+        }
+        let stripped = title
+            .split_once(" (")
+            .map(|(a, _)| a)
+            .unwrap_or(title)
+            .split_once(" - ")
+            .map(|(a, _)| a)
+            .unwrap_or_else(|| title.split_once(" (").map(|(a, _)| a).unwrap_or(title))
+            .trim()
+            .to_string();
+        if !stripped.is_empty() && stripped != *title {
+            if artist.is_empty() {
+                queries.push(stripped.clone());
+            } else {
+                queries.push(format!("{artist} {stripped}"));
+            }
+        }
+
         // Instrumentation for #1235 (Reivax66: "aucun résultat trouvé" on Qobuz
         // even though a manual Qobuz search finds the track). Without logging we
         // cannot tell three very different failure modes apart: the service
@@ -987,43 +1039,56 @@ async fn create_streaming_playlist_from_favorites(
         // returning zero candidates, or the matcher rejecting every candidate.
         // Log the query, result count, the top candidate the service returned,
         // and the accept/reject decision so the next tester log pinpoints it.
-        let best = match svc.search(&q, 10).await {
-            Ok(results) => {
-                let n = results.tracks.len();
-                let top = results
-                    .tracks
-                    .first()
-                    .map(|t| format!("{} — {}", t.artist, t.title))
-                    .unwrap_or_else(|| "<none>".into());
-                let m = tune_core::streaming::matching::best_stream_match(
-                    title,
-                    artist,
-                    "",
-                    0,
-                    &results.tracks,
-                )
-                .cloned();
-                if m.is_some() {
-                    tracing::info!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_ok");
-                } else {
-                    tracing::warn!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_rejected");
+        let mut best: Option<(tune_core::streaming::traits::StreamTrack, f64)> = None;
+        for q in &queries {
+            match svc.search(q, 10).await {
+                Ok(results) => {
+                    let n = results.tracks.len();
+                    let top = results
+                        .tracks
+                        .first()
+                        .map(|t| format!("{} — {}", t.artist, t.title))
+                        .unwrap_or_else(|| "<none>".into());
+                    match tune_core::streaming::matching::best_stream_match_scored(
+                        title,
+                        artist,
+                        "",
+                        0,
+                        &results.tracks,
+                    ) {
+                        Some((t, score))
+                            if score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE =>
+                        {
+                            tracing::info!(service = %service, query = %q, results = n, top = %top, score, "radio_fav_match_ok");
+                            best = Some((t.clone(), score));
+                            break;
+                        }
+                        Some((t, score)) => {
+                            tracing::info!(service = %service, query = %q, results = n, top = %top, score, "radio_fav_match_approx");
+                            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                                best = Some((t.clone(), score));
+                            }
+                        }
+                        None => {
+                            tracing::warn!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_rejected");
+                        }
+                    }
                 }
-                m
+                Err(e) => {
+                    tracing::warn!(service = %service, query = %q, error = %e, "radio_fav_search_failed");
+                }
             }
-            Err(e) => {
-                tracing::warn!(service = %service, query = %q, error = %e, "radio_fav_search_failed");
-                None
-            }
-        };
+        }
         match best {
-            Some(t) => {
+            Some((t, score)) => {
+                let sure = score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE;
                 details.push(json!({
                     "title": title,
                     "artist": artist,
                     "matched_title": t.title,
                     "matched_artist": t.artist,
                     "matched_id": t.id,
-                    "status": "matched",
+                    "status": if sure { "matched" } else { "approximate" },
                 }));
                 matched_ids.push(t.id);
             }
