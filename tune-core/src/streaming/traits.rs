@@ -190,6 +190,25 @@ pub trait StreamingService: Send + Sync {
         let _ = artist_id;
         Ok(vec![])
     }
+    /// Artistes similaires SELON LE SERVICE, pour la radio d'autoplay (#1553).
+    ///
+    /// Jusqu'ici « qui ressemble à qui » n'avait qu'une seule reponse possible :
+    /// l'API d'enrichissement mozaiklabs, interrogeable par MBID seulement.
+    /// Or ~10 % des artistes en ont un, et une piste Qobuz n'en transporte
+    /// aucun : la radio streaming n'avait donc jamais de candidats, et la file
+    /// s'arretait en silence (Sandro, 0.9.75).
+    ///
+    /// Le service qui diffuse la piste connait, lui, son propre catalogue.
+    /// Defaut vide : un service sans notion de similarite ne bloque rien, le
+    /// couple appelant/repli reste responsable de la suite.
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let _ = (artist_id, limit);
+        Ok(vec![])
+    }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
 

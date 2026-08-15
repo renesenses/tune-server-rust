@@ -1420,6 +1420,31 @@ impl StreamingService for QobuzService {
         Ok(tracks)
     }
 
+    /// `artist/getSimilarArtists` — la reponse de Qobuz a « et apres ? ».
+    ///
+    /// `artist/get` refuse `extra=similarArtists` (400, « accepted values are
+    /// albums, tracks, playlists, ... ») : c'est bien un point d'entree
+    /// distinct. Verifie sur le catalogue reel : Pink Floyd (38324) rend 72
+    /// artistes, King Crimson en tete.
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let limit = limit.to_string();
+        let data = self
+            .api_get(
+                "/artist/getSimilarArtists",
+                &[("artist_id", artist_id), ("limit", &limit)],
+            )
+            .await?;
+        let artists = data["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_artist).collect())
+            .unwrap_or_default();
+        Ok(artists)
+    }
+
     async fn create_playlist(
         &self,
         name: &str,
@@ -1742,6 +1767,45 @@ mod tests {
             err.to_string().contains("Qobuz"),
             "le message doit désigner le compte à reconnecter, obtenu : {err}"
         );
+    }
+
+    #[test]
+    fn map_similar_artists_payload() {
+        // Charge utile reelle de /artist/getSimilarArtists?artist_id=38324
+        // (Pink Floyd, 72 resultats) : la radio d'autoplay lit `artists.items`,
+        // pas la racine — une erreur de chemin rendrait zero candidat en
+        // silence, exactement le bug #1553.
+        let payload = json!({
+            "artists": {
+                "limit": 3,
+                "offset": 0,
+                "total": 72,
+                "items": [
+                    {"id": 1191678, "name": "King Crimson", "albums_count": 87},
+                    {"id": 26718, "name": "Yes", "albums_count": 120},
+                    {"id": 43821, "name": "Queen", "albums_count": 64},
+                ]
+            }
+        });
+        let artists: Vec<_> = payload["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(QobuzService::map_artist).collect())
+            .unwrap_or_default();
+        assert_eq!(artists.len(), 3);
+        assert_eq!(artists[0].id, "1191678");
+        assert_eq!(artists[0].name, "King Crimson");
+    }
+
+    #[test]
+    fn map_similar_artists_missing_payload_is_empty_not_a_panic() {
+        // Un artiste sans voisins connus rend un objet sans `artists` : la
+        // radio doit rendre zero candidat, pas paniquer dans le poller.
+        let payload = json!({"status": "success"});
+        let artists: Vec<crate::streaming::traits::StreamArtist> = payload["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(QobuzService::map_artist).collect())
+            .unwrap_or_default();
+        assert!(artists.is_empty());
     }
 
     #[test]
