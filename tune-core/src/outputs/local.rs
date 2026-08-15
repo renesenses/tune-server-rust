@@ -1390,10 +1390,8 @@ pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
         // Strict alternation. Which of the two values a buffer starts on
         // depends on where the chunk boundary fell, so only the alternation is
         // asserted, never the starting value.
-        if let Some(p) = prev {
-            if marker == p {
-                return false;
-            }
+        if prev.is_some_and(|p| p == marker) {
+            return false;
         }
         prev = Some(marker);
     }
