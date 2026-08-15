@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -6,6 +7,109 @@ use tune_core::outputs::oh_events::OpenHomeEventListener;
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
+
+/// Témoin déposé le temps du balayage ASIO de démarrage, dans le dossier de
+/// données (celui du journal). Sa présence au démarrage suivant signifie que le
+/// balayage précédent n'est jamais revenu — le processus est mort dedans.
+const ASIO_WARM_SENTINEL: &str = "asio-warm.pending";
+
+/// Variable d'environnement de secours pour couper le balayage ASIO du
+/// démarrage sans toucher au fichier témoin.
+const ASIO_WARM_DISABLE_ENV: &str = "TUNE_DISABLE_ASIO_SCAN";
+
+/// Ce que le démarrage doit faire du balayage ASIO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsioWarmDecision {
+    /// Rien ne s'y oppose : on énumère.
+    Run,
+    /// Coupé explicitement par l'environnement.
+    SkippedByEnv,
+    /// Un balayage précédent a emporté le processus : on ne recommence pas.
+    SkippedAfterCrash,
+}
+
+/// Décide si le balayage ASIO de démarrage peut être tenté.
+///
+/// `list_asio_devices()` charge **en processus** chaque pilote ASIO tiers
+/// enregistré sur la machine (COM + `ASIOInit`). Un pilote fautif — pilote
+/// ASIO d'un DAC débranché, ASIO4ALL, résidu de station de travail audio —
+/// tue le processus au niveau natif : pas de panique Rust, donc pas de
+/// `tune-crash.log`, et le serveur disparaît sans le moindre message.
+/// Depuis la 0.9.45 ce balayage tourne à **chaque** démarrage : sur une
+/// machine dont un pilote plante, Tune devient définitivement inutilisable
+/// (Alain Bonnel, fil forum 1313 / #1283 : 0.9.44 démarre, tout ce qui suit
+/// meurt une centaine de millisecondes après `com_sta_initialized`, sur plus
+/// de trente lancements d'affilée).
+///
+/// Le témoin transforme cette panne définitive en panne d'un seul démarrage.
+pub(crate) fn asio_warm_decision(sentinel: &Path, disabled_by_env: bool) -> AsioWarmDecision {
+    if disabled_by_env {
+        return AsioWarmDecision::SkippedByEnv;
+    }
+    if sentinel.exists() {
+        return AsioWarmDecision::SkippedAfterCrash;
+    }
+    AsioWarmDecision::Run
+}
+
+/// Chemin du témoin : à côté du journal, donc `%LOCALAPPDATA%\TuneServer` sous
+/// Windows — le dossier que l'on demande déjà aux testeurs d'ouvrir.
+fn asio_warm_sentinel_path() -> PathBuf {
+    crate::config::default_log_file_path()
+        .parent()
+        .map(|dir| dir.join(ASIO_WARM_SENTINEL))
+        .unwrap_or_else(|| PathBuf::from(ASIO_WARM_SENTINEL))
+}
+
+fn asio_warm_disabled_by_env() -> bool {
+    std::env::var(ASIO_WARM_DISABLE_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Lance le préchauffage du cache ASIO, protégé par le témoin de plantage.
+#[cfg(feature = "local-audio")]
+fn spawn_asio_warm_scan() {
+    // `list_asio_devices()` ne fait rien hors Windows : pas de témoin, pas de
+    // thread, comportement inchangé sur macOS et Linux.
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+
+    let sentinel = asio_warm_sentinel_path();
+    let decision = asio_warm_decision(&sentinel, asio_warm_disabled_by_env());
+
+    tokio::task::spawn_blocking(move || match decision {
+        AsioWarmDecision::SkippedByEnv => {
+            info!(
+                env = ASIO_WARM_DISABLE_ENV,
+                "asio_warm_scan_disabled_by_env"
+            );
+        }
+        AsioWarmDecision::SkippedAfterCrash => {
+            warn!(
+                sentinel = %sentinel.display(),
+                "asio_warm_scan_skipped_after_crash — the previous boot died while enumerating \
+                 ASIO drivers, so the scan is disabled to keep the server startable. One of the \
+                 machine's ASIO drivers is faulty. Delete this file to try again."
+            );
+        }
+        AsioWarmDecision::Run => {
+            if let Some(dir) = sentinel.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // Déposé AVANT l'énumération : si un pilote emporte le processus,
+            // le fichier reste et le démarrage suivant saute le balayage.
+            let armed = std::fs::write(&sentinel, "asio warm scan in progress\n").is_ok();
+            info!(armed, "asio_warm_scan_started");
+
+            let devices = tune_core::outputs::local::list_asio_devices();
+
+            let _ = std::fs::remove_file(&sentinel);
+            info!(count = devices.len(), "asio_warm_scan_complete");
+        }
+    });
+}
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
@@ -26,9 +130,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // `outputs::local` only exists under `local-audio` (the oaat-only CI build
     // compiles without it).
     #[cfg(feature = "local-audio")]
-    tokio::task::spawn_blocking(|| {
-        let _ = tune_core::outputs::local::list_asio_devices();
-    });
+    spawn_asio_warm_scan();
 
     reset_zones_offline(state);
     deduplicate_zones(state);
@@ -1027,5 +1129,58 @@ mod restore_zone_volumes_tests {
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");
+    }
+}
+
+#[cfg(test)]
+mod asio_warm_scan_tests {
+    use super::*;
+
+    /// Cas nominal : pas de témoin, pas de coupure — on énumère.
+    #[test]
+    fn clean_boot_runs_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        assert_eq!(asio_warm_decision(&sentinel, false), AsioWarmDecision::Run);
+    }
+
+    /// Le témoin laissé par un démarrage qui n'est jamais revenu doit couper le
+    /// balayage. C'est le test qui ÉCHOUE contre le code d'avant : la 0.9.45 à
+    /// la 0.9.71 relançaient l'énumération à chaque lancement, donc mouraient
+    /// à chaque lancement (fil 1313, Alain Bonnel — plus de trente démarrages
+    /// identiques, aucun n'atteignant l'écoute HTTP).
+    #[test]
+    fn sentinel_from_a_crashed_boot_skips_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+        assert_eq!(
+            asio_warm_decision(&sentinel, false),
+            AsioWarmDecision::SkippedAfterCrash
+        );
+    }
+
+    /// La coupure par l'environnement prime sur tout le reste : c'est le
+    /// dépannage qu'on peut dicter à un testeur au téléphone.
+    #[test]
+    fn env_kill_switch_wins_over_a_clean_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        assert_eq!(
+            asio_warm_decision(&sentinel, true),
+            AsioWarmDecision::SkippedByEnv
+        );
+    }
+
+    /// Le témoin vit dans le dossier de données, à côté du journal — celui que
+    /// l'on demande déjà d'ouvrir (`%LOCALAPPDATA%\TuneServer`).
+    #[test]
+    fn sentinel_sits_next_to_the_log_file() {
+        let path = asio_warm_sentinel_path();
+        assert_eq!(path.file_name().unwrap(), ASIO_WARM_SENTINEL);
+        assert_eq!(
+            path.parent(),
+            crate::config::default_log_file_path().parent()
+        );
     }
 }
