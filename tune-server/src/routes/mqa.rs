@@ -52,7 +52,10 @@ async fn detect_mqa(
     let track = state
         .backend
         .query_one(
-            "SELECT path, format, sample_rate, bit_depth FROM tracks WHERE id = ?",
+            // La colonne s'appelle file_path — « path » faisait échouer la
+            // requête et la route répondait 500 systématiquement : elle n'a
+            // jamais fonctionné depuis son introduction.
+            "SELECT file_path, format, sample_rate, bit_depth FROM tracks WHERE id = ?",
             &[&track_id as &dyn tune_core::db::backend::ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -88,10 +91,11 @@ async fn detect_mqa(
     // MQA detection heuristics:
     // 1. Must be FLAC or WAV (MQA encodes in PCM)
     // 2. Typically 44.1kHz or 48kHz base rate (unfolds to higher rates)
-    // 3. 24-bit depth (MQA uses LSBs for signaling)
+    // 3. ≥16-bit : le MQA « CD » existe en 16 bits (le mot de synchro se
+    //    trouve alors dans les tout derniers bits), ne pas exiger 24.
     let format_str = format.as_deref().unwrap_or("").to_lowercase();
     let is_candidate =
-        (format_str.contains("flac") || format_str.contains("wav")) && bit_depth.unwrap_or(0) >= 24;
+        (format_str.contains("flac") || format_str.contains("wav")) && bit_depth.unwrap_or(0) >= 16;
 
     if !is_candidate {
         return Ok(Json(json!({
@@ -101,7 +105,7 @@ async fn detect_mqa(
             "sample_rate": sample_rate,
             "bit_depth": bit_depth,
             "mqa_detected": false,
-            "reason": "Not a candidate — MQA requires 24-bit FLAC/WAV",
+            "reason": "Not a candidate — MQA requires 16/24-bit FLAC/WAV",
         }))
         .into_response());
     }
@@ -133,39 +137,123 @@ struct MqaResult {
     analysis: String,
 }
 
-async fn check_mqa_signaling(path: &str) -> MqaResult {
-    // Try to read first bytes of the file to check for FLAC signature
-    let data = match tokio::fs::read(path).await {
-        Ok(d) => d,
-        Err(e) => {
-            return MqaResult {
-                detected: false,
-                original_rate: None,
-                is_studio: false,
-                analysis: format!("Could not read file: {e}"),
-            };
-        }
-    };
+/// Mot de synchronisation MQA : 36 bits, embarqués en continu dans le XOR des
+/// deux canaux à une position de bit fixe parmi les LSB. Constante et méthode
+/// publiques et éprouvées (projets `mqa_identifier` — détection identique à
+/// celle des lecteurs qui affichent le badge MQA).
+const MQA_SYNC_WORD: u64 = 0xbe0498c88;
+const MQA_SYNC_MASK: u64 = 0xF_FFFF_FFFF; // 36 bits
 
-    // Basic FLAC header check
-    let is_flac = data.len() > 4 && &data[0..4] == b"fLaC";
-    if !is_flac && !(data.len() > 12 && &data[0..4] == b"RIFF") {
-        return MqaResult {
+/// Cherche le mot de synchro MQA dans un bloc d'échantillons entrelacés
+/// (i32 cadrés à droite, sortie de decode_to_pcm). Retourne la position de
+/// bit (0..8, depuis le LSB) où le motif a été trouvé.
+fn detect_mqa_sync(samples: &[i32], channels: u32) -> Option<u8> {
+    if channels < 2 {
+        return None; // le signal MQA vit dans le XOR L/R — rien à chercher en mono
+    }
+    let ch = channels as usize;
+    let mut buffers = [0u64; 8];
+    for frame in samples.chunks_exact(ch) {
+        let x = (frame[0] ^ frame[1]) as u32;
+        for (p, buf) in buffers.iter_mut().enumerate() {
+            *buf = ((*buf << 1) | u64::from((x >> p) & 1)) & MQA_SYNC_MASK;
+            if *buf == MQA_SYNC_WORD {
+                return Some(p as u8);
+            }
+        }
+    }
+    None
+}
+
+async fn check_mqa_signaling(path: &str) -> MqaResult {
+    // Décodage bloquant → spawn_blocking. Les 10 premières secondes suffisent :
+    // le flux MQA signale en continu, pas seulement en tête de fichier.
+    // (L'ancien stub lisait le fichier ENTIER en mémoire pour ne vérifier que
+    // les 4 octets de magie et répondait toujours detected:false.)
+    let p = path.to_string();
+    let decoded = tokio::task::spawn_blocking(move || {
+        tune_core::audio::decode::decode_to_pcm(&p, None, None, 0.0, 10.0)
+    })
+    .await;
+
+    match decoded {
+        Ok(Ok(audio)) => {
+            if audio.channels < 2 {
+                return MqaResult {
+                    detected: false,
+                    original_rate: None,
+                    is_studio: false,
+                    analysis: "Mono file — MQA signaling lives in the L/R XOR".into(),
+                };
+            }
+            match detect_mqa_sync(&audio.samples_i32, audio.channels) {
+                Some(pos) => MqaResult {
+                    detected: true,
+                    // Le décodage du champ « original sample rate » qui suit le
+                    // mot de synchro n'est pas encore implémenté — ne rien
+                    // inventer, les tags ORIGINALSAMPLERATE restent la source.
+                    original_rate: None,
+                    is_studio: false,
+                    analysis: format!("MQA sync word found (XOR bit position {pos})"),
+                },
+                None => MqaResult {
+                    detected: false,
+                    original_rate: None,
+                    is_studio: false,
+                    analysis: "No MQA sync word in the first 10 seconds".into(),
+                },
+            }
+        }
+        Ok(Err(e)) => MqaResult {
             detected: false,
             original_rate: None,
             is_studio: false,
-            analysis: "Not a FLAC or WAV file".into(),
-        };
+            analysis: format!("Could not decode file: {e}"),
+        },
+        Err(e) => MqaResult {
+            detected: false,
+            original_rate: None,
+            is_studio: false,
+            analysis: format!("Decode task failed: {e}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod mqa_sync_tests {
+    use super::*;
+
+    #[test]
+    fn trouve_le_mot_de_synchro_a_la_position_zero() {
+        // Encode le mot 36 bits dans le LSB du XOR L/R : R = 0, L = bit.
+        let mut samples: Vec<i32> = Vec::new();
+        for i in (0..36).rev() {
+            let bit = ((MQA_SYNC_WORD >> i) & 1) as i32;
+            samples.push(bit); // L
+            samples.push(0); // R
+        }
+        assert_eq!(detect_mqa_sync(&samples, 2), Some(0));
     }
 
-    // Full MQA detection would require decoding audio frames and analyzing
-    // the LSB pattern. This is a simplified stub that reports the file as
-    // a potential MQA candidate based on format and bit depth.
-    MqaResult {
-        detected: false,
-        original_rate: None,
-        is_studio: false,
-        analysis: "Full MQA bit-pattern analysis not yet implemented. File is a valid candidate for MQA encoding.".into(),
+    #[test]
+    fn trouve_le_mot_a_une_position_haute() {
+        // Même encodage, décalé au bit 5 (fichier 24 bits typique).
+        let mut samples: Vec<i32> = Vec::new();
+        for i in (0..36).rev() {
+            let bit = (((MQA_SYNC_WORD >> i) & 1) as i32) << 5;
+            samples.push(bit);
+            samples.push(0);
+        }
+        assert_eq!(detect_mqa_sync(&samples, 2), Some(5));
+    }
+
+    #[test]
+    fn silence_et_mono_ne_matchent_pas() {
+        assert_eq!(detect_mqa_sync(&[0; 4096], 2), None);
+        assert_eq!(detect_mqa_sync(&[1; 4096], 1), None);
+        // Bruit déterministe : XOR alternant, aucun motif de 36 bits ne colle.
+        let noise: Vec<i32> = (0..4096).map(|i| if i % 3 == 0 { 1 } else { 0 }).collect();
+        assert_eq!(detect_mqa_sync(&noise, 2), None);
     }
 }
 
