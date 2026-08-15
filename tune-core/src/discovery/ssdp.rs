@@ -252,19 +252,20 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                 // concernent pas — un contrôleur cherchant des renderers —
                 // restent sans réponse.
                 if head.starts_with("M-SEARCH") {
+                    let full = String::from_utf8_lossy(data);
+                    let st = full
+                        .lines()
+                        .find_map(|l| {
+                            l.trim()
+                                .strip_prefix("ST:")
+                                .or_else(|| l.trim().strip_prefix("st:"))
+                        })
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
                     if let Some(advert) = crate::upnp_server::media_server_advert() {
-                        let full = String::from_utf8_lossy(data);
-                        let st = full
-                            .lines()
-                            .find_map(|l| {
-                                l.trim()
-                                    .strip_prefix("ST:")
-                                    .or_else(|| l.trim().strip_prefix("st:"))
-                            })
-                            .map(str::trim)
-                            .unwrap_or("");
                         for (st_reply, usn) in
-                            crate::upnp_server::msearch_reply_targets(st, &advert.uuid)
+                            crate::upnp_server::msearch_reply_targets(&st, &advert.uuid)
                         {
                             let resp = crate::upnp_server::ssdp_msearch_response(
                                 &st_reply,
@@ -273,6 +274,23 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                             );
                             if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
                                 debug!(error = %e, "ssdp_msearch_reply_failed");
+                            }
+                        }
+                    }
+                    // Les zones qui s'annoncent en MediaRenderer (#1750)
+                    // répondent aussi — un contrôleur qui cherche des sorties
+                    // (JPlay « Rechercher des renderers ») ne voit que par là.
+                    for adv in crate::upnp_renderer::renderer_adverts() {
+                        for (st_reply, usn) in
+                            crate::upnp_renderer::renderer_msearch_targets(&st, &adv.uuid)
+                        {
+                            let resp = crate::upnp_server::ssdp_msearch_response(
+                                &st_reply,
+                                &usn,
+                                &adv.location,
+                            );
+                            if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
+                                debug!(error = %e, "ssdp_renderer_msearch_reply_failed");
                             }
                         }
                     }

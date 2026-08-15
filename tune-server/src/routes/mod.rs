@@ -79,6 +79,7 @@ pub mod system;
 pub mod tagger;
 pub mod tags;
 pub mod upnp;
+pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod visualizer;
 pub mod voice;
@@ -454,7 +455,7 @@ pub fn router_with_plugins(
         .nest("/ws", ws::router())
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
-        .with_state(state)
+        .with_state(state.clone())
         .route("/add-station", get(|axum::extract::Query(q): axum::extract::Query<radios::AddFromWebQuery>| async move {
             // q.name is attacker-controlled and reflected into HTML on the
             // server's own origin — escape it or it is a reflected XSS.
@@ -469,6 +470,14 @@ pub fn router_with_plugins(
     if let Some(upnp) = upnp_routes {
         app = app.nest("/upnp", upnp);
     }
+
+    // MediaRenderer:1 par zone (#1750) — routes toujours montées, mais
+    // chaque handler vérifie l'opt-in `zone_{id}_upnp_renderer` (404 sinon)
+    // et seules les zones opt-in sont annoncées en SSDP.
+    app = app.nest(
+        "/upnp/renderer",
+        upnp_media_renderer::router().with_state(state.clone()),
+    );
 
     // Mount all installed skins on /{skin_id}
     for (skin_id, skin_path) in mountable_skins {
