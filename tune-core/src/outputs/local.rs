@@ -828,6 +828,18 @@ pub struct LocalOutput {
     /// `local:` dans ses journaux ; même famille que #1216 / #1168 / Diretta).
     /// Set per-play by the orchestrator, exactly like `crossfeed`.
     eq: Arc<std::sync::Mutex<Option<super::super::audio::eq::EqProcessor>>>,
+    /// Format effectivement résolu pour le flux en cours : (taux, canaux),
+    /// empaquetés dans un seul u32 (taux sur 24 bits, canaux sur 8).
+    ///
+    /// Un `EqProcessor` se construit POUR un couple (taux, canaux) — d'où sa
+    /// reconstruction à chaque lecture. Sans mémoire de ce couple, personne ne
+    /// pouvait en rebâtir un pendant la lecture : bouger un curseur écrivait le
+    /// profil, le serveur répondait 200, et le son ne changeait pas avant la
+    /// piste suivante (#1725). Or c'est exactement ainsi qu'on règle un
+    /// égaliseur — musique en cours, à l'oreille.
+    ///
+    /// 0 = aucun flux en cours ; `current_format()` renvoie alors `None`.
+    current_format: Arc<AtomicU32>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
     /// PURE (audiophile) bypass for the zone currently playing on this output.
     /// When set, the playback loop skips the room-correction convolver so the
@@ -838,6 +850,26 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// True while the PCM currently flowing through this output is a **DoP**
+    /// (DSD over PCM) payload, as detected on the bytes themselves by
+    /// [`is_dop_pcm`].
+    ///
+    /// DoP is not audio: it is a DSD bitstream smuggled inside 24-bit PCM
+    /// frames, recognised by the receiving DAC through a marker byte. Any
+    /// arithmetic on those samples — an equalizer biquad, the convolver, the
+    /// crossfeed — rewrites the marker, the DAC stops seeing DoP, and it
+    /// **mutes**. That is the whole point of the marker: a DAC must fall silent
+    /// rather than blast a DSD bitstream at the speakers as if it were PCM.
+    ///
+    /// Held on the output rather than kept local to the feed loop so the
+    /// transition can be logged exactly once (a support log then says whether a
+    /// track played as DoP), and so the remaining half of the problem has a
+    /// place to hang: the **volume multiply** in the render callbacks destroys
+    /// the marker in the same way, which is why DoP only ever survives at 100 %
+    /// with ReplayGain off. That one is older and independent of the DSP chain,
+    /// and it changes what the volume slider does on a DSD track — it is
+    /// tracked separately rather than smuggled in here.
+    dop_active: Arc<AtomicBool>,
     /// Set by the playback thread when the audio device refuses to open, so
     /// the poller can stop the zone and tell the user on the very next tick
     /// instead of waiting out the stall heuristics. Cleared on every
@@ -913,9 +945,11 @@ impl LocalOutput {
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
             eq: Arc::new(std::sync::Mutex::new(None)),
+            current_format: Arc::new(AtomicU32::new(0)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            dop_active: Arc::new(AtomicBool::new(false)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -936,6 +970,33 @@ impl LocalOutput {
 
     pub fn has_eq(&self) -> bool {
         self.eq.lock().unwrap().is_some()
+    }
+
+    /// Format du flux en cours, `(taux, canaux)`, ou `None` si rien ne joue.
+    ///
+    /// Sert à rebâtir un `EqProcessor` aux bons coefficients SANS attendre la
+    /// piste suivante (#1725).
+    pub fn current_format(&self) -> Option<(u32, u16)> {
+        let empaquete = self.current_format.load(Ordering::Relaxed);
+        if empaquete == 0 {
+            return None;
+        }
+        let taux = empaquete >> 8;
+        let canaux = (empaquete & 0xFF) as u16;
+        if taux == 0 || canaux == 0 {
+            return None;
+        }
+        Some((taux, canaux))
+    }
+
+    /// Empaquette `(taux, canaux)` pour [`Self::current_format`]. Un taux
+    /// au-delà de 16,7 MHz déborderait les 24 bits — il n'en existe pas, mais
+    /// on préfère annoncer « pas de flux » qu'un taux tronqué.
+    pub(crate) fn pack_format(taux: u32, canaux: u16) -> u32 {
+        if taux == 0 || taux > 0x00FF_FFFF || canaux == 0 || canaux > 255 {
+            return 0;
+        }
+        (taux << 8) | (canaux as u32)
     }
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
@@ -1315,6 +1376,68 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     data_offset.map(|d| (channels, sample_rate, bit_depth, d))
 }
 
+/// Frames that must carry a valid, alternating DoP marker before a buffer is
+/// treated as DoP.
+///
+/// The marker is one byte out of three, so a single frame would match ordinary
+/// PCM once every ~256 samples. Requiring 32 consecutive frames — with the
+/// marker *alternating* and identical across channels — puts a false positive
+/// past 1 in 2^250 while still fitting in the smallest chunk the feed loops
+/// ever assemble.
+const DOP_DETECT_FRAMES: usize = 32;
+
+/// True when `bytes` — interleaved 24-bit little-endian PCM — actually carries
+/// a **DoP** (DSD over PCM) payload.
+///
+/// DoP packs 16 DSD bits into the low two bytes of each 24-bit sample and
+/// stamps the top byte with a marker that alternates `0x05` / `0xFA` from one
+/// frame to the next, identically on every channel (see
+/// `audio::dsd_to_dop::DsdToDoP::feed`). That marker is the *only* thing that
+/// tells a DAC it is being handed DSD and not audio — and it is exactly what
+/// any sample-domain processing destroys.
+///
+/// Sniffing the bytes is how DoP is meant to be recognised: the DAC at the far
+/// end of the cable does precisely this, and it is why the detection lives here
+/// rather than being threaded down from the resolver. Any path that produces
+/// DoP is covered, now and later, with nothing to keep in sync.
+///
+/// Only ever true for 24-bit streams — DoP has no other carrier.
+pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
+    if bit_depth != 24 || channels == 0 {
+        return false;
+    }
+    let ch = channels as usize;
+    let frame_bytes = 3 * ch;
+    if bytes.len() < frame_bytes * DOP_DETECT_FRAMES {
+        return false;
+    }
+    let mut prev: Option<u8> = None;
+    for f in 0..DOP_DETECT_FRAMES {
+        let base = f * frame_bytes;
+        // The marker is the top byte of the 24-bit little-endian sample, and it
+        // is the SAME on every channel of a frame. A stereo PCM signal that
+        // happened to hit 0x05 on the left would have to hit it on the right in
+        // the same frame too.
+        let marker = bytes[base + 2];
+        if marker != 0x05 && marker != 0xFA {
+            return false;
+        }
+        for c in 1..ch {
+            if bytes[base + 3 * c + 2] != marker {
+                return false;
+            }
+        }
+        // Strict alternation. Which of the two values a buffer starts on
+        // depends on where the chunk boundary fell, so only the alternation is
+        // asserted, never the starting value.
+        if prev.is_some_and(|p| p == marker) {
+            return false;
+        }
+        prev = Some(marker);
+    }
+    true
+}
+
 /// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
 /// in place, at the three playback-loop feed sites.
 ///
@@ -1324,6 +1447,13 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
 /// bit-perfect). Crossfeed additionally requires a stereo stream
 /// (`channels == 2`); on non-stereo it is left untouched. Uses the same
 /// try-lock pattern as the convolver so a contended lock never blocks audio.
+///
+/// They are skipped just as hard when `dop` is set: the buffer is then a DSD
+/// bitstream wearing PCM's clothes, and filtering it would strip the marker
+/// that makes the DAC play it at all — the user hears nothing (Tades, forum
+/// #1408 : « pas de son quand j'active égaliseur ou crossfeed », hors mode
+/// PURE). PURE zones never hit this because they bypass everything anyway;
+/// the silence was reserved for people who had asked for processing.
 ///
 /// EQ-before-convolver is the order the transcoded path already uses
 /// (`transcode_source_to_file`), so a zone hears the same chain whether it
@@ -1336,8 +1466,9 @@ fn apply_local_dsp(
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
     channels: u16,
+    dop: bool,
 ) {
-    if pure_bypass.load(Ordering::Relaxed) {
+    if dop || pure_bypass.load(Ordering::Relaxed) {
         return;
     }
     if let Ok(mut e) = eq.lock() {
@@ -1562,9 +1693,11 @@ impl OutputTarget for LocalOutput {
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
         let eq = self.eq.clone();
+        let current_format = self.current_format.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
         let crossfeed = self.crossfeed.clone();
+        let dop_active = self.dop_active.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -1939,6 +2072,17 @@ impl OutputTarget for LocalOutput {
                 return;
             };
 
+            // Format definitif du flux PCM : c'est CE couple que voit
+            // `apply_local_dsp`, donc celui auquel un EqProcessor doit etre
+            // bati. Memorise ici pour qu'un profil modifie EN COURS de lecture
+            // puisse etre applique tout de suite, au lieu d'attendre la piste
+            // suivante (#1725). La branche compressee est sortie en `return`
+            // juste au-dessus : elle ne passe pas par le DSP.
+            current_format.store(
+                LocalOutput::pack_format(sample_rate, channels),
+                Ordering::Relaxed,
+            );
+
             // bit_depth == 0 is the sentinel for IEEE float 32-bit (4 bytes)
             let bytes_per_sample = if bit_depth == 0 {
                 4
@@ -2058,6 +2202,13 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
+                    // Detected on the raw bytes, BEFORE they become f32 and
+                    // before `leftover` is truncated: the marker only exists in
+                    // the 24-bit packing.
+                    let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
+                    if dop_active.swap(dop, Ordering::Relaxed) != dop {
+                        info!(dop, "local_audio_dop_stream_state_changed");
+                    }
                     let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
@@ -2069,6 +2220,7 @@ impl OutputTarget for LocalOutput {
                         &crossfeed,
                         &pure_bypass,
                         channels,
+                        dop,
                     );
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
@@ -2391,6 +2543,13 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
+                    // Detected on the raw bytes, BEFORE they become f32 and
+                    // before `leftover` is truncated: the marker only exists in
+                    // the 24-bit packing.
+                    let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
+                    if dop_active.swap(dop, Ordering::Relaxed) != dop {
+                        info!(dop, "local_audio_dop_stream_state_changed");
+                    }
                     let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
@@ -2402,6 +2561,7 @@ impl OutputTarget for LocalOutput {
                         &crossfeed,
                         &pure_bypass,
                         channels,
+                        dop,
                     );
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
@@ -3319,6 +3479,10 @@ impl OutputTarget for LocalOutput {
                     continue;
                 }
 
+                let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
+                if dop_active.swap(dop, Ordering::Relaxed) != dop {
+                    info!(dop, "local_audio_dop_stream_state_changed");
+                }
                 let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                 let remainder = leftover[aligned_len..].to_vec();
                 leftover = remainder;
@@ -3341,6 +3505,7 @@ impl OutputTarget for LocalOutput {
                     &crossfeed,
                     &pure_bypass,
                     channels,
+                    dop,
                 );
 
                 if needs_channel_adapt {
@@ -3903,6 +4068,10 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        // Plus de flux, donc plus de format : sans cet oubli explicite,
+        // `current_format()` decrirait encore la piste precedente et on
+        // rebatirait un EqProcessor pour un flux mort (#1725).
+        self.current_format.store(0, Ordering::Relaxed);
         // Immediately silence the cpal callback so no audio leaks while
         // we wait for the playback thread to exit.  This flag is also
         // checked by the I/O read loop and feed_ring, causing the thread
@@ -4496,7 +4665,7 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
         // On saute les 512 premières trames (établissement du filtre).
         let after = rms(&samples[1024..]);
 
@@ -4518,7 +4687,7 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
         assert_eq!(samples, before);
     }
 
@@ -4533,7 +4702,7 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
         assert_eq!(samples, before);
     }
 
@@ -4564,9 +4733,115 @@ mod tests {
             })
             .collect();
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1, false);
         let after = rms(&samples[1024..]);
         assert!(20.0 * (after / before).log10() < -8.0);
+    }
+
+    /// Génère du DoP réel avec l'encodeur du serveur, pour ne pas tester une
+    /// idée qu'on se fait du format.
+    fn real_dop_bytes(frames: usize, channels: usize) -> Vec<u8> {
+        let mut enc = crate::audio::dsd_to_dop::DsdToDoP::new(channels, false);
+        // 2 octets DSD par canal et par trame DoP.
+        let dsd: Vec<u8> = (0..frames * 2 * channels).map(|i| (i * 37) as u8).collect();
+        enc.feed(&dsd)
+    }
+
+    #[test]
+    fn dop_is_recognised_on_real_encoder_output() {
+        for ch in [2usize, 1, 6] {
+            let bytes = real_dop_bytes(256, ch);
+            assert!(
+                is_dop_pcm(&bytes, 24, ch as u16),
+                "DoP {ch} canaux non reconnu"
+            );
+        }
+    }
+
+    #[test]
+    fn dop_detection_survives_a_chunk_boundary() {
+        // Les boucles de lecture découpent le flux à l'octet près : la
+        // détection ne doit pas dépendre de la parité du marqueur au début du
+        // tampon, sinon une trame DoP sur deux serait filtrée — et le DAC se
+        // tairait par intermittence.
+        let bytes = real_dop_bytes(256, 2);
+        let offset = 6; // une trame stéréo complète
+        assert!(is_dop_pcm(&bytes[offset..], 24, 2));
+    }
+
+    #[test]
+    fn ordinary_pcm_is_never_taken_for_dop() {
+        // Le faux positif est le risque de cette détection : il désactiverait
+        // l'égaliseur en silence. Un sinus 24 bits ne doit jamais passer.
+        let mut pcm = Vec::new();
+        for i in 0..2048 {
+            let v = ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44100.0).sin() * 8_000_000.0)
+                as i32;
+            for _ in 0..2 {
+                pcm.extend_from_slice(&v.to_le_bytes()[..3]);
+            }
+        }
+        assert!(!is_dop_pcm(&pcm, 24, 2));
+        // Le silence non plus (octet de poids fort à 0 partout).
+        assert!(!is_dop_pcm(&vec![0u8; 4096], 24, 2));
+        // Ni un tampon dont le marqueur est constant au lieu d'alterner.
+        let stuck: Vec<u8> = (0..4096)
+            .map(|i| if i % 3 == 2 { 0x05 } else { 0x11 })
+            .collect();
+        assert!(!is_dop_pcm(&stuck, 24, 2));
+    }
+
+    #[test]
+    fn dop_is_only_ever_detected_on_24_bit() {
+        // DoP n'a pas d'autre porteur : chercher le marqueur dans du 16 ou du
+        // 32 bits lirait des octets qui ne sont pas des marqueurs.
+        let bytes = real_dop_bytes(256, 2);
+        assert!(!is_dop_pcm(&bytes, 16, 2));
+        assert!(!is_dop_pcm(&bytes, 32, 2));
+        assert!(!is_dop_pcm(&bytes, 24, 0));
+    }
+
+    #[test]
+    fn dop_detection_needs_enough_frames() {
+        // Un tampon trop court ne prouve rien : mieux vaut traiter le son
+        // (comportement d'avant) que couper l'égaliseur sur une coïncidence.
+        let bytes = real_dop_bytes(DOP_DETECT_FRAMES - 1, 2);
+        assert!(!is_dop_pcm(&bytes, 24, 2));
+        assert!(is_dop_pcm(&real_dop_bytes(DOP_DETECT_FRAMES, 2), 24, 2));
+    }
+
+    #[test]
+    fn local_dsp_leaves_a_dop_stream_strictly_untouched() {
+        // Le cœur du défaut : avec un EQ ET un crossfeed installés, un flux DoP
+        // doit ressortir bit pour bit identique. Un seul échantillon modifié
+        // efface le marqueur, le DAC quitte le mode DSD et se tait (Tades,
+        // forum #1408).
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(Some(
+            crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
+        ));
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(1024);
+        let before = samples.clone();
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, true);
+        assert_eq!(samples, before);
+    }
+
+    #[test]
+    fn dop_bypass_does_not_disable_the_eq_on_ordinary_pcm() {
+        // Non-régression de #1708 : la garde DoP ne doit rien coûter à ceux qui
+        // écoutent du PCM, c'est-à-dire presque tout le monde.
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(4096);
+        let before = rms(&samples);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        assert!(20.0 * (rms(&samples[1024..]) / before).log10() < -8.0);
     }
 
     #[test]
@@ -5146,5 +5421,64 @@ mod backend_display_tests {
             matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
             "nom inattendu: {name}"
         );
+    }
+}
+
+#[cfg(test)]
+mod format_courant_tests {
+    use super::LocalOutput;
+
+    // -----------------------------------------------------------------------
+    // #1725 — un curseur bouge pendant la lecture, le son doit suivre.
+    //
+    // `set_eq` n'etait appele qu'au demarrage d'une piste, faute de connaitre
+    // le couple (taux, canaux) auquel batir les biquads. `current_format` le
+    // memorise ; ces tests verrouillent l'empaquetage, dont depend la
+    // reconstruction a chaud.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empaquetage_aller_retour_sur_les_formats_courants() {
+        for (taux, canaux) in [
+            (44_100u32, 2u16),
+            (48_000, 2),
+            (96_000, 2),
+            (192_000, 2),
+            (352_800, 2),
+            (768_000, 2),
+            (44_100, 1),
+            (48_000, 8),
+        ] {
+            let empaquete = LocalOutput::pack_format(taux, canaux);
+            assert_ne!(empaquete, 0, "{taux}/{canaux} doit s'empaqueter");
+            assert_eq!(empaquete >> 8, taux, "taux perdu pour {taux}/{canaux}");
+            assert_eq!(
+                (empaquete & 0xFF) as u16,
+                canaux,
+                "canaux perdus pour {taux}/{canaux}"
+            );
+        }
+    }
+
+    /// Zero = « aucun flux ». Batir un EqProcessor pour un format inconnu
+    /// donnerait des coefficients faux, donc mieux vaut ne rien pousser.
+    #[test]
+    fn un_format_absent_ou_aberrant_ne_s_empaquette_pas() {
+        assert_eq!(LocalOutput::pack_format(0, 2), 0, "taux nul");
+        assert_eq!(LocalOutput::pack_format(44_100, 0), 0, "zero canal");
+        assert_eq!(
+            LocalOutput::pack_format(0x0100_0000, 2),
+            0,
+            "un taux qui deborde les 24 bits doit dire « pas de flux » plutot \
+             que de rendre un taux tronque"
+        );
+        assert_eq!(LocalOutput::pack_format(44_100, 256), 0, "trop de canaux");
+    }
+
+    /// Une sortie neuve n'a pas de flux : rien a rebatir.
+    #[test]
+    fn une_sortie_neuve_n_annonce_aucun_format() {
+        let sortie = LocalOutput::new("format-test".to_string());
+        assert_eq!(sortie.current_format(), None);
     }
 }

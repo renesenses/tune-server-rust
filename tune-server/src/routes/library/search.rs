@@ -172,6 +172,20 @@ pub(super) async fn acoustic_search(
     }
     let limit = body.limit.unwrap_or(50).clamp(1, 200) as usize;
 
+    // La tour texte du CLAP est entraînée en anglais : une requête libre en
+    // français recale mal. Si l'utilisateur a configuré une clé API IA
+    // (anthropic/openai/gemini), on traduit sa requête (cache local, une
+    // seule traduction par requête) ; sans clé ou en cas d'échec, requête
+    // brute — comportement historique, les presets anglais ne changent pas.
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let effective_query = tune_core::ai::translate::translate_query(&settings, query)
+        .await
+        .unwrap_or_else(|| query.to_string());
+    if effective_query != query {
+        tracing::info!(query = %query, translated = %effective_query, "acoustic_query_translated");
+    }
+    let query = effective_query.as_str();
+
     // Text-tower embedding (provisions runtime + model + tokenizer on first call).
     let qvec = text_embedding::embed_query(&state.backend, query)
         .await

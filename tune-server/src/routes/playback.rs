@@ -1947,12 +1947,26 @@ async fn set_eq(
     }
     let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
 
+    // Persister ne suffit pas : sans ceci, le reglage n'atteignait le son qu'a
+    // la piste SUIVANTE sur une zone locale, alors que la reponse valait 200
+    // (#1725). On regle un egaliseur musique en cours, a l'oreille — et trois
+    // utilisateurs ont rapporte « l'egaliseur ne fonctionne pas » avant ca.
+    // Sans effet quand rien ne joue, hors zone locale, ou en mode PURE.
+    let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+
     let bands = eq_bands_json(&profile);
     Json(json!({
         "zone_id": zone_id,
         "enabled": profile.enabled,
         "preset": body.preset.unwrap_or_else(|| "custom".into()),
         "bands": bands,
+        // Vrai quand le reglage vient d'atteindre le son d'un flux en cours.
+        // Faux ne signale PAS un echec : rien ne joue, la zone n'est pas
+        // locale, ou elle est en PURE. Expose pour qu'un client puisse dire
+        // « prendra effet a la piste suivante » plutot que de laisser croire
+        // a un egaliseur muet — c'est ce silence qui a produit #1372, #1555
+        // et #1688.
+        "applied_live": applique_a_chaud,
     }))
     .into_response()
 }
@@ -2110,29 +2124,59 @@ async fn do_transfer(
         streaming_items.len() as i64
     };
 
+    // Position et état AVANT de toucher quoi que ce soit : la piste doit
+    // reprendre là où elle en était, pas redémarrer à zéro (point 17, revue
+    // 2026-08-15 — play_from_queue prend un index de file, pas des ms).
+    let source_position_ms = current.position_ms.max(0) as u64;
+    let source_paused = current.state == tune_core::playback::PlayState::Paused;
+
     // Transfer now-playing and playback state
     let np = current.now_playing.unwrap();
     state.playback.play(target_zone, np).await;
-    state.playback.set_volume(target_zone, current.volume).await;
+    let target_db_zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(target_zone)
+        .ok()
+        .flatten();
+    // Le volume de la CIBLE, pas celui de la source : chaque zone garde son
+    // niveau (les renderers n'ont pas la même sensibilité — c'était le
+    // symptôme que le trim par renderer corrige, autant ne plus l'aggraver).
+    let target_volume = target_db_zone
+        .as_ref()
+        .map(|z| f64::from(z.volume) / 100.0)
+        .unwrap_or(current.volume);
+    state.playback.set_volume(target_zone, target_volume).await;
     state
         .playback
         .update_queue_info(target_zone, current.queue_position, queue_length)
         .await;
 
     // Start playback on the target device via the orchestrator if a device is assigned
-    let has_output = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .get(target_zone)
-        .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id)
-        .is_some();
-    if has_output {
-        if let Err(e) = state
+    let target_device = target_db_zone.and_then(|z| z.output_device_id);
+    if let Some(ref did) = target_device {
+        match state
             .orchestrator
             .play_from_queue(target_zone, current.queue_position)
             .await
         {
-            warn!(target_zone, error = %e, "transfer_play_on_target_failed");
+            Ok(_) => {
+                // Reprendre à la position de la source. Sous 3 s on repart du
+                // début (même seuil que la route seek) — inutile de chercher
+                // dans un flux qui vient de démarrer.
+                if source_position_ms > 3000 {
+                    state
+                        .orchestrator
+                        .seek(target_zone, source_position_ms, Some(did))
+                        .await;
+                }
+                // Une source en pause reste en pause sur la cible : transférer
+                // ne veut pas dire relancer.
+                if source_paused {
+                    state.orchestrator.pause(target_zone, Some(did)).await;
+                }
+            }
+            Err(e) => {
+                warn!(target_zone, error = %e, "transfer_play_on_target_failed");
+            }
         }
     }
 

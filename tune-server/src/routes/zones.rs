@@ -109,6 +109,12 @@ struct PatchZone {
     /// Marque choisie par l'utilisateur dans le catalogue (ou « Autre »).
     /// Persistée en setting `zone_{id}_brand`. Chaîne vide = efface l'override.
     brand: Option<String>,
+    /// Trim de gain du renderer en dB (±12), pour harmoniser le niveau perçu
+    /// entre appareils. Persisté en setting `zone_{id}_gain_trim_db` ; `0`
+    /// efface. Appliqué UNIQUEMENT au volume envoyé au device — le volume
+    /// affiché et persisté reste celui de l'utilisateur. Sans effet sur une
+    /// zone `fixed_volume` (bit-perfect assumé, le DAC gère).
+    gain_trim_db: Option<f64>,
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
@@ -138,6 +144,13 @@ fn inject_device_identity(
         .flatten();
     obj.insert("brand".into(), json!(brand));
     obj.insert("model".into(), json!(model));
+    let trim = settings
+        .get(&format!("zone_{zone_id}_gain_trim_db"))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    obj.insert("gain_trim_db".into(), json!(trim));
     obj.insert(
         "detected_manufacturer".into(),
         json!(detected.and_then(|d| d.manufacturer.clone())),
@@ -1711,6 +1724,33 @@ async fn patch_zone(
         };
         if let Err(e) = r {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
+    if let Some(db) = body.gain_trim_db {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_gain_trim_db");
+        let clamped = db.clamp(-12.0, 12.0);
+        let r = if clamped == 0.0 {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, &format!("{clamped}"))
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // Effet immédiat : re-pousser le volume courant au device (le trim est
+        // composé dans orchestrator.set_volume). Sans ça, il faudrait attendre
+        // le prochain coup de curseur.
+        if let Ok(Some(z)) = repo.get(id) {
+            if !z.fixed_volume {
+                if let Some(ref did) = z.output_device_id {
+                    state
+                        .orchestrator
+                        .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
+                        .await;
+                }
+            }
         }
     }
     // Correction de marque/modele : la remonter a mozaiklabs.fr.
