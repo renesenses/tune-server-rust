@@ -855,7 +855,11 @@ async fn fetch_url_guarded(
         return Err((StatusCode::BAD_GATEWAY, "host did not resolve".to_string()));
     }
 
-    let client = reqwest::Client::builder()
+    // Construit depuis `tune_core::http::client::builder()` pour hériter du TLS
+    // webpki, en conservant les deux réglages voulus ici : aucune redirection
+    // (une redirection contournerait le contrôle d'adresse privée ci-dessus) et
+    // un délai d'attente court.
+    let client = tune_core::http::client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()

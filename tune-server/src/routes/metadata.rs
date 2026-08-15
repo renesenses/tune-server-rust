@@ -680,7 +680,9 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
         return Json(json!({"error": "no lastfm api key configured"})).into_response();
     }
 
-    let client = reqwest::Client::new();
+    // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
+    // d'attente, qu'un client reqwest construit à la main n'a pas du tout.
+    let client = tune_core::http::client::shared();
     let resp = client
         .get("http://ws.audioscrobbler.com/2.0/")
         .query(&[
