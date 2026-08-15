@@ -163,7 +163,7 @@ struct BiquadCoeffs {
 }
 
 /// Biquad filter state (per channel).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct BiquadState {
     x1: f64,
     x2: f64,
@@ -400,6 +400,35 @@ impl EqProcessor {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Reprendre l'historique des filtres du processeur que celui-ci remplace,
+    /// quand la cascade a la même forme.
+    ///
+    /// Sert au remplacement **en cours de lecture** (#1725) : un curseur bougé
+    /// pendant qu'un morceau joue. Un `EqProcessor` neuf part avec des
+    /// `BiquadState` à zéro ; injecter un signal continu dans un filtre dont
+    /// l'historique vient d'être remis à zéro est une discontinuité, et une
+    /// discontinuité dans le chemin audio, c'est un clic. Un curseur qu'on
+    /// fait glisser en produirait un à chaque cran.
+    ///
+    /// L'état n'est transposable que si la cascade coïncide en nombre de
+    /// canaux ET d'étages, parce que `states[canal][étage]` est positionnel :
+    /// l'étage *n* de l'ancienne cascade n'est le même filtre que l'étage *n*
+    /// de la nouvelle que si rien n'a été inséré ni retiré. Changer le gain ou
+    /// la fréquence d'une bande conserve la forme — les coefficients changent,
+    /// pas la cascade — et c'est justement le cas courant, celui du glissement.
+    ///
+    /// Quand la forme change — une bande qui repasse sous le seuil
+    /// d'audibilité sort de la cascade via `is_neutral()`, donc le nombre
+    /// d'étages bouge — l'historique n'est pas transposable et reste à zéro. Ce
+    /// transitoire-là est inévitable, et c'est le même qu'on entend déjà au
+    /// début de chaque piste.
+    pub fn inherit_state_from(&mut self, previous: &EqProcessor) {
+        if previous.channels != self.channels || previous.filters.len() != self.filters.len() {
+            return;
+        }
+        self.states.clone_from(&previous.states);
     }
 }
 
@@ -717,5 +746,98 @@ mod tests {
         }
 
         assert_eq!(one_shot, chunked);
+    }
+
+    /// Même profil, même forme de cascade : reprendre l'état revient exactement
+    /// au même que n'avoir jamais changé de processeur. C'est LA garantie qui
+    /// autorise à remplacer l'égaliseur en pleine lecture sans que ça s'entende.
+    #[test]
+    fn inherited_state_continues_the_stream_exactly() {
+        let profile = shelf_profile();
+        let (whole, _) = stereo_sine(8000.0, 1024);
+        let split = 400 * 2; // frontière du remplacement, en échantillons
+
+        // Référence : un seul processeur, du début à la fin.
+        let mut reference = whole.clone();
+        EqProcessor::new(&profile, 44100, 2).process_interleaved(&mut reference);
+
+        // Remplacement à chaud : un processeur neuf reprend l'historique.
+        let mut swapped = whole.clone();
+        let mut first = EqProcessor::new(&profile, 44100, 2);
+        first.process_interleaved(&mut swapped[..split]);
+        let mut second = EqProcessor::new(&profile, 44100, 2);
+        second.inherit_state_from(&first);
+        second.process_interleaved(&mut swapped[split..]);
+
+        assert_eq!(reference, swapped);
+    }
+
+    /// Sans reprise d'état, le même remplacement dévie du flux continu — c'est
+    /// le clic. Ce test existe pour que la reprise d'état ne puisse pas
+    /// disparaître en silence lors d'un remaniement.
+    #[test]
+    fn dropping_state_breaks_the_stream_where_inheriting_does_not() {
+        let profile = shelf_profile();
+        let (whole, _) = stereo_sine(8000.0, 1024);
+        let split = 400 * 2;
+
+        let mut reference = whole.clone();
+        EqProcessor::new(&profile, 44100, 2).process_interleaved(&mut reference);
+
+        let mut naive = whole.clone();
+        EqProcessor::new(&profile, 44100, 2).process_interleaved(&mut naive[..split]);
+        // Processeur neuf, historique à zéro : le comportement d'un `set_eq`
+        // nu en cours de lecture.
+        EqProcessor::new(&profile, 44100, 2).process_interleaved(&mut naive[split..]);
+
+        let ecart = (naive[split] - reference[split]).abs();
+        assert!(
+            ecart > 1e-6,
+            "un historique perdu devrait dévier du flux continu (écart {ecart})"
+        );
+    }
+
+    /// La cascade change de forme (une bande s'ajoute) : l'état n'est plus
+    /// transposable et ne doit PAS être recopié sur des étages qui ne se
+    /// correspondent plus.
+    #[test]
+    fn state_is_not_inherited_across_a_different_cascade() {
+        let one_band = shelf_profile();
+        let mut two_bands = shelf_profile();
+        two_bands.bands.push(EqBandSpec {
+            freq: 120.0,
+            gain: 6.0,
+            q: 0.71,
+            band_type: "low_shelf".into(),
+        });
+
+        let (mut buf, _) = stereo_sine(8000.0, 256);
+        let mut warmed = EqProcessor::new(&one_band, 44100, 2);
+        warmed.process_interleaved(&mut buf);
+
+        let mut fresh = EqProcessor::new(&two_bands, 44100, 2);
+        fresh.inherit_state_from(&warmed);
+
+        assert_eq!(
+            fresh.states,
+            EqProcessor::new(&two_bands, 44100, 2).states,
+            "état repris d'une cascade de taille différente"
+        );
+    }
+
+    /// Le nombre de canaux est l'autre garde-fou : reprendre l'état d'une
+    /// cascade stéréo sur une cascade mono écraserait la structure.
+    #[test]
+    fn state_is_not_inherited_across_a_channel_count_change() {
+        let profile = shelf_profile();
+        let mut stereo = EqProcessor::new(&profile, 44100, 2);
+        let (mut buf, _) = stereo_sine(8000.0, 256);
+        stereo.process_interleaved(&mut buf);
+
+        let mut mono = EqProcessor::new(&profile, 44100, 1);
+        mono.inherit_state_from(&stereo);
+
+        assert_eq!(mono.states.len(), 1, "le nombre de canaux a été écrasé");
+        assert_eq!(mono.states, EqProcessor::new(&profile, 44100, 1).states);
     }
 }

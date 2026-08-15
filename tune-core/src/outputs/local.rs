@@ -968,6 +968,30 @@ impl LocalOutput {
         *self.eq.lock().unwrap() = eq;
     }
 
+    /// Remplacer l'égaliseur **pendant** la lecture, en emportant l'historique
+    /// des filtres pour que le changement s'entende sans claquer.
+    ///
+    /// La boucle de lecture relit ce mutex à chaque paquet : en remplacer le
+    /// contenu suffit à changer le son en vol. Ce qu'il ne faut pas faire, en
+    /// revanche, c'est jeter l'historique des biquads — un filtre dont l'état
+    /// retombe brutalement à zéro produit une discontinuité, donc un clic, et
+    /// un curseur qu'on fait glisser en produirait un par cran. Voir
+    /// `EqProcessor::inherit_state_from`.
+    ///
+    /// Distinct de [`Self::set_eq`] à dessein : au début d'une piste il n'y a
+    /// pas d'historique à conserver, et celui de la piste précédente serait
+    /// faux.
+    pub fn replace_eq_live(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+        let mut emplacement = self.eq.lock().unwrap();
+        match (eq, emplacement.as_ref()) {
+            (Some(mut neuf), Some(precedent)) => {
+                neuf.inherit_state_from(precedent);
+                *emplacement = Some(neuf);
+            }
+            (suivant, _) => *emplacement = suivant,
+        }
+    }
+
     pub fn has_eq(&self) -> bool {
         self.eq.lock().unwrap().is_some()
     }
