@@ -43,8 +43,9 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             } else {
                 "?1"
             };
+            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
             let count: i64 = match state.backend.query_one(
-                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}"),
+                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
                 &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
             ) {
                 Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -100,10 +101,11 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             } else {
                 "?1"
             };
+            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
             let count: i64 = state
                 .backend
                 .query_one(
-                    &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}"),
+                    &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
                     &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
                 )
                 .ok()
@@ -232,12 +234,13 @@ pub(super) async fn browse_directory(
                     let pattern = format!("{base}{sep}%");
                     let track_count: i64 = match state.backend.query_one(
                         &format!(
-                            "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
+                            "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}{}",
                             if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
                                 "$1"
                             } else {
                                 "?1"
-                            }
+                            },
+                            tune_core::db::track_repo::like_escape_clause(state.backend.engine())
                         ),
                         &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
                     ) {
@@ -280,8 +283,9 @@ pub(super) async fn browse_directory(
                t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path \
                FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
                LEFT JOIN artists ar ON t.artist_id = ar.id \
-               WHERE t.file_path LIKE {ph} \
-               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title"
+               WHERE t.file_path LIKE {ph}{esc} \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+        esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine())
     );
     let rows = state
         .backend
