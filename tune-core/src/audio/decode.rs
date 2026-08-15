@@ -386,8 +386,17 @@ pub fn decode_to_pcm(
     if ext == "ape" {
         // SPIKE (#1145): real Monkey's Audio playback via the pure-Rust
         // `ape-decoder` crate (MIT/Apache-2.0), replacing the broken in-tree
-        // stub. This is a feasibility wiring — validate before shipping.
-        return decode_ape_to_pcm(file_path, seek_s, max_duration_s);
+        // stub.
+        //
+        // catch_unwind : le catch symphonia plus bas ne couvrait PAS cette
+        // branche (return anticipé) — un panic du décodeur entropique tiers
+        // sur un fichier corrompu tuait le worker au lieu de produire une
+        // erreur propre (durcissement, revue 2026-08-15).
+        let fp = file_path.to_string();
+        return catch_unwind(AssertUnwindSafe(move || {
+            decode_ape_to_pcm(&fp, seek_s, max_duration_s)
+        }))
+        .unwrap_or_else(|_| Err("ape: decoder panicked (corrupt file?)".into()));
     }
 
     // WMA/ASF partait vers ffmpeg — un binaire externe retire du projet en
@@ -1318,7 +1327,7 @@ fn decode_ape_to_pcm(
 
     // Copy out the fields we need BEFORE any &mut decode call: info() borrows
     // the decoder immutably and decode_all/decode_from borrow it mutably.
-    let (sample_rate, channels, bit_depth, is_float, is_signed_8bit) = {
+    let (sample_rate, channels, bit_depth, is_float, is_signed_8bit, total_samples) = {
         let info = decoder.info();
         (
             info.sample_rate,
@@ -1326,6 +1335,7 @@ fn decode_ape_to_pcm(
             info.bits_per_sample,
             info.is_floating_point,
             info.is_signed_8bit,
+            info.total_samples,
         )
     };
 
@@ -1334,6 +1344,27 @@ fn decode_ape_to_pcm(
     }
     if !matches!(bit_depth, 8 | 16 | 24 | 32) {
         return Err(format!("ape: unsupported bit depth {bit_depth}"));
+    }
+    // Garde-fous d'en-tête : un fichier corrompu/forgé peut annoncer des
+    // valeurs absurdes que le décodage intégral en mémoire transformerait en
+    // allocation démesurée (un 24/96 légitime fait déjà ~1 Go de PCM).
+    if channels == 0 || channels > 8 {
+        return Err(format!("ape: implausible channel count {channels}"));
+    }
+    if sample_rate == 0 || sample_rate > 384_000 {
+        return Err(format!("ape: implausible sample rate {sample_rate}"));
+    }
+    // Plafond d'allocation calculé depuis l'en-tête, AVANT decode_all.
+    const MAX_APE_PCM_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    let bytes_per = u64::from(bit_depth / 8).max(1);
+    let expected_bytes = total_samples
+        .saturating_mul(u64::from(channels))
+        .saturating_mul(bytes_per);
+    if expected_bytes > MAX_APE_PCM_BYTES {
+        return Err(format!(
+            "ape: decoded size would exceed {} GiB (header claims {total_samples} samples)",
+            MAX_APE_PCM_BYTES / (1024 * 1024 * 1024)
+        ));
     }
 
     // Sample-accurate seek: decode from the requested sample offset onward.
