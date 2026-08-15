@@ -828,6 +828,18 @@ pub struct LocalOutput {
     /// `local:` dans ses journaux ; même famille que #1216 / #1168 / Diretta).
     /// Set per-play by the orchestrator, exactly like `crossfeed`.
     eq: Arc<std::sync::Mutex<Option<super::super::audio::eq::EqProcessor>>>,
+    /// Format effectivement résolu pour le flux en cours : (taux, canaux),
+    /// empaquetés dans un seul u32 (taux sur 24 bits, canaux sur 8).
+    ///
+    /// Un `EqProcessor` se construit POUR un couple (taux, canaux) — d'où sa
+    /// reconstruction à chaque lecture. Sans mémoire de ce couple, personne ne
+    /// pouvait en rebâtir un pendant la lecture : bouger un curseur écrivait le
+    /// profil, le serveur répondait 200, et le son ne changeait pas avant la
+    /// piste suivante (#1725). Or c'est exactement ainsi qu'on règle un
+    /// égaliseur — musique en cours, à l'oreille.
+    ///
+    /// 0 = aucun flux en cours ; `current_format()` renvoie alors `None`.
+    current_format: Arc<AtomicU32>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
     /// PURE (audiophile) bypass for the zone currently playing on this output.
     /// When set, the playback loop skips the room-correction convolver so the
@@ -933,6 +945,7 @@ impl LocalOutput {
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
             eq: Arc::new(std::sync::Mutex::new(None)),
+            current_format: Arc::new(AtomicU32::new(0)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
@@ -957,6 +970,33 @@ impl LocalOutput {
 
     pub fn has_eq(&self) -> bool {
         self.eq.lock().unwrap().is_some()
+    }
+
+    /// Format du flux en cours, `(taux, canaux)`, ou `None` si rien ne joue.
+    ///
+    /// Sert à rebâtir un `EqProcessor` aux bons coefficients SANS attendre la
+    /// piste suivante (#1725).
+    pub fn current_format(&self) -> Option<(u32, u16)> {
+        let empaquete = self.current_format.load(Ordering::Relaxed);
+        if empaquete == 0 {
+            return None;
+        }
+        let taux = empaquete >> 8;
+        let canaux = (empaquete & 0xFF) as u16;
+        if taux == 0 || canaux == 0 {
+            return None;
+        }
+        Some((taux, canaux))
+    }
+
+    /// Empaquette `(taux, canaux)` pour [`Self::current_format`]. Un taux
+    /// au-delà de 16,7 MHz déborderait les 24 bits — il n'en existe pas, mais
+    /// on préfère annoncer « pas de flux » qu'un taux tronqué.
+    pub(crate) fn pack_format(taux: u32, canaux: u16) -> u32 {
+        if taux == 0 || taux > 0x00FF_FFFF || canaux == 0 || canaux > 255 {
+            return 0;
+        }
+        (taux << 8) | (canaux as u32)
     }
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
@@ -1653,6 +1693,7 @@ impl OutputTarget for LocalOutput {
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
         let eq = self.eq.clone();
+        let current_format = self.current_format.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
         let crossfeed = self.crossfeed.clone();
@@ -2030,6 +2071,17 @@ impl OutputTarget for LocalOutput {
                 info!(device = %device_name, "local_audio_compressed_stopped");
                 return;
             };
+
+            // Format definitif du flux PCM : c'est CE couple que voit
+            // `apply_local_dsp`, donc celui auquel un EqProcessor doit etre
+            // bati. Memorise ici pour qu'un profil modifie EN COURS de lecture
+            // puisse etre applique tout de suite, au lieu d'attendre la piste
+            // suivante (#1725). La branche compressee est sortie en `return`
+            // juste au-dessus : elle ne passe pas par le DSP.
+            current_format.store(
+                LocalOutput::pack_format(sample_rate, channels),
+                Ordering::Relaxed,
+            );
 
             // bit_depth == 0 is the sentinel for IEEE float 32-bit (4 bytes)
             let bytes_per_sample = if bit_depth == 0 {
@@ -4016,6 +4068,10 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        // Plus de flux, donc plus de format : sans cet oubli explicite,
+        // `current_format()` decrirait encore la piste precedente et on
+        // rebatirait un EqProcessor pour un flux mort (#1725).
+        self.current_format.store(0, Ordering::Relaxed);
         // Immediately silence the cpal callback so no audio leaks while
         // we wait for the playback thread to exit.  This flag is also
         // checked by the I/O read loop and feed_ring, causing the thread
@@ -5365,5 +5421,64 @@ mod backend_display_tests {
             matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
             "nom inattendu: {name}"
         );
+    }
+}
+
+#[cfg(test)]
+mod format_courant_tests {
+    use super::LocalOutput;
+
+    // -----------------------------------------------------------------------
+    // #1725 — un curseur bouge pendant la lecture, le son doit suivre.
+    //
+    // `set_eq` n'etait appele qu'au demarrage d'une piste, faute de connaitre
+    // le couple (taux, canaux) auquel batir les biquads. `current_format` le
+    // memorise ; ces tests verrouillent l'empaquetage, dont depend la
+    // reconstruction a chaud.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empaquetage_aller_retour_sur_les_formats_courants() {
+        for (taux, canaux) in [
+            (44_100u32, 2u16),
+            (48_000, 2),
+            (96_000, 2),
+            (192_000, 2),
+            (352_800, 2),
+            (768_000, 2),
+            (44_100, 1),
+            (48_000, 8),
+        ] {
+            let empaquete = LocalOutput::pack_format(taux, canaux);
+            assert_ne!(empaquete, 0, "{taux}/{canaux} doit s'empaqueter");
+            assert_eq!(empaquete >> 8, taux, "taux perdu pour {taux}/{canaux}");
+            assert_eq!(
+                (empaquete & 0xFF) as u16,
+                canaux,
+                "canaux perdus pour {taux}/{canaux}"
+            );
+        }
+    }
+
+    /// Zero = « aucun flux ». Batir un EqProcessor pour un format inconnu
+    /// donnerait des coefficients faux, donc mieux vaut ne rien pousser.
+    #[test]
+    fn un_format_absent_ou_aberrant_ne_s_empaquette_pas() {
+        assert_eq!(LocalOutput::pack_format(0, 2), 0, "taux nul");
+        assert_eq!(LocalOutput::pack_format(44_100, 0), 0, "zero canal");
+        assert_eq!(
+            LocalOutput::pack_format(0x0100_0000, 2),
+            0,
+            "un taux qui deborde les 24 bits doit dire « pas de flux » plutot \
+             que de rendre un taux tronque"
+        );
+        assert_eq!(LocalOutput::pack_format(44_100, 256), 0, "trop de canaux");
+    }
+
+    /// Une sortie neuve n'a pas de flux : rien a rebatir.
+    #[test]
+    fn une_sortie_neuve_n_annonce_aucun_format() {
+        let sortie = LocalOutput::new("format-test".to_string());
+        assert_eq!(sortie.current_format(), None);
     }
 }

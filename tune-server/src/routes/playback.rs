@@ -1947,12 +1947,26 @@ async fn set_eq(
     }
     let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
 
+    // Persister ne suffit pas : sans ceci, le reglage n'atteignait le son qu'a
+    // la piste SUIVANTE sur une zone locale, alors que la reponse valait 200
+    // (#1725). On regle un egaliseur musique en cours, a l'oreille — et trois
+    // utilisateurs ont rapporte « l'egaliseur ne fonctionne pas » avant ca.
+    // Sans effet quand rien ne joue, hors zone locale, ou en mode PURE.
+    let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+
     let bands = eq_bands_json(&profile);
     Json(json!({
         "zone_id": zone_id,
         "enabled": profile.enabled,
         "preset": body.preset.unwrap_or_else(|| "custom".into()),
         "bands": bands,
+        // Vrai quand le reglage vient d'atteindre le son d'un flux en cours.
+        // Faux ne signale PAS un echec : rien ne joue, la zone n'est pas
+        // locale, ou elle est en PURE. Expose pour qu'un client puisse dire
+        // « prendra effet a la piste suivante » plutot que de laisser croire
+        // a un egaliseur muet — c'est ce silence qui a produit #1372, #1555
+        // et #1688.
+        "applied_live": applique_a_chaud,
     }))
     .into_response()
 }
