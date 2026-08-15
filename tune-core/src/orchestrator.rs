@@ -5789,6 +5789,24 @@ impl PlaybackOrchestrator {
                     // stream sample rate so the delay line matches the DAC clock.
                     let cf_sr = media.sample_rate.unwrap_or(44100);
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
+                    // Zone equalizer, applied by the output itself for a local
+                    // DAC — exactly like the crossfeed above, and for the same
+                    // reason: a local zone never goes through
+                    // `transcode_source_to_file`, the ONLY place the
+                    // `EqProcessor` was ever run. `use_file_transcode_for`
+                    // requires a network output, so a local zone always took the
+                    // streaming pipe, which touches no DSP. Result: the EQ was
+                    // applied nowhere at all on a local output — profil
+                    // enregistré, courbe affichée, zéro effet au DAC (Jean
+                    // Marie, forum #1416 : ses journaux ne montrent QUE des
+                    // sorties `local:`, sur les deux zones qu'il a essayées).
+                    //
+                    // `load_eq_processor` returns None in PURE mode, so the
+                    // bit-perfect promise is kept without a second guard.
+                    // Built at the resolved stream's rate/channel count so the
+                    // biquads match the DAC clock, mirroring the crossfeed.
+                    let eq_ch = media.channels.unwrap_or(2).clamp(1, 8) as u16;
+                    local_output.set_eq(self.load_eq_processor(zone_id, cf_sr, eq_ch));
                 }
                 drop(output);
             }
