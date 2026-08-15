@@ -275,11 +275,24 @@ async fn apply_profile_handler(
         )
         .map_err(AppError::internal)?;
 
+    // Persister ne suffit pas : sans ceci la correction n'atteint le son qu'a
+    // la piste SUIVANTE sur une zone locale, alors que la reponse annonce deja
+    // `applied: true` (#1725). Une correction de piece se juge a l'oreille,
+    // musique en cours — c'est le geste meme qu'on attend de l'utilisateur.
+    // `zone_id` est textuel sur cette route ; l'orchestrateur indexe par i64.
+    let applique_a_chaud = match zone_id.parse::<i64>() {
+        Ok(id) => state.orchestrator.refresh_zone_eq(id).await,
+        Err(_) => false,
+    };
+
     Ok(Json(json!({
         "applied": true,
         "zone_id": zone_id,
         "profile_name": profile.name,
         "filter_count": profile.filters.len(),
+        // `applied` dit « persiste » ; celui-ci dit « entendu maintenant ».
+        // Faux ne signale pas un echec : rien ne joue, zone non locale, PURE.
+        "applied_live": applique_a_chaud,
     }))
     .into_response())
 }

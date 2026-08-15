@@ -398,12 +398,18 @@ async fn set_zone_dsp(
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
     // Handle eq_profile if present
+    let mut eq_applique_a_chaud = false;
     if let Some(eq_val) = body.get("eq_profile") {
         if let Ok(profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
         {
             let key = format!("zone_{id}_eq_profile");
             let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+            // Persister ne suffit pas : sans ceci le reglage n'atteint le son
+            // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
+            // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
+            // ne le faisait pas.
+            eq_applique_a_chaud = state.orchestrator.refresh_zone_eq(id).await;
         }
     }
 
@@ -450,6 +456,12 @@ async fn set_zone_dsp(
         "dsp_enabled": enabled,
         "eq_profile": body.get("eq_profile"),
         "crossfeed": crossfeed_saved,
+        // Meme contrat que `POST /zones/{id}/eq` : vrai quand le reglage vient
+        // d'atteindre le son d'un flux en cours. Faux ne signale PAS un echec
+        // (rien ne joue, zone non locale, mode PURE) — c'est ce qui permet a un
+        // client de dire « prendra effet a la piste suivante » au lieu de
+        // laisser croire a un egaliseur muet.
+        "eq_applied_live": eq_applique_a_chaud,
     }))
     .into_response()
 }
