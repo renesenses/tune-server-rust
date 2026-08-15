@@ -742,6 +742,32 @@ pub fn spawn_mdns_handler(
                         // whole reconnect/create block for hidden devices.
                         if zone_repo.is_device_hidden(&dev.id) {
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_hidden_skipping");
+                        } else if let Some((zid, was_hidden)) =
+                            legacy_zone_to_reanchor(&zone_repo, &dev)
+                        {
+                            // Zone creee AVANT #1528, donc enregistree sous
+                            // l'ancien identifiant derive de l'adresse. On la
+                            // re-ancre sur le nouvel identifiant durable — c'est
+                            // ce qui remplace la migration SQL, qui n'aurait pas
+                            // pu calculer ces identifiants (ils ne sont connus
+                            // qu'a la decouverte) et aurait fait perdre toutes
+                            // les zones d'un coup.
+                            //
+                            // Une zone supprimee reste supprimee : on deplace
+                            // son identifiant sans la remettre en ligne, sinon
+                            // la mise a jour ressusciterait ce que
+                            // l'utilisateur avait efface.
+                            let _ = zone_repo.update_output_device(zid, &dev.id);
+                            if !was_hidden {
+                                set_zone_online(&event_bus, &db, &dev.id, true);
+                            }
+                            info!(
+                                name = %dev.name,
+                                id = %dev.id,
+                                zone_id = zid,
+                                hidden = was_hidden,
+                                "mdns_zone_reanchored_from_legacy_id"
+                            );
                         } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
@@ -1144,6 +1170,66 @@ fn find_cross_protocol_zone_conflict<'a>(
 /// the same zone lifecycle as the mDNS handler: hidden zones stay deleted,
 /// known device_ids reconnect (online + restored volume), renamed device_ids
 /// re-attach by zone name, and new devices honour `zone_auto_create`.
+/// La zone a re-ancrer sur le nouvel identifiant durable, s'il y en a une.
+///
+/// Rend `(zone_id, etait_masquee)`.
+///
+/// Les zones creees avant #1528 sont enregistrees sous l'identifiant derive de
+/// l'adresse (`{type}-{host}-{port}`). Plutot qu'une migration SQL — impossible,
+/// puisque les nouveaux identifiants ne sont connus qu'a la decouverte — chaque
+/// appareil re-ancre sa zone a sa premiere reapparition. Les zones jamais
+/// revues gardent leur ancien identifiant sans dommage.
+///
+/// Trois garde-fous, et le troisieme a ete ajoute apres coup — il manquait :
+///
+/// 1. **Ne rien faire si une zone porte deja le nouvel identifiant.** Sans
+///    cela, une zone en double restee sur l'ancienne forme serait re-ancree
+///    par-dessus la bonne, et deux zones partageraient la meme cle.
+/// 2. Ne pas agir quand l'ancienne et la nouvelle forme coincident — cas d'un
+///    appareil qui n'annonce aucun identifiant : il n'y a rien a deplacer.
+/// 3. **Exiger que le nom corresponde.** L'ancien identifiant contient une
+///    adresse IP, donc il n'identifie rien — c'est la these de ce correctif, et
+///    l'oublier ici a coute une zone detournee (voir le commentaire sur le
+///    test de nom).
+fn legacy_zone_to_reanchor(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<(i64, bool)> {
+    let legacy = tune_core::discovery::mdns::legacy_device_id(dev.device_type, &dev.host, dev.port);
+    let new_id_taken = matches!(zone_repo.get_by_device_id(&dev.id), Ok(Some(_)));
+    let zone = zone_repo.get_by_device_id(&legacy).ok().flatten()?;
+    if !may_reanchor(&legacy, &dev.id, new_id_taken, &zone.name, &dev.name) {
+        return None;
+    }
+    let zid = zone.id?;
+    Some((zid, zone_repo.is_device_hidden(&legacy)))
+}
+
+/// La regle de re-ancrage, isolee pour etre testable — la fonction ci-dessus
+/// demande une base et un appareil decouvert.
+///
+/// Le troisieme terme merite son histoire. Sur .18 le 13/08, l'Apple TV etait en
+/// 192.168.1.37 ; le DHCP a donne cette adresse a une enceinte Sonos, qui
+/// annonce aussi de l'AirPlay sur le port 7000 ; la zone « AppleTV14,1 » s'est
+/// re-ancree sur le Sonos. Jouer sur l'Apple TV envoyait le son dans la chambre.
+///
+/// La cause : l'ancien identifiant contient une adresse IP, donc il n'identifie
+/// rien — c'est la these meme de ce correctif, et le mecanisme de transition
+/// l'avait oubliee. Le nom est le seul signal restant. Il est faillible, un
+/// utilisateur renomme ; mais l'asymetrie tranche : un faux negatif laisse la
+/// zone sur son ancien identifiant, c'est-a-dire l'etat d'avant le correctif,
+/// tandis qu'un faux positif detourne le son vers une autre enceinte, en
+/// silence.
+fn may_reanchor(
+    legacy_id: &str,
+    new_id: &str,
+    new_id_taken: bool,
+    zone_name: &str,
+    dev_name: &str,
+) -> bool {
+    legacy_id != new_id && !new_id_taken && zone_name == dev_name
+}
+
 pub fn spawn_output_providers(
     state: &AppState,
     providers: Vec<Arc<dyn tune_core::outputs::traits::OutputProvider>>,
@@ -1258,7 +1344,7 @@ pub fn spawn_output_providers(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_cross_protocol_zone_conflict, resolve_control_url};
+    use super::{find_cross_protocol_zone_conflict, may_reanchor, resolve_control_url};
     use tune_core::db::zone_repo::Zone;
 
     fn zone(name: &str, output_type: &str, device_id: &str) -> Zone {
@@ -1397,5 +1483,56 @@ mod tests {
             resolve_control_url("192.168.68.55", 443, abs_https),
             abs_https
         );
+    }
+
+    #[test]
+    fn reanchor_refuses_a_zone_whose_name_no_longer_matches() {
+        // Vecu sur .18 le 13/08. L'Apple TV etait en 192.168.1.37 ; le DHCP a
+        // donne cette adresse a une enceinte Sonos qui annonce aussi de
+        // l'AirPlay sur le port 7000. Sans ce refus, la zone « AppleTV14,1 »
+        // se re-ancre sur le Sonos et le son part dans la chambre.
+        assert!(!may_reanchor(
+            "airplay-192.168.1.37-7000",
+            "airplay-BA:C9:C4:56:04:E8",
+            false,
+            "AppleTV14,1",
+            "Chambre",
+        ));
+    }
+
+    #[test]
+    fn reanchor_accepts_the_same_device_under_a_new_identity() {
+        assert!(may_reanchor(
+            "airplay-192.168.1.37-7000",
+            "airplay-AA:BB:CC:DD:EE:FF",
+            false,
+            "AppleTV14,1",
+            "AppleTV14,1",
+        ));
+    }
+
+    #[test]
+    fn reanchor_never_steals_an_identity_already_in_use() {
+        // Une zone en double restee sur l'ancienne forme ne doit pas etre
+        // re-ancree par-dessus la bonne : deux zones partageraient la cle.
+        assert!(!may_reanchor(
+            "airplay-192.168.1.37-7000",
+            "airplay-AA:BB:CC:DD:EE:FF",
+            true,
+            "AppleTV14,1",
+            "AppleTV14,1",
+        ));
+    }
+
+    #[test]
+    fn reanchor_does_nothing_when_both_forms_are_identical() {
+        // L'appareil n'annonce aucun identifiant : rien a deplacer.
+        assert!(!may_reanchor(
+            "dlna-192.168.1.9-8080",
+            "dlna-192.168.1.9-8080",
+            false,
+            "Salon",
+            "Salon",
+        ));
     }
 }
