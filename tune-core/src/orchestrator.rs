@@ -686,6 +686,12 @@ pub struct ResolvedStream {
 /// file served on the HI-RES streaming path (cache-hit → a previously-finished
 /// transcode instead of a fresh one), so it stays OFF until validated on a real
 /// DLNA renderer. Enable with `TUNE_DASH_WARM_CACHE=1`.
+/// Facteur linéaire d'un trim de gain par renderer (`zone_{id}_gain_trim_db`).
+/// Clampe à ±12 dB — au-delà, on harmonise plus rien, on casse.
+fn gain_trim_factor(trim_db: f64) -> f64 {
+    10f64.powf(trim_db.clamp(-12.0, 12.0) / 20.0)
+}
+
 fn dash_warm_cache_enabled() -> bool {
     std::env::var("TUNE_DASH_WARM_CACHE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -6988,16 +6994,33 @@ impl PlaybackOrchestrator {
         ZoneRepo::with_backend(self.db.clone())
             .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
             .ok();
+        // Trim de gain par renderer (setting `zone_{id}_gain_trim_db`, ±12 dB) :
+        // composé UNIQUEMENT dans la valeur envoyée au device. Le volume
+        // affiché/persisté reste celui de l'utilisateur, le cache de
+        // transcodage n'est pas affecté (rien n'est cuit dans le PCM), et les
+        // zones fixed_volume ne passent jamais ici (early return ci-dessus).
+        // Limite assumée : un trim positif est plafonné quand user_volume est
+        // déjà haut (clamp 0..1).
+        let device_volume = {
+            let trim_db = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+                .get(&format!("zone_{zone_id}_gain_trim_db"))
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
+        };
         if let Some(did) = device_id {
             let arc = { self.outputs.lock().await.get(did) };
             if let Some(output) = arc {
                 info!(
                     zone_id,
                     volume,
+                    device_volume,
                     device_id = did,
                     "device_set_volume_sending"
                 );
-                if let Err(e) = output.lock().await.set_volume(volume).await {
+                if let Err(e) = output.lock().await.set_volume(device_volume).await {
                     warn!(zone_id, error = %e, "device_set_volume_failed");
                     // A refused volume used to stop at this log line: the DB kept
                     // the new value, the slider stayed where the user left it,
@@ -9394,6 +9417,37 @@ mod tests {
         orch.set_volume(zone_id, 1.0, None).await;
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gain_trim_factor_convertit_et_clampe() {
+        use crate::orchestrator::gain_trim_factor;
+        assert!((gain_trim_factor(0.0) - 1.0).abs() < 1e-9);
+        // -6 dB ≈ ×0.5012
+        assert!((gain_trim_factor(-6.0) - 0.501_187).abs() < 1e-4);
+        // +6 dB ≈ ×1.9953
+        assert!((gain_trim_factor(6.0) - 1.995_262).abs() < 1e-4);
+        // Clamp ±12 dB
+        assert!((gain_trim_factor(-40.0) - gain_trim_factor(-12.0)).abs() < 1e-9);
+        assert!((gain_trim_factor(40.0) - gain_trim_factor(12.0)).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn le_trim_ne_touche_pas_le_volume_utilisateur() {
+        // Le trim n'affecte que la valeur envoyée au device : l'état de
+        // lecture (ce que l'UI affiche) et la base gardent le volume brut.
+        let orch = test_orchestrator();
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo.create("Trim Zone", None, None).unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&format!("zone_{zone_id}_gain_trim_db"), "-6")
+            .unwrap();
+
+        orch.set_volume(zone_id, 0.8, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert!((state.volume - 0.8).abs() < f64::EPSILON);
+        let zone = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(zone.volume, 80);
     }
 
     #[tokio::test]
