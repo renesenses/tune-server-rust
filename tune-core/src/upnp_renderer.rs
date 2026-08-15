@@ -93,6 +93,11 @@ pub fn avtransport_scpd() -> &'static str {
       <argument><name>CurrentURI</name><direction>in</direction><relatedStateVariable>AVTransportURI</relatedStateVariable></argument>
       <argument><name>CurrentURIMetaData</name><direction>in</direction><relatedStateVariable>AVTransportURIMetaData</relatedStateVariable></argument>
     </argumentList></action>
+    <action><name>SetNextAVTransportURI</name><argumentList>
+      <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+      <argument><name>NextURI</name><direction>in</direction><relatedStateVariable>AVTransportURI</relatedStateVariable></argument>
+      <argument><name>NextURIMetaData</name><direction>in</direction><relatedStateVariable>AVTransportURIMetaData</relatedStateVariable></argument>
+    </argumentList></action>
     <action><name>Play</name><argumentList>
       <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
       <argument><name>Speed</name><direction>in</direction><relatedStateVariable>TransportPlaySpeed</relatedStateVariable></argument>
@@ -208,6 +213,13 @@ pub fn renderingcontrol_scpd() -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RendererCommand {
     SetUri {
+        uri: String,
+        title: Option<String>,
+        artist: Option<String>,
+        duration_ms: Option<i64>,
+    },
+    /// SetNextAVTransportURI : la piste à enchaîner quand la courante finit.
+    SetNextUri {
         uri: String,
         title: Option<String>,
         artist: Option<String>,
@@ -372,6 +384,17 @@ pub fn parse_renderer_command(soap_body: &str) -> RendererCommand {
             let meta = text_of(soap_body, "CurrentURIMetaData").unwrap_or_default();
             let (title, artist, duration_ms) = parse_didl_metadata(&meta);
             RendererCommand::SetUri {
+                uri,
+                title,
+                artist,
+                duration_ms,
+            }
+        }
+        "SetNextAVTransportURI" => {
+            let uri = text_of(soap_body, "NextURI").unwrap_or_default();
+            let meta = text_of(soap_body, "NextURIMetaData").unwrap_or_default();
+            let (title, artist, duration_ms) = parse_didl_metadata(&meta);
+            RendererCommand::SetNextUri {
                 uri,
                 title,
                 artist,
@@ -639,6 +662,19 @@ mod tests {
             }
             other => panic!("attendu SetUri, obtenu {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_set_next_uri() {
+        let body = soap(
+            "SetNextAVTransportURI",
+            "<InstanceID>0</InstanceID><NextURI>http://srv/next.flac</NextURI><NextURIMetaData></NextURIMetaData>",
+        );
+        match parse_renderer_command(&body) {
+            RendererCommand::SetNextUri { uri, .. } => assert_eq!(uri, "http://srv/next.flac"),
+            other => panic!("attendu SetNextUri, obtenu {other:?}"),
+        }
+        assert!(avtransport_scpd().contains("<name>SetNextAVTransportURI</name>"));
     }
 
     #[test]

@@ -115,6 +115,10 @@ struct PatchZone {
     /// affiché et persisté reste celui de l'utilisateur. Sans effet sur une
     /// zone `fixed_volume` (bit-perfect assumé, le DAC gère).
     gain_trim_db: Option<f64>,
+    /// La zone s'annonce en MediaRenderer UPnP (#1750). Persisté en setting
+    /// `zone_{id}_upnp_renderer` ; défaut off. L'activation réveille
+    /// l'annonceur SSDP pour une annonce immédiate.
+    upnp_renderer: Option<bool>,
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
@@ -151,6 +155,13 @@ fn inject_device_identity(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0);
     obj.insert("gain_trim_db".into(), json!(trim));
+    let upnp_renderer = settings
+        .get(&format!("zone_{zone_id}_upnp_renderer"))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    obj.insert("upnp_renderer".into(), json!(upnp_renderer));
     obj.insert(
         "detected_manufacturer".into(),
         json!(detected.and_then(|d| d.manufacturer.clone())),
@@ -1738,6 +1749,21 @@ async fn patch_zone(
         if let Err(e) = r {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
+    }
+    // Opt-in MediaRenderer UPnP (#1750) → setting zone_{id}_upnp_renderer.
+    if let Some(enabled) = body.upnp_renderer {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_upnp_renderer");
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
+        crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
     }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {
