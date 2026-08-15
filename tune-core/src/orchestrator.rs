@@ -6171,7 +6171,11 @@ impl PlaybackOrchestrator {
             };
             let eq = self.load_eq_processor(zone_id, taux, canaux);
             let actif = eq.is_some();
-            local_output.set_eq(eq);
+            // `replace_eq_live` et non `set_eq` : la piste est en cours, donc
+            // l'historique des biquads doit survivre au remplacement, sinon le
+            // geste même qu'on vient de rendre possible — bouger un curseur en
+            // écoutant — claque à chaque cran.
+            local_output.replace_eq_live(eq);
             info!(
                 zone_id,
                 device_id = %device_id,
