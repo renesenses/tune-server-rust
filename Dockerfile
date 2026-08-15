@@ -20,7 +20,7 @@ COPY tune-bridge/Cargo.toml tune-bridge/
 RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     echo 'fn main() {}' > tune-cli/src/main.rs && \
     touch tune-core/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
-    cargo build --release --package tune-server --no-default-features --features oaat 2>/dev/null || true && \
+    cargo build --release --package tune-server --no-default-features --features oaat,dj,karaoke,plugins-wasm,audio-embedding 2>/dev/null || true && \
     rm -rf tune-core/src tune-server/src tune-cli/src
 
 # Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
@@ -41,8 +41,11 @@ COPY tune-server/ tune-server/
 COPY tune-cli/ tune-cli/
 COPY tune-ffi/ tune-ffi/
 COPY tune-bridge/ tune-bridge/
+# Même jeu de features que .github/workflows/docker.yml : une image construite
+# depuis ce Dockerfile sans audio-embedding renvoyait available:false et l'entrée
+# Ambiance disparaissait de l'UI sans aucun message (#19 de la revue 2026-08-15).
 RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-server && \
-    cargo build --release --package tune-server --no-default-features --features oaat && \
+    cargo build --release --package tune-server --no-default-features --features oaat,dj,karaoke,plugins-wasm,audio-embedding && \
     strip target/release/tune-server
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
