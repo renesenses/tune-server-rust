@@ -381,10 +381,29 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let model_ready = false;
 
+    // `model_ready` seul confond « jamais tenté », « en cours de
+    // téléchargement » et « en échec ». Les trois donnaient le même message à
+    // l'utilisateur, qui allait alors chercher la panne du côté de sa connexion
+    // (#1658) ou concluait à une jauge bloquée (#1512).
+    #[cfg(feature = "audio-embedding")]
+    let model_fetch = {
+        let f = tune_core::audio::embedding::fetch_state("audio_model");
+        json!({
+            "in_progress": f.in_progress,
+            "downloaded_bytes": f.downloaded,
+            "total_bytes": f.total,
+            "attempts": f.attempts,
+            "last_error": f.last_error,
+        })
+    };
+    #[cfg(not(feature = "audio-embedding"))]
+    let model_fetch = json!(null);
+
     Json(json!({
         "available": available,
         "enabled": enabled,
         "model_ready": model_ready,
+        "model_fetch": model_fetch,
         "analysed_tracks": analysed,
         "eligible_tracks": eligible,
         // Bornée à 0 : un modèle qui change repart de zéro et l'analyse peut
