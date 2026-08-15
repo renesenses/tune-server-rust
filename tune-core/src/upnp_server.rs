@@ -93,11 +93,38 @@ impl UpnpState {
         server_port: u16,
         advertised_ip: Option<String>,
     ) -> Self {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        // UDN stable entre les démarrages : certains points de contrôle (JPLAY
+        // notamment) mémorisent un MediaServer par UDN. Un uuid régénéré à
+        // chaque boot faisait apparaître un « nouveau » serveur à chaque
+        // redémarrage et cassait l'appairage mémorisé.
+        let uuid = match settings
+            .get("upnp_udn")
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(u) => u,
+            None => {
+                let fresh = format!("uuid:{}", uuid::Uuid::new_v4());
+                let _ = settings.set("upnp_udn", &fresh);
+                fresh
+            }
+        };
+        // Le nom publié suit le réglage `upnp_friendly_name` (POST
+        // /api/v1/upnp/config) — il était écrit mais jamais lu, renommer le
+        // serveur depuis l'interface n'avait aucun effet.
+        let friendly_name = settings
+            .get("upnp_friendly_name")
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "Tune Server".into());
         Self {
             backend,
             server_port,
-            friendly_name: "Tune Server".into(),
-            uuid: format!("uuid:{}", uuid::Uuid::new_v4()),
+            friendly_name,
+            uuid,
             advertised_ip,
         }
     }
@@ -126,10 +153,11 @@ pub fn build_device_description(state: &UpnpState) -> String {
     let base = state.base_url();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
+<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
     <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
     <friendlyName>{friendly}</friendlyName>
     <manufacturer>MozAIk Labs</manufacturer>
     <manufacturerURL>https://mozaiklabs.fr</manufacturerURL>
@@ -137,6 +165,7 @@ pub fn build_device_description(state: &UpnpState) -> String {
     <modelName>Tune</modelName>
     <modelNumber>{version}</modelNumber>
     <modelURL>https://mozaiklabs.fr/tune</modelURL>
+    <serialNumber>{version}</serialNumber>
     <UDN>{uuid}</UDN>
     <iconList>
       <icon>
@@ -236,8 +265,9 @@ pub fn content_directory_scpd() -> &'static str {
 </scpd>"#
 }
 
-/// SCPD minimal du ConnectionManager (GetProtocolInfo, la seule action que
-/// le handler implémente).
+/// SCPD du ConnectionManager. Les trois actions obligatoires de CM:1 —
+/// un point de contrôle strict peut appeler GetCurrentConnectionIDs/Info
+/// avant son premier Browse et refuser un serveur qui ne les déclare pas.
 pub fn connection_manager_scpd() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
@@ -250,10 +280,41 @@ pub fn connection_manager_scpd() -> &'static str {
         <argument><name>Sink</name><direction>out</direction><relatedStateVariable>SinkProtocolInfo</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <action>
+      <name>GetCurrentConnectionIDs</name>
+      <argumentList>
+        <argument><name>ConnectionIDs</name><direction>out</direction><relatedStateVariable>CurrentConnectionIDs</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetCurrentConnectionInfo</name>
+      <argumentList>
+        <argument><name>ConnectionID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable></argument>
+        <argument><name>RcsID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_RcsID</relatedStateVariable></argument>
+        <argument><name>AVTransportID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_AVTransportID</relatedStateVariable></argument>
+        <argument><name>ProtocolInfo</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ProtocolInfo</relatedStateVariable></argument>
+        <argument><name>PeerConnectionManager</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionManager</relatedStateVariable></argument>
+        <argument><name>PeerConnectionID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable></argument>
+        <argument><name>Direction</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Direction</relatedStateVariable></argument>
+        <argument><name>Status</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionStatus</relatedStateVariable></argument>
+      </argumentList>
+    </action>
   </actionList>
   <serviceStateTable>
     <stateVariable sendEvents="yes"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="yes"><name>CurrentConnectionIDs</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ConnectionID</name><dataType>i4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_RcsID</name><dataType>i4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_AVTransportID</name><dataType>i4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ProtocolInfo</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ConnectionManager</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_Direction</name><dataType>string</dataType>
+      <allowedValueList><allowedValue>Input</allowedValue><allowedValue>Output</allowedValue></allowedValueList>
+    </stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_ConnectionStatus</name><dataType>string</dataType>
+      <allowedValueList><allowedValue>OK</allowedValue><allowedValue>ContentFormatMismatch</allowedValue><allowedValue>InsufficientBandwidth</allowedValue><allowedValue>UnreliableChannel</allowedValue><allowedValue>Unknown</allowedValue></allowedValueList>
+    </stateVariable>
   </serviceStateTable>
 </scpd>"#
 }
@@ -262,7 +323,116 @@ pub fn connection_manager_scpd() -> &'static str {
 // ContentDirectory SOAP response builder
 // ---------------------------------------------------------------------------
 
+/// Nom de la première action SOAP du corps (élément fils de `Body`), sans
+/// préfixe de namespace. `None` si le corps n'est pas du SOAP reconnaissable.
+pub fn parse_soap_action(soap_xml: &str) -> Option<String> {
+    let mut reader = quick_xml::Reader::from_str(soap_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_body = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let local = name.rsplit(':').next().unwrap_or(&name).to_string();
+                if in_body {
+                    return Some(local);
+                }
+                if local == "Body" {
+                    in_body = true;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// Enveloppe SOAP d'une réponse d'action réussie.
+fn soap_action_response(service_urn: &str, action: &str, args: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:{action}Response xmlns:u="{urn}">{args}</u:{action}Response>
+  </s:Body>
+</s:Envelope>"#,
+        action = action,
+        urn = service_urn,
+        args = args,
+    )
+}
+
+/// Fault SOAP UPnP (à servir en HTTP 500 côté route).
+pub fn soap_fault(error_code: u32, description: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <s:Fault>
+      <faultcode>s:Client</faultcode>
+      <faultstring>UPnPError</faultstring>
+      <detail>
+        <UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
+          <errorCode>{code}</errorCode>
+          <errorDescription>{desc}</errorDescription>
+        </UPnPError>
+      </detail>
+    </s:Fault>
+  </s:Body>
+</s:Envelope>"#,
+        code = error_code,
+        desc = quick_xml::escape::escape(description),
+    )
+}
+
+/// Une réponse SOAP est-elle un fault ? Les routes s'en servent pour renvoyer
+/// le statut HTTP 500 que la spec impose aux faults.
+pub fn is_soap_fault(soap: &str) -> bool {
+    soap.contains("<s:Fault>")
+}
+
+/// SID pour une réponse SUBSCRIBE (GENA). Aucun état n'est conservé : le
+/// serveur n'émet pas d'événements, mais un SUBSCRIBE qui échoue suffit à
+/// faire abandonner certains points de contrôle avant le premier Browse.
+pub fn new_subscription_sid() -> String {
+    format!("uuid:{}", uuid::Uuid::new_v4())
+}
+
+const CONTENT_DIRECTORY_URN: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
+const CONNECTION_MANAGER_URN: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
+
+/// Point d'entrée du contrôle ContentDirectory : dispatch sur le NOM d'action.
+/// Avant, toute requête recevait une BrowseResponse — un point de contrôle
+/// strict qui appelle `GetSortCapabilities` avant son premier Browse (JPLAY)
+/// recevait un corps dont l'élément ne correspond pas à l'action et abandonnait.
 pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
+    match parse_soap_action(soap_body).as_deref() {
+        // Corps sans action identifiable : on garde le comportement historique
+        // (Browse) plutôt que de casser un client laxiste qui marchait.
+        None | Some("Browse") => browse_action_response(state, soap_body),
+        Some("GetSortCapabilities") => soap_action_response(
+            CONTENT_DIRECTORY_URN,
+            "GetSortCapabilities",
+            "<SortCaps></SortCaps>",
+        ),
+        Some("GetSearchCapabilities") => soap_action_response(
+            CONTENT_DIRECTORY_URN,
+            "GetSearchCapabilities",
+            "<SearchCaps></SearchCaps>",
+        ),
+        Some("GetSystemUpdateID") => {
+            soap_action_response(CONTENT_DIRECTORY_URN, "GetSystemUpdateID", "<Id>1</Id>")
+        }
+        Some(other) => {
+            debug!(action = other, "upnp_content_directory_unsupported_action");
+            soap_fault(401, "Invalid Action")
+        }
+    }
+}
+
+fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
     debug!(body_len = soap_body.len(), "upnp_content_directory_request");
 
     let (object_id, browse_flag, start, count) = parse_browse_request(soap_body);
@@ -306,16 +476,32 @@ pub fn build_connection_manager_response(soap_body: &str) -> String {
         "upnp_connection_manager_request"
     );
 
-    r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <s:Body>
-    <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
-      <Source>http-get:*:audio/flac:*,http-get:*:audio/wav:*,http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*,http-get:*:audio/mp4:*,http-get:*:audio/x-aiff:*</Source>
-      <Sink></Sink>
-    </u:GetProtocolInfoResponse>
-  </s:Body>
-</s:Envelope>"#
-        .to_string()
+    match parse_soap_action(soap_body).as_deref() {
+        // Comportement historique conservé pour un corps non identifiable.
+        None | Some("GetProtocolInfo") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetProtocolInfo",
+            "<Source>http-get:*:audio/flac:*,http-get:*:audio/wav:*,http-get:*:audio/mpeg:*,http-get:*:audio/ogg:*,http-get:*:audio/aac:*,http-get:*:audio/mp4:*,http-get:*:audio/x-aiff:*</Source><Sink></Sink>",
+        ),
+        // CM:1 impose ces deux actions ; certains points de contrôle les
+        // appellent avant le premier Browse. Réponse statique : un media
+        // server http-get n'entretient pas de connexions explicites,
+        // l'ID 0 permanent est la réponse canonique de la spec.
+        Some("GetCurrentConnectionIDs") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetCurrentConnectionIDs",
+            "<ConnectionIDs>0</ConnectionIDs>",
+        ),
+        Some("GetCurrentConnectionInfo") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetCurrentConnectionInfo",
+            "<RcsID>-1</RcsID><AVTransportID>-1</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Output</Direction><Status>OK</Status>",
+        ),
+        Some(other) => {
+            debug!(action = other, "upnp_connection_manager_unsupported_action");
+            soap_fault(401, "Invalid Action")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,12 +585,107 @@ struct DidlResult {
 }
 
 fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
-    // For simplicity, return the same as a single-item browse
-    let result = browse_direct_children(state, object_id, 0, 1);
-    DidlResult {
-        xml: result.xml,
-        total: 1,
-        returned: 1.min(result.returned),
+    // BrowseMetadata = les métadonnées de L'OBJET lui-même, pas ses enfants.
+    // L'ancienne version renvoyait « les enfants, limités à 1 » : un point de
+    // contrôle strict qui valide la racine par BrowseMetadata("0") recevait
+    // un enfant à la place du conteneur racine et refusait le serveur.
+    let container = match object_id {
+        "0" => Some(didl_container(
+            "0",
+            "-1",
+            "Tune",
+            "object.container.storageFolder",
+            Some(5),
+        )),
+        "artists" => Some(didl_container(
+            "artists",
+            "0",
+            "Artists",
+            "object.container",
+            None,
+        )),
+        "albums" => Some(didl_container(
+            "albums",
+            "0",
+            "Albums",
+            "object.container",
+            None,
+        )),
+        "genres" => Some(didl_container(
+            "genres",
+            "0",
+            "Genres",
+            "object.container",
+            None,
+        )),
+        "playlists" => Some(didl_container(
+            "playlists",
+            "0",
+            "Playlists",
+            "object.container",
+            None,
+        )),
+        "radios" => Some(didl_container(
+            "radios",
+            "0",
+            "Radio",
+            "object.container",
+            None,
+        )),
+        id if id.starts_with("artist/") => {
+            let artist_id: i64 = id
+                .strip_prefix("artist/")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            ArtistRepo::with_backend(state.backend.clone())
+                .get(artist_id)
+                .ok()
+                .flatten()
+                .map(|a| {
+                    didl_container(
+                        id,
+                        "artists",
+                        &a.name,
+                        "object.container.person.musicArtist",
+                        None,
+                    )
+                })
+        }
+        id if id.starts_with("album/") => {
+            let album_id: i64 = id
+                .strip_prefix("album/")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            AlbumRepo::with_backend(state.backend.clone())
+                .get(album_id)
+                .ok()
+                .flatten()
+                .map(|al| {
+                    didl_container(
+                        id,
+                        "albums",
+                        &al.title,
+                        "object.container.album.musicAlbum",
+                        al.track_count.map(|c| c as u64),
+                    )
+                })
+        }
+        _ => None,
+    };
+
+    match container {
+        Some(xml) => DidlResult {
+            xml: didl_wrap(&xml),
+            total: 1,
+            returned: 1,
+        },
+        None => DidlResult {
+            xml: didl_wrap(""),
+            total: 0,
+            returned: 0,
+        },
     }
 }
 
@@ -1110,6 +1391,108 @@ mod tests {
     fn scpd_connection_manager_expose_get_protocol_info() {
         let scpd = connection_manager_scpd();
         assert!(scpd.contains("<name>GetProtocolInfo</name>"));
+        // CM:1 impose aussi ces deux actions — des points de contrôle stricts
+        // les appellent avant le premier Browse.
+        assert!(scpd.contains("<name>GetCurrentConnectionIDs</name>"));
+        assert!(scpd.contains("<name>GetCurrentConnectionInfo</name>"));
+    }
+
+    fn soap_body(action: &str, urn: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:{action} xmlns:u="{urn}"></u:{action}></s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    #[test]
+    fn parse_soap_action_extrait_le_nom() {
+        let body = soap_body(
+            "GetSortCapabilities",
+            "urn:schemas-upnp-org:service:ContentDirectory:1",
+        );
+        assert_eq!(
+            parse_soap_action(&body).as_deref(),
+            Some("GetSortCapabilities")
+        );
+        assert_eq!(parse_soap_action("pas du xml"), None);
+    }
+
+    #[test]
+    fn content_directory_dispatch_repond_a_chaque_action() {
+        // Avant : TOUTE action recevait une BrowseResponse — un client strict
+        // qui appelle GetSortCapabilities avant son premier Browse (JPLAY)
+        // recevait un corps invalide et abandonnait.
+        let state = test_state();
+        let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
+
+        let sort = build_browse_response(&state, &soap_body("GetSortCapabilities", urn));
+        assert!(sort.contains("<u:GetSortCapabilitiesResponse"));
+        assert!(!sort.contains("BrowseResponse"));
+
+        let search = build_browse_response(&state, &soap_body("GetSearchCapabilities", urn));
+        assert!(search.contains("<u:GetSearchCapabilitiesResponse"));
+
+        let update = build_browse_response(&state, &soap_body("GetSystemUpdateID", urn));
+        assert!(update.contains("<u:GetSystemUpdateIDResponse"));
+        assert!(update.contains("<Id>1</Id>"));
+
+        // Action non déclarée au SCPD → fault 401, pas une BrowseResponse.
+        let fault = build_browse_response(&state, &soap_body("Search", urn));
+        assert!(is_soap_fault(&fault));
+        assert!(fault.contains("<errorCode>401</errorCode>"));
+
+        // Un Browse ordinaire répond toujours en BrowseResponse.
+        let browse = build_browse_response(&state, &soap_body("Browse", urn));
+        assert!(browse.contains("<u:BrowseResponse"));
+    }
+
+    #[test]
+    fn connection_manager_dispatch_actions_obligatoires() {
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+
+        let ids = build_connection_manager_response(&soap_body("GetCurrentConnectionIDs", urn));
+        assert!(ids.contains("<u:GetCurrentConnectionIDsResponse"));
+        assert!(ids.contains("<ConnectionIDs>0</ConnectionIDs>"));
+
+        let info = build_connection_manager_response(&soap_body("GetCurrentConnectionInfo", urn));
+        assert!(info.contains("<u:GetCurrentConnectionInfoResponse"));
+        assert!(info.contains("<Direction>Output</Direction>"));
+        assert!(info.contains("<Status>OK</Status>"));
+
+        let proto = build_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+        assert!(proto.contains("<u:GetProtocolInfoResponse"));
+
+        let fault = build_connection_manager_response(&soap_body("PrepareForConnection", urn));
+        assert!(is_soap_fault(&fault));
+    }
+
+    #[test]
+    fn browse_metadata_racine_renvoie_le_conteneur_lui_meme() {
+        // BrowseMetadata("0") doit décrire la racine (parentID -1), pas son
+        // premier enfant — c'est ainsi qu'un client strict valide le serveur.
+        let state = test_state();
+        let body = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+    <ObjectID>0</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag>
+    <StartingIndex>0</StartingIndex><RequestedCount>1</RequestedCount>
+  </u:Browse></s:Body>
+</s:Envelope>"#;
+        let resp = build_browse_response(&state, body);
+        // Le DIDL est échappé dans <Result> — on vérifie sur la forme échappée.
+        assert!(resp.contains("container id=&quot;0&quot; parentID=&quot;-1&quot;"));
+        assert!(resp.contains("<TotalMatches>1</TotalMatches>"));
+    }
+
+    #[test]
+    fn description_expose_x_dlnadoc_et_serial() {
+        let state = test_state();
+        let xml = build_device_description(&state);
+        assert!(xml.contains("<dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>"));
+        assert!(xml.contains("xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\""));
+        assert!(xml.contains("<serialNumber>"));
     }
 
     #[test]

@@ -3796,12 +3796,28 @@ impl PositionPoller {
                 // le local n'avait rien rendu — donc jamais, chez qui a une
                 // bibliotheque locale garnie. L'autoplay enchainait alors des
                 // titres locaux au milieu d'une ecoute Qobuz.
+                // Le repli streaming plus bas est le MEME appel : sans ce
+                // temoin il refaisait a l'identique le travail que la branche
+                // preferee venait d'echouer — deux fois les memes appels
+                // reseau, deux fois les memes lignes de log.
+                let mut streaming_already_tried = false;
                 let seed_source = zone_state.now_playing.as_ref().map(|np| np.source.clone());
+                let seed_source_id = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.source_id.clone());
                 if decisions::autoplay_prefers_streaming(seed_source.as_deref())
                     && let Some(ref artist) = seed_artist
                     && let Some(ref source) = seed_source
                 {
-                    let added = self.autoplay_streaming_radio(zone_id, artist, source).await;
+                    let added = self
+                        .autoplay_streaming_radio(
+                            zone_id,
+                            artist,
+                            source,
+                            seed_source_id.as_deref(),
+                        )
+                        .await;
                     if added > 0 {
                         let new_pos = zone_state.queue_position + 1;
                         info!(
@@ -3819,7 +3835,8 @@ impl PositionPoller {
                     // Le service n'a rien rendu (hors catalogue, API muette) :
                     // on retombe sur le generateur local plutot que de laisser
                     // la file s'arreter en silence.
-                    debug!(zone_id, "autoplay_streaming_empty_falling_back_local");
+                    info!(zone_id, "autoplay_streaming_empty_falling_back_local");
+                    streaming_already_tried = true;
                 }
 
                 let mut generated = Vec::new();
@@ -3854,6 +3871,7 @@ impl PositionPoller {
                 // résultats ne pouvaient être que locaux. On va donc chercher
                 // les artistes similaires dans le service de la piste en cours.
                 if track_ids.is_empty()
+                    && !streaming_already_tried
                     && let Some(ref artist) = seed_artist
                     && let Some(source) = zone_state
                         .now_playing
@@ -3862,7 +3880,12 @@ impl PositionPoller {
                         .filter(|s| s != "local" && !s.is_empty())
                 {
                     let added = self
-                        .autoplay_streaming_radio(zone_id, artist, &source)
+                        .autoplay_streaming_radio(
+                            zone_id,
+                            artist,
+                            &source,
+                            seed_source_id.as_deref(),
+                        )
                         .await;
                     if added > 0 {
                         let new_pos = zone_state.queue_position + 1;
@@ -4187,25 +4210,138 @@ impl PositionPoller {
         zone_id: i64,
         seed_artist: &str,
         source: &str,
+        seed_source_id: Option<&str>,
     ) -> usize {
-        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
-        if names.is_empty() {
-            debug!(zone_id, seed_artist, "autoplay_streaming_no_similar_names");
-            return 0;
-        }
         let Some(service) = self.orchestrator.services.lock().await.get(source) else {
-            debug!(zone_id, source, "autoplay_streaming_service_absent");
+            warn!(zone_id, source, "autoplay_streaming_service_absent");
             return 0;
         };
+
+        // Source 1 : l'API d'enrichissement. Elle ne repond que par MBID, et
+        // une piste de streaming n'en transporte aucun — en pratique elle rend
+        // toujours zero candidat sur une ecoute Qobuz (#1553).
+        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
+        let from_enrichment = !names.is_empty();
+
+        // Source 2 : le service lui-meme. Deux appels reseau, pas un de plus.
+        // On garde les IDENTIFIANTS de catalogue, pas seulement les noms : ils
+        // permettent ensuite de demander « des titres DE cet artiste » plutot
+        // que « des titres qui contiennent son nom ».
+        let mut service_artists: Vec<crate::streaming::traits::StreamArtist> = Vec::new();
+        if names.is_empty() {
+            info!(
+                zone_id,
+                seed_artist, source, "autoplay_streaming_enrichment_empty_trying_service"
+            );
+            service_artists = crate::playback::auto_dj::service_similar_artists(
+                seed_artist,
+                20,
+                |query| {
+                    let service = service.clone();
+                    async move {
+                        let svc = service.lock().await;
+                        match svc.search(&query, 10).await {
+                            Ok(res) => res.artists,
+                            Err(e) => {
+                                warn!(artist = %query, error = %e, "autoplay_streaming_artist_search_failed");
+                                Vec::new()
+                            }
+                        }
+                    }
+                },
+                |artist_id| {
+                    let service = service.clone();
+                    async move {
+                        let svc = service.lock().await;
+                        match svc.get_similar_artists(&artist_id, 20).await {
+                            Ok(artists) => artists,
+                            Err(e) => {
+                                warn!(artist_id = %artist_id, error = %e, "autoplay_streaming_similar_failed");
+                                Vec::new()
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+
+        if names.is_empty() && service_artists.is_empty() {
+            // Les DEUX sources sont muettes : c'est ici que la file s'arrete,
+            // et c'est la ligne que doit trouver quiconque diagnostique un
+            // « autoplay qui ne fait rien ».
+            warn!(
+                zone_id,
+                seed_artist, source, "autoplay_streaming_no_similar_names_from_any_source"
+            );
+            return 0;
+        }
+        let candidates = if from_enrichment {
+            names.len()
+        } else {
+            service_artists.len()
+        };
+        info!(
+            zone_id,
+            source, seed_artist, candidates, from_enrichment, "autoplay_streaming_candidates"
+        );
+
+        // Ne jamais reproposer ce qu'on vient d'entendre, ni ce qui est deja
+        // dans la file : une radio qui rejoue la piste qui se termine n'est pas
+        // une radio.
+        let mut exclude: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(id) = seed_source_id {
+            exclude.insert(id.to_string());
+        }
+        if let Ok(rows) = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+            .get_ordered(zone_id)
+        {
+            exclude.extend(rows.into_iter().filter_map(|r| r.source_id));
+        }
+
+        // Deux facons de transformer un voisin en piste jouable :
+        //  - via l'API d'enrichissement on n'a qu'un NOM, donc une recherche ;
+        //  - via le service on a son identifiant de catalogue, donc ses titres
+        //    a lui. La recherche par nom reste le repli quand l'artiste n'a pas
+        //    de titres exposes.
+        let names_by_id: std::collections::HashMap<String, String> = service_artists
+            .iter()
+            .map(|a| (a.id.clone(), a.name.clone()))
+            .collect();
+        let keys: Vec<String> = if from_enrichment {
+            names.clone()
+        } else {
+            service_artists.iter().map(|a| a.id.clone()).collect()
+        };
+
         let found =
-            crate::playback::auto_dj::streaming_tracks_for_artist_names(&names, 10, |name| {
+            crate::playback::auto_dj::streaming_tracks_for_artist_names(&keys, 10, &exclude, |key| {
                 let service = service.clone();
+                let artist_name = names_by_id.get(&key).cloned();
                 async move {
                     let svc = service.lock().await;
-                    match svc.search(&name, 5).await {
+                    // Chemin identifiant : les titres DE l'artiste, sans
+                    // ambiguite de titre homonyme.
+                    if let Some(ref name) = artist_name {
+                        match svc.get_artist_top_tracks(&key).await {
+                            Ok(tracks) if !tracks.is_empty() => return tracks,
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(artist_id = %key, error = %e, "autoplay_streaming_top_tracks_failed");
+                            }
+                        }
+                        return match svc.search(name, 5).await {
+                            Ok(res) => res.tracks,
+                            Err(e) => {
+                                warn!(artist = %name, error = %e, "autoplay_streaming_search_failed");
+                                Vec::new()
+                            }
+                        };
+                    }
+                    match svc.search(&key, 5).await {
                         Ok(res) => res.tracks,
                         Err(e) => {
-                            debug!(artist = %name, error = %e, "autoplay_streaming_search_failed");
+                            warn!(artist = %key, error = %e, "autoplay_streaming_search_failed");
                             Vec::new()
                         }
                     }
@@ -4213,6 +4349,10 @@ impl PositionPoller {
             })
             .await;
         if found.is_empty() {
+            warn!(
+                zone_id,
+                source, candidates, "autoplay_streaming_no_playable_track"
+            );
             return 0;
         }
         let items: Vec<crate::db::play_queue_repo::StreamingQueueItem> = found

@@ -397,9 +397,18 @@ fn service_to_device(
     let port = info.get_port();
     let port = if port > 0 { port } else { default_port };
 
-    let dev_id = format!("{}-{}-{}", output_type, host, port);
+    // L'identifiant que l'appareil annonce lui-meme, lu AVANT tout
+    // enrichissement et jamais reecrit ensuite (cf. `stable_id`).
+    let stable_id = info
+        .get_property_val_str("deviceid")
+        .or_else(|| info.get_property_val_str("id"))
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+
+    let dev_id = device_id_for(output_type, stable_id.as_deref(), &host, port);
 
     let mut device = DiscoveredDevice::new(dev_id, friendly_name, output_type, host, port);
+    device.stable_id = stable_id;
 
     // Extract capabilities from TXT records
     let mut caps = HashMap::new();
@@ -500,6 +509,36 @@ fn service_to_device(
     // the TXT record carried no manufacturer.
     super::mac::enrich_identity(&mut device);
     device
+}
+
+/// L'identifiant durable d'un appareil.
+///
+/// Prefere ce que l'appareil annonce lui-meme ; ne retombe sur l'adresse que
+/// lorsqu'il n'annonce rien. C'est tout l'objet de #1528 : un bail DHCP
+/// renouvele changeait l'identite de l'appareil, donc dedoublait sa zone et
+/// faisait revenir les zones supprimees, puisque tout le cycle de vie d'une
+/// zone repose sur cette chaine.
+pub fn device_id_for(
+    output_type: OutputType,
+    stable_id: Option<&str>,
+    host: &str,
+    port: u16,
+) -> String {
+    match stable_id {
+        Some(id) => format!("{output_type}-{id}"),
+        None => legacy_device_id(output_type, host, port),
+    }
+}
+
+/// L'ancienne forme, derivee de l'adresse.
+///
+/// Toujours produite pour les appareils qui n'annoncent aucun identifiant, et
+/// surtout : c'est sous cette forme que sont enregistrees les zones creees
+/// AVANT #1528. La decouverte s'en sert pour les retrouver et les re-ancrer
+/// (`discovery_setup`), ce qui evite la migration SQL qui aurait fait perdre
+/// toutes les zones d'un coup.
+pub fn legacy_device_id(output_type: OutputType, host: &str, port: u16) -> String {
+    format!("{output_type}-{host}-{port}")
 }
 
 fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
@@ -650,5 +689,56 @@ mod tests {
     #[test]
     fn choose_address_without_any_address_is_empty_not_a_panic() {
         assert_eq!(choose_address(&[], Some("192.168.1.")), "");
+    }
+
+    #[test]
+    fn device_id_prefers_what_the_device_announces() {
+        // Le coeur de #1528 : deux adresses differentes, meme appareil, meme
+        // identifiant. C'est ce qui empeche un bail DHCP renouvele de dedoubler
+        // la zone et de faire revenir celles qu'on a supprimees.
+        let a = device_id_for(
+            OutputType::Chromecast,
+            Some("uuid-abc"),
+            "192.168.1.42",
+            8009,
+        );
+        let b = device_id_for(
+            OutputType::Chromecast,
+            Some("uuid-abc"),
+            "192.168.1.77",
+            8009,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn device_id_falls_back_to_the_address_when_nothing_is_announced() {
+        // Tous les appareils n'annoncent pas d'identifiant : on ne peut pas
+        // faire mieux que l'adresse, et c'est la forme historique.
+        assert_eq!(
+            device_id_for(OutputType::Dlna, None, "192.168.1.9", 8080),
+            legacy_device_id(OutputType::Dlna, "192.168.1.9", 8080),
+        );
+    }
+
+    #[test]
+    fn two_devices_announcing_different_ids_never_collide() {
+        // L'autre bord : meme adresse et meme port (un hote qui expose deux
+        // services), identifiants distincts.
+        assert_ne!(
+            device_id_for(OutputType::Airplay, Some("aa:bb"), "192.168.1.5", 7000),
+            device_id_for(OutputType::Airplay, Some("cc:dd"), "192.168.1.5", 7000),
+        );
+    }
+
+    #[test]
+    fn the_legacy_form_is_unchanged() {
+        // Les zones creees avant #1528 sont enregistrees sous cette forme
+        // exacte : la decouverte s'en sert pour les retrouver et les
+        // re-ancrer. La changer perdrait toutes les zones existantes.
+        assert_eq!(
+            legacy_device_id(OutputType::Bluos, "192.168.1.23", 11000),
+            format!("{}-192.168.1.23-11000", OutputType::Bluos),
+        );
     }
 }
