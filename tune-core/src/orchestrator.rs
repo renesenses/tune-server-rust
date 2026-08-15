@@ -6116,6 +6116,78 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Réappliquer l'égaliseur d'une zone à la sortie locale qui joue, sans
+    /// attendre la piste suivante.
+    ///
+    /// `set_eq` n'était appelé qu'au démarrage d'une piste — « rebuilt at each
+    /// play », par construction, puisqu'un `EqProcessor` se bâtit POUR un couple
+    /// (taux, canaux). Bouger un curseur en cours de lecture persistait donc le
+    /// profil, renvoyait 200, et ne changeait rien avant la piste suivante
+    /// (#1725). Or c'est exactement le geste par lequel on règle un égaliseur :
+    /// musique en cours, à l'oreille. Trois signalements « l'égaliseur ne
+    /// fonctionne pas » (#1372, #1555, #1688) l'ont précédé.
+    ///
+    /// `LocalOutput::current_format` mémorise désormais le couple réellement vu
+    /// par `apply_local_dsp`, ce qui permet de rebâtir aux bons coefficients.
+    ///
+    /// Renvoie `true` si un égaliseur a été poussé vers une sortie vivante.
+    /// `false` couvre tout le reste — zone sans sortie locale, rien en lecture,
+    /// mode PURE (où `load_eq_processor` rend `None`, donc la promesse
+    /// bit-perfect tient sans garde supplémentaire).
+    pub async fn refresh_zone_eq(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            // Pas de flux en cours : la prochaine lecture rebâtira l'EQ de
+            // toute façon, et bâtir pour un format inconnu donnerait des
+            // coefficients faux.
+            let Some((taux, canaux)) = local_output.current_format() else {
+                return false;
+            };
+            let eq = self.load_eq_processor(zone_id, taux, canaux);
+            let actif = eq.is_some();
+            // `replace_eq_live` et non `set_eq` : la piste est en cours, donc
+            // l'historique des biquads doit survivre au remplacement, sinon le
+            // geste même qu'on vient de rendre possible — bouger un curseur en
+            // écoutant — claque à chaque cran.
+            local_output.replace_eq_live(eq);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                sample_rate = taux,
+                channels = canaux,
+                actif,
+                "zone_eq_refreshed_live"
+            );
+            actif
+        }
+    }
+
     fn zone_has_active_eq(&self, zone_id: i64) -> bool {
         // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
         // gains, not the rate.

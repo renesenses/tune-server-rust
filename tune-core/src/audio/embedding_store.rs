@@ -146,6 +146,223 @@ pub fn rank_by_vector(
     scored
 }
 
+/// Héritage d'embeddings entre éditions d'une même piste (#1732, phase 1).
+///
+/// Le DSD est exclu de l'analyse acoustique (le rééchantillonneur boucle sur
+/// certains repiquages SACD) : une piste DSD n'a donc JAMAIS de vecteur et ne
+/// remonte dans aucune ambiance. Quand la bibliothèque contient la même piste
+/// dans un format analysable (FLAC…), on copie son embedding : même
+/// enregistrement, même acoustique.
+///
+/// Jumelle = titre + artiste normalisés (lower/trim) identiques ET durée à
+/// ±1 s — la clé du dédoublonnage des résultats d'ambiance, en plus strict.
+/// La copie porte `source = 'inherited:<id>'` ; seuls les vecteurs ANALYSÉS
+/// du modèle courant servent de source (jamais d'héritage en chaîne). Au
+/// changement de modèle, les hérités du vieux modèle sont purgés puis
+/// recopiés depuis les sources ré-analysées — sans purge, ils mélangeraient
+/// deux espaces vectoriels dans le même classement.
+///
+/// Idempotent et borné : ne recopie jamais par-dessus un embedding existant,
+/// ne charge aucun blob tant qu'aucune cible n'attend.
+pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
+    // 1. Purge des hérités d'un autre espace vectoriel (bump de modèle).
+    let purge_params: [&dyn ToSqlValue; 1] = [&MODEL_ID];
+    let _ = backend.execute(
+        "DELETE FROM track_audio_embedding \
+         WHERE source LIKE 'inherited:%' AND model != ?",
+        &purge_params,
+    );
+
+    // 2. Cibles : pistes des formats exclus, sans embedding.
+    let targets = match backend.query_many(
+        "SELECT t.id, lower(trim(t.title)), lower(trim(coalesce(a.name, ''))), t.duration_ms \
+         FROM tracks t LEFT JOIN artists a ON a.id = t.artist_id \
+         WHERE lower(t.format) IN ('dsd', 'dsf', 'dff', 'dsdiff') \
+           AND NOT EXISTS (SELECT 1 FROM track_audio_embedding e WHERE e.track_id = t.id)",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    if targets.is_empty() {
+        return 0;
+    }
+
+    // 3. Sources : vecteurs ANALYSÉS du modèle courant (métadonnées seules,
+    //    pas les blobs — on ne les lit qu'au moment de copier).
+    let sources = match backend.query_many(
+        "SELECT e.track_id, lower(trim(t.title)), lower(trim(coalesce(a.name, ''))), \
+                t.duration_ms, e.analyzed_at \
+         FROM track_audio_embedding e \
+         JOIN tracks t ON t.id = e.track_id \
+         LEFT JOIN artists a ON a.id = t.artist_id \
+         WHERE e.model = ? AND e.source IS NULL",
+        &purge_params,
+    ) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut by_key: std::collections::HashMap<(String, String), Vec<(i64, i64, i64)>> =
+        std::collections::HashMap::new();
+    for r in &sources {
+        let (Some(id), Some(title), Some(artist), Some(dur)) = (
+            r.first().and_then(|v| v.as_i64()),
+            r.get(1).and_then(|v| v.as_string()),
+            r.get(2).and_then(|v| v.as_string()),
+            r.get(3).and_then(|v| v.as_i64()),
+        ) else {
+            continue;
+        };
+        let at = r.get(4).and_then(|v| v.as_i64()).unwrap_or(0);
+        by_key
+            .entry((title, artist))
+            .or_default()
+            .push((id, dur, at));
+    }
+
+    let mut inherited = 0u64;
+    for r in &targets {
+        let (Some(target_id), Some(title), Some(artist), Some(dur)) = (
+            r.first().and_then(|v| v.as_i64()),
+            r.get(1).and_then(|v| v.as_string()),
+            r.get(2).and_then(|v| v.as_string()),
+            r.get(3).and_then(|v| v.as_i64()),
+        ) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        // Meilleure jumelle = écart de durée minimal, sous ±1 s.
+        let Some(&(src_id, _, analyzed_at)) = by_key.get(&(title, artist)).and_then(|c| {
+            c.iter()
+                .filter(|(_, d, _)| (d - dur).abs() <= 1000)
+                .min_by_key(|(_, d, _)| (d - dur).abs())
+        }) else {
+            continue;
+        };
+        let Some(embedding) = fetch_one(backend, src_id) else {
+            continue;
+        };
+        let blob = Some(to_bytes(&embedding));
+        let provenance = format!("inherited:{src_id}");
+        let params: [&dyn ToSqlValue; 5] =
+            [&target_id, &MODEL_ID, &blob, &analyzed_at, &provenance];
+        let ok = backend.execute(
+            "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at, source) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT (track_id) DO NOTHING",
+            &params,
+        );
+        if ok.is_ok() {
+            inherited += 1;
+        }
+    }
+    inherited
+}
+
+#[cfg(test)]
+mod inherit_tests {
+    use super::*;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    fn setup() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn mk_track(backend: &Arc<dyn DbBackend>, title: &str, format: &str, dur: i64) -> i64 {
+        let repo = TrackRepo::with_backend(backend.clone());
+        let mut t = Track::new(title.into());
+        t.format = Some(format.into());
+        t.duration_ms = dur;
+        t.file_path = Some(format!("/m/{title}.{format}"));
+        repo.create(&t).unwrap()
+    }
+
+    fn store_analysed(backend: &Arc<dyn DbBackend>, track_id: i64) -> Vec<f32> {
+        let mut v = vec![0.0f32; EMBED_DIM];
+        v[0] = 1.0;
+        let blob = Some(to_bytes(&v));
+        let params: [&dyn ToSqlValue; 3] = [&track_id, &MODEL_ID, &blob];
+        backend
+            .execute(
+                "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                 VALUES (?, ?, ?, 42)",
+                &params,
+            )
+            .unwrap();
+        v
+    }
+
+    #[test]
+    fn herite_vers_la_jumelle_dsd_et_reste_idempotent() {
+        let backend = setup();
+        let flac = mk_track(&backend, "So What", "flac", 200_000);
+        let dsd = mk_track(&backend, "So What", "dsf", 200_400); // ±1 s : ok
+        let orphan = mk_track(&backend, "Blue in Green", "dsf", 300_000); // pas de jumelle
+        let v = store_analysed(&backend, flac);
+
+        assert_eq!(inherit_from_local_twins(&backend), 1);
+        // La DSD a reçu LE vecteur de la FLAC, marqué hérité.
+        assert_eq!(fetch_one(&backend, dsd).as_deref(), Some(v.as_slice()));
+        assert!(fetch_one(&backend, orphan).is_none());
+        let src = backend
+            .query_one(
+                "SELECT source FROM track_audio_embedding WHERE track_id = ?",
+                &[&dsd as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()));
+        assert_eq!(src.as_deref(), Some(format!("inherited:{flac}").as_str()));
+
+        // Idempotent : rien de nouveau au second passage.
+        assert_eq!(inherit_from_local_twins(&backend), 0);
+    }
+
+    #[test]
+    fn duree_trop_differente_ne_matche_pas() {
+        // Même titre mais 5 s d'écart : autre version (live/edit), on ne
+        // copie pas — c'est le même seuil d'esprit que le dédoublonnage.
+        let backend = setup();
+        let flac = mk_track(&backend, "Imagine", "flac", 187_000);
+        let dsd = mk_track(&backend, "Imagine", "dsf", 192_500);
+        store_analysed(&backend, flac);
+        assert_eq!(inherit_from_local_twins(&backend), 0);
+        assert!(fetch_one(&backend, dsd).is_none());
+    }
+
+    #[test]
+    fn un_bump_de_modele_purge_puis_recopie() {
+        let backend = setup();
+        let flac = mk_track(&backend, "Nightswimming", "flac", 255_000);
+        let dsd = mk_track(&backend, "Nightswimming", "dsf", 255_000);
+        store_analysed(&backend, flac);
+        assert_eq!(inherit_from_local_twins(&backend), 1);
+
+        // Simule un bump : l'hérité porte un vieux modèle, la source a été
+        // ré-analysée dans le nouvel espace.
+        backend
+            .execute(
+                "UPDATE track_audio_embedding SET model = 'clap-old' WHERE track_id = ?",
+                &[&dsd as &dyn ToSqlValue],
+            )
+            .unwrap();
+        assert_eq!(inherit_from_local_twins(&backend), 1, "purgé puis recopié");
+        let model = backend
+            .query_one(
+                "SELECT model FROM track_audio_embedding WHERE track_id = ?",
+                &[&dsd as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()));
+        assert_eq!(model.as_deref(), Some(MODEL_ID));
+    }
+}
+
 /// Rank the library by acoustic similarity to a seed track's embedding, most
 /// similar first, excluding the seed itself. Returns `(track_id, cosine)`; empty
 /// when the seed has no embedding (caller falls back to the metadata path).

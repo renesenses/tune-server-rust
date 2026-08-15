@@ -680,7 +680,9 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
         return Json(json!({"error": "no lastfm api key configured"})).into_response();
     }
 
-    let client = reqwest::Client::new();
+    // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
+    // d'attente, qu'un client reqwest construit à la main n'a pas du tout.
+    let client = tune_core::http::client::shared();
     let resp = client
         .get("http://ws.audioscrobbler.com/2.0/")
         .query(&[
@@ -846,16 +848,23 @@ async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> 
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Voir auto_dj::similar_artist_names : pas de repli codé en dur, le client
+    // porte l'adresse de référence (#1730).
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let api_base = settings
-        .get("artist_enrichment_api")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
+    let api_base = settings.get("artist_enrichment_api").ok().flatten();
 
-    let mut client =
-        tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
-    let data = client.get_similar(&artist.name).await;
+    let mut client = tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(
+        api_base.as_deref(),
+        10,
+    );
+    // Même correction qu'en auto_dj : l'API est indexée par MBID, la route
+    // lui passait le nom de l'artiste (#1730). Un artiste inconnu du cloud
+    // rend une liste vide, pas une erreur — la vue « artistes similaires »
+    // reste affichable.
+    let data = match client.resolve_mbid(&artist.name).await {
+        Some(mbid) => client.get_similar(&mbid).await,
+        None => Vec::new(),
+    };
     Json(json!(data)).into_response()
 }
 

@@ -245,7 +245,7 @@ async fn start_job(
             let p = PathBuf::from(path);
             if p.is_dir() {
                 collect_audio_files(&p, &mut file_paths);
-            } else if p.is_file() && can_decode_native(path) {
+            } else if p.is_file() && convertible_input(path) {
                 file_paths.push(p);
             } else {
                 warn!(path, "converter_skip_not_audio_or_missing");
@@ -632,7 +632,7 @@ fn encode_aac_native(
     quality: Option<&str>,
     target_sr: Option<u32>,
 ) -> Result<(), String> {
-    let decoded = decode_to_pcm(input, target_sr, None, 0.0, f64::MAX)?;
+    let decoded = decode_for_convert(input, target_sr)?;
 
     // AAC wants a standard rate; honour the request when it is one, and
     // fall back to 48 kHz otherwise (hi-res sources included).
@@ -678,7 +678,7 @@ fn encode_alac_native(
     target_sr: Option<u32>,
     target_bd: Option<u16>,
 ) -> Result<(), String> {
-    let decoded = decode_to_pcm(input, target_sr, None, 0.0, f64::MAX)?;
+    let decoded = decode_for_convert(input, target_sr)?;
 
     let out_sr = target_sr.unwrap_or(decoded.sample_rate);
     let samples = if out_sr != decoded.sample_rate {
@@ -740,7 +740,7 @@ fn encode_lossless_native(
 ) -> Result<(), String> {
     // Decode to PCM. Only the DSD/WavPack decoders honour target_sr; the
     // symphonia path returns the source rate — the rubato pass below covers it.
-    let decoded = decode_to_pcm(input, target_sr, None, 0.0, f64::MAX)?;
+    let decoded = decode_for_convert(input, target_sr)?;
 
     let out_sr = target_sr.unwrap_or(decoded.sample_rate);
     let out_bd = target_bd.unwrap_or(decoded.bit_depth);
@@ -779,7 +779,7 @@ fn encode_lossless_native(
 /// Encode to Ogg Opus fully in-process (#1525): native decode → rubato to
 /// 48 kHz → libopus (audiopus) → native Ogg mux. Replaces opusenc/ffmpeg.
 fn encode_opus_native(input: &str, output: &Path, quality: Option<&str>) -> Result<(), String> {
-    let decoded = decode_to_pcm(input, None, None, 0.0, f64::MAX)?;
+    let decoded = decode_for_convert(input, None)?;
     if decoded.channels > 2 {
         return Err(format!(
             "opus: {} canaux non pris en charge (mono/stéréo)",
@@ -1115,10 +1115,128 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             collect_audio_files(&path, out);
         } else if let Some(s) = path.to_str() {
-            if can_decode_native(s) {
+            if convertible_input(s) {
                 out.push(path);
             }
         }
+    }
+}
+
+/// Le convertisseur accepte-t-il ce fichier en ENTRÉE ? Décodage natif, ou
+/// WMA/ASF via le ffmpeg résolu du convertisseur (point 12, revue
+/// 2026-08-15 : le WMA n'a plus de décodeur natif depuis le retrait de
+/// ffmpeg du CHEMIN DE LECTURE en v0.8.46 — la CONVERSION, elle, a le droit
+/// au ffmpeg livré avec la release, épic #1523).
+fn convertible_input(path: &str) -> bool {
+    if can_decode_native(path) {
+        return true;
+    }
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("wma" | "asf")
+    ) && resolve_tool("ffmpeg").is_some()
+}
+
+/// Décodage d'une entrée du convertisseur : natif quand on sait faire,
+/// sinon (WMA/ASF) via le ffmpeg résolu. `target_sr` n'est honoré que par
+/// les décodeurs natifs qui le supportent — les appelants rééchantillonnent
+/// de toute façon quand `decoded.sample_rate` ne correspond pas.
+fn decode_for_convert(
+    input: &str,
+    target_sr: Option<u32>,
+) -> Result<tune_core::audio::decode::DecodedAudio, String> {
+    if can_decode_native(input) {
+        return decode_to_pcm(input, target_sr, None, 0.0, f64::MAX);
+    }
+    decode_via_converter_ffmpeg(input)
+}
+
+/// Décode WMA/ASF en PCM s24le via le ffmpeg du convertisseur. Le bundle
+/// minimal n'a pas ffprobe : la fréquence et les canaux sont lus dans la
+/// bannière stderr de `ffmpeg -i`. Si le ffmpeg résolu est le bundle minimal
+/// (sans démuxeur ASF), l'échec est propre et nommé.
+fn decode_via_converter_ffmpeg(
+    input: &str,
+) -> Result<tune_core::audio::decode::DecodedAudio, String> {
+    let ffmpeg =
+        resolve_tool("ffmpeg").ok_or("aucun ffmpeg disponible pour décoder ce format (WMA/ASF)")?;
+
+    let probe = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-i", input])
+        .output()
+        .map_err(|e| format!("ffmpeg probe: {e}"))?;
+    let banner = String::from_utf8_lossy(&probe.stderr);
+    let (sample_rate, channels) = parse_ffmpeg_audio_banner(&banner).ok_or_else(|| {
+        format!(
+            "le ffmpeg résolu ne reconnaît pas ce fichier (bundle minimal sans démuxeur ASF ?) : {}",
+            banner.lines().last().unwrap_or("").trim()
+        )
+    })?;
+
+    let out = std::process::Command::new(&ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-i",
+            input,
+            "-f",
+            "s24le",
+            "-acodec",
+            "pcm_s24le",
+            "-",
+        ])
+        .output()
+        .map_err(|e| format!("ffmpeg decode: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ffmpeg decode failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let pcm = out.stdout;
+    if pcm.is_empty() || pcm.len() % 3 != 0 {
+        return Err("ffmpeg decode produced no usable PCM".into());
+    }
+    let mut samples_i32 = Vec::with_capacity(pcm.len() / 3);
+    for b in pcm.chunks_exact(3) {
+        let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+        samples_i32.push((v << 8) >> 8); // sign-extend 24-bit
+    }
+    let duration_s = samples_i32.len() as f64 / f64::from(channels) / f64::from(sample_rate);
+    Ok(tune_core::audio::decode::DecodedAudio {
+        samples_i32,
+        bit_depth: 24,
+        sample_rate,
+        channels,
+        duration_s,
+    })
+}
+
+/// Extrait `(sample_rate, channels)` de la ligne « Audio: … » de la bannière
+/// stderr de ffmpeg, ex. « Stream #0:0: Audio: wmav2, 44100 Hz, stereo, … ».
+fn parse_ffmpeg_audio_banner(stderr: &str) -> Option<(u32, u32)> {
+    let line = stderr.lines().find(|l| l.contains("Audio:"))?;
+    let mut sample_rate = None;
+    let mut channels = None;
+    for part in line.split(',') {
+        let part = part.trim();
+        if let Some(hz) = part.strip_suffix(" Hz") {
+            sample_rate = hz.trim().parse::<u32>().ok();
+        } else if part == "stereo" {
+            channels = Some(2);
+        } else if part == "mono" {
+            channels = Some(1);
+        } else if let Some(n) = part.strip_suffix(" channels") {
+            channels = n.trim().parse::<u32>().ok();
+        }
+    }
+    match (sample_rate, channels) {
+        (Some(sr), Some(ch)) if sr > 0 && ch > 0 => Some((sr, ch)),
+        _ => None,
     }
 }
 
@@ -1279,6 +1397,18 @@ fn build_zip(dir: &Path) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_parsing_extrait_frequence_et_canaux() {
+        let banner = "Input #0, asf, from 'x.wma':\n  Duration: 00:03:12.34\n    Stream #0:0: Audio: wmav2 (a[1][0][0] / 0x0161), 44100 Hz, stereo, fltp, 128 kb/s";
+        assert_eq!(parse_ffmpeg_audio_banner(banner), Some((44100, 2)));
+        let mono = "    Stream #0:0: Audio: wmav2, 22050 Hz, mono, fltp, 64 kb/s";
+        assert_eq!(parse_ffmpeg_audio_banner(mono), Some((22050, 1)));
+        let multi = "    Stream #0:0: Audio: wmapro, 48000 Hz, 6 channels, fltp";
+        assert_eq!(parse_ffmpeg_audio_banner(multi), Some((48000, 6)));
+        // Pas de ligne Audio (bundle minimal sans démuxeur ASF) → None.
+        assert_eq!(parse_ffmpeg_audio_banner("x.wma: Invalid data found"), None);
+    }
 
     #[test]
     fn ffmpeg_encoders_parsing_reads_the_second_column() {

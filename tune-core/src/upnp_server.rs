@@ -595,7 +595,7 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "-1",
             "Tune",
             "object.container.storageFolder",
-            Some(5),
+            Some(ROOT_CONTAINERS.len() as u64),
         )),
         "artists" => Some(didl_container(
             "artists",
@@ -615,13 +615,6 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "genres",
             "0",
             "Genres",
-            "object.container",
-            None,
-        )),
-        "playlists" => Some(didl_container(
-            "playlists",
-            "0",
-            "Playlists",
             "object.container",
             None,
         )),
@@ -672,6 +665,18 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     )
                 })
         }
+        // Un genre est un conteneur comme un autre : sans cette branche, un
+        // point de contrôle strict qui décrit l'objet avant de l'ouvrir
+        // n'obtenait rien et abandonnait la navigation.
+        id if id.starts_with("genre/") => decode_genre_id(id).map(|genre| {
+            didl_container(
+                id,
+                "genres",
+                &genre,
+                "object.container.genre.musicGenre",
+                None,
+            )
+        }),
         _ => None,
     };
 
@@ -702,7 +707,6 @@ fn browse_direct_children(
         "artists" => browse_artists(state, start, count),
         "albums" => browse_albums(state, start, count),
         "genres" => browse_genres(state),
-        "playlists" => browse_playlists(state),
         "radios" => browse_radios(state),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
@@ -720,22 +724,55 @@ fn browse_direct_children(
                 .unwrap_or(0);
             browse_album_tracks(state, album_id, &base_url)
         }
-        _ => DidlResult {
-            xml: didl_wrap(""),
-            total: 0,
-            returned: 0,
+        // `browse_genres` publiait des conteneurs `genre/<nom>` que PERSONNE
+        // ne savait ouvrir : la branche manquait ici, tout genre tombait dans
+        // le bras par défaut et rendait un DIDL vide (#1736, Jean Valjean).
+        id if id.starts_with("genre/") => match decode_genre_id(id) {
+            Some(genre) => browse_genre_albums(state, &genre, &base_url),
+            None => empty_didl(),
         },
+        _ => empty_didl(),
     }
 }
 
+/// Le DIDL des conteneurs racine. Cette liste est la SEULE source de vérité :
+/// `browse_metadata("0")` en tire son nombre d'enfants, et un conteneur
+/// annoncé ici doit être navigable dans `browse_direct_children` — un dossier
+/// visible et vide se lit comme une bibliothèque cassée, pas comme une
+/// fonction manquante.
+const ROOT_CONTAINERS: [(&str, &str, &str); 4] = [
+    ("artists", "Artists", "object.container"),
+    ("albums", "Albums", "object.container"),
+    ("genres", "Genres", "object.container"),
+    ("radios", "Radio", "object.container"),
+];
+
+fn empty_didl() -> DidlResult {
+    DidlResult {
+        xml: didl_wrap(""),
+        total: 0,
+        returned: 0,
+    }
+}
+
+/// Décode l'identifiant d'un conteneur de genre.
+///
+/// `browse_genres` encode le nom avec `urlencoding::encode`, qui échappe aussi
+/// la barre oblique — « Rock/Pop » devient `genre/Rock%2FPop`. Le découpage se
+/// fait donc sur le PREMIER `/` seulement, et le décodage est symétrique de
+/// l'encodage : sans cela, un genre composé serait tronqué et ne retrouverait
+/// jamais ses albums.
+fn decode_genre_id(object_id: &str) -> Option<String> {
+    let raw = object_id.strip_prefix("genre/")?;
+    let decoded = urlencoding::decode(raw).ok()?.into_owned();
+    if decoded.trim().is_empty() {
+        return None;
+    }
+    Some(decoded)
+}
+
 fn browse_root(_state: &UpnpState) -> DidlResult {
-    let containers = [
-        ("artists", "Artists", "object.container"),
-        ("albums", "Albums", "object.container"),
-        ("genres", "Genres", "object.container"),
-        ("playlists", "Playlists", "object.container"),
-        ("radios", "Radio", "object.container"),
-    ];
+    let containers = ROOT_CONTAINERS;
 
     let mut inner = String::new();
     for (id, title, class) in &containers {
@@ -857,12 +894,49 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
     }
 }
 
-fn browse_playlists(_state: &UpnpState) -> DidlResult {
-    // Placeholder — playlists browsing can be extended later
+/// Les albums d'un genre.
+///
+/// `AlbumRepo::list_by_genre` gère seule les genres composés (« Jazz; Blues »,
+/// « Rock/Pop ») et la colonne JSON `genres` — la même correspondance que
+/// l'interface web, pour que les deux vues d'un même genre donnent la même
+/// liste.
+fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlResult {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let albums = repo.list_by_genre(genre).unwrap_or_default();
+
+    let parent_id = format!("genre/{}", urlencoding::encode(genre));
+    let mut inner = String::new();
+    for album in &albums {
+        let id = format!("album/{}", album.id.unwrap_or(0));
+        let child_count = album.track_count.map(|c| c as u64);
+        let mut extra = String::new();
+        if let Some(ref artist_name) = album.artist_name {
+            extra.push_str(&format!(
+                "<dc:creator>{}</dc:creator>",
+                quick_xml::escape::escape(artist_name)
+            ));
+        }
+        if let Some(ref cover) = album.cover_path {
+            extra.push_str(&format!(
+                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
+                quick_xml::escape::escape(&artwork_url(base_url, cover))
+            ));
+        }
+        inner.push_str(&didl_container_ext(
+            &id,
+            &parent_id,
+            &album.title,
+            "object.container.album.musicAlbum",
+            child_count,
+            &extra,
+        ));
+    }
+
+    let total = albums.len() as u64;
     DidlResult {
-        xml: didl_wrap(""),
-        total: 0,
-        returned: 0,
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
     }
 }
 
@@ -1336,6 +1410,143 @@ mod tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         UpnpState::new(Arc::new(db), 8888, None)
+    }
+
+    fn album_with_genre(title: &str, genre: &str) -> crate::db::models::Album {
+        crate::db::models::Album {
+            id: None,
+            title: title.into(),
+            artist_id: None,
+            artist_name: None,
+            year: None,
+            original_year: None,
+            genre: Some(genre.into()),
+            genres: None,
+            disc_count: None,
+            track_count: Some(9),
+            cover_path: None,
+            source: "local".into(),
+            source_id: None,
+            label: None,
+            catalog_number: None,
+            barcode: None,
+            format: None,
+            sample_rate: None,
+            bit_depth: None,
+            bio: None,
+            musicbrainz_release_id: None,
+            musicbrainz_release_group_id: None,
+            release_date: None,
+            original_date: None,
+            added_at: None,
+        }
+    }
+
+    /// Un état avec un vrai schéma et trois albums, dont un genre composé.
+    fn state_with_albums() -> UpnpState {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend.clone());
+        repo.create(&album_with_genre("Kind of Blue", "Jazz"))
+            .unwrap();
+        repo.create(&album_with_genre("Bitches Brew", "Jazz; Fusion"))
+            .unwrap();
+        repo.create(&album_with_genre("The Wall", "Rock")).unwrap();
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #1736 — le cœur du défaut : `browse_genres` publiait des conteneurs
+    /// `genre/<nom>` que `browse_direct_children` ne savait pas ouvrir.
+    #[test]
+    fn browser_un_genre_renvoie_ses_albums() {
+        let state = state_with_albums();
+        let res = browse_direct_children(&state, "genre/Jazz", 0, 100);
+        assert_eq!(
+            res.total, 2,
+            "Jazz doit rendre ses deux albums, dont celui au genre composé"
+        );
+        assert!(res.xml.contains("Kind of Blue"));
+        assert!(res.xml.contains("Bitches Brew"));
+        assert!(
+            !res.xml.contains("The Wall"),
+            "un album d'un autre genre n'a rien à faire ici"
+        );
+        assert!(
+            res.xml.contains("parentID=\"genre/Jazz\""),
+            "le parentID doit ramener au conteneur de genre, pas à la racine"
+        );
+    }
+
+    /// Contre-échec : sans la branche `genre/`, ce test rendait 0 — c'est
+    /// exactement ce que Jean Valjean voyait à l'écran.
+    #[test]
+    fn un_genre_inconnu_reste_vide_sans_planter() {
+        let state = state_with_albums();
+        assert_eq!(
+            browse_direct_children(&state, "genre/Zouk", 0, 100).total,
+            0
+        );
+        assert_eq!(browse_direct_children(&state, "genre/", 0, 100).total, 0);
+    }
+
+    /// L'encodage échappe la barre oblique ; le décodage doit la rendre,
+    /// sinon « Rock/Pop » serait tronqué en « Rock » et ne trouverait rien.
+    #[test]
+    fn l_identifiant_de_genre_se_decode_symetriquement() {
+        for genre in [
+            "Jazz",
+            "Rock/Pop",
+            "Musique française",
+            "R&B",
+            "Jazz; Fusion",
+        ] {
+            let id = format!("genre/{}", urlencoding::encode(genre));
+            assert_eq!(decode_genre_id(&id).as_deref(), Some(genre), "{genre}");
+        }
+        assert_eq!(decode_genre_id("albums"), None);
+        assert_eq!(decode_genre_id("genre/"), None);
+        assert_eq!(decode_genre_id("genre/%20%20"), None);
+    }
+
+    /// Un point de contrôle strict décrit l'objet avant de l'ouvrir.
+    #[test]
+    fn browse_metadata_decrit_le_conteneur_de_genre() {
+        let state = state_with_albums();
+        let res = browse_metadata(&state, "genre/Jazz");
+        assert_eq!(res.total, 1);
+        assert!(res.xml.contains("parentID=\"genres\""));
+        assert!(res.xml.contains("object.container.genre.musicGenre"));
+        assert!(res.xml.contains("Jazz"));
+    }
+
+    /// La racine ne doit annoncer que des dossiers réellement navigables :
+    /// « Playlists » était visible et vide depuis toujours.
+    #[test]
+    fn la_racine_n_annonce_aucun_conteneur_impossible_a_ouvrir() {
+        let state = test_state();
+        let root = browse_root(&state);
+        assert!(
+            !root.xml.contains("Playlists"),
+            "un conteneur sans contenu navigable se lit comme une bibliothèque cassée"
+        );
+        assert_eq!(root.total, ROOT_CONTAINERS.len() as u64);
+
+        // Et le nombre d'enfants annoncé par BrowseMetadata suit la liste.
+        let meta = browse_metadata(&state, "0");
+        assert!(
+            meta.xml
+                .contains(&format!("childCount=\"{}\"", ROOT_CONTAINERS.len()))
+        );
+
+        // Chaque conteneur racine annoncé doit savoir s'ouvrir.
+        for (id, _, _) in ROOT_CONTAINERS.iter() {
+            assert!(
+                browse_metadata(&state, id).total == 1,
+                "conteneur racine {id} sans BrowseMetadata"
+            );
+        }
     }
 
     #[test]

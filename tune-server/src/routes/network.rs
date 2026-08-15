@@ -674,7 +674,11 @@ async fn browse_media_server(
     // StartingIndex>=TotalMatches, with a safety bound.
     const PAGE_SIZE: u32 = 200;
     const MAX_PAGES: u32 = 500; // up to 100k children
-    let client = reqwest::Client::new();
+    // Client partagé (voir `tune_core::http::client`). Le délai d'attente de
+    // 30 s compte ici : la boucle ci-dessous peut enchaîner jusqu'à 500 pages,
+    // et un client reqwest nu n'impose aucune limite — un serveur DLNA qui
+    // accepte la connexion sans jamais répondre bloquait la requête sans fin.
+    let client = tune_core::http::client::shared();
     let mut containers: Vec<Value> = Vec::new();
     let mut items: Vec<Value> = Vec::new();
     let mut starting_index: u32 = 0;
