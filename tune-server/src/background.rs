@@ -553,6 +553,21 @@ fn spawn_token_refresher(state: &AppState) {
 
 async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
     if let Some(ref upnp) = state.upnp {
+        // `upnp_enabled` (POST /api/v1/upnp/config) était écrit mais jamais
+        // lu : désactiver le media server depuis l'interface n'avait aucun
+        // effet. Les routes /upnp restent montées (inertes sans annonce) ;
+        // la bascule prend effet au redémarrage, comme le renommage.
+        let enabled =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("upnp_enabled")
+                .ok()
+                .flatten()
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true);
+        if !enabled {
+            info!("upnp_mediaserver_disabled_by_setting");
+            return;
+        }
         // La LOCATION n'est plus figée ici : l'annonceur recalcule l'IP à
         // chaque cycle et n'annonce rien tant qu'aucune IP réseau n'est
         // disponible — l'ancien repli « 127.0.0.1 » calculé une fois au
