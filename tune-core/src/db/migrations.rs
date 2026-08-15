@@ -2179,6 +2179,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "embedding_source",
         include_str!("../../migrations/postgres/025_embedding_source.sql"),
     ),
+    (
+        26,
+        "queue_items_numbering",
+        include_str!("../../migrations/postgres/026_queue_items_numbering.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.

@@ -322,3 +322,119 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
     db.query_many("SELECT id FROM albums WHERE year = $1 LIMIT 1", &[&2020i32])
         .expect("WHERE year = $int must not raise `text = bigint` after the heal");
 }
+
+/// #1706 — reproduces the exact .15 production drift and proves `ensure_schema`
+/// heals it instead of dying on the first bad statement.
+///
+/// The drift: `streaming_favorites.id` is BIGINT (migration 012 converts the
+/// TEXT ids of a SQLite→PG migrated database back to bigint + sequence), while
+/// `ensure_schema` re-imposed a `nextval(...)::text` DEFAULT on it. Because the
+/// whole self-healing DDL went out as ONE multi-statement query — one implicit
+/// transaction — that single failure discarded everything, including the
+/// `CREATE TABLE queue_items`. And that CREATE was itself missing
+/// track_number/disc_number, which every streaming queue write names.
+/// Net effect on .15: `queue_restore_append_failed` for 9 zones, every boot.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_1706_ensure_schema_heals_queue_items_numbering() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    // Rebuild the broken pre-fix state.
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS queue_items CASCADE;
+         DROP TABLE IF EXISTS streaming_favorites CASCADE;
+         DROP SEQUENCE IF EXISTS streaming_favorites_id_seq;
+         CREATE TABLE streaming_favorites (
+             id BIGINT PRIMARY KEY,
+             profile_id TEXT NOT NULL DEFAULT '1',
+             item_type TEXT NOT NULL,
+             service TEXT NOT NULL,
+             service_id TEXT NOT NULL,
+             title TEXT,
+             artist TEXT,
+             album TEXT,
+             cover_url TEXT,
+             created_at TEXT,
+             UNIQUE(profile_id, item_type, service, service_id)
+         );",
+    )
+    .execute(&pool)
+    .await
+    .expect("seeding the drifted schema must succeed");
+
+    // Boot the backend: connect() runs ensure_schema().
+    let db = crate::db::postgres::PostgresDb::connect(&url)
+        .await
+        .expect("connect must succeed");
+
+    // The statement that used to abort the batch is now guarded, so everything
+    // AFTER it ran: queue_items exists…
+    let exists: Option<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_name = 'queue_items'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        exists.is_some(),
+        "queue_items was not created: a failing statement still rolls back the batch"
+    );
+
+    // …and it carries the numbering columns, as BIGINT (bound as i64).
+    for col in ["track_number", "disc_number"] {
+        let dt: Option<String> = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'queue_items' AND column_name = $1",
+        )
+        .bind(col)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            dt.as_deref(),
+            Some("bigint"),
+            "queue_items.{col} missing or not bigint — streaming queue writes will fail"
+        );
+    }
+
+    // The failing write from the ticket, verbatim in shape: a streaming row
+    // naming track_number/disc_number must now insert.
+    sqlx::raw_sql(
+        "INSERT INTO queue_items \
+         (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number) \
+         VALUES (424242, 0, 'q1', 't', 'a', 'al', NULL, 1000, 'qobuz', 3, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .expect("streaming queue insert must succeed once the numbering columns exist");
+
+    // Migration 026 is what repairs an ALREADY installed database: the seeded
+    // `streaming_favorites.id` is BIGINT with no DEFAULT at all (the guarded
+    // ALTER deliberately leaves a non-text column alone), so an insert that
+    // omits `id` — which is what the repo does — fails until 026 re-attaches an
+    // integer sequence. Replaying it here also asserts its idempotence: the CI
+    // database has already had it applied by the migration step.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/026_queue_items_numbering.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .expect("migration 026 must be replayable");
+
+    sqlx::raw_sql(
+        "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id) \
+         VALUES ('1', 'album', 'qobuz', 'a1')",
+    )
+    .execute(db.pool())
+    .await
+    .expect("streaming_favorites must stay insertable without an explicit id");
+
+    // Leave the schema in the shape the other tests expect.
+    sqlx::raw_sql("DELETE FROM queue_items WHERE zone_id = 424242")
+        .execute(db.pool())
+        .await
+        .ok();
+}
