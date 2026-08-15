@@ -78,15 +78,26 @@ pub async fn similar_artist_names(
     seed_artist: &str,
     max: usize,
 ) -> Vec<String> {
+    // Pas de repli codé en dur ici : le client porte déjà l'adresse de
+    // référence. Celui qui vivait à cette ligne pointait vers
+    // `https://api.mozaiklabs.fr`, un domaine qui n'existe pas (NXDOMAIN) —
+    // toutes les suggestions échouaient en silence sur chaque installation qui
+    // n'avait pas surchargé le réglage (#1730).
     let api_base = crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
         .get("artist_enrichment_api")
         .ok()
-        .flatten()
-        .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
+        .flatten();
     let mut client =
-        crate::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 5);
+        crate::metadata::artist_enrichment::ArtistEnrichmentClient::new(api_base.as_deref(), 5);
+    // `get_similar` est indexée par MBID ; on lui passait le NOM de la graine.
+    // L'appel ne pouvait pas aboutir — quel que soit l'hôte (#1730). On résout
+    // d'abord, et on renonce proprement si l'artiste est inconnu du cloud :
+    // l'appelant se rabat sur le genre et le tempo (dégradation gracieuse).
+    let Some(mbid) = client.resolve_mbid(seed_artist).await else {
+        return Vec::new();
+    };
     let mut names: Vec<String> = client
-        .get_similar(seed_artist)
+        .get_similar(&mbid)
         .await
         .iter()
         .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_owned))
