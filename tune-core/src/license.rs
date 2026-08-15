@@ -56,6 +56,10 @@ pub enum Feature {
     BatchConverter,
     PlaylistsHub,
     Declick,
+    /// Analyse acoustique CLAP : la passe d'embeddings qui alimente la radio
+    /// acoustique. C'est le traitement le plus lourd du serveur (décodage +
+    /// inférence ONNX multi-thread, ~300 Mo résidents).
+    AcousticAnalysis,
 }
 
 impl Feature {
@@ -88,6 +92,7 @@ impl Feature {
             Feature::BatchConverter,
             Feature::PlaylistsHub,
             Feature::Declick,
+            Feature::AcousticAnalysis,
         ]
     }
 
@@ -104,6 +109,7 @@ impl Feature {
             Feature::ListeningStats => "Listening Stats",
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
+            Feature::AcousticAnalysis => "Acoustic Analysis",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -870,8 +876,12 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyfour_features() {
-        assert_eq!(Feature::all_premium().len(), 24);
+    fn all_premium_has_twentyfive_features() {
+        // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
+        // premium doit être un acte conscient, pas un effet de bord. Passé de
+        // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
+        // rien et tournait sur des installations gratuites.
+        assert_eq!(Feature::all_premium().len(), 25);
     }
 
     #[test]

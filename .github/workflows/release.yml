@@ -725,11 +725,56 @@ jobs:
         with:
           path: artifacts
 
+      # Les sommes sont calculées sur les artefacts DU RUN COURANT. Sur un
+      # re-run partiel, ce run n'a rejoué qu'une partie des jobs : les fichiers
+      # produits par un run antérieur ne sont pas dans `artifacts/` et
+      # disparaissaient donc du SHA256SUMS republié — écrasé par une version
+      # plus pauvre que la précédente.
+      #
+      # Vécu sur v0.9.71 (#1679) : macOS téléversé à 09:31 par un re-run des
+      # seuls jobs Apple, SHA256SUMS régénéré à 10:30 par un autre re-run
+      # partiel — 5 sommes pour 9 fichiers. Les quatre fichiers macOS étaient
+      # publiés mais invérifiables, faute de ligne à comparer.
+      #
+      # Le fichier ne doit donc JAMAIS rétrécir : on repart de celui déjà
+      # publié pour ce tag et on ne remplace que ce que ce run a réellement
+      # reconstruit. Le défaut ne se déclenchait que sur une release réparée en
+      # deux temps, c'est-à-dire quand quelque chose avait déjà mal tourné.
       - name: Checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS.run
           cd ..
+
+          # Le SHA256SUMS déjà publié, s'il existe (absent au premier run).
+          if gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+               --pattern SHA256SUMS --output SHA256SUMS.published 2>/dev/null; then
+            echo "SHA256SUMS déjà publié récupéré ($(wc -l < SHA256SUMS.published) entrées)"
+          else
+            : > SHA256SUMS.published
+            echo "aucun SHA256SUMS publié pour ${GITHUB_REF_NAME} — premier run"
+          fi
+
+          # Union, le run courant l'emportant : on repart des anciennes lignes
+          # dont le NOM DE FICHIER n'a pas été reconstruit par ce run, puis on
+          # ajoute tout ce que ce run a produit. Comparaison sur le basename :
+          # le chemin porte le nom du répertoire d'artefact, qui varie.
+          awk '{ n = $2; sub(/.*\//, "", n); print n }' SHA256SUMS.run | sort -u > .rebuilt
+          awk 'NR==FNR { rebuilt[$0]=1; next }
+               { n = $2; sub(/.*\//, "", n); if (!(n in rebuilt)) print }' \
+              .rebuilt SHA256SUMS.published > SHA256SUMS.kept
+          cat SHA256SUMS.kept SHA256SUMS.run | sort -k2 > SHA256SUMS
+          rm -f SHA256SUMS.run SHA256SUMS.published SHA256SUMS.kept .rebuilt
+
+          # Garde-fou : republier moins que ce qui existait est toujours une
+          # régression, quelle qu'en soit la cause.
+          before=$(gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+                     --json assets --jq '[.assets[].name | select(test("SHA256SUMS")|not)] | length' 2>/dev/null || echo 0)
+          echo "--- SHA256SUMS republié : $(wc -l < SHA256SUMS) entrées (release : ${before} assets binaires) ---"
+          cat SHA256SUMS
 
       # Sign SHA256SUMS with minisign so the self-update client can verify the
       # release cryptographically (audit item 8). No-ops until MINISIGN_SECRET_KEY
@@ -755,8 +800,22 @@ jobs:
           rm -f minisign.key
           echo "Signed SHA256SUMS -> SHA256SUMS.minisig"
 
+      # `draft: true` — la release naît INVISIBLE des clients.
+      #
+      # Ce job porte `if: always()`, donc il tourne aussi quand des builds ont
+      # échoué : c'est voulu (on veut les artefacts partiels et les journaux),
+      # mais jusqu'ici il publiait ce demi-résultat au monde entier. v0.9.71 :
+      # release visible à 19:15 avec 7 assets sur 13, run terminé en échec le
+      # lendemain à 07:45 — douze heures pendant lesquelles le client de mise à
+      # jour de Jean Valjean a cherché un SHA256SUMS incomplet, et pendant
+      # lesquelles on lui a répondu que son réseau était en cause (#1588).
+      #
+      # La bascule en public est faite par le job `publish`, tout en bas, une
+      # fois TOUT déposé — image Tune OS comprise, elle qui s'attachait
+      # jusqu'ici à une release déjà visible.
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
@@ -795,9 +854,52 @@ jobs:
       version: ${{ github.ref_name }}
       attach_to_release: true
 
+  # ─── La bascule en public ──────────────────────────────────────────────
+  #
+  # Seul endroit du workflow qui rend une release visible des clients. Elle
+  # ne s'ouvre que si TOUT a abouti : les binaires (`build`), leur dépôt et
+  # leurs sommes de contrôle (`release`), et l'image appliance
+  # (`tune-os-image`), qui s'attachait jusqu'ici à une release déjà publique.
+  #
+  # `always()` est nécessaire pour que le job s'évalue malgré un `needs`
+  # SAUTÉ — une RC n'a pas d'image Tune OS, et sans ça la release resterait
+  # en brouillon pour toujours. Les conditions qui suivent font le tri : un
+  # `skipped` est acceptable, un `failure` ne l'est pas.
+  #
+  # Les identifiants de job à tiret ne peuvent pas s'écrire `needs.tune-os-image`
+  # dans une expression — le tiret y serait lu comme une soustraction. D'où
+  # la notation entre crochets.
+  publish:
+    name: Publish release (drop the draft)
+    needs: [build, release, tune-os-image]
+    if: >-
+      always()
+      && needs.build.result == 'success'
+      && needs.release.result == 'success'
+      && (needs['tune-os-image'].result == 'success' || needs['tune-os-image'].result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Vérifier que la release est complète, puis la publier
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Ce qui est publié doit être vérifiable : SHA256SUMS est la
+          # sentinelle que le client de mise à jour va chercher en premier.
+          # S'il manque, ne rien montrer plutôt que montrer un demi-état.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS'; then
+            echo "::error::SHA256SUMS absent de $TAG — la release reste en brouillon."
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Release $TAG publiée."
+
   homebrew:
     name: Update Homebrew tap
-    needs: release
+    needs: publish
     # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
     # or `brew upgrade` would move stable users onto an RC.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -896,7 +998,10 @@ jobs:
 
   notify-website:
     name: Update mozaiklabs.fr/download
-    needs: [release, homebrew]
+    # `publish` et non `release` : la page de téléchargement ne doit annoncer
+    # qu'une release réellement publique et complète. Le webhook exige ≥3
+    # assets, mais rien ne lui disait jusqu'ici que la liste était finie.
+    needs: [publish, homebrew]
     # Stable tags only — a pre-release must not update the public download page.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest

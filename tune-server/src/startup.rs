@@ -318,6 +318,21 @@ fn warm_sqlite_cache(state: &AppState) {
 }
 
 /// Initialize PlaybackManager volume from DB-stored zone volumes and mark devices offline.
+///
+/// Une zone stockée à 100 % était ramenée à 20 % ici, « garde-fou contre un
+/// réveil à plein volume » (2fdc2b5e, collatéral d'un défaut DLNA où le poller
+/// écrivait 100 en base pour un renderer à sortie fixe). Ce garde-fou ne
+/// protégeait de rien : `PlaybackManager::set_volume` n'écrit ni la base ni la
+/// sortie. Il laissait trois valeurs pour une seule zone — base 100, mémoire
+/// 0.2, `LocalOutput::user_volume` 1.0 — et envoyait un événement `volume: 0.2`
+/// que personne n'avait demandé (les 20 % de #1504 et #1480, attribués à tort
+/// au défaut 50 % de `ZoneState::default()` dans #1548).
+///
+/// La cause d'origine est traitée à la source : le poller ignore désormais un
+/// renderer qui annonce 100 % (`status.volume < 0.999`), donc un 100 % en base
+/// est aujourd'hui un choix de l'utilisateur. Et la vraie protection contre le
+/// réveil à plein volume est dans `register_local_outputs`, qui ensemence la
+/// sortie avec la valeur stockée — celle-là agit sur le son. Refs #1596.
 async fn restore_zone_volumes(state: &AppState) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     if let Ok(zones) = zone_repo.list() {
@@ -336,10 +351,6 @@ async fn restore_zone_volumes(state: &AppState) {
                     // désaccord d'affichage).
                     state.playback.set_volume(id, 1.0).await;
                     info!(zone_id = id, zone_name = %zone.name, "zone_volume_fixed_restored_full");
-                } else if vol >= 0.999 {
-                    let safe_vol = 0.2;
-                    state.playback.set_volume(id, safe_vol).await;
-                    info!(zone_id = id, zone_name = %zone.name, volume = safe_vol, "zone_volume_clamped_from_100");
                 } else {
                     state.playback.set_volume(id, vol).await;
                     info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
@@ -584,6 +595,22 @@ async fn resolve_ytdlp(state: &AppState) {
     }
 }
 
+/// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
+/// base dit de sa zone. Une zone « Volume fixe (bit-perfect) » reste à pleine
+/// échelle — c'est son contrat, le DoP ne survit pas à une multiplication.
+///
+/// Volontairement HORS du gate `local-audio` : c'est de l'arithmétique, sans
+/// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
+/// fonctionnalités.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+    if fixed_volume {
+        1.0
+    } else {
+        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+    }
+}
+
 /// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
@@ -660,6 +687,31 @@ pub async fn register_local_outputs(state: &AppState) {
                 exclusive_mode,
                 audio_backend,
             );
+            // Ensemencer la sortie avec le volume stocké.
+            //
+            // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
+            // `restore_zone_volumes` ne touche que la copie mémoire du
+            // PlaybackManager, et depuis le compromis « Fabien » l'orchestrateur
+            // ne réimpose plus le volume enregistré à la lecture. Une zone locale
+            // réglée à 30 % repartait donc à PLEIN VOLUME au premier morceau
+            // après un redémarrage — c'est précisément le réveil brutal que
+            // l'écrêtage à 20 % prétendait empêcher sans jamais y toucher (#1596).
+            //
+            // Ce compromis-là ne s'applique pas ici : il protège le niveau
+            // *physique* d'un appareil externe, que Tune ne connaît pas. Le gain
+            // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
+            // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
+            // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
+            if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
+                let stored = seed_volume_for(zone.volume, zone.fixed_volume);
+                if let Err(e) =
+                    tune_core::outputs::OutputTarget::set_volume(&local_out, stored).await
+                {
+                    warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
+                } else {
+                    info!(device_id = %device_id, volume = stored, "local_output_volume_seeded");
+                }
+            }
             outputs.register(Box::new(local_out));
             info!(
                 name = %dev.name,
@@ -768,6 +820,111 @@ pub async fn register_local_outputs(state: &AppState) {
     }
 }
 
+/// Remonte les partages reseau enregistres, avant que quoi que ce soit ne lise
+/// la bibliotheque.
+///
+/// Rien ne les remontait au demarrage. Consequence chez Dominique Comet
+/// (#1692) : apres chaque redemarrage son partage SMB n'etait plus monte, le
+/// repertoire configure existait mais vide, le scan annoncait « 0 fichier », et
+/// il devait re-saisir son partage ET ses identifiants pour retrouver sa
+/// musique.
+///
+/// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
+/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
+/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
+/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
+/// que le serveur ne remplit jamais.
+///
+/// Chaque montage est independant : un partage injoignable est journalise et
+/// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
+/// Tune de servir ce qui est local.
+pub async fn remount_network_shares(state: &AppState) {
+    let rows = match state.backend.query_many(
+        "SELECT server, share, mount_path, username, password \
+         FROM network_mounts WHERE mount_type = 'smb' AND COALESCE(active, 1) = 1",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "remount_network_shares_query_failed");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    info!(count = rows.len(), "remounting_network_shares");
+    for r in rows {
+        let host = r.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let share = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+        let path = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+        if host.is_empty() || share.is_empty() || path.is_empty() {
+            continue;
+        }
+        // Deja monte (redemarrage du seul service, systeme reste debout) :
+        // ne pas empiler un second montage sur le meme point.
+        if std::path::Path::new(&path)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+        {
+            tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_populated_skipping");
+            continue;
+        }
+        let user = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
+        let pass = r.get(4).and_then(|v| v.as_string()).unwrap_or_default();
+
+        // Meme commande que la route de montage — volontairement recopiee
+        // plutot que factorisee : la route rend des erreurs HTTP detaillees a
+        // un humain qui attend, celle-ci journalise et passe au suivant. Les
+        // fusionner obligerait a inventer une abstraction pour deux appelants
+        // aux contrats opposes.
+        let result = if cfg!(target_os = "macos") {
+            let creds = if user.is_empty() {
+                "guest@".to_string()
+            } else if pass.is_empty() {
+                format!("{user}@")
+            } else {
+                format!("{user}:{pass}@")
+            };
+            let unc = format!("//{creds}{host}/{share}");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                tokio::process::Command::new("mount_smbfs")
+                    .args([&unc, &path])
+                    .output(),
+            )
+            .await
+        } else {
+            let u = if user.is_empty() { "guest" } else { &user };
+            let unc = format!("//{host}/{share}");
+            let opts = format!("username={u},password={pass},vers=3.0");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                tokio::process::Command::new("mount.cifs")
+                    .args([&unc, &path, "-o", &opts])
+                    .output(),
+            )
+            .await
+        };
+
+        match result {
+            Ok(Ok(out)) if out.status.success() => {
+                info!(host = %host, share = %share, path = %path, "network_share_remounted")
+            }
+            Ok(Ok(out)) => warn!(
+                host = %host, share = %share,
+                error = %String::from_utf8_lossy(&out.stderr).trim(),
+                "network_share_remount_failed"
+            ),
+            Ok(Err(e)) => {
+                warn!(host = %host, share = %share, error = %e, "network_share_remount_failed")
+            }
+            Err(_) => warn!(host = %host, share = %share, "network_share_remount_timeout"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod restore_zone_volumes_tests {
     use super::*;
@@ -801,17 +958,66 @@ mod restore_zone_volumes_tests {
         );
     }
 
-    /// Le garde-fou reste en place pour les zones SANS engagement bit-perfect :
-    /// un 100 % oublié ne doit pas hurler au premier morceau du matin.
+    /// #1596 — une zone ordinaire stockée à 100 % revient à 100 %.
+    ///
+    /// L'écrêtage à 20 % qui vivait ici ne descendait le son de personne : il
+    /// ne touchait ni la base ni la sortie. Il ne produisait qu'un désaccord à
+    /// trois voix et un événement `volume: 0.2` — les 20 % que Jean Valjean
+    /// (#1504) et Bebelalu55 (#1480) ont vus s'afficher. Ce test ÉCHOUE contre
+    /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
-    async fn non_fixed_zone_at_full_scale_is_still_clamped() {
+    async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
         let (state, id) = state_with_zone(100, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
-            (vol - 0.2).abs() < 1e-9,
-            "garde-fou attendu à 0.2, volume restauré: {vol}"
+            (vol - 1.0).abs() < 1e-9,
+            "un 100 % choisi par l'utilisateur doit revenir à 1.0, obtenu: {vol}"
         );
+    }
+
+    /// La mémoire ne doit jamais contredire la base après restauration : c'est
+    /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
+    #[tokio::test]
+    async fn memory_agrees_with_db_for_every_stored_level() {
+        for stocke in [0, 20, 55, 99, 100] {
+            let (state, id) = state_with_zone(stocke, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = stocke as f64 / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-9,
+                "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
+            );
+        }
+    }
+
+    /// #1596 — la protection réelle contre le réveil à plein volume.
+    ///
+    /// `LocalOutput` naît à 1.0 et personne ne le corrigeait : une zone locale
+    /// à 30 % repartait à fond au premier morceau après un redémarrage. C'est
+    /// le seul endroit où le volume stocké atteint vraiment le son.
+    #[test]
+    fn local_output_is_seeded_with_the_stored_level() {
+        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+    }
+
+    /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
+    /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
+    #[test]
+    fn fixed_volume_output_is_seeded_at_full_scale() {
+        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+    }
+
+    /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
+    /// multiplicateur appliqué à chaque échantillon.
+    #[test]
+    fn out_of_range_stored_level_never_amplifies() {
+        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.

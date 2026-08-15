@@ -604,8 +604,22 @@ async fn mount_smb_share(
     // Persist to database
     use tune_core::db::backend::ToSqlValue;
     match state.backend.execute_returning_id(
-        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username) VALUES (?, ?, ?, ?, ?)",
-        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue],
+        // Le mot de passe est persiste AVEC le reste. Sans lui, le partage
+        // enregistre est inexploitable au redemarrage : Tune connait l'adresse
+        // et l'identifiant, pas le secret, donc il ne peut pas remonter — et
+        // l'utilisateur doit re-saisir son partage ET ses identifiants a chaque
+        // fois (Dominique Comet, #1692 : « il faut que je relance Ajouter un
+        // partage reseau SMB, que je rechoisisse le disque avec les identifiants
+        // adequats »).
+        //
+        // Ce n'est pas une nouvelle exposition : la route de montage generique
+        // (`create_mount`) enregistre deja le mot de passe dans cette meme
+        // colonne, et la meme base porte les jetons de streaming. Le chiffrer
+        // ici seul donnerait l'illusion d'une protection sans en apporter —
+        // `secret_envelope` exige une passphrase utilisateur, incompatible avec
+        // un remontage sans personne devant la machine.
+        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password) VALUES (?, ?, ?, ?, ?, ?)",
+        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue],
     ) {
         Ok(id) => {
             (
