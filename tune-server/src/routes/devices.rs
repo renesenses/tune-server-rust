@@ -811,6 +811,27 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         } else {
             tune_core::outputs::local::list_audio_devices_with_backend(backend)
         };
+        // Publier l'identifiant de registre à côté du nom.
+        //
+        // Cette charge utile n'en portait aucun, et un client qui veut créer
+        // une zone n'a pas d'autre choix que de deviner. Le panneau latéral du
+        // client web devinait « le nom », d'où des zones sans le préfixe
+        // `local:` — invisibles au dédoublonnage, et traitées par
+        // l'orchestrateur comme des renderers réseau, ce qui bloquait la
+        // lecture plus d'une minute avant de ne rien jouer (DEvir, #1823).
+        //
+        // La clé est celle que posent les quatre points d'enregistrement
+        // (`local.rs`, `background.rs`, `startup.rs`) : `local:{name}`.
+        let devices: Vec<Value> = devices
+            .into_iter()
+            .map(|d| {
+                let mut v = serde_json::to_value(&d).unwrap_or_else(|_| json!({}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("id".into(), json!(format!("local:{}", d.name)));
+                }
+                v
+            })
+            .collect();
         Json(json!({
             "devices": devices,
             "backend": tune_core::outputs::local::active_backend_name(backend),
