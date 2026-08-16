@@ -6,7 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use tracing::info;
+use tracing::{info, warn};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 
@@ -92,7 +92,7 @@ fn next_id(items: &[Value]) -> i64 {
         + 1
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -902,6 +902,53 @@ async fn list_oaat_groups(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "oaat_groups": groups }))
 }
 
+/// Délai laissé à un point de diffusion pour accepter une connexion TCP.
+///
+/// Court volontairement : les points de diffusion sont sur le réseau local, et
+/// cette sonde s'exécute pendant que l'utilisateur attend devant son écran. Un
+/// appareil qui n'a pas répondu en une seconde et demie sur son propre réseau
+/// ne jouera pas non plus.
+const ENDPOINT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Ceux des membres qui n'acceptent pas une connexion sur le port OAAT.
+///
+/// Un groupe multiroom est servi par `OaatMultiroomOutput`, qui ouvre une
+/// connexion TCP vers chaque membre sur le port du protocole OAAT. Un renderer
+/// DLNA n'écoute rien là : la connexion est refusée, `connected` retombe à
+/// zéro, et le groupe ne peut plus jamais jouer.
+///
+/// Rien ne vérifiait cela à la création. Cyrille Moutia a donc pu grouper deux
+/// Yamaha DLNA, voir le groupe s'afficher comme actif, et chercher pendant un
+/// moment ce qu'il avait mal réglé — alors que le seul endroit où l'échec
+/// apparaissait était une ligne d'erreur dans un journal (#1779).
+///
+/// Les sondes partent en parallèle : le coût du contrôle est celui du membre
+/// le plus lent, pas leur somme.
+pub(crate) async fn unreachable_endpoints(endpoints: &[(String, u16)]) -> Vec<String> {
+    let probes = endpoints.iter().map(|(host, port)| {
+        let host = host.clone();
+        let port = *port;
+        async move {
+            let ok = tokio::time::timeout(
+                ENDPOINT_PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok());
+            if ok {
+                None
+            } else {
+                Some(format!("{host}:{port}"))
+            }
+        }
+    });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
     let name = body["name"].as_str().unwrap_or("OAAT Group");
     let endpoints: Vec<(String, u16)> = body["endpoints"]
@@ -917,6 +964,29 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
 
     if endpoints.is_empty() {
         return Json(json!({ "error": "at least one endpoint required" }));
+    }
+
+    // Un groupe qui ne peut pas jouer ne doit pas pouvoir se créer (#1779).
+    // Avant ce contrôle, le groupe était accepté, persisté et réenregistré à
+    // chaque démarrage ; l'échec n'apparaissait que dans les journaux.
+    let unreachable = unreachable_endpoints(&endpoints).await;
+    if !unreachable.is_empty() {
+        warn!(
+            name,
+            unreachable = unreachable.join(", "),
+            total = endpoints.len(),
+            "oaat_multiroom_group_refused_unreachable_endpoints"
+        );
+        return Json(json!({
+            "error": format!(
+                "Ces appareils ne répondent pas comme des points de diffusion Tune : {}. \
+                 Le multiroom synchronisé relie des points de diffusion Tune entre eux ; \
+                 un lecteur DLNA ou AirPlay ne peut pas en faire partie. \
+                 Le groupe n'a pas été créé.",
+                unreachable.join(", ")
+            ),
+            "unreachable_endpoints": unreachable,
+        }));
     }
 
     let group_id = format!(
@@ -1146,4 +1216,76 @@ fn downcast_oaat_multiroom(
     output
         .as_any()
         .downcast_ref::<tune_core::outputs::oaat::OaatMultiroomOutput>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un port fermé sur la boucle locale : on ouvre un écouteur pour obtenir
+    /// un numéro de port réellement libre, puis on le referme. Tirer un numéro
+    /// au hasard donnerait un test qui échoue le jour où quelque chose écoute
+    /// dessus.
+    async fn port_ferme() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    #[tokio::test]
+    async fn un_appareil_qui_refuse_la_connexion_est_signale() {
+        // C'est le cas de Cyrille : deux Yamaha DLNA, rien à l'écoute sur le
+        // port OAAT, `Connection refused` sur les deux. Le groupe était
+        // pourtant créé et persisté (#1779).
+        let port = port_ferme().await;
+        let refuses = unreachable_endpoints(&[("127.0.0.1".to_string(), port)]).await;
+        assert_eq!(
+            refuses,
+            vec![format!("127.0.0.1:{port}")],
+            "un membre injoignable doit être nommé, pour que l'interface \
+             puisse dire LEQUEL pose problème"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_appareil_qui_accepte_la_connexion_passe() {
+        // Contre-épreuve indispensable : un contrôle qui refuse tout le monde
+        // « marche » aussi sur le test précédent, et casserait le multiroom
+        // pour les vrais points de diffusion.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+        let refuses = unreachable_endpoints(&[("127.0.0.1".to_string(), port)]).await;
+        assert!(
+            refuses.is_empty(),
+            "un point de diffusion qui accepte la connexion ne doit pas être \
+             refusé, sinon on casse le multiroom qui fonctionne : {refuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seuls_les_membres_fautifs_sont_nommes() {
+        // Le message affiché ne doit pas accuser tout le groupe quand un seul
+        // membre est en cause — c'est la différence entre « votre groupe ne
+        // marche pas » et « CET appareil ne peut pas en faire partie ».
+        let bon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_bon = bon.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if bon.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let port_mauvais = port_ferme().await;
+        let refuses = unreachable_endpoints(&[
+            ("127.0.0.1".to_string(), port_bon),
+            ("127.0.0.1".to_string(), port_mauvais),
+        ])
+        .await;
+        assert_eq!(refuses, vec![format!("127.0.0.1:{port_mauvais}")]);
+    }
 }

@@ -7,6 +7,7 @@ pub mod favorites_reconcile;
 pub mod history_repo;
 pub mod metadata_proposal_repo;
 pub mod metadata_report_repo;
+pub mod migration_status;
 pub mod migrations;
 pub mod models;
 #[cfg(feature = "postgres")]

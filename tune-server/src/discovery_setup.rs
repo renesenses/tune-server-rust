@@ -101,6 +101,20 @@ fn save_known_renderers(db: &Arc<dyn DbBackend>, renderers: &[KnownRenderer]) {
     }
 }
 
+/// Replie le magasin sur UNE entrée par `LOCATION`, en gardant la première.
+///
+/// UPnP garantit qu'une `LOCATION` renvoie une seule description racine, donc
+/// un seul appareil physique : deux entrées qui la partagent sont le même
+/// matériel vu par deux de ses UDN. Fonction pure, testable sans réseau
+/// (#1703).
+fn dedup_renderers_by_location(renderers: Vec<KnownRenderer>) -> Vec<KnownRenderer> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    renderers
+        .into_iter()
+        .filter(|r| seen.insert(r.location.clone()))
+        .collect()
+}
+
 /// Upsert a discovered renderer by device_id (replacing any prior entry).
 /// Best-effort: a persistence failure is logged, never panics, and never
 /// blocks discovery. Skips the settings write when the stored entry is already
@@ -113,7 +127,12 @@ fn persist_known_renderer(db: &Arc<dyn DbBackend>, device_id: &str, location: &s
     {
         return;
     }
-    renderers.retain(|r| r.device_id != device_id);
+    // Une `LOCATION` = un appareil physique (UPnP) : un HEOS Denon/Marantz
+    // annonce racine et appareils embarqués sous des `uuid:` différents mais à
+    // la même URL de description. Sans le `r.location != location`, le magasin
+    // gagnait une entrée par UDN et le démarrage re-sondait cinq fois le même
+    // ND8006 (#1703).
+    renderers.retain(|r| r.device_id != device_id && r.location != location);
     renderers.push(KnownRenderer {
         device_id: device_id.to_string(),
         location: location.to_string(),
@@ -490,9 +509,22 @@ async fn handle_ssdp_discovered(
 /// device; failures are logged and never block boot. Mirrors
 /// `routes::devices::reregister_manual_devices`.
 pub async fn reregister_known_renderers(state: &AppState) {
-    let renderers = load_known_renderers(&state.backend);
-    if renderers.is_empty() {
+    let stored = load_known_renderers(&state.backend);
+    if stored.is_empty() {
         return;
+    }
+    // Les magasins écrits avant #1703 portent une entrée par UDN — cinq pour
+    // un seul Marantz ND8006, toutes à la même URL de description. On les
+    // replie avant de sonder, et on réécrit le magasin pour qu'il guérisse.
+    let stored_len = stored.len();
+    let renderers = dedup_renderers_by_location(stored);
+    if renderers.len() != stored_len {
+        info!(
+            before = stored_len,
+            after = renderers.len(),
+            "known_renderers_collapsed_by_location"
+        );
+        save_known_renderers(&state.backend, &renderers);
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
 
@@ -1534,5 +1566,77 @@ mod tests {
             "Salon",
             "Salon",
         ));
+    }
+
+    // ── Un appareil physique = une LOCATION (#1703) ───────────────────────
+
+    mod known_renderers_par_location {
+        use super::super::{KnownRenderer, dedup_renderers_by_location, persist_known_renderer};
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+
+        const AIOS: &str = "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml";
+
+        fn memory_backend() -> Arc<dyn DbBackend> {
+            let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            // La table `settings` naît d'une migration : sans elle le magasin
+            // relit toujours vide et le test ne prouve rien.
+            tune_core::db::migrations::run_migrations(&db).unwrap();
+            Arc::new(db)
+        }
+
+        #[test]
+        fn les_udn_freres_d_un_heos_ne_font_qu_une_entree() {
+            // Le ND8006 de Jean Valjean : cinq `uuid:` annoncés, une seule
+            // description racine. Sans le correctif, cinq entrées persistées
+            // et cinq re-sondages au démarrage suivant.
+            let backend = memory_backend();
+            for i in 0..5 {
+                persist_known_renderer(&backend, &format!("uuid:aios-{i}"), AIOS, "Marantz ND8006");
+            }
+            let stored = super::super::load_known_renderers(&backend);
+            assert_eq!(
+                stored.len(),
+                1,
+                "un appareil physique = une entrée, pas {:?}",
+                stored.iter().map(|r| &r.device_id).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn deux_locations_restent_deux_appareils() {
+            // Garde-fou : un ampli multi-zone expose deux descriptions
+            // distinctes derrière la même adresse — on ne doit en perdre
+            // aucune.
+            let backend = memory_backend();
+            persist_known_renderer(
+                &backend,
+                "uuid:z1",
+                "http://192.168.1.11:8080/desc.xml",
+                "Zone 1",
+            );
+            persist_known_renderer(
+                &backend,
+                "uuid:z2",
+                "http://192.168.1.11:8081/desc.xml",
+                "Zone 2",
+            );
+            assert_eq!(super::super::load_known_renderers(&backend).len(), 2);
+        }
+
+        #[test]
+        fn un_magasin_deja_dedouble_se_replie() {
+            let stored: Vec<KnownRenderer> = (0..5)
+                .map(|i| KnownRenderer {
+                    device_id: format!("uuid:aios-{i}"),
+                    location: AIOS.to_string(),
+                    name: "Marantz ND8006".into(),
+                })
+                .collect();
+            let collapsed = dedup_renderers_by_location(stored);
+            assert_eq!(collapsed.len(), 1);
+            assert_eq!(collapsed[0].device_id, "uuid:aios-0");
+        }
     }
 }
