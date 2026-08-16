@@ -1493,6 +1493,17 @@ fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
 /// regardless of what follows. Used for keys lofty has no `ItemKey` for (e.g.
 /// `SOURCE`), which are dropped during the VorbisComments → generic-tag split.
 fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
+    let data = read_vorbis_header(path)?;
+    find_vorbis_comment(&data, field_name)
+}
+
+/// The bounded header read behind [`raw_vorbis_comment`], split out so a caller
+/// after several fields pays for **one** read instead of one per field.
+///
+/// This matters at scan time: looking for four Dynamic Range spellings with four
+/// separate calls costs four 1 MB reads on *every* file, and the files that have
+/// none — the vast majority — pay the full price every time.
+fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
         return None;
@@ -1509,6 +1520,11 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
             .read_to_end(&mut data)
             .ok()?;
     }
+    Some(data)
+}
+
+/// Find one field in an already-read Vorbis header.
+fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
     let needle = format!("{}=", field_name.to_ascii_uppercase());
     let nlen = needle.len();
     if data.len() <= nlen {
@@ -1531,6 +1547,38 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Reduce a Dynamic Range tag to its bare digits.
+///
+/// Tools disagree on the form: DROffline MK2 and foobar2000 write `12`, `DR12`
+/// or `DR 12` depending on version and template. Storing the raw form would
+/// sink the sort this feature exists for — values are TEXT in `track_metadata`,
+/// so `"DR9"` and `"9"` never line up, and `"10" < "9"` lexically.
+///
+/// An optional `DR` prefix and surrounding spaces are dropped, but the result is
+/// kept ONLY when what remains is an integer. Anything unexpected is returned
+/// untouched rather than mangled: showing a value we failed to parse beats
+/// losing it.
+fn normalise_dr(raw: &str) -> String {
+    let t = raw.trim();
+    let body = t
+        .strip_prefix("DR")
+        .or_else(|| t.strip_prefix("dr"))
+        .or_else(|| t.strip_prefix("Dr"))
+        .unwrap_or(t)
+        .trim();
+    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit()) {
+        return t.to_string();
+    }
+    // "08" → "8", but a lone "0" stays "0" (a crushed master really can measure
+    // DR0, and dropping it would read as "no value").
+    let stripped = body.trim_start_matches('0');
+    if stripped.is_empty() {
+        "0".to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
@@ -2017,6 +2065,37 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     {
         meta.insert("source_media".into(), v);
     }
+    // Dynamic Range — the mastering's measured dynamics, asked for twice on the
+    // forum (Babacar #303, Patatorz #1418). No standard exists: lofty has no
+    // `ItemKey` for it, so like `SOURCE` these fields are dropped during the
+    // VorbisComments → generic-tag split and need the raw header read.
+    //
+    // Patatorz described the real chain (2026-08-15): measured with DROffline
+    // MK2, written as `ALBUM DYNAMIC RANGE` through Mp3tag. He does NOT tag
+    // individual tracks ("trop de travail"), which is why the album field leads
+    // here; `DYNAMIC RANGE` is read anyway since foobar2000 writes it.
+    //
+    // NOT covered: MP3. There these values live in TXXX frames, which lofty does
+    // not surface either, and no raw reader serves that format (the `Id3v2Tags`
+    // one is DSF-specific). Separate piece of work.
+    //
+    // `ALBUM DR` / `DR` are accepted as secondary spellings. The header is read
+    // ONCE for all four: a file without any of them — the common case — would
+    // otherwise pay four separate 1 MB reads per scan.
+    if let Some(header) = read_vorbis_header(path) {
+        if let Some(v) = find_vorbis_comment(&header, "ALBUM DYNAMIC RANGE")
+            .or_else(|| find_vorbis_comment(&header, "ALBUM DR"))
+        {
+            meta.insert("dr_album".into(), normalise_dr(&v));
+        }
+        // "DR" is checked last and only as a fallback: it is short enough to
+        // collide with an unrelated field, so a specific spelling always wins.
+        if let Some(v) = find_vorbis_comment(&header, "DYNAMIC RANGE")
+            .or_else(|| find_vorbis_comment(&header, "DR"))
+        {
+            meta.insert("dr_track".into(), normalise_dr(&v));
+        }
+    }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
         meta.insert("copyright".into(), v);
     }
@@ -2250,6 +2329,78 @@ fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
     tag.extend_from_slice(&ss);
     tag.extend_from_slice(&frame_bytes);
     tag
+}
+
+#[cfg(test)]
+mod dynamic_range_tests {
+    use super::{find_vorbis_comment, normalise_dr};
+
+    /// Build a Vorbis comment block the way the format stores it:
+    /// `[len: u32 LE]["KEY=value"]`, which is what the reader relies on.
+    fn comment_block(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = vec![0u8; 4]; // reader starts at index 4
+        for (k, v) in pairs {
+            let entry = format!("{k}={v}");
+            out.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            out.extend_from_slice(entry.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn reads_the_album_field_written_by_mp3tag() {
+        // Patatorz's real chain: DROffline MK2 measures, Mp3tag writes this key.
+        let data = comment_block(&[("ARTIST", "Autechre"), ("ALBUM DYNAMIC RANGE", "12")]);
+        assert_eq!(
+            find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").as_deref(),
+            Some("12")
+        );
+    }
+
+    #[test]
+    fn field_lookup_ignores_case() {
+        let data = comment_block(&[("album dynamic range", "9")]);
+        assert_eq!(
+            find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").as_deref(),
+            Some("9")
+        );
+    }
+
+    #[test]
+    fn absent_field_is_none_not_a_wrong_match() {
+        // A library with no DR tags is the common case; it must not pick up a
+        // neighbouring field just because the block contains the word.
+        let data = comment_block(&[("COMMENT", "dynamic range is great")]);
+        assert!(find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").is_none());
+    }
+
+    /// The forms seen in the wild, and what the future numeric sort needs.
+    #[test]
+    fn normalises_every_known_spelling_to_bare_digits() {
+        assert_eq!(normalise_dr("12"), "12");
+        assert_eq!(normalise_dr("DR12"), "12");
+        assert_eq!(normalise_dr("DR 12"), "12");
+        assert_eq!(normalise_dr(" dr8 "), "8");
+        assert_eq!(normalise_dr("Dr8"), "8");
+        // Zero-padded values must collapse, or "08" and "8" sort apart.
+        assert_eq!(normalise_dr("08"), "8");
+    }
+
+    #[test]
+    fn keeps_dr_zero_rather_than_emptying_it() {
+        // A crushed master really can measure DR0; an empty string would read
+        // as "no value" and hide it.
+        assert_eq!(normalise_dr("DR0"), "0");
+        assert_eq!(normalise_dr("0"), "0");
+    }
+
+    #[test]
+    fn unparseable_values_survive_untouched() {
+        // Better to show something we could not interpret than to lose it.
+        assert_eq!(normalise_dr("n/a"), "n/a");
+        assert_eq!(normalise_dr("12.5"), "12.5");
+        assert_eq!(normalise_dr(""), "");
+    }
 }
 
 #[cfg(test)]
