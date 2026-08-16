@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,8 +13,8 @@ use crate::state::AppState;
 
 /// Ce module ne garde QUE ce qui atteint le son ou sert reellement un client.
 ///
-/// Six routes ont ete retirees — `/status`, `/bands`, `/parametric`,
-/// `/graphic`, `/presets/{id}/activate` et `/room-correction`. Elles
+/// Cinq routes ont ete retirees — `/status`, `/bands`, `/parametric`,
+/// `/graphic` et `/room-correction`. Elles
 /// persistaient leur etat dans cinq cles de reglages — `eq_current_bands`,
 /// `eq_parametric`, `eq_graphic`, `eq_active_preset`, `eq_room_correction` —
 /// **qu'aucun code hors de ce fichier ne lisait**. Le chemin audio ne connait
@@ -39,6 +39,10 @@ pub fn router() -> Router<AppState> {
             "/presets/{id}",
             get(get_preset).put(update_preset).delete(delete_preset),
         )
+        // Conservee : contrairement aux six retirees, celle-ci ecrit
+        // `zone_{id}_eq_profile` — la cle que le chemin audio lit — puis
+        // rafraichit la sortie en cours. Elle atteint donc le son.
+        .route("/presets/{id}/activate", post(activate_preset))
         .route(
             "/expert-settings",
             get(get_expert_settings).post(set_expert_settings),
@@ -281,6 +285,178 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Quelle zone égaliser en activant ce preset : `?zone_id=` d'abord, à défaut
+/// le `zone_id` que le preset porte lui-même, `None` si aucun des deux.
+///
+/// Le paramètre d'URL prime volontairement : un preset « global »
+/// (`zone_id: null`) doit pouvoir être activé sur n'importe quelle zone, et un
+/// preset lié à une zone doit pouvoir être essayé ailleurs sans être modifié.
+///
+/// `None` conduit à un 400. C'est le point de l'issue #1718 : mieux vaut
+/// refuser que répondre `activated: true` sans savoir quoi régler.
+fn resolve_activation_zone(query: Option<&str>, preset: &Value) -> Option<i64> {
+    query
+        .and_then(|z| z.trim().parse::<i64>().ok())
+        .or_else(|| {
+            preset["zone_id"]
+                .as_str()
+                .and_then(|z| z.trim().parse().ok())
+        })
+        // Un preset créé depuis un client qui envoie un nombre JSON plutôt
+        // qu'une chaîne — `CreatePresetBody.zone_id` est `Option<String>`, mais
+        // le preset est restocké en JSON libre et rien ne garantit le type.
+        .or_else(|| preset["zone_id"].as_i64())
+}
+
+/// Activer un preset SUR UNE ZONE — et l'entendre.
+///
+/// Cette route ne faisait qu'écrire `eq_active_preset` et répondre
+/// `activated: true`. Le chemin audio ne lit pas cette clé : le preset
+/// n'atteignait jamais le son (#1718). Elle écrit désormais les bandes du
+/// preset dans `zone_{id}_eq_profile` — la seule clé que
+/// `Orchestrator::load_eq_processor` connaisse — puis rafraîchit la sortie qui
+/// joue, comme `POST /zones/{id}/eq`.
+///
+/// La zone vient de `?zone_id=`, à défaut du `zone_id` que le preset porte
+/// déjà (`CreatePresetBody`, « None = global »). Sans l'une ni l'autre on ne
+/// peut pas savoir QUOI égaliser : 400 plutôt qu'un succès sans effet.
+///
+/// Les champs de macro-réglage du profil (tilt graves/médiums/aigus, pièce,
+/// placement) sont PRÉSERVÉS : activer un preset remplace les bandes expertes,
+/// pas l'environnement d'écoute. Même règle que `POST /zones/{id}/eq`.
+async fn activate_preset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return resp;
+    }
+
+    let presets = load_presets(&state);
+    let preset = presets.iter().find(|p| p["id"].as_str() == Some(&id));
+
+    match preset {
+        Some(p) => {
+            let Some(zone_id) =
+                resolve_activation_zone(params.get("zone_id").map(|s| s.as_str()), p)
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "zone_id required",
+                        "detail": "Ce preset n'est lié à aucune zone : préciser \
+                                   ?zone_id=N. Sans zone, l'égaliseur ne saurait \
+                                   pas quelle sortie régler.",
+                    })),
+                )
+                    .into_response();
+            };
+
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let key = format!("zone_{zone_id}_eq_profile");
+            let mut profile: tune_core::audio::eq::EqProfile = settings
+                .get(&key)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            profile.bands = p["bands"]
+                .as_array()
+                .map(|bands| {
+                    bands
+                        .iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            profile.enabled = true;
+            let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+
+            settings.set("eq_active_preset", &id).ok();
+            settings.set("eq_enabled", "true").ok();
+
+            // Persister ne suffit pas : sans ceci le preset n'atteindrait le son
+            // qu'à la piste suivante sur une zone locale (#1725).
+            let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+
+            Json(json!({
+                "active_preset_id": id,
+                "active_preset_name": p["name"],
+                "zone_id": zone_id,
+                "band_count": profile.bands.len(),
+                "activated": true,
+                // « persisté » d'un côté, « entendu maintenant » de l'autre.
+                // Faux ne signale pas un échec : rien ne joue, zone non locale,
+                // ou mode PURE.
+                "applied_live": applique_a_chaud,
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "preset not found"})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_activation_zone;
+    use serde_json::json;
+
+    #[test]
+    fn le_parametre_durl_prime_sur_la_zone_du_preset() {
+        // Un preset lié à la zone 3 doit pouvoir être essayé sur la 7 sans
+        // etre modifié.
+        let preset = json!({"id": "a", "zone_id": "3"});
+        assert_eq!(resolve_activation_zone(Some("7"), &preset), Some(7));
+    }
+
+    #[test]
+    fn a_defaut_on_prend_la_zone_du_preset() {
+        let preset = json!({"id": "a", "zone_id": "3"});
+        assert_eq!(resolve_activation_zone(None, &preset), Some(3));
+    }
+
+    #[test]
+    fn un_preset_global_active_sur_la_zone_demandee() {
+        // `zone_id: null` = preset global (cf. CreatePresetBody).
+        let preset = json!({"id": "a", "zone_id": null});
+        assert_eq!(resolve_activation_zone(Some("2"), &preset), Some(2));
+    }
+
+    #[test]
+    fn sans_zone_nulle_part_on_refuse() {
+        // Le coeur de #1718 : mieux vaut un 400 qu'un `activated: true` qui ne
+        // sait pas quoi regler.
+        let preset = json!({"id": "a", "zone_id": null});
+        assert_eq!(resolve_activation_zone(None, &preset), None);
+        assert_eq!(resolve_activation_zone(Some(""), &preset), None);
+        assert_eq!(resolve_activation_zone(Some("salon"), &preset), None);
+    }
+
+    #[test]
+    fn un_zone_id_numerique_est_accepte_aussi() {
+        // Le preset est restocke en JSON libre : rien ne garantit que zone_id
+        // soit reste une chaine.
+        let preset = json!({"id": "a", "zone_id": 5});
+        assert_eq!(resolve_activation_zone(None, &preset), Some(5));
+    }
+
+    #[test]
+    fn les_espaces_ne_font_pas_echouer_la_resolution() {
+        let preset = json!({"id": "a", "zone_id": " 4 "});
+        assert_eq!(resolve_activation_zone(None, &preset), Some(4));
+        assert_eq!(resolve_activation_zone(Some(" 9 "), &preset), Some(9));
+    }
+}
+
 #[cfg(test)]
 mod routes_mortes_tests {
     /// #1718 — verrouille le retrait, par le CONTENU du fichier.
@@ -310,7 +486,6 @@ mod routes_mortes_tests {
             "\"/parametric\"",
             "\"/graphic\"",
             "\"/room-correction\"",
-            "activate",
         ] {
             assert!(
                 !routeur.contains(mortes),
@@ -330,6 +505,14 @@ mod routes_mortes_tests {
         assert!(
             routeur.contains("\"/expert-settings\""),
             "resolution du mode Expert perdue"
+        );
+        // Retiree par erreur lors du premier jet de #1718, rattrapee par le
+        // garde-fou `every_route_writing_the_eq_profile_refreshes_the_live_output` :
+        // contrairement aux cinq autres, elle ecrit `zone_{id}_eq_profile` et
+        // rafraichit la sortie. Elle atteint le son.
+        assert!(
+            routeur.contains("activate"),
+            "activation d'un preset perdue : elle ecrit la vraie cle du chemin audio"
         );
     }
 }
