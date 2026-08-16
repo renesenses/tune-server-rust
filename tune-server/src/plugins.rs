@@ -115,6 +115,16 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+
+    // Bandcamp (#1768) : recherche et découverte, sorties du cœur
+    // toujours-compilé. Aucun `HostServices` — ce plugin ne touche ni la base,
+    // ni la lecture, ni les réglages : il parle HTTP à un tiers, via le client
+    // partagé de tune-core. Lui inventer des services vides serait de la
+    // cérémonie.
+    #[cfg(feature = "bandcamp")]
+    loader
+        .register(Box::new(tune_bandcamp::BandcampPlugin::new()))
+        .await;
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.
