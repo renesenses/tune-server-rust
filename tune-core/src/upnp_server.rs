@@ -940,6 +940,35 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
     }
 }
 
+/// Traduit le codec d'une station en type MIME utilisable dans un
+/// `protocolInfo` DIDL.
+///
+/// La colonne `codec` porte un **nom de codec**, pas un type MIME : Radio
+/// Browser renvoie « MP3 », « AAC », « AAC+ », « FLAC », « OGG », et la saisie
+/// manuelle reprend ces étiquettes. Les préfixer d'`audio/` produisait
+/// `audio/MP3` ou `audio/AAC`, qui ne sont pas des types enregistrés. Un point
+/// de contrôle strict — la télécommande d'un Marantz ND8006, par exemple —
+/// confronte le `protocolInfo` de chaque item à ses propres capacités et
+/// **écarte ce qu'il ne reconnaît pas** : le dossier Radio s'affiche vide alors
+/// que les stations sont bien renvoyées.
+fn radio_mime_type(codec: Option<&str>) -> String {
+    let brut = codec.unwrap_or("").trim();
+    // Un type MIME déjà complet est respecté tel quel (saisie manuelle).
+    if brut.contains('/') {
+        return brut.to_ascii_lowercase();
+    }
+    match brut.to_ascii_uppercase().as_str() {
+        "AAC" | "AAC+" | "AACP" | "HE-AAC" | "M4A" | "MP4" => "audio/aac",
+        "FLAC" => "audio/flac",
+        "OGG" | "VORBIS" | "OPUS" => "audio/ogg",
+        "WAV" | "WAVE" | "PCM" => "audio/wav",
+        // « MP3 », « MPEG », l'inconnu et l'absent : l'audio/mpeg est le seul
+        // format qu'aucun lecteur réseau ne refuse, et c'était déjà le repli.
+        _ => "audio/mpeg",
+    }
+    .to_string()
+}
+
 fn browse_radios(state: &UpnpState) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
@@ -949,14 +978,10 @@ fn browse_radios(state: &UpnpState) -> DidlResult {
     for station in &stations {
         let id = format!("radio/{}", station.id.unwrap_or(0));
         let mut res = String::new();
-        let mime = station.codec.as_deref().unwrap_or("audio/mpeg");
-        let mime_full = if mime.contains('/') {
-            mime.to_string()
-        } else {
-            format!("audio/{mime}")
-        };
+        let mime_full = radio_mime_type(station.codec.as_deref());
         res.push_str(&format!(
             "<res protocolInfo=\"http-get:*:{mime_full}:*\">{url}</res>",
+            mime_full = quick_xml::escape::escape(&mime_full),
             url = quick_xml::escape::escape(&station.url),
         ));
         if let Some(ref logo) = station.logo_url {
@@ -1571,6 +1596,44 @@ mod tests {
         state.advertised_ip = Some("10.11.12.13".into());
         assert_eq!(state.server_ip(), "10.11.12.13");
         assert_eq!(state.base_url(), "http://10.11.12.13:8888");
+    }
+
+    /// Le défaut signalé par Jean Valjean : le dossier Radio vide sur un
+    /// Marantz ND8006. Les noms de codec de Radio Browser sont en majuscules,
+    /// et `audio/MP3` n'existe pas.
+    #[test]
+    fn le_codec_dune_station_devient_un_type_mime_reel() {
+        assert_eq!(radio_mime_type(Some("MP3")), "audio/mpeg");
+        assert_eq!(radio_mime_type(Some("AAC")), "audio/aac");
+        assert_eq!(radio_mime_type(Some("AAC+")), "audio/aac");
+        assert_eq!(radio_mime_type(Some("FLAC")), "audio/flac");
+        assert_eq!(radio_mime_type(Some("OGG")), "audio/ogg");
+    }
+
+    #[test]
+    fn aucun_type_annonce_ne_porte_le_nom_du_codec() {
+        for codec in ["MP3", "AAC", "AAC+", "FLAC", "OGG", "UNKNOWN", ""] {
+            let mime = radio_mime_type(Some(codec));
+            assert!(
+                mime.starts_with("audio/") && mime[6..].chars().all(|c| !c.is_ascii_uppercase()),
+                "« {codec} » annoncé comme « {mime} » — un type MIME ne porte pas de majuscule"
+            );
+        }
+    }
+
+    #[test]
+    fn un_codec_absent_ou_inconnu_retombe_sur_mpeg() {
+        assert_eq!(radio_mime_type(None), "audio/mpeg");
+        assert_eq!(radio_mime_type(Some("UNKNOWN")), "audio/mpeg");
+        assert_eq!(radio_mime_type(Some("  ")), "audio/mpeg");
+    }
+
+    /// Une saisie manuelle qui donne déjà un type MIME complet est respectée —
+    /// c'est la porte de sortie pour un format que la table ci-dessus ignore.
+    #[test]
+    fn un_type_mime_deja_complet_est_conserve() {
+        assert_eq!(radio_mime_type(Some("audio/x-mpegurl")), "audio/x-mpegurl");
+        assert_eq!(radio_mime_type(Some("Audio/MPEG")), "audio/mpeg");
     }
 
     #[test]
