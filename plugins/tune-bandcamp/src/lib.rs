@@ -51,13 +51,27 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 const BC_SEARCH_API: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
 const BC_DISCOVER_API: &str = "https://bandcamp.com/api/discover/3/get_web";
 
-/// Le plugin Bandcamp. Sans état : il ne possède rien de l'hôte.
-#[derive(Default)]
-pub struct BandcampPlugin;
+/// Services de l'hôte remis au plugin à la construction.
+///
+/// Le lot 1 n'en avait **aucun**, et c'était juste : recherche et découverte
+/// ne touchent ni la base, ni la lecture, ni les réglages. Le lot 2 mémorise
+/// un pseudo Bandcamp et le `fan_id` résolu — il lui faut donc la base. La
+/// décision d'hier n'était pas fausse, elle a cessé de l'être ; passée
+/// explicitement ici plutôt que tirée du `PluginContext`, comme `tune-dj`.
+pub struct HostServices {
+    pub backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+}
+
+/// Le plugin Bandcamp. Possède la base pour les réglages du lot 2.
+pub struct BandcampPlugin {
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+}
 
 impl BandcampPlugin {
-    pub fn new() -> Self {
-        Self
+    pub fn new(services: HostServices) -> Self {
+        Self {
+            backend: services.backend,
+        }
     }
 }
 
@@ -80,7 +94,7 @@ impl TunePlugin for BandcampPlugin {
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(router());
+        ctx.register_router(router(self.backend.clone()));
         Ok(())
     }
 
@@ -96,7 +110,25 @@ impl TunePlugin for BandcampPlugin {
 
 /// Le routeur Bandcamp, `Router<()>` pour que l'hôte le monte sous
 /// `/api/v1/ext/bandcamp`. Routes identiques à l'ancien `routes/bandcamp.rs`.
-pub fn router() -> Router<()> {
+/// État du routeur : la base, capturée pour que le routeur reste un
+/// `Router<()>` comme l'hôte l'exige, sans fuite de type `tune-server`.
+#[derive(Clone)]
+struct EtatBandcamp {
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+}
+
+pub fn router(backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Router<()> {
+    let etat = EtatBandcamp { backend };
+    Router::new()
+        // Lot 2 — la collection d'un acheteur.
+        .route("/collection/link", axum::routing::post(bc_lier_compte))
+        .route("/collection", get(bc_collection))
+        .with_state(etat.clone())
+        .merge(routes_publiques())
+}
+
+/// Les routes qui n'ont besoin d'aucun état — lot 1, inchangées.
+fn routes_publiques() -> Router<()> {
     Router::new()
         .route("/search", get(bc_search))
         .route("/discover", get(bc_discover))
@@ -348,15 +380,204 @@ async fn bc_tag_releases(Path(tag): Path<String>, Query(q): Query<TagQuery>) -> 
     rendre_json(resp).await
 }
 
+// ---------------------------------------------------------------------------
+// Lot 2 — la collection d'un acheteur
+// ---------------------------------------------------------------------------
+
+const BC_COLLECTION_API: &str = "https://bandcamp.com/api/fancollection/1/collection_items";
+/// Jeton de départ : « tout ce qui est plus ancien que jamais », c'est-à-dire
+/// la page la plus récente. Convention de Bandcamp, pas la nôtre.
+const BC_JETON_DEBUT: &str = "9999999999::a::";
+const CLE_PSEUDO: &str = "bandcamp_username";
+const CLE_FAN_ID: &str = "bandcamp_fan_id";
+
+/// Extraire le `fan_id` d'une page de profil Bandcamp publique.
+///
+/// La page ne l'expose que sous forme **échappée** dans un attribut HTML
+/// (`fan_id&quot;:897100`), jamais en JSON nu — vérifié sur une page réelle.
+/// Et elle contient plusieurs occurrences, dont au moins une SANS chiffres :
+/// s'arrêter à la première rendrait `None` sur un profil parfaitement valide.
+/// On parcourt donc jusqu'à en trouver une qui porte un nombre.
+fn extraire_fan_id(page: &str) -> Option<i64> {
+    for motif in ["fan_id&quot;:", "\"fan_id\":"] {
+        let mut reste = page;
+        while let Some(i) = reste.find(motif) {
+            reste = &reste[i + motif.len()..];
+            let chiffres: String = reste.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !chiffres.is_empty() {
+                if let Ok(n) = chiffres.parse::<i64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct LierBody {
+    /// Pseudo Bandcamp — PAS un identifiant de connexion.
+    username: String,
+}
+
+/// `POST /collection/link` — mémoriser un pseudo et résoudre son `fan_id`.
+///
+/// Aucun mot de passe, aucun cookie : le pseudo suffit, parce que la page de
+/// profil est publique. C'est délibéré et non une limitation subie — voir la
+/// note de portée en tête de module.
+async fn bc_lier_compte(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+    Json(body): Json<LierBody>,
+) -> impl IntoResponse {
+    let pseudo = body.username.trim().to_string();
+    if pseudo.is_empty() || pseudo.contains('/') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "username invalide"})),
+        )
+            .into_response();
+    }
+    let client = tune_core::http::client::shared();
+    let url = format!("https://bandcamp.com/{pseudo}");
+    let reponse = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; Tune)")
+        .send()
+        .await;
+    let page = match reponse {
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("aucun profil Bandcamp public pour « {pseudo} »")})),
+            )
+                .into_response();
+        }
+        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
+        Err(e) => return passerelle_en_echec(e.to_string()),
+    };
+    let Some(fan_id) = extraire_fan_id(&page) else {
+        return passerelle_en_echec(
+            "profil trouvé mais sans fan_id — la page a changé, ou le profil est privé".into(),
+        );
+    };
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone());
+    let _ = reglages.set(CLE_PSEUDO, &pseudo);
+    let _ = reglages.set(CLE_FAN_ID, &fan_id.to_string());
+    Json(json!({ "username": pseudo, "fan_id": fan_id, "linked": true })).into_response()
+}
+
+#[derive(Deserialize)]
+struct CollectionQuery {
+    /// Jeton de pagination rendu par l'appel précédent (`last_token`).
+    older_than_token: Option<String>,
+    #[serde(default = "default_count")]
+    count: u32,
+}
+
+fn default_count() -> u32 {
+    50
+}
+
+/// `GET /collection` — la collection du compte lié, page par page.
+///
+/// Bandcamp pagine par curseur (`older_than_token`), pas par numéro : le
+/// client réémet le `last_token` de la réponse précédente jusqu'à
+/// `more_available: false`. La collection d'un acheteur de longue date dépasse
+/// largement une page.
+async fn bc_collection(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+    Query(q): Query<CollectionQuery>,
+) -> impl IntoResponse {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone());
+    let fan_id = reglages
+        .get(CLE_FAN_ID)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
+    let Some(fan_id) = fan_id else {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({
+                "error": "aucun compte Bandcamp lié",
+                "detail": "POST /collection/link avec {\"username\": \"…\"} d'abord.",
+            })),
+        )
+            .into_response();
+    };
+    let jeton = q
+        .older_than_token
+        .unwrap_or_else(|| BC_JETON_DEBUT.to_string());
+    let client = tune_core::http::client::shared();
+    let reponse = client
+        .post(BC_COLLECTION_API)
+        .json(&json!({
+            "fan_id": fan_id,
+            "older_than_token": jeton,
+            "count": q.count.clamp(1, 100),
+        }))
+        .send()
+        .await;
+    let brut: Value = match reponse {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(json!({})),
+        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
+        Err(e) => return passerelle_en_echec(e.to_string()),
+    };
+    Json(collection_mise_en_forme(&brut, fan_id)).into_response()
+}
+
+/// Mettre une page de collection en forme pour un client Tune.
+///
+/// Ne garde que ce qui sert au rapprochement avec la bibliothèque locale
+/// (lot 3) : qui, quoi, et de quel type. Le reste de la charge Bandcamp —
+/// prix, dates d'achat, compteurs — n'a pas à traverser l'API de Tune.
+fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
+    let articles: Vec<Value> = brut["items"]
+        .as_array()
+        .map(|v| v.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|it| {
+            json!({
+                "artist": it["band_name"],
+                "title": it["item_title"],
+                "type": it["item_type"],
+                "url": it["item_url"],
+                "art_id": it["item_art_id"],
+            })
+        })
+        .collect();
+    json!({
+        "fan_id": fan_id,
+        "count": articles.len(),
+        "items": articles,
+        // Curseur à réémettre tel quel pour la page suivante.
+        "more_available": brut["more_available"].as_bool().unwrap_or(false),
+        "last_token": brut["last_token"],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un plugin de test avec une base en mémoire.
+    ///
+    /// Le lot 2 lui a donné un `HostServices` ; les tests du lot 1 le
+    /// construisaient sans argument et ne compilaient plus. `cargo check` ne
+    /// compile pas le code de test — seul `cargo test` l'a montré.
+    fn plugin_de_test() -> BandcampPlugin {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        BandcampPlugin::new(HostServices {
+            backend: std::sync::Arc::new(db),
+        })
+    }
 
     #[test]
     fn le_prefixe_de_montage_vient_du_nom() {
         // L'hôte dérive `/api/v1/ext/{name}` de `name()`. Le renommer
         // déplacerait silencieusement toutes les routes du plugin.
-        let p = BandcampPlugin::new();
+        let p = plugin_de_test();
         assert_eq!(p.name(), "bandcamp");
     }
 
@@ -364,7 +585,7 @@ mod tests {
     fn le_plugin_reste_opt_in() {
         // « Ajouter le plugin Bandcamp » (#1768) : il doit apparaître comme
         // disponible et non installé, pas tourner d'office.
-        assert!(!BandcampPlugin::new().default_enabled());
+        assert!(!plugin_de_test().default_enabled());
     }
 
     #[test]
@@ -380,7 +601,8 @@ mod tests {
         // Le routeur doit se construire sans panique : une route mal formée
         // (accolades dépareillées dans un motif de chemin) panique à la
         // construction, pas à la compilation.
-        let _ = router();
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        let _ = router(std::sync::Arc::new(db));
     }
 
     /// Fragment de page RÉEL, réduit : l'attribut tel que Bandcamp l'émet,
