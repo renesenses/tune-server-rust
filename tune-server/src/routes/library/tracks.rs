@@ -95,6 +95,12 @@ pub(super) struct TrackFilterQuery {
     pub rating: Option<i32>,
     /// Oxygen collection facet: manual collection name (resolved to album ids).
     pub collection: Option<String>,
+    /// Facette Favoris : `track` ou `album` (profil 1).
+    pub favorite: Option<String>,
+    /// Facette Listes de lecture : nom de la liste.
+    pub playlist: Option<String>,
+    /// Facette Sans étiquette : `genre`, `year`, `artist`, `album` ou `cover`.
+    pub untagged: Option<String>,
 }
 
 pub(super) async fn list_tracks(
@@ -120,7 +126,10 @@ pub(super) async fn list_tracks(
         || p.source_media.is_some()
         || p.folder.as_deref().is_some_and(|s| !s.is_empty())
         || p.rating.is_some()
-        || p.collection.as_deref().is_some_and(|s| !s.is_empty());
+        || p.collection.as_deref().is_some_and(|s| !s.is_empty())
+        || p.favorite.as_deref().is_some_and(|s| !s.is_empty())
+        || p.playlist.as_deref().is_some_and(|s| !s.is_empty())
+        || p.untagged.as_deref().is_some_and(|s| !s.is_empty());
 
     // Resolve the collection name so /library/tracks?collection=<name> filters
     // to its members. A MANUAL collection resolves to album ids (JSON settings);
@@ -163,6 +172,9 @@ pub(super) async fn list_tracks(
             p.rating,
             collection_ids.as_deref(),
             collection_track_ids.as_deref(),
+            p.favorite.as_deref(),
+            p.playlist.as_deref(),
+            p.untagged.as_deref(),
             limit,
             offset,
         ) {
