@@ -529,9 +529,10 @@ async fn restore_oaat_groups(state: &AppState) {
         .ok()
         .flatten()
         .unwrap_or_else(|| "[]".into());
-    let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
+    let mut groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
 
     let mut restored = 0usize;
+    let mut to_probe: Vec<(String, String, Vec<(String, u16)>)> = Vec::new();
     for group in &groups {
         let id = match group["id"].as_str() {
             Some(id) => id.to_string(),
@@ -563,7 +564,80 @@ async fn restore_oaat_groups(state: &AppState) {
         drop(outputs);
 
         info!(group_id = %id, name = %name, endpoints = endpoints.len(), "oaat_group_restored");
+        to_probe.push((id.clone(), name.clone(), endpoints));
         restored += 1;
+    }
+
+    // Les sondes partent HORS du chemin de démarrage (#1779).
+    //
+    // `restore_oaat_groups` est appelée par `init_state`, donc en série avec le
+    // reste du démarrage : une sonde de 1,5 s par groupe injoignable retarderait
+    // d'autant l'ouverture du serveur. C'est exactement la raison pour laquelle
+    // les re-sondages d'appareils juste en dessous sont déjà déportés dans une
+    // tâche — « so an offline device's probe timeout doesn't delay boot ».
+    //
+    // Et on ne REFUSE pas ici, contrairement à la création. À la création, un
+    // membre injoignable est forcément un appareil qui n'est pas un point de
+    // diffusion Tune : l'utilisateur vient de le choisir, il est allumé, il est
+    // devant lui. Au démarrage, la même sonde ne distingue plus « renderer DLNA,
+    // ne marchera jamais » de « point de diffusion pas encore démarré » — et le
+    // serveur démarre souvent avant le reste de l'installation. Refuser
+    // casserait un groupe valide dont un membre a mis dix secondes de plus.
+    //
+    // On enregistre donc toujours, puis on inscrit le constat dans l'entrée
+    // persistée : `list_oaat_groups` la renvoie telle quelle, donc l'interface
+    // peut enfin dire « ce membre ne répond pas » au lieu de laisser l'échec
+    // dans un journal que personne ne lit.
+    if !to_probe.is_empty() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut results: Vec<(String, Vec<String>)> = Vec::new();
+            for (id, name, endpoints) in &to_probe {
+                let unreachable =
+                    crate::routes::zone_manager::unreachable_endpoints(endpoints).await;
+                if !unreachable.is_empty() {
+                    warn!(
+                        group_id = %id,
+                        name = %name,
+                        unreachable = unreachable.join(", "),
+                        total = endpoints.len(),
+                        "oaat_group_has_unreachable_endpoints — ce groupe ne pourra pas jouer tant que ces membres ne repondent pas sur leur port OAAT"
+                    );
+                }
+                results.push((id.clone(), unreachable));
+            }
+
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+            // Relu MAINTENANT, pas au démarrage : entre-temps l'utilisateur a pu
+            // créer ou supprimer un groupe, et réécrire une copie vieille de
+            // quelques secondes les effacerait.
+            let mut groups: Vec<serde_json::Value> = settings
+                .get("oaat_groups")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let mut changed = false;
+            for g in groups.iter_mut() {
+                let Some(gid) = g["id"].as_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if let Some((_, unreachable)) = results.iter().find(|(id, _)| *id == gid) {
+                    g["unreachable_endpoints"] = serde_json::json!(unreachable);
+                    g["probed_at"] = serde_json::json!(crate::routes::zone_manager::now_iso());
+                    changed = true;
+                }
+            }
+            if changed {
+                settings
+                    .set(
+                        "oaat_groups",
+                        &serde_json::to_string(&groups).unwrap_or_else(|_| "[]".into()),
+                    )
+                    .ok();
+            }
+        });
     }
 
     if restored > 0 {
