@@ -445,6 +445,9 @@ mod tests {
             "mb_work_id",
             // Note: `source_media` (Vorbis SOURCE) is intentionally read-only —
             // it has no lofty ItemKey and is read via raw_vorbis_field.
+            // Same for `dr_album` / `dr_track` (Vorbis DYNAMIC RANGE): a measured
+            // value produced by an external analyser, not something Tune should
+            // let a user overwrite from the tag editor.
             "rg_track_gain",
             "rg_track_peak",
             "rg_album_gain",
