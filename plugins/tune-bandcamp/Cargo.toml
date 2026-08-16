@@ -21,3 +21,5 @@ serde_json = { workspace = true }
 # Nommé dans la signature du helper d'erreur commun. `tune-core` ne réexporte
 # pas reqwest, et `tune-karaoke` le déclare de la même façon.
 reqwest = { workspace = true }
+# Lot 2 : mémoriser le pseudo et le fan_id resolus (SettingsRepo).
+tokio = { workspace = true }
