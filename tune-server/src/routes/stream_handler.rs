@@ -237,7 +237,14 @@ pub async fn handle_stream(
     // Proxy mode
     let proxy_url = session.proxy_url.lock().await.clone();
     if let Some(ref url) = proxy_url {
-        return proxy_stream(url, &session.info, session.is_radio, &req_headers, &session).await;
+        return proxy_stream(
+            url,
+            &session.info,
+            session.is_radio,
+            &req_headers,
+            session.clone(),
+        )
+        .await;
     }
 
     // Chunked streaming mode
@@ -366,7 +373,10 @@ pub async fn handle_stream(
         .wav_header_included
         .load(std::sync::atomic::Ordering::Relaxed);
     let data_ready = session.data_ready.clone();
-    let body = Body::from_stream(async_stream::stream! {
+    // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
+    // radio, deux vidages de tampon — sont comptes par `corps_compte`.
+    let compteur = session.clone();
+    let flux = async_stream::stream! {
         if is_wav && !wav_header_included {
             // Live radio: a Lavf renderer needs the 0xFFFF_FFFF
             // indeterminate-length header to keep reading until the connection
@@ -527,7 +537,8 @@ pub async fn handle_stream(
                 yield Ok(bytes::Bytes::from(coalesce_buf));
             }
         }
-    });
+    };
+    let body = corps_compte(flux, compteur);
 
     let status = if use_partial {
         StatusCode::PARTIAL_CONTENT
@@ -639,6 +650,32 @@ async fn serve_file(
 /// With a faststart map the virtual file is `header (ftyp+moov, in memory)` then
 /// the original file's mdat body; without one it's the plain file. Byte counting
 /// feeds the poller's actively-fetching heuristic.
+/// Envelopper un flux de sortie pour compter ce qu'il sert reellement.
+///
+/// `bytes_sent` n'etait incremente que dans `build_file_body` — le chemin
+/// FICHIER. Radio et mandataire n'y passent pas : leur compteur restait a zero
+/// quels que soient les octets livres. Or `output_reach` (routes/zones.rs) en
+/// deduit « personne n'ecoute », et le diagnostic de zone affiche le meme
+/// chiffre : une zone navigateur jouant une radio etait declaree sans onglet
+/// pendant que l'onglet jouait (Bilou, #1841).
+///
+/// On compte a la SORTIE du flux plutot qu'a chaque `yield` : tous les
+/// morceaux passent par la, y compris ceux qu'on ajoutera. Un compteur qu'il
+/// faut penser a mettre a jour finit toujours par mentir quelque part.
+fn corps_compte<S>(flux: S, compteur: std::sync::Arc<StreamSession>) -> Body
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+{
+    Body::from_stream(futures_util::StreamExt::map(flux, move |morceau| {
+        if let Ok(ref o) = morceau {
+            compteur
+                .bytes_sent
+                .fetch_add(o.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        morceau
+    }))
+}
+
 fn build_file_body(
     faststart: Option<tune_core::audio::faststart::FaststartMap>,
     path: String,
@@ -824,8 +861,9 @@ fn resumable_proxy_body(
     initial: reqwest::Response,
     abs_offset: u64,
     reresolve: Option<ReresolveFn>,
+    compteur: std::sync::Arc<StreamSession>,
 ) -> Body {
-    Body::from_stream(async_stream::stream! {
+    let flux = async_stream::stream! {
         use futures_util::StreamExt;
         let mut resp = initial;
         // Current (possibly re-resolved) CDN URL we reconnect against.
@@ -885,7 +923,8 @@ fn resumable_proxy_body(
                 }
             }
         }
-    })
+    };
+    corps_compte(flux, compteur)
 }
 
 async fn proxy_stream(
@@ -893,7 +932,7 @@ async fn proxy_stream(
     info: &StreamInfo,
     is_radio: bool,
     req_headers: &HeaderMap,
-    session: &StreamSession,
+    session: std::sync::Arc<StreamSession>,
 ) -> Response {
     // Re-resolver for expiring signed CDN URLs (Qobuz/Tidal). Present only for
     // streaming proxy sessions; None for radio and non-expiring sources.
@@ -1044,6 +1083,7 @@ async fn proxy_stream(
             upstream_resp,
             start,
             reresolve.clone(),
+            session.clone(),
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -1060,7 +1100,7 @@ async fn proxy_stream(
 
         info!(url = upstream_url, "proxy_radio_206_open_ended");
 
-        let body = Body::from_stream(async_stream::stream! {
+        let flux = async_stream::stream! {
             let mut stream = upstream_resp.bytes_stream();
             use futures_util::StreamExt;
             while let Some(chunk_result) = stream.next().await {
@@ -1072,7 +1112,8 @@ async fn proxy_stream(
                     }
                 }
             }
-        });
+        };
+        let body = corps_compte(flux, session.clone());
 
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -1090,6 +1131,7 @@ async fn proxy_stream(
             upstream_resp,
             0,
             reresolve.clone(),
+            session.clone(),
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -1104,6 +1146,7 @@ async fn proxy_stream(
         upstream_resp,
         0,
         reresolve.clone(),
+        session.clone(),
     );
     (StatusCode::OK, headers, body).into_response()
 }
@@ -1119,10 +1162,66 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts_chunked_live_stream, parse_range_start};
+    use super::{accepts_chunked_live_stream, corps_compte, parse_range_start};
     use tune_core::http::streamer::{
-        LIVE_BOUNDED_TOTAL_LEN, build_wav_header_bounded_live, build_wav_header_streaming,
+        LIVE_BOUNDED_TOTAL_LEN, StreamInfo, StreamSession, build_wav_header_bounded_live,
+        build_wav_header_streaming,
     };
+
+    /// #1841 — le compteur d'octets ne bougeait que sur le chemin fichier.
+    /// Radio et mandataire servaient des octets sans jamais le dire, et
+    /// `output_reach` en concluait que personne n'ecoutait.
+    #[tokio::test]
+    async fn un_flux_servi_incremente_le_compteur_de_la_session() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let session = std::sync::Arc::new(StreamSession::new(
+            "test".into(),
+            StreamInfo::default(),
+            false,
+            4,
+        ));
+        assert_eq!(session.bytes_sent.load(Relaxed), 0);
+
+        let flux = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::from_static(b"defgh")),
+        ]);
+        let body = corps_compte(flux, session.clone());
+
+        // Consommer le corps : c'est la lecture qui compte, pas sa creation.
+        let mut flux_corps = body.into_data_stream();
+        while let Some(morceau) = flux_corps.next().await {
+            morceau.unwrap();
+        }
+
+        assert_eq!(
+            session.bytes_sent.load(Relaxed),
+            8,
+            "trois octets puis cinq — ce que le client a reellement recu"
+        );
+    }
+
+    /// Un corps qui n'est jamais lu n'a rien servi : le compteur doit rester
+    /// a zero, sinon « quelqu'un ecoute » deviendrait vrai des la creation.
+    #[tokio::test]
+    async fn un_corps_non_consomme_ne_compte_rien() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let session = std::sync::Arc::new(StreamSession::new(
+            "test".into(),
+            StreamInfo::default(),
+            false,
+            4,
+        ));
+        let flux = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(b"abc"),
+        )]);
+        let _body = corps_compte(flux, session.clone());
+
+        assert_eq!(session.bytes_sent.load(Relaxed), 0);
+    }
 
     #[test]
     fn lavf_renderers_keep_the_chunked_contract() {
