@@ -115,8 +115,32 @@ pub mod sql {
         ("lyrics_offset_ms", "0"),
     ];
 
-    /// Colonnes dont le defaut est NULL : marque, modele, plafond de frequence.
-    const REGLAGES_NULLABLES: &[&str] = &["brand", "model", "max_sample_rate"];
+    /// Colonnes dont le defaut est NULL.
+    ///
+    /// `brand` et `model` figuraient ici et n'ont JAMAIS ete des colonnes de
+    /// `zones` : ils vivent dans `settings`, sous `zone_{id}_brand` et
+    /// `zone_{id}_model`. Les deux instructions correspondantes echouaient donc
+    /// a chaque demarrage, sur chaque machine, et le garde-fou les sautait —
+    /// du code mort sous une couverture apparente (#1832, decouvert dans les
+    /// journaux de DEvir). Le report de ces deux reglages se fait desormais la
+    /// ou ils sont reellement ranges, voir
+    /// [`ZoneRepo::reporter_reglages_de_doublons`].
+    const REGLAGES_NULLABLES: &[&str] = &["max_sample_rate"];
+
+    /// Les zones en doublon, survivante d'abord dans chaque groupe.
+    ///
+    /// Meme regroupement que [`Self::deduplicate`] — `MIN(id)` survit — mais
+    /// rendu ligne par ligne, pour pouvoir traiter les reglages qui ne sont pas
+    /// des colonnes.
+    pub fn doublons_par_appareil() -> &'static str {
+        "SELECT output_device_id, id FROM zones \
+         WHERE output_device_id IS NOT NULL \
+           AND output_device_id IN ( \
+             SELECT output_device_id FROM zones \
+             WHERE output_device_id IS NOT NULL \
+             GROUP BY output_device_id HAVING COUNT(*) > 1 ) \
+         ORDER BY output_device_id, id"
+    }
 
     /// Instructions de fusion, dans l'ordre. Chacune ne touche QUE les zones
     /// conservees d'un groupe en doublon, et seulement quand elles sont restees
@@ -480,7 +504,131 @@ impl ZoneRepo {
     pub fn deduplicate(&self) -> Result<usize, String> {
         self.reparer_prefixe_local()?;
         self.merge_duplicate_settings()?;
+        self.reporter_reglages_de_doublons()?;
         self.db.execute(sql::deduplicate(), &[])
+    }
+
+    /// Reporter sur la survivante les reglages de zone ranges dans `settings`.
+    ///
+    /// [`Self::merge_duplicate_settings`] ne sait traiter que des COLONNES. Or
+    /// une zone porte une dizaine de reglages qui n'en sont pas : profil
+    /// d'egaliseur, crossfeed, mode audiophile, qualite, trim de gain, profil
+    /// audio, renderer UPnP, marque, modele, epingles — tous ranges dans
+    /// `settings` sous `zone_{id}_{quoi}`.
+    ///
+    /// Aucun d'eux n'etait reporte : `zone_repo` ne connaissait pas
+    /// `SettingsRepo`. Le doublon supprime, ses reglages restaient rattaches a
+    /// l'identifiant d'une zone qui n'existe plus — le defaut de #1774, une
+    /// couche plus bas, et le plus visible des dix est l'egaliseur (#1832).
+    ///
+    /// On reporte **par prefixe**, pas par liste : un onzieme reglage arrivera,
+    /// et il doit etre couvert sans que personne y pense.
+    ///
+    /// Meme regle que pour les colonnes : la valeur du doublon ne s'applique
+    /// que si la survivante n'a rien. Un reglage explicite ne cede jamais.
+    ///
+    /// Les cles du doublon ne sont **pas** supprimees. Un report est
+    /// reversible, un effacement ne l'est pas, et rien ne presse : le menage
+    /// des cles orphelines est un sujet distinct.
+    pub fn reporter_reglages_de_doublons(&self) -> Result<(), String> {
+        let lignes = match self.db.query_many_strong(sql::doublons_par_appareil(), &[]) {
+            Ok(l) => l,
+            // Base anterieure a `output_device_id` : rien a reporter.
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if lignes.is_empty() {
+            return Ok(());
+        }
+
+        // Grouper par appareil, en gardant l'ordre : la premiere est la
+        // survivante (`ORDER BY output_device_id, id`).
+        let mut groupes: Vec<(String, Vec<i64>)> = Vec::new();
+        for ligne in &lignes {
+            let appareil = ligne
+                .first()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let Some(id) = ligne.get(1).and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            match groupes.last_mut() {
+                Some((precedent, ids)) if *precedent == appareil => ids.push(id),
+                _ => groupes.push((appareil, vec![id])),
+            }
+        }
+
+        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        // Meme garde-fou que pour les colonnes, et pour la meme raison : une
+        // base incomplete ne doit pas empecher le dedoublonnage de tourner.
+        // Elle le DIT, en revanche — c'est le silence qui avait rendu #1832
+        // invisible.
+        let manque = |e: &String| {
+            e.contains("no such table")
+                || e.contains("no such column")
+                || e.contains("does not exist")
+        };
+        // Une carte, et non la liste brute : ce qu'on vient de reporter doit
+        // compter comme « deja pose » pour le doublon suivant. Sinon, deux
+        // doublons apportant le meme reglage, le second ecraserait le premier —
+        // et le survivant heriterait du plus recent au lieu du plus ancien,
+        // sans qu'aucune regle l'ait decide.
+        let mut connues: std::collections::HashMap<String, String> = match settings.all() {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) if manque(&e) => {
+                tracing::warn!(error = %e, "zone_reglages_table_absente_report_saute");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let apportees: Vec<(String, String)> = connues
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut reportees = 0usize;
+
+        for (_, ids) in &groupes {
+            let Some((survivante, doublons)) = ids.split_first() else {
+                continue;
+            };
+            let prefixe_survivante = format!("zone_{survivante}_");
+            for doublon in doublons {
+                let prefixe_doublon = format!("zone_{doublon}_");
+                for (cle, valeur) in &apportees {
+                    let Some(quoi) = cle.strip_prefix(&prefixe_doublon) else {
+                        continue;
+                    };
+                    if valeur.trim().is_empty() {
+                        continue;
+                    }
+                    let cible = format!("{prefixe_survivante}{quoi}");
+                    let deja_pose = connues.get(&cible).is_some_and(|v| !v.trim().is_empty());
+                    if deja_pose {
+                        continue;
+                    }
+                    match settings.set(&cible, valeur) {
+                        Ok(()) => {}
+                        Err(e) if manque(&e) => {
+                            tracing::warn!(error = %e, "zone_reglages_table_absente_report_saute");
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    connues.insert(cible.clone(), valeur.clone());
+                    reportees += 1;
+                    tracing::info!(
+                        depuis = %cle,
+                        vers = %cible,
+                        "zone_reglage_reporte_depuis_doublon"
+                    );
+                }
+            }
+        }
+
+        if reportees > 0 {
+            tracing::info!(reglages = reportees, "zone_reglages_reportes");
+        }
+        Ok(())
     }
 
     /// Rendre leur prefixe `local:` aux zones locales qui l'ont perdu.
@@ -1324,6 +1472,16 @@ mod tests {
         db
     }
 
+    /// Base complete : `settings` n'est pas dans `init_schema`, elle vient des
+    /// migrations. Les tests qui touchent aux reglages hors colonnes en ont
+    /// besoin ; les autres restent sur la base minimale.
+    fn test_db_migree() -> SqliteDb {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db
+    }
+
     #[test]
     fn crud_zone() {
         let db = test_db();
@@ -1348,6 +1506,128 @@ mod tests {
         repo.delete(id).unwrap();
         assert!(repo.list().unwrap().is_empty());
         assert!(repo.is_device_hidden("uuid:123"));
+    }
+
+    /// #1832 — les reglages ranges dans `settings` (profil d'egaliseur en
+    /// tete) partaient avec le doublon supprime.
+    #[test]
+    fn les_reglages_hors_colonnes_suivent_la_survivante() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+
+        let survivante = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+        let doublon = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+
+        settings
+            .set(&format!("zone_{doublon}_eq_profile"), "loudness")
+            .unwrap();
+        settings
+            .set(&format!("zone_{doublon}_brand"), "Devialet")
+            .unwrap();
+
+        repo.deduplicate().unwrap();
+
+        assert_eq!(
+            settings
+                .get(&format!("zone_{survivante}_eq_profile"))
+                .unwrap()
+                .as_deref(),
+            Some("loudness"),
+            "le profil d'egaliseur ne doit pas partir avec le doublon"
+        );
+        assert_eq!(
+            settings
+                .get(&format!("zone_{survivante}_brand"))
+                .unwrap()
+                .as_deref(),
+            Some("Devialet")
+        );
+    }
+
+    /// La regle des colonnes vaut aussi ici : un reglage explicite ne cede
+    /// jamais a celui d'un doublon.
+    #[test]
+    fn un_reglage_deja_pose_sur_la_survivante_resiste() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+
+        let survivante = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+        let doublon = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+
+        settings
+            .set(&format!("zone_{survivante}_eq_profile"), "plat")
+            .unwrap();
+        settings
+            .set(&format!("zone_{doublon}_eq_profile"), "loudness")
+            .unwrap();
+
+        repo.reporter_reglages_de_doublons().unwrap();
+
+        assert_eq!(
+            settings
+                .get(&format!("zone_{survivante}_eq_profile"))
+                .unwrap()
+                .as_deref(),
+            Some("plat"),
+            "ce que l'utilisateur a pose reste"
+        );
+    }
+
+    /// Une valeur vide sur la survivante compte pour « pas encore regle » —
+    /// la chaine vide est le marqueur d'effacement des surcharges de zone.
+    #[test]
+    fn une_valeur_vide_ne_bloque_pas_le_report() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+
+        let survivante = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+        let doublon = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+
+        settings
+            .set(&format!("zone_{survivante}_model"), "")
+            .unwrap();
+        settings
+            .set(&format!("zone_{doublon}_model"), "Expert 140 Pro")
+            .unwrap();
+
+        repo.reporter_reglages_de_doublons().unwrap();
+
+        assert_eq!(
+            settings
+                .get(&format!("zone_{survivante}_model"))
+                .unwrap()
+                .as_deref(),
+            Some("Expert 140 Pro")
+        );
+    }
+
+    /// Une zone sans doublon ne doit rien recevoir de personne.
+    #[test]
+    fn une_zone_seule_ne_recoit_rien() {
+        let db = test_db_migree();
+        let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+        let repo = ZoneRepo::new(db);
+
+        let seule = repo.create("Salon", Some("dlna"), Some("uuid:1")).unwrap();
+        let autre = repo
+            .create("Cuisine", Some("dlna"), Some("uuid:2"))
+            .unwrap();
+        settings
+            .set(&format!("zone_{autre}_eq_profile"), "loudness")
+            .unwrap();
+
+        repo.reporter_reglages_de_doublons().unwrap();
+
+        assert!(
+            settings
+                .get(&format!("zone_{seule}_eq_profile"))
+                .unwrap()
+                .is_none(),
+            "deux appareils distincts ne se transmettent rien"
+        );
     }
 
     /// #1823 — le panneau lateral creait la zone avec le NOM du peripherique.
