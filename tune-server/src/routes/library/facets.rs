@@ -13,8 +13,11 @@ use crate::state::AppState;
 pub(super) struct FacetQuery {
     /// Comma-separated facet fields to compute (default: the common set).
     fields: Option<String>,
-    /// Max values per facet (default 200).
-    limit: Option<i64>,
+    /// Max values per facet (default 200). Également réutilisé par
+    /// `albums-detailed` comme taille de page (même jeu de paramètres).
+    pub(super) limit: Option<i64>,
+    /// Pagination de `albums-detailed` uniquement — sans effet sur les facettes.
+    pub(super) offset: Option<i64>,
     /// Oxygen folder facet: absolute directory prefix. Not a facet field itself,
     /// but an active selection that narrows every other facet's counts (the
     /// folder-facet endpoint owns the drill-down; here it only filters).
