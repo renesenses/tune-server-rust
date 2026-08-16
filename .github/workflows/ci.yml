@@ -70,6 +70,21 @@ jobs:
   # `audio-embedding` feature, now shipped in the release + docker builds. This
   # job compile-checks it in isolation so a break surfaces on the PR rather than
   # only at release time. `load-dynamic` needs no onnxruntime binary at build.
+  #
+  # Il EXECUTE aussi les tests de `tune-core` derriere cette fonctionnalite —
+  # dix-sept a ce jour — que rien ne lancait. Aucune tache ne les couvrait :
+  #   `test`                  : --features oaat, donc sans audio-embedding ;
+  #   `test-shipped-features` : -p tune-server SEUL, donc pas tune-core ;
+  #   ce job                  : `cargo check`, donc compilation sans execution.
+  #
+  # Le module entier est sous `#[cfg(feature = "audio-embedding")]`
+  # (`audio/mod.rs`) : ces tests ne s'executaient donc QUE sur la machine de
+  # celui qui pensait a passer la fonctionnalite a la main. Meme motif que
+  # `test-shipped-features`, qui existe parce que neuf tests de greffons
+  # echouaient en silence depuis la 0.9.61 (#1427).
+  #
+  # `provision_and_embed` est `#[ignore]` (il telecharge le modele) : il reste
+  # hors de cette execution, comme avant.
   audio-embedding:
     name: Audio embedding feature
     runs-on: ubuntu-latest
@@ -86,6 +101,7 @@ jobs:
       # `Package alsa was not found in the pkg-config`.
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo check -p tune-server --features audio-embedding
+      - run: cargo test -p tune-core --features audio-embedding
 
   build:
     name: Build ${{ matrix.target }}
