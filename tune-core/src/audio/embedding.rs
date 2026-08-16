@@ -1128,17 +1128,53 @@ mod tests {
     }
 
     #[test]
-    fn default_leaves_half_the_machine_free() {
-        // Ni réglage écrit, ni valeur reconnue : la moitié des cœurs. C'est ce
-        // qui laisse de quoi décoder et servir un flux pendant l'analyse.
-        let expected = (cores() / 2).max(1);
-        assert_eq!(
-            super::intra_threads_for(&settings_with_throttle(None)),
-            expected
-        );
+    fn sans_reglage_le_defaut_depend_de_la_taille_de_la_machine() {
+        // Ce test affirmait « la moitié des cœurs » dans tous les cas. C'était
+        // vrai avant #1576, qui a rendu le défaut dépendant de la machine :
+        // `eco` (un seul fil) jusqu'à huit cœurs, `equilibre` (la moitié)
+        // au-delà. Le matériel typique d'un serveur audio — Pi, NAS, mini-PC —
+        // est précisément sous la barre, et c'est là que la passe avait éteint
+        // des machines.
+        //
+        // L'ancienne version passait sur toute machine de plus de huit cœurs et
+        // échouait en dessous. Elle n'a jamais été exécutée par la CI (aucune
+        // tâche ne lançait les tests de `tune-core` derrière `audio-embedding`),
+        // donc elle n'a été vue que sur des postes de développement — tous
+        // au-dessus de la barre. Le runner GitHub en a quatre.
+        let obtenu = super::intra_threads_for(&settings_with_throttle(None));
+        if cores() <= 8 {
+            assert_eq!(
+                obtenu,
+                1,
+                "sous huit cœurs le défaut doit être `eco` — un seul fil, la \
+                 machine reste utilisable pendant l'analyse ({} cœurs ici)",
+                cores()
+            );
+        } else {
+            assert_eq!(
+                obtenu,
+                (cores() / 2).max(1),
+                "au-delà de huit cœurs le défaut doit être `equilibre` — la \
+                 moitié de la machine ({} cœurs ici)",
+                cores()
+            );
+        }
+    }
+
+    #[test]
+    fn une_valeur_inconnue_retombe_toujours_sur_l_equilibre() {
+        // Contrat distinct du précédent, et c'est là que l'ancien test se
+        // trompait en les traitant ensemble : `intra_threads_for` n'applique
+        // `default_throttle()` que faute de réglage écrit. Un réglage PRÉSENT
+        // mais illisible — faute de frappe, valeur d'une version future,
+        // migration ratée — tombe dans la branche `_`, donc l'équilibre, quelle
+        // que soit la taille de la machine.
+        //
+        // C'est voulu : un réglage mal écrit ne doit ni mettre la machine à
+        // genoux, ni brider quelqu'un qui a demandé autre chose.
         assert_eq!(
             super::intra_threads_for(&settings_with_throttle(Some("n'importe quoi"))),
-            expected
+            (cores() / 2).max(1)
         );
     }
 
