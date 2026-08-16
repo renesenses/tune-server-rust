@@ -986,6 +986,27 @@ WHERE key IN ('rg_album_gain','rg_album_peak')
   );
 ",
     },
+    Migration {
+        version: 76,
+        name: "cue_virtual_tracks",
+        // Les colonnes elles-memes sont posees par add_column_if_missing (voir
+        // plus bas) : un ALTER TABLE ici planterait en « duplicate column name »
+        // sur une base neuve, ou CORE_SCHEMA les a deja.
+        //
+        // Ce qui se joue ici est l'UNICITE. `tracks.file_path` est UNIQUE, et
+        // une feuille CUE produit N pistes pointant vers LE MEME fichier. Plutot
+        // que de retirer cette contrainte — impossible en ligne sous SQLite,
+        // qui exigerait de reconstruire toute la table `tracks` —, les pistes
+        // virtuelles laissent `file_path` NUL (UNIQUE tolere plusieurs NULL, sur
+        // les deux moteurs) et portent le vrai chemin dans `cue_media_path`.
+        //
+        // ⚠️ `up:` est VIDE a dessein. Le runner execute `up:` AVANT les blocs
+        // `if migration.version == N`, donc un CREATE INDEX ecrit ici porterait
+        // sur des colonnes pas encore ajoutees, echouerait, et un echec de
+        // migration casse tout le runner (vecu chez JF, sentinelle 99).
+        // Colonnes ET index sont donc poses ensemble, dans le bloc de version.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1871,6 +1892,22 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "queue_items", "track_number", "INTEGER");
             add_column_if_missing(db, "queue_items", "disc_number", "INTEGER");
         }
+        if migration.version == 76 {
+            // Pistes virtuelles d'une feuille CUE : `cue_media_path` porte le
+            // vrai fichier audio, `file_path` restant NUL pour ces pistes.
+            add_column_if_missing(db, "tracks", "cue_media_path", "TEXT");
+            add_column_if_missing(db, "tracks", "cue_start_ms", "INTEGER");
+            add_column_if_missing(db, "tracks", "cue_end_ms", "INTEGER");
+            // L'index vient APRES les colonnes, et ici plutot que dans `up:` —
+            // que le runner execute avant ce bloc. Il rend une identite aux
+            // pistes virtuelles : sans lui, chaque scan les recreerait, faute de
+            // pouvoir les retrouver (`file_path` etant NUL pour toutes).
+            let _ = db.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_cue_identity \
+                 ON tracks(cue_media_path, cue_start_ms) \
+                 WHERE cue_media_path IS NOT NULL;",
+            );
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -2491,6 +2528,80 @@ mod tests {
             cols.iter().any(|c| c == "cover_path"),
             "tracks.cover_path missing: {cols:?}"
         );
+    }
+
+    /// Les pistes virtuelles CUE reposent sur trois colonnes ET un index unique
+    /// partiel. Les colonnes seules ne suffisent pas : sans l'index, rien
+    /// n'identifie une piste virtuelle et chaque scan les recréerait.
+    #[test]
+    fn cue_virtual_tracks_have_their_columns_and_identity_index() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tracks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["cue_media_path", "cue_start_ms", "cue_end_ms"] {
+            assert!(
+                cols.iter().any(|x| x == c),
+                "tracks.{c} manquante: {cols:?}"
+            );
+        }
+
+        let idx: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tracks'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            idx.iter().any(|i| i == "idx_tracks_cue_identity"),
+            "index d'identité CUE manquant: {idx:?}"
+        );
+    }
+
+    /// Le point qui rend tout le dispositif possible : `file_path` est UNIQUE,
+    /// et plusieurs pistes d'une même feuille CUE partagent un seul fichier.
+    /// C'est légal UNIQUEMENT parce que `UNIQUE` tolère plusieurs `NULL`.
+    /// Si ce comportement changeait, le découpage CUE casserait en silence.
+    #[test]
+    fn unique_file_path_still_tolerates_several_nulls() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        for (start, title) in [(0, "Aria"), (32_000, "Variatio 1"), (125_493, "Variatio 2")] {
+            conn.execute(
+                "INSERT INTO tracks (title, file_path, cue_media_path, cue_start_ms) \
+                 VALUES (?1, NULL, '/m/gould.ape', ?2)",
+                rusqlite::params![title, start],
+            )
+            .expect("plusieurs pistes CUE doivent coexister sur un même fichier");
+        }
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE cue_media_path = '/m/gould.ape'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+
+        // Mais deux pistes au MÊME début sur le MÊME fichier restent interdites :
+        // c'est ce qui empêche un rescan de dupliquer la bibliothèque.
+        let dup = conn.execute(
+            "INSERT INTO tracks (title, file_path, cue_media_path, cue_start_ms) \
+             VALUES ('doublon', NULL, '/m/gould.ape', 0)",
+            [],
+        );
+        assert!(dup.is_err(), "l'index d'identité n'empêche pas le doublon");
     }
 
     /// The upgrade path relies on `add_column_if_missing`, so pin its contract:
