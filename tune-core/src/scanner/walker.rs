@@ -113,6 +113,26 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "alac", "ape", "iso",
 ];
 
+/// Audio (or audio-describing) extensions Tune does NOT read, listed so the scan
+/// report can say WHY files were left out instead of letting them vanish.
+///
+/// Deliberately a fixed list rather than "anything not in SUPPORTED_EXTENSIONS":
+/// a music library is full of `.jpg`, `.nfo`, `.m3u`, `.log` and `.accurip`, and
+/// counting those would drown the one line the user can act on.
+///
+/// `cue` earns its place even though it is not audio: a `.cue` next to a single
+/// large file is precisely how an album gets stored as one track, so its
+/// presence explains a missing album better than anything else.
+pub const KNOWN_UNREAD_AUDIO: &[&str] = &[
+    "mpc", "mp+", "mpp", // Musepack (Rhorn, #1763)
+    "cue", // feuille de découpe, jamais interprétée
+    "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
+    "m4b", "m4p", // livres audio, achats protégés
+    "dts", "ac3", "eac3", "mka", // conteneurs plutôt vidéo/multicanal
+    "aac", // AAC brut, hors conteneur m4a
+    "ra", "rm", "amr", "spx",
+];
+
 const SKIP_DIRS: &[&str] = &[
     "duplicates",
     ".tune",
@@ -291,6 +311,12 @@ pub struct ListAudioResult {
     /// drive invisible to a service token, …) instead of burying the reason
     /// in the server log (Alain Bonnel, Windows NAS).
     pub missing_dir_reasons: Vec<String>,
+    /// Fichiers audio rencontrés mais non lus, comptés par extension.
+    ///
+    /// Vide dans l'immense majorité des cas. Quand il ne l'est pas, c'est la
+    /// seule chose qui explique à l'utilisateur pourquoi des albums manquent —
+    /// sans quoi ils disparaissent en silence (cf `KNOWN_UNREAD_AUDIO`).
+    pub skipped_by_ext: std::collections::HashMap<String, usize>,
 }
 
 impl ListAudioResult {
@@ -321,6 +347,8 @@ pub fn list_audio_files_with_excludes(
     let skip_set: HashSet<&str> = SKIP_DIRS.iter().copied().collect();
 
     let mut files = Vec::new();
+    let mut skipped_by_ext: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -401,6 +429,22 @@ pub fn list_audio_files_with_excludes(
                         continue;
                     }
                     let path = entry.path();
+                    // Count the AUDIO files we walk past, by extension. Until now
+                    // a file whose format Tune does not read simply vanished: no
+                    // log, no line in the scan report, nothing. The user sees
+                    // albums missing with no way to learn why — the `.cue` /
+                    // `.mpc` case (Rhorn, #1763), and every future format.
+                    //
+                    // Only KNOWN_UNREAD_AUDIO is counted, never "every unknown
+                    // extension": a music library holds thousands of .jpg, .nfo,
+                    // .m3u and .log, and reporting those would bury the one line
+                    // that matters under noise nobody can act on.
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        let lower = ext.to_lowercase();
+                        if KNOWN_UNREAD_AUDIO.contains(&lower.as_str()) {
+                            *skipped_by_ext.entry(lower).or_insert(0) += 1;
+                        }
+                    }
                     if let Some(ext) = path.extension().and_then(|e| e.to_str())
                         && extensions.contains(ext.to_lowercase().as_str())
                     {
@@ -476,11 +520,34 @@ pub fn list_audio_files_with_excludes(
         walk_errors = error_dirs.len(),
         "audio_files_listed"
     );
+    // Journalisé ici, une seule ligne par scan, et seulement quand il y a
+    // quelque chose à dire : c'est la trace qui manquait pour répondre « vos
+    // fichiers .mpc ne sont pas lus » au lieu de chercher un bug de scanner.
+    if !skipped_by_ext.is_empty() {
+        let mut par_ext: Vec<(String, usize)> = skipped_by_ext
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        par_ext.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let total: usize = par_ext.iter().map(|(_, n)| n).sum();
+        let detail = par_ext
+            .iter()
+            .map(|(e, n)| format!(".{e}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        warn!(
+            total,
+            detail = %detail,
+            "scan_unsupported_audio_skipped — fichiers audio rencontrés mais non lus par Tune"
+        );
+    }
+
     ListAudioResult {
         files,
         missing_dirs,
         error_dirs,
         missing_dir_reasons,
+        skipped_by_ext,
     }
 }
 
@@ -875,6 +942,39 @@ mod tests {
         assert!(SUPPORTED_EXTENSIONS.contains(&"dsf"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"ape"));
         assert!(!SUPPORTED_EXTENSIONS.contains(&"txt"));
+    }
+
+    /// Les deux listes doivent rester DISJOINTES.
+    ///
+    /// Ajouter un format à `SUPPORTED_EXTENSIONS` sans le retirer de
+    /// `KNOWN_UNREAD_AUDIO` produirait un rapport de scan qui annonce comme
+    /// « non lus » des fichiers pourtant indexés — pire qu'un silence, puisque
+    /// l'utilisateur irait chercher un problème inexistant.
+    #[test]
+    fn unread_list_never_overlaps_supported() {
+        for e in KNOWN_UNREAD_AUDIO {
+            assert!(
+                !SUPPORTED_EXTENSIONS.contains(e),
+                "{e} est à la fois lu et annoncé comme non lu"
+            );
+        }
+    }
+
+    /// Ce que la liste doit couvrir, et ce qu'elle ne doit surtout pas.
+    #[test]
+    fn unread_list_targets_audio_only() {
+        // Les formats réclamés sur le forum (Rhorn, #1763).
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"mpc"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"cue"));
+        // Le bruit d'une bibliothèque musicale ne doit JAMAIS y figurer :
+        // compter les pochettes et les fichiers de log noierait le seul
+        // renseignement exploitable.
+        for noise in ["jpg", "png", "nfo", "m3u", "log", "txt", "accurip", "pdf"] {
+            assert!(
+                !KNOWN_UNREAD_AUDIO.contains(&noise),
+                "{noise} n'est pas de l'audio et polluerait le rapport"
+            );
+        }
     }
 
     #[test]

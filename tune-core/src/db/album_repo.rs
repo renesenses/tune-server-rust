@@ -1424,6 +1424,39 @@ impl AlbumRepo {
 
     /// Bio provenance (source, url, license, lang, fetched_at) for the
     /// album-detail endpoint. Returns None when no sourced bio is recorded.
+    /// The album's Dynamic Range, as tagged by an external analyser.
+    ///
+    /// The value is written per track by the scanner (`track_metadata['dr_album']`,
+    /// read from the Vorbis `ALBUM DYNAMIC RANGE` field) because that is where
+    /// the tag physically lives — in each file — while it describes the album as
+    /// a whole. Any one track therefore answers for the album, hence `LIMIT 1`.
+    ///
+    /// Returns `None` when no track carries the tag, which is the common case:
+    /// tagging DR is a deliberate step most libraries never take. The caller
+    /// must render nothing at all rather than an empty field.
+    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "SELECT tm.value FROM track_metadata tm \
+                 JOIN tracks t ON t.id = tm.track_id \
+                 WHERE t.album_id = ? AND tm.key = 'dr_album' AND tm.value <> '' \
+                 LIMIT 1"
+            }
+            Engine::Postgres => {
+                "SELECT tm.value FROM track_metadata tm \
+                 JOIN tracks t ON t.id = tm.track_id \
+                 WHERE t.album_id = $1 AND tm.key = 'dr_album' AND tm.value <> '' \
+                 LIMIT 1"
+            }
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(sql, &params)?
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .filter(|s| !s.trim().is_empty()))
+    }
+
     pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {
         let sql = match self.db.engine() {
             Engine::Sqlite => {
@@ -2390,6 +2423,61 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn dynamic_range_reads_the_tag_from_any_track_of_the_album() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = test_db();
+        // `track_metadata` arrives by migration, not by CORE_SCHEMA, so the
+        // in-memory fixture does not have it. Create it here rather than run the
+        // whole migration chain: this test is about the join, not the schema.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_metadata (
+                 track_id INTEGER NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (track_id, key)
+             );",
+        )
+        .unwrap();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Tri Repetae".into())).unwrap();
+        let mut t1 = Track::new("Dael".into());
+        t1.album_id = Some(album_id);
+        t1.file_path = Some("/m/1.flac".into());
+        let id1 = trepo.create(&t1).unwrap();
+        let mut t2 = Track::new("Clipper".into());
+        t2.album_id = Some(album_id);
+        t2.file_path = Some("/m/2.flac".into());
+        let id2 = trepo.create(&t2).unwrap();
+
+        // No tag anywhere yet: nothing to show, and that is the common case.
+        assert_eq!(arepo.dynamic_range(album_id).unwrap(), None);
+
+        // The tag lives in each file; the scanner therefore writes it per track
+        // even though it describes the album. Tagging the SECOND track proves
+        // the lookup does not just read the first one.
+        mrepo.set(id2, "dr_album", "12").unwrap();
+        assert_eq!(
+            arepo.dynamic_range(album_id).unwrap().as_deref(),
+            Some("12")
+        );
+
+        // An empty value must not masquerade as a measurement.
+        mrepo.set(id1, "dr_album", "").unwrap();
+        mrepo.delete(id2, "dr_album").unwrap();
+        assert_eq!(arepo.dynamic_range(album_id).unwrap(), None);
+
+        // DR0 is a real measurement on a crushed master, not an absence.
+        mrepo.set(id1, "dr_album", "0").unwrap();
+        assert_eq!(arepo.dynamic_range(album_id).unwrap().as_deref(), Some("0"));
     }
 
     #[test]

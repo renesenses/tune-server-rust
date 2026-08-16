@@ -4,7 +4,6 @@ pub mod airplay_pairing;
 pub mod appliance;
 pub mod appliance_storage;
 pub mod archive;
-pub mod bandcamp;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
@@ -327,7 +326,6 @@ pub fn router_with_plugins(
         .nest("/listenbrainz", listenbrainz::router())
         .nest("/scrobbler", scrobbler::router())
         .nest("/soundcloud", soundcloud::router())
-        .nest("/bandcamp", bandcamp::router())
         .nest("/archive", archive::router())
         .nest("/discogs", discogs::router())
         .nest("/setlistfm", setlistfm::router())

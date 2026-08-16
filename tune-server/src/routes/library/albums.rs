@@ -204,6 +204,13 @@ pub(super) async fn get_album(
             if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
                 obj.insert("bio_provenance".into(), prov);
             }
+            // Dynamic Range, when the files carry the tag (#303, #1418). Absent
+            // from the payload rather than null when untagged, so a client can
+            // simply test for the key instead of distinguishing "no tag" from
+            // "measured zero" — DR0 is a real value.
+            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range(id)) {
+                obj.insert("dynamic_range".into(), Value::String(dr));
+            }
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
