@@ -67,10 +67,23 @@ pub fn fetch_one(backend: &Arc<dyn DbBackend>, track_id: i64) -> Option<Vec<f32>
 /// All (track_id, embedding) pairs. Bounded by `limit`; a typical audiophile
 /// library is 20-200k tracks and each vector is 2 KB, so an in-memory
 /// brute-force cosine over the set is a few ms — no vector index needed yet.
+///
+/// ⚠️ **Filtré sur le modèle courant.** Deux modèles produisent deux espaces
+/// vectoriels sans rapport : un cosinus entre un vecteur `clap-music-2023` et un
+/// vecteur `clap-music-2023-pcm2` ne veut rien dire. Sans ce filtre, après un
+/// changement de modèle, le classement mélangeait les deux — mesuré sur .18 le
+/// 16/08 : 16 782 vecteurs de l'ancien espace contre 8 257 du nouveau, comparés
+/// entre eux (#1819, et piste sérieuse pour #1820).
+///
+/// Conséquence assumée : juste après un changement de modèle, la recherche par
+/// ambiance ne porte que sur les pistes déjà ré-analysées. Moins de résultats,
+/// mais des résultats qui veulent dire quelque chose ; les autres reviennent au
+/// fil de la passe.
 pub fn fetch_all(backend: &Arc<dyn DbBackend>, limit: i64) -> Vec<(i64, Vec<f32>)> {
     let rows = match backend.query_many(
-        "SELECT track_id, embedding FROM track_audio_embedding LIMIT ?",
-        &[&limit as &dyn ToSqlValue],
+        "SELECT track_id, embedding FROM track_audio_embedding \
+         WHERE model = ? LIMIT ?",
+        &[&MODEL_ID as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
     ) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -90,13 +103,59 @@ pub fn fetch_all(backend: &Arc<dyn DbBackend>, limit: i64) -> Vec<(i64, Vec<f32>
 /// résultat pour cette recherche » : sans cette distinction, une recherche par
 /// ambiance renvoyait une liste vide dans les deux cas et l'utilisateur ne
 /// pouvait pas savoir s'il devait reformuler ou attendre (retour Fabien).
+/// ⚠️ Compte les embeddings **du modèle courant**, et pas les lignes de la
+/// table. Sans ce filtre, la jauge était figée par construction (#1819) :
+/// `track_audio_embedding` a `track_id` pour clé primaire, donc ré-analyser une
+/// piste **écrase** sa ligne au lieu d'en ajouter une. Après un changement de
+/// modèle, le total ne bougeait plus d'un pouce pendant que la passe
+/// retravaillait toute la discothèque.
+///
+/// Mesuré sur la machine de Bertrand (.18) le 16/08 : 16 782 embeddings sous
+/// `clap-music-2023` et 8 257 sous `clap-music-2023-pcm2`. La jauge affichait
+/// 25 039 / 25 090 — 99,8 % — alors qu'il restait 16 832 pistes à ré-analyser.
 pub fn analysed_count(backend: &Arc<dyn DbBackend>) -> i64 {
     backend
-        .query_one("SELECT COUNT(*) FROM track_audio_embedding", &[])
+        .query_one(
+            "SELECT COUNT(*) FROM track_audio_embedding WHERE model = ?",
+            &[&MODEL_ID as &dyn ToSqlValue],
+        )
         .ok()
         .flatten()
         .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
         .unwrap_or(0)
+}
+
+/// Pistes **traitées** par la passe pour le modèle courant : celles qui portent
+/// le témoin `audio_embed_analyzed` estampillé du `MODEL_ID` en cours.
+///
+/// C'est le numérateur honnête d'une barre de progression, et il diffère de
+/// [`analysed_count`] : le témoin est posé même quand l'inférence échoue, pour
+/// qu'une piste en échec ne soit pas retentée sans fin. La différence entre les
+/// deux, ce sont les échecs — voir [`failed_count`].
+///
+/// Le filtre sur la valeur est indispensable : un changement de modèle rend
+/// toutes les pistes candidates à nouveau, et un compteur qui ignorerait la
+/// valeur afficherait 100 % pendant que la passe recommence tout.
+pub fn processed_count(backend: &Arc<dyn DbBackend>) -> i64 {
+    backend
+        .query_one(
+            "SELECT COUNT(*) FROM track_metadata \
+             WHERE key = 'audio_embed_analyzed' AND value = ?",
+            &[&MODEL_ID as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// Pistes que la passe a traitées sans parvenir à en tirer un embedding.
+///
+/// Ni un blocage ni une file d'attente : ces pistes sont **finies**, elles ont
+/// échoué. Les taire fabriquait une jauge qui n'atteignait jamais 100 % et
+/// poussait à relancer indéfiniment une passe terminée.
+pub fn failed_count(backend: &Arc<dyn DbBackend>) -> i64 {
+    (processed_count(backend) - analysed_count(backend)).max(0)
 }
 
 /// Combien de pistes la passe acoustique peut-elle analyser en tout — le
@@ -376,4 +435,141 @@ pub fn acoustic_neighbors(
         None => return Vec::new(),
     };
     rank_by_vector(backend, &seed, limit, Some(seed_track_id))
+}
+
+#[cfg(test)]
+mod progress_counter_tests {
+    use super::*;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    fn setup() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn mk_track(backend: &Arc<dyn DbBackend>, n: usize) -> i64 {
+        let repo = TrackRepo::with_backend(backend.clone());
+        let mut t = Track::new(format!("piste {n}"));
+        t.format = Some("flac".into());
+        t.file_path = Some(format!("/m/{n}.flac"));
+        repo.create(&t).unwrap()
+    }
+
+    /// Pose le témoin de passage, avec le modèle sous lequel la piste a été
+    /// traitée — c'est ce que fait la passe, y compris quand elle échoue.
+    fn stamp(backend: &Arc<dyn DbBackend>, track_id: i64, model: &str) {
+        let params: [&dyn ToSqlValue; 2] = [&track_id, &model];
+        backend
+            .execute(
+                "INSERT INTO track_metadata (track_id, key, value) \
+                 VALUES (?, 'audio_embed_analyzed', ?)",
+                &params,
+            )
+            .unwrap();
+    }
+
+    fn store_embedding(backend: &Arc<dyn DbBackend>, track_id: i64, model: &str) {
+        let mut v = vec![0.0f32; EMBED_DIM];
+        v[0] = 1.0;
+        let blob = Some(to_bytes(&v));
+        let params: [&dyn ToSqlValue; 3] = [&track_id, &model, &blob];
+        backend
+            .execute(
+                "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                 VALUES (?, ?, ?, 42)",
+                &params,
+            )
+            .unwrap();
+    }
+
+    /// #1819, cas RÉEL de la machine .18 (16/08) : le modèle a été bumpé.
+    /// 16 832 pistes portent l'ancien témoin, 8 258 le nouveau. La jauge
+    /// affichait 99,8 % et ne bougeait plus, alors qu'il restait un tiers de la
+    /// discothèque à ré-analyser.
+    ///
+    /// Réduit à l'échelle : 5 pistes, 3 sous l'ancien modèle, 2 sous le nouveau.
+    #[test]
+    fn un_changement_de_modele_ne_doit_pas_afficher_une_jauge_pleine() {
+        let backend = setup();
+        for n in 0..5 {
+            let id = mk_track(&backend, n);
+            if n < 3 {
+                // Ancien modèle : traitées, mais à refaire.
+                stamp(&backend, id, "clap-music-2023");
+                store_embedding(&backend, id, "clap-music-2023");
+            } else {
+                stamp(&backend, id, MODEL_ID);
+                store_embedding(&backend, id, MODEL_ID);
+            }
+        }
+
+        assert_eq!(eligible_count(&backend), 5, "les 5 pistes sont analysables");
+        assert_eq!(
+            analysed_count(&backend),
+            2,
+            "seuls les embeddings du modèle COURANT comptent — c'est le cœur du \
+             défaut : sans ce filtre, on comptait 5 et la jauge était pleine"
+        );
+        assert_eq!(
+            processed_count(&backend),
+            2,
+            "les 3 pistes de l'ancien modèle sont redevenues candidates"
+        );
+        assert_eq!(failed_count(&backend), 0, "aucun échec ici");
+    }
+
+    /// Le cas de Reivax66 : 17 292 éligibles, 17 277 traitées, 15 pistes qui
+    /// ont échoué. La passe est TERMINÉE — il ne reste aucun candidat — mais la
+    /// jauge affichait 17 277/17 292 et l'utilisateur concluait au blocage.
+    ///
+    /// Réduit : 4 pistes traitées sous le modèle courant, dont 1 sans embedding.
+    #[test]
+    fn les_echecs_sont_comptes_a_part_et_la_passe_peut_finir() {
+        let backend = setup();
+        for n in 0..4 {
+            let id = mk_track(&backend, n);
+            stamp(&backend, id, MODEL_ID);
+            // La dernière a échoué : témoin posé, aucun embedding écrit.
+            if n < 3 {
+                store_embedding(&backend, id, MODEL_ID);
+            }
+        }
+
+        assert_eq!(eligible_count(&backend), 4);
+        assert_eq!(analysed_count(&backend), 3, "3 embeddings écrits");
+        assert_eq!(
+            processed_count(&backend),
+            4,
+            "les 4 sont traitées : c'est ce compteur qui atteint le total"
+        );
+        assert_eq!(
+            failed_count(&backend),
+            1,
+            "la 4e a échoué, elle doit être dite"
+        );
+        assert_eq!(
+            eligible_count(&backend) - processed_count(&backend),
+            0,
+            "plus rien en attente : la passe est finie, la jauge doit le montrer"
+        );
+    }
+
+    /// Le classement ne doit jamais comparer deux espaces vectoriels : un
+    /// cosinus entre modèles différents ne veut rien dire (#1820).
+    #[test]
+    fn le_classement_ignore_les_vecteurs_d_un_autre_modele() {
+        let backend = setup();
+        let ancien = mk_track(&backend, 0);
+        let courant = mk_track(&backend, 1);
+        store_embedding(&backend, ancien, "clap-music-2023");
+        store_embedding(&backend, courant, MODEL_ID);
+
+        let charges = fetch_all(&backend, 100);
+        assert_eq!(charges.len(), 1, "un seul espace vectoriel à la fois");
+        assert_eq!(charges[0].0, courant, "celui du modèle courant");
+    }
 }
