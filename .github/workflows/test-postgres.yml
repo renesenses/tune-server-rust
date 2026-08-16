@@ -64,3 +64,24 @@ jobs:
 
       - name: PostgresDb smoke tests
         run: cargo test -p tune-core --no-default-features --features postgres db::postgres
+
+      # Real-schema regression for #1706: the self-healing DDL in
+      # `ensure_schema` and migration 026 can only be proven against an actual
+      # PostgreSQL. Applies the numbered migrations first (as scripts/pg-e2e.sh
+      # does), then runs the #1706 test with TUNE_TEST_PG_URL set so it does not
+      # skip. Scoped to that one test on purpose: the older E2E tests stay
+      # opt-in via scripts/pg-e2e.sh.
+      - name: Apply PG migrations
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          export PGPASSWORD=tune
+          psql -h localhost -U tune -d tune_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
+          for migration in tune-core/migrations/postgres/*.sql; do
+            echo "  $(basename "$migration")"
+            psql -h localhost -U tune -d tune_test -v ON_ERROR_STOP=1 -q -f "$migration"
+          done
+
+      - name: Schema-drift regression (#1706)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
