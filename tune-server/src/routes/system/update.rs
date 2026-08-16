@@ -1133,48 +1133,20 @@ fn install_unix(
 }
 
 /// Windows install: write a bat script that replaces the binary after exit.
-fn install_windows(
-    current_exe: &std::path::Path,
-    new_binary: &std::path::Path,
-    tmp_dir: &std::path::Path,
-) -> Result<(), String> {
-    let exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Cannot determine binary directory".to_string())?;
-
-    let new_staging = current_exe.with_extension("new.exe");
-    std::fs::copy(new_binary, &new_staging).map_err(|e| format!("copy new binary: {e}"))?;
-    info!(staging = %new_staging.display(), "update_win_binary_staged");
-
-    update_web_dir(exe_dir, tmp_dir)?;
-    info!("update_win_web_swapped");
-
-    // Wait for OUR specific PID to exit, not any process named tune-server.exe.
-    // Matching by image name hangs forever whenever a second tune-server.exe is
-    // alive (a lingering child, a double launch): the wait_loop never completes,
-    // the binary is never swapped, and the OLD version comes back — an
-    // intermittent "update did nothing" that reproduces only sometimes
-    // (Christophe/Bilou/Yves). A PID filter is immune to that. A 60s timeout is
-    // the backstop so the swap is never blocked indefinitely.
-    let pid = std::process::id();
-    let err_file = exe_dir.join("tune-update-failed.txt");
-
-    // Le batch se termine par `(goto) 2>nul & del "%~f0"` et non par
-    // `del "%~f0"` suivi de `goto :eof`.
-    //
-    // cmd.exe lit un fichier batch ligne par ligne DEPUIS LE DISQUE, en gardant
-    // une position de lecture. Supprimer le fichier puis continuer le fait donc
-    // échouer sur la lecture suivante : « Le fichier de commandes est
-    // introuvable », et la fenêtre reste ouverte sur le prompt au lieu de se
-    // fermer — alors que la mise à jour, elle, s'est bien déroulée (capture de
-    // Bilou, Windows 11 25H2).
-    //
-    // L'idiome `(goto) 2>nul` provoque une sortie du contexte batch (l'erreur
-    // de syntaxe est avalée par 2>nul) AVANT que `del` ne s'exécute : plus
-    // aucune lecture n'a lieu ensuite, le fichier est supprimé et la fenêtre se
-    // ferme proprement.
-    let bat_path = exe_dir.join("tune-update.bat");
-    let bat_content = format!(
+/// Le script de bascule écrit à côté du binaire, isolé pour être testable.
+///
+/// Les deux invariants que verrouillent les tests : le chemin nominal se
+/// termine par `exit /b 0` avant `:swap_failed`, et le script ne se supprime
+/// jamais lui-même.
+fn windows_update_bat(
+    pid: u32,
+    exe: &str,
+    new: &str,
+    err_file: &str,
+    exe_name: &str,
+    exe_name_new: &str,
+) -> String {
+    format!(
         "@echo off\r\n\
          setlocal enabledelayedexpansion\r\n\
          echo Waiting for Tune server (PID {pid}) to stop...\r\n\
@@ -1203,7 +1175,7 @@ fn install_windows(
          echo Starting updated server...\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
          start \"\" \"{exe}\"\r\n\
-         (goto) 2>nul & del \"%~f0\"\r\n\
+         exit /b 0\r\n\
          :swap_failed\r\n\
          echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
          echo The old binary was still locked by a running process.>> \"{err_file}\"\r\n\
@@ -1211,15 +1183,78 @@ fn install_windows(
          echo completely, delete {exe_name}, then rename {exe_name_new} to {exe_name}.>> \"{err_file}\"\r\n\
          echo Update failed - old binary locked. Details written to {err_file}\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
-         start \"\" \"{exe}\"\r\n",
-        exe = current_exe.display(),
-        new = new_staging.display(),
-        err_file = err_file.display(),
-        exe_name = current_exe
+         start \"\" \"{exe}\"\r\n"
+    )
+}
+
+fn install_windows(
+    current_exe: &std::path::Path,
+    new_binary: &std::path::Path,
+    tmp_dir: &std::path::Path,
+) -> Result<(), String> {
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| "Cannot determine binary directory".to_string())?;
+
+    let new_staging = current_exe.with_extension("new.exe");
+    std::fs::copy(new_binary, &new_staging).map_err(|e| format!("copy new binary: {e}"))?;
+    info!(staging = %new_staging.display(), "update_win_binary_staged");
+
+    update_web_dir(exe_dir, tmp_dir)?;
+    info!("update_win_web_swapped");
+
+    // Wait for OUR specific PID to exit, not any process named tune-server.exe.
+    // Matching by image name hangs forever whenever a second tune-server.exe is
+    // alive (a lingering child, a double launch): the wait_loop never completes,
+    // the binary is never swapped, and the OLD version comes back — an
+    // intermittent "update did nothing" that reproduces only sometimes
+    // (Christophe/Bilou/Yves). A PID filter is immune to that. A 60s timeout is
+    // the backstop so the swap is never blocked indefinitely.
+    let pid = std::process::id();
+    let err_file = exe_dir.join("tune-update-failed.txt");
+
+    let bat_path = exe_dir.join("tune-update.bat");
+    // Le script ne se supprime plus lui-même, et c'est délibéré.
+    //
+    // HISTORIQUE — cette décision ANNULE celle qui la précédait, il faut donc
+    // savoir pourquoi avant de la re-inverser.
+    //
+    // cmd.exe relit un fichier batch DEPUIS LE DISQUE après chaque commande, en
+    // gardant une position de lecture. L'effacer pendant son interprétation fait
+    // donc échouer la lecture suivante : « Le fichier de commande est
+    // introuvable » juste après « Starting updated server... » (capture de
+    // Bilou, Windows 11 25H2).
+    //
+    // Le correctif précédent (#1377) a conservé la suppression mais l'a fait
+    // précéder de `(goto) 2>nul`, censé quitter le contexte batch AVANT que
+    // `del` ne s'exécute. Le raisonnement se tient — mais **le terrain l'a
+    // démenti** : Bilou a confirmé le 13/08/2026 que le message persiste en
+    // v0.9.71, version qui contient pourtant ce correctif (vérifié par
+    // ascendance). L'astuce n'est pas fiable ici, vraisemblablement à cause du
+    // `setlocal enabledelayedexpansion` actif dès la première ligne.
+    //
+    // Plutôt que de parier une troisième fois sur une subtilité de cmd.exe
+    // qu'on ne peut pas tester depuis un Mac, on supprime la cause : le script
+    // ne s'efface plus. Il reste un fichier d'environ 2 Ko dans le répertoire
+    // d'installation, réécrit à chaque mise à jour — un bien meilleur marché
+    // qu'un message d'erreur à chaque fois. Et contrairement à un `cmd /c del`
+    // détaché, aucune subtilité de guillemets ne peut casser la mise à jour
+    // elle-même.
+    //
+    // `exit /b 0` est ce qui rend l'ensemble sûr : sans lui, le chemin nominal
+    // tombe droit dans `:swap_failed`, écrit un rapport d'échec pour une mise à
+    // jour réussie et relance l'exécutable une seconde fois. Seule l'astuce
+    // `(goto)` l'empêchait — un second défaut latent que ceci supprime.
+    let bat_content = windows_update_bat(
+        pid,
+        &current_exe.display().to_string(),
+        &new_staging.display().to_string(),
+        &err_file.display().to_string(),
+        &current_exe
             .file_name()
             .unwrap_or_default()
             .to_string_lossy(),
-        exe_name_new = new_staging
+        &new_staging
             .file_name()
             .unwrap_or_default()
             .to_string_lossy(),
@@ -2172,5 +2207,67 @@ mod swap_result_tests {
         // No pending update (empty marker) → nothing to compare.
         assert_eq!(swap_took("", "0.9.48"), None);
         assert_eq!(swap_took("   ", "0.9.48"), None);
+    }
+}
+
+#[cfg(test)]
+mod windows_update_bat_tests {
+    use super::windows_update_bat;
+
+    fn script() -> String {
+        windows_update_bat(
+            4242,
+            r"C:\Program Files\Tune\tune-server.exe",
+            r"C:\Program Files\Tune\tune-server.new.exe",
+            r"C:\Program Files\Tune\tune-update-failed.txt",
+            "tune-server.exe",
+            "tune-server.new.exe",
+        )
+    }
+
+    /// Le script ne doit JAMAIS s'effacer lui-même.
+    ///
+    /// cmd.exe relit le fichier depuis le disque après chaque commande : le
+    /// supprimer en cours d'interprétation affiche « Le fichier de commande est
+    /// introuvable » à chaque mise à jour (Bilou, fil #1306). Le correctif
+    /// précédent gardait la suppression derrière `(goto) 2>nul` ; le terrain a
+    /// démenti cette parade en v0.9.71. Réintroduire l'une ou l'autre forme
+    /// ramènerait le bug.
+    #[test]
+    fn never_deletes_itself() {
+        let s = script();
+        assert!(!s.contains("%~f0"), "le script se supprime lui-même");
+        assert!(!s.contains("(goto)"), "l'astuce (goto) est de retour");
+    }
+
+    /// Le chemin nominal doit sortir avant l'étiquette d'échec.
+    ///
+    /// Sans `exit /b 0`, une mise à jour RÉUSSIE tombe dans `:swap_failed` :
+    /// elle écrit un rapport d'échec mensonger et relance l'exécutable une
+    /// seconde fois, `start` étant présent dans les deux branches.
+    #[test]
+    fn success_path_exits_before_the_failure_branch() {
+        let s = script();
+        let exit = s.find("exit /b 0").expect("pas de sortie explicite");
+        let failed = s.find(":swap_failed").expect("pas d'étiquette d'échec");
+        assert!(
+            exit < failed,
+            "le chemin nominal traverse :swap_failed au lieu de sortir"
+        );
+    }
+
+    /// Garde-fou sur les points déjà corrigés ailleurs : l'attente porte sur
+    /// NOTRE pid (et non sur le nom d'image, qui pendait indéfiniment quand un
+    /// second tune-server.exe tournait), et le binaire de remplacement est bien
+    /// celui préparé à côté.
+    #[test]
+    fn keeps_the_pid_wait_and_the_staged_binary() {
+        let s = script();
+        assert!(
+            s.contains("PID eq 4242"),
+            "l'attente ne filtre plus par PID"
+        );
+        assert!(s.contains("tune-server.new.exe"));
+        assert!(s.contains("tune-update-failed.txt"));
     }
 }
