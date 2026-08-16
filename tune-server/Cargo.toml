@@ -27,12 +27,18 @@ dj = ["dep:tune-dj"]
 # `tune_core::lyrics` (no LRC parse/fetch reimplemented). NOT in default; build
 # `--features karaoke` to mount its routes at /api/v1/ext/karaoke.
 karaoke = ["dep:tune-karaoke"]
+# Bandcamp (#1768) : la recherche/découverte quittent le cœur toujours-compilé
+# pour un plugin natif, comme `dj` avant elle. PAS dans default : le serveur nu
+# ne sert plus /bandcamp ; construire `--features bandcamp` monte ses routes
+# sur /api/v1/ext/bandcamp.
+bandcamp = ["dep:tune-bandcamp"]
 
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
+tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
