@@ -272,3 +272,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --release
         working-directory: tune-widget/src-tauri
+      # Le widget porte des tests unitaires depuis le seuil de disposition mini
+      # (`parse_version`), mais personne ne les executait : `cargo test` a la
+      # racine ne voit pas une crate exclue du workspace. Ils passaient donc
+      # pour verifies sans l'avoir jamais ete.
+      - run: cargo test
+        working-directory: tune-widget/src-tauri

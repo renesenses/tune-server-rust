@@ -257,7 +257,7 @@ pub async fn run_with(opts: RunOptions) {
     // sur une socket IPv4 seule (#1321). Le repli couvre les machines où IPv6
     // est désactivé, et la reprise de port ci-dessous reste inchangée.
     let v4_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = {
+    let (listener, boot_socket) = {
         let (mut socket, mut addr) = crate::config::dual_stack_listen_socket(config.port)
             .unwrap_or_else(|| (crate::config::ipv4_listen_socket(), v4_addr));
         let mut ipv6_attempted = addr.is_ipv6();
@@ -320,18 +320,36 @@ pub async fn run_with(opts: RunOptions) {
         socket
             .set_nonblocking(true)
             .expect("failed to set nonblocking");
-        tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
+        // Descripteur dupliqué de la MÊME socket, pour le répondeur de
+        // démarrage (#1701) : il accepte les connexions pendant que la base se
+        // met à niveau, puis rend la place à axum. Dupliquer plutôt que
+        // réécouter garde la protection ci-dessus (un seul serveur tient le
+        // port) et le backlog déjà constitué.
+        let boot_socket = socket.try_clone().ok().map(std::net::TcpListener::from);
+        (
+            tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener"),
+            boot_socket,
+        )
     };
     // Adresse réellement obtenue : `[::]` en double pile, `0.0.0.0` en repli.
     let addr = listener.local_addr().unwrap_or(v4_addr);
 
+    // À partir d'ici et jusqu'à ce qu'axum serve, quelqu'un répond. Sans ça,
+    // une migration longue laissait le navigateur tourner dans le vide : le
+    // testeur « eric » a signalé « l'installation de la 9.70 plante » alors que
+    // la base se mettait à niveau, en silence (#1701, fil forum 1386).
+    let boot_responder = boot_socket.map(crate::boot_status::spawn);
+
     // Appliance : ne jamais démarrer sur une base vide si le disque de
     // données externe est absent (docs/DATA-RELOCATION.md).
+    crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
 
+    crate::boot_status::set_phase("base de données");
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
 
+    crate::boot_status::set_phase("configuration");
     state.restore_tokens().await;
 
     // Restore zone volumes, persist music_dirs/discogs_token to DB
@@ -365,9 +383,11 @@ pub async fn run_with(opts: RunOptions) {
     // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
     // partage absent fait voir un repertoire vide, et le scan qui suit conclut
     // « 0 fichier » (#1692).
+    crate::boot_status::set_phase("partages réseau");
     crate::startup::remount_network_shares(&state).await;
 
     // Register local audio outputs (USB DAC, headphones, speakers)
+    crate::boot_status::set_phase("sorties audio");
     #[cfg(feature = "local-audio")]
     crate::startup::register_local_outputs(&state).await;
 
@@ -378,6 +398,7 @@ pub async fn run_with(opts: RunOptions) {
     // `build_plugins` is where an out-of-tree binary injects its own. It runs
     // here, and not earlier, because a plugin's host services (`services`,
     // `backend`, `http_client`) only exist once `state` does.
+    crate::boot_status::set_phase("greffons");
     let extra_plugins = build_plugins.map(|build| build(&state)).unwrap_or_default();
     let plugin_routers = crate::plugins::init(
         &state,
@@ -403,6 +424,7 @@ pub async fn run_with(opts: RunOptions) {
     // with local_audio_http_fetch_failed and left playback silently dead.
 
     // Create shared OpenHome event listener
+    crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
 
     // SSDP discovery (DLNA / OpenHome)
@@ -454,6 +476,13 @@ pub async fn run_with(opts: RunOptions) {
     // besoin pour replier le WAL.
     let shutdown_state = state.clone();
     let app = routes::router_with_plugins(state, plugin_routers);
+
+    // Le routeur est prêt : le répondeur de démarrage rend la socket. `stop()`
+    // attend la sortie du fil, donc il n'y a jamais deux accepteurs à la fois
+    // et aucune connexion ne peut recevoir un « je démarre » après coup.
+    if let Some(responder) = boot_responder {
+        responder.stop();
+    }
 
     // Listener was bound before the DB was opened (see above) — the socket's
     // backlog has been queueing connections since then.

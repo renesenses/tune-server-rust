@@ -535,3 +535,82 @@ mod escape_tests {
         assert_eq!(html_escape("plain radio"), "plain radio");
     }
 }
+
+/// Garde-fou : écrire `zone_{id}_eq_profile` sans rafraîchir la sortie qui joue.
+///
+/// L'égaliseur n'atteint le son d'une zone locale que si quelqu'un rebâtit
+/// l'`EqProcessor` et l'installe — `Orchestrator::refresh_zone_eq`. Persister
+/// la clé ne suffit pas : le réglage n'agit alors qu'à la piste SUIVANTE, et la
+/// route répond quand même 200 (ou `applied: true`). C'est ce silence qui a
+/// produit #1372, #1555 et #1688, et le correctif de #1725 n'avait branché
+/// qu'un des quatre points d'écriture.
+///
+/// Ce test relit les sources plutôt que d'exercer les routes : la propriété à
+/// garder est structurelle — « tout fichier qui écrit cette clé rafraîchit » —
+/// et aucun harnais HTTP ne la vérifierait aussi simplement.
+///
+/// Granularité volontairement au FICHIER, pas à la ligne : plus grossier, mais
+/// robuste aux déplacements de code. Un fichier qui ne ferait que LIRE la clé
+/// déclencherait un faux positif ; il irait dans `LECTURE_SEULE` avec sa raison.
+#[cfg(test)]
+mod eq_refresh_guard {
+    use std::fs;
+    use std::path::Path;
+
+    /// Fichiers qui mentionnent la clé sans jamais l'écrire. Vide aujourd'hui.
+    const LECTURE_SEULE: &[&str] = &[];
+
+    #[test]
+    fn every_route_writing_the_eq_profile_refreshes_the_live_output() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        let mut fautifs = Vec::new();
+        let mut vus = 0usize;
+
+        let mut piles = vec![racine.clone()];
+        while let Some(dir) = piles.pop() {
+            for entree in fs::read_dir(&dir).expect("lecture de src/routes") {
+                let chemin = entree.expect("entrée de répertoire").path();
+                if chemin.is_dir() {
+                    piles.push(chemin);
+                    continue;
+                }
+                if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let nom = chemin
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let source = fs::read_to_string(&chemin).expect("lecture du fichier");
+                if !source.contains("_eq_profile") {
+                    continue;
+                }
+                vus += 1;
+                if LECTURE_SEULE.contains(&nom.as_str()) {
+                    continue;
+                }
+                if !source.contains("refresh_zone_eq") {
+                    fautifs.push(nom);
+                }
+            }
+        }
+
+        assert!(
+            vus >= 4,
+            "le garde-fou n'a trouvé que {vus} fichier(s) touchant `zone_*_eq_profile` — \
+             la clé a probablement été renommée, et ce test ne garde plus rien"
+        );
+        assert!(
+            fautifs.is_empty(),
+            "ces routes écrivent `zone_*_eq_profile` sans appeler \
+             `Orchestrator::refresh_zone_eq` : {fautifs:?}\n\
+             Sans lui, le réglage n'atteint le son qu'à la piste SUIVANTE sur une \
+             zone locale, alors que la réponse annonce un succès (#1725).\n\
+             Ajouter, après le `settings.set(...)` :\n    \
+             let applique = state.orchestrator.refresh_zone_eq(zone_id).await;\n\
+             puis exposer `applied_live` dans la réponse. Si le fichier ne fait que \
+             LIRE la clé, l'inscrire dans `LECTURE_SEULE` avec sa raison."
+        );
+    }
+}

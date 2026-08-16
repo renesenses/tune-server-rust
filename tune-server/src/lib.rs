@@ -5,6 +5,7 @@ pub mod auto_resume;
 pub mod auto_scan;
 pub mod background;
 pub mod background_tasks;
+pub mod boot_status;
 pub mod bootstrap;
 pub mod config;
 pub mod discovery_setup;
