@@ -121,6 +121,50 @@ impl CrossfeedProcessor {
         }
     }
 
+    /// Reprendre la ligne à retard d'un processeur précédent, pour qu'un
+    /// remplacement **en cours de lecture** ne claque pas.
+    ///
+    /// Miroir de `EqProcessor::inherit_state_from`. Le terme croisé est bâti
+    /// sur les échantillons retardés : si la ligne repart à zéro, il chute
+    /// brutalement au silence pendant `delay_samples` échantillons — une
+    /// discontinuité, donc un clic. Et un curseur qu'on fait glisser en
+    /// produirait un par cran.
+    ///
+    /// Trois cas, du plus fréquent au plus rare :
+    ///
+    /// - **même retard** (on a bougé `amount`) : l'historique est transféré tel
+    ///   quel, le changement est inaudible hors du réglage voulu ;
+    /// - **retard raccourci** : on garde les échantillons les plus RÉCENTS, ce
+    ///   sont eux que la nouvelle ligne va relire en premier ;
+    /// - **retard allongé** : on ne possède pas l'histoire manquante. Les
+    ///   échantillons connus sont placés à la fin, le début reste à zéro. Le
+    ///   creux est inévitable — on ne l'invente pas — mais il est borné à la
+    ///   différence de longueur au lieu de valoir toute la ligne.
+    pub fn inherit_state_from(&mut self, previous: &CrossfeedProcessor) {
+        let (n_neuf, n_prec) = (self.delay_samples, previous.delay_samples);
+        if n_neuf == 0 || n_prec == 0 {
+            return; // Pas de ligne à retard d'un côté ou de l'autre.
+        }
+        if n_neuf == n_prec {
+            self.ring_l.clone_from(&previous.ring_l);
+            self.ring_r.clone_from(&previous.ring_r);
+            self.pos = previous.pos;
+            return;
+        }
+        // Rejouer l'historique du plus ancien au plus récent : dans l'anneau
+        // précédent le plus ancien est en `pos`, et on avance en bouclant.
+        let a_reprendre = n_neuf.min(n_prec);
+        // Départ = le plus récent moins `a_reprendre`, modulo la taille.
+        let debut = (previous.pos + n_prec - a_reprendre) % n_prec;
+        let decalage = n_neuf - a_reprendre; // 0 si on raccourcit
+        for i in 0..a_reprendre {
+            let src = (debut + i) % n_prec;
+            self.ring_l[decalage + i] = previous.ring_l[src];
+            self.ring_r[decalage + i] = previous.ring_r[src];
+        }
+        self.pos = 0;
+    }
+
     /// Crossfeed strength this processor was built with.
     pub fn amount(&self) -> f32 {
         self.amount
@@ -251,5 +295,89 @@ mod tests {
         cf.process_interleaved(&mut c2);
         // L_out = 0 + 0.5*(Rd - Ld) = 0.5*(1.0 - 0.0) = 0.5
         assert!((c2[0] - 0.5).abs() < 1e-6, "carried delay L {}", c2[0]);
+    }
+
+    /// Meme retard : l'historique doit etre transfere a l'identique, sinon le
+    /// terme croise chute au silence et un curseur qu'on glisse claque a chaque
+    /// cran (#1786).
+    #[test]
+    fn heritage_meme_retard_transfere_lhistorique() {
+        let mut prec = CrossfeedProcessor::new(48000, 0.3, 1.0);
+        let mut tampon: Vec<f32> = (0..200).map(|i| (i as f32) / 200.0).collect();
+        prec.process_interleaved(&mut tampon);
+
+        let mut neuf = CrossfeedProcessor::new(48000, 0.5, 1.0);
+        assert_eq!(neuf.delay_samples(), prec.delay_samples());
+        neuf.inherit_state_from(&prec);
+
+        assert_eq!(neuf.ring_l, prec.ring_l);
+        assert_eq!(neuf.ring_r, prec.ring_r);
+        assert_eq!(neuf.pos, prec.pos);
+    }
+
+    /// Retard raccourci : on garde les echantillons les plus RECENTS, ce sont
+    /// eux que la nouvelle ligne relira en premier.
+    #[test]
+    fn heritage_retard_raccourci_garde_les_plus_recents() {
+        let mut prec = CrossfeedProcessor::new(48000, 0.3, 1.0);
+        let mut tampon: Vec<f32> = (0..400).map(|i| (i as f32) / 400.0).collect();
+        prec.process_interleaved(&mut tampon);
+
+        let mut neuf = CrossfeedProcessor::new(48000, 0.3, 0.5);
+        assert!(neuf.delay_samples() < prec.delay_samples());
+        neuf.inherit_state_from(&prec);
+
+        // Aucun zero : la ligne courte est entierement remplie d'historique.
+        assert!(
+            neuf.ring_l.iter().all(|v| *v != 0.0),
+            "ligne partiellement vide"
+        );
+        assert_eq!(neuf.pos, 0);
+
+        // Et ce sont bien les plus recents. Le dernier echantillon ecrit par
+        // `prec` est en `pos - 1`, il doit se retrouver en fin de nouvelle ligne.
+        let dernier = prec.ring_l[(prec.pos + prec.delay_samples() - 1) % prec.delay_samples()];
+        assert_eq!(*neuf.ring_l.last().unwrap(), dernier);
+    }
+
+    /// Retard allonge : on ne possede pas l'histoire manquante, on ne l'invente
+    /// pas. Les echantillons connus vont a la FIN, le creux est borne a la
+    /// difference de longueur au lieu de valoir toute la ligne.
+    #[test]
+    fn heritage_retard_allonge_place_le_connu_a_la_fin() {
+        let mut prec = CrossfeedProcessor::new(48000, 0.3, 0.5);
+        let mut tampon: Vec<f32> = (0..400).map(|i| 0.1 + (i as f32) / 400.0).collect();
+        prec.process_interleaved(&mut tampon);
+
+        let mut neuf = CrossfeedProcessor::new(48000, 0.3, 1.0);
+        assert!(neuf.delay_samples() > prec.delay_samples());
+        neuf.inherit_state_from(&prec);
+
+        let connus = prec.delay_samples();
+        let creux = neuf.delay_samples() - connus;
+        assert!(
+            neuf.ring_l[..creux].iter().all(|v| *v == 0.0),
+            "le creux doit etre en tete"
+        );
+        assert!(
+            neuf.ring_l[creux..].iter().all(|v| *v != 0.0),
+            "le connu doit etre en fin"
+        );
+        assert_eq!(neuf.pos, 0);
+    }
+
+    /// Sans ligne a retard d'un cote ou de l'autre, il n'y a rien a heriter et
+    /// rien ne doit paniquer (division par zero, indexation hors bornes).
+    #[test]
+    fn heritage_sans_ligne_a_retard_ne_panique_pas() {
+        let prec = CrossfeedProcessor::new(48000, 0.3, 0.0);
+        let mut neuf = CrossfeedProcessor::new(48000, 0.3, 1.0);
+        neuf.inherit_state_from(&prec);
+        assert!(neuf.ring_l.iter().all(|v| *v == 0.0));
+
+        let prec2 = CrossfeedProcessor::new(48000, 0.3, 1.0);
+        let mut neuf2 = CrossfeedProcessor::new(48000, 0.3, 0.0);
+        neuf2.inherit_state_from(&prec2);
+        assert!(neuf2.ring_l.is_empty());
     }
 }

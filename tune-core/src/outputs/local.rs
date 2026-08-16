@@ -1052,6 +1052,32 @@ impl LocalOutput {
         *self.crossfeed.lock().unwrap() = cf;
     }
 
+    /// Remplacer le crossfeed **pendant** la lecture, en emportant les lignes à
+    /// retard pour que le changement s'entende sans claquer.
+    ///
+    /// Jumeau de [`Self::replace_eq_live`], et pour la même raison : la boucle
+    /// de lecture relit ce mutex à chaque paquet, donc en remplacer le contenu
+    /// suffit à changer le son en vol — mais une ligne à retard qui repart à
+    /// zéro fait chuter le terme croisé au silence, ce qui s'entend comme un
+    /// clic. Voir `CrossfeedProcessor::inherit_state_from`.
+    ///
+    /// Distinct de [`Self::set_crossfeed`] à dessein : au début d'une piste il
+    /// n'y a pas d'historique à conserver, et celui de la piste précédente
+    /// serait faux.
+    pub fn replace_crossfeed_live(
+        &self,
+        cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>,
+    ) {
+        let mut emplacement = self.crossfeed.lock().unwrap();
+        match (cf, emplacement.as_ref()) {
+            (Some(mut neuf), Some(precedent)) => {
+                neuf.inherit_state_from(precedent);
+                *emplacement = Some(neuf);
+            }
+            (suivant, _) => *emplacement = suivant,
+        }
+    }
+
     pub fn has_crossfeed(&self) -> bool {
         self.crossfeed.lock().unwrap().is_some()
     }
