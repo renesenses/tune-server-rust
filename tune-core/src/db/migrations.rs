@@ -2636,7 +2636,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 25, "latest PG migration must be 25");
+        assert_eq!(pg_latest_version(), 26, "latest PG migration must be 26");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
