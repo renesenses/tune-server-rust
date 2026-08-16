@@ -5102,7 +5102,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "axum",
  "bytes",
@@ -5121,7 +5121,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5135,7 +5135,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "ape-decoder",
  "argon2",
@@ -5205,7 +5205,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "async-trait",
  "axum",
@@ -5217,7 +5217,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "axum",
  "serde_json",
@@ -5230,7 +5230,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "async-trait",
  "axum",
@@ -5243,7 +5243,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "async-trait",
  "serde",
@@ -5252,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.80"
+version = "0.9.81"
 dependencies = [
  "argon2",
  "async-stream",
