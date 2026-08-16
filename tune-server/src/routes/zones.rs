@@ -429,6 +429,7 @@ async fn set_zone_dsp(
     // Same premium gate (Feature::DspEq) as the EQ path above. Ranges clamped:
     // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
+    let mut cf_applique_a_chaud = false;
     if let Some(cf_val) = body.get("crossfeed") {
         let enabled = cf_val
             .get("enabled")
@@ -455,6 +456,11 @@ async fn set_zone_dsp(
             &serde_json::to_string(&normalised).unwrap_or_default(),
         );
         crossfeed_saved = Some(normalised);
+        // Meme raison que pour l'egaliseur juste au-dessus : persister ne
+        // suffit pas. Sans ceci, activer le crossfeed ou deplacer `amount` /
+        // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
+        // (#1786).
+        cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
     }
 
     let preset_id = body["dsp_preset_id"].as_i64();
@@ -474,6 +480,8 @@ async fn set_zone_dsp(
         // client de dire « prendra effet a la piste suivante » au lieu de
         // laisser croire a un egaliseur muet.
         "eq_applied_live": eq_applique_a_chaud,
+        // Idem pour le crossfeed (#1786).
+        "crossfeed_applied_live": cf_applique_a_chaud,
     }))
     .into_response()
 }
