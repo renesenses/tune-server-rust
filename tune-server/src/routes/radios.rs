@@ -921,39 +921,110 @@ async fn create_playlist_from_favorites(
     // plancher approximatif (0.6), comme côté Qobuz.
     use tune_core::library::track_matcher::{MatchCandidate, find_best_match};
     let mut matched = 0i64;
+    // Rapport par favori, comme la cible streaming. Sans lui, un « 3 sur 12 »
+    // ne dit pas LESQUELS ont échoué ni pourquoi, et l'utilisateur ne peut ni
+    // corriger un tag ni signaler utilement.
+    let mut report: Vec<serde_json::Value> = Vec::with_capacity(favorites.len());
+    // Deux favoris capturés sur des stations différentes peuvent désigner la
+    // même piste locale : sans ce garde, elle entrait deux fois dans la
+    // playlist.
+    let mut already: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
     for (title, artist) in &favorites {
         let q = if artist.is_empty() {
             title.clone()
         } else {
             format!("{artist} {title}")
         };
-        if let Ok(results) = track_repo.search(&q, 10) {
-            let candidates: Vec<MatchCandidate> = results
-                .iter()
-                .filter(|t| t.id.is_some())
-                .map(|t| MatchCandidate {
-                    title: t.title.clone(),
-                    artist_name: t.artist_name.clone().unwrap_or_default(),
-                    album_title: t.album_title.clone().unwrap_or_default(),
-                    source_id: t.id.unwrap_or(0).to_string(),
-                    duration_ms: t.duration_ms,
-                    isrc: String::new(),
-                    score: 0.0,
-                    match_method: String::new(),
-                    confidence: String::new(),
-                })
-                .collect();
-            let best = find_best_match(title, artist, "", 0, &candidates)
-                .best_match
-                .filter(|m| m.score >= tune_core::streaming::matching::MATCH_APPROX_SCORE);
-            if let Some(m) = best {
-                if let Ok(id) = m.source_id.parse::<i64>() {
-                    repo.add_tracks(playlist_id, &[id], None).ok();
-                    matched += 1;
+        // ⚠ Le `if let Ok(...)` sans branche d'erreur a rendu #1235
+        // indiagnosticable pendant des semaines DU CÔTÉ STREAMING : trois modes
+        // d'échec — recherche en erreur, zéro résultat, score sous le seuil —
+        // produisaient tous le même silence. #1079 l'a instrumenté là-bas ; ce
+        // chemin-ci était resté aveugle.
+        let results = match track_repo.search(&q, 10) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(query = %q, error = %e, "radio_fav_local_search_failed");
+                report.push(json!({"title": title, "artist": artist, "status": "search_failed"}));
+                continue;
+            }
+        };
+        let n = results.len();
+        let candidates: Vec<MatchCandidate> = results
+            .iter()
+            .filter(|t| t.id.is_some())
+            .map(|t| MatchCandidate {
+                title: t.title.clone(),
+                artist_name: t.artist_name.clone().unwrap_or_default(),
+                album_title: t.album_title.clone().unwrap_or_default(),
+                source_id: t.id.unwrap_or(0).to_string(),
+                duration_ms: t.duration_ms,
+                isrc: String::new(),
+                score: 0.0,
+                match_method: String::new(),
+                confidence: String::new(),
+            })
+            .collect();
+        let outcome = find_best_match(title, artist, "", 0, &candidates).best_match;
+        let best = outcome
+            .as_ref()
+            .filter(|m| m.score >= tune_core::streaming::matching::MATCH_APPROX_SCORE);
+
+        let Some(m) = best else {
+            // Distinguer « rien trouvé » de « trouvé mais refusé au seuil » :
+            // le second désigne un tag à corriger, le premier une absence.
+            match outcome.as_ref() {
+                Some(top) => {
+                    tracing::warn!(query = %q, results = n, top = %top.title, score = top.score, "radio_fav_local_match_rejected");
+                    report.push(json!({
+                        "title": title, "artist": artist, "status": "rejected",
+                        "best_candidate": top.title, "score": top.score,
+                    }));
                 }
+                None => {
+                    tracing::info!(query = %q, results = n, "radio_fav_local_no_candidate");
+                    report.push(json!({"title": title, "artist": artist, "status": "not_found"}));
+                }
+            }
+            continue;
+        };
+
+        let Ok(id) = m.source_id.parse::<i64>() else {
+            report.push(json!({"title": title, "artist": artist, "status": "not_found"}));
+            continue;
+        };
+        if !already.insert(id) {
+            report.push(
+                json!({"title": title, "artist": artist, "status": "duplicate", "track_id": id}),
+            );
+            continue;
+        }
+        // `matched` ne s'incrémente QUE si l'ajout a réussi. Auparavant le
+        // compteur montait avant l'écriture : une playlist pouvait annoncer
+        // douze pistes et n'en contenir aucune.
+        match repo.add_tracks(playlist_id, &[id], None) {
+            Ok(_) => {
+                matched += 1;
+                tracing::info!(query = %q, results = n, track_id = id, score = m.score, "radio_fav_local_match_ok");
+                report.push(json!({
+                    "title": title, "artist": artist, "status": "matched",
+                    "track_id": id, "score": m.score,
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "radio_fav_local_add_failed");
+                already.remove(&id);
+                report.push(json!({"title": title, "artist": artist, "status": "add_failed"}));
             }
         }
     }
+
+    tracing::info!(
+        playlist_id,
+        favorites = favorites.len(),
+        matched,
+        "radio_fav_local_playlist_done"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -962,6 +1033,7 @@ async fn create_playlist_from_favorites(
             "name": name,
             "favorites_count": favorites.len(),
             "matched_tracks": matched,
+            "results": report,
         })),
     )
         .into_response())
