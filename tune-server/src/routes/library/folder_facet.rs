@@ -104,7 +104,10 @@ fn where_with_prefix(
     };
     all.push(SqlValue::Text(like_pattern.to_string()));
     let mut parts: Vec<String> = conds.to_vec();
-    parts.push(format!("t.file_path LIKE {like_ph}"));
+    parts.push(format!(
+        "t.file_path LIKE {like_ph}{}",
+        tune_core::db::track_repo::like_escape_clause(engine)
+    ));
     (parts.join(" AND "), all)
 }
 

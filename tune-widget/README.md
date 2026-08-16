@@ -33,6 +33,28 @@ signs with the Developer ID certificate, and — because the notarization
 secrets are set — notarizes and staples the DMG automatically, then publishes
 it as a GitHub release asset.
 
+## Stale web cache (#1704)
+
+The UI is a page rendered by the system web engine, which keeps a disk copy of
+what it loaded — **outside** the program folder on macOS, and on Windows inside
+the install folder under `tune-widget.exe.WebView2\` (WebView2's documented
+default when no `dataDirectory` is declared). Neither an uninstall nor a
+reinstall used to clear it, so a UI fix could stay invisible forever: nothing
+distinguished "the fix was not shipped" from "the fix is hidden by a cache".
+
+Two nets now:
+
+- **At startup**, `purge_webview_cache_on_version_change()` drops the HTTP
+  cache whenever the running version differs from the stamp in
+  `<config dir>/tune-widget/webview-cache-version`. Only the caches — the
+  neighbouring `Local Storage` holds the server address the user typed in.
+- **At uninstall**, `src-tauri/installer-hooks.nsh` clears the same caches, and
+  removes the whole profile plus `%APPDATA%\tune-widget` when the user ticks
+  *delete application data*.
+
+If you ever need to reproduce a user's stale UI, delete that stamp file rather
+than the cache: the next launch will purge it the same way theirs does.
+
 ## Global shortcuts
 
 `Cmd/Ctrl+Shift+Space` play/pause · `Right` next · `Left` prev ·
