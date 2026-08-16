@@ -2483,23 +2483,126 @@ async fn rename_zone(
 
 #[derive(Deserialize)]
 struct CreateGroup {
-    name: String,
+    /// Optional. The web client groups a *selection* of zones and has no name
+    /// to offer, so it never sent this field; when it was mandatory serde
+    /// rejected the whole body and axum answered a bare `422 Unprocessable
+    /// Entity` with no text at all — the unexplained code the tester saw
+    /// (#1702). Absent or blank, the group is named after its zones.
+    #[serde(default)]
+    name: Option<String>,
     zone_ids: Vec<i64>,
+    /// The zone the others follow. Sent by the web client; defaults to the
+    /// first zone of the selection.
+    #[serde(default)]
+    leader_id: Option<i64>,
+}
+
+/// Why a set of zones cannot form a group.
+///
+/// Kept separate from the HTTP layer so the rules can be unit-tested without a
+/// database, and so every refusal is forced to carry the words explaining it.
+#[derive(Debug, PartialEq)]
+enum GroupRefusal {
+    /// Fewer than two *distinct* zones.
+    NotEnoughZones,
+    /// A zone id that no longer exists (stale list on the client's side).
+    UnknownZone(i64),
+    /// Two zones bound to the same output. Tune creates one zone per
+    /// discovered output and duplicates do happen ("PC" and "Haut parleurs"
+    /// on one sound card, #1702): grouping them would send the same stream
+    /// twice to a single device. Both names travel with the refusal so the
+    /// message can say *which* zones clash.
+    SameOutput(String, String),
+}
+
+/// Check a grouping request against the zones that actually exist.
+///
+/// Returns the de-duplicated zone ids, in request order, when the group is
+/// legitimate.
+fn validate_group(zone_ids: &[i64], zones: &[Zone]) -> Result<Vec<i64>, GroupRefusal> {
+    let mut unique: Vec<i64> = Vec::new();
+    for &id in zone_ids {
+        if !unique.contains(&id) {
+            unique.push(id);
+        }
+    }
+    if unique.len() < 2 {
+        return Err(GroupRefusal::NotEnoughZones);
+    }
+
+    // (output device, name of the zone that claimed it first)
+    let mut claimed: Vec<(&str, &str)> = Vec::new();
+    for &id in &unique {
+        let zone = zones
+            .iter()
+            .find(|z| z.id == Some(id))
+            .ok_or(GroupRefusal::UnknownZone(id))?;
+        // A zone with no output device is an orphan, not a duplicate: several
+        // of them share "nothing", which is not the same output.
+        let Some(device) = zone.output_device_id.as_deref().filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        if let Some((_, first)) = claimed.iter().find(|(d, _)| *d == device) {
+            return Err(GroupRefusal::SameOutput(
+                (*first).to_string(),
+                zone.name.clone(),
+            ));
+        }
+        claimed.push((device, zone.name.as_str()));
+    }
+    Ok(unique)
+}
+
+/// Turn a refusal into the error envelope the web client understands:
+/// `error` is the machine code, `message` the sentence it displays.
+fn group_refusal_response(refusal: &GroupRefusal, lang: &str) -> axum::response::Response {
+    let (status, code, message) = match refusal {
+        GroupRefusal::NotEnoughZones => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "group_needs_two_zones",
+            crate::i18n::t(lang, "zonegroup.needsTwoZones"),
+        ),
+        GroupRefusal::UnknownZone(id) => (
+            StatusCode::NOT_FOUND,
+            "group_unknown_zone",
+            crate::i18n::t(lang, "zonegroup.unknownZone").replace("{id}", &id.to_string()),
+        ),
+        GroupRefusal::SameOutput(a, b) => (
+            StatusCode::CONFLICT,
+            "group_same_output",
+            crate::i18n::t(lang, "zonegroup.sameOutput")
+                .replace("{a}", a)
+                .replace("{b}", b),
+        ),
+    };
+    warn!(code, message = %message, "zone_group_refused");
+    (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
 
 async fn list_groups(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let groups: Vec<Value> = settings
+    let mut groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    // Groups stored before #1702 have no `group_id`. The web client keys its
+    // "dissolve" button on that field and was putting `undefined` in the URL,
+    // so an existing group could not be undone. Derive it from `id` on read.
+    for group in &mut groups {
+        if group.get("group_id").is_none()
+            && let Some(id) = group.get("id").and_then(|v| v.as_i64())
+        {
+            group["group_id"] = json!(id.to_string());
+        }
+    }
     Json(json!(groups))
 }
 
 async fn create_group(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateGroup>,
 ) -> Result<impl IntoResponse, AppError> {
     // Premium gate: Multiroom sync requires Premium
@@ -2512,6 +2615,34 @@ async fn create_group(
         return Ok(resp);
     }
 
+    let lang = crate::i18n::lang_from_header(&headers);
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default();
+    let zone_ids = match validate_group(&body.zone_ids, &zones) {
+        Ok(ids) => ids,
+        Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
+    };
+
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            zone_ids
+                .iter()
+                .filter_map(|id| zones.iter().find(|z| z.id == Some(*id)))
+                .map(|z| z.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        });
+    let leader_id = body
+        .leader_id
+        .filter(|id| zone_ids.contains(id))
+        .unwrap_or(zone_ids[0]);
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -2521,20 +2652,23 @@ async fn create_group(
         .unwrap_or_default();
 
     let id = groups.len() as i64 + 1;
-    groups.push(json!({
+    let group = json!({
         "id": id,
-        "name": body.name,
-        "zone_ids": body.zone_ids,
-    }));
+        "group_id": id.to_string(),
+        "name": name,
+        "leader_id": leader_id,
+        "zone_ids": zone_ids,
+    });
+    groups.push(group.clone());
 
     settings
         .set("zone_groups", &serde_json::to_string(&groups)?)
         .ok();
     state.event_bus.emit_typed(
         tune_core::event_types::EventType::GroupCreated,
-        json!({ "id": id, "name": body.name, "zone_ids": body.zone_ids }),
+        json!({ "id": id, "name": name, "zone_ids": zone_ids }),
     );
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
+    Ok((StatusCode::CREATED, Json(group)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -3611,5 +3745,139 @@ mod patch_zone_deserialize_tests {
     fn value_means_set_the_cap() {
         let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": 705600}"#).unwrap();
         assert_eq!(p.max_sample_rate, Some(Some(705_600)));
+    }
+}
+
+#[cfg(test)]
+mod zone_group_tests {
+    use super::{CreateGroup, GroupRefusal, validate_group};
+    use tune_core::db::zone_repo::Zone;
+
+    // #1702 (Bilou, fil 1392) — deux zones pointant sur la même sortie : le
+    // groupement répondait « 422 unprocessable entity », un code nu, sans
+    // phrase. Deux causes distinctes, testées séparément :
+    //   1. le client web n'envoie pas de `name`, et serde rejetait le corps
+    //      avant même d'atteindre le handler → 422 d'axum, sans texte ;
+    //   2. rien ne vérifiait la sortie partagée, donc aucun message ne
+    //      pouvait l'expliquer.
+
+    fn zone(id: i64, name: &str, device: Option<&str>) -> Zone {
+        Zone {
+            id: Some(id),
+            name: name.to_string(),
+            output_type: Some("local".into()),
+            output_device_id: device.map(str::to_string),
+            volume: 50,
+            muted: false,
+            online: true,
+            gapless_enabled: false,
+            group_id: None,
+            sync_delay_ms: 0,
+            last_position_ms: 0,
+            last_track_id: None,
+            last_track_source: None,
+            last_track_source_id: None,
+            max_sample_rate: None,
+            fixed_volume: false,
+            autoplay_enabled: false,
+        }
+    }
+
+    #[test]
+    fn payload_without_name_is_accepted() {
+        // Le corps exact qu'envoie le client web. Il échouait ici.
+        let body: CreateGroup =
+            serde_json::from_str(r#"{"leader_id": 1, "zone_ids": [1, 2]}"#).unwrap();
+        assert_eq!(body.zone_ids, vec![1, 2]);
+        assert_eq!(body.leader_id, Some(1));
+        assert_eq!(body.name, None);
+    }
+
+    #[test]
+    fn two_zones_on_the_same_output_are_refused_by_name() {
+        let zones = vec![
+            zone(1, "PC", Some("hw:0,0")),
+            zone(2, "Haut parleurs", Some("hw:0,0")),
+        ];
+        assert_eq!(
+            validate_group(&[1, 2], &zones),
+            Err(GroupRefusal::SameOutput(
+                "PC".into(),
+                "Haut parleurs".into()
+            )),
+            "le refus doit nommer les deux zones pour que le message soit lisible"
+        );
+    }
+
+    #[test]
+    fn two_zones_on_distinct_outputs_are_accepted() {
+        let zones = vec![
+            zone(1, "Salon", Some("hw:0,0")),
+            zone(2, "Cuisine", Some("hw:1,0")),
+        ];
+        assert_eq!(validate_group(&[1, 2], &zones), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn zones_without_an_output_are_not_duplicates_of_each_other() {
+        // Deux zones orphelines ne partagent pas « la même sortie » : elles
+        // n'en ont aucune. Les refuser ici afficherait un message faux.
+        let zones = vec![zone(1, "Salon", None), zone(2, "Cuisine", None)];
+        assert_eq!(validate_group(&[1, 2], &zones), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn the_same_zone_twice_is_not_a_group() {
+        let zones = vec![zone(1, "Salon", Some("hw:0,0"))];
+        assert_eq!(
+            validate_group(&[1, 1], &zones),
+            Err(GroupRefusal::NotEnoughZones)
+        );
+    }
+
+    #[test]
+    fn a_single_zone_is_not_a_group() {
+        let zones = vec![
+            zone(1, "Salon", Some("hw:0,0")),
+            zone(2, "Cuisine", Some("hw:1,0")),
+        ];
+        assert_eq!(
+            validate_group(&[1], &zones),
+            Err(GroupRefusal::NotEnoughZones)
+        );
+    }
+
+    #[test]
+    fn a_vanished_zone_is_named_in_the_refusal() {
+        let zones = vec![zone(1, "Salon", Some("hw:0,0"))];
+        assert_eq!(
+            validate_group(&[1, 7], &zones),
+            Err(GroupRefusal::UnknownZone(7))
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_collapsed_not_flagged_as_same_output() {
+        let zones = vec![
+            zone(1, "Salon", Some("hw:0,0")),
+            zone(2, "Cuisine", Some("hw:1,0")),
+        ];
+        assert_eq!(validate_group(&[1, 2, 1], &zones), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn every_refusal_has_a_french_sentence() {
+        for key in [
+            "zonegroup.needsTwoZones",
+            "zonegroup.unknownZone",
+            "zonegroup.sameOutput",
+        ] {
+            let msg = crate::i18n::t("fr", key);
+            assert_ne!(
+                msg, key,
+                "{key} n'a pas de traduction : le client afficherait la clé"
+            );
+            assert!(msg.len() > 20, "{key} doit expliquer, pas juste nommer");
+        }
     }
 }
