@@ -1970,9 +1970,44 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing"
                 );
 
+                // Chaine DSP de la zone : egaliseur, correction de piece,
+                // crossfeed.
+                //
+                // Ce chemin — flux compresse decode en bloc — ne l'appelait
+                // PAS. Les trois sites d'`apply_local_dsp` etaient tous sur le
+                // chemin PCM : sur un flux non-WAV, l'egaliseur, le convolveur
+                // et le crossfeed n'agissaient nulle part (#1725, quatrieme
+                // trou de la meme famille que #1216, #1168 et Diretta).
+                //
+                // AVANT l'adaptation de canaux et le reechantillonnage, et
+                // c'est deliberé : l'orchestrateur construit l'`EqProcessor`
+                // pour le couple (`media.sample_rate`, `media.channels`) —
+                // c'est-a-dire (`dec_sr`, `dec_ch`). Appliquer apres coup des
+                // biquads calcules pour 44,1 kHz a un flux ramene a 48 kHz
+                // deplacerait toutes les frequences de coupure.
+                let mut samples = decoded_samples;
+                //
+                // `dop = false` : le DoP voyage dans un conteneur PCM, donc un
+                // flux DoP arrive en WAV et prend l'autre chemin. Ici les
+                // echantillons sortent d'un decodeur (FLAC, MP3, AAC) sous
+                // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
+                // bruts, n'a rien a y examiner.
+                apply_local_dsp(
+                    &mut samples,
+                    &eq,
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    dec_ch,
+                    false,
+                );
+
+                // Memoriser le format pour un rebatissage d'EQ a chaud
+                // (#1725) : c'est le couple que la chaine DSP vient de voir.
+                current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
+
                 // Adapt channels and resample if needed (using rubato
                 // sinc resampler for high-quality rate conversion)
-                let mut samples = decoded_samples;
                 if dec_ch != output_ch {
                     samples = adapt_channels(&samples, dec_ch, output_ch);
                 }
@@ -5504,5 +5539,50 @@ mod format_courant_tests {
     fn une_sortie_neuve_n_annonce_aucun_format() {
         let sortie = LocalOutput::new("format-test".to_string());
         assert_eq!(sortie.current_format(), None);
+    }
+}
+
+#[cfg(test)]
+mod chemin_compresse_dsp_tests {
+    /// #1725 — le chemin compresse ne passait par AUCUN DSP.
+    ///
+    /// Les trois appels d'`apply_local_dsp` vivaient tous sur le chemin PCM.
+    /// Un flux non-WAV — FLAC, MP3, AAC decode en bloc — alimentait le tampon
+    /// sans egaliseur, sans correction de piece et sans crossfeed. Quatrieme
+    /// trou de la meme famille que #1216 (passthrough reseau), #1168
+    /// (navigateur) et Diretta (sortie pull) : un DSP annonce comme applique,
+    /// absent d'un chemin donne.
+    ///
+    /// Ce test lit le CONTENU du fichier : il verifie que la branche
+    /// compressee applique la chaine AVANT de reechantillonner. C'est un
+    /// controle grossier, mais il attrape la seule regression qui compte —
+    /// quelqu'un qui deplace ou supprime cet appel.
+    #[test]
+    fn la_branche_compressee_applique_le_dsp_avant_le_reechantillonnage() {
+        let source = include_str!("local.rs");
+        let branche = source
+            .split("local_audio_compressed_playing")
+            .nth(1)
+            .expect("branche compressee introuvable");
+        // On ne regarde que jusqu'au pre-remplissage du tampon.
+        let avant_tampon = branche
+            .split("Pre-fill the ring buffer")
+            .next()
+            .expect("pre-remplissage introuvable");
+
+        let pos_dsp = avant_tampon
+            .find("apply_local_dsp(")
+            .expect("le chemin compresse n'applique AUCUN DSP (#1725)");
+        let pos_resample = avant_tampon.find("rubato_resample_batch");
+
+        if let Some(pos_resample) = pos_resample {
+            assert!(
+                pos_dsp < pos_resample,
+                "le DSP doit s'appliquer AVANT le reechantillonnage : \
+                 l'EqProcessor est bati pour (media.sample_rate, media.channels), \
+                 donc pour dec_sr/dec_ch. L'appliquer apres deplacerait toutes \
+                 les frequences de coupure."
+            );
+        }
     }
 }
