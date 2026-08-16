@@ -273,6 +273,7 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
+        let skipped_by_ext = list_result.skipped_by_ext;
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -1110,6 +1111,12 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": scan_stats.failed_paths,
+            // Fichiers audio rencontrés mais dont Tune ne lit pas le format,
+            // comptés par extension ({"mpc": 280, "cue": 132}). Presque toujours
+            // vide ; quand il ne l'est pas, c'est la seule chose qui explique à
+            // l'utilisateur pourquoi des albums manquent, au lieu de le laisser
+            // chercher un bug de scanner (#1763).
+            "skipped_unsupported_by_ext": skipped_by_ext,
         });
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
