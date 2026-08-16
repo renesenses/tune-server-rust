@@ -453,7 +453,13 @@ pub fn persist_discovered_dlna(
     {
         return;
     }
-    devices.retain(|d| d.uuid != uuid);
+    // Une `LOCATION` = une description racine = UN appareil physique (UPnP).
+    // Un HEOS Denon/Marantz annonce sa racine et chacun de ses appareils
+    // embarques sous des `uuid:` differents mais a la MEME `LOCATION` : sans
+    // ce `d.location != location`, le magasin gagnait une entree par UDN —
+    // cinq lecteurs pour un seul ND8006, re-sondes huit fois chacun au
+    // demarrage (#1703).
+    devices.retain(|d| d.uuid != uuid && d.location != location);
     devices.push(DiscoveredDlnaDevice {
         uuid: uuid.to_string(),
         location: location.to_string(),
@@ -477,6 +483,21 @@ fn is_definitive_rejection(err: &str) -> bool {
     DEFINITIVE_MARKERS.iter().any(|m| err.contains(m))
 }
 
+/// Replie le magasin sur UNE entree par `LOCATION`, en gardant la premiere.
+///
+/// UPnP garantit qu'une `LOCATION` renvoie une seule description racine, donc
+/// un seul appareil physique : deux entrees qui la partagent sont le meme
+/// materiel vu par deux de ses UDN (racine, MediaRenderer, MediaServer,
+/// ACT-Denon… pour un HEOS Denon/Marantz). Fonction pure, pour que la regle
+/// soit testable sans reseau (#1703).
+fn dedup_dlna_by_location(devices: Vec<DiscoveredDlnaDevice>) -> Vec<DiscoveredDlnaDevice> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    devices
+        .into_iter()
+        .filter(|d| seen.insert(d.location.clone()))
+        .collect()
+}
+
 /// Retire un appareil du magasin des DLNA decouverts.
 fn forget_discovered_dlna(backend: &Arc<dyn DbBackend>, uuid: &str) {
     let mut devices = load_discovered_dlna(backend);
@@ -491,9 +512,24 @@ fn forget_discovered_dlna(backend: &Arc<dyn DbBackend>, uuid: &str) {
 /// [`reregister_manual_devices`]). Each runs in its own task with backoff so a
 /// briefly-unreachable device neither blocks the others nor delays boot.
 pub async fn reprobe_persisted_dlna_devices(state: &AppState) {
-    let devices = load_discovered_dlna(&state.backend);
-    if devices.is_empty() {
+    let stored = load_discovered_dlna(&state.backend);
+    if stored.is_empty() {
         return;
+    }
+    // Les magasins ecrits avant #1703 contiennent une entree par UDN : chez
+    // Jean Valjean, cinq pour un seul Marantz ND8006, toutes pointant sur
+    // `http://…:60006/upnp/desc/aios_device/aios_device.xml`. On les replie
+    // AVANT de sonder — sinon 5 x 8 tentatives = 80 sondages voues a l'echec
+    // a chaque demarrage — et on reecrit le magasin pour qu'il guerisse.
+    let stored_len = stored.len();
+    let devices = dedup_dlna_by_location(stored);
+    if devices.len() != stored_len {
+        info!(
+            before = stored_len,
+            after = devices.len(),
+            "discovered_dlna_collapsed_by_location"
+        );
+        save_discovered_dlna(&state.backend, &devices);
     }
     info!(count = devices.len(), "reprobing_discovered_dlna_devices");
     for dev in devices {
@@ -1229,5 +1265,104 @@ mod dlna_reprobe_tests {
         // a explicitement comprise.
         assert!(!is_definitive_rejection("boom"));
         assert!(!is_definitive_rejection(""));
+    }
+
+    // ── Un appareil physique = une LOCATION (#1703) ───────────────────────
+    //
+    // Journaux de Jean Valjean (0.9.71) : 86 lignes pour `host=192.168.1.11`,
+    // CINQ uuid distincts, tous a la meme URL de description
+    // `http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml`.
+    // C'est un HEOS Denon/Marantz : il annonce sa racine AiOS et chacun de
+    // ses appareils embarques (MediaRenderer, MediaServer, ACT-Denon…) sous
+    // un `uuid:` different mais derriere une seule description racine.
+
+    const AIOS_LOCATION: &str = "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml";
+
+    fn memory_backend() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // La table `settings` naît d'une migration : sans elle le magasin
+        // relit toujours vide et le test ne prouve rien.
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    #[test]
+    fn les_udn_freres_d_un_heos_ne_font_qu_une_entree() {
+        let backend = memory_backend();
+        // Les cinq UDN du ND8006, dans l'ordre ou SSDP les annonce. Trois
+        // partagent le suffixe `-0080-0006787c2e26` : meme materiel.
+        for uuid in [
+            "uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26",
+            "uuid:9ab0c001-f668-11de-9976-0080-0006787c2e26",
+            "uuid:9ab0c002-f668-11de-9976-0080-0006787c2e26",
+            "uuid:5f9ec1b3-ff59-19bb-8530-0006787c2e26",
+            "uuid:a2c8e5d1-0011-2233-4455-0006787c2e26",
+        ] {
+            persist_discovered_dlna(
+                &backend,
+                uuid,
+                AIOS_LOCATION,
+                "Marantz ND8006",
+                "192.168.1.11",
+                60006,
+            );
+        }
+
+        // Sans le correctif : cinq entrees, donc 5 x 8 = 80 sondages au
+        // demarrage suivant. Avec : une seule.
+        let stored = load_discovered_dlna(&backend);
+        assert_eq!(
+            stored.len(),
+            1,
+            "un seul appareil physique doit donner une seule entree, pas {} : {:?}",
+            stored.len(),
+            stored.iter().map(|d| &d.uuid).collect::<Vec<_>>()
+        );
+        assert_eq!(stored[0].location, AIOS_LOCATION);
+    }
+
+    #[test]
+    fn deux_lecteurs_distincts_gardent_chacun_leur_entree() {
+        // Le garde-fou a ne pas casser : deux LOCATION differentes sont deux
+        // appareils, meme derriere la meme adresse (ampli multi-zone, hote
+        // faisant tourner deux renderers).
+        let backend = memory_backend();
+        persist_discovered_dlna(
+            &backend,
+            "uuid:zone-1",
+            "http://192.168.1.11:8080/desc.xml",
+            "Ampli Zone 1",
+            "192.168.1.11",
+            8080,
+        );
+        persist_discovered_dlna(
+            &backend,
+            "uuid:zone-2",
+            "http://192.168.1.11:8081/desc.xml",
+            "Ampli Zone 2",
+            "192.168.1.11",
+            8081,
+        );
+        assert_eq!(load_discovered_dlna(&backend).len(), 2);
+    }
+
+    #[test]
+    fn un_magasin_deja_dedouble_se_replie_au_demarrage() {
+        // Les installations qui tournent deja ont les cinq entrees en base :
+        // le repli doit les guerir sans attendre le rejet definitif de #1647.
+        let stored: Vec<DiscoveredDlnaDevice> = (0..5)
+            .map(|i| DiscoveredDlnaDevice {
+                uuid: format!("uuid:aios-{i}"),
+                location: AIOS_LOCATION.to_string(),
+                name: "Marantz ND8006".into(),
+                host: "192.168.1.11".into(),
+                port: 60006,
+            })
+            .collect();
+        let collapsed = dedup_dlna_by_location(stored);
+        assert_eq!(collapsed.len(), 1);
+        // On garde la premiere entree, celle qui a ete decouverte en premier.
+        assert_eq!(collapsed[0].uuid, "uuid:aios-0");
     }
 }
