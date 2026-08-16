@@ -606,6 +606,21 @@ pub struct PlaybackOrchestrator {
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
     levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// Anti-rebond du redémarrage de flux déclenché par un changement
+    /// d'égaliseur sur un chemin NON local (#1710, lot 2).
+    ///
+    /// Deux états, deux rôles distincts :
+    /// - `eq_replay_gen` : numéro de la dernière demande par zone. Chaque
+    ///   demande incrémente, puis une tâche différée vérifie qu'elle est
+    ///   toujours la plus récente avant d'agir. Un curseur de 31 bandes
+    ///   qu'on fait glisser produit donc UN redémarrage, pas 31.
+    /// - `eq_replay_last` : quand la zone a réellement redémarré. Plancher
+    ///   dur, pour qu'une rafale espacée juste au-delà de l'anti-rebond ne
+    ///   hache pas la lecture malgré tout.
+    ///
+    /// Verrous std : accès très courts, jamais tenus à travers un await.
+    eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
+    eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
     /// Per-zone record of the last track pushed to a NETWORK renderer:
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
@@ -908,6 +923,8 @@ impl PlaybackOrchestrator {
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
         }
     }
@@ -6188,6 +6205,208 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Rejouer la piste en cours d'une zone **à sa position courante**, en
+    /// recréant le flux.
+    ///
+    /// Extrait tel quel de la branche `seek` (#1710, lot 1). Aucun changement
+    /// de comportement : le seek passe désormais par ici, et les mêmes
+    /// événements sont journalisés par l'appelant.
+    ///
+    /// Pourquoi cette manœuvre existe : une sortie locale ou OAAT consomme un
+    /// flux HTTP **séquentiel** (mpsc / chunké). On ne peut pas y chercher une
+    /// position par `Range` — sur un DSD servi en WAV chunké, une requête
+    /// `Range` brute atterrit au milieu d'un bloc DSD et joue du BRUIT BLANC
+    /// (Xavier). Il faut arrêter et rejouer depuis l'offset.
+    ///
+    /// Elle est extraite parce qu'elle ne sert pas qu'au seek : c'est la seule
+    /// voie connue pour faire prendre effet un changement d'égaliseur sur un
+    /// chemin transcodé ou navigateur, où le fichier est déjà écrit et déjà
+    /// téléchargé (#1710). `raison` sert à distinguer les appelants dans les
+    /// journaux — un redémarrage inattendu doit pouvoir être imputé.
+    ///
+    /// ⚠️ Coûteux et AUDIBLE : environ une seconde de silence. Tout appelant
+    /// déclenché par un geste répétable — un curseur qu'on fait glisser — doit
+    /// l'anti-rebondir lui-même, sinon il produit une coupure par cran.
+    ///
+    /// Rend `Err` si la zone n'a rien en lecture ou si la relecture échoue ;
+    /// la position est repositionnée dans les deux cas, pour que le poller ne
+    /// prenne pas un état `Stopped` pour une panne de lecture.
+    pub async fn replay_zone_at_position(
+        &self,
+        zone_id: i64,
+        position_ms: u64,
+        raison: &str,
+    ) -> Result<(), String> {
+        let state = self.playback.get_state(zone_id).await;
+        let Some(np) = state.now_playing.clone() else {
+            return Err("rien en lecture sur cette zone".into());
+        };
+        self.playback.seek(zone_id, position_ms as i64).await;
+
+        let output_device_id = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+
+        // Arrêter la sortie AVANT que play() n'en crée une autre : sans ça,
+        // l'ancien fil ASIO/WASAPI peut encore tenir la connexion HTTP quand la
+        // nouvelle session démarre — d'où un « request or response body error »
+        // intermittent. Les 300 ms lui laissent relâcher le périphérique.
+        if let Some(ref did) = output_device_id {
+            if did.starts_with("local:") || did.starts_with("oaat:") {
+                let arc = { self.outputs.lock().await.get(did.as_str()) };
+                if let Some(output) = arc {
+                    let _ = output.lock().await.stop().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+
+        let req = PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: np.track_id,
+            source: Some(np.source.clone()),
+            source_id: np.source_id.clone(),
+            title: Some(np.title.clone()),
+            artist_name: np.artist_name.clone(),
+            album_title: np.album_title.clone(),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(np.duration_ms),
+            seek_ms: Some(position_ms),
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+        };
+
+        let resultat = self.play_without_history(req).await;
+        // Repositionner DANS LES DEUX CAS : à la réussite pour que la grâce du
+        // poller parte d'après la relecture, à l'échec pour qu'il ne prenne pas
+        // l'état `Stopped` pour une panne.
+        self.playback.seek(zone_id, position_ms as i64).await;
+        match resultat {
+            Ok(_) => {
+                info!(zone_id, position_ms, raison, "zone_replayed_at_position");
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Faire prendre effet un changement d'égaliseur, PAR TOUS LES CHEMINS.
+    ///
+    /// Point d'entrée unique des routes qui écrivent `zone_{id}_eq_profile`.
+    /// Il existe parce que la règle « local d'abord, redémarrage sinon » ne
+    /// doit vivre qu'à un seul endroit : c'est sa duplication implicite entre
+    /// quatre routes qui avait produit #1725.
+    ///
+    /// - **sortie locale** : [`Self::refresh_zone_eq`] remplace l'`EqProcessor`
+    ///   derrière son mutex — immédiat, inaudible, aucune coupure ;
+    /// - **tout le reste** (DLNA, navigateur) : le fichier transcodé est déjà
+    ///   écrit et téléchargé, rien à remplacer. [`Self::schedule_eq_replay`]
+    ///   programme un redémarrage anti-rebondi (#1710).
+    ///
+    /// Rend `true` quand le réglage a atteint le son **immédiatement** — donc
+    /// uniquement sur le chemin local. Un redémarrage programmé rend `false` :
+    /// il n'a pas encore eu lieu, et une demande plus récente peut encore
+    /// l'annuler. L'interface continue donc d'annoncer « prendra effet à la
+    /// piste suivante », ce qui est vrai jusqu'à ce que le redémarrage advienne
+    /// — mieux vaut cela qu'une promesse que l'anti-rebond peut retirer.
+    pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        if self.refresh_zone_eq(zone_id).await {
+            return true;
+        }
+        // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
+        // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
+        // seule, et redémarrer un flux inexistant n'a aucun sens.
+        let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
+        if joue {
+            self.schedule_eq_replay(zone_id);
+        }
+        false
+    }
+
+    /// Délai d'anti-rebond avant de redémarrer un flux sur changement d'EQ.
+    ///
+    /// Assez long pour qu'un curseur qu'on fait glisser ne produise qu'un seul
+    /// redémarrage, assez court pour que le réglage s'entende dans la seconde.
+    const EQ_REPLAY_DEBOUNCE_MS: u64 = 500;
+    /// Plancher dur entre deux redémarrages d'une même zone.
+    ///
+    /// L'anti-rebond seul ne suffit pas : une rafale espacée de 600 ms le
+    /// franchirait à chaque fois et hacherait la lecture. Le redémarrage coûte
+    /// environ une seconde de silence — deux par cinq secondes est déjà
+    /// beaucoup.
+    const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
+
+    /// Faire prendre effet un changement d'égaliseur sur un chemin **non
+    /// local**, en redémarrant le flux à la position courante (#1710, lot 2).
+    ///
+    /// Sur une sortie locale, `refresh_zone_eq` suffit : l'`EqProcessor` vit
+    /// derrière un mutex relu à chaque paquet. Ailleurs — DLNA, navigateur — le
+    /// fichier transcodé est déjà écrit, déjà en cours de téléchargement,
+    /// souvent déjà en cache. Rien à remplacer : il faut re-résoudre.
+    ///
+    /// **Anti-rebondi et planchéié**, parce que la manœuvre est audible. Sans
+    /// ça, un curseur de 31 bandes produirait 31 coupures d'une seconde — un
+    /// remède pire que le mal. Voir [`Self::replay_zone_at_position`].
+    ///
+    /// Rend immédiatement : le redémarrage est différé dans une tâche. La
+    /// valeur dit si un redémarrage a été **programmé**, pas s'il a eu lieu —
+    /// une demande plus récente peut encore l'annuler.
+    pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        let generation = {
+            let mut gens = self.eq_replay_gen.lock().unwrap();
+            let g = gens.entry(zone_id).or_insert(0);
+            *g += 1;
+            *g
+        };
+        let moi = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                Self::EQ_REPLAY_DEBOUNCE_MS,
+            ))
+            .await;
+            // Une demande plus récente est arrivée pendant l'attente : c'est
+            // elle qui redémarrera, pas nous.
+            {
+                let gens = moi.eq_replay_gen.lock().unwrap();
+                if gens.get(&zone_id).copied() != Some(generation) {
+                    return;
+                }
+            }
+            // Plancher : trop tôt après le précédent, on renonce plutôt que de
+            // hacher. Le réglage prendra effet à la piste suivante, ce que le
+            // client sait déjà dire (`applied_live: false`).
+            {
+                let derniers = moi.eq_replay_last.lock().unwrap();
+                if let Some(t) = derniers.get(&zone_id) {
+                    if t.elapsed().as_millis() < Self::EQ_REPLAY_FLOOR_MS as u128 {
+                        info!(zone_id, "eq_replay_skipped_floor");
+                        return;
+                    }
+                }
+            }
+            let position_ms = moi.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+            match moi
+                .replay_zone_at_position(zone_id, position_ms, "eq_change")
+                .await
+            {
+                Ok(()) => {
+                    moi.eq_replay_last
+                        .lock()
+                        .unwrap()
+                        .insert(zone_id, std::time::Instant::now());
+                    info!(zone_id, position_ms, "eq_replay_done");
+                }
+                Err(e) => warn!(zone_id, error = %e, "eq_replay_failed"),
+            }
+        });
+        true
+    }
+
     /// Réappliquer le crossfeed d'une zone à la sortie locale qui joue, sans
     /// attendre la piste suivante.
     ///
@@ -7033,67 +7252,17 @@ impl PlaybackOrchestrator {
 
                 if (is_local_output || is_oaat_output) && has_track {
                     info!(zone_id, position_ms, "seek_local_output_recreating_stream");
-                    self.playback.seek(zone_id, position_ms as i64).await;
-
-                    // Stop the current output FIRST so the old ASIO/WASAPI
-                    // thread releases the device before play() creates a new
-                    // stream. Without this, the old thread may still hold the
-                    // HTTP connection when the new session starts, causing a
-                    // "request or response body error" race condition.
-                    if let Some(ref did) = state.now_playing.as_ref().and_then(|_| {
-                        ZoneRepo::with_backend(self.db.clone())
-                            .get(zone_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|z| z.output_device_id)
-                    }) {
-                        if did.starts_with("local:") || did.starts_with("oaat:") {
-                            let arc = { self.outputs.lock().await.get(did.as_str()) };
-                            if let Some(output) = arc {
-                                let _ = output.lock().await.stop().await;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        }
-                    }
-
-                    let np = state.now_playing.as_ref().unwrap();
-                    let output_device_id = ZoneRepo::with_backend(self.db.clone())
-                        .get(zone_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|z| z.output_device_id);
-                    let req = PlayRequest {
-                        zone_id,
-                        output_device_id,
-                        track_id: np.track_id,
-                        source: Some(np.source.clone()),
-                        source_id: np.source_id.clone(),
-                        title: Some(np.title.clone()),
-                        artist_name: np.artist_name.clone(),
-                        album_title: np.album_title.clone(),
-                        cover_url: np.cover_path.clone(),
-                        duration_ms: Some(np.duration_ms),
-                        seek_ms: Some(position_ms),
-                        temp_file_path: None,
-                        sample_rate: None,
-                        bit_depth: None,
-                        media_format: None,
-                    };
-
-                    match self.play_without_history(req).await {
-                        Ok(_) => {
-                            self.playback.seek(zone_id, position_ms as i64).await;
-                            info!(
-                                zone_id,
-                                position_ms,
-                                seek_ms = seek_start.elapsed().as_millis() as u64,
-                                "seek_local_output_complete"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(zone_id, error = %e, "seek_local_output_play_failed");
-                            self.playback.seek(zone_id, position_ms as i64).await;
-                        }
+                    match self
+                        .replay_zone_at_position(zone_id, position_ms, "seek")
+                        .await
+                    {
+                        Ok(()) => info!(
+                            zone_id,
+                            position_ms,
+                            seek_ms = seek_start.elapsed().as_millis() as u64,
+                            "seek_local_output_complete"
+                        ),
+                        Err(e) => warn!(zone_id, error = %e, "seek_local_output_play_failed"),
                     }
                 } else {
                     let arc = { self.outputs.lock().await.get(did) };

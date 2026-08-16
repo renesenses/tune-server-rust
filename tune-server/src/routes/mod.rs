@@ -564,8 +564,14 @@ mod eq_refresh_guard {
     /// `zone_*_eq_profile` a coûté quatre omissions (#1725), `zone_*_crossfeed`
     /// une de plus (#1786). Toute nouvelle clé de ce type doit rejoindre cette
     /// table AVANT sa première route d'écriture, pas après le signalement.
+    ///
+    /// L'égaliseur exige `apply_eq_change` et non `refresh_zone_eq` depuis
+    /// #1710 : le premier couvre AUSSI les chemins non locaux, en programmant
+    /// un redémarrage de flux. Une route qui n'appellerait que le second
+    /// laisserait les zones DLNA et navigateur muettes jusqu'à la piste
+    /// suivante — le défaut d'origine, à moitié réparé.
     const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
-        ("_eq_profile", "refresh_zone_eq"),
+        ("_eq_profile", "apply_eq_change"),
         ("_crossfeed", "refresh_zone_crossfeed"),
     ];
 
