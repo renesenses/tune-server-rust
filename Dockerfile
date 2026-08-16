@@ -1,3 +1,20 @@
+# ── Stage 0: Web client ──────────────────────────────────────────────
+# Le client web n'est PAS dans ce dépôt (#1690) : il vit dans
+# renesenses/tune-web-client et part en asset de release. On le construit ici,
+# comme le fait .github/workflows/docker.yml pour l'image publiée — c'est la
+# seule façon d'obtenir une image de dev dont l'interface correspond au code
+# serveur qu'elle embarque. Branche `main` : c'est celle qui livre côté web
+# (l'inverse du serveur, cf. CLAUDE.md).
+FROM node:22-bookworm-slim AS web
+ARG WEB_CLIENT_REF=main
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /web
+RUN git clone --depth 1 -b "$WEB_CLIENT_REF" \
+      https://github.com/renesenses/tune-web-client.git . && \
+    npm ci && npm run build
+
 # ── Stage 1: Builder ─────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
 
@@ -66,7 +83,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/tune-server /app/tune-server
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
 COPY --from=builder /usr/local/cargo/bin/airplay-daemon /usr/local/bin/airplay-daemon
-COPY web/ /app/web/
+COPY --from=web /web/dist/ /app/web/
 
 # Ensure tune user can read the app but not write
 RUN chown -R root:root /app && chmod -R 755 /app
