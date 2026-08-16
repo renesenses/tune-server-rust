@@ -557,14 +557,24 @@ mod eq_refresh_guard {
     use std::fs;
     use std::path::Path;
 
-    /// Fichiers qui mentionnent la clé sans jamais l'écrire. Vide aujourd'hui.
+    /// Fichiers qui mentionnent une clé sans jamais l'écrire. Vide aujourd'hui.
     const LECTURE_SEULE: &[&str] = &[];
 
+    /// Les réglages DSP par zone qui n'atteignent le son que si quelqu'un
+    /// rafraîchit la sortie vivante, et la méthode qui le fait.
+    ///
+    /// `zone_*_eq_profile` a coûté quatre omissions (#1725), `zone_*_crossfeed`
+    /// une de plus (#1786). Toute nouvelle clé de ce type doit rejoindre cette
+    /// table AVANT sa première route d'écriture, pas après le signalement.
+    const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
+        ("_eq_profile", "refresh_zone_eq"),
+        ("_crossfeed", "refresh_zone_crossfeed"),
+    ];
+
     #[test]
-    fn every_route_writing_the_eq_profile_refreshes_the_live_output() {
+    fn every_route_writing_a_dsp_setting_refreshes_the_live_output() {
         let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
-        let mut fautifs = Vec::new();
-        let mut vus = 0usize;
+        let mut sources: Vec<(String, String)> = Vec::new();
 
         let mut piles = vec![racine.clone()];
         while let Some(dir) = piles.pop() {
@@ -582,35 +592,38 @@ mod eq_refresh_guard {
                     .and_then(|n| n.to_str())
                     .unwrap_or_default()
                     .to_string();
-                let source = fs::read_to_string(&chemin).expect("lecture du fichier");
-                if !source.contains("_eq_profile") {
-                    continue;
-                }
-                vus += 1;
-                if LECTURE_SEULE.contains(&nom.as_str()) {
-                    continue;
-                }
-                if !source.contains("refresh_zone_eq") {
-                    fautifs.push(nom);
-                }
+                sources.push((
+                    nom,
+                    fs::read_to_string(&chemin).expect("lecture du fichier"),
+                ));
             }
         }
 
-        assert!(
-            vus >= 4,
-            "le garde-fou n'a trouvé que {vus} fichier(s) touchant `zone_*_eq_profile` — \
-             la clé a probablement été renommée, et ce test ne garde plus rien"
-        );
-        assert!(
-            fautifs.is_empty(),
-            "ces routes écrivent `zone_*_eq_profile` sans appeler \
-             `Orchestrator::refresh_zone_eq` : {fautifs:?}\n\
-             Sans lui, le réglage n'atteint le son qu'à la piste SUIVANTE sur une \
-             zone locale, alors que la réponse annonce un succès (#1725).\n\
-             Ajouter, après le `settings.set(...)` :\n    \
-             let applique = state.orchestrator.refresh_zone_eq(zone_id).await;\n\
-             puis exposer `applied_live` dans la réponse. Si le fichier ne fait que \
-             LIRE la clé, l'inscrire dans `LECTURE_SEULE` avec sa raison."
-        );
+        for (cle, rafraichisseur) in REGLAGES_A_RAFRAICHIR {
+            let concernes: Vec<&(String, String)> =
+                sources.iter().filter(|(_, s)| s.contains(cle)).collect();
+            assert!(
+                !concernes.is_empty(),
+                "le garde-fou ne trouve aucun fichier touchant `zone_*{cle}` — \
+                 la clé a probablement été renommée, et ce test ne garde plus rien"
+            );
+            let fautifs: Vec<&str> = concernes
+                .iter()
+                .filter(|(nom, _)| !LECTURE_SEULE.contains(&nom.as_str()))
+                .filter(|(_, s)| !s.contains(rafraichisseur))
+                .map(|(nom, _)| nom.as_str())
+                .collect();
+            assert!(
+                fautifs.is_empty(),
+                "ces routes écrivent `zone_*{cle}` sans appeler \
+                 `Orchestrator::{rafraichisseur}` : {fautifs:?}\n\
+                 Sans lui, le réglage n'atteint le son qu'à la piste SUIVANTE sur une \
+                 zone locale, alors que la réponse annonce un succès (#1725, #1786).\n\
+                 Ajouter, après le `settings.set(...)` :\n    \
+                 let applique = state.orchestrator.{rafraichisseur}(zone_id).await;\n\
+                 puis exposer `applied_live` dans la réponse. Si le fichier ne fait que \
+                 LIRE la clé, l'inscrire dans `LECTURE_SEULE` avec sa raison."
+            );
+        }
     }
 }

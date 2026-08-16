@@ -8,6 +8,7 @@ use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for zone_repo.
 pub mod sql {
+    use super::Engine;
     use super::SqlDialect;
 
     // NOTE: autoplay_enabled intentionally omitted from COLS.
@@ -53,6 +54,92 @@ pub mod sql {
     /// output_device_id. Returns the DELETE statement.
     pub fn deduplicate() -> &'static str {
         "DELETE FROM zones WHERE id NOT IN (SELECT MIN(id) FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id) AND output_device_id IS NOT NULL AND output_device_id IN (SELECT output_device_id FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id HAVING COUNT(*) > 1)"
+    }
+
+    /// Colonnes reportees d'un doublon vers la zone conservee, avec la valeur
+    /// qui compte pour « pas encore regle ».
+    ///
+    /// Le defaut declare ici est celui du schema. Il sert deux fois : a savoir
+    /// si la survivante est vierge, et a savoir si le doublon apporte vraiment
+    /// quelque chose. Voir `ZoneRepo::merge_duplicate_settings` pour la regle
+    /// et pour l'absence deliberee de `gapless_enabled`.
+    const REGLAGES_A_FUSIONNER: &[(&str, &str)] = &[
+        // Drapeaux : defaut 0, donc seul un 1 se reporte.
+        ("fixed_volume", "0"),
+        ("alac_passthrough", "0"),
+        ("autoplay_enabled", "0"),
+        ("dlna_lpcm", "0"),
+        ("dlna_wav24", "0"),
+        ("dlna_cap_16bit", "0"),
+        ("dlna_native_flac", "0"),
+        // Delais et decalages : defaut 0, toute autre valeur est un reglage.
+        ("dlna_play_delay_ms", "0"),
+        ("sync_delay_ms", "0"),
+        ("lyrics_offset_ms", "0"),
+    ];
+
+    /// Colonnes dont le defaut est NULL : marque, modele, plafond de frequence.
+    const REGLAGES_NULLABLES: &[&str] = &["brand", "model", "max_sample_rate"];
+
+    /// Instructions de fusion, dans l'ordre. Chacune ne touche QUE les zones
+    /// conservees d'un groupe en doublon, et seulement quand elles sont restees
+    /// au defaut — un reglage explicite n'est jamais ecrase.
+    pub fn merge_duplicate_settings(_engine: Engine) -> Vec<String> {
+        let survivantes = "SELECT MIN(id) FROM zones \
+             WHERE output_device_id IS NOT NULL \
+             GROUP BY output_device_id HAVING COUNT(*) > 1";
+        let mut sorties = Vec::new();
+
+        for (colonne, defaut) in REGLAGES_A_FUSIONNER {
+            sorties.push(format!(
+                "UPDATE zones SET {colonne} = ( \
+                    SELECT MAX(d.{colonne}) FROM zones d \
+                    WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
+                 ) \
+                 WHERE id IN ({survivantes}) \
+                   AND COALESCE({colonne}, {defaut}) = {defaut} \
+                   AND EXISTS ( \
+                    SELECT 1 FROM zones d \
+                    WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
+                      AND COALESCE(d.{colonne}, {defaut}) <> {defaut} \
+                   )"
+            ));
+        }
+
+        for colonne in REGLAGES_NULLABLES {
+            sorties.push(format!(
+                "UPDATE zones SET {colonne} = ( \
+                    SELECT MAX(d.{colonne}) FROM zones d \
+                    WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
+                      AND d.{colonne} IS NOT NULL \
+                 ) \
+                 WHERE id IN ({survivantes}) \
+                   AND {colonne} IS NULL \
+                   AND EXISTS ( \
+                    SELECT 1 FROM zones d \
+                    WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
+                      AND d.{colonne} IS NOT NULL \
+                   )"
+            ));
+        }
+
+        // `dsd_mode` a pour defaut la chaine 'auto', pas 0 ni NULL.
+        sorties.push(format!(
+            "UPDATE zones SET dsd_mode = ( \
+                SELECT MAX(d.dsd_mode) FROM zones d \
+                WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
+                  AND d.dsd_mode IS NOT NULL AND d.dsd_mode <> 'auto' \
+             ) \
+             WHERE id IN ({survivantes}) \
+               AND COALESCE(dsd_mode, 'auto') = 'auto' \
+               AND EXISTS ( \
+                SELECT 1 FROM zones d \
+                WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
+                  AND COALESCE(d.dsd_mode, 'auto') <> 'auto' \
+               )"
+        ));
+
+        sorties
     }
 
     pub fn update_field<D: SqlDialect>(d: &D, field: &str) -> String {
@@ -346,8 +433,52 @@ impl ZoneRepo {
 
     /// Remove duplicate zones that share the same output_device_id, keeping only
     /// the one with the lowest id. Returns the number of duplicates removed.
+    ///
+    /// Les reglages des doublons sont REPORTES sur la survivante avant la
+    /// suppression : voir [`Self::merge_duplicate_settings`]. Sans cela, la
+    /// survivante etant choisie par son anciennete et non par ce qu'elle porte,
+    /// une zone reglee par l'utilisateur pouvait etre effacee au demarrage avec
+    /// tous ses reglages avances (#1774, Yves — « les parametres coches n'ont
+    /// pas ete sauvegardes »).
     pub fn deduplicate(&self) -> Result<usize, String> {
+        self.merge_duplicate_settings()?;
         self.db.execute(sql::deduplicate(), &[])
+    }
+
+    /// Reporter sur la zone conservee les reglages non par defaut de ses
+    /// doublons, avant que [`Self::deduplicate`] ne les supprime.
+    ///
+    /// La survivante est `MIN(id)` — la plus ANCIENNE. Rien ne garantit que ce
+    /// soit celle que l'utilisateur a reglee : c'est meme le contraire quand un
+    /// appareil a change d'identite et qu'une seconde zone est apparue, plus
+    /// recente, devenue celle que l'interface montre. Le demarrage suivant
+    /// supprimait alors la ligne configuree, en silence.
+    ///
+    /// La regle est la meme pour toutes les colonnes : **si la survivante est
+    /// restee au defaut et qu'un doublon porte autre chose, on prend celle du
+    /// doublon.** Un reglage explicite ne doit jamais ceder a une valeur que
+    /// personne n'a choisie. Quand plusieurs doublons different, `MAX` tranche
+    /// de facon deterministe — le cas ne se pose en pratique que si l'appareil
+    /// a produit trois zones et qu'au moins deux ont ete reglees.
+    ///
+    /// `gapless_enabled` est volontairement ABSENT : son defaut vaut 1, donc
+    /// « non par defaut » y signifie 0, et la meme regle l'ecraserait dans le
+    /// mauvais sens. Le traiter demande de distinguer « jamais touche » de
+    /// « desactive exprès », ce que le schema ne permet pas aujourd'hui.
+    pub fn merge_duplicate_settings(&self) -> Result<(), String> {
+        for instruction in sql::merge_duplicate_settings(self.db.engine()) {
+            match self.db.execute(&instruction, &[]) {
+                Ok(_) => {}
+                // Une base ancienne peut ne pas avoir toutes ces colonnes. On
+                // ne fait pas echouer le demarrage pour autant, mais on le DIT
+                // — contrairement au silence qui a rendu ce defaut invisible.
+                Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                    tracing::warn!(error = %e, "zone_merge_column_missing_skipped");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
@@ -1640,5 +1771,110 @@ mod tests {
 
         assert!(repo.list().unwrap().iter().all(|z| z.name != "Salon"));
         assert!(repo.is_device_hidden("bluos-192.168.1.77-11000"));
+    }
+}
+
+#[cfg(test)]
+mod fusion_doublons_tests {
+    use super::*;
+
+    fn repo() -> ZoneRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // `CORE_SCHEMA` ne porte PAS les colonnes de reglage avance : elles
+        // arrivent par migration. Sans cet appel, `update_dlna_lpcm` echoue sur
+        // « no such column », avale l'erreur, renvoie Ok(()) — et le test
+        // mesure un schema incomplet en croyant mesurer la fusion.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        ZoneRepo::new(db)
+    }
+
+    fn delai_synchro(repo: &ZoneRepo, id: i64) -> i32 {
+        repo.get(id).unwrap().unwrap().sync_delay_ms
+    }
+
+    /// #1774 — Yves : « les parametres coches n'ont pas ete sauvegardes ».
+    ///
+    /// La deduplication garde `MIN(id)`, la zone la PLUS ANCIENNE, sans jamais
+    /// regarder laquelle porte une configuration. Quand l'utilisateur a regle
+    /// la zone que l'interface lui montrait — pas forcement la plus ancienne —
+    /// le demarrage suivant la supprimait avec ses reglages.
+    ///
+    /// Ce test ECHOUE contre le code d'avant : les drapeaux revenaient a 0.
+    #[test]
+    fn les_reglages_du_doublon_survivent_a_la_deduplication() {
+        let repo = repo();
+        let ancienne = repo
+            .create("DarTZeel", Some("dlna"), Some("uuid:lhc208"))
+            .unwrap();
+        let reglee = repo
+            .create("DarTZeel", Some("dlna"), Some("uuid:lhc208"))
+            .unwrap();
+
+        // L'utilisateur configure la zone que l'interface lui montre.
+        repo.update_dlna_lpcm(reglee, true).unwrap();
+        repo.update_dlna_cap_16bit(reglee, true).unwrap();
+        repo.update_sync_delay(reglee, 120).unwrap();
+
+        assert_eq!(repo.deduplicate().unwrap(), 1);
+
+        // La survivante est bien la plus ancienne...
+        let restantes = repo.list().unwrap();
+        assert_eq!(restantes.len(), 1);
+        assert_eq!(restantes[0].id, Some(ancienne));
+
+        // ...mais elle porte desormais les reglages de celle qui a disparu.
+        assert!(
+            repo.get_dlna_lpcm(ancienne),
+            "le reglage LPCM a ete efface avec le doublon"
+        );
+        assert!(
+            repo.get_dlna_cap_16bit(ancienne),
+            "le plafond 16 bits a ete efface avec le doublon"
+        );
+        assert_eq!(
+            delai_synchro(&repo, ancienne),
+            120,
+            "le delai de synchro a ete efface avec le doublon"
+        );
+    }
+
+    /// Un reglage explicite de la survivante ne cede jamais a celui d'un
+    /// doublon : la fusion comble un vide, elle n'arbitre pas.
+    #[test]
+    fn un_reglage_deja_pose_sur_la_survivante_n_est_pas_ecrase() {
+        let repo = repo();
+        let survivante = repo
+            .create("Ampli", Some("dlna"), Some("uuid:ampli"))
+            .unwrap();
+        let doublon = repo
+            .create("Ampli", Some("dlna"), Some("uuid:ampli"))
+            .unwrap();
+
+        repo.update_sync_delay(survivante, 40).unwrap();
+        repo.update_sync_delay(doublon, 250).unwrap();
+
+        repo.deduplicate().unwrap();
+
+        assert_eq!(
+            delai_synchro(&repo, survivante),
+            40,
+            "la valeur choisie sur la zone conservee doit primer"
+        );
+    }
+
+    /// Une zone sans doublon n'est jamais touchee par la fusion.
+    #[test]
+    fn une_zone_seule_n_est_pas_modifiee() {
+        let repo = repo();
+        let seule = repo
+            .create("Salon", Some("dlna"), Some("uuid:salon"))
+            .unwrap();
+        repo.update_dlna_lpcm(seule, true).unwrap();
+
+        repo.deduplicate().unwrap();
+
+        assert!(repo.get_dlna_lpcm(seule));
+        assert_eq!(repo.count().unwrap(), 1);
     }
 }

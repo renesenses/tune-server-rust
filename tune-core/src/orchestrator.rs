@@ -6188,6 +6188,70 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Réappliquer le crossfeed d'une zone à la sortie locale qui joue, sans
+    /// attendre la piste suivante.
+    ///
+    /// Jumeau de [`Self::refresh_zone_eq`], pour le même défaut : `set_crossfeed`
+    /// n'était appelé qu'au démarrage d'une piste (`orchestrator.rs`, chemin de
+    /// lecture), si bien qu'activer le crossfeed ou déplacer `amount` /
+    /// `delay_ms` en écoutant persistait la configuration, renvoyait un succès,
+    /// et ne changeait rien avant la piste suivante (#1786).
+    ///
+    /// Renvoie `true` si un crossfeed a été poussé vers une sortie vivante.
+    /// `false` couvre tout le reste — zone sans sortie locale, rien en lecture,
+    /// crossfeed désactivé, mode PURE (où `load_crossfeed_processor` rend `None`,
+    /// donc la promesse bit-perfect tient sans garde supplémentaire).
+    pub async fn refresh_zone_crossfeed(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            // Pas de flux en cours : la prochaine lecture rebâtira le crossfeed
+            // de toute façon, et le bâtir pour un taux inconnu donnerait une
+            // ligne à retard de la mauvaise longueur.
+            let Some((taux, _canaux)) = local_output.current_format() else {
+                return false;
+            };
+            let cf = self.load_crossfeed_processor(zone_id, taux);
+            let actif = cf.is_some();
+            // `replace_crossfeed_live` et non `set_crossfeed` : la piste est en
+            // cours, donc les lignes à retard doivent survivre au remplacement.
+            local_output.replace_crossfeed_live(cf);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                sample_rate = taux,
+                actif,
+                "zone_crossfeed_refreshed_live"
+            );
+            actif
+        }
+    }
+
     fn zone_has_active_eq(&self, zone_id: i64) -> bool {
         // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
         // gains, not the rate.

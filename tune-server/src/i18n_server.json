@@ -1546,5 +1546,41 @@
     "ko": "「User token」을 복사해 여기에 붙여넣으세요.",
     "ro": "Copiază «User token» și lipește-l aici.",
     "sv": "Kopiera ”User token” och klistra in den här."
+  },
+  "zonegroup.needsTwoZones": {
+    "fr": "Il faut au moins deux zones différentes pour créer un groupe.",
+    "en": "A group needs at least two different zones.",
+    "de": "Für eine Gruppe sind mindestens zwei verschiedene Zonen erforderlich.",
+    "es": "Un grupo necesita al menos dos zonas diferentes.",
+    "it": "Per creare un gruppo servono almeno due zone diverse.",
+    "zh": "创建编组至少需要两个不同的区域。",
+    "ja": "グループを作成するには、異なるゾーンが少なくとも 2 つ必要です。",
+    "ko": "그룹을 만들려면 서로 다른 영역이 두 개 이상 필요합니다.",
+    "ro": "Un grup are nevoie de cel puțin două zone diferite.",
+    "sv": "En grupp kräver minst två olika zoner."
+  },
+  "zonegroup.unknownZone": {
+    "fr": "La zone n° {id} n'existe plus. Rafraîchissez la liste des zones.",
+    "en": "Zone #{id} no longer exists. Refresh the zone list.",
+    "de": "Zone Nr. {id} existiert nicht mehr. Aktualisieren Sie die Zonenliste.",
+    "es": "La zona n.º {id} ya no existe. Actualice la lista de zonas.",
+    "it": "La zona n. {id} non esiste più. Aggiorna l'elenco delle zone.",
+    "zh": "区域 {id} 已不存在。请刷新区域列表。",
+    "ja": "ゾーン番号 {id} は存在しません。ゾーン一覧を更新してください。",
+    "ko": "{id}번 영역이 더 이상 존재하지 않습니다. 영역 목록을 새로 고치세요.",
+    "ro": "Zona nr. {id} nu mai există. Reîmprospătați lista de zone.",
+    "sv": "Zon nr {id} finns inte längre. Uppdatera zonlistan."
+  },
+  "zonegroup.sameOutput": {
+    "fr": "Les zones « {a} » et « {b} » utilisent la même sortie audio : elles ne peuvent pas être groupées. Supprimez-en une, ou donnez-lui une autre sortie.",
+    "en": "Zones “{a}” and “{b}” use the same audio output: they cannot be grouped. Delete one of them, or give it another output.",
+    "de": "Die Zonen „{a}“ und „{b}“ verwenden denselben Audioausgang: Sie können nicht gruppiert werden. Löschen Sie eine davon oder weisen Sie ihr einen anderen Ausgang zu.",
+    "es": "Las zonas «{a}» y «{b}» usan la misma salida de audio: no se pueden agrupar. Elimine una de ellas o asígnele otra salida.",
+    "it": "Le zone «{a}» e «{b}» usano la stessa uscita audio: non possono essere raggruppate. Eliminane una oppure assegnale un'altra uscita.",
+    "zh": "区域「{a}」和「{b}」使用同一个音频输出，无法编组。请删除其中一个，或为其指定其他输出。",
+    "ja": "ゾーン「{a}」と「{b}」は同じオーディオ出力を使用しているため、グループ化できません。どちらか一方を削除するか、別の出力を割り当ててください。",
+    "ko": "'{a}' 영역과 '{b}' 영역은 같은 오디오 출력을 사용하므로 그룹으로 묶을 수 없습니다. 둘 중 하나를 삭제하거나 다른 출력을 지정하세요.",
+    "ro": "Zonele „{a}” și „{b}” folosesc aceeași ieșire audio: nu pot fi grupate. Ștergeți una dintre ele sau atribuiți-i altă ieșire.",
+    "sv": "Zonerna ”{a}” och ”{b}” använder samma ljudutgång: de kan inte grupperas. Ta bort en av dem eller ge den en annan utgång."
   }
 }
