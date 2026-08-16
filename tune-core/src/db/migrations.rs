@@ -1,5 +1,6 @@
 use tracing::info;
 
+use super::migration_status;
 use super::sqlite::SqliteDb;
 
 struct Migration {
@@ -1666,16 +1667,38 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         info!(version = 1, "migration_marked_existing");
     }
 
+    // Ce qui reste à faire, AVANT de le faire : sans ce décompte il n'y avait
+    // rien à annoncer — ni dans le journal, ni à l'écran d'attente (#1701). Le
+    // « +1 » est la passe finale (colonnes de sûreté, file unifiée, ANALYZE),
+    // qui tourne à chaque démarrage et pèse, elle aussi, sur une grosse base.
+    let floor = current_version.max(if tables_exist { 1 } else { 0 });
+    let pending = MIGRATIONS.iter().filter(|m| m.version > floor).count();
+    let started = std::time::Instant::now();
+    migration_status::begin("sqlite", pending + 1);
+    if pending > 0 {
+        info!(
+            from = floor,
+            to = latest_version(),
+            pending,
+            "migration_start"
+        );
+    }
+
+    let mut done = 0usize;
     for migration in MIGRATIONS {
-        if migration.version <= current_version.max(if tables_exist { 1 } else { 0 }) {
+        if migration.version <= floor {
             continue;
         }
 
         info!(
             version = migration.version,
             name = migration.name,
+            step = done + 1,
+            total = pending + 1,
             "migration_applying"
         );
+        migration_status::advance(migration.name, done);
+        let step_started = std::time::Instant::now();
 
         if !migration.up.is_empty() {
             db.execute_batch(migration.up)?;
@@ -1857,12 +1880,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ],
         )?;
 
+        done += 1;
         info!(
             version = migration.version,
             name = migration.name,
+            ms = step_started.elapsed().as_millis() as u64,
             "migration_applied"
         );
     }
+
+    migration_status::advance("contrôles finaux", done);
 
     // Post-migration safety pass: ensure critical columns always exist regardless
     // of what migration version the DB came from. This guards against:
@@ -2014,6 +2041,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
+
+    migration_status::finish();
+    info!(
+        applied = pending,
+        ms = started.elapsed().as_millis() as u64,
+        "migrations_complete"
+    );
 
     Ok(())
 }
@@ -2265,12 +2299,38 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         );
     }
 
+    // Même décompte que côté SQLite : de quoi annoncer l'avancement au lieu de
+    // laisser croire à un serveur planté (#1701). Le « +1 » est l'ANALYZE final.
+    let pending = PG_MIGRATIONS
+        .iter()
+        .filter(|&&(v, _, _)| v > current)
+        .count();
+    let started = std::time::Instant::now();
+    migration_status::begin("postgres", pending + 1);
+    if pending > 0 {
+        info!(
+            from = current,
+            to = pg_latest_version(),
+            pending,
+            "pg_migration_start"
+        );
+    }
+
+    let mut done = 0usize;
     for &(version, name, sql) in PG_MIGRATIONS {
         if version <= current {
             continue;
         }
 
-        info!(version, name, "pg_migration_applying");
+        info!(
+            version,
+            name,
+            step = done + 1,
+            total = pending + 1,
+            "pg_migration_applying"
+        );
+        migration_status::advance(name, done);
+        let step_started = std::time::Instant::now();
 
         // Each migration file manages its own BEGIN/COMMIT, so we
         // execute the raw SQL directly.
@@ -2279,8 +2339,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             .await
             .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
 
-        info!(version, name, "pg_migration_applied");
+        done += 1;
+        info!(
+            version,
+            name,
+            ms = step_started.elapsed().as_millis() as u64,
+            "pg_migration_applied"
+        );
     }
+
+    migration_status::advance("contrôles finaux", done);
 
     // Run ANALYZE on key tables for the query planner.
     sqlx::raw_sql("ANALYZE artists; ANALYZE albums; ANALYZE tracks;")
@@ -2288,6 +2356,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         .await
         .ok();
     info!("pg_analyze_complete");
+
+    migration_status::finish();
+    info!(
+        applied = pending,
+        ms = started.elapsed().as_millis() as u64,
+        "pg_migrations_complete"
+    );
 
     Ok(())
 }

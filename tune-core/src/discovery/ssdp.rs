@@ -81,6 +81,10 @@ struct ScannerState {
     devices: HashMap<String, DiscoveredDevice>,
     known_locations: HashMap<String, String>,
     miss_count: HashMap<String, u32>,
+    /// Échecs de récupération de la description, **par `LOCATION`** et non par
+    /// UDN : les frères embarqués d'un HEOS partagent la même URL, les compter
+    /// séparément multipliait par cinq les re-tentatives et les sondes
+    /// MinimalDMR pour un seul appareil injoignable (#1703).
     create_failures: HashMap<String, u32>,
     // Device ids with an in-flight byebye liveness probe. A chatty renderer
     // (Samsung/LG TV) fires one ssdp:byebye per embedded service, all collapsing
@@ -92,6 +96,22 @@ struct ScannerState {
 }
 
 impl ScannerState {
+    /// L'identifiant déjà attribué à cette `LOCATION`, s'il y en a un.
+    ///
+    /// UPnP garantit qu'une `LOCATION` renvoie **une** description racine,
+    /// donc **un** appareil physique. Or un appareil HEOS (Denon/Marantz
+    /// AIOS) annonce sa racine *et* chacun de ses appareils embarqués —
+    /// MediaRenderer, MediaServer, ACT-Denon… — avec un `uuid:` différent
+    /// dans l'USN mais **la même `LOCATION`**. Sans cette résolution, chaque
+    /// UDN frère devenait un appareil de plus : cinq lecteurs pour un seul
+    /// Marantz ND8006, et autant de re-détections (#1703).
+    fn known_id_for_location(&self, location: &str) -> Option<&String> {
+        self.known_locations
+            .iter()
+            .find(|(_, loc)| loc.as_str() == location)
+            .map(|(id, _)| id)
+    }
+
     fn new() -> Self {
         Self {
             devices: HashMap::new(),
@@ -756,12 +776,21 @@ async fn process_responses(
             }
         }
 
-        let dev_id = device_id_from_usn(&resp.usn);
-        seen_ids.insert(dev_id.clone());
-
+        // Un appareil est identifié par sa LOCATION, pas par l'UDN de
+        // l'annonce : les frères embarqués d'un HEOS partagent la première
+        // et diffèrent par le second (#1703, cf. `known_id_for_location`).
+        // Le déduplicat par `seen_locations` ci-dessus ne couvre qu'un seul
+        // lot ; le NOTIFY passif appelle cette fonction avec **une** réponse
+        // à la fois, donc chaque annonce d'un frère y échappait.
         let st = state.lock().await;
+        let dev_id = st
+            .known_id_for_location(&resp.location)
+            .cloned()
+            .unwrap_or_else(|| device_id_from_usn(&resp.usn));
         let known = st.known_locations.contains_key(&dev_id);
         drop(st);
+
+        seen_ids.insert(dev_id.clone());
 
         if !known {
             new_devices.push((dev_id, resp));
@@ -852,9 +881,9 @@ async fn process_responses(
                     build_renderer_device(&dev_id, &resp.location, host, port, device_type, &desc);
 
                 let mut st = state.lock().await;
+                st.create_failures.remove(&resp.location);
                 st.known_locations.insert(dev_id.clone(), resp.location);
                 st.miss_count.remove(&dev_id);
-                st.create_failures.remove(&dev_id);
                 st.devices.insert(dev_id.clone(), device.clone());
                 drop(st);
 
@@ -866,7 +895,7 @@ async fn process_responses(
             Err(e) => {
                 let failure_count = {
                     let mut st = state.lock().await;
-                    let count = st.create_failures.entry(dev_id.clone()).or_insert(0);
+                    let count = st.create_failures.entry(resp.location.clone()).or_insert(0);
                     *count += 1;
                     *count
                 };
@@ -907,9 +936,9 @@ async fn process_responses(
                         super::mac::enrich_identity(&mut device);
 
                         let mut st = state.lock().await;
+                        st.create_failures.remove(&resp.location);
                         st.known_locations.insert(dev_id.clone(), resp.location);
                         st.miss_count.remove(&dev_id);
-                        st.create_failures.remove(&dev_id);
                         st.devices.insert(dev_id.clone(), device.clone());
                         drop(st);
 
@@ -1227,6 +1256,161 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(8);
         scanner.set_event_tx(tx2).await;
         scanner.stop().await; // aucune tâche lancée : ne doit pas paniquer
+    }
+
+    // ── Un appareil physique = une LOCATION (#1703) ───────────────────────
+    //
+    // Journaux de Jean Valjean (0.9.71, Marantz ND8006) : 86 lignes pour
+    // `host=192.168.1.11`, CINQ `uuid:` distincts, tous derrière la même URL
+    // `http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml`.
+    // Un HEOS Denon/Marantz annonce sa racine AiOS *et* chacun de ses
+    // appareils embarqués (MediaRenderer, MediaServer, ACT-Denon…) sous un
+    // UDN différent — UPnP garantit pourtant qu'une LOCATION ne renvoie
+    // qu'une description racine, donc un seul appareil.
+
+    /// Description AiOS simplifiée : racine Denon + MediaRenderer embarqué.
+    const AIOS_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-denon-com:device:AiosDevice:1</deviceType>
+    <friendlyName>Marantz ND8006</friendlyName>
+    <manufacturer>Marantz</manufacturer>
+    <UDN>uuid:9ab0c000-f668-11de-9976-0080-0006787c2e26</UDN>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+        <friendlyName>Marantz ND8006</friendlyName>
+        <manufacturer>Marantz</manufacturer>
+        <UDN>uuid:9ab0c001-f668-11de-9976-0080-0006787c2e26</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <controlURL>/upnp/control/AVTransport</controlURL>
+            <eventSubURL>/upnp/event/AVTransport</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+            <controlURL>/upnp/control/RenderingControl</controlURL>
+            <eventSubURL>/upnp/event/RenderingControl</eventSubURL>
+          </service>
+        </serviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>"#;
+
+    /// Sert `AIOS_XML` sur une adresse locale éphémère. Chaque requête est lue
+    /// entièrement puis la connexion est fermée proprement : un RST envoyé
+    /// avant que le client ait fini d'écrire rendrait le test intermittent.
+    async fn spawn_description_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        AIOS_XML.len(),
+                        AIOS_XML
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn announcement(location: &str, usn: &str) -> SsdpResponse {
+        SsdpResponse {
+            location: location.to_string(),
+            usn: usn.to_string(),
+            _server: None,
+            _st: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cinq_udn_a_une_seule_location_ne_font_qu_un_lecteur() {
+        let addr = spawn_description_server().await;
+        let location = format!("http://{addr}/upnp/desc/aios_device/aios_device.xml");
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+
+        // Une annonce à la fois : c'est exactement ce que fait le listener
+        // NOTIFY passif, pour qui le déduplicat par lot (`seen_locations`) ne
+        // peut rien. Sans le correctif, chaque UDN frère devenait un lecteur.
+        for i in 0..5 {
+            process_responses(
+                &state,
+                &tx,
+                vec![announcement(
+                    &location,
+                    &format!("uuid:aios-{i}::urn:schemas-upnp-org:device:MediaRenderer:1"),
+                )],
+            )
+            .await;
+        }
+
+        let devices = state.lock().await.devices.clone();
+        assert_eq!(
+            devices.len(),
+            1,
+            "un seul ND8006 doit donner un seul lecteur, pas {} : {:?}",
+            devices.len(),
+            devices.keys().collect::<Vec<_>>()
+        );
+
+        let mut discovered = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, SsdpEvent::DeviceDiscovered(_)) {
+                discovered += 1;
+            }
+        }
+        assert_eq!(discovered, 1, "un seul évènement de découverte attendu");
+    }
+
+    #[tokio::test]
+    async fn deux_locations_restent_deux_lecteurs() {
+        // Garde-fou : on ne replie QUE ce que l'UPnP garantit identique. Deux
+        // descriptions distinctes — un ampli multi-zone, un hôte faisant
+        // tourner deux renderers — restent deux appareils, même à la même
+        // adresse. C'est ce qui protège DLNA, OpenHome et les autres marques.
+        let addr = spawn_description_server().await;
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+
+        process_responses(
+            &state,
+            &tx,
+            vec![
+                announcement(
+                    &format!("http://{addr}/zone1/desc.xml"),
+                    "uuid:zone-1::urn:x",
+                ),
+                announcement(
+                    &format!("http://{addr}/zone2/desc.xml"),
+                    "uuid:zone-2::urn:x",
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(state.lock().await.devices.len(), 2);
     }
 
     #[test]

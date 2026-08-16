@@ -550,6 +550,55 @@ pub fn model_ready(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
     configured_model_path(settings).exists()
 }
 
+/// Ce que devient un téléchargement d'actif, observable depuis l'API.
+///
+/// `model_ready` est un booléen « le fichier est là ou pas ». Il confond quatre
+/// situations que l'utilisateur vit très différemment : jamais tenté,
+/// téléchargement en cours, échec avec nouvelle tentative dans moins de 15 min,
+/// et échec répété. Les quatre affichaient le même message — « son modèle
+/// acoustique n'est pas encore disponible […] vérifiez la connexion Internet du
+/// serveur » — qui a envoyé Sevy Tabroc chercher du côté de sa connexion
+/// (#1658) alors que le modèle n'avait jamais été demandé, et Bilou constater
+/// une jauge figée sans une ligne de journal (#1512).
+///
+/// Le réessai, lui, a toujours existé : la boucle de [`spawn`] repasse toutes
+/// les [`IDLE_SLEEP_SECS`] et rappelle `ensure_model`. Ce qui manquait n'était
+/// pas la ténacité du serveur, c'était sa capacité à la DIRE.
+#[derive(Clone, Debug, Default)]
+pub struct FetchState {
+    /// Un téléchargement est en cours en ce moment même.
+    pub in_progress: bool,
+    /// Octets déjà écrits sur le disque pour la tentative en cours.
+    pub downloaded: u64,
+    /// Taille annoncée par le serveur, si elle l'est.
+    pub total: Option<u64>,
+    /// Nombre de tentatives depuis le démarrage du serveur.
+    pub attempts: u32,
+    /// Motif du dernier échec, `None` si la dernière tentative a abouti.
+    pub last_error: Option<String>,
+}
+
+type FetchStates = std::sync::Mutex<std::collections::HashMap<&'static str, FetchState>>;
+static FETCH_STATES: std::sync::OnceLock<FetchStates> = std::sync::OnceLock::new();
+
+fn fetch_states() -> &'static FetchStates {
+    FETCH_STATES.get_or_init(Default::default)
+}
+
+/// L'état du téléchargement nommé (`"audio_model"`, `"text_model"`).
+///
+/// Rend `FetchState::default()` tant que rien n'a été tenté — `attempts == 0`
+/// distingue « jamais demandé » de « demandé et échoué », ce que l'absence
+/// d'entrée ne dirait pas à l'appelant.
+pub fn fetch_state(what: &str) -> FetchState {
+    fetch_states()
+        .lock()
+        .unwrap()
+        .get(what)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Emplacement du modèle : réglage, puis variable d'environnement, puis un
 /// défaut.
 ///
@@ -593,7 +642,23 @@ pub(super) async fn ensure_file(
     dest: &Path,
     url: &str,
     sha256: &str,
-    what: &str,
+    what: &'static str,
+) -> Result<(), String> {
+    let outcome = ensure_file_inner(dest, url, sha256, what).await;
+    // L'état survit à la sortie de fonction : c'est lui que l'interface lit
+    // entre deux tours de boucle, y compris longtemps après un échec.
+    fetch_states().lock().unwrap().entry(what).and_modify(|s| {
+        s.in_progress = false;
+        s.last_error = outcome.as_ref().err().cloned();
+    });
+    outcome
+}
+
+async fn ensure_file_inner(
+    dest: &Path,
+    url: &str,
+    sha256: &str,
+    what: &'static str,
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     if dest.exists() {
@@ -617,26 +682,73 @@ pub(super) async fn ensure_file(
     // Client partagé et non `reqwest::get` : le client par défaut de reqwest
     // s'en remet à `rustls-platform-verifier`, que la build FFI Android
     // n'initialise jamais. Voir `crate::http::client`.
-    let bytes = crate::http::client::long_timeout()
+    let resp = crate::http::client::long_timeout()
         .get(url)
         .send()
         .await
         .map_err(|e| format!("download: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("download status: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("download body: {e}"))?;
+        .map_err(|e| format!("download status: {e}"))?;
 
-    let got = format!("{:x}", Sha256::new_with_prefix(&bytes).finalize());
+    let total = resp.content_length();
+    {
+        let mut states = fetch_states().lock().unwrap();
+        let s = states.entry(what).or_default();
+        s.in_progress = true;
+        s.downloaded = 0;
+        s.total = total;
+        s.attempts = s.attempts.saturating_add(1);
+        s.last_error = None;
+    }
+
+    // Écriture EN FLUX, et non `.bytes()`. Le modèle CLAP pèse plusieurs
+    // centaines de Mo : le tamponner entièrement en mémoire avant de le
+    // recopier sur le disque produisait une pointe de la taille du fichier sur
+    // des machines qui n'en ont pas les moyens — Raspberry Pi, NAS. On hache
+    // au fil de l'eau, donc la vérification ne coûte pas non plus une seconde
+    // copie.
+    use futures_util::StreamExt;
+    let tmp = dest.with_extension("part");
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("download body: {e}"))?;
+        hasher.update(&chunk);
+        {
+            use tokio::io::AsyncWriteExt;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        }
+        written += chunk.len() as u64;
+        fetch_states()
+            .lock()
+            .unwrap()
+            .entry(what)
+            .and_modify(|s| s.downloaded = written);
+    }
+    {
+        use tokio::io::AsyncWriteExt;
+        file.flush()
+            .await
+            .map_err(|e| format!("flush {}: {e}", tmp.display()))?;
+    }
+    drop(file);
+
+    let got = format!("{:x}", hasher.finalize());
     if got != sha256 {
+        // Le fichier partiel ne doit pas rester : au tour suivant il serait
+        // rehaché pour rien, et il occupe la place du modèle.
+        std::fs::remove_file(&tmp).ok();
         return Err(format!("checksum mismatch: got {got}, want {sha256}"));
     }
 
-    let tmp = dest.with_extension("part");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
-    info!(dest = %dest.display(), bytes = bytes.len(), what, "asset_ready");
+    info!(dest = %dest.display(), bytes = written, what, "asset_ready");
     Ok(())
 }
 
@@ -1041,6 +1153,30 @@ mod tests {
                 "{v:?}"
             );
         }
+    }
+
+    #[test]
+    fn jamais_tente_se_distingue_de_tente_et_echoue() {
+        // C'est TOUTE la raison d'être de `FetchState`. `model_ready` rend
+        // `false` dans les deux cas, et l'interface affichait donc le même
+        // message — « vérifiez la connexion Internet du serveur » — à quelqu'un
+        // dont le modèle n'avait jamais été demandé. Sevy Tabroc a cherché la
+        // panne du côté de sa connexion pour cette raison (#1658).
+        //
+        // `attempts == 0` est le discriminant : il dit « le serveur n'a pas
+        // encore essayé », ce qu'une absence d'entrée ne dirait pas à
+        // l'appelant, qui ne peut pas faire la différence entre « pas de
+        // nouvelle » et « rien à signaler ».
+        let jamais = super::fetch_state("actif-qui-n-existe-pas");
+        assert_eq!(jamais.attempts, 0, "aucune tentative ne doit être comptée");
+        assert!(!jamais.in_progress);
+        assert!(
+            jamais.last_error.is_none(),
+            "pas d'erreur tant que rien n'a été tenté — sinon l'interface \
+             accuserait le réseau sans raison"
+        );
+        assert_eq!(jamais.downloaded, 0);
+        assert!(jamais.total.is_none());
     }
 
     #[test]
