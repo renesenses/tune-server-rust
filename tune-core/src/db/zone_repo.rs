@@ -56,6 +56,43 @@ pub mod sql {
         "DELETE FROM zones WHERE id NOT IN (SELECT MIN(id) FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id) AND output_device_id IS NOT NULL AND output_device_id IN (SELECT output_device_id FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id HAVING COUNT(*) > 1)"
     }
 
+    /// Rendre son prefixe `local:` a une zone locale qui l'a perdu.
+    ///
+    /// Une zone creee avec le NOM du peripherique au lieu de son identifiant de
+    /// registre ne joue rien : l'orchestrateur reconnait une sortie locale au
+    /// prefixe `local:`, et sans lui la zone part sur le chemin renderer
+    /// reseau — telechargement complet, decodage, re-encodage, puis une URL
+    /// poussee vers un appareil qui n'existe pas (DEvir, #1823). Elle echappe
+    /// en prime au dedoublonnage, qui regroupe par `output_device_id` : deux
+    /// valeurs differentes pour un seul appareil physique.
+    ///
+    /// Deux instructions, dans cet ordre :
+    ///
+    /// 1. supprimer le jumeau prefixe **s'il est masque** — une zone masquee
+    ///    est une zone que l'utilisateur a supprimee, ses reglages sont deja
+    ///    ecartes par son geste, et elle bloque l'index unique ;
+    /// 2. reecrire l'identifiant, mais seulement s'il ne heurte plus rien.
+    ///
+    /// Le cas ou les DEUX zones sont visibles n'est volontairement pas traite :
+    /// il faudrait choisir laquelle des deux configurations survit, et aucune
+    /// regle automatique ne vaut mieux que la question posee a l'utilisateur.
+    pub fn reparer_prefixe_local() -> [&'static str; 2] {
+        [
+            "DELETE FROM zones WHERE is_hidden = 1 AND output_device_id IN ( \
+                SELECT 'local:' || z.output_device_id FROM zones z \
+                WHERE z.output_type = 'local' \
+                  AND z.output_device_id IS NOT NULL \
+                  AND z.output_device_id NOT LIKE 'local:%' )",
+            "UPDATE zones SET output_device_id = 'local:' || output_device_id \
+             WHERE output_type = 'local' \
+               AND output_device_id IS NOT NULL \
+               AND output_device_id NOT LIKE 'local:%' \
+               AND NOT EXISTS ( \
+                SELECT 1 FROM zones d \
+                WHERE d.output_device_id = 'local:' || zones.output_device_id )",
+        ]
+    }
+
     /// Colonnes reportees d'un doublon vers la zone conservee, avec la valeur
     /// qui compte pour « pas encore regle ».
     ///
@@ -441,8 +478,37 @@ impl ZoneRepo {
     /// tous ses reglages avances (#1774, Yves — « les parametres coches n'ont
     /// pas ete sauvegardes »).
     pub fn deduplicate(&self) -> Result<usize, String> {
+        self.reparer_prefixe_local()?;
         self.merge_duplicate_settings()?;
         self.db.execute(sql::deduplicate(), &[])
+    }
+
+    /// Rendre leur prefixe `local:` aux zones locales qui l'ont perdu.
+    ///
+    /// AVANT la fusion et le dedoublonnage, et c'est tout l'interet de
+    /// l'ordre : une fois les identifiants remis en forme, les deux zones d'un
+    /// meme appareil portent enfin la meme valeur, donc `deduplicate` les voit
+    /// et `merge_duplicate_settings` reporte les reglages. Lancee apres, la
+    /// reparation ne rattraperait plus rien. Voir [`sql::reparer_prefixe_local`].
+    pub fn reparer_prefixe_local(&self) -> Result<(), String> {
+        for (rang, instruction) in sql::reparer_prefixe_local().iter().enumerate() {
+            match self.db.execute(instruction, &[]) {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        zones = n,
+                        etape = if rang == 0 {
+                            "jumeau_masque_supprime"
+                        } else {
+                            "prefixe_rendu"
+                        },
+                        "zone_local_prefix_repare"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Reporter sur la zone conservee les reglages non par defaut de ses
@@ -1282,6 +1348,115 @@ mod tests {
         repo.delete(id).unwrap();
         assert!(repo.list().unwrap().is_empty());
         assert!(repo.is_device_hidden("uuid:123"));
+    }
+
+    /// #1823 — le panneau lateral creait la zone avec le NOM du peripherique.
+    /// Sans le prefixe, l'orchestrateur la prend pour un renderer reseau.
+    #[test]
+    fn une_zone_locale_sans_prefixe_le_recupere() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo
+            .create("SPDIF/ADAT (1+2)", Some("local"), Some("SPDIF/ADAT (1+2)"))
+            .unwrap();
+        repo.reparer_prefixe_local().unwrap();
+
+        let zone = repo.get(id).unwrap().unwrap();
+        assert_eq!(
+            zone.output_device_id.as_deref(),
+            Some("local:SPDIF/ADAT (1+2)")
+        );
+    }
+
+    /// Le cas vecu par DEvir : la zone auto-decouverte avait ete supprimee
+    /// (masquee), et bloquait la place que la reparation doit rendre.
+    #[test]
+    fn le_jumeau_masque_cede_la_place() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let auto = repo
+            .create("Sortie", Some("local"), Some("local:Sortie"))
+            .unwrap();
+        repo.delete(auto).unwrap(); // suppression = masquage
+        let manuelle = repo
+            .create("Sortie", Some("local"), Some("Sortie"))
+            .unwrap();
+
+        repo.reparer_prefixe_local().unwrap();
+
+        assert!(repo.get(auto).unwrap().is_none(), "le jumeau masque part");
+        assert_eq!(
+            repo.get(manuelle)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("local:Sortie"),
+            "la zone que l'utilisateur voit garde ses reglages et devient jouable"
+        );
+    }
+
+    /// Deux zones VISIBLES pour le meme appareil : on ne tranche pas a la
+    /// place de l'utilisateur, et surtout on ne casse pas l'index unique.
+    #[test]
+    fn deux_zones_visibles_sont_laissees_intactes() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let prefixee = repo
+            .create("Sortie", Some("local"), Some("local:Sortie"))
+            .unwrap();
+        let nue = repo
+            .create("Sortie", Some("local"), Some("Sortie"))
+            .unwrap();
+
+        repo.reparer_prefixe_local().unwrap();
+
+        assert!(repo.get(prefixee).unwrap().is_some());
+        assert_eq!(
+            repo.get(nue).unwrap().unwrap().output_device_id.as_deref(),
+            Some("Sortie"),
+            "rien n'est ecrase tant que la question n'est pas tranchee"
+        );
+    }
+
+    /// La reparation ne doit toucher QUE les sorties locales.
+    #[test]
+    fn une_zone_reseau_nest_pas_prefixee() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo
+            .create("Salon", Some("dlna"), Some("uuid:4aac5a61"))
+            .unwrap();
+        repo.reparer_prefixe_local().unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().output_device_id.as_deref(),
+            Some("uuid:4aac5a61")
+        );
+    }
+
+    /// Idempotence : une base deja saine ne bouge pas, et un second passage
+    /// ne double pas le prefixe.
+    #[test]
+    fn la_reparation_est_idempotente() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo
+            .create("Sortie", Some("local"), Some("Sortie"))
+            .unwrap();
+        repo.reparer_prefixe_local().unwrap();
+        repo.reparer_prefixe_local().unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().output_device_id.as_deref(),
+            Some("local:Sortie"),
+            "jamais local:local:"
+        );
     }
 
     #[test]
