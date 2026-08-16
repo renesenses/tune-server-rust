@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,24 +11,38 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Ce module ne garde QUE ce qui atteint le son ou sert reellement un client.
+///
+/// Six routes ont ete retirees — `/status`, `/bands`, `/parametric`,
+/// `/graphic`, `/presets/{id}/activate` et `/room-correction`. Elles
+/// persistaient leur etat dans cinq cles de reglages — `eq_current_bands`,
+/// `eq_parametric`, `eq_graphic`, `eq_active_preset`, `eq_room_correction` —
+/// **qu'aucun code hors de ce fichier ne lisait**. Le chemin audio ne connait
+/// qu'une cle, `zone_{id}_eq_profile`, et ces six-la n'y menaient pas.
+///
+/// `set_bands` repondait pourtant `"applied": true`, et `/room-correction`
+/// ecrivait dans sa propre reponse « Actual convolution requires DSP pipeline
+/// integration ». Une API qui annonce un succes qu'elle ne peut pas tenir est
+/// pire qu'une API absente : elle fait chercher la panne ailleurs (#1718).
+///
+/// Verifie avant retrait : le client web n'appelle que `/expert-settings` et
+/// `/presets` ; tune-ios, tune-macos, tune-remote*, tune-server-flutter,
+/// tune-server-ipados, Alexa, Home Assistant et Endpoint n'en appellent
+/// aucune. Le plugin EQ Pro vit sous `/api/v1/eq-pro/`, autre espace de noms.
+/// Le plugin Room Calibration pousse bien vers `/api/v1/eq/bands`, mais en
+/// PUT sur le port 8200 — l'API du plugin EQ Advanced, pas celle-ci, qui
+/// n'expose que GET et POST sur 8888.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/status", get(eq_status))
         .route("/presets", get(list_presets).post(create_preset))
         .route(
             "/presets/{id}",
             get(get_preset).put(update_preset).delete(delete_preset),
         )
-        .route("/presets/{id}/activate", post(activate_preset))
-        .route("/bands", get(get_bands).post(set_bands))
         .route(
             "/expert-settings",
             get(get_expert_settings).post(set_expert_settings),
         )
-        // Advanced EQ routes
-        .route("/parametric", get(get_parametric).post(set_parametric))
-        .route("/graphic", get(get_graphic).post(set_graphic))
-        .route("/room-correction", post(apply_room_correction))
 }
 
 /// Résolution du mode Expert (nombre de bandes de l'égaliseur graphique).
@@ -84,32 +98,6 @@ fn save_presets(state: &AppState, presets: &[Value]) -> Result<(), AppError> {
         .set("eq_presets", &serde_json::to_string(presets)?)
         .ok();
     Ok(())
-}
-
-/// EQ subsystem status.
-async fn eq_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let presets = load_presets(&state);
-    let active_id = settings.get("eq_active_preset").ok().flatten();
-    let enabled = settings
-        .get("eq_enabled")
-        .ok()
-        .flatten()
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    let active_preset = active_id
-        .as_ref()
-        .and_then(|id| presets.iter().find(|p| p["id"].as_str() == Some(id)));
-
-    Json(json!({
-        "enabled": enabled,
-        "preset_count": presets.len(),
-        "active_preset_id": active_id,
-        "active_preset_name": active_preset.and_then(|p| p["name"].as_str()),
-        "supported_types": ["parametric", "graphic", "room_correction"],
-        "max_bands": 31,
-    }))
 }
 
 /// List all EQ presets.
@@ -284,286 +272,64 @@ async fn delete_preset(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Activate a preset for the current or specified zone.
-async fn activate_preset(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
-    {
-        return resp;
-    }
-
-    let presets = load_presets(&state);
-    let preset = presets.iter().find(|p| p["id"].as_str() == Some(&id));
-
-    match preset {
-        Some(p) => {
-            let settings = SettingsRepo::with_backend(state.backend.clone());
-            settings.set("eq_active_preset", &id).ok();
-            settings.set("eq_enabled", "true").ok();
-            Json(json!({
-                "active_preset_id": id,
-                "active_preset_name": p["name"],
-                "activated": true,
-            }))
-            .into_response()
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "preset not found"})),
-        )
-            .into_response(),
-    }
-}
-
-/// Get current active EQ bands.
-async fn get_bands(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let active_id = settings.get("eq_active_preset").ok().flatten();
-    let presets = load_presets(&state);
-
-    let bands = active_id
-        .and_then(|id| {
-            presets
-                .iter()
-                .find(|p| p["id"].as_str() == Some(&id))
-                .and_then(|p| p["bands"].as_array())
-                .cloned()
-        })
-        .unwrap_or_default();
-
-    Json(json!({
-        "bands": bands,
-        "count": bands.len(),
-        "active_preset_id": settings.get("eq_active_preset").ok().flatten(),
-    }))
-}
-
-#[derive(Deserialize)]
-struct SetBandsBody {
-    bands: Vec<EqBand>,
-}
-
-/// Set EQ bands directly (updates active preset or creates a transient one).
-async fn set_bands(
-    State(state): State<AppState>,
-    Json(body): Json<SetBandsBody>,
-) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
-    {
-        return Ok(resp);
-    }
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
-
-    // If there's an active preset, update it; otherwise create a transient config
-    if let Some(active_id) = settings.get("eq_active_preset").ok().flatten() {
-        let mut presets = load_presets(&state);
-        if let Some(p) = presets
-            .iter_mut()
-            .find(|p| p["id"].as_str() == Some(&active_id))
-        {
-            p["bands"] = json!(&bands_json);
-            save_presets(&state, &presets)?;
-        }
-    }
-
-    settings
-        .set("eq_current_bands", &serde_json::to_string(&bands_json)?)
-        .ok();
-
-    Ok(Json(json!({
-        "bands": bands_json,
-        "count": bands_json.len(),
-        "applied": true,
-    }))
-    .into_response())
-}
-
 // --- Advanced EQ routes ---
-
-/// Get parametric EQ state (multi-band with full control).
-async fn get_parametric(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let parametric: Value = settings
-        .get("eq_parametric")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(json!({
-            "enabled": false,
-            "bands": [],
-            "preamp_db": 0.0,
-        }));
-    Json(parametric)
-}
-
-#[derive(Deserialize)]
-struct ParametricBody {
-    enabled: Option<bool>,
-    bands: Option<Vec<EqBand>>,
-    preamp_db: Option<f64>,
-}
-
-/// Set parametric EQ configuration.
-async fn set_parametric(
-    State(state): State<AppState>,
-    Json(body): Json<ParametricBody>,
-) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
-    {
-        return Ok(resp);
-    }
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut current: Value = settings
-        .get("eq_parametric")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(json!({"enabled": false, "bands": [], "preamp_db": 0.0}));
-
-    if let Some(e) = body.enabled {
-        current["enabled"] = json!(e);
-    }
-    if let Some(bands) = &body.bands {
-        current["bands"] = json!(bands.iter().map(|b| b.to_json()).collect::<Vec<_>>());
-    }
-    if let Some(preamp) = body.preamp_db {
-        current["preamp_db"] = json!(preamp);
-    }
-
-    settings
-        .set("eq_parametric", &serde_json::to_string(&current)?)
-        .ok();
-    Ok(Json(json!({"saved": true, "parametric": current})).into_response())
-}
-
-/// Get graphic EQ state (fixed frequency bands).
-async fn get_graphic(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let graphic: Value = settings
-        .get("eq_graphic")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| {
-            // Default 31-band graphic EQ frequencies (ISO standard)
-            let frequencies = [
-                20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0,
-                400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0, 2000.0, 2500.0, 3150.0, 4000.0,
-                5000.0, 6300.0, 8000.0, 10000.0, 12500.0, 16000.0, 20000.0,
-            ];
-            let bands: Vec<Value> = frequencies
-                .iter()
-                .map(|&f| json!({"freq": f, "gain": 0.0}))
-                .collect();
-            json!({
-                "enabled": false,
-                "bands": bands,
-                "preamp_db": 0.0,
-            })
-        });
-    Json(graphic)
-}
-
-#[derive(Deserialize)]
-struct GraphicBody {
-    enabled: Option<bool>,
-    /// Array of {freq, gain} — must match the 31-band layout
-    bands: Option<Vec<Value>>,
-    preamp_db: Option<f64>,
-}
-
-/// Set graphic EQ bands.
-async fn set_graphic(
-    State(state): State<AppState>,
-    Json(body): Json<GraphicBody>,
-) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
-    {
-        return Ok(resp);
-    }
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut current: Value = settings
-        .get("eq_graphic")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(json!({"enabled": false, "bands": [], "preamp_db": 0.0}));
-
-    if let Some(e) = body.enabled {
-        current["enabled"] = json!(e);
-    }
-    if let Some(bands) = &body.bands {
-        current["bands"] = json!(bands);
-    }
-    if let Some(preamp) = body.preamp_db {
-        current["preamp_db"] = json!(preamp);
-    }
-
-    settings
-        .set("eq_graphic", &serde_json::to_string(&current)?)
-        .ok();
-    Ok(Json(json!({"saved": true, "graphic": current})).into_response())
-}
-
-#[derive(Deserialize)]
-struct RoomCorrectionBody {
-    /// Path to a room correction impulse response file (WAV)
-    impulse_response_path: Option<String>,
-    /// Or calibration profile ID from room_calibration plugin
-    calibration_profile_id: Option<String>,
-}
-
-/// Apply room correction EQ from a calibration profile or impulse response.
-async fn apply_room_correction(
-    State(state): State<AppState>,
-    Json(body): Json<RoomCorrectionBody>,
-) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
-    {
-        return Ok(resp);
-    }
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    let correction = json!({
-        "enabled": true,
-        "impulse_response_path": body.impulse_response_path,
-        "calibration_profile_id": body.calibration_profile_id,
-        "applied_at": epoch_secs(),
-        "message": "Room correction configuration saved. Actual convolution requires DSP pipeline integration.",
-    });
-
-    settings
-        .set("eq_room_correction", &serde_json::to_string(&correction)?)
-        .ok();
-
-    Ok(Json(correction).into_response())
-}
 
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod routes_mortes_tests {
+    /// #1718 — verrouille le retrait, par le CONTENU du fichier.
+    ///
+    /// Ces six routes persistaient leur etat dans des cles qu'aucun code hors
+    /// de ce module ne lisait : elles annoncaient un succes que le son ne
+    /// suivait jamais. Si l'une revient, c'est ce test qui doit le dire — pas
+    /// un utilisateur qui cherche pourquoi son egaliseur reste muet.
+    ///
+    /// Le controle porte sur le ROUTEUR : les fonctions peuvent reapparaitre
+    /// pour d'autres usages, ce qui ne doit pas etre interdit ; ce qui ne doit
+    /// pas revenir, c'est leur exposition en HTTP.
+    #[test]
+    fn les_routes_sans_effet_sur_le_son_ne_reviennent_pas() {
+        let source = include_str!("eq_pro.rs");
+        let routeur = source
+            .split("pub fn router()")
+            .nth(1)
+            .expect("routeur introuvable")
+            .split("\n}")
+            .next()
+            .expect("fin du routeur introuvable");
+
+        for mortes in [
+            "\"/status\"",
+            "\"/bands\"",
+            "\"/parametric\"",
+            "\"/graphic\"",
+            "\"/room-correction\"",
+            "activate",
+        ] {
+            assert!(
+                !routeur.contains(mortes),
+                "la route {mortes} est revenue dans le routeur : elle ecrivait une cle \
+                 que le chemin audio ne lit pas (#1718). Si elle doit exister, elle doit \
+                 d'abord ecrire zone_{{id}}_eq_profile."
+            );
+        }
+    }
+
+    /// Les deux routes que le client web utilise reellement doivent rester.
+    #[test]
+    fn les_routes_utilisees_par_le_client_restent_exposees() {
+        let source = include_str!("eq_pro.rs");
+        let routeur = source.split("pub fn router()").nth(1).unwrap();
+        assert!(routeur.contains("\"/presets\""), "liste des presets perdue");
+        assert!(
+            routeur.contains("\"/expert-settings\""),
+            "resolution du mode Expert perdue"
+        );
+    }
 }
