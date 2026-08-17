@@ -429,6 +429,14 @@ impl PlaybackManager {
             .last_seek_at
             .map(|t| t.elapsed().as_secs() < 5)
             .unwrap_or(false);
+        // La recherche est finie : on tient une URL jouable, c'est tout l'objet
+        // de cet appel. Sans cette ligne le drapeau levé par l'orchestrateur
+        // avant `resolve_stream` n'était JAMAIS abaissé sur le chemin qui
+        // réussit — seuls deux chemins d'erreur le faisaient. Le commentaire de
+        // `play_inner` affirmait pourtant « le drapeau retombe dans play() » :
+        // l'intention était écrite, l'instruction manquait, et la zone restait
+        // annoncée « recherche en cours » pendant toute la lecture.
+        state.resolving = false;
         state.state = PlayState::Playing;
         state.paused_at = None;
         if !is_recent_seek {
@@ -487,6 +495,10 @@ impl PlaybackManager {
     pub async fn stop(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         let data = if let Some(state) = zones.get_mut(&zone_id) {
+            // Un arrêt met fin à toute recherche en cours : sans cela, une
+            // lecture interrompue pendant `resolve_stream` laissait la zone
+            // annoncée « recherche en cours » alors qu'elle est à l'arrêt.
+            state.resolving = false;
             state.state = PlayState::Stopped;
             state.paused_at = None;
             state.last_seek_at = None;
@@ -508,6 +520,7 @@ impl PlaybackManager {
     pub async fn stop_and_clear(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
+            state.resolving = false;
             state.state = PlayState::Stopped;
             state.paused_at = None;
             state.now_playing = None;
@@ -959,5 +972,49 @@ mod tests {
         assert_eq!(np.bit_depth, None);
         assert_eq!(np.sample_rate, None);
         assert_eq!(np.format, None);
+    }
+
+    /// Le drapeau de recherche doit retomber quand la lecture démarre.
+    ///
+    /// Il ne retombait QUE sur deux chemins d'erreur de `play_inner`. Sur le
+    /// chemin qui réussit, rien ne l'abaissait : `play()` n'y touchait pas, et
+    /// son `entry().or_insert_with()` ne réinitialise une zone existante pour
+    /// personne. Une zone restait donc annoncée « recherche en cours » pendant
+    /// toute sa lecture — au point que l'indication ne voulait plus rien dire,
+    /// ce qui est pire que son absence.
+    ///
+    /// Le commentaire de `play_inner` affirmait pourtant : « Le drapeau retombe
+    /// dans `play()`, dès qu'une URL jouable existe ». L'intention était écrite
+    /// et l'instruction manquait ; seul un test pouvait faire la différence.
+    #[tokio::test]
+    async fn la_recherche_se_termine_quand_la_lecture_demarre() {
+        let pm = super::PlaybackManager::new();
+        pm.set_resolving(1, true).await;
+        assert!(
+            pm.get_state(1).await.resolving,
+            "le drapeau doit être levé avant la résolution"
+        );
+
+        pm.play(1, super::NowPlaying::default()).await;
+
+        assert!(
+            !pm.get_state(1).await.resolving,
+            "une lecture qui démarre signifie qu'une URL jouable existe : la \
+             recherche est finie"
+        );
+    }
+
+    /// Même exigence à l'arrêt : une lecture interrompue pendant la résolution
+    /// laissait la zone à l'arrêt ET annoncée « recherche en cours ».
+    #[tokio::test]
+    async fn un_arret_met_fin_a_la_recherche() {
+        let pm = super::PlaybackManager::new();
+        pm.set_resolving(1, true).await;
+        pm.stop(1).await;
+        assert!(!pm.get_state(1).await.resolving);
+
+        pm.set_resolving(2, true).await;
+        pm.stop_and_clear(2).await;
+        assert!(!pm.get_state(2).await.resolving);
     }
 }
