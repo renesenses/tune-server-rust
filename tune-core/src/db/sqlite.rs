@@ -477,6 +477,9 @@ CREATE TABLE IF NOT EXISTS zones (
     last_play_state TEXT DEFAULT 'stopped',
     dsd_mode TEXT DEFAULT 'auto',
     dlna_native_flac INTEGER DEFAULT 0,
+    -- Servir l'AAC tel quel au renderer qui le decode (#1424). Eteint par
+    -- defaut : un renderer qui l'annonce peut le refuser en pratique.
+    aac_passthrough INTEGER DEFAULT 0,
     host TEXT,
     mac TEXT,
     -- Décalage des paroles synchronisées, en ms (positif = retardées).
