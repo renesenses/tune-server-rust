@@ -406,7 +406,14 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- Cover embedded in THIS file. The album cover stays the norm; this is the
     -- override for a track whose album is a folder of unrelated files, where
     -- one track's artwork must not stand for all the others (forum #1312).
-    cover_path TEXT
+    cover_path TEXT,
+    -- Piste virtuelle issue d'une feuille CUE (#1763). `file_path` reste NUL
+    -- pour ces pistes — plusieurs partagent le meme fichier, ce que la
+    -- contrainte UNIQUE interdirait, mais elle tolere plusieurs NULL. Le vrai
+    -- chemin vit ici, avec les bornes de la piste dans le fichier.
+    cue_media_path TEXT,
+    cue_start_ms INTEGER,
+    cue_end_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (

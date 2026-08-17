@@ -266,7 +266,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     acoustid_confidence TEXT,
     trailing_silence_ms TEXT,
     synced_lyrics TEXT,
-    cover_path TEXT
+    cover_path TEXT,
+    -- Pistes virtuelles CUE (#1763) : cf le commentaire de CORE_SCHEMA.
+    cue_media_path TEXT,
+    cue_start_ms BIGINT,
+    cue_end_ms BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (

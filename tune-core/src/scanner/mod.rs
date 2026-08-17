@@ -1,5 +1,6 @@
 pub mod album_folder;
 pub mod compilation;
+pub mod cue;
 pub mod hasher;
 pub mod quality;
 pub mod walker;
