@@ -441,8 +441,11 @@ pub async fn analyze_embedding_batch(
         // Playback can start mid-batch; yield at once so neither the decode
         // nor the inference competes with the audio pipeline (#1515) — the
         // same mid-batch bail as the ReplayGain pass (#1310).
-        if crate::audio::replaygain::any_zone_playing(backend) {
-            info!("audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch");
+        if let Some(zone) = crate::audio::replaygain::playing_zone_name(backend) {
+            info!(
+                zone = %zone,
+                "audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch"
+            );
             break;
         }
         let track_id = match r.first().and_then(|v| v.as_i64()) {

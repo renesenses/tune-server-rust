@@ -293,6 +293,33 @@ fn ensure_zones_is_hidden(state: &AppState) {
         }
         _ => {}
     }
+
+    // Aucune zone ne peut être en lecture au démarrage : c'est ce processus qui
+    // la produit. Un `playing` trouvé ici est donc forcément un reliquat — arrêt
+    // brutal pendant une lecture, enceinte DLNA coupée au secteur, sondage
+    // interrompu.
+    //
+    // Et ce reliquat coûte cher. `any_zone_playing` (replaygain.rs) lit CETTE
+    // colonne pour décider si l'analyse acoustique et le ReplayGain doivent
+    // s'effacer devant la lecture. Une zone figée à `playing` les bloque donc
+    // **définitivement**, et comme la valeur est persistée, redémarrer n'y
+    // change rien — trois signalements convergents (#1464 Bertrand, #1456 Bruno
+    // Lescarret, #1457 Bilou), tous décrivant une jauge immobile « sans lecture
+    // en cours », tous ayant redémarré en vain.
+    //
+    // Le symptôme est illisible parce que rien ne relie la cause à l'effet :
+    // l'utilisateur ne joue rien, voit une analyse figée, et conclut à un
+    // blocage du scan.
+    match state.backend.execute(
+        "UPDATE zones SET last_play_state = 'stopped' WHERE last_play_state = 'playing'",
+        &[],
+    ) {
+        Ok(n) if n > 0 => {
+            info!(zones = n, "zones_stale_playing_state_reset");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "zones_stale_playing_reset_failed"),
+    }
 }
 
 fn deduplicate_radios(state: &AppState) {
