@@ -214,6 +214,13 @@ impl OutputTarget for BluosOutput {
         if add_play_rejected(&add_body, &play_body) {
             warn!(
                 device = %self.name,
+                // L'URL envoyee manquait au journal, et c'est elle qui manque
+                // pour diagnostiquer. Sans elle on sait que le Node a refuse,
+                // jamais CE QU'IL a refuse : une adresse injoignable depuis le
+                // lecteur, un caractere qui casse le decoupage des parametres,
+                // une pochette trop longue… Trois allers-retours avec Bilou
+                // (17/08/2026) se sont arretes faute de cette ligne.
+                add_url = %add_url,
                 add_reply = %truncate_body(&add_body),
                 play_reply = %truncate_body(&play_body),
                 "bluos_add_rejected_empty_queue"
