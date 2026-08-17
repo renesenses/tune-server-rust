@@ -225,9 +225,32 @@ def main():
         if author == "Admin":
             continue
 
+        # Nos propres annonces ne sont pas des signalements.
+        #
+        # Le filtre sur l'auteur « Admin » ci-dessus ne suffit plus : les notes
+        # de version sont publiées sous le compte **Bertrand** depuis qu'on les
+        # signe, et non plus sous le compte de publication. Chaque release
+        # fabriquait donc une issue « [Forum] Tune vX.Y.Z — Notes de version »
+        # que personne ne fermait jamais : 34 accumulées entre la 0.9.41 et la
+        # 0.9.82, soit 8 % du fond de tickets ouvert, pour zéro travail réel.
+        #
+        # On filtre sur le TYPE plutôt que sur l'auteur ou le titre : c'est ce
+        # qui porte l'intention (« ceci est une annonce »), là où l'auteur peut
+        # changer et où un titre se reformule.
+        #
+        # ⚠️ On saute la création du FIL, surtout pas son suivi : un testeur qui
+        # répond sous les notes de version pour signaler que la nouvelle version
+        # casse quelque chose est exactement le signal qu'on veut recevoir. La
+        # détection de réponses, plus bas, continue donc de tourner.
+        is_announcement = (t.get("type") or "").lower() == "release"
+
         # New thread?
         if tid > last_thread_id:
-            new_threads.append(t)
+            if not is_announcement:
+                new_threads.append(t)
+            # L'identifiant avance dans tous les cas : sans cela, une annonce
+            # non retenue resterait éternellement « nouvelle » et le curseur
+            # n'atteindrait jamais les fils suivants.
             max_thread_id = max(max_thread_id, tid)
 
         # New replies?
