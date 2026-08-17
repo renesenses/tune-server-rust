@@ -2825,6 +2825,19 @@ impl PlaybackOrchestrator {
             && !dlna_force_wav
             && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
+        // Même mécanique pour l'AAC (Marco Polo, #1424) : un Marantz SR7009 ou
+        // un Denon RC12 le décodent nativement, et le transcoder en FLAC ne fait
+        // que retarder le premier son et consommer du processeur — l'AAC étant
+        // déjà compressé avec perte, le transcodage n'apporte aucune qualité.
+        //
+        // Pas de garde `dlna_cap_16bit` ici, contrairement à l'ALAC : ce plafond
+        // vise les sources plus profondes que 16 bits, ce qu'un AAC n'est jamais.
+        // `dlna_force_wav` reste respecté — un renderer qui exige du LPCM le
+        // dit, et son exigence prime sur une préférence.
+        let aac_passthrough = source_format == Some(AudioFormat::Aac)
+            && is_network_output
+            && !dlna_force_wav
+            && ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id);
 
         // Chromecast's Default Media Receiver decodes a narrower set than most
         // DLNA renderers — notably it cannot play AIFF (which DLNA plays
@@ -2836,6 +2849,7 @@ impl PlaybackOrchestrator {
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
             && !alac_passthrough
+            && !aac_passthrough
             && source_format.as_ref().is_some_and(|f| {
                 if is_chromecast {
                     f.needs_transcode_for_chromecast()

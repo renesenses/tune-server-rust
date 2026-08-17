@@ -104,6 +104,7 @@ pub mod sql {
         // Drapeaux : defaut 0, donc seul un 1 se reporte.
         ("fixed_volume", "0"),
         ("alac_passthrough", "0"),
+        ("aac_passthrough", "0"),
         ("autoplay_enabled", "0"),
         ("dlna_lpcm", "0"),
         ("dlna_wav24", "0"),
@@ -926,6 +927,38 @@ impl ZoneRepo {
             Ok(_) => Ok(()),
             Err(e) if e.contains("no such column") || e.contains("does not exist") => {
                 tracing::debug!(id, error = %e, "alac_passthrough_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Servir l'AAC tel quel au renderer, au lieu de le transcoder (#1424).
+    /// Opt-in — le renderer doit le décoder nativement.
+    pub fn get_aac_passthrough(&self, id: i64) -> bool {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT COALESCE(aac_passthrough, 0) FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+            != 0
+    }
+
+    pub fn update_aac_passthrough(&self, id: i64, enabled: bool) -> Result<(), String> {
+        let sql = self.update_field_sql("aac_passthrough");
+        let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "aac_passthrough_column_missing_ignoring_update");
                 Ok(())
             }
             Err(e) => Err(e),

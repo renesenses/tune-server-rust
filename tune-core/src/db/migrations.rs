@@ -1956,6 +1956,20 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // no FLAC transcode). Off by default — ALAC and AAC share the audio/mp4
     // MIME, so it can't be auto-detected safely.
     add_column_if_missing(db, "zones", "alac_passthrough", "INTEGER DEFAULT 0");
+    // Opt-in : servir l'AAC tel quel au renderer qui le décode, au lieu de le
+    // transcoder en FLAC. Demandé par Marco Polo (#1424) pour un Marantz SR7009
+    // et un Denon RC12, qui l'acceptent nativement.
+    //
+    // L'AAC étant déjà compressé avec perte, le gain n'est pas la qualité — le
+    // transcodage n'ajoute pas de perte audible — mais la RÉACTIVITÉ : plus de
+    // réencodage avant le premier octet, et pas de charge processeur.
+    //
+    // Éteint par défaut, comme alac_passthrough et pour la même raison : un
+    // renderer qui ANNONCE l'AAC peut le refuser dans un conteneur ou à un
+    // débit donné. Détecté automatiquement, cela produirait un silence
+    // inexpliqué — le pire symptôme. Celui qui active sait ce que son appareil
+    // fait vraiment ; les autres ne voient aucun changement.
+    add_column_if_missing(db, "zones", "aac_passthrough", "INTEGER DEFAULT 0");
     // Opt-in: transcode lossless to WAV/LPCM (not FLAC) for this DLNA renderer.
     // Skips the slow native FLAC encoder for hi-res AND avoids renderers whose
     // ALAC decoder pops at start (Yves, LHC-56). Overrides alac_passthrough.
