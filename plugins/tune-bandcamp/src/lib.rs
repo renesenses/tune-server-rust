@@ -150,20 +150,94 @@ fn passerelle_en_echec(detail: String) -> axum::response::Response {
     (StatusCode::BAD_GATEWAY, Json(json!({ "error": detail }))).into_response()
 }
 
-/// Exécuter une requête sortante et rendre son JSON, ou un 502 explicite.
-async fn rendre_json(reponse: Result<reqwest::Response, reqwest::Error>) -> impl IntoResponse {
+/// Récupérer le JSON d'une réponse sortante, ou l'erreur déjà mise en forme.
+///
+/// Remplace l'ancien `rendre_json`, qui recopiait la réponse de Bandcamp
+/// telle quelle. Ce passe-plat est ce qui a rendu la panne invisible : un
+/// corps `{"error":true,"error_message":"missing key p"}` traversait le
+/// plugin avec un HTTP 200 et n'échouait que dans le navigateur. Rendre le
+/// `Value` à l'appelant l'oblige à regarder ce qu'il a reçu avant de le
+/// servir.
+async fn json_sortant(
+    reponse: Result<reqwest::Response, reqwest::Error>,
+) -> Result<Value, axum::response::Response> {
     match reponse {
-        Ok(r) if r.status().is_success() => {
-            let body: Value = r.json().await.unwrap_or(json!({}));
-            Json(body).into_response()
-        }
+        Ok(r) if r.status().is_success() => Ok(r.json().await.unwrap_or(json!({}))),
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            passerelle_en_echec(format!("HTTP {status}: {body}"))
+            Err(passerelle_en_echec(format!("HTTP {status}: {body}")))
         }
-        Err(e) => passerelle_en_echec(e.to_string()),
+        Err(e) => Err(passerelle_en_echec(e.to_string())),
     }
+}
+
+/// URL de pochette Bandcamp pour un `art_id`.
+///
+/// Le suffixe `_10` est le format carré ~1200 px : la pochette est ce que
+/// l'utilisateur regarde en premier dans une grille de découverte, et Tune
+/// affiche des pochettes sur des écrans de salon.
+fn pochette(art_id: Option<&Value>) -> Option<String> {
+    let id = art_id?.as_i64()?;
+    (id > 0).then(|| format!("https://f4.bcbits.com/img/a{id}_10.jpg"))
+}
+
+/// Reconstruire l'adresse publique d'un album ou d'une piste depuis les
+/// `url_hints` de la découverte.
+///
+/// Bandcamp ne renvoie pas l'URL montée : il donne les morceaux. Un artiste
+/// qui a payé un domaine propre est servi dessus, sinon c'est son
+/// sous-domaine. Sans cette adresse, un résultat de découverte n'est pas
+/// jouable — c'est elle que `/album?url=` attend.
+fn url_depuis_hints(hints: &Value) -> Option<String> {
+    let slug = hints.get("slug")?.as_str()?;
+    let genre = match hints.get("item_type").and_then(|v| v.as_str()) {
+        Some("t") => "track",
+        _ => "album",
+    };
+    let racine = match hints.get("custom_domain").and_then(|v| v.as_str()) {
+        Some(d) if !d.is_empty() => format!("https://{d}"),
+        _ => format!("https://{}.bandcamp.com", hints.get("subdomain")?.as_str()?),
+    };
+    Some(format!("{racine}/{genre}/{slug}"))
+}
+
+/// Mettre les items de découverte à la forme que l'écran consomme.
+///
+/// La version précédente recopiait la réponse de Bandcamp telle quelle. C'est
+/// ce qui a rendu la panne invisible : le corps `{"error":true}` traversait le
+/// plugin avec un 200 et n'échouait que dans le navigateur. Normaliser ici
+/// donne une forme stable, et un champ absent chez Bandcamp devient `null`
+/// chez nous plutôt qu'un écran vide sans explication.
+fn normaliser_decouverte(brut: &Value) -> Vec<Value> {
+    let Some(items) = brut.get("items").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let url = it.get("url_hints").and_then(url_depuis_hints)?;
+            Some(json!({
+                "id": it.get("id"),
+                "titre": it.get("primary_text"),
+                "artiste": it.get("secondary_text"),
+                "url": url,
+                "pochette": pochette(it.get("art_id")),
+                "genre": it.get("genre_text"),
+                "lieu": it.get("location_text"),
+                // Extrait offert par Bandcamp sur la page de découverte : de
+                // quoi écouter avant d'ouvrir l'album. Même qualité que le
+                // reste, donc annoncée pareil.
+                "extrait": it
+                    .get("featured_track")
+                    .and_then(|t| t.get("file"))
+                    .and_then(|f| f.get(BC_STREAM_QUALITY))
+                    .and_then(|u| u.as_str()),
+                "qualite": BC_STREAM_QUALITY,
+                "lossless": false,
+            }))
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -171,10 +245,68 @@ struct SearchQuery {
     q: String,
 }
 
+/// Recherche Bandcamp.
+///
+/// **POST**, et non GET : `autocomplete_elastic` répond 404 à un GET, ce qui
+/// remontait en 502 côté Tune. Le corps attend `search_text`, pas `q`. Sondé
+/// contre l'API réelle avant réécriture — les deux erreurs venaient d'une
+/// signature supposée et jamais vérifiée.
 async fn bc_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
     let client = tune_core::http::client::shared();
-    let resp = client.get(BC_SEARCH_API).query(&[("q", &q.q)]).send().await;
-    rendre_json(resp).await
+    let resp = client
+        .post(BC_SEARCH_API)
+        .json(&json!({
+            "search_text": q.q,
+            "search_filter": "",
+            "full_page": false,
+            "fan_id": null,
+        }))
+        .send()
+        .await;
+
+    let brut = match json_sortant(resp).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let resultats = brut
+        .get("auto")
+        .and_then(|a| a.get("results"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Bandcamp mélange les trois genres dans une seule liste, distingués par
+    // `type`. Les séparer ici plutôt que dans l'écran : c'est une convention
+    // de leur API, pas une affaire d'affichage.
+    let (mut artistes, mut albums, mut pistes) = (vec![], vec![], vec![]);
+    for r in &resultats {
+        let commun = json!({
+            "id": r.get("id"),
+            "titre": r.get("name"),
+            "artiste": r.get("band_name"),
+            "url": r.get("item_url_path").or_else(|| r.get("item_url_root")),
+            "pochette": r.get("img"),
+            "lieu": r.get("location"),
+            "album": r.get("album_name"),
+        });
+        match r.get("type").and_then(|t| t.as_str()) {
+            Some("b") => artistes.push(commun),
+            Some("a") => albums.push(commun),
+            Some("t") => pistes.push(commun),
+            _ => {}
+        }
+    }
+
+    Json(json!({
+        "q": q.q,
+        "artistes": artistes,
+        "albums": albums,
+        "pistes": pistes,
+        "qualite": BC_STREAM_QUALITY,
+        "lossless": false,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -194,15 +326,57 @@ fn default_sort() -> String {
     "top".into()
 }
 
-async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
+/// Appel commun à `/discover` et `/tag/{tag}` : les deux interrogent le même
+/// point d'entrée, seule la provenance du genre change.
+///
+/// `get_web` est un **GET à paramètres**, pas un POST JSON. Les trois clés
+/// `g` (genre), `s` (tri) et `p` (page) sont toutes obligatoires : il en
+/// manquait deux, et Bandcamp répondait `{"error":true,"error_message":
+/// "missing key p"}` avec un HTTP 200 — d'où une panne qu'aucun code de statut
+/// ne signalait.
+async fn decouvrir(tag: &str, sort: &str, page: u32) -> axum::response::Response {
     let client = tune_core::http::client::shared();
-    let payload = json!({
-        "tag_norm_names": [q.tag],
-        "sort": q.sort,
-        "page": q.page,
-    });
-    let resp = client.post(BC_DISCOVER_API).json(&payload).send().await;
-    rendre_json(resp).await
+    let resp = client
+        .get(BC_DISCOVER_API)
+        .query(&[
+            ("g", tag),
+            ("s", sort),
+            ("p", &page.to_string()),
+            ("gn", "0"),
+            ("f", "all"),
+        ])
+        .send()
+        .await;
+
+    let brut = match json_sortant(resp).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Bandcamp signale ses propres refus dans le corps, avec un 200. Les
+    // laisser passer serait reproduire exactement le bug corrigé ici.
+    if brut.get("error").and_then(|e| e.as_bool()) == Some(true) {
+        let detail = brut
+            .get("error_message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("refus sans motif");
+        return passerelle_en_echec(format!("Bandcamp: {detail}"));
+    }
+
+    let items = normaliser_decouverte(&brut);
+    Json(json!({
+        "tag": tag,
+        "sort": sort,
+        "page": page,
+        "items": items,
+        "qualite": BC_STREAM_QUALITY,
+        "lossless": false,
+    }))
+    .into_response()
+}
+
+async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
+    decouvrir(&q.tag, &q.sort, q.page).await
 }
 
 /// Qualité **unique** que Bandcamp sert sans session. Reprise telle quelle
@@ -370,14 +544,7 @@ struct TagQuery {
 }
 
 async fn bc_tag_releases(Path(tag): Path<String>, Query(q): Query<TagQuery>) -> impl IntoResponse {
-    let client = tune_core::http::client::shared();
-    let payload = json!({
-        "tag_norm_names": [tag],
-        "sort": q.sort,
-        "page": q.page,
-    });
-    let resp = client.post(BC_DISCOVER_API).json(&payload).send().await;
-    rendre_json(resp).await
+    decouvrir(&tag, &q.sort, q.page).await
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +738,111 @@ mod tests {
         BandcampPlugin::new(HostServices {
             backend: std::sync::Arc::new(db),
         })
+    }
+
+    /// Un item de découverte tel que Bandcamp le rend, réduit aux champs lus.
+    fn item_decouverte() -> Value {
+        json!({
+            "id": 3179309048_i64,
+            "primary_text": "Kind Of Grunge",
+            "secondary_text": "Ulysses Owens Jr.",
+            "art_id": 4214215264_i64,
+            "genre_text": "jazz",
+            "location_text": "New York, New York",
+            "url_hints": {
+                "subdomain": "ulyssesowensjr",
+                "custom_domain": null,
+                "slug": "kind-of-grunge",
+                "item_type": "a"
+            },
+            "featured_track": { "file": { "mp3-128": "https://t4.bcbits.com/stream/x" } }
+        })
+    }
+
+    #[test]
+    fn l_adresse_d_un_resultat_se_reconstruit_depuis_les_hints() {
+        // Bandcamp ne rend pas l'URL montée : sans cette reconstruction, un
+        // résultat de découverte n'est pas jouable — `/album?url=` l'attend.
+        let hints = item_decouverte();
+        let hints = hints.get("url_hints").unwrap();
+        assert_eq!(
+            url_depuis_hints(hints).unwrap(),
+            "https://ulyssesowensjr.bandcamp.com/album/kind-of-grunge"
+        );
+    }
+
+    #[test]
+    fn un_domaine_propre_l_emporte_sur_le_sous_domaine() {
+        // Un artiste qui a payé un domaine doit être servi dessus.
+        let hints = json!({
+            "subdomain": "monlabel",
+            "custom_domain": "disques.example",
+            "slug": "opus-1",
+            "item_type": "a"
+        });
+        assert_eq!(
+            url_depuis_hints(&hints).unwrap(),
+            "https://disques.example/album/opus-1"
+        );
+    }
+
+    #[test]
+    fn une_piste_ne_se_range_pas_sous_album() {
+        let hints = json!({
+            "subdomain": "x", "custom_domain": null,
+            "slug": "y", "item_type": "t"
+        });
+        assert_eq!(
+            url_depuis_hints(&hints).unwrap(),
+            "https://x.bandcamp.com/track/y"
+        );
+    }
+
+    #[test]
+    fn la_decouverte_normalisee_porte_de_quoi_jouer_et_afficher() {
+        let brut = json!({ "items": [item_decouverte()] });
+        let items = normaliser_decouverte(&brut);
+        assert_eq!(items.len(), 1);
+        let a = &items[0];
+        assert_eq!(a["titre"], "Kind Of Grunge");
+        assert_eq!(a["artiste"], "Ulysses Owens Jr.");
+        assert_eq!(
+            a["url"],
+            "https://ulyssesowensjr.bandcamp.com/album/kind-of-grunge"
+        );
+        assert_eq!(
+            a["pochette"],
+            "https://f4.bcbits.com/img/a4214215264_10.jpg"
+        );
+        assert_eq!(a["extrait"], "https://t4.bcbits.com/stream/x");
+        // La qualité voyage avec chaque item : #1768 exige qu'un flux à
+        // 128 kbit/s soit annoncé partout où il apparaît.
+        assert_eq!(a["qualite"], BC_STREAM_QUALITY);
+        assert_eq!(a["lossless"], false);
+    }
+
+    #[test]
+    fn un_item_sans_adresse_est_ecarte_plutot_que_rendu_injouable() {
+        // Mieux vaut un résultat de moins qu'une vignette qui ne s'ouvre pas.
+        let brut = json!({ "items": [ { "primary_text": "Sans hints" } ] });
+        assert!(normaliser_decouverte(&brut).is_empty());
+    }
+
+    #[test]
+    fn un_refus_de_bandcamp_ne_devient_pas_une_liste_vide_silencieuse() {
+        // La panne corrigée ici : Bandcamp répond `{"error":true}` avec un
+        // HTTP 200. `decouvrir` le convertit en 502 ; ce test verrouille le
+        // fait que le corps de refus ne porte aucun item à afficher.
+        let refus = json!({ "error": true, "error_message": "missing key p" });
+        assert!(normaliser_decouverte(&refus).is_empty());
+        assert_eq!(refus["error"], true);
+    }
+
+    #[test]
+    fn une_pochette_sans_art_id_ne_s_invente_pas() {
+        assert!(pochette(None).is_none());
+        assert!(pochette(Some(&json!(null))).is_none());
+        assert!(pochette(Some(&json!(0))).is_none());
     }
 
     #[test]
