@@ -1343,3 +1343,80 @@ async fn autoplay_inactif_reste_inactif() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(zone["autoplay_enabled"], false, "defaut attendu : {zone}");
 }
+
+/// Une playlist bâtie depuis les favoris radio doit dire ce qui n'a PAS marché.
+///
+/// L'ancien chemin local ne rendait que `matched_tracks` : « 0 sur 2 » sans
+/// indiquer lesquels, ni si la recherche avait échoué, ni si un candidat avait
+/// été trouvé puis refusé au seuil. C'est exactement l'aveuglement qui a rendu
+/// #1235 indiagnosticable pendant des semaines côté streaming — corrigé là-bas
+/// par #1079, jamais ici.
+///
+/// Le test vise le rapport, pas la qualité du rapprochement : la bibliothèque
+/// est vide, donc aucun favori ne peut correspondre. Ce qui doit être vrai,
+/// c'est que chaque favori figure dans le compte rendu avec une raison.
+#[tokio::test]
+async fn playlist_depuis_favoris_radio_rend_compte_de_chaque_favori() {
+    let app = make_app();
+
+    for (title, artist) in [
+        ("Nightswimming", "R.E.M."),
+        ("Under the Strikes", "Sofiane Pamart"),
+    ] {
+        let (st, _) = post_json(
+            &app,
+            "/api/v1/radio-favorites",
+            serde_json::json!({
+                "title": title,
+                "artist": artist,
+                "station_name": "FIP",
+            }),
+        )
+        .await;
+        assert!(
+            st.is_success(),
+            "le favori « {title} » doit pouvoir être enregistré (statut {st})"
+        );
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        serde_json::json!({ "playlist_name": "Depuis FIP" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "réponse : {body}");
+    assert_eq!(body["favorites_count"], 2);
+
+    let results = body["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("le rapport par favori doit être présent : {body}"));
+    assert_eq!(
+        results.len(),
+        2,
+        "chaque favori doit apparaître dans le compte rendu, y compris ceux qui \
+         n'ont rien donné — sinon l'utilisateur ne peut ni corriger un tag ni \
+         signaler utilement : {body}"
+    );
+
+    for r in results {
+        let s = r["status"].as_str().unwrap_or("");
+        assert!(
+            [
+                "matched",
+                "not_found",
+                "rejected",
+                "search_failed",
+                "duplicate",
+                "add_failed"
+            ]
+            .contains(&s),
+            "statut inattendu « {s} » dans {r}"
+        );
+        assert!(
+            r["title"].as_str().is_some_and(|t| !t.is_empty()),
+            "chaque ligne doit nommer le favori concerné : {r}"
+        );
+    }
+}
