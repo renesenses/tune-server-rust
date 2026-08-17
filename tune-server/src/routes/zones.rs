@@ -90,6 +90,10 @@ struct PatchZone {
     /// When enabled, serve ALAC straight to the renderer (bit-perfect, no FLAC
     /// transcode). Only for renderers that decode ALAC natively.
     alac_passthrough: Option<bool>,
+    /// Servir l'AAC tel quel au renderer qui le décode, au lieu de le
+    /// transcoder en FLAC (#1424). Opt-in : un renderer peut annoncer l'AAC
+    /// et le refuser en pratique.
+    aac_passthrough: Option<bool>,
     /// When enabled, transcode lossless to WAV/LPCM (not FLAC) for this DLNA
     /// renderer — skips the slow FLAC encoder for hi-res and avoids renderers
     /// whose ALAC decoder pops at start (LHC-56). Overrides alac_passthrough.
@@ -1019,8 +1023,15 @@ fn build_signal_path(
         && !dlna_wav24
         && !dlna_cap_16bit
         && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
+    // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
+    let aac_passthrough = source_format == Some(AudioFormat::Aac)
+        && is_network_output
+        && !dlna_lpcm
+        && !dlna_wav24
+        && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
     let needs_transcode_for_output = is_network_output
         && !alac_passthrough
+        && !aac_passthrough
         && source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna());
@@ -1402,6 +1413,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "alac_passthrough".into(),
                 json!(zone_repo.get_alac_passthrough(zone_id)),
             );
+            obj.insert(
+                "aac_passthrough".into(),
+                json!(zone_repo.get_aac_passthrough(zone_id)),
+            );
             obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
             obj.insert(
                 "dlna_cap_16bit".into(),
@@ -1546,6 +1561,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "alac_passthrough".into(),
                     json!(repo.get_alac_passthrough(id)),
                 );
+                obj.insert(
+                    "aac_passthrough".into(),
+                    json!(repo.get_aac_passthrough(id)),
+                );
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
                 obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
@@ -1689,6 +1708,11 @@ async fn patch_zone(
     }
     if let Some(passthrough) = body.alac_passthrough {
         if let Err(e) = repo.update_alac_passthrough(id, passthrough) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(passthrough) = body.aac_passthrough {
+        if let Err(e) = repo.update_aac_passthrough(id, passthrough) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
@@ -1841,6 +1865,9 @@ fn renderer_settings_snapshot(state: &AppState, zone_id: i64) -> serde_json::Map
     }
     if repo.get_alac_passthrough(zone_id) {
         out.insert("alac_passthrough".into(), json!(true));
+    }
+    if repo.get_aac_passthrough(zone_id) {
+        out.insert("aac_passthrough".into(), json!(true));
     }
     if repo.get_dlna_lpcm(zone_id) {
         out.insert("dlna_lpcm".into(), json!(true));
@@ -3926,5 +3953,67 @@ mod zone_group_tests {
             );
             assert!(msg.len() > 20, "{key} doit expliquer, pas juste nommer");
         }
+    }
+}
+
+#[cfg(test)]
+mod aac_passthrough_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    fn zone_repo() -> (Arc<dyn DbBackend>, i64) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+        (backend, id)
+    }
+
+    /// Le réglage doit être ÉTEINT par défaut.
+    ///
+    /// C'est l'invariant central de cette fonctionnalité : un renderer qui
+    /// annonce l'AAC peut le refuser dans un conteneur ou à un débit donné.
+    /// Activé d'office, cela produirait un silence inexpliqué chez ceux dont le
+    /// matériel a menti — le pire symptôme, celui qu'on ne relie jamais à sa
+    /// cause. Celui qui l'active sait ce que son appareil fait vraiment.
+    #[test]
+    fn aac_passthrough_is_off_until_the_user_asks_for_it() {
+        let (backend, id) = zone_repo();
+        let repo = ZoneRepo::with_backend(backend);
+        assert!(
+            !repo.get_aac_passthrough(id),
+            "le passthrough AAC ne doit jamais être actif par défaut"
+        );
+        repo.update_aac_passthrough(id, true).unwrap();
+        assert!(repo.get_aac_passthrough(id));
+        repo.update_aac_passthrough(id, false).unwrap();
+        assert!(!repo.get_aac_passthrough(id));
+    }
+
+    /// Les deux réglages sont indépendants : activer l'AAC ne doit pas activer
+    /// l'ALAC, et réciproquement. Ils partagent le conteneur MP4 côté format,
+    /// ce qui rend la confusion facile à écrire et invisible à l'usage.
+    #[test]
+    fn aac_and_alac_settings_never_leak_into_each_other() {
+        let (backend, id) = zone_repo();
+        let repo = ZoneRepo::with_backend(backend);
+        repo.update_aac_passthrough(id, true).unwrap();
+        assert!(repo.get_aac_passthrough(id));
+        assert!(
+            !repo.get_alac_passthrough(id),
+            "activer l'AAC a activé l'ALAC"
+        );
+        repo.update_aac_passthrough(id, false).unwrap();
+        repo.update_alac_passthrough(id, true).unwrap();
+        assert!(repo.get_alac_passthrough(id));
+        assert!(
+            !repo.get_aac_passthrough(id),
+            "activer l'ALAC a activé l'AAC"
+        );
     }
 }
