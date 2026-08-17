@@ -363,6 +363,23 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let eligible = 0_i64;
 
+    // Numérateur de la progression : les pistes TRAITÉES pour le modèle
+    // courant, pas celles dont on a tiré un embedding. Les deux diffèrent des
+    // échecs, et confondre les deux figeait la jauge sous 100 % à jamais
+    // (#1819). C'est `processed` qui doit piloter la barre : il atteint le
+    // dénominateur quand il ne reste plus rien à faire.
+    #[cfg(feature = "audio-embedding")]
+    let processed = tune_core::audio::embedding_store::processed_count(&state.backend);
+    #[cfg(not(feature = "audio-embedding"))]
+    let processed = 0_i64;
+
+    // Les pistes finies mais sans embedding. À dire franchement : « 51 pistes
+    // n'ont pas pu être analysées » se comprend, une jauge coincée à 99,8 % non.
+    #[cfg(feature = "audio-embedding")]
+    let failed = (processed - analysed).max(0);
+    #[cfg(not(feature = "audio-embedding"))]
+    let failed = 0_i64;
+
     let throttle = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
         .get("audio_embedding_throttle")
         .ok()
@@ -404,11 +421,18 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         "enabled": enabled,
         "model_ready": model_ready,
         "model_fetch": model_fetch,
+        // Embeddings réellement écrits pour le modèle courant.
         "analysed_tracks": analysed,
+        // Pistes traitées (embedding écrit OU échec constaté) : le numérateur
+        // de la barre, celui qui atteint le dénominateur quand c'est fini.
+        "processed_tracks": processed,
+        // Traitées sans embedding. L'interface doit les nommer, pas les taire.
+        "failed_tracks": failed,
         "eligible_tracks": eligible,
-        // Bornée à 0 : un modèle qui change repart de zéro et l'analyse peut
-        // dépasser brièvement l'ancien dénominateur.
-        "pending_tracks": (eligible - analysed).max(0),
+        // Ce qui RESTE à faire, mesuré sur les pistes traitées et non sur les
+        // embeddings : sinon les échecs restaient éternellement « en attente »
+        // et la jauge ne finissait jamais (#1819).
+        "pending_tracks": (eligible - processed).max(0),
         "throttle": throttle,
     }))
 }
