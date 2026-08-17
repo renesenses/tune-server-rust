@@ -638,8 +638,17 @@ mod eq_refresh_guard {
 /// binaires 0.9.82. Le job `Test (jeu de fonctionnalités livré)` disait la
 /// vérité — il teste la liste explicite, qui ne le contenait pas.
 ///
-/// Ce test relit `ci.yml` et exige que toute feature déclarant un plugin
-/// in-tree (`dep:tune-*`) figure dans les lignes de build de release.
+/// Ce test relit `ci.yml` **et `release.yml`** et exige que toute feature
+/// déclarant un plugin in-tree (`dep:tune-*`) figure dans chaque liste de
+/// features qui produit un binaire.
+///
+/// ⚠️ La première version de ce garde-fou ne lisait que `ci.yml` — le fichier
+/// des PR. Or les binaires téléchargés sont construits par `release.yml`. Le
+/// correctif de Bandcamp y a donc été déclaré vert alors que le plugin restait
+/// absent des cinq listes de `release.yml` : la même erreur, un cran plus haut.
+/// Dans `release.yml` les listes vivent à DEUX endroits — les lignes de build
+/// explicites, et les entrées `features:` de la matrice, injectées plus loin
+/// via `--features ${{ matrix.features }}`. Les deux sont vérifiées.
 #[cfg(test)]
 mod plugin_feature_ships_guard {
     use std::fs;
@@ -650,6 +659,8 @@ mod plugin_feature_ships_guard {
         let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
         let cargo = fs::read_to_string(racine.join("Cargo.toml")).expect("Cargo.toml");
         let ci = fs::read_to_string(racine.join("../.github/workflows/ci.yml")).expect("ci.yml");
+        let rel = fs::read_to_string(racine.join("../.github/workflows/release.yml"))
+            .expect("release.yml");
 
         // Une feature « plugin » se reconnaît à sa dépendance optionnelle
         // `dep:tune-<nom>` — c'est la forme qu'ont dj, karaoke et bandcamp.
@@ -671,30 +682,49 @@ mod plugin_feature_ships_guard {
             plugins.len()
         );
 
-        // Les lignes qui produisent un binaire publié.
-        let lignes_release: Vec<&str> = ci
-            .lines()
-            .filter(|l| l.contains("build --release") && l.contains("--features"))
-            .collect();
+        // Toutes les listes de features qui produisent un binaire, dans les
+        // DEUX fichiers. Une liste interpolée (`${{ matrix.features }}`) est
+        // ignorée : sa vraie valeur est l'entrée `features:` de la matrice,
+        // captée juste en dessous.
+        let mut listes: Vec<(&str, String)> = Vec::new();
+        for (fichier, contenu) in [("ci.yml", &ci), ("release.yml", &rel)] {
+            for l in contenu.lines() {
+                let t = l.trim();
+                if t.contains("build --release") && t.contains("--features") {
+                    let liste = t
+                        .split("--features")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+                    if !liste.is_empty() && !liste.contains("${{") {
+                        listes.push((fichier, liste.to_string()));
+                    }
+                } else if let Some(liste) = t.strip_prefix("features:") {
+                    let liste = liste.trim();
+                    if !liste.is_empty() && !liste.contains("${{") {
+                        listes.push((fichier, liste.to_string()));
+                    }
+                }
+            }
+        }
         assert!(
-            !lignes_release.is_empty(),
-            "aucune ligne `build --release … --features` dans ci.yml — le \
-             garde-fou ne garde plus rien"
+            listes.iter().any(|(f, _)| *f == "ci.yml"),
+            "aucune liste de features trouvée dans ci.yml — le garde-fou ne garde plus rien"
+        );
+        assert!(
+            listes.iter().any(|(f, _)| *f == "release.yml"),
+            "aucune liste de features trouvée dans release.yml — or c'est CE \
+             fichier qui construit les binaires téléchargés"
         );
 
         let mut manquants = Vec::new();
         for p in &plugins {
-            for ligne in &lignes_release {
-                // `--features a,b,c` : on cherche le nom entouré de séparateurs.
-                let liste = ligne.split("--features").nth(1).unwrap_or("");
-                let present = liste
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .split(',')
-                    .any(|f| f.trim() == p);
+            for (fichier, liste) in &listes {
+                let present = liste.split(',').any(|f| f.trim() == p);
                 if !present {
-                    manquants.push(format!("{p} absent d'une ligne de build"));
+                    manquants.push(format!("{p} absent d'une liste de {fichier} : {liste}"));
                     break;
                 }
             }
