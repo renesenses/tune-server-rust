@@ -53,6 +53,11 @@ pub(super) struct FacetQuery {
     /// Étiquette manquante : `genre`, `year`, `artist`, `album` ou `cover`.
     /// Sert au nettoyage de bibliothèque, pas à l'écoute.
     pub(super) untagged: Option<String>,
+    /// Année d'ENREGISTREMENT (`albums.original_year`), distincte de `year` qui
+    /// est celle de l'édition. L'écart n'est pas anecdotique : un Abbey Lincoln
+    /// enregistré en 1959 et réédité en 1987 se range sous 1959 pour qui écoute
+    /// du jazz, sous 1987 pour qui range des disques.
+    original_year: Option<i32>,
     q: Option<String>,
 }
 
@@ -222,6 +227,18 @@ pub(super) fn build_conditions(
     // ⚠️ Ces trois prédicats sont dupliqués dans `TrackRepo::list_filtered`
     // (crates distincts) : toute modification ici doit y être reportée, sans
     // quoi une facette compterait autrement que la liste qu'elle filtre.
+    // L'année d'enregistrement vit sur l'ALBUM, pas sur la piste : jointure par
+    // EXISTS pour rester sur l'alias `t`, comme la note et les favoris.
+    if exclude != "original_year" {
+        if let Some(y) = q.original_year {
+            conds.push(format!(
+                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND alo.original_year = {})",
+                ph(idx)
+            ));
+            params.push(SqlValue::Int(y as i64));
+            idx += 1;
+        }
+    }
     if exclude != "favorite" {
         if let Some(kind) = q.favorite.as_deref().filter(|s| !s.is_empty()) {
             match kind {
@@ -357,6 +374,7 @@ pub(super) async fn library_facets(
             "source" => kv_facet(&state, "source_media", limit, &conds, &params),
             "rating" => rating_facet(&state, limit, &conds, &params),
             "collection" => collection_facet(&state, &q, engine),
+            "original_year" => original_year_facet(&state, limit, &conds, &params),
             "favorite" => favorite_facet(&state, &conds, &params),
             "playlist" => playlist_facet(&state, limit, &conds, &params),
             "untagged" => untagged_facet(&state, &conds, &params),
@@ -397,6 +415,48 @@ pub(super) fn untagged_condition(field: &str) -> Option<String> {
 /// sans artiste ni album, une piste est introuvable ; sans genre ni année, elle
 /// échappe au tri ; sans pochette, elle est seulement laide.
 const UNTAGGED_FIELDS: [&str; 5] = ["artist", "album", "genre", "year", "cover"];
+
+/// Années d'enregistrement présentes, la plus récente d'abord — comme `year`,
+/// dont le tri chronologique descendant avait été demandé (« pas facile de
+/// trouver 2026 ! »).
+fn original_year_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    // `> 0` écarte les années nulles ET les `0` que certains taggeurs écrivent
+    // quand le champ est vide : « 0 » en tête de liste ne désigne aucun disque.
+    let sql = format!(
+        "SELECT alo.original_year, COUNT(*) AS n FROM tracks t \
+         JOIN albums alo ON alo.id = t.album_id{where_clause} \
+         {and_or_where} alo.original_year IS NOT NULL AND alo.original_year > 0 \
+         GROUP BY alo.original_year ORDER BY alo.original_year DESC{limit_clause}",
+        and_or_where = if conds.is_empty() { "WHERE" } else { "AND" }
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let y = it.next()?.as_i64()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((y.to_string(), count))
+        })
+        .collect()
+}
 
 /// Favoris du profil 1, comptés par type. Deux valeurs au plus (`track`,
 /// `album`) : pas de LIMIT à appliquer.

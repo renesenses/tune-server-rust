@@ -101,6 +101,8 @@ pub(super) struct TrackFilterQuery {
     pub playlist: Option<String>,
     /// Facette Sans étiquette : `genre`, `year`, `artist`, `album` ou `cover`.
     pub untagged: Option<String>,
+    /// Facette Année d'enregistrement (`albums.original_year`).
+    pub original_year: Option<i32>,
 }
 
 pub(super) async fn list_tracks(
@@ -129,7 +131,8 @@ pub(super) async fn list_tracks(
         || p.collection.as_deref().is_some_and(|s| !s.is_empty())
         || p.favorite.as_deref().is_some_and(|s| !s.is_empty())
         || p.playlist.as_deref().is_some_and(|s| !s.is_empty())
-        || p.untagged.as_deref().is_some_and(|s| !s.is_empty());
+        || p.untagged.as_deref().is_some_and(|s| !s.is_empty())
+        || p.original_year.is_some();
 
     // Resolve the collection name so /library/tracks?collection=<name> filters
     // to its members. A MANUAL collection resolves to album ids (JSON settings);
@@ -175,6 +178,7 @@ pub(super) async fn list_tracks(
             p.favorite.as_deref(),
             p.playlist.as_deref(),
             p.untagged.as_deref(),
+            p.original_year,
             limit,
             offset,
         ) {
