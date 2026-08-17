@@ -2063,7 +2063,34 @@ async fn create_zone(
     Json(body): Json<CreateZone>,
 ) -> impl IntoResponse {
     let output_type = body.output_type.as_deref();
-    let output_device_id = body.output_device_id.as_deref();
+
+    // Une sortie locale s'identifie par `local:{nom}` — c'est ce préfixe, et
+    // lui seul, qui dit à l'orchestrateur « carte son » plutôt que « renderer
+    // réseau » (`orchestrator.rs`, une dizaine de `starts_with("local:")`).
+    //
+    // Un client qui envoie le nom nu crée donc une zone que rien ne peut
+    // jouer : la lecture part sur le chemin réseau, télécharge la piste
+    // entière, la décode, la ré-encode, puis pousse une URL vers un appareil
+    // qui n'existe pas. Plus d'une minute d'attente, et aucun son (DEvir,
+    // #1823). La zone échappe en prime au dédoublonnage, qui regroupe par
+    // `output_device_id` : elle double la zone correcte du même appareil.
+    //
+    // On répare ici plutôt qu'au seul appelant : le serveur se met à jour
+    // avant le client, et un client déjà installé continuerait sinon à créer
+    // des zones mortes.
+    let device_id_normalise = body.output_device_id.as_deref().map(|d| {
+        if output_type == Some("local") && !d.starts_with("local:") {
+            warn!(
+                device_id = d,
+                corrige = format!("local:{d}"),
+                "create_zone_local_device_id_sans_prefixe_corrige"
+            );
+            format!("local:{d}")
+        } else {
+            d.to_string()
+        }
+    });
+    let output_device_id = device_id_normalise.as_deref();
 
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
     // A previously soft-deleted zone (is_hidden=1) is resurrected so the user's
