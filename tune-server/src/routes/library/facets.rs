@@ -41,6 +41,15 @@ pub(super) struct FacetQuery {
     /// album membership lives as a JSON `album_ids` array in the `collections`
     /// setting, resolved to ids by the handler (not a joinable table).
     pub(super) collection: Option<String>,
+    /// Favoris (profil 1) : `track` = la piste elle-même est en favori,
+    /// `album` = son album l'est. Deux valeurs distinctes plutôt qu'un booléen
+    /// unique : aimer un album et aimer un morceau ne se rangent pas pareil.
+    pub(super) favorite: Option<String>,
+    /// Nom d'une liste de lecture — les pistes qui en font partie.
+    pub(super) playlist: Option<String>,
+    /// Étiquette manquante : `genre`, `year`, `artist`, `album` ou `cover`.
+    /// Sert au nettoyage de bibliothèque, pas à l'écoute.
+    pub(super) untagged: Option<String>,
     q: Option<String>,
 }
 
@@ -206,6 +215,48 @@ pub(super) fn build_conditions(
             }
         }
     }
+    // Favoris du profil 1. `EXISTS` reste sur l'alias `t`, comme la note.
+    // ⚠️ Ces trois prédicats sont dupliqués dans `TrackRepo::list_filtered`
+    // (crates distincts) : toute modification ici doit y être reportée, sans
+    // quoi une facette compterait autrement que la liste qu'elle filtre.
+    if exclude != "favorite" {
+        if let Some(kind) = q.favorite.as_deref().filter(|s| !s.is_empty()) {
+            match kind {
+                "album" => conds.push(
+                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                     AND f.item_type = 'album' AND f.item_id = t.album_id)"
+                        .to_string(),
+                ),
+                "track" => conds.push(
+                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                     AND f.item_type = 'track' AND f.item_id = t.id)"
+                        .to_string(),
+                ),
+                // Valeur inconnue : ne rien filtrer plutôt que tout exclure.
+                _ => {}
+            }
+        }
+    }
+    if exclude != "playlist" {
+        if let Some(name) = q.playlist.as_deref().filter(|s| !s.is_empty()) {
+            conds.push(format!(
+                "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
+                 WHERE pt.track_id = t.id AND LOWER(pl.name) = LOWER({}))",
+                ph(idx)
+            ));
+            params.push(SqlValue::Text(name.to_string()));
+            idx += 1;
+        }
+    }
+    if exclude != "untagged" {
+        if let Some(field) = q.untagged.as_deref().filter(|s| !s.is_empty()) {
+            // Champ choisi dans une liste fermée : le SQL formaté ci-dessous ne
+            // dépend jamais de l'entrée brute.
+            if let Some(cond) = untagged_condition(field) {
+                conds.push(cond);
+            }
+        }
+    }
     if let Some(query) = q.q.as_deref().filter(|s| !s.is_empty()) {
         // Artist match via subquery — no artist_name column / no join here (#1189).
         conds.push(format!(
@@ -303,6 +354,9 @@ pub(super) async fn library_facets(
             "source" => kv_facet(&state, "source_media", limit, &conds, &params),
             "rating" => rating_facet(&state, limit, &conds, &params),
             "collection" => collection_facet(&state, &q, engine),
+            "favorite" => favorite_facet(&state, &conds, &params),
+            "playlist" => playlist_facet(&state, limit, &conds, &params),
+            "untagged" => untagged_facet(&state, &conds, &params),
             _ => continue,
         };
         let arr: Vec<Value> = rows
@@ -312,6 +366,138 @@ pub(super) async fn library_facets(
         out.insert(field, Value::Array(arr));
     }
     Ok(Json(Value::Object(out)))
+}
+
+/// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
+/// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
+///
+/// « Manquant » vaut ici NULL **ou** chaîne vide : un tag effacé par un éditeur
+/// laisse souvent une chaîne vide, et l'utilisateur qui range sa bibliothèque
+/// ne fait pas la différence entre les deux.
+pub(super) fn untagged_condition(field: &str) -> Option<String> {
+    let c = match field {
+        "genre" => "(t.genre IS NULL OR t.genre = '')",
+        "year" => "(t.year IS NULL OR t.year = 0)",
+        "artist" => "t.artist_id IS NULL",
+        "album" => "t.album_id IS NULL",
+        // La pochette vit sur l'album : une piste sans album n'en a pas non plus.
+        "cover" => {
+            "(t.album_id IS NULL OR EXISTS (SELECT 1 FROM albums al \
+              WHERE al.id = t.album_id AND (al.cover_path IS NULL OR al.cover_path = '')))"
+        }
+        _ => return None,
+    };
+    Some(c.to_string())
+}
+
+/// Les cinq étiquettes surveillées, dans l'ordre où elles gênent l'écoute :
+/// sans artiste ni album, une piste est introuvable ; sans genre ni année, elle
+/// échappe au tri ; sans pochette, elle est seulement laide.
+const UNTAGGED_FIELDS: [&str; 5] = ["artist", "album", "genre", "year", "cover"];
+
+/// Favoris du profil 1, comptés par type. Deux valeurs au plus (`track`,
+/// `album`) : pas de LIMIT à appliquer.
+fn favorite_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(String, i64)> {
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    let mut out = Vec::new();
+    for kind in ["track", "album"] {
+        let own = match kind {
+            "album" => {
+                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                        AND f.item_type = 'album' AND f.item_id = t.album_id)"
+            }
+            _ => {
+                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                  AND f.item_type = 'track' AND f.item_id = t.id)"
+            }
+        };
+        let mut all: Vec<String> = conds.to_vec();
+        all.push(own.to_string());
+        let sql = format!("SELECT COUNT(*) FROM tracks t WHERE {}", all.join(" AND "));
+        let n = state
+            .backend
+            .query_one(&sql, &bound)
+            .ok()
+            .flatten()
+            .and_then(|row| row.into_iter().next())
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        // Une facette vide ne s'affiche pas : inutile d'offrir un filtre qui
+        // ne rend rien.
+        if n > 0 {
+            out.push((kind.to_string(), n));
+        }
+    }
+    out
+}
+
+/// Listes de lecture contenant au moins une piste du jeu courant.
+fn playlist_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT pl.name, COUNT(*) AS n FROM tracks t \
+         JOIN playlist_tracks pt ON pt.track_id = t.id \
+         JOIN playlists pl ON pl.id = pt.playlist_id{where_clause} \
+         GROUP BY pl.name ORDER BY n DESC{limit_clause}"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let name = it.next()?.as_string()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            (!name.is_empty()).then_some((name, count))
+        })
+        .collect()
+}
+
+/// Combien de pistes il manque quoi. Un compte par étiquette surveillée.
+fn untagged_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(String, i64)> {
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    let mut out = Vec::new();
+    for field in UNTAGGED_FIELDS {
+        let Some(missing) = untagged_condition(field) else {
+            continue;
+        };
+        let mut all: Vec<String> = conds.to_vec();
+        all.push(missing);
+        let sql = format!("SELECT COUNT(*) FROM tracks t WHERE {}", all.join(" AND "));
+        let n = state
+            .backend
+            .query_one(&sql, &bound)
+            .ok()
+            .flatten()
+            .and_then(|row| row.into_iter().next())
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if n > 0 {
+            out.push((field.to_string(), n));
+        }
+    }
+    out
 }
 
 /// Count distinct values of a fixed `tracks` column, optionally narrowed by the
@@ -670,7 +856,42 @@ fn kv_facet(
 #[cfg(test)]
 mod tests {
     use super::smart_collection_where;
+    use super::untagged_condition;
     use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+
+    /// La liste des étiquettes surveillées est FERMÉE : c'est elle qui garantit
+    /// que le SQL formaté ne dépend jamais de l'entrée de la requête.
+    #[test]
+    fn untagged_n_accepte_que_ses_cinq_champs() {
+        for field in ["artist", "album", "genre", "year", "cover"] {
+            assert!(
+                untagged_condition(field).is_some(),
+                "{field} devrait être reconnu"
+            );
+        }
+        // Tout le reste ne filtre RIEN plutôt que d'injecter quoi que ce soit.
+        for hostile in ["", "id", "t.genre", "1=1", "genre; DROP TABLE tracks--"] {
+            assert!(
+                untagged_condition(hostile).is_none(),
+                "{hostile:?} n'aurait pas dû être accepté"
+            );
+        }
+    }
+
+    /// « Manquant » doit couvrir NULL ET la chaîne vide : un tag effacé par un
+    /// éditeur laisse souvent une chaîne vide, et l'utilisateur qui range sa
+    /// bibliothèque ne fait pas la différence entre les deux.
+    #[test]
+    fn untagged_traite_la_chaine_vide_comme_une_absence() {
+        let genre = untagged_condition("genre").unwrap();
+        assert!(genre.contains("IS NULL"), "{genre}");
+        assert!(genre.contains("= ''"), "{genre}");
+        let cover = untagged_condition("cover").unwrap();
+        // Une piste sans album n'a pas de pochette non plus — sinon elle
+        // échapperait au ménage.
+        assert!(cover.contains("t.album_id IS NULL"), "{cover}");
+        assert!(cover.contains("cover_path"), "{cover}");
+    }
 
     #[test]
     fn smart_where_parenthesizes_any_rules_before_extra_conds() {
