@@ -682,6 +682,9 @@ impl TrackRepo {
         favorite: Option<&str>,
         playlist: Option<&str>,
         untagged: Option<&str>,
+        // Année d'ENREGISTREMENT (`albums.original_year`) — distincte de
+        // `year`, qui est celle de l'édition.
+        original_year: Option<i32>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -832,6 +835,16 @@ impl TrackRepo {
                     .join(",");
                 conditions.push(format!("t.id IN ({list})"));
             }
+        }
+
+        // L'année d'enregistrement vit sur l'ALBUM : jointure par EXISTS.
+        if let Some(y) = original_year {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND alo.original_year = {})",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Int(y as i64));
+            idx += 1;
         }
 
         // Favoris du profil 1 : la piste elle-même, ou son album.

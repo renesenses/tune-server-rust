@@ -164,16 +164,13 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // after a restart without waiting for multicast (#1126). Runs concurrently
     // with SSDP; the registry is keyed by UUID so the first to win re-attaches
     // the zone and the other is a no-op.
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        crate::routes::devices::reprobe_persisted_dlna_devices(&state_clone).await;
-    });
-
-    // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
-    // so one with a lazy SSDP responder (Cyrus Stream X2) comes back online
-    // after a restart without waiting for multicast (#1126). Runs concurrently
-    // with SSDP; the registry is keyed by UUID so the first to win re-attaches
-    // the zone and the other is a no-op.
+    //
+    // UNE SEULE fois. Ce bloc etait present en double, commentaire compris :
+    // chaque appareil persiste etait sonde DEUX fois en parallele. Sur un
+    // renderer eteint ou parti du reseau, cela doublait la sequence de
+    // reprises — 16 tentatives au lieu de 8, ~3 minutes de tampons reseau et
+    // de journal au demarrage (journal de JP Borderies, 0.9.83, ou chaque
+    // ligne `discovered_dlna_reprobe_retry` apparait exactement deux fois).
     let state_clone = state.clone();
     tokio::spawn(async move {
         crate::routes::devices::reprobe_persisted_dlna_devices(&state_clone).await;
@@ -292,6 +289,33 @@ fn ensure_zones_is_hidden(state: &AppState) {
             }
         }
         _ => {}
+    }
+
+    // Aucune zone ne peut être en lecture au démarrage : c'est ce processus qui
+    // la produit. Un `playing` trouvé ici est donc forcément un reliquat — arrêt
+    // brutal pendant une lecture, enceinte DLNA coupée au secteur, sondage
+    // interrompu.
+    //
+    // Et ce reliquat coûte cher. `any_zone_playing` (replaygain.rs) lit CETTE
+    // colonne pour décider si l'analyse acoustique et le ReplayGain doivent
+    // s'effacer devant la lecture. Une zone figée à `playing` les bloque donc
+    // **définitivement**, et comme la valeur est persistée, redémarrer n'y
+    // change rien — trois signalements convergents (#1464 Bertrand, #1456 Bruno
+    // Lescarret, #1457 Bilou), tous décrivant une jauge immobile « sans lecture
+    // en cours », tous ayant redémarré en vain.
+    //
+    // Le symptôme est illisible parce que rien ne relie la cause à l'effet :
+    // l'utilisateur ne joue rien, voit une analyse figée, et conclut à un
+    // blocage du scan.
+    match state.backend.execute(
+        "UPDATE zones SET last_play_state = 'stopped' WHERE last_play_state = 'playing'",
+        &[],
+    ) {
+        Ok(n) if n > 0 => {
+            info!(zones = n, "zones_stale_playing_state_reset");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "zones_stale_playing_reset_failed"),
     }
 }
 
@@ -1255,6 +1279,43 @@ mod asio_warm_scan_tests {
         assert_eq!(
             path.parent(),
             crate::config::default_log_file_path().parent()
+        );
+    }
+}
+
+#[cfg(test)]
+mod demarrage_sans_doublon_tests {
+    /// Le re-sondage DLNA au demarrage etait ecrit DEUX FOIS dans
+    /// `init_state`, commentaire compris. Chaque appareil persiste etait donc
+    /// sonde deux fois en parallele : sur un renderer eteint, la sequence de
+    /// reprises jouait en double — 16 tentatives au lieu de 8, pres de trois
+    /// minutes de tampons reseau et de journal au demarrage.
+    ///
+    /// Repere dans le journal de JP Borderies (0.9.83) : chaque ligne
+    /// `discovered_dlna_reprobe_retry` y apparait exactement deux fois, pour
+    /// le meme uuid, a la meme milliseconde.
+    ///
+    /// Ce test lit le CONTENU de `init_state`. Un doublon de ce genre ne se
+    /// voit pas a la relecture — les deux blocs sont identiques et separes par
+    /// rien — mais il se compte.
+    #[test]
+    fn le_resondage_dlna_n_est_lance_qu_une_fois() {
+        let source = include_str!("startup.rs");
+        let init = source
+            .split("pub async fn init_state")
+            .nth(1)
+            .expect("init_state introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de init_state introuvable");
+
+        let n = init.matches("reprobe_persisted_dlna_devices").count();
+        assert_eq!(
+            n, 1,
+            "`reprobe_persisted_dlna_devices` est lance {n} fois dans \
+             init_state. Chaque appel sonde TOUS les appareils persistes : le \
+             doubler double aussi la sequence de reprises sur un renderer \
+             injoignable."
         );
     }
 }
