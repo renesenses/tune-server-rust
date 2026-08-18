@@ -1,0 +1,3878 @@
+{
+  "routes": [
+    {
+      "route": "/cloud/license/activate",
+      "type": "LicenseActivateResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "tier"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/cloud/license/deactivate",
+      "type": "LicenseActivateResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "tier"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/cloud/license/status",
+      "type": "LicenseStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "tier",
+        "license_key",
+        "expires_at",
+        "features",
+        "zone_limit",
+        "hardware_fingerprint"
+      ],
+      "champs_optionnels": [
+        "session_conflict"
+      ]
+    },
+    {
+      "route": "/cloud/license/validate",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/cloud/sso/disconnect",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "status"
+      ]
+    },
+    {
+      "route": "/devices",
+      "type": "DiscoveredDevice",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "type",
+        "host",
+        "port"
+      ],
+      "champs_optionnels": [
+        "available",
+        "capabilities",
+        "manufacturer",
+        "model",
+        "mac_address"
+      ]
+    },
+    {
+      "route": "/devices/${encodeURIComponent",
+      "type": "DiscoveredDevice",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "type",
+        "host",
+        "port"
+      ],
+      "champs_optionnels": [
+        "available",
+        "capabilities",
+        "manufacturer",
+        "model",
+        "mac_address"
+      ]
+    },
+    {
+      "route": "/devices/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "device_id"
+      ],
+      "champs_optionnels": [
+        "message"
+      ]
+    },
+    {
+      "route": "/devices/catalog",
+      "type": "DeviceCatalog",
+      "liste": false,
+      "champs_obligatoires": [
+        "version",
+        "brands"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/devices/clear",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "cleared"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/dj/waveform/{}",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "track_id",
+        "waveform",
+        "bpm"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/eq/expert-settings",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "expert_bands"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/eq/presets",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "presets"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/eq/presets",
+      "type": "EqProPreset",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "eq_type",
+        "bands"
+      ],
+      "champs_optionnels": [
+        "zone_id",
+        "created_at"
+      ]
+    },
+    {
+      "route": "/ext/bandcamp/album",
+      "type": "BandcampAlbumDetail",
+      "liste": false,
+      "champs_obligatoires": [
+        "title",
+        "artist",
+        "url",
+        "track_count",
+        "tracks",
+        "quality",
+        "lossless"
+      ],
+      "champs_optionnels": [
+        "art_id",
+        "quality_note"
+      ]
+    },
+    {
+      "route": "/ext/bandcamp/collection",
+      "type": "BandcampCollectionPage",
+      "liste": false,
+      "champs_obligatoires": [
+        "fan_id",
+        "count",
+        "items",
+        "more_available",
+        "last_token"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/ext/bandcamp/collection/link",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "username",
+        "fan_id",
+        "linked"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/ext/bandcamp/discover",
+      "type": "BandcampDecouverte",
+      "liste": false,
+      "champs_obligatoires": [
+        "tag",
+        "sort",
+        "page",
+        "items",
+        "qualite",
+        "lossless"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/ext/bandcamp/search",
+      "type": "BandcampRecherche",
+      "liste": false,
+      "champs_obligatoires": [
+        "q",
+        "artistes",
+        "albums",
+        "pistes"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/ext/bandcamp/tags",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tags"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/home",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "sections"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums",
+      "type": "Album",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/library/albums-detailed",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "items",
+        "total"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/batch-update",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "updated",
+        "total"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/recent",
+      "type": "Album",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/library/albums/{}",
+      "type": "Album",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/artwork/rescan",
+      "type": "ArtworkRescanResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "cover_path"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/{}/bio",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "bio",
+        "source"
+      ],
+      "champs_optionnels": [
+        "release_id"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/similar",
+      "type": "Album",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/tracks${qs",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/library/ambiances",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ambiances"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/artists",
+      "type": "Artist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "sort_name",
+        "musicbrainz_id",
+        "discogs_id",
+        "bio",
+        "image_path",
+        "image_source",
+        "source_id"
+      ]
+    },
+    {
+      "route": "/library/artists/{}",
+      "type": "Artist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "sort_name",
+        "musicbrainz_id",
+        "discogs_id",
+        "bio",
+        "image_path",
+        "image_source",
+        "source_id"
+      ]
+    },
+    {
+      "route": "/library/artists/{}/albums",
+      "type": "Album",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/library/artists/{}/bio",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "bio"
+      ],
+      "champs_optionnels": [
+        "source"
+      ]
+    },
+    {
+      "route": "/library/artists/{}/credits",
+      "type": "TrackCredit",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "track_id",
+        "artist_id",
+        "artist_name",
+        "role",
+        "instrument",
+        "position"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/artists/{}/metadata",
+      "type": "ArtistMetadata",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "bio",
+        "bio_fr",
+        "bio_en",
+        "anecdotes",
+        "similar_artists",
+        "members",
+        "discography_highlights",
+        "image_url",
+        "enrichment_status"
+      ]
+    },
+    {
+      "route": "/library/artists/{}/tracks",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/library/artwork/enrich-artists",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "artists_without_image"
+      ]
+    },
+    {
+      "route": "/library/artwork/enrich-artists/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "result",
+        "artists_without_image"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/artwork/rescan",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/browse",
+      "type": "BrowseRootsResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "roots"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/browse/dir",
+      "type": "BrowseResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "path",
+        "parent",
+        "music_root",
+        "directories",
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "accessible",
+        "access_error"
+      ]
+    },
+    {
+      "route": "/library/enrich-all",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/enrich-all/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "enriched",
+        "total"
+      ],
+      "champs_optionnels": [
+        "errors"
+      ]
+    },
+    {
+      "route": "/library/history",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "items",
+        "total"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/history/at",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "weekday",
+        "hour",
+        "period",
+        "tracks"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/history/dashboard",
+      "type": "DashboardData",
+      "liste": false,
+      "champs_obligatoires": [
+        "period",
+        "range",
+        "totals",
+        "top_artists",
+        "top_albums",
+        "top_tracks",
+        "trend",
+        "hourly",
+        "by_zone",
+        "by_source",
+        "completion"
+      ],
+      "champs_optionnels": [
+        "top_radios",
+        "by_genre",
+        "weekday_hourly",
+        "streak",
+        "on_this_day"
+      ]
+    },
+    {
+      "route": "/library/history/top-artists",
+      "type": "TopArtist",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "plays"
+      ],
+      "champs_optionnels": [
+        "artist_name",
+        "play_count",
+        "artist_id",
+        "id"
+      ]
+    },
+    {
+      "route": "/library/history/top-tracks",
+      "type": "TopTrack",
+      "liste": true,
+      "champs_obligatoires": [
+        "title",
+        "artist_name",
+        "album_title",
+        "cover_path",
+        "track_id",
+        "source",
+        "plays"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/history/tracks/{}/plays",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "track_id",
+        "plays"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/reports",
+      "type": "MetadataReportResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "reported",
+        "entity",
+        "image_cleared",
+        "pushed"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/search",
+      "type": "SearchResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks",
+        "albums",
+        "artists"
+      ],
+      "champs_optionnels": [
+        "playlists"
+      ]
+    },
+    {
+      "route": "/library/search/acoustic/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "available",
+        "enabled",
+        "analysed_tracks"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/smart-collections",
+      "type": "SmartCollection",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "description",
+        "icon",
+        "color",
+        "rules",
+        "match_mode",
+        "sort_by",
+        "sort_order",
+        "max_albums",
+        "auto_refresh",
+        "created_at",
+        "updated_at"
+      ],
+      "champs_optionnels": [
+        "album_count"
+      ]
+    },
+    {
+      "route": "/library/smart-collections/preview",
+      "type": "SmartCollectionPreview",
+      "liste": false,
+      "champs_obligatoires": [
+        "total",
+        "albums"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/smart-collections/{}",
+      "type": "SmartCollection",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "description",
+        "icon",
+        "color",
+        "rules",
+        "match_mode",
+        "sort_by",
+        "sort_order",
+        "max_albums",
+        "auto_refresh",
+        "created_at",
+        "updated_at"
+      ],
+      "champs_optionnels": [
+        "album_count"
+      ]
+    },
+    {
+      "route": "/library/smart-playlists",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/smart-playlists/{}",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "deleted"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/stats",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks",
+        "albums",
+        "artists"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/stats/completeness",
+      "type": "CompletenessStats",
+      "liste": false,
+      "champs_obligatoires": [
+        "total_albums",
+        "albums_without_cover",
+        "albums_without_genre",
+        "albums_without_year",
+        "total_artists",
+        "artists_without_image",
+        "total_tracks",
+        "tracks_without_artist",
+        "doubtful_count"
+      ],
+      "champs_optionnels": [
+        "albums_without_artist"
+      ]
+    },
+    {
+      "route": "/library/tracks/{}",
+      "type": "Track",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/library/tracks/{}/credits",
+      "type": "TrackCredit",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "track_id",
+        "artist_id",
+        "artist_name",
+        "role",
+        "instrument",
+        "position"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/tracks/{}/lyrics",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "lyrics",
+        "synced",
+        "source"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/tracks/{}/similar",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "seed_track_id",
+        "count",
+        "items"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/metadata/artists/{}/enrich",
+      "type": "ArtistMetadata",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "bio",
+        "bio_fr",
+        "bio_en",
+        "anecdotes",
+        "similar_artists",
+        "members",
+        "discography_highlights",
+        "image_url",
+        "enrichment_status"
+      ]
+    },
+    {
+      "route": "/metadata/doubtful",
+      "type": "DoubtfulAlbum",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title",
+        "artist_name",
+        "artist_resolved",
+        "genre",
+        "year",
+        "cover_path",
+        "source",
+        "reasons"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/media-servers/${encodeURIComponent",
+      "type": "MediaServerBrowseResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "object_id",
+        "containers",
+        "items",
+        "total_matches",
+        "number_returned"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/media-servers/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "url"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/media-servers/{}/item/{}/play/{}",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/network/smb/mount",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok"
+      ],
+      "champs_optionnels": [
+        "message",
+        "error"
+      ]
+    },
+    {
+      "route": "/network/smb/mount",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "mount_path",
+        "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/offline/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "total",
+        "size_bytes",
+        "pending"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/onboarding/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "complete",
+        "current_step"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/outputs/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok",
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/outputs/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/outputs/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playback/shuffle-all",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "track_count"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlist-manager/backups/{}",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "deleted",
+        "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlist-manager/backups/{}/restore",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "local_playlist_id",
+        "name",
+        "tracks_restored",
+        "tracks_matched",
+        "tracks_not_found"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlists",
+      "type": "Playlist",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "description",
+        "track_count"
+      ]
+    },
+    {
+      "route": "/playlists/all",
+      "type": "UnifiedPlaylistsResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "local",
+        "services"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlists/diff",
+      "type": "PlaylistDiffResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "source_name",
+        "target_name",
+        "only_in_source",
+        "only_in_target",
+        "in_both"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlists/import",
+      "type": "PlaylistImportResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "playlist_id",
+        "name",
+        "tracks_imported"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlists/transfer",
+      "type": "PlaylistTransferResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "playlist_id",
+        "playlist_name",
+        "total_tracks",
+        "matched",
+        "not_found",
+        "approximate",
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "local_playlist_id",
+        "target_service"
+      ]
+    },
+    {
+      "route": "/playlists/{}",
+      "type": "Playlist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "description",
+        "track_count"
+      ]
+    },
+    {
+      "route": "/playlists/{}/recover",
+      "type": "PlaylistRecoverResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "playlist_name",
+        "total_tracks",
+        "available",
+        "unavailable",
+        "recovered",
+        "tracks"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlists/{}/recover/apply",
+      "type": "RecoverApplyResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "replaced",
+        "failed"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/playlists/{}/tracks",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/playlists/{}/tracks",
+      "type": "Playlist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "description",
+        "track_count"
+      ]
+    },
+    {
+      "route": "/plugins",
+      "type": "InstalledPlugin",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "version",
+        "status",
+        "description"
+      ],
+      "champs_optionnels": [
+        "error_message"
+      ]
+    },
+    {
+      "route": "/plugins",
+      "type": "MergedPlugin",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "display_name",
+        "description",
+        "version",
+        "category",
+        "compatible",
+        "installed",
+        "update_available",
+        "status"
+      ],
+      "champs_optionnels": [
+        "author",
+        "icon",
+        "install_count",
+        "platforms",
+        "enabled",
+        "installed_version",
+        "error_message",
+        "source",
+        "min_tune_version",
+        "max_tune_version",
+        "is_featured",
+        "marketplace",
+        "slug"
+      ]
+    },
+    {
+      "route": "/plugins/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/plugins/${encodeURIComponent",
+      "type": "MergedPlugin",
+      "liste": false,
+      "champs_obligatoires": [
+        "name",
+        "display_name",
+        "description",
+        "version",
+        "category",
+        "compatible",
+        "installed",
+        "update_available",
+        "status"
+      ],
+      "champs_optionnels": [
+        "author",
+        "icon",
+        "install_count",
+        "platforms",
+        "enabled",
+        "installed_version",
+        "error_message",
+        "source",
+        "min_tune_version",
+        "max_tune_version",
+        "is_featured",
+        "marketplace",
+        "slug"
+      ]
+    },
+    {
+      "route": "/profiles/{}/favorites/streaming{}",
+      "type": "StreamingFavorite",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "profile_id",
+        "item_type",
+        "service",
+        "service_id"
+      ],
+      "champs_optionnels": [
+        "title",
+        "artist",
+        "album",
+        "cover_url"
+      ]
+    },
+    {
+      "route": "/radios",
+      "type": "RadioStation",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "stream_url",
+        "favorite"
+      ],
+      "champs_optionnels": [
+        "logo_url",
+        "genre",
+        "tags",
+        "codec",
+        "country",
+        "homepage_url"
+      ]
+    },
+    {
+      "route": "/radios${qs",
+      "type": "RadioStation",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "stream_url",
+        "favorite"
+      ],
+      "champs_optionnels": [
+        "logo_url",
+        "genre",
+        "tags",
+        "codec",
+        "country",
+        "homepage_url"
+      ]
+    },
+    {
+      "route": "/radios/{}",
+      "type": "RadioStation",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "stream_url",
+        "favorite"
+      ],
+      "champs_optionnels": [
+        "logo_url",
+        "genre",
+        "tags",
+        "codec",
+        "country",
+        "homepage_url"
+      ]
+    },
+    {
+      "route": "/radios/{}/play/{}",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/smart-ai/discovery",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "name"
+      ]
+    },
+    {
+      "route": "/smart-ai/generate",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "name"
+      ]
+    },
+    {
+      "route": "/smart-ai/history-based",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "name"
+      ]
+    },
+    {
+      "route": "/smart-ai/mood",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "name"
+      ]
+    },
+    {
+      "route": "/smart-ai/tempo-match",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "name"
+      ]
+    },
+    {
+      "route": "/snapcast/clients",
+      "type": "SnapcastClient",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "host",
+        "mac",
+        "connected",
+        "volume"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/snapcast/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled"
+      ],
+      "champs_optionnels": [
+        "reason",
+        "binary",
+        "stream_count"
+      ]
+    },
+    {
+      "route": "/sonos/discover",
+      "type": "SonosSpeaker",
+      "liste": true,
+      "champs_obligatoires": [
+        "uid",
+        "name",
+        "ip",
+        "is_coordinator",
+        "group_uid"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/sonos/speakers",
+      "type": "SonosSpeaker",
+      "liste": true,
+      "champs_obligatoires": [
+        "uid",
+        "name",
+        "ip",
+        "is_coordinator",
+        "group_uid"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/spotify-connect/disable",
+      "type": "SpotifyConnectStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "available",
+        "device_name",
+        "zone_id",
+        "binary_available",
+        "stream_url",
+        "active"
+      ],
+      "champs_optionnels": [
+        "reason"
+      ]
+    },
+    {
+      "route": "/spotify-connect/enable",
+      "type": "SpotifyConnectStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "available",
+        "device_name",
+        "zone_id",
+        "binary_available",
+        "stream_url",
+        "active"
+      ],
+      "champs_optionnels": [
+        "reason"
+      ]
+    },
+    {
+      "route": "/spotify-connect/status",
+      "type": "SpotifyConnectStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "available",
+        "device_name",
+        "zone_id",
+        "binary_available",
+        "stream_url",
+        "active"
+      ],
+      "champs_optionnels": [
+        "reason"
+      ]
+    },
+    {
+      "route": "/squeezebox/discover",
+      "type": "SqueezeboxStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "lms_host",
+        "lms_discovered",
+        "players"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/squeezebox/players/${encodeURIComponent",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/squeezebox/status",
+      "type": "SqueezeboxStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "lms_host",
+        "lms_discovered",
+        "players"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "StreamingAuthResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "authenticated"
+      ],
+      "champs_optionnels": [
+        "verification_url",
+        "user_code"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "disconnected"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "StreamingServiceStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "authenticated"
+      ],
+      "champs_optionnels": [
+        "username",
+        "subscription"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "SearchResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks",
+        "albums",
+        "artists"
+      ],
+      "champs_optionnels": [
+        "playlists"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "Album",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "Artist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "sort_name",
+        "musicbrainz_id",
+        "discogs_id",
+        "bio",
+        "image_path",
+        "image_source",
+        "source_id"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "FeaturedSection",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "StreamingPlaylist",
+      "liste": true,
+      "champs_obligatoires": [
+        "source_id",
+        "name",
+        "track_count",
+        "duration_ms",
+        "source"
+      ],
+      "champs_optionnels": [
+        "description",
+        "cover_path"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "PlaylistTagGroup",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "playlists"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "StreamingGenre",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "has_children"
+      ],
+      "champs_optionnels": [
+        "image_url"
+      ]
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/auth/device-code",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "user_code",
+        "verification_url",
+        "device_code",
+        "expires_in"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/auth/poll",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "authenticated",
+        "pending",
+        "email"
+      ]
+    },
+    {
+      "route": "/streaming/youtube/auth/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "authenticated",
+        "email"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/home",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "sections",
+        "data"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/library",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/streaming/youtube/moods",
+      "type": "(en ligne)",
+      "liste": true,
+      "champs_obligatoires": [
+        "title",
+        "items"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/moods/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": true,
+      "champs_obligatoires": [
+        "title",
+        "playlistId",
+        "description",
+        "cover_path"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/admin/connections",
+      "type": "AdminConnections",
+      "liste": false,
+      "champs_obligatoires": [
+        "websocket_connections",
+        "http_streamer_sessions"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/admin/discovery",
+      "type": "AdminDiscovery",
+      "liste": false,
+      "champs_obligatoires": [
+        "devices",
+        "protocols",
+        "device_count"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/admin/errors",
+      "type": "AdminError",
+      "liste": true,
+      "champs_obligatoires": [
+        "ts",
+        "level",
+        "event"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/admin/health",
+      "type": "AdminHealth",
+      "liste": false,
+      "champs_obligatoires": [
+        "cpu_percent",
+        "ram_mb",
+        "ram_total_mb",
+        "disk_free_gb",
+        "disk_total_gb",
+        "uptime_seconds",
+        "uptime_formatted",
+        "open_fds",
+        "pid",
+        "python_threads"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/admin/zones",
+      "type": "AdminZone",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "state",
+        "output_type",
+        "device_name",
+        "online",
+        "current_track",
+        "position_ms",
+        "volume",
+        "buffer",
+        "group_id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/audio-check",
+      "type": "AudioCheckResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "zones",
+        "zones_with_output",
+        "local_outputs",
+        "network_renderers",
+        "has_audio",
+        "issues"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/backups",
+      "type": "BackupInfo",
+      "liste": true,
+      "champs_obligatoires": [
+        "filename",
+        "size",
+        "created_at"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/backups/${encodeURIComponent",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "restored"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/config/import",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "imported"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/database/rebuild-fts",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "rows_indexed",
+        "message"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/diagnostics",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "server_version",
+        "uptime_seconds",
+        "active_zones",
+        "tracks_count",
+        "albums_count",
+        "artists_count",
+        "connectors",
+        "memory_rss_mb",
+        "scan_status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/diagnostics/network",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "multicast_ssdp",
+        "port_8888",
+        "internet",
+        "dns_resolution",
+        "renderers"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/enrich",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/health/alerts",
+      "type": "HealthAlert",
+      "liste": true,
+      "champs_obligatoires": [
+        "timestamp",
+        "level",
+        "category",
+        "message"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/health/monitor",
+      "type": "HealthMonitorResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "uptime_seconds",
+        "checks",
+        "alerts"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/music-dirs",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "music_dirs"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/music-dirs/remove",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "music_dirs"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/peers",
+      "type": "TunePeer",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "host",
+        "port",
+        "version",
+        "tracks",
+        "zones"
+      ],
+      "champs_optionnels": [
+        "server_id",
+        "online"
+      ]
+    },
+    {
+      "route": "/system/peers",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/restart",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "music_dirs"
+      ],
+      "champs_optionnels": [
+        "full"
+      ]
+    },
+    {
+      "route": "/system/scan/report",
+      "type": "ScanReport",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "total_files",
+        "inserted",
+        "updated",
+        "skipped",
+        "skipped_unchanged",
+        "skipped_duplicate",
+        "skipped_no_metadata",
+        "metadata_timeout",
+        "db_insert_failed",
+        "db_update_failed",
+        "missing_dirs",
+        "missing_dir_reasons",
+        "error_dirs",
+        "failed_paths"
+      ]
+    },
+    {
+      "route": "/system/scan/schedule",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "time"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/scan/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "scanning"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/stats",
+      "type": "SystemStats",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks",
+        "albums",
+        "artists",
+        "zones",
+        "devices"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/youtube/enable",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "installed"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/youtube/status",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "installed",
+        "version",
+        "status"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/tags",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/tags/for/{}/{}",
+      "type": "UserTag",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "color"
+      ],
+      "champs_optionnels": [
+        "count"
+      ]
+    },
+    {
+      "route": "/tags/search",
+      "type": "UserTag",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "color"
+      ],
+      "champs_optionnels": [
+        "count"
+      ]
+    },
+    {
+      "route": "/tags/{}",
+      "type": "UserTag",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "color"
+      ],
+      "champs_optionnels": [
+        "count"
+      ]
+    },
+    {
+      "route": "/tags/{}/albums",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "albums",
+        "count"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/tags/{}/items/batch",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tagged"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/group",
+      "type": "ZoneGroupResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "group_id",
+        "leader_id",
+        "zone_ids",
+        "auto_synced",
+        "group_manufacturer"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/group-delays",
+      "type": "GroupDelay",
+      "liste": true,
+      "champs_obligatoires": [
+        "tech_a",
+        "tech_b",
+        "delay_ms"
+      ],
+      "champs_optionnels": [
+        "calibrated_at"
+      ]
+    },
+    {
+      "route": "/zones/groups/list",
+      "type": "ZoneGroupResponse",
+      "liste": true,
+      "champs_obligatoires": [
+        "group_id",
+        "leader_id",
+        "zone_ids",
+        "auto_synced",
+        "group_manufacturer"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/stereo-pair",
+      "type": "StereoPairResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "stereo_pair_id",
+        "left_zone_id",
+        "right_zone_id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/stereo-pairs",
+      "type": "StereoPairInfo",
+      "liste": true,
+      "champs_obligatoires": [
+        "stereo_pair_id",
+        "left_zone",
+        "right_zone"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/audiophile",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/crossfade",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "duration"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/device-presets",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "presets"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/dsp",
+      "type": "DspSettings",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "eq_profile",
+        "crossfeed"
+      ]
+    },
+    {
+      "route": "/zones/{}/eq",
+      "type": "EqSettings",
+      "liste": false,
+      "champs_obligatoires": [
+        "bands",
+        "enabled"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/next",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "queue_position"
+      ]
+    },
+    {
+      "route": "/zones/{}/pause",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/pins",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "supported",
+        "pins",
+        "max_slots"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/play",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/previous",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "queue_position"
+      ]
+    },
+    {
+      "route": "/zones/{}/quality",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "quality"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/queue",
+      "type": "QueueStateResponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "tracks",
+        "position",
+        "length"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/queue/add",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "queue_length"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/queue/jump",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/queue/move",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "queue_length"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/queue/{}",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "queue_length"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/renderer-capabilities",
+      "type": "RendererCapabilities",
+      "liste": false,
+      "champs_obligatoires": [
+        "probed"
+      ],
+      "champs_optionnels": [
+        "flac",
+        "wav",
+        "lpcm16",
+        "lpcm24",
+        "alac",
+        "aac",
+        "mp3",
+        "dsd",
+        "sink",
+        "reason",
+        "message"
+      ]
+    },
+    {
+      "route": "/zones/{}/repeat",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "repeat"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/resume",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/seek",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/share",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "title",
+        "artist",
+        "album",
+        "text",
+        "cover_url"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/shuffle",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "shuffle"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/sleep",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "active"
+      ],
+      "champs_optionnels": [
+        "remaining_seconds",
+        "fading"
+      ]
+    },
+    {
+      "route": "/zones/{}/stop",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}/transfer/{}",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    }
+  ],
+  "non_resolus": [
+    {
+      "route": "/zones",
+      "type": "T>(url: string, options?: RequestInit): Promise<T> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    if (response.status === 402) {\n      try {\n        const body = await response.json();\n        notifications.error(body?.message || 'Tune Premium requis pour cette fonctionnalite');\n      } catch {\n        notifications.error('Tune Premium requis pour cette fonctionnalite');\n      }\n      throw new Error('premium_required');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    } else {\n      // Surface actionable playback failures that callers would otherwise\n      // swallow (they fire play/next/resume without awaiting): a missing local\n      // file or a zone with no output device. Localised so it matches the UI.\n      const key = err.code ? PLAY_ERROR_KEYS[err.code] : undefined;\n      if (key) notifications.error(get(t)(key as any));\n    }\n    throw err;\n  }\n  const text = await response.text();\n  if (text.trimStart().startsWith('<!') || text.trimStart().toLowerCase().startsWith('<html')) {\n    throw new Error('Expected JSON but received HTML — check the endpoint URL');\n  }\n  // A 204, or any 2xx with an empty body, is a success with nothing to parse.\n  // Many mutating endpoints answer that way; treating it as a parse failure\n  // made successful writes surface as errors in the UI (the rating that saved\n  // fine but showed \"Erreur notation\").\n  if (response.status === 204 || text.trim() === '') {\n    return undefined as T;\n  }\n  try {\n    return JSON.parse(text) as T;\n  } catch {\n    throw new Error('Invalid JSON response');\n  }\n}\n\n/** Wrap a promise with a timeout — rejects with an Error after `ms` milliseconds. */\nexport function withTimeout<T>(promise: Promise<T>, ms: number, label = 'request'): Promise<T> {\n  return new Promise<T>((resolve, reject) => {\n    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);\n    promise.then(\n      (v) => { clearTimeout(timer); resolve(v); },\n      (e) => { clearTimeout(timer); reject(e); },\n    );\n  });\n}\n\nasync function fetchVoid(url: string, options?: RequestInit): Promise<void> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    }\n    throw err;\n  }\n}\n\n// --- Zones ---\n\nexport function getZones() {\n  return fetchJSON<Zone[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/devices/audio",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/pins",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/pins/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/pins/{}/invoke",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/pins/from-queue",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/overview",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/zones/{}/hot-swap",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/zones/{}/mute",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups/${encodeURIComponent",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups/${encodeURIComponent",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/profiles",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/profiles",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/profiles/{}/activate",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/measure-latency",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups/${encodeURIComponent",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/zones/{}/health",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups/${encodeURIComponent",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/sync/stats",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zone-manager/groups/${encodeURIComponent",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/artists",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/tracks",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/tracks",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/facets",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/folder-facet",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/tracks",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/network/media-servers",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/tags/{}",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/tags/{}",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/tags/{}/items",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/tags/{}/items/{}/{}",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/artists/{}/timeline",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/eq",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/eq",
+      "type": "EqSetResult",
+      "raison": "type introuvable dans les sources"
+    },
+    {
+      "route": "/system/stats/listening",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/smart-playlists",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/smart-playlists/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/smart-playlists/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/smart-playlists/{}/tracks",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/health",
+      "type": "FederatedSearchResult>(url).then(result => {\n    if (result.local) result.local.tracks = mapStreamingTracks(result.local.tracks);\n    if (result.services) {\n      for (const key of Object.keys(result.services)) {\n        result.services[key].tracks = mapStreamingTracks(result.services[key].tracks);\n        result.services[key].albums = mapStreamingAlbums(result.services[key].albums);\n        // The server's StreamTrack/StreamAlbum carry no `source` field, so a\n        // track played from global search had no source and did nothing\n        // (DEvir). Stamp the service key as the source so play/queue actions\n        // can route these streaming results.\n        for (const t of result.services[key].tracks ?? []) if (t && !t.source) t.source = key;\n        for (const a of result.services[key].albums ?? []) if (a && !a.source) a.source = key;\n      }\n    }\n    return result;\n  });\n}\n\n// --- System ---\n\nexport function getHealth() {\n  return fetchJSON<SystemHealth",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/config",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/database/status",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/config",
+      "type": "Record<string, unknown>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/peers/{}/browse",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/peers/{}/transfer",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/streaming/services",
+      "type": "Record<string, StreamingServiceStatus>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/streaming/${encodeURIComponent",
+      "type": "Record<string, any[]>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}/favorites/streaming/add",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/match",
+      "type": "Record<string, import('./types').Track>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/streaming/youtube/auth/logout",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/streaming/youtube/charts",
+      "type": "Record<string, any[]>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/services",
+      "type": "Record<string, { authenticated: boolean; supports_write: boolean }>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/transfer",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/batch-transfer",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/merge",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/backup",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/backups/{}",
+      "type": "PlaylistSnapshot[]>(url);\n}\n\nexport function getPlaylistSnapshot(id: number) {\n  return fetchJSON<SnapshotDetail",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/links",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/links",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/links/{}/sync",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/links/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/history",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlist-manager/history/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}/favorites{}",
+      "type": "Array<{ item_type: string; item_id: number }>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}/favorites/add",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}/favorites/check",
+      "type": "Array<{ item_id: number; is_favorite: boolean }>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/network/shares",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/network/shares/${encodeURIComponent",
+      "type": "any>(url);\n}\n\nexport function listHostShares(hostId: string) {\n  return fetchJSON<{ shares: string[] }",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/network/mounts",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/enable/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/disable/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/load/{}/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/crossfade/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/auto-crossfade/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/status/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/play/{}/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/pause/{}/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/crossfader/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/analyze/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/sync-tempo/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/dj/volume/{}/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/party/status",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/party/add",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/party/vote",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/party/vote/reset{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/party/queue{}",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/radio-favorites/create-playlist",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/sleep",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/queue/save-as-playlist",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/crossfade",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/normalization",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/dsp",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/recommendations",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/history/dashboard",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums/{}/rate",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums/{}/rating",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums/top-rated",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/collaborative",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/collaborative",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/collaborative/{}/add",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/collaborative/{}/tracks",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/collaborative/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/alarm",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/alarm",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/alarm",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/tracks/{}/quick-fav",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums/{}/quick-fav",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections/{}/albums",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections/{}/albums/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/collections/{}/albums/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/duplicates/smart",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/activity",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/playlists/{}/share",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/now-listening",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/audio-profile",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/audio-profile",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/ratings/export",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/ratings/import",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/smart-collections/{}/albums",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/home/continue-listening",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/home/recently-added",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/home/new-in-library",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/home/recommendations",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/home/top-mixes",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/home/radio-picks",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/offline/downloads",
+      "type": "any[]",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/profile",
+      "type": "Record<string, unknown>",
+      "raison": "type non structurel"
+    }
+  ],
+  "resume": {
+    "routes_cartographiees": 198,
+    "appels_non_resolus": 139
+  }
+}
