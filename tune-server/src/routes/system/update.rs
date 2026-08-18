@@ -1815,6 +1815,13 @@ async fn fetch_github_changelog() -> Result<Value, String> {
 fn changelog_hardcoded() -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
+        // Dit au client que ces notes sont un secours, pas l'actualité du
+        // produit. Sans ce drapeau, le panneau badge sa première entrée
+        // « Récent » — soit « v0.8.15 » annoncée comme la version en cours sur
+        // un serveur bien plus récent. Un panneau vide n'affirmait rien ; un
+        // panneau mal étiqueté affirme quelque chose de faux, ce qui est pire.
+        // Lu par `WhatsNew.svelte` (tune-web-client#501).
+        "offline": true,
         "entries": [
             {
                 "version": "0.8.15",
@@ -2315,6 +2322,18 @@ mod changelog_fallback_tests {
         assert!(
             body["version"].is_string(),
             "le repli doit annoncer la version du serveur"
+        );
+    }
+
+    /// Le client distingue un secours d'une vraie réponse par ce seul drapeau.
+    /// S'il disparaît, le panneau rebadge « Récent » sur une entrée de juin.
+    #[test]
+    fn le_repli_sannonce_comme_tel() {
+        let body = changelog_hardcoded().0;
+        assert_eq!(
+            body["offline"],
+            serde_json::json!(true),
+            "sans ce drapeau, WhatsNew.svelte presente le secours comme l'actualite"
         );
     }
 
