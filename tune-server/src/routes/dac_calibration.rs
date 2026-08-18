@@ -225,7 +225,7 @@ async fn apply_profile_handler(
     // calibration n'atteint le son qu'a la piste SUIVANTE sur une zone locale
     // alors que la reponse annonce `applied: true` (#1725).
     let applique_a_chaud = match zone_id.parse::<i64>() {
-        Ok(id) => state.orchestrator.refresh_zone_eq(id).await,
+        Ok(id) => state.orchestrator.apply_eq_change(id).await,
         Err(_) => false,
     };
 
@@ -266,7 +266,7 @@ async fn remove_zone_profile_handler(
         // (#1725). `load_eq_processor` ne trouve plus de profil et rend `None`,
         // ce que `refresh_zone_eq` installe — l'egaliseur est bien vide.
         if let Ok(id) = zone_id.parse::<i64>() {
-            state.orchestrator.refresh_zone_eq(id).await;
+            state.orchestrator.apply_eq_change(id).await;
         }
 
         Ok(StatusCode::NO_CONTENT.into_response())

@@ -281,7 +281,7 @@ async fn apply_profile_handler(
     // musique en cours — c'est le geste meme qu'on attend de l'utilisateur.
     // `zone_id` est textuel sur cette route ; l'orchestrateur indexe par i64.
     let applique_a_chaud = match zone_id.parse::<i64>() {
-        Ok(id) => state.orchestrator.refresh_zone_eq(id).await,
+        Ok(id) => state.orchestrator.apply_eq_change(id).await,
         Err(_) => false,
     };
 

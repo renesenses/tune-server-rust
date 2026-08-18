@@ -219,6 +219,16 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
                 v.as_object_mut()
                     .unwrap()
                     .insert("stream_url".into(), json!(stream_url));
+                // Adresse joignable de l'exterieur, quand le pont est actif.
+                if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
+                    state.backend.clone(),
+                    stream_id,
+                    ext,
+                ) {
+                    v.as_object_mut()
+                        .unwrap()
+                        .insert("stream_url_remote".into(), json!(distant));
+                }
             }
         }
     }
@@ -480,6 +490,15 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
             v.as_object_mut()
                 .unwrap()
                 .insert("stream_url".into(), json!(stream_url));
+            if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
+                state.backend.clone(),
+                stream_id,
+                ext,
+            ) {
+                v.as_object_mut()
+                    .unwrap()
+                    .insert("stream_url_remote".into(), json!(distant));
+            }
         }
     }
     Json(v)
@@ -1952,7 +1971,7 @@ async fn set_eq(
     // (#1725). On regle un egaliseur musique en cours, a l'oreille — et trois
     // utilisateurs ont rapporte « l'egaliseur ne fonctionne pas » avant ca.
     // Sans effet quand rien ne joue, hors zone locale, ou en mode PURE.
-    let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+    let applique_a_chaud = state.orchestrator.apply_eq_change(zone_id).await;
 
     let bands = eq_bands_json(&profile);
     Json(json!({
