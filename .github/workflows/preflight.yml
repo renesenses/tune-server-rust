@@ -15,6 +15,8 @@ name: Preflight
 # - cahier_de_recette: a cahier-recette-v{major}.{minor}*.md file exists
 # - cargo_audit: no high-severity CVE in the dependency tree
 # - cargo_deny: licenses and duplicate-dep checks pass
+# - web_api_contract: le client web n'appelle aucune route que le serveur
+#   ne sert pas (scripts/preflight-web-contract.py, lu depuis main)
 # - ci_status: all check-runs on the commit are green (skipped for
 #   workflow_dispatch on a branch that hasn't had CI yet)
 
@@ -66,6 +68,23 @@ jobs:
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
             echo "skip_ci=${{ inputs.skip_ci_check }}" >> "$GITHUB_OUTPUT"
           fi
+
+      # Le web et le serveur sortent dans la MÊME version, mais rien ne
+      # vérifiait leur contrat : deux fois en trois jours, un écran web
+      # fusionné a failli partir en appelant une route serveur encore en PR
+      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). On lit main, la
+      # branche depuis laquelle la release construit son bundle.
+      - name: Checkout web client
+        uses: actions/checkout@v4
+        with:
+          repository: renesenses/tune-web-client
+          ref: main
+          path: .web-client
+
+      - name: Contrat d'API web ↔ serveur
+        run: |
+          python3 scripts/preflight-web-contract.py --self-test
+          python3 scripts/preflight-web-contract.py --web .web-client
 
       - name: Run preflight checks
         env:
