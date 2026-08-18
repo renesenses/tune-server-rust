@@ -45,6 +45,24 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # lui-même, le cœur, et les greffons in-tree (bandcamp, dj, karaoke…).
 SOURCES_SERVEUR = ["tune-server/src", "tune-core/src", "plugins"]
 
+# Routes déjà cassées AVANT ce contrôle, documentées dans #1893.
+#
+# Elles partent en 404 depuis un certain temps : ce n'est pas ce train qui les
+# a introduites. Les laisser rougir en permanence apprendrait à ignorer le
+# contrôle — et un contrôle qu'on ignore ne garde rien. Elles sont donc
+# tolérées NOMMÉMENT, jamais par une règle vague : toute NOUVELLE route absente
+# fait échouer le préflight.
+#
+# Retirer une ligne d'ici dès que la route est servie ou l'appel supprimé.
+SOCLE_CONNU: dict[str, str] = {
+    "/metadata/auto-fix": "#1893",
+    "/metadata/auto-fix-albums": "#1893",
+    "/metadata/auto-fix/status": "#1893",
+    "/metadata/duplicates/move-album": "#1893",
+    "/metadata/reclassify-genres-by-path": "#1893",
+    "/metadata/suggestions/accept-all": "#1893",
+}
+
 # Segments qui ne distinguent rien : les retenir produirait du bruit, et un
 # contrôle bruyant finit ignoré.
 SEGMENTS_GENERIQUES = {
@@ -165,13 +183,16 @@ def self_test() -> int:
     if restantes:
         echecs.append(f"le contrôle reste rouge alors que tout est servi : {restantes}")
 
+    if "/metadata/auto-fix" not in SOCLE_CONNU:
+        echecs.append("le socle connu a perdu une entrée sans que personne ne le voie")
+
     if echecs:
         for e in echecs:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 5 garanties vérifiées (extraction gabarit, "
-          "extraction apiFetch, détection, absence de bruit, contre-épreuve)")
+    print("SELF-TEST: ok — 6 garanties vérifiées (extraction gabarit, "
+          "extraction apiFetch, détection, absence de bruit, contre-épreuve, socle connu)")
     return 0
 
 
@@ -199,14 +220,25 @@ def main() -> int:
               "ce contrôle ne garde plus rien", file=sys.stderr)
         return 2
 
-    absentes = routes_absentes(routes, lire_sources_serveur())
+    toutes_absentes = routes_absentes(routes, lire_sources_serveur())
+    absentes = [(r, s) for r, s in toutes_absentes if r not in SOCLE_CONNU]
+    tolerees = [(r, s) for r, s in toutes_absentes if r in SOCLE_CONNU]
 
     print(f"routes appelées par le web : {len(routes)}")
+    for route, _ in tolerees:
+        print(f"  toléré ({SOCLE_CONNU[route]}) : {route}")
+
+    # Une entrée du socle qui a disparu des absentes est une route réparée :
+    # le dire, pour que la liste ne fossilise pas une dette déjà payée.
+    reparees = sorted(set(SOCLE_CONNU) - {r for r, _ in toutes_absentes})
+    for route in reparees:
+        print(f"  ✓ {route} est désormais servie — la retirer de SOCLE_CONNU")
+
     if not absentes:
-        print("✓ toutes sont servies par le serveur")
+        print("✓ aucune route absente hors socle connu")
         return 0
 
-    print(f"✗ {len(absentes)} route(s) appelée(s) mais introuvable(s) côté serveur :")
+    print(f"✗ {len(absentes)} route(s) NOUVELLE(s) appelée(s) mais introuvable(s) côté serveur :")
     for route, segment in absentes:
         print(f"    {route}   (segment « {segment} »)")
     print()
