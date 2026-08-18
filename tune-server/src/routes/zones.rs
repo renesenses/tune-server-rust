@@ -425,7 +425,7 @@ async fn set_zone_dsp(
             // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
             // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
             // ne le faisait pas.
-            eq_applique_a_chaud = state.orchestrator.refresh_zone_eq(id).await;
+            eq_applique_a_chaud = state.orchestrator.apply_eq_change(id).await;
         }
     }
 
@@ -1485,6 +1485,13 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                         server_ip, state.port, stream_id
                     );
                     obj.insert("stream_url".into(), json!(stream_url));
+                    if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
+                        state.backend.clone(),
+                        stream_id,
+                        "flac",
+                    ) {
+                        obj.insert("stream_url_remote".into(), json!(distant));
+                    }
                 }
             }
         }
@@ -1617,6 +1624,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                             server_ip, state.port, stream_id
                         );
                         obj.insert("stream_url".into(), json!(stream_url));
+                        if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
+                            state.backend.clone(),
+                            stream_id,
+                            "flac",
+                        ) {
+                            obj.insert("stream_url_remote".into(), json!(distant));
+                        }
                     }
                 }
             }

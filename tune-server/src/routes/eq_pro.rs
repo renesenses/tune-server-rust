@@ -393,7 +393,7 @@ async fn activate_preset(
 
             // Persister ne suffit pas : sans ceci le preset n'atteindrait le son
             // qu'à la piste suivante sur une zone locale (#1725).
-            let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+            let applique_a_chaud = state.orchestrator.apply_eq_change(zone_id).await;
 
             Json(json!({
                 "active_preset_id": id,
