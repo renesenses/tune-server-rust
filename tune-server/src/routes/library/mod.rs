@@ -1,4 +1,5 @@
 mod albums;
+mod albums_detailed;
 mod ambiances;
 mod artists;
 mod artwork;
@@ -180,6 +181,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/count", get(albums::album_count))
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
+        .route("/albums-detailed", get(albums_detailed::albums_detailed))
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
