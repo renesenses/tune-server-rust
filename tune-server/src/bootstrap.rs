@@ -79,6 +79,24 @@ pub async fn run_with(opts: RunOptions) {
     // one dangerous thing and exit before any server state exists (#1249).
     crate::plugins::maybe_run_wasm_probe();
 
+    // `--version` / `-V` : répondre et sortir avant tout effet de bord.
+    //
+    // Ici et non dans `main.rs` : ce dernier est délibérément vide pour qu'un
+    // binaire composeur (`tune-server-diretta`) partage ce démarrage, et il
+    // doit hériter du drapeau. Et après la sonde wasm ci-dessus, dont le
+    // commentaire impose qu'elle reste le premier geste.
+    //
+    // Pourquoi ce drapeau existe : l'écran d'une appliance Tune OS affichait
+    // la version gravée à l'installation, définitivement. Philippe Landes a lu
+    // 0.9.85 dans l'interface web et 0.9.83 en console — sur la MÊME machine,
+    // après une mise à jour qui avait parfaitement fonctionné. Faute de pouvoir
+    // demander sa version au binaire, l'écran ne pouvait que répéter une valeur
+    // figée. Cf tune-os#27.
+    if version_requested(std::env::args().skip(1)) {
+        println!("tune-server {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]
@@ -778,4 +796,57 @@ fn same_executable(a: &str, b: &str) -> bool {
     }
     // One side may be truncated by ps (TASK_COMM_LEN / MAXCOMLEN).
     (a.len() >= 15 && b.starts_with(a)) || (b.len() >= 15 && a.starts_with(b))
+}
+
+/// Les arguments demandent-ils la version ?
+///
+/// Extrait de [`run_with`] pour être testable : la branche appelante quitte le
+/// processus, ce qu'un test ne peut pas observer. L'appelant a déjà écarté
+/// `argv[0]`.
+///
+/// Comparaison stricte, jamais un préfixe : `--verbose` ne doit pas faire
+/// sortir un serveur au démarrage.
+fn version_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == "--version" || a == "-V")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_requested;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn les_deux_formes_demandent_la_version() {
+        assert!(version_requested(args(&["--version"])));
+        assert!(version_requested(args(&["-V"])));
+    }
+
+    #[test]
+    fn un_demarrage_ordinaire_ne_demande_rien() {
+        assert!(!version_requested(args(&[])));
+        assert!(!version_requested(args(&[
+            "--config",
+            "/opt/tune/tune.toml"
+        ])));
+    }
+
+    /// Le vrai risque de ce drapeau : un serveur qui sort au lieu de démarrer.
+    /// Un préfixe ne doit JAMAIS suffire.
+    #[test]
+    fn un_argument_qui_commence_pareil_ne_fait_pas_sortir_le_serveur() {
+        assert!(!version_requested(args(&["--verbose"])));
+        assert!(!version_requested(args(&["--version-check"])));
+        assert!(!version_requested(args(&["-Version"])));
+        assert!(!version_requested(args(&["-Vv"])));
+    }
+
+    /// La sonde wasm est dispatchée avant, mais si l'ordre changeait un jour,
+    /// ce test rappelle que ses arguments ne doivent pas déclencher la sortie.
+    #[test]
+    fn les_arguments_de_la_sonde_wasm_ne_declenchent_rien() {
+        assert!(!version_requested(args(&["--wasm-probe", "/tmp/x.wasm"])));
+    }
 }
