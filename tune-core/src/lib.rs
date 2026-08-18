@@ -30,8 +30,6 @@ pub mod library;
 pub mod license;
 pub mod lyrics;
 pub mod metadata;
-pub mod mount_manager;
-pub mod network;
 pub mod notifications;
 pub mod orchestrator;
 pub mod outputs;
