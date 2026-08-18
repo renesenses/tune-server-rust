@@ -34,8 +34,13 @@ from pathlib import Path
 
 # `fetchJSON<Zone[]>(`${BASE}/zones` … )` ou `fetchJSON<{ items: X[] }>(…)`.
 # Le type peut contenir des accolades : on le capture non-greedy jusqu'à `>(`.
+# La route est capturée JUSQU'AU guillemet fermant, et non par un jeu de
+# caractères : `${encodeURIComponent(id)}` contient des parenthèses, et les
+# exclure tronquait la route en plein milieu — 27 entrées sur 198 étaient
+# amputées avant ce correctif. La normalisation vient après, sur la chaîne
+# complète.
 MOTIF_APPEL = re.compile(
-    r"fetchJSON<(?P<type>.+?)>\(\s*[`'\"]\$\{BASE\}(?P<route>/[a-zA-Z0-9/_${}.-]*)",
+    r"fetchJSON<(?P<type>.+?)>\(\s*(?P<q>[`'\"])\$\{BASE\}(?P<route>(?:(?!(?P=q)).)*)",
     re.S,
 )
 
@@ -108,9 +113,36 @@ def dictionnaire_des_types(sources: dict[str, str]) -> dict[str, dict]:
 
 
 def normaliser_route(route: str) -> str:
-    """`/zones/${id}/dsp?x=1` → `/zones/{}/dsp` — la forme, pas les valeurs."""
-    route = route.split("?")[0]
-    route = re.sub(r"\$\{[^}]*\}", "{}", route)
+    """`/zones/${id}/dsp?x=1` → `/zones/{}/dsp` — la forme, pas les valeurs.
+
+    Les interpolations sont remplacées d'abord : une route comme
+    `/devices/${encodeURIComponent(id)}?x=1` doit devenir `/devices/{}`, et
+    couper sur `?` avant de les réduire mutilerait celles qui en contiennent.
+    """
+    # Remplacement à accolades ÉQUILIBRÉES : une interpolation peut en
+    # contenir une autre (`${qs ? `?${qs}` : ""}`), et une expression régulière
+    # simple s'arrête à la première fermante — produisant une route fausse.
+    sortie, i = [], 0
+    while i < len(route):
+        if route.startswith("${", i):
+            profondeur, j = 0, i + 1
+            while j < len(route):
+                if route[j] == "{":
+                    profondeur += 1
+                elif route[j] == "}":
+                    profondeur -= 1
+                    if profondeur == 0:
+                        break
+                j += 1
+            if j >= len(route):
+                return ""  # interpolation non fermée : route indigne de confiance
+            sortie.append("{}")
+            i = j + 1
+            continue
+        sortie.append(route[i])
+        i += 1
+    route = "".join(sortie).split("?")[0]
+    route = re.sub(r"\{\}+", "{}", route)
     return route.rstrip("/") or "/"
 
 
@@ -122,6 +154,12 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
     for m in MOTIF_APPEL.finditer(api_ts):
         brut = m.group("type").strip()
         route = normaliser_route(m.group("route"))
+        if not route:
+            non_resolus.append({
+                "route": m.group("route")[:60], "type": brut,
+                "raison": "interpolation non fermée — route non fiable",
+            })
+            continue
         nu = brut.removesuffix("[]").strip()
         # `import('./types').Zone` désigne un type parfaitement résoluble : la
         # forme d'import en ligne ne change rien à ce qu'il déclare. Trente
@@ -188,6 +226,7 @@ def self_test() -> int:
       export const rien = () => fetchJSON<void>(`${BASE}/system/ping`);
       export const inconnu = () => fetchJSON<PasDefini>(`${BASE}/x/y-z`);
       export const imp = () => fetchJSON<import('./types').Zone[]>(`${BASE}/zones-bis`);
+      export const dev = (id) => fetchJSON<Zone>(`${BASE}/devices/${encodeURIComponent(id)}?x=1`);
     """
     entrees, non_resolus = carte(types_src, api)
     par_route = {e["route"]: e for e in entrees}
@@ -215,6 +254,9 @@ def self_test() -> int:
     elif par_route["/zones-bis"]["champs_obligatoires"] != ["id", "name", "sortie"]:
         echecs.append("la forme import('./types').X résout le mauvais type")
 
+    if "/devices/{}" not in par_route:
+        echecs.append(f"encodeURIComponent tronque la route : {sorted(par_route)}")
+
     raisons = {n["route"]: n["raison"] for n in non_resolus}
     if "/system/ping" not in raisons:
         echecs.append("un type non structurel (void) n'est pas signalé")
@@ -226,8 +268,8 @@ def self_test() -> int:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 9 garanties (type nommé, optionnels, liste, paramètre "
-          "d'URL, type en ligne, import en ligne, et les deux formes de non-résolution)")
+    print("SELF-TEST: ok — 10 garanties (type nommé, optionnels, liste, paramètre "
+          "d'URL, type en ligne, import en ligne, route à parenthèses, et les deux non-résolutions)")
     return 0
 
 
