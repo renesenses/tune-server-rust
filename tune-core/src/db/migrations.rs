@@ -3070,3 +3070,95 @@ mod tests {
         assert_eq!(restants, 2, "deux disques homonymes restent deux albums");
     }
 }
+
+#[cfg(test)]
+mod schema_unique_tests {
+    use std::fs;
+    use std::path::Path;
+
+    /// Garde-fou : une seule définition de `network_mounts` dans tout le code.
+    ///
+    /// #1692 — il en existait TROIS, dont deux concurrentes portant le même nom
+    /// avec des colonnes différentes :
+    ///
+    ///   - `routes/network.rs` écrivait `mount_type/server/share/…/active` ;
+    ///   - `mount_manager.rs` déclarait `host/share_name/…/auto_mount/status`.
+    ///
+    /// Comme les deux disaient `CREATE TABLE IF NOT EXISTS`, celle qui passait
+    /// la première gagnait — et l'autre chemin lisait ensuite une table dont les
+    /// colonnes n'existaient pas. `mount_manager.rs` n'étant construit nulle
+    /// part hors tests, le piège dormait : il se serait réveillé au premier
+    /// appelant. Un correctif du remontage avait d'ailleurs déjà été écrit
+    /// contre la mauvaise table, puis annulé.
+    ///
+    /// Le module mort a été supprimé. Ce test empêche qu'une seconde définition
+    /// réapparaisse sans que personne ne le voie.
+    #[test]
+    fn network_mounts_n_a_qu_une_definition_par_moteur() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut declarations = Vec::new();
+
+        for caisse in ["tune-core/src", "tune-server/src", "plugins"] {
+            let base = racine.join(caisse);
+            if !base.exists() {
+                continue;
+            }
+            let mut piles = vec![base];
+            while let Some(dir) = piles.pop() {
+                let Ok(entrees) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in entrees.flatten() {
+                    let chemin = e.path();
+                    if chemin.is_dir() {
+                        piles.push(chemin);
+                    } else if chemin.extension().is_some_and(|x| x == "rs") {
+                        let Ok(texte) = fs::read_to_string(&chemin) else {
+                            continue;
+                        };
+                        for ligne in texte.lines() {
+                            let l = ligne.to_lowercase();
+                            if l.contains("create table") && l.contains("network_mounts") {
+                                declarations.push(
+                                    chemin
+                                        .strip_prefix(&racine)
+                                        .unwrap_or(&chemin)
+                                        .display()
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        declarations.sort();
+        declarations.dedup();
+
+        // Une par moteur de base : SQLite (migrations.rs) et PostgreSQL
+        // (pg_migrate.rs). Toute autre est un doublon.
+        let attendues = [
+            "tune-core/src/db/migrations.rs",
+            "tune-core/src/db/pg_migrate.rs",
+        ];
+        let en_trop: Vec<&String> = declarations
+            .iter()
+            .filter(|d| !attendues.iter().any(|a| d.ends_with(a) || d == a))
+            .collect();
+
+        assert!(
+            en_trop.is_empty(),
+            "définition(s) concurrente(s) de `network_mounts` : {en_trop:?}\n\
+             Une seule par moteur. Deux tables du même nom aux colonnes \
+             différentes se masquent l'une l'autre via CREATE TABLE IF NOT \
+             EXISTS, et le chemin perdant lit des colonnes inexistantes (#1692)."
+        );
+
+        assert!(
+            declarations.len() >= 2,
+            "aucune définition de `network_mounts` trouvée ({declarations:?}) — \
+             le test ne garde plus rien : chemin de recherche ou nom de table changé ?"
+        );
+    }
+}

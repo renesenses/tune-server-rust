@@ -7,6 +7,14 @@
 //!   - "CHNL": channel count (u16 BE) + channel IDs
 //!   - "CMPR": compression type (4 bytes: "DSD " or "DST ")
 //! - DSD Sound Data chunk "DSD ": raw DSD data (interleaved by sample)
+//! - DST Sound Data chunk "DST ": DSD compressé sans perte (SACD), contenant
+//!   - "FRTE": nombre de trames (u32 BE) + cadence en trames/s (u16 BE)
+//!   - "DSTF": une trame compressée, répétée — et parfois "DSTC" (CRC)
+//!
+//! Le contenu des trames DSTF n'est pas décodé ici : c'est un codec entropique
+//! complet (ISO/IEC 14496-3 sous-partie 10). Ce module en lit l'enveloppe, ce
+//! qui suffit à annoncer la bonne durée et à refuser la lecture par un message
+//! juste — au lieu de prétendre que le fichier n'a pas de données audio.
 //!
 //! All multi-byte values are big-endian.
 //! DSD bit ordering: MSB first within each byte.
@@ -22,15 +30,33 @@ pub struct DffInfo {
     pub compression: String,
     pub data_offset: u64,
     pub data_size: u64,
+    /// Nombre de trames DST, lu dans FRTE. `None` pour un fichier non compressé.
+    pub dst_frames: Option<u32>,
+    /// Cadence des trames DST en trames/s (75 sur un SACD), lue dans FRTE.
+    pub dst_frame_rate: Option<u16>,
 }
 
 impl DffInfo {
+    /// Vrai si les données audio sont compressées en DST.
+    pub fn is_dst(&self) -> bool {
+        self.compression.trim_end() == "DST"
+    }
+
     /// Track duration in milliseconds from the DSDIFF header. DSD is 1 bit per
     /// sample, so samples-per-channel = data_size*8/channels, and
     /// duration = samples-per-channel / sample_rate. `None` if the header can't
     /// yield a positive value. Single source of truth for the scan-time
     /// (metadata) and play-time (orchestrator) duration recovery.
     pub fn duration_ms(&self) -> Option<u64> {
+        // En DST, `data_size` est la taille COMPRESSÉE : la formule ci-dessous
+        // sous-estimerait la durée d'autant que le fichier compresse bien.
+        // FRTE donne l'information exacte, indépendante du taux de compression.
+        if let (Some(frames), Some(rate)) = (self.dst_frames, self.dst_frame_rate)
+            && rate > 0
+        {
+            return Some(frames as u64 * 1000 / rate as u64);
+        }
+
         let denom = self.channels as u64 * self.sample_rate as u64;
         (denom > 0).then(|| self.data_size.saturating_mul(8).saturating_mul(1000) / denom)
     }
@@ -96,6 +122,8 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
     let mut sample_rate: Option<u32> = None;
     let mut channels: Option<u32> = None;
     let mut compression: Option<String> = None;
+    let mut dst_frames: Option<u32> = None;
+    let mut dst_frame_rate: Option<u16> = None;
     let mut data_offset: Option<u64> = None;
     let mut data_size: Option<u64> = None;
 
@@ -198,6 +226,41 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
                 // Don't need to read past this for header parsing
                 break;
             }
+            b"DST " => {
+                // Enveloppe DST. On ne lit que FRTE : il donne la durée exacte,
+                // que la taille compressée ne permet pas de déduire. Les trames
+                // DSTF restent où elles sont, `data_offset` pointant sur le
+                // début de l'enveloppe pour qui saura les décoder un jour.
+                let dst_end = pos + 12 + chunk_size;
+                while file
+                    .stream_position()
+                    .map_err(|e| format!("dff pos: {e}"))?
+                    < dst_end
+                {
+                    let mut sub_header = [0u8; 12];
+                    if file.read_exact(&mut sub_header).is_err() {
+                        break;
+                    }
+                    let sub_id = [sub_header[0], sub_header[1], sub_header[2], sub_header[3]];
+                    let sub_size = read_u64_be(&sub_header, 4);
+
+                    if &sub_id == b"FRTE" {
+                        let mut frte = [0u8; 6];
+                        file.read_exact(&mut frte)
+                            .map_err(|e| format!("dff read FRTE: {e}"))?;
+                        dst_frames = Some(read_u32_be(&frte, 0));
+                        dst_frame_rate = Some(read_u16_be(&frte, 4));
+                        break; // seul FRTE nous intéresse dans l'en-tête
+                    }
+
+                    let padded = (sub_size + 1) & !1;
+                    file.seek(SeekFrom::Current(padded as i64))
+                        .map_err(|e| format!("dff skip DST sub-chunk: {e}"))?;
+                }
+                data_offset = Some(pos + 12);
+                data_size = Some(chunk_size);
+                break;
+            }
             _ => {
                 // Skip unknown chunk (pad to even boundary per IFF spec)
                 let padded = (chunk_size + 1) & !1;
@@ -210,8 +273,8 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
     let sample_rate = sample_rate.ok_or("DFF: missing FS (sample rate) sub-chunk")?;
     let channels = channels.ok_or("DFF: missing CHNL (channels) sub-chunk")?;
     let compression = compression.unwrap_or_else(|| "DSD ".into());
-    let data_offset = data_offset.ok_or("DFF: missing DSD sound data chunk")?;
-    let data_size = data_size.ok_or("DFF: missing DSD sound data chunk size")?;
+    let data_offset = data_offset.ok_or("DFF: missing DSD/DST sound data chunk")?;
+    let data_size = data_size.ok_or("DFF: missing DSD/DST sound data chunk size")?;
 
     if channels == 0 || channels > 8 {
         return Err(format!("invalid channel count: {channels}"));
@@ -226,6 +289,8 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
         compression,
         data_offset,
         data_size,
+        dst_frames,
+        dst_frame_rate,
     })
 }
 
@@ -235,6 +300,16 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
 /// byte layout is already ch0_byte0, ch1_byte0, ch0_byte1, ch1_byte1, ...
 /// so no de-interleaving is needed — just read the raw bytes.
 pub fn read_dff_data(path: &str, info: &DffInfo) -> Result<Vec<u8>, String> {
+    if info.is_dst() {
+        // Message distinct du cas « compression inconnue » : ici le fichier est
+        // parfaitement lisible et sa durée est connue, seul le décodage manque.
+        return Err(format!(
+            "DFF: DST compressed audio not supported yet ({} frames at {} fps) — \
+             convert to uncompressed DSD in the meantime",
+            info.dst_frames.unwrap_or(0),
+            info.dst_frame_rate.unwrap_or(0)
+        ));
+    }
     if info.compression != "DSD " {
         return Err(format!(
             "DFF: unsupported compression '{}' (only uncompressed DSD supported)",
@@ -363,6 +438,8 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
     let mut sample_rate: Option<u32> = None;
     let mut channels: Option<u32> = None;
     let mut compression: Option<String> = None;
+    let mut dst_frames: Option<u32> = None;
+    let mut dst_frame_rate: Option<u16> = None;
     let mut data_offset: Option<u64> = None;
     let mut data_size: Option<u64> = None;
 
@@ -467,6 +544,40 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
                 data_size = Some(chunk_size);
                 break;
             }
+            b"DST " => {
+                // Même lecture que dans `parse_dff` : seul FRTE est requis ici.
+                let dst_end = pos + 12 + chunk_size;
+                while cursor
+                    .stream_position()
+                    .map_err(|e| format!("dff pos: {e}"))?
+                    < dst_end
+                {
+                    let mut sub_header = [0u8; 12];
+                    if cursor.read_exact(&mut sub_header).is_err() {
+                        break;
+                    }
+                    let sub_id = [sub_header[0], sub_header[1], sub_header[2], sub_header[3]];
+                    let sub_size = read_u64_be(&sub_header, 4);
+
+                    if &sub_id == b"FRTE" {
+                        let mut frte = [0u8; 6];
+                        cursor
+                            .read_exact(&mut frte)
+                            .map_err(|e| format!("dff read FRTE: {e}"))?;
+                        dst_frames = Some(read_u32_be(&frte, 0));
+                        dst_frame_rate = Some(read_u16_be(&frte, 4));
+                        break;
+                    }
+
+                    let padded = (sub_size + 1) & !1;
+                    cursor
+                        .seek(SeekFrom::Current(padded as i64))
+                        .map_err(|e| format!("dff skip: {e}"))?;
+                }
+                data_offset = Some(pos + 12);
+                data_size = Some(chunk_size);
+                break;
+            }
             _ => {
                 let padded = (chunk_size + 1) & !1;
                 cursor
@@ -479,8 +590,8 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
     let sample_rate = sample_rate.ok_or("DFF: missing FS sub-chunk")?;
     let channels = channels.ok_or("DFF: missing CHNL sub-chunk")?;
     let compression = compression.unwrap_or_else(|| "DSD ".into());
-    let data_offset = data_offset.ok_or("DFF: missing DSD data chunk")?;
-    let data_size = data_size.ok_or("DFF: missing DSD data chunk")?;
+    let data_offset = data_offset.ok_or("DFF: missing DSD/DST data chunk")?;
+    let data_size = data_size.ok_or("DFF: missing DSD/DST data chunk")?;
 
     Ok(DffInfo {
         channels,
@@ -488,6 +599,8 @@ pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
         compression,
         data_offset,
         data_size,
+        dst_frames,
+        dst_frame_rate,
     })
 }
 
@@ -496,6 +609,81 @@ mod tests {
     use super::*;
 
     /// Build a minimal valid DFF header in memory.
+    /// Fichier DSDIFF compressé DST : même en-tête, mais CMPR = "DST " et un
+    /// chunk "DST " contenant FRTE puis des trames DSTF.
+    fn build_dff_dst(channels: u16, sample_rate: u32, frames: u32, frame_rate: u16) -> Vec<u8> {
+        let mut prop = Vec::new();
+        prop.extend_from_slice(b"SND ");
+        prop.extend_from_slice(b"FS  ");
+        prop.extend_from_slice(&4u64.to_be_bytes());
+        prop.extend_from_slice(&sample_rate.to_be_bytes());
+        prop.extend_from_slice(b"CHNL");
+        prop.extend_from_slice(&2u64.to_be_bytes());
+        prop.extend_from_slice(&channels.to_be_bytes());
+        prop.extend_from_slice(b"CMPR");
+        prop.extend_from_slice(&4u64.to_be_bytes());
+        prop.extend_from_slice(b"DST ");
+
+        // Contenu du chunk DST : FRTE, puis deux trames factices. Leur contenu
+        // n'a pas à être décodable : on vérifie l'enveloppe, pas le codec.
+        let mut dst = Vec::new();
+        dst.extend_from_slice(b"FRTE");
+        dst.extend_from_slice(&6u64.to_be_bytes());
+        dst.extend_from_slice(&frames.to_be_bytes());
+        dst.extend_from_slice(&frame_rate.to_be_bytes());
+        for _ in 0..2 {
+            dst.extend_from_slice(b"DSTF");
+            dst.extend_from_slice(&8u64.to_be_bytes());
+            dst.extend_from_slice(&[0xAAu8; 8]);
+        }
+
+        let frm8_content = 4 + 12 + prop.len() as u64 + 12 + dst.len() as u64;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"FRM8");
+        buf.extend_from_slice(&frm8_content.to_be_bytes());
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(b"PROP");
+        buf.extend_from_slice(&(prop.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&prop);
+        buf.extend_from_slice(b"DST ");
+        buf.extend_from_slice(&(dst.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&dst);
+        buf
+    }
+
+    #[test]
+    fn parse_dst_reads_frame_table() {
+        // 75 trames/s est la cadence d'un SACD ; 4500 trames = 60 s.
+        let info = parse_dff_from_bytes(&build_dff_dst(2, 2_822_400, 4500, 75)).unwrap();
+        assert_eq!(info.compression, "DST ");
+        assert!(info.is_dst());
+        assert_eq!(info.dst_frames, Some(4500));
+        assert_eq!(info.dst_frame_rate, Some(75));
+    }
+
+    #[test]
+    fn dst_duration_comes_from_frames_not_compressed_size() {
+        // Le piège : `data_size` est ici la taille COMPRESSÉE (quelques dizaines
+        // d'octets). La formule bit-à-bit rendrait une durée quasi nulle ; FRTE
+        // donne la vraie, 60 s.
+        let info = parse_dff_from_bytes(&build_dff_dst(2, 2_822_400, 4500, 75)).unwrap();
+        assert_eq!(info.duration_ms(), Some(60_000));
+        assert!(
+            info.data_size < 1000,
+            "l'enveloppe de test est bien plus petite qu'une minute de DSD"
+        );
+    }
+
+    #[test]
+    fn dsd_duration_unaffected_by_dst_path() {
+        // Non-régression : un fichier non compressé garde le calcul d'origine.
+        let info =
+            parse_dff_from_bytes(&build_dff_header(2, 2_822_400, &vec![0u8; 705_600])).unwrap();
+        assert_eq!(info.dst_frames, None);
+        assert_eq!(info.duration_ms(), Some(1000));
+    }
+
     fn build_dff_header(channels: u16, sample_rate: u32, dsd_data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
 
