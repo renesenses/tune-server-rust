@@ -1588,6 +1588,17 @@ pub(super) async fn changelog() -> Json<Value> {
         Err(_) => guard.1.clone(),
     };
     drop(guard);
+
+    // Le cache démarre à `json!([])`. Sur un serveur fraîchement lancé et sans
+    // réseau, les deux branches ci-dessus rendent donc un tableau VIDE, et le
+    // panneau « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme
+    // « je n'ai pas pu joindre la source » mais comme « cette version
+    // n'apporte rien ». Le repli en dur existait depuis toujours pour ce cas ;
+    // il n'était simplement jamais appelé.
+    if entries.as_array().is_none_or(|a| a.is_empty()) {
+        return changelog_hardcoded();
+    }
+
     Json(json!({ "version": tune_core::version(), "entries": entries }))
 }
 
@@ -1792,7 +1803,15 @@ async fn fetch_github_changelog() -> Result<Value, String> {
     Ok(json!(entries))
 }
 
-#[allow(dead_code)]
+/// Dernier recours quand la source distante est injoignable ET que le cache
+/// est vide (serveur qui vient de démarrer, machine hors ligne, panne de
+/// GitHub — vécu le 17/08/2026). Le client sait lire cette forme `sections`
+/// aussi bien que la forme `features/fixes/improvements` du chemin réseau :
+/// `WhatsNew.svelte` convertit l'une vers l'autre.
+///
+/// Ces notes sont figées et ne suivent pas les releases : elles valent mieux
+/// qu'un panneau vide, pas mieux que les vraies notes. Chaque entrée porte sa
+/// version et sa date, donc rien n'est présenté comme récent à tort.
 fn changelog_hardcoded() -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
@@ -2269,5 +2288,56 @@ mod windows_update_bat_tests {
         );
         assert!(s.contains("tune-server.new.exe"));
         assert!(s.contains("tune-update-failed.txt"));
+    }
+}
+
+#[cfg(test)]
+mod changelog_fallback_tests {
+    use super::changelog_hardcoded;
+
+    /// Le repli doit satisfaire le contrat que `changelog_has_entries` vérifie
+    /// quand des données arrivent : au moins 5 versions, la plus récente
+    /// nommée. Contrairement à ce test d'intégration, celui-ci ne touche PAS
+    /// au réseau — il vaut donc aussi pendant une panne de GitHub, qui est
+    /// précisément le moment où le repli sert.
+    #[test]
+    fn le_repli_satisfait_le_contrat_du_panneau() {
+        let body = changelog_hardcoded().0;
+        let entries = body["entries"]
+            .as_array()
+            .expect("le repli doit exposer un tableau `entries`");
+
+        assert!(
+            entries.len() >= 5,
+            "le repli doit porter au moins 5 versions, il en a {}",
+            entries.len()
+        );
+        assert!(
+            body["version"].is_string(),
+            "le repli doit annoncer la version du serveur"
+        );
+    }
+
+    /// Chaque entrée doit être exploitable par `WhatsNew.svelte` : une version
+    /// non vide, une date, et des rubriques. Une entrée creuse produirait une
+    /// ligne muette dans le panneau — le défaut même qu'on corrige.
+    #[test]
+    fn chaque_entree_du_repli_est_affichable() {
+        let body = changelog_hardcoded().0;
+        for e in body["entries"].as_array().unwrap() {
+            let v = e["version"].as_str().unwrap_or("");
+            assert!(!v.is_empty(), "entrée sans version : {e}");
+            assert!(
+                e["date"].as_str().is_some_and(|d| !d.is_empty()),
+                "version {v} sans date"
+            );
+            let sections = e["sections"]
+                .as_array()
+                .unwrap_or_else(|| panic!("version {v} sans rubriques"));
+            assert!(
+                !sections.is_empty(),
+                "version {v} : rubriques vides, la ligne serait muette"
+            );
+        }
     }
 }

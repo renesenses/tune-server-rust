@@ -15,6 +15,71 @@ use crate::state::AppState;
 /// forum thread stays readable; the "Export logs" button has the full tail).
 const BUG_REPORT_LOG_LINES: usize = 200;
 
+/// Fenêtre LUE avant filtrage, pour que les 200 lignes retenues soient 200
+/// lignes utiles.
+///
+/// Mesuré sur un rapport réel (#1884, Bertrand, analyse acoustique figée) :
+/// **160 des 200 lignes étaient la même sonde `ssdp_unicast_probe_ok` en
+/// DEBUG**, et le rapport ne contenait pas une seule ligne acoustique — la
+/// fenêtre couvrait moins de trois minutes. Un rapport arrivé vide de ce qui
+/// concerne le défaut oblige à redemander un journal complet, et un
+/// signalement sur deux s'éteint en route.
+const BUG_REPORT_LOG_SCAN_LINES: usize = 3000;
+
+/// Ne garder d'un journal que ce qui documente un défaut.
+///
+/// Le DEBUG des modules de découverte est une sonde de bon fonctionnement :
+/// sa place est dans le fichier et dans l'export complet, pas dans un rapport
+/// de bogue où il chasse tout le reste. On ne garde donc que INFO et au-dessus.
+///
+/// Une ligne de continuation — celle d'une trace d'erreur, qui ne porte ni
+/// horodatage ni niveau — hérite de la décision prise pour la ligne qui la
+/// précède : découper une trace en deux vaudrait moins que de la jeter
+/// entière.
+fn lignes_utiles_pour_un_rapport(journal: &str, garder: usize) -> String {
+    let mut retenu: Vec<&str> = Vec::new();
+    // Une ligne sans niveau reconnu ouvre le journal : on la garde, faute de
+    // quoi un format inattendu viderait le rapport au lieu de l'alléger.
+    let mut on_garde = true;
+    for ligne in journal.lines() {
+        match niveau_de_ligne(ligne) {
+            Some(niveau) => {
+                on_garde = !matches!(niveau, "DEBUG" | "TRACE");
+                if on_garde {
+                    retenu.push(ligne);
+                }
+            }
+            None => {
+                if on_garde {
+                    retenu.push(ligne);
+                }
+            }
+        }
+    }
+    let debut = retenu.len().saturating_sub(garder);
+    retenu[debut..].join("\n")
+}
+
+/// Le niveau d'une ligne de journal, quand elle en porte un.
+///
+/// Format écrit par `tracing` : `2026-08-17T15:22:15.003+02:00  DEBUG
+/// tune_core::discovery::ssdp: …`. On ne cherche le niveau que dans les
+/// premiers champs — un `DEBUG` au milieu d'un message ne doit pas faire
+/// passer la ligne pour du DEBUG.
+fn niveau_de_ligne(ligne: &str) -> Option<&'static str> {
+    for mot in ligne.split_whitespace().take(3) {
+        match mot {
+            "TRACE" => return Some("TRACE"),
+            "DEBUG" => return Some("DEBUG"),
+            "INFO" => return Some("INFO"),
+            "WARN" => return Some("WARN"),
+            "ERROR" => return Some("ERROR"),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Public bug-intake endpoint on the community site. It creates a *moderated*
 /// (pending) forum thread server-side with the site's own credentials — the
 /// distributed Tune server never holds a forum admin token. Same
@@ -744,11 +809,15 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
     // "Export logs" button shows.
-    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_LINES).await;
-    let log_text = logs_json["logs"].as_str().unwrap_or("").trim();
+    // On lit large et on filtre, plutôt que de lire 200 lignes et d'espérer
+    // qu'elles parlent du défaut (#1884). L'export complet, lui, reste verbatim.
+    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_SCAN_LINES).await;
+    let brut = logs_json["logs"].as_str().unwrap_or("");
+    let filtre = lignes_utiles_pour_un_rapport(brut, BUG_REPORT_LOG_LINES);
+    let log_text = filtre.trim();
     let log_source = logs_json["source"].as_str().unwrap_or("none");
     md.push_str(&format!(
-        "\n## Recent Logs (last {BUG_REPORT_LOG_LINES} lines, source: {log_source})\n"
+        "\n## Recent Logs ({BUG_REPORT_LOG_LINES} dernières lignes INFO et au-dessus, source: {log_source} — le DEBUG est dans l'export complet)\n"
     ));
     if log_text.is_empty() {
         md.push_str("_No logs available._\n");
@@ -1302,5 +1371,95 @@ mod log_tail_tests {
         std::fs::write(&path, "a\nb\n").unwrap();
         let lines = read_log_tail(path.to_str().unwrap(), 1000, 1024).unwrap();
         assert_eq!(lines, ["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod tests_journal_rapport {
+    use super::{lignes_utiles_pour_un_rapport, niveau_de_ligne};
+
+    /// Le cas mesuré : 160 sondes SSDP en DEBUG chassaient tout le reste.
+    #[test]
+    fn le_debug_bavard_ne_chasse_plus_ce_qui_compte() {
+        let mut journal = String::new();
+        for i in 0..160 {
+            journal.push_str(&format!(
+                "2026-08-17T15:22:15.003+02:00 DEBUG tune_core::discovery::ssdp: ssdp_unicast_probe_ok id=uuid:{i}\n"
+            ));
+        }
+        journal.push_str(
+            "2026-08-17T15:25:00.000+02:00  INFO tune_core::audio::embedding: audio_embedding_batch embedded=10\n",
+        );
+        journal.push_str(
+            "2026-08-17T15:25:01.000+02:00  WARN tune_core::audio::embedding: audio_embed_decode_failed track_id=42\n",
+        );
+
+        let garde = lignes_utiles_pour_un_rapport(&journal, 200);
+
+        assert!(
+            !garde.contains("ssdp_unicast_probe_ok"),
+            "le DEBUG bavard sort"
+        );
+        assert!(garde.contains("audio_embedding_batch"), "l'INFO reste");
+        assert!(garde.contains("audio_embed_decode_failed"), "le WARN reste");
+        assert_eq!(garde.lines().count(), 2);
+    }
+
+    /// La coupe se fait APRÈS le filtrage : on garde N lignes utiles, pas les
+    /// N dernières lignes du fichier.
+    #[test]
+    fn on_garde_les_dernieres_lignes_utiles() {
+        let mut journal = String::new();
+        for i in 0..10 {
+            journal.push_str(&format!("2026-08-17T10:00:0{i}Z  INFO m: utile-{i}\n"));
+            journal.push_str(&format!("2026-08-17T10:00:0{i}Z DEBUG m: bruit-{i}\n"));
+        }
+        let garde = lignes_utiles_pour_un_rapport(&journal, 3);
+        assert_eq!(garde.lines().count(), 3);
+        assert!(garde.contains("utile-9") && garde.contains("utile-7"));
+        assert!(!garde.contains("utile-6"), "seules les trois dernières");
+        assert!(!garde.contains("bruit"));
+    }
+
+    /// Une trace d'erreur suit sa ligne d'en-tête : la découper en deux
+    /// vaudrait moins que de la jeter entière.
+    #[test]
+    fn une_trace_suit_la_ligne_qui_la_porte() {
+        let journal = "2026-08-17T10:00:00Z ERROR m: panic\n    at src/lib.rs:12\n    at src/main.rs:3\n\
+                       2026-08-17T10:00:01Z DEBUG m: sonde\n    detail de la sonde\n";
+        let garde = lignes_utiles_pour_un_rapport(journal, 200);
+        assert!(
+            garde.contains("at src/lib.rs:12"),
+            "la trace de l'ERROR reste"
+        );
+        assert!(garde.contains("at src/main.rs:3"));
+        assert!(!garde.contains("detail de la sonde"), "celle du DEBUG part");
+    }
+
+    /// Un format inattendu ne doit pas vider le rapport : sans niveau
+    /// reconnu, on garde.
+    #[test]
+    fn un_journal_sans_niveau_reconnu_est_conserve() {
+        let journal = "ligne sans niveau\nune autre\n";
+        let garde = lignes_utiles_pour_un_rapport(journal, 200);
+        assert_eq!(garde.lines().count(), 2);
+    }
+
+    /// Le niveau se lit dans les premiers champs — pas au milieu du message,
+    /// sans quoi une ligne parlant de « DEBUG » serait jetée.
+    #[test]
+    fn le_mot_debug_dans_un_message_ne_compte_pas() {
+        assert_eq!(
+            niveau_de_ligne("2026-08-17T10:00:00Z  INFO m: log_level=DEBUG applique"),
+            Some("INFO")
+        );
+        assert_eq!(
+            niveau_de_ligne("2026-08-17T10:00:00Z DEBUG m: coucou"),
+            Some("DEBUG")
+        );
+        assert_eq!(niveau_de_ligne("    at src/lib.rs:12"), None);
+
+        let journal = "2026-08-17T10:00:00Z  INFO m: log_level=DEBUG applique\n";
+        assert!(lignes_utiles_pour_un_rapport(journal, 10).contains("log_level=DEBUG"));
     }
 }

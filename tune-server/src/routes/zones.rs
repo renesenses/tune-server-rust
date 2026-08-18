@@ -425,7 +425,7 @@ async fn set_zone_dsp(
             // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
             // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
             // ne le faisait pas.
-            eq_applique_a_chaud = state.orchestrator.refresh_zone_eq(id).await;
+            eq_applique_a_chaud = state.orchestrator.apply_eq_change(id).await;
         }
     }
 
