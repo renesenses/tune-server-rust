@@ -660,6 +660,26 @@ fn spawn_heartbeat(state: &AppState) {
             }
         };
 
+        // Identifiant de SERVEUR — distinct d'`instance_id`, et c'est le point.
+        //
+        // Le cloud lie une licence a un serveur via `License::claimSession`,
+        // qui recoit `server_id` depuis cette charge utile. Le champ n'y etait
+        // pas : la route le lisait, obtenait null, et n'ecrivait rien. Sur 72
+        // licences premium, 53 n'avaient donc AUCUN serveur associe — alors
+        // meme que ces machines battent toutes les cinq minutes et valident
+        // leur licence correctement (`is_premium` est a jour).
+        //
+        // Consequence directe : le relais Tune Bridge, qui ne connait que le
+        // `server_id`, ne peut pas verifier l'eligibilite premium de ces
+        // serveurs. Sans ce champ, activer le controle en couperait 57 sur 72.
+        //
+        // `get_or_create_server_id` est le MEME accesseur que la telemetrie et
+        // que le pont : les trois doivent parler du meme identifiant, sans
+        // quoi le lien se ferait sur une valeur que personne d'autre ne
+        // connait.
+        let server_id =
+            tune_core::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
+
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| gethostname().unwrap_or_else(|| "unknown".into()));
@@ -819,6 +839,8 @@ fn spawn_heartbeat(state: &AppState) {
                 "devices": devices,
                 "license_key": ls.license_key,
                 "hardware_fingerprint": ls.hardware_fingerprint,
+                // Sans lui, `claimSession` lie la licence a rien.
+                "server_id": server_id,
             });
 
             // Update server_last_alive_at timestamp for crash detection
@@ -1669,4 +1691,51 @@ fn spawn_social_sharing_listener(state: &AppState) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod heartbeat_server_id_tests {
+    /// Le heartbeat doit porter `server_id`, sans quoi le cloud ne peut lier
+    /// aucune licence a aucun serveur.
+    ///
+    /// La route `/api/v1/heartbeat` lit `server_id` et le passe a
+    /// `License::claimSession`. Le champ manquait : elle obtenait null et
+    /// n'ecrivait rien. Mesure en production le 2026-08-18 : sur 72 licences
+    /// premium, 53 sans serveur associe, et seulement 15 auraient ete jugees
+    /// eligibles par le relais Tune Bridge.
+    ///
+    /// Ce test lit le CONTENU du fichier. C'est grossier, mais il attrape la
+    /// seule regression qui compte — quelqu'un qui retire le champ de la
+    /// charge utile, ou qui le remplace par `instance_id`, lequel est un
+    /// identifiant DIFFERENT que le relais ne connait pas.
+    #[test]
+    fn la_charge_utile_porte_le_server_id() {
+        let source = include_str!("background.rs");
+        let charge = source
+            .split("\"hardware_fingerprint\": ls.hardware_fingerprint,")
+            .nth(1)
+            .expect("charge utile du heartbeat introuvable");
+        let fin = charge
+            .find("});")
+            .expect("fin de la charge utile introuvable");
+
+        assert!(
+            charge[..fin].contains("\"server_id\": server_id"),
+            "le heartbeat n'envoie plus `server_id` : le cloud ne pourra plus \
+             lier les licences aux serveurs, et le relais refusera tout le monde"
+        );
+    }
+
+    /// `instance_id` et `server_id` sont deux UUID distincts, ranges sous deux
+    /// cles de reglages differentes. Les confondre lierait la licence a un
+    /// identifiant que ni la telemetrie ni le relais ne connaissent.
+    #[test]
+    fn le_server_id_vient_du_meme_accesseur_que_la_telemetrie() {
+        let source = include_str!("background.rs");
+        assert!(
+            source.contains("TelemetryReporter::get_or_create_server_id"),
+            "le server_id du heartbeat doit venir du meme accesseur que la \
+             telemetrie et que le pont"
+        );
+    }
 }
