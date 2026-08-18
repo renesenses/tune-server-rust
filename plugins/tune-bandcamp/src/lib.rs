@@ -137,6 +137,9 @@ fn routes_publiques() -> Router<()> {
         // renvoie vers elle.
         .route("/album", get(bc_album_par_url))
         .route("/album/{id}", get(bc_album))
+        // `?url=` d'abord, comme pour l'album : une adresse Bandcamp
+        // contient des `/` et ne tient pas dans un segment de chemin.
+        .route("/artist", get(bc_artiste_par_url))
         .route("/artist/{id}", get(bc_artist))
         .route("/tags", get(bc_tags))
         .route("/tag/{tag}", get(bc_tag_releases))
@@ -172,14 +175,52 @@ async fn json_sortant(
     }
 }
 
+/// Format de pochette servi aux grilles.
+///
+/// Choisi en mesurant, pas en devinant. Les variantes du même visuel :
+///
+/// | code | pixels | poids |
+/// |------|--------|-------|
+/// | `_3`  | 100    | 2,8 Ko |
+/// | `_7`  | 150    | 4,7 Ko |
+/// | `_2`  | 350    | 12,5 Ko |
+/// | `_16` | 700    | 29 Ko |
+/// | `_10` | 1150   | 50 Ko |
+///
+/// Les vignettes font 9 rem, soit ~144 px, donc ~288 px sur un écran à double
+/// densité : `_2` les couvre. `_10`, servi au départ, pesait quatre fois plus
+/// pour un résultat identique à l'œil — 48 résultats de découverte faisaient
+/// 2,4 Mo au lieu de 600 Ko.
+const POCHETTE_GRILLE: &str = "_2";
+
 /// URL de pochette Bandcamp pour un `art_id`.
 ///
-/// Le suffixe `_10` est le format carré ~1200 px : la pochette est ce que
-/// l'utilisateur regarde en premier dans une grille de découverte, et Tune
-/// affiche des pochettes sur des écrans de salon.
+/// ⚠️ Le préfixe `a` n'est pas décoratif : `.../img/4029072179_2.jpg` répond
+/// **404**, `.../img/a4029072179_2.jpg` répond 200. C'est exactement le piège
+/// dans lequel le champ `img` de l'API de recherche fait tomber — voir
+/// [`pochette_de_resultat`].
 fn pochette(art_id: Option<&Value>) -> Option<String> {
     let id = art_id?.as_i64()?;
-    (id > 0).then(|| format!("https://f4.bcbits.com/img/a{id}_10.jpg"))
+    (id > 0).then(|| format!("https://f4.bcbits.com/img/a{id}{POCHETTE_GRILLE}.jpg"))
+}
+
+/// Pochette d'un résultat de recherche, selon son genre.
+///
+/// Bandcamp se contredit d'un type à l'autre, et il a fallu le mesurer :
+///
+/// - pour un **album ou une piste**, le champ `img` qu'il rend est **cassé** —
+///   il omet le préfixe `a` de l'identifiant et renvoie un 404. L'`art_id`
+///   étant fourni à côté, on reconstruit l'adresse nous-mêmes ;
+/// - pour un **artiste**, il n'y a pas d'`art_id`, et le champ `img` est
+///   correct tel quel (identifiant zéro-padé, sans préfixe) : on le reprend.
+///
+/// Sans cette distinction, la grille de recherche affichait des cadres vides —
+/// des URL bien formées, présentes dans la réponse, et toutes en 404.
+fn pochette_de_resultat(r: &Value) -> Option<Value> {
+    match pochette(r.get("art_id")) {
+        Some(u) => Some(Value::String(u)),
+        None => r.get("img").cloned().filter(|v| v.is_string()),
+    }
 }
 
 /// Reconstruire l'adresse publique d'un album ou d'une piste depuis les
@@ -286,7 +327,7 @@ async fn bc_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
             "titre": r.get("name"),
             "artiste": r.get("band_name"),
             "url": r.get("item_url_path").or_else(|| r.get("item_url_root")),
-            "pochette": r.get("img"),
+            "pochette": pochette_de_resultat(r),
             "lieu": r.get("location"),
             "album": r.get("album_name"),
         });
@@ -518,9 +559,120 @@ async fn bc_artist(Path(id): Path<String>) -> Json<Value> {
     Json(json!({
         "id": id,
         "type": "artist",
-        "message": "Bandcamp has no public artist API. Use /search to find artists.",
+        "message": "Use /artist?url=<bandcamp artist url> to list a discography.",
         "albums": [],
     }))
+}
+
+/// Extraire la discographie de la page `/music` d'un artiste.
+///
+/// L'ancien `/artist/{id}` répondait « Bandcamp has no public artist API ».
+/// C'était faux, comme ça l'était pour les albums : la page publique porte une
+/// `<ol id="music-grid">` dont chaque `<li>` donne le titre, le lien relatif et
+/// la pochette. Aucune session requise.
+///
+/// Bandcamp y sert lui-même ses vignettes en `_2` — la même taille que
+/// [`POCHETTE_GRILLE`], choisie indépendamment en mesurant. On reprend l'URL
+/// telle quelle plutôt que de la reconstruire : elle est déjà juste, préfixe
+/// `a` compris.
+///
+/// Fonction pure sur le HTML, donc testable sans réseau. Rend une liste vide
+/// quand la grille est absente — Bandcamp peut changer sa page sans préavis, et
+/// une liste vide franche vaut mieux qu'une structure devinée.
+fn extraire_discographie(page: &str, racine: &str) -> Vec<Value> {
+    let Some(debut) = page.find("id=\"music-grid\"") else {
+        return Vec::new();
+    };
+    let grille = &page[debut..];
+    let fin = grille.find("</ol>").unwrap_or(grille.len());
+    let grille = &grille[..fin];
+
+    let mut sortie = Vec::new();
+    for bloc in grille.split("<li ").skip(1) {
+        // Le lien est relatif (`/album/mon-disque`) : le rendre absolu ici, car
+        // c'est lui que `/album?url=` recevra, et il exige une adresse complète.
+        let Some(href) = attribut(bloc, "href=\"") else {
+            continue;
+        };
+        if !href.starts_with("/album/") && !href.starts_with("/track/") {
+            continue;
+        }
+        let titre = entre(bloc, "class=\"title\">", "</p>")
+            .map(|t| deshtmliser(t.trim()))
+            .unwrap_or_default();
+        if titre.is_empty() {
+            continue;
+        }
+        sortie.push(json!({
+            "titre": titre,
+            "url": format!("{}{}", racine.trim_end_matches('/'), href),
+            "pochette": attribut(bloc, "src=\"").map(|s| deshtmliser(&s)),
+            "type": if href.starts_with("/track/") { "track" } else { "album" },
+        }));
+    }
+    sortie
+}
+
+/// Valeur d'un attribut HTML repéré par son préfixe (`href="`, `src="`).
+fn attribut(bloc: &str, prefixe: &str) -> Option<String> {
+    let i = bloc.find(prefixe)? + prefixe.len();
+    let reste = &bloc[i..];
+    let j = reste.find('"')?;
+    Some(reste[..j].to_string())
+}
+
+/// Texte entre deux bornes, sans les bornes.
+fn entre<'a>(bloc: &'a str, ouvre: &str, ferme: &str) -> Option<&'a str> {
+    let i = bloc.find(ouvre)? + ouvre.len();
+    let reste = &bloc[i..];
+    let j = reste.find(ferme)?;
+    Some(&reste[..j])
+}
+
+#[derive(Deserialize)]
+struct ArtistQuery {
+    url: String,
+}
+
+/// La discographie publique d'un artiste, à partir de l'adresse de sa page.
+///
+/// Comme `/album`, l'adresse passe par `?url=` : une URL Bandcamp contient des
+/// `/` et ne tient pas dans un segment de chemin.
+async fn bc_artiste_par_url(Query(q): Query<ArtistQuery>) -> impl IntoResponse {
+    if !q.url.starts_with("https://") || !q.url.contains("bandcamp.com") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "url must be an https bandcamp.com address" })),
+        )
+            .into_response();
+    }
+    // La discographie vit sur `/music`, pas sur la racine — une racine seule
+    // affiche l'album mis en avant, ce qui donnerait un seul résultat.
+    let racine = q
+        .url
+        .split("/music")
+        .next()
+        .unwrap_or(&q.url)
+        .trim_end_matches('/')
+        .to_string();
+    let cible = format!("{racine}/music");
+
+    let client = tune_core::http::client::shared();
+    let reponse = client.get(&cible).send().await;
+    let page = match reponse {
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
+        Err(e) => return passerelle_en_echec(e.to_string()),
+    };
+
+    let albums = extraire_discographie(&page, &racine);
+    Json(json!({
+        "type": "artist",
+        "url": racine,
+        "albums": albums,
+        "count": albums.len(),
+    }))
+    .into_response()
 }
 
 async fn bc_tags() -> Json<Value> {
@@ -810,10 +962,10 @@ mod tests {
             a["url"],
             "https://ulyssesowensjr.bandcamp.com/album/kind-of-grunge"
         );
-        assert_eq!(
-            a["pochette"],
-            "https://f4.bcbits.com/img/a4214215264_10.jpg"
-        );
+        // `_2` (350 px, 12,5 Ko) et non `_10` (1150 px, 50 Ko) : les vignettes
+        // font 9 rem, la grande taille pesait quatre fois plus pour un résultat
+        // identique à l'œil. Changement délibéré — ce test l'a bien attrapé.
+        assert_eq!(a["pochette"], "https://f4.bcbits.com/img/a4214215264_2.jpg");
         assert_eq!(a["extrait"], "https://t4.bcbits.com/stream/x");
         // La qualité voyage avec chaque item : #1768 exige qu'un flux à
         // 128 kbit/s soit annoncé partout où il apparaît.
@@ -843,6 +995,99 @@ mod tests {
         assert!(pochette(None).is_none());
         assert!(pochette(Some(&json!(null))).is_none());
         assert!(pochette(Some(&json!(0))).is_none());
+    }
+
+    #[test]
+    fn la_pochette_porte_le_prefixe_a_sans_lequel_bandcamp_repond_404() {
+        // Mesuré : `.../img/4029072179_2.jpg` → 404, `.../a4029072179_2.jpg` → 200.
+        let u = pochette(Some(&json!(4029072179_i64))).unwrap();
+        assert_eq!(u, "https://f4.bcbits.com/img/a4029072179_2.jpg");
+        assert!(u.contains("/img/a"), "le prefixe `a` est obligatoire");
+    }
+
+    #[test]
+    fn un_album_de_recherche_ignore_le_img_casse_de_bandcamp() {
+        // Le champ `img` que Bandcamp rend pour un album OMET le prefixe `a` :
+        // l'URL est bien formee, presente, et tombe en 404. C'est ce qui
+        // affichait des cadres vides dans la grille de recherche.
+        let album = json!({
+            "type": "a",
+            "art_id": 4029072179_i64,
+            "img": "https://f4.bcbits.com/img/4029072179_3.jpg",
+        });
+        assert_eq!(
+            pochette_de_resultat(&album).unwrap(),
+            json!("https://f4.bcbits.com/img/a4029072179_2.jpg")
+        );
+    }
+
+    #[test]
+    fn un_artiste_garde_son_img_qui_lui_est_correct() {
+        // Un artiste n'a pas d'`art_id`, et son `img` est juste tel quel
+        // (identifiant zero-pade, sans prefixe) — verifie en 200.
+        let artiste = json!({
+            "type": "b",
+            "img": "https://f4.bcbits.com/img/0035340864_23.jpg",
+        });
+        assert_eq!(
+            pochette_de_resultat(&artiste).unwrap(),
+            json!("https://f4.bcbits.com/img/0035340864_23.jpg")
+        );
+        assert!(pochette_de_resultat(&json!({ "type": "b" })).is_none());
+    }
+
+    /// Une `music-grid` reduite aux attributs lus, telle que Bandcamp la rend.
+    const GRILLE: &str = r#"<ol id="music-grid" class="editable-grid music-grid columns-3 public">
+      <li data-item-id="album-1297872477" data-band-id="3966070289" class="music-grid-item square">
+        <a href="/album/prime-example">
+          <div class="art"><img src="https://f4.bcbits.com/img/a0808959197_2.jpg" alt="" /></div>
+          <p class="title"> Prime Example &amp; co </p>
+        </a>
+      </li>
+      <li data-item-id="track-42" class="music-grid-item">
+        <a href="/track/un-titre">
+          <div class="art"><img src="https://f4.bcbits.com/img/a1_2.jpg" alt="" /></div>
+          <p class="title">Un titre</p>
+        </a>
+      </li>
+      <li class="music-grid-item"><a href="/community"><p class="title">Pas un disque</p></a></li>
+    </ol>"#;
+
+    #[test]
+    fn la_discographie_se_lit_sur_la_page_music() {
+        // L'ancien `/artist/{id}` repondait « Bandcamp has no public artist
+        // API ». Faux, comme ca l'etait pour les albums.
+        let d = extraire_discographie(GRILLE, "https://ulysseshellier.bandcamp.com/");
+        assert_eq!(d.len(), 2, "le lien /community n'est pas un disque");
+        assert_eq!(d[0]["titre"], "Prime Example & co");
+        assert_eq!(
+            d[0]["url"],
+            "https://ulysseshellier.bandcamp.com/album/prime-example"
+        );
+        assert_eq!(
+            d[0]["pochette"],
+            "https://f4.bcbits.com/img/a0808959197_2.jpg"
+        );
+        assert_eq!(d[0]["type"], "album");
+        // Une piste isolee est marquee comme telle : `/album?url=` la resout
+        // aussi, mais l'ecran doit pouvoir la presenter differemment.
+        assert_eq!(d[1]["type"], "track");
+    }
+
+    #[test]
+    fn une_url_relative_devient_absolue_sans_double_barre() {
+        // La racine arrive parfois avec une barre finale, parfois sans : les
+        // deux doivent donner la meme adresse, car `/album?url=` la rejettera
+        // si elle est malformee.
+        let avec = extraire_discographie(GRILLE, "https://x.bandcamp.com/");
+        let sans = extraire_discographie(GRILLE, "https://x.bandcamp.com");
+        assert_eq!(avec[0]["url"], sans[0]["url"]);
+        assert_eq!(avec[0]["url"], "https://x.bandcamp.com/album/prime-example");
+    }
+
+    #[test]
+    fn une_page_sans_grille_rend_une_liste_vide_franche() {
+        assert!(extraire_discographie("<html>rien</html>", "https://x.bandcamp.com").is_empty());
     }
 
     #[test]
