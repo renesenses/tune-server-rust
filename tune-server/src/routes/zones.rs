@@ -1485,6 +1485,13 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                         server_ip, state.port, stream_id
                     );
                     obj.insert("stream_url".into(), json!(stream_url));
+                    if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
+                        state.backend.clone(),
+                        stream_id,
+                        "flac",
+                    ) {
+                        obj.insert("stream_url_remote".into(), json!(distant));
+                    }
                 }
             }
         }
@@ -1617,6 +1624,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                             server_ip, state.port, stream_id
                         );
                         obj.insert("stream_url".into(), json!(stream_url));
+                        if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
+                            state.backend.clone(),
+                            stream_id,
+                            "flac",
+                        ) {
+                            obj.insert("stream_url_remote".into(), json!(distant));
+                        }
                     }
                 }
             }
