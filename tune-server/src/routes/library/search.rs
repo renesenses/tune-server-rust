@@ -416,11 +416,24 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let model_fetch = json!(null);
 
+    // Pourquoi la passe ne travaille pas, quand elle ne travaille pas.
+    //
+    // Une passe en pause et une passe cassée donnaient exactement le même
+    // écran — jauge immobile, rien qui bouge. Bilou a ouvert un fil sur une
+    // analyse « qui ne démarre pas » (#1457) alors qu'elle cédait le passage à
+    // sa musique, comme prévu. `null` quand rien ne l'empêche de tourner.
+    #[cfg(feature = "audio-embedding")]
+    let paused_reason = tune_core::audio::embedding::pause_acoustique().nom();
+    #[cfg(not(feature = "audio-embedding"))]
+    let paused_reason: Option<&str> = None;
+
     Json(json!({
         "available": available,
         "enabled": enabled,
         "model_ready": model_ready,
         "model_fetch": model_fetch,
+        // « playback » | « thermal » | « low_memory » | « not_premium » | null
+        "paused_reason": paused_reason,
         // Embeddings réellement écrits pour le modèle courant.
         "analysed_tracks": analysed,
         // Pistes traitées (embedding écrit OU échec constaté) : le numérateur
