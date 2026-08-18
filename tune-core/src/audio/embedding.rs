@@ -635,6 +635,70 @@ pub struct FetchState {
     pub last_error: Option<String>,
 }
 
+/// Pourquoi la passe acoustique ne travaille pas en ce moment.
+///
+/// Même raison d'être que [`FetchState`], au point d'en reprendre la phrase :
+/// ce qui manquait n'était pas la ténacité du serveur, c'était sa capacité à
+/// la DIRE. Une passe en pause et une passe cassée donnent exactement le même
+/// écran — jauge immobile, rien qui bouge — et l'utilisateur conclut à une
+/// panne. Bilou a ouvert un fil sur une analyse acoustique « qui ne démarre
+/// pas » (#1457) alors qu'elle cédait le passage à sa musique, comme prévu.
+///
+/// Chacune de ces raisons appelle un geste différent, ou aucun. Les taire
+/// revient à demander à l'utilisateur de deviner laquelle s'applique.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PauseAcoustique {
+    /// La passe travaille, ou attend simplement son prochain tour.
+    #[default]
+    Aucune,
+    /// Une zone joue : l'analyse s'efface devant la lecture (#1515).
+    Lecture,
+    /// Garde thermique (#1576).
+    Thermique,
+    /// Mémoire disponible sous le seuil.
+    Memoire,
+    /// Fonction réservée au premium ; le réglage reste actif.
+    NonPremium,
+}
+
+impl PauseAcoustique {
+    /// Nom stable, destiné à l'API et à l'interface. `None` quand rien
+    /// n'empêche la passe de tourner.
+    pub fn nom(self) -> Option<&'static str> {
+        match self {
+            PauseAcoustique::Aucune => None,
+            PauseAcoustique::Lecture => Some("playback"),
+            PauseAcoustique::Thermique => Some("thermal"),
+            PauseAcoustique::Memoire => Some("low_memory"),
+            PauseAcoustique::NonPremium => Some("not_premium"),
+        }
+    }
+}
+
+static PAUSE_ACOUSTIQUE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn poser_pause(raison: PauseAcoustique) {
+    let code = match raison {
+        PauseAcoustique::Aucune => 0,
+        PauseAcoustique::Lecture => 1,
+        PauseAcoustique::Thermique => 2,
+        PauseAcoustique::Memoire => 3,
+        PauseAcoustique::NonPremium => 4,
+    };
+    PAUSE_ACOUSTIQUE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Ce qui empêche la passe acoustique de travailler, s'il y a quelque chose.
+pub fn pause_acoustique() -> PauseAcoustique {
+    match PAUSE_ACOUSTIQUE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => PauseAcoustique::Lecture,
+        2 => PauseAcoustique::Thermique,
+        3 => PauseAcoustique::Memoire,
+        4 => PauseAcoustique::NonPremium,
+        _ => PauseAcoustique::Aucune,
+    }
+}
+
 type FetchStates = std::sync::Mutex<std::collections::HashMap<&'static str, FetchState>>;
 static FETCH_STATES: std::sync::OnceLock<FetchStates> = std::sync::OnceLock::new();
 
@@ -868,6 +932,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         "audio_embed_requires_premium — l'analyse acoustique est réservée au premium ; le réglage reste actif et la passe reprendra dès qu'une licence sera validée"
                     );
                 }
+                poser_pause(PauseAcoustique::NonPremium);
                 // On relâche aussi la session ONNX : inutile de garder ~300 Mo
                 // résidents pour une passe qui ne tournera pas.
                 embedder = None;
@@ -876,6 +941,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
             }
             if not_premium {
                 not_premium = false;
+                poser_pause(PauseAcoustique::Aucune);
                 info!("audio_embed_premium_ok — licence validée, l'analyse acoustique reprend");
             }
             if enabled(&settings) {
@@ -893,6 +959,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             "audio_embed_yield_to_playback — zone playing, acoustic analysis paused until playback stops"
                         );
                     }
+                    poser_pause(PauseAcoustique::Lecture);
                     tokio::time::sleep(std::time::Duration::from_secs(
                         crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
                     ))
@@ -908,6 +975,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 // la mémoire, une analyse facultative ne doit jamais mettre la
                 // machine en danger — et ici le danger est physique.
                 if thermal.should_hold("acoustique") {
+                    poser_pause(PauseAcoustique::Thermique);
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
                 }
@@ -938,6 +1006,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
                         );
                     }
+                    poser_pause(PauseAcoustique::Memoire);
                     tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                     continue;
                 }
@@ -948,6 +1017,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         "audio_embed_resumed_memory_ok"
                     );
                 }
+                // Passé les trois gardes, plus rien n'empêche la passe de
+                // travailler : ce qu'affiche l'interface doit le suivre.
+                poser_pause(PauseAcoustique::Aucune);
 
                 // Le nombre de fils est figé à la construction de la session.
                 // Si le réglage a changé depuis, on relâche la session pour
@@ -1044,6 +1116,40 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
 
 #[cfg(test)]
 mod tests {
+    use super::{PauseAcoustique, pause_acoustique, poser_pause};
+
+    /// Chaque raison porte un nom stable, et « rien ne bloque » n'en porte pas.
+    /// C'est ce `None` qui permet à l'interface de distinguer une passe qui
+    /// travaille d'une passe empêchée — la confusion des deux est le défaut
+    /// que ce champ existe pour lever (#1457, #1866).
+    #[test]
+    fn chaque_pause_porte_un_nom_stable_et_aucune_nen_porte_pas() {
+        assert_eq!(PauseAcoustique::Aucune.nom(), None);
+        assert_eq!(PauseAcoustique::Lecture.nom(), Some("playback"));
+        assert_eq!(PauseAcoustique::Thermique.nom(), Some("thermal"));
+        assert_eq!(PauseAcoustique::Memoire.nom(), Some("low_memory"));
+        assert_eq!(PauseAcoustique::NonPremium.nom(), Some("not_premium"));
+    }
+
+    /// Le défaut est « rien ne bloque » : un serveur qui n'a pas encore posé
+    /// de raison ne doit pas laisser croire à une pause.
+    #[test]
+    fn le_defaut_est_aucune_pause() {
+        assert_eq!(PauseAcoustique::default(), PauseAcoustique::Aucune);
+        assert_eq!(PauseAcoustique::default().nom(), None);
+    }
+
+    /// La raison posée est celle qu'on relit, et elle s'efface.
+    #[test]
+    fn la_raison_posee_est_celle_quon_relit() {
+        poser_pause(PauseAcoustique::Thermique);
+        assert_eq!(pause_acoustique(), PauseAcoustique::Thermique);
+        poser_pause(PauseAcoustique::Lecture);
+        assert_eq!(pause_acoustique().nom(), Some("playback"));
+        poser_pause(PauseAcoustique::Aucune);
+        assert_eq!(pause_acoustique().nom(), None);
+    }
+
     use super::*;
 
     #[test]
