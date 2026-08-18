@@ -212,20 +212,22 @@ impl OpenHomeOutput {
 
     async fn select_playlist_source(&self) {
         let Some(url) = self.svc_url("product") else {
+            info!(device = %self.name, "oh_source_no_product_service");
             return;
         };
-        let Ok(resp) = self.soap_call(url, SVC_PRODUCT, "SourceXml", &[]).await else {
+        let resp = match self.soap_call(url, SVC_PRODUCT, "SourceXml", &[]).await {
+            Ok(r) => r,
+            Err(e) => {
+                info!(device = %self.name, error = %e, "oh_source_xml_call_failed");
+                return;
+            }
+        };
+        let Some(xml_raw) = extract_tag(&resp, "Value") else {
+            info!(device = %self.name, "oh_source_xml_no_value");
             return;
         };
-        let Some(xml) = extract_tag(&resp, "Value") else {
-            return;
-        };
-
-        let mut idx = 0u32;
-        for chunk in xml.split("<Source>").skip(1) {
-            if let Some(stype) = extract_tag(chunk, "Type")
-                && stype.trim() == "Playlist"
-            {
+        match playlist_source_index(&xml_raw) {
+            Some(idx) => {
                 if let Err(e) = self
                     .soap_call(
                         url,
@@ -237,11 +239,10 @@ impl OpenHomeOutput {
                 {
                     warn!(device = %self.name, error = %e, "oh_source_select_failed");
                 } else {
-                    debug!(device = %self.name, index = idx, "oh_source_set_playlist");
+                    info!(device = %self.name, index = idx, "oh_source_set_playlist");
                 }
-                return;
             }
-            idx += 1;
+            None => info!(device = %self.name, "oh_source_no_playlist_found"),
         }
     }
 
@@ -343,6 +344,12 @@ impl OutputTarget for OpenHomeOutput {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let metadata = Self::build_didl(media);
+        debug!(
+            device = %self.name,
+            uri = media.url,
+            didl = %metadata,
+            "oh_insert_uri_didl"
+        );
 
         self.playlist_delete_all().await?;
 
@@ -511,6 +518,8 @@ impl OutputTarget for OpenHomeOutput {
             track_title,
             track_artist,
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 
@@ -561,6 +570,28 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let end = xml[start..].find(&close)? + start;
     let text = xml[start..end].trim().to_string();
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// Index of the `Playlist` source in an OpenHome Product `SourceXml` Value.
+///
+/// The Value is an *escaped* XML string (`&lt;SourceList&gt;&lt;Source&gt;…`),
+/// so it must be entity-decoded before parsing. Without the decode, the
+/// `<Source>` split finds nothing, the Playlist source is never selected, and
+/// the renderer plays no source (bytes_sent=0) — Vincent's LUXMAN NT-07 looped
+/// on every track for exactly this. Returns None when no Playlist source
+/// exists.
+fn playlist_source_index(source_xml_value: &str) -> Option<u32> {
+    let xml = quick_xml::escape::unescape(source_xml_value)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| source_xml_value.to_string());
+    for (idx, chunk) in xml.split("<Source>").skip(1).enumerate() {
+        if let Some(stype) = extract_tag(chunk, "Type")
+            && stype.trim() == "Playlist"
+        {
+            return Some(idx as u32);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -617,6 +648,38 @@ mod tests {
         });
         assert!(didl.contains("Rock &amp; Roll"));
         assert!(didl.contains("a=1&amp;b=2"));
+    }
+
+    #[test]
+    fn playlist_source_index_decodes_escaped_sourcexml() {
+        // Vincent's LUXMAN NT-07 returns the SourceXml Value entity-encoded.
+        // Without decoding, the `<Source>` split found nothing → Playlist never
+        // selected → bytes_sent=0 loop.
+        let escaped = "&lt;SourceList&gt;&lt;Source&gt;&lt;Name&gt;Playlist&lt;/Name&gt;\
+                       &lt;Type&gt;Playlist&lt;/Type&gt;&lt;Visible&gt;true&lt;/Visible&gt;\
+                       &lt;/Source&gt;&lt;/SourceList&gt;";
+        assert_eq!(playlist_source_index(escaped), Some(0));
+
+        // A Radio source before Playlist → index 1.
+        let two = "&lt;SourceList&gt;&lt;Source&gt;&lt;Type&gt;Radio&lt;/Type&gt;&lt;/Source&gt;\
+                   &lt;Source&gt;&lt;Type&gt;Playlist&lt;/Type&gt;&lt;/Source&gt;&lt;/SourceList&gt;";
+        assert_eq!(playlist_source_index(two), Some(1));
+
+        // Already-decoded XML still works.
+        assert_eq!(
+            playlist_source_index(
+                "<SourceList><Source><Type>Playlist</Type></Source></SourceList>"
+            ),
+            Some(0)
+        );
+
+        // No Playlist source → None.
+        assert_eq!(
+            playlist_source_index(
+                "&lt;SourceList&gt;&lt;Source&gt;&lt;Type&gt;Radio&lt;/Type&gt;&lt;/Source&gt;&lt;/SourceList&gt;"
+            ),
+            None
+        );
     }
 
     #[test]

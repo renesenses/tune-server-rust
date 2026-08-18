@@ -15,6 +15,18 @@ pub struct PluginManifest {
     pub entry_point: String,
     pub permissions: Vec<String>,
     pub min_server_version: Option<String>,
+    /// Whether this plugin's mounted HTTP routes are premium-gated. When true,
+    /// the host runs `premium_guard` before dispatching a request to the plugin
+    /// (RFC §3.5). Defaults to `false` so existing manifests parse unchanged.
+    #[serde(default)]
+    pub premium: bool,
+    /// Glob patterns for the `event_bus` events this plugin wants forwarded to
+    /// its optional `plugin_on_event` export (RFC §3.6). Each pattern is an
+    /// exact event name, a `"prefix.*"` wildcard, or the bare `"*"` (all
+    /// events). Empty (the default) means the plugin receives no events, so
+    /// existing manifests parse unchanged.
+    #[serde(default)]
+    pub event_subscriptions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +331,8 @@ mod tests {
                     entry_point: String::new(),
                     permissions: vec![],
                     min_server_version: None,
+                    premium: false,
+                    event_subscriptions: vec![],
                 },
                 state: PluginState::Active,
                 path: String::new(),
@@ -337,6 +351,8 @@ mod tests {
                     entry_point: String::new(),
                     permissions: vec![],
                     min_server_version: None,
+                    premium: false,
+                    event_subscriptions: vec![],
                 },
                 state: PluginState::Disabled,
                 path: String::new(),

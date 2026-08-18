@@ -6,13 +6,17 @@ mod convert;
 mod database;
 mod diagnostics;
 mod enrich;
+// Shared enrichment quota/premium gate, reused by /library/enrich-all so the
+// full-library MusicBrainz path isn't a free bypass of the same operation.
+pub(crate) use enrich::gate_enrichment;
 mod import;
 mod playlist_hub;
 mod plugins;
+mod profile;
 mod remote;
-mod scan;
+pub(crate) mod scan;
 mod tags;
-mod update;
+pub(crate) mod update;
 mod youtube;
 
 use axum::Router;
@@ -27,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/version", get(config::version))
         .route("/health", get(config::health))
         .route("/stats", get(config::stats))
+        .route("/profile", get(profile::system_profile))
         .route(
             "/config",
             get(config::get_config).patch(config::update_config),
@@ -79,7 +84,13 @@ pub fn router() -> Router<AppState> {
         .route("/database/export", get(database::export_database))
         .route("/update/check", get(update::update_check))
         .route("/changelog", get(update::changelog))
-        .route("/peers", get(admin::system_peers))
+        .route(
+            "/peers",
+            get(admin::system_peers)
+                .post(admin::add_peer)
+                .delete(admin::remove_peer),
+        )
+        .route("/peer-info", get(admin::peer_info))
         .route(
             "/scan/schedule",
             get(scan::scan_schedule).post(scan::set_scan_schedule),
@@ -94,6 +105,7 @@ pub fn router() -> Router<AppState> {
             "/bug-report/markdown",
             get(diagnostics::bug_report_markdown),
         )
+        .route("/bug-report/submit", post(diagnostics::submit_bug_report))
         .route("/health/monitor", get(diagnostics::health_monitor))
         .route("/health/alerts", get(diagnostics::health_alerts))
         .route("/clear-cache", post(config::clear_cache))
@@ -174,9 +186,20 @@ pub fn router() -> Router<AppState> {
             "/playlist-hub/{hub_id}/transfer",
             post(playlist_hub::transfer),
         )
-        // Cloud config backup — full server config export/import/push/pull
-        .route("/config-backup/export", get(config_backup::export))
+        // Cloud config backup — full server config export/import/push/pull.
+        // GET export omits streaming tokens; POST takes the passphrase and
+        // returns them sealed (audit item 7).
+        .route(
+            "/config-backup/export",
+            get(config_backup::export).post(config_backup::export_sealed),
+        )
         .route("/config-backup/import", post(config_backup::import))
+        .route(
+            "/config-backup/passphrase",
+            get(config_backup::passphrase_status)
+                .post(config_backup::set_passphrase)
+                .put(config_backup::change_passphrase),
+        )
         .route("/config-backup/cloud-push", post(config_backup::cloud_push))
         .route("/config-backup/cloud-pull", post(config_backup::cloud_pull))
         .route(

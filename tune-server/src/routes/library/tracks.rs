@@ -72,7 +72,7 @@ pub(super) struct QuickFavQuery {
 
 /// Query parameters for GET /library/tracks — supports pagination + metadata filters.
 /// All filters combine with AND logic.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(super) struct TrackFilterQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -85,6 +85,61 @@ pub(super) struct TrackFilterQuery {
     pub label: Option<String>,
     pub composer: Option<String>,
     pub q: Option<String>,
+    pub artist: Option<String>,
+    pub country: Option<String>,
+    pub mood: Option<String>,
+    pub source_media: Option<String>,
+    /// Oxygen folder facet: absolute directory prefix; matches its whole subtree.
+    pub folder: Option<String>,
+    /// Oxygen rating facet: album rating 1-5 (profile 1).
+    pub rating: Option<i32>,
+    /// Oxygen collection facet: manual collection name (resolved to album ids).
+    pub collection: Option<String>,
+    /// Facette Favoris : `track` ou `album` (profil 1).
+    pub favorite: Option<String>,
+    /// Facette Listes de lecture : nom de la liste.
+    pub playlist: Option<String>,
+    /// Facette Sans étiquette : `genre`, `year`, `artist`, `album` ou `cover`.
+    pub untagged: Option<String>,
+    /// Facette Année d'enregistrement (`albums.original_year`).
+    pub original_year: Option<i32>,
+}
+
+impl TrackFilterQuery {
+    /// Une requête porte-t-elle au moins un filtre ?
+    ///
+    /// Extrait de `list_tracks` pour être testable : tant que l'expression
+    /// vivait en ligne, un champ pouvait en être absent sans qu'aucun test ne
+    /// puisse le dire. C'est arrivé — `original_year` avait été ajouté à la
+    /// suite d'un `;`, donc dans une fermeture `|| …` créée et jetée, et le
+    /// tri par année d'enregistrement partait sur le chemin NON filtré.
+    ///
+    /// Toute facette ajoutée à cette structure doit être ajoutée ici ET dans
+    /// `chaque_facette_compte_comme_un_filtre`.
+    fn has_filters(&self) -> bool {
+        let non_vide = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
+
+        self.genre.is_some()
+            || self.year.is_some()
+            || self.format.is_some()
+            || self.sample_rate.is_some()
+            || self.bit_depth.is_some()
+            || self.source.is_some()
+            || self.label.is_some()
+            || self.composer.is_some()
+            || self.q.is_some()
+            || self.artist.is_some()
+            || self.country.is_some()
+            || self.mood.is_some()
+            || self.source_media.is_some()
+            || self.rating.is_some()
+            || self.original_year.is_some()
+            || non_vide(&self.folder)
+            || non_vide(&self.collection)
+            || non_vide(&self.favorite)
+            || non_vide(&self.playlist)
+            || non_vide(&self.untagged)
+    }
 }
 
 pub(super) async fn list_tracks(
@@ -95,15 +150,29 @@ pub(super) async fn list_tracks(
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
 
-    let has_filters = p.genre.is_some()
-        || p.year.is_some()
-        || p.format.is_some()
-        || p.sample_rate.is_some()
-        || p.bit_depth.is_some()
-        || p.source.is_some()
-        || p.label.is_some()
-        || p.composer.is_some()
-        || p.q.is_some();
+    let has_filters = p.has_filters();
+
+    // Resolve the collection name so /library/tracks?collection=<name> filters
+    // to its members. A MANUAL collection resolves to album ids (JSON settings);
+    // a SMART collection resolves to concrete track ids (its compiled rule query).
+    // Manual wins on a name clash. An unknown name → empty album set → matches
+    // nothing (the requested collection is simply empty).
+    let (collection_ids, collection_track_ids): (Option<Vec<i64>>, Option<Vec<i64>>) =
+        match p.collection.as_deref().filter(|s| !s.is_empty()) {
+            None => (None, None),
+            Some(name) => {
+                let album_ids = super::facets::collection_album_ids(&state, name);
+                if !album_ids.is_empty() {
+                    (Some(album_ids), None)
+                } else if let Some(track_ids) =
+                    super::facets::smart_collection_track_ids(&state, name)
+                {
+                    (None, Some(track_ids))
+                } else {
+                    (Some(Vec::new()), None)
+                }
+            }
+        };
 
     if has_filters {
         match repo.list_filtered(
@@ -116,6 +185,18 @@ pub(super) async fn list_tracks(
             p.label.as_deref(),
             p.composer.as_deref(),
             p.q.as_deref(),
+            p.artist.as_deref(),
+            p.country.as_deref(),
+            p.mood.as_deref(),
+            p.source_media.as_deref(),
+            p.folder.as_deref(),
+            p.rating,
+            collection_ids.as_deref(),
+            collection_track_ids.as_deref(),
+            p.favorite.as_deref(),
+            p.playlist.as_deref(),
+            p.untagged.as_deref(),
+            p.original_year,
             limit,
             offset,
         ) {
@@ -151,6 +232,52 @@ pub(super) async fn track_count(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     Json(json!({ "count": count }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SimilarParams {
+    limit: Option<i64>,
+}
+
+/// GET /library/tracks/{id}/similar — acoustically similar tracks ("Plus comme
+/// ça", Phase 2). Ranks the library by cosine distance to the seed's CLAP
+/// embedding via `acoustic_neighbors`, hydrates the tracks and re-emits them in
+/// similarity order with a `similarity` score. Empty (not an error) when the
+/// seed has no embedding yet — the audio-embedding pass hasn't covered it, or
+/// this build never computed vectors — so the client can fall back gracefully.
+pub(super) async fn track_similar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(p): Query<SimilarParams>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let neighbors =
+        tune_core::audio::embedding_store::acoustic_neighbors(&state.backend, id, limit);
+    if neighbors.is_empty() {
+        return Json(json!({ "seed_track_id": id, "count": 0, "items": [] }));
+    }
+    let ids: Vec<i64> = neighbors.iter().map(|(t, _)| *t).collect();
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .list_by_ids(&ids)
+        .unwrap_or_default();
+    let by_id: std::collections::HashMap<i64, &tune_core::db::models::Track> =
+        tracks.iter().filter_map(|t| t.id.map(|i| (i, t))).collect();
+    // Re-emit in acoustic-rank order (list_by_ids is unordered) with the score.
+    let items: Vec<Value> = neighbors
+        .iter()
+        .filter_map(|(tid, score)| {
+            let t = by_id.get(tid)?;
+            let mut v = serde_json::to_value(t).ok()?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "similarity".into(),
+                    json!((score * 1000.0).round() / 1000.0),
+                );
+            }
+            Some(v)
+        })
+        .collect();
+    Json(json!({ "seed_track_id": id, "count": items.len(), "items": items }))
 }
 
 pub(super) async fn get_track(
@@ -264,10 +391,11 @@ pub(super) async fn rescan_track(
 
 pub(super) async fn quick_fav_track(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<QuickFavQuery>,
 ) -> Json<Value> {
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     let repo = ProfileRepo::with_backend(state.backend.clone());
     let is_fav = repo.is_favorite(profile_id, "track", id).unwrap_or(false);
     if is_fav {
@@ -311,53 +439,158 @@ pub(super) async fn track_all_tags(
     Json(result).into_response()
 }
 
+/// GET /api/v1/library/tracks/{id}/lyrics — mode « Grand écran + paroles ».
+///
+/// Contract (the web client is built against this — do not change):
+/// - 200: `{"synced": bool, "source": "lrc"|"tag"|"lrclib",
+///          "lines": [{"t_ms": <u64|null>, "text": "..."}]}`
+///   (`t_ms` is null when the source is unsynchronized)
+/// - 404: `{"error": "no_lyrics"}` when no source has lyrics.
+///
+/// Resolution cascade:
+/// 1. Sidecar `.lrc` / `.LRC` next to the audio file → synced, source "lrc".
+/// 2. Embedded tag (USLT/LYRICS via lofty; the scanner also persists it in
+///    `track_metadata` under the `lyrics` key). LRC timestamps inside the
+///    tag → synced; otherwise raw lines with `t_ms: null` → unsynced.
+/// 3. LRCLIB, only when the `lyrics_lrclib_enabled` setting is "true"
+///    (cache-first, negatives retried after 14 days).
+///
+/// Never returns 500 for a track without lyrics; LRCLIB failures degrade
+/// to a clean 404. No premium gate: this is a display feature.
 pub(super) async fn track_lyrics(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    // Réponses partagées avec GET /lyrics/by-meta (même contrat JSON).
+    use crate::routes::lyrics::{
+        no_lyrics_response as no_lyrics, plain_lines_response as plain_response,
+        synced_lines_response as synced_response,
+    };
+
     let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => return no_lyrics(),
     };
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let genius_token = settings.get("genius_api_token").ok().flatten();
-    let Some(token) = genius_token else {
-        return Json(json!({"track_id": id, "lyrics": null, "error": "Genius API not configured"}))
-            .into_response();
-    };
-    let title = &track.title;
-    let artist = track.artist_name.as_deref().unwrap_or("");
-    let q = format!("{title} {artist}");
-    let search_url = format!(
-        "https://api.genius.com/search?q={}",
-        urlencoding::encode(&q)
-    );
-    let resp = state
-        .http_client
-        .get(&search_url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let data: Value = r.json().await.unwrap_or(json!({}));
-            let hits = data.pointer("/response/hits").and_then(|v| v.as_array());
-            let url = hits
-                .and_then(|arr| arr.first())
-                .and_then(|h| h.pointer("/result/url"))
-                .and_then(|v| v.as_str());
-            Json(json!({
-                "track_id": id,
-                "title": title,
-                "artist": artist,
-                "genius_url": url,
-                "lyrics": null,
-            }))
-            .into_response()
+
+    // 1. Sidecar .lrc / .LRC next to the audio file.
+    if let Some(ref path) = track.file_path {
+        if let Some(content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
+            let lines = tune_core::metadata::lyrics::parse_lrc(&content);
+            if !lines.is_empty() {
+                return synced_response("lrc", &lines);
+            }
         }
-        _ => Json(json!({"track_id": id, "lyrics": null, "error": "Genius API request failed"}))
-            .into_response(),
+    }
+
+    // 2. Embedded tag: scanner-persisted `track_metadata['lyrics']` first
+    // (no file I/O), then a direct lofty read of the file.
+    let meta_repo =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    let tag_lyrics = meta_repo
+        .get_all(id)
+        .ok()
+        .and_then(|m| m.get("lyrics").cloned())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            track
+                .file_path
+                .as_deref()
+                .and_then(tune_core::metadata::lyrics::read_embedded_lyrics)
+        });
+    if let Some(text) = tag_lyrics {
+        let lines = tune_core::metadata::lyrics::parse_lrc(&text);
+        if !lines.is_empty() {
+            return synced_response("tag", &lines);
+        }
+        if let Some(resp) = plain_response("tag", &text) {
+            return resp;
+        }
+    }
+
+    // 3. LRCLIB — opt-in via the generic settings key `lyrics_lrclib_enabled`.
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let lrclib_enabled = settings
+        .get("lyrics_lrclib_enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    if !lrclib_enabled {
+        return no_lyrics();
+    }
+
+    let artist = track.artist_name.clone().unwrap_or_default();
+    if artist.is_empty() || track.title.is_empty() {
+        return no_lyrics();
+    }
+
+    // Cache first (positive entries never expire; negatives retry after 14 d).
+    if let Some(entry) = tune_core::lyrics::load_cache_entry(&state.backend, id) {
+        if let Some(lrc) = entry
+            .synced_lyrics
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let lines = tune_core::metadata::lyrics::parse_lrc(lrc);
+            if !lines.is_empty() {
+                return synced_response("lrclib", &lines);
+            }
+        }
+        if let Some(plain) = entry
+            .plain_lyrics
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            if let Some(resp) = plain_response("lrclib", plain) {
+                return resp;
+            }
+        }
+        if entry.negative_still_fresh() {
+            return no_lyrics();
+        }
+    }
+
+    let duration_secs = (track.duration_ms > 0).then_some(track.duration_ms / 1000);
+    match tune_core::lyrics::fetch_lrclib_raw(
+        &state.http_client,
+        &artist,
+        &track.title,
+        track.album_title.as_deref(),
+        duration_secs,
+    )
+    .await
+    {
+        Ok(raw) => {
+            let raw = raw.unwrap_or_default();
+            // Cache both hits and misses (misses are retried after 14 days).
+            tune_core::lyrics::store_cache_entry(
+                &state.backend,
+                id,
+                &track.title,
+                &artist,
+                raw.synced_lyrics.as_deref(),
+                raw.plain_lyrics.as_deref(),
+            );
+            if let Some(lrc) = raw.synced_lyrics.as_deref() {
+                let lines = tune_core::metadata::lyrics::parse_lrc(lrc);
+                if !lines.is_empty() {
+                    return synced_response("lrclib", &lines);
+                }
+            }
+            if let Some(plain) = raw.plain_lyrics.as_deref() {
+                if let Some(resp) = plain_response("lrclib", plain) {
+                    return resp;
+                }
+            }
+            no_lyrics()
+        }
+        // Network/protocol failure: clean 404, nothing cached so the next
+        // request retries.
+        Err(e) => {
+            tracing::debug!(track_id = id, error = %e, "lrclib_fetch_failed");
+            no_lyrics()
+        }
     }
 }
 
@@ -733,4 +966,125 @@ pub(super) async fn track_metadata_put(
         resp["file_write_warning"] = json!(err);
     }
     Json(resp).into_response()
+}
+
+#[cfg(test)]
+mod has_filters_tests {
+    use super::TrackFilterQuery;
+
+    /// Le garde-fou de la régression : `original_year` seul DOIT compter comme
+    /// un filtre. Il ne comptait pas — il avait atterri après un `;`, dans une
+    /// fermeture `|| …` que le compilateur signalait (« unused closure ») sans
+    /// faire échouer la compilation. Neuf checks de CI verts ne l'ont pas vu.
+    #[test]
+    fn annee_denregistrement_seule_est_un_filtre() {
+        let q = TrackFilterQuery {
+            original_year: Some(1969),
+            ..Default::default()
+        };
+        assert!(
+            q.has_filters(),
+            "filtrer sur l'année d'enregistrement partait sur le chemin NON filtré"
+        );
+    }
+
+    /// Une requête nue ne filtre rien — sinon le chemin rapide (liste complète
+    /// paginée) ne serait jamais emprunté.
+    #[test]
+    fn une_requete_nue_ne_filtre_rien() {
+        assert!(!TrackFilterQuery::default().has_filters());
+    }
+
+    /// Une chaîne vide n'est pas un filtre : `?favorite=` arrive ainsi depuis
+    /// le client quand la facette est désélectionnée.
+    #[test]
+    fn une_chaine_vide_nest_pas_un_filtre() {
+        let q = TrackFilterQuery {
+            favorite: Some(String::new()),
+            playlist: Some(String::new()),
+            untagged: Some(String::new()),
+            collection: Some(String::new()),
+            folder: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!q.has_filters(), "une facette vide ne doit pas filtrer");
+    }
+
+    /// Chaque facette, prise SEULE, doit compter. Ce test est la raison d'être
+    /// de l'extraction : il échouera si une facette est ajoutée à la structure
+    /// et oubliée dans `has_filters` — exactement le défaut corrigé ici.
+    #[test]
+    fn chaque_facette_compte_comme_un_filtre() {
+        let cas: Vec<(&str, TrackFilterQuery)> = vec![
+            (
+                "genre",
+                TrackFilterQuery {
+                    genre: Some("Rock".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "year",
+                TrackFilterQuery {
+                    year: Some(1994),
+                    ..Default::default()
+                },
+            ),
+            (
+                "original_year",
+                TrackFilterQuery {
+                    original_year: Some(1969),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rating",
+                TrackFilterQuery {
+                    rating: Some(4),
+                    ..Default::default()
+                },
+            ),
+            (
+                "favorite",
+                TrackFilterQuery {
+                    favorite: Some("1".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "playlist",
+                TrackFilterQuery {
+                    playlist: Some("Ma liste".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "untagged",
+                TrackFilterQuery {
+                    untagged: Some("genre".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "collection",
+                TrackFilterQuery {
+                    collection: Some("Jazz".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "folder",
+                TrackFilterQuery {
+                    folder: Some("/mnt/music".into()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (nom, q) in cas {
+            assert!(
+                q.has_filters(),
+                "la facette « {nom} » ne compte pas comme un filtre"
+            );
+        }
+    }
 }

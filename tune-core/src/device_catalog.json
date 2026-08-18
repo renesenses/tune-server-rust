@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "brands": [
+    {
+      "name": "Sonos",
+      "models": [
+        { "name": "One", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "One SL", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Play:5", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Five", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Beam", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Arc", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Move", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Roam", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Port", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Amp", "quirks": { "max_sample_rate": 48000 } }
+      ]
+    },
+    {
+      "name": "Bang & Olufsen",
+      "models": [
+        { "name": "Beoplay A9", "quirks": { "force_mime": "audio/x-flac", "dlna_no_extra_headers": true } },
+        { "name": "Beosound Balance", "quirks": { "force_mime": "audio/x-flac", "dlna_no_extra_headers": true } },
+        { "name": "Beosound Emerge", "quirks": { "force_mime": "audio/x-flac", "dlna_no_extra_headers": true } },
+        { "name": "Beoplay M5", "quirks": { "force_mime": "audio/x-flac", "dlna_no_extra_headers": true } }
+      ]
+    },
+    {
+      "name": "WiiM",
+      "models": [
+        { "name": "WiiM Mini", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "WiiM Pro", "quirks": {} },
+        { "name": "WiiM Pro Plus", "quirks": {} },
+        { "name": "WiiM Amp", "quirks": {} },
+        { "name": "WiiM Ultra", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Ruark Audio",
+      "models": [
+        { "name": "R3", "quirks": { "force_16bit": true } },
+        { "name": "R5", "quirks": { "force_16bit": true } },
+        { "name": "MR1 Mk2", "quirks": { "max_sample_rate": 48000 } }
+      ]
+    },
+    {
+      "name": "Eversolo",
+      "models": [
+        { "name": "DMP-A6", "quirks": {} },
+        { "name": "DMP-A8", "quirks": {} },
+        { "name": "DMP-A10", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Micromega",
+      "models": [
+        { "name": "MyDAC", "quirks": {} },
+        { "name": "M-One", "quirks": {} },
+        { "name": "M-100", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Lindemann",
+      "models": [
+        { "name": "musicbook:source", "quirks": {} },
+        { "name": "Limetree Bridge", "quirks": {} },
+        { "name": "Limetree Network", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Revox",
+      "models": [
+        { "name": "STUDIOART S100", "quirks": {} },
+        { "name": "STUDIOART A100", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Diretta",
+      "models": [
+        { "name": "Diretta Target", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Totaldac",
+      "models": [
+        { "name": "d1-core", "quirks": {} },
+        { "name": "d1-streamer", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Cambridge Audio",
+      "models": [
+        { "name": "CXN v2", "quirks": {} },
+        { "name": "CXN100", "quirks": {} },
+        { "name": "Evo 75", "quirks": {} },
+        { "name": "Evo 150", "quirks": {} },
+        { "name": "MXN10", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Bluesound",
+      "models": [
+        { "name": "Node", "quirks": {} },
+        { "name": "Node N130", "quirks": {} },
+        { "name": "Node Icon", "quirks": {} },
+        { "name": "Powernode", "quirks": {} },
+        { "name": "Vault", "quirks": {} },
+        { "name": "Pulse Flex", "quirks": { "max_sample_rate": 48000 } }
+      ]
+    },
+    {
+      "name": "Denon",
+      "models": [
+        { "name": "HEOS Link", "quirks": {} },
+        { "name": "Home 150", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Home 250", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Home 350", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Ceol N12", "quirks": { "dlna_native_flac": true } }
+      ]
+    },
+    {
+      "name": "Marantz",
+      "models": [
+        { "name": "Model M1", "quirks": {} },
+        { "name": "NR1200", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Naim",
+      "models": [
+        { "name": "Uniti Atom", "quirks": {} },
+        { "name": "Uniti Star", "quirks": {} },
+        { "name": "Uniti Nova", "quirks": {} },
+        { "name": "NDX 2", "quirks": {} },
+        { "name": "ND5 XS 2", "quirks": {} },
+        { "name": "Mu-so 2", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Auralic",
+      "models": [
+        { "name": "Aries G1.1", "quirks": {} },
+        { "name": "Aries G2.2", "quirks": {} },
+        { "name": "Altair G1.1", "quirks": {} },
+        { "name": "Vega G2.1", "quirks": {} }
+      ]
+    },
+    {
+      "name": "dCS",
+      "models": [
+        { "name": "Bartok", "quirks": {} },
+        { "name": "Lina", "quirks": {} },
+        { "name": "Rossini", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Chord Electronics",
+      "models": [
+        { "name": "Poly", "quirks": {} },
+        { "name": "2go", "quirks": {} },
+        { "name": "DAVE", "quirks": {} }
+      ]
+    },
+    {
+      "name": "RME",
+      "models": [
+        { "name": "ADI-2 DAC FS", "quirks": {} },
+        { "name": "ADI-2/4 Pro SE", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Topping",
+      "models": [
+        { "name": "E30", "quirks": {} },
+        { "name": "D90SE", "quirks": {} },
+        { "name": "DX7 Pro+", "quirks": {} }
+      ]
+    },
+    {
+      "name": "SMSL",
+      "models": [
+        { "name": "SU-9", "quirks": {} },
+        { "name": "DO100", "quirks": {} },
+        { "name": "D400ES", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Linn",
+      "models": [
+        { "name": "Majik DSM", "quirks": {} },
+        { "name": "Selekt DSM", "quirks": {} },
+        { "name": "Klimax DSM", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Yamaha",
+      "models": [
+        { "name": "R-N2000A", "quirks": { "dlna_play_delay_ms": 800 } },
+        { "name": "R-N1000A", "quirks": {} },
+        { "name": "WXC-50", "quirks": {} },
+        { "name": "WXA-50", "quirks": {} }
+      ]
+    }
+  ]
+}

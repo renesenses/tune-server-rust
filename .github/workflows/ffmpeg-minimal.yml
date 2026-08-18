@@ -1,0 +1,146 @@
+# Build d'un ffmpeg MINIMAL audio-only pour le convertisseur (#1524).
+#
+# Tune n'appelle ffmpeg que pour deux encodages sans alternative native —
+# AAC et ALAC (lots 3/4 du chantier #1523) — toujours nourris d'un WAV
+# temporaire produit par le décodeur natif. Le build n'active donc que :
+# démuxeur wav, décodeurs PCM, encodeurs aac/alac, muxeur ipod (.m4a),
+# filtre aresample. Résultat : ~3 Mo, LGPL (aucun composant GPL activé),
+# contre ~80 Mo pour un build complet — le poids qui avait fait retirer
+# ffmpeg du DMG en v0.8.46.
+#
+# Déclenchement MANUEL uniquement : le résultat est publié sur la release
+# `ffmpeg-minimal` du dépôt, et release.yml y pioche à chaque release de
+# Tune. On ne recompile pas ffmpeg à chaque train — seulement quand on
+# change de version ffmpeg ou de configuration.
+name: FFmpeg minimal
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "Version ffmpeg (tarball ffmpeg.org)"
+        required: true
+        default: "7.1.2"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+          - platform: linux-aarch64
+            os: ubuntu-22.04-arm
+          - platform: macos-x86_64
+            os: macos-15-intel
+          - platform: macos-aarch64
+            os: macos-latest
+          # Windows : cross-compilation mingw depuis Linux — le configure
+          # ffmpeg y est bien plus simple et rapide que MSVC.
+          - platform: windows-x86_64
+            os: ubuntu-22.04
+            mingw: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install mingw toolchain
+        if: matrix.mingw
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      # Le configure ffmpeg exige nasm pour l'asm x86 (« nasm/yasm not found
+      # or too old ») — c'est ce qui a fait échouer linux-x86_64 et windows
+      # au premier run, pendant que les deux ARM passaient (pas d'asm x86).
+      # macOS runners : nasm absent aussi sur macos-15-intel → brew.
+      - name: Install nasm (x86 asm)
+        if: matrix.platform == 'linux-x86_64' || matrix.mingw
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Install nasm (macOS x86)
+        if: matrix.platform == 'macos-x86_64'
+        run: brew install nasm
+
+      - name: Download ffmpeg source
+        run: |
+          curl -fsSL -o ffmpeg.tar.xz \
+            "https://ffmpeg.org/releases/ffmpeg-${{ inputs.ffmpeg_version }}.tar.xz"
+          tar xf ffmpeg.tar.xz
+          mv "ffmpeg-${{ inputs.ffmpeg_version }}" ffmpeg-src
+
+      - name: Configure (minimal audio-only, LGPL)
+        working-directory: ffmpeg-src
+        run: |
+          EXTRA=""
+          if [ "${{ matrix.mingw }}" = "true" ]; then
+            EXTRA="--arch=x86_64 --target-os=mingw32 --cross-prefix=x86_64-w64-mingw32- --enable-cross-compile"
+          fi
+          ./configure \
+            --disable-everything \
+            --disable-autodetect \
+            --disable-network \
+            --disable-doc \
+            --disable-debug \
+            --disable-avdevice \
+            --disable-postproc \
+            --disable-ffplay \
+            --disable-ffprobe \
+            --enable-protocol=file,pipe \
+            --enable-demuxer=wav \
+            --enable-decoder=pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
+            --enable-encoder=aac,alac \
+            --enable-muxer=ipod \
+            --enable-filter=aresample \
+            --enable-swresample \
+            $EXTRA
+
+      - name: Build
+        working-directory: ffmpeg-src
+        run: make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+
+      - name: Package
+        run: |
+          mkdir -p out
+          if [ "${{ matrix.mingw }}" = "true" ]; then
+            cp ffmpeg-src/ffmpeg.exe out/
+            x86_64-w64-mingw32-strip out/ffmpeg.exe || true
+          else
+            cp ffmpeg-src/ffmpeg out/
+            strip out/ffmpeg || true
+          fi
+          # Conformité LGPL : la licence + où trouver les sources exactes.
+          cp ffmpeg-src/COPYING.LGPLv2.1 out/FFMPEG-LICENSE.txt
+          {
+            echo ""
+            echo "---"
+            echo "This ffmpeg binary is a minimal audio-only build (aac/alac encoders"
+            echo "only), configured without any GPL component, bundled with Tune for"
+            echo "its offline file converter."
+            echo "Source: https://ffmpeg.org/releases/ffmpeg-${{ inputs.ffmpeg_version }}.tar.xz"
+            echo "Build configuration: .github/workflows/ffmpeg-minimal.yml in"
+            echo "https://github.com/${{ github.repository }}"
+          } >> out/FFMPEG-LICENSE.txt
+          ls -la out/
+          tar czf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz" -C out .
+
+      # Garde-fou : le binaire doit annoncer exactement les encodeurs promis.
+      # (Uniquement là où il est exécutable : pas de check pour le cross mingw.)
+      - name: Verify encoders
+        if: '!matrix.mingw'
+        run: |
+          ./out/ffmpeg -hide_banner -encoders | tee encoders.txt
+          grep -qE '^ A.* aac ' encoders.txt || { echo "::error::encodeur aac absent"; exit 1; }
+          grep -qE '^ A.* alac ' encoders.txt || { echo "::error::encodeur alac absent"; exit 1; }
+
+      - name: Publish to the ffmpeg-minimal release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view ffmpeg-minimal --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create ffmpeg-minimal --repo "$GITHUB_REPOSITORY" \
+              --title "ffmpeg minimal (convertisseur)" \
+              --notes "Builds ffmpeg minimaux audio-only (aac/alac) consommés par release.yml — voir ffmpeg-minimal.yml. Ne pas supprimer." \
+              --latest=false
+          gh release upload ffmpeg-minimal --repo "$GITHUB_REPOSITORY" --clobber \
+            "ffmpeg-minimal-${{ matrix.platform }}.tar.gz"

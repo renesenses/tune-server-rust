@@ -25,6 +25,17 @@ pub struct DsfInfo {
     pub data_size: u64,
 }
 
+impl DsfInfo {
+    /// Track duration in milliseconds. `total_samples` is the per-channel DSD
+    /// sample count and `sample_rate` the 1-bit rate, so duration =
+    /// total_samples / sample_rate. `None` if the rate is 0. Single source of
+    /// truth for scan-time (metadata) and play-time (orchestrator) recovery.
+    pub fn duration_ms(&self) -> Option<u64> {
+        (self.sample_rate > 0)
+            .then(|| self.total_samples.saturating_mul(1000) / self.sample_rate as u64)
+    }
+}
+
 /// Read a little-endian u32 from a byte slice at the given offset.
 fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
@@ -451,6 +462,20 @@ mod tests {
         let info = parse_dsf_from_bytes(&buf).unwrap();
         assert_eq!(info.sample_rate, 5_644_800);
         assert_eq!(info.total_samples, 65536);
+    }
+
+    #[test]
+    fn dsf_info_duration_ms_from_header() {
+        // total_samples is the per-channel count; 2_822_400 @ DSD64 = 1 s.
+        let info = parse_dsf_from_bytes(&build_dsf_header(
+            2,
+            2_822_400,
+            2_822_400,
+            4096,
+            &[0u8; 8192],
+        ))
+        .unwrap();
+        assert_eq!(info.duration_ms(), Some(1000));
     }
 
     #[test]

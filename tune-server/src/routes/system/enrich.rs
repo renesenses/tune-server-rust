@@ -69,15 +69,19 @@ fn increment_daily_enrichment(settings: &SettingsRepo, n: i64) {
 // POST /system/enrich — artwork enrichment (MBID + covers)
 // ---------------------------------------------------------------------------
 
-pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoResponse {
+/// The daily free-tier enrichment gate shared by every `/system/enrich*`
+/// mutation route: premium runs unlimited, the free tier consumes one of its
+/// daily quota and gets a `429` body once it is spent. Returns the
+/// `(is_premium, settings)` the caller needs on allow, or `Err(response)` to
+/// short-circuit with the quota error. Centralises four identical copies of
+/// this block — the single place to reason about the enrichment quota.
+pub(crate) async fn gate_enrichment(state: &AppState) -> Result<bool, (StatusCode, Json<Value>)> {
     let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
-
     let settings = SettingsRepo::with_backend(state.backend.clone());
-
     if !is_premium {
         let (used, limit) = get_daily_enrichment_usage(&settings);
         if used >= limit {
-            return (
+            return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({
                     "error": "free_tier_daily_enrichment_limit_reached",
@@ -85,11 +89,18 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
                     "limit": limit,
                     "upgrade": "Premium unlocks unlimited auto enrichment",
                 })),
-            );
+            ));
         }
-        // Free tier: increment and proceed (limited scope)
         increment_daily_enrichment(&settings, 1);
     }
+    Ok(is_premium)
+}
+
+pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoResponse {
+    let is_premium = match gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     let db = state.backend.clone();
     let cache_dir = crate::routes::library::artwork_cache_dir();
@@ -126,25 +137,10 @@ pub(super) async fn enrich_bios(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
-    let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    if !is_premium {
-        let (used, limit) = get_daily_enrichment_usage(&settings);
-        if used >= limit {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "free_tier_daily_enrichment_limit_reached",
-                    "used": used,
-                    "limit": limit,
-                    "upgrade": "Premium unlocks unlimited auto enrichment",
-                })),
-            );
-        }
-        increment_daily_enrichment(&settings, 1);
-    }
+    let is_premium = match gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     let artist_db = state.backend.clone();
     let album_db = state.backend.clone();
@@ -191,25 +187,10 @@ pub(super) async fn enrich_bios(
 // ---------------------------------------------------------------------------
 
 pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> impl IntoResponse {
-    let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    if !is_premium {
-        let (used, limit) = get_daily_enrichment_usage(&settings);
-        if used >= limit {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "free_tier_daily_enrichment_limit_reached",
-                    "used": used,
-                    "limit": limit,
-                    "upgrade": "Premium unlocks unlimited auto enrichment",
-                })),
-            );
-        }
-        increment_daily_enrichment(&settings, 1);
-    }
+    let is_premium = match gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     let db = state.backend.clone();
     tokio::spawn(async move {
@@ -289,17 +270,23 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
         .unwrap_or(0);
-    // Artists with images
-    let artists_with_image: i64 = state
-        .backend
-        .query_one(
-            "SELECT COUNT(*) FROM artists WHERE image_path IS NOT NULL AND image_path != ''",
-            &[],
-        )
-        .ok()
-        .flatten()
-        .and_then(|r| r[0].as_i64())
-        .unwrap_or(0);
+    // Artists with images — au sens de l'utilisateur : une image QUI S'AFFICHE.
+    //
+    // La colonne seule ment dès que le cache d'images a été vidé ou déplacé :
+    // la base garde des chemins vers des fichiers disparus, et le panneau
+    // annonçait « tous les artistes ont une vignette » devant une grille vide
+    // (Fabien, 11/08/2026). On retire donc les chemins qui ne pointent plus
+    // sur rien, comme le fait déjà l'enrichissement lui-même.
+    let artist_repo_paths = ArtistRepo::with_backend(state.backend.clone());
+    let artwork_cache = crate::routes::library::artwork_cache_dir();
+    let artists_with_image: i64 = artist_repo_paths
+        .list_with_image_and_mbid()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, _, image_path)| {
+            tune_core::library::artwork::cached_artwork_exists(&artwork_cache, image_path)
+        })
+        .count() as i64;
     // Albums with covers
     let albums_with_cover: i64 = state
         .backend
@@ -399,27 +386,13 @@ pub(super) async fn enrichment_run(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let bio_lang = crate::i18n::lang_from_header(&headers);
-    let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
-
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    if !is_premium {
-        let (used, limit) = get_daily_enrichment_usage(&settings);
-        if used >= limit {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "free_tier_daily_enrichment_limit_reached",
-                    "used": used,
-                    "limit": limit,
-                    "upgrade": "Premium unlocks unlimited auto enrichment",
-                })),
-            );
-        }
-        increment_daily_enrichment(&settings, 1);
-    }
+    let is_premium = match gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     // Record the run timestamp
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let now = now_utc_str();
     settings.set("enrichment_last_run", &now).ok();
 
@@ -515,7 +488,10 @@ pub(super) async fn enrichment_run(
 // POST /system/cleanup — existing cleanup (unchanged)
 // ---------------------------------------------------------------------------
 
-pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+pub(super) async fn cleanup(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
 

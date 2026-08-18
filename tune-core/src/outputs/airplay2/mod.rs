@@ -13,9 +13,10 @@ use tracing::{debug, info, warn};
 
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
-/// HomeKit-style PIN pairing (pair-setup SRP-6a + pair-verify Curve25519).
-/// Phase-1 scaffold: pure, unit-tested crypto/TLV8 building blocks; the live
-/// handshakes land in a later increment (see `pairing::run_pair_setup`).
+/// Appairage par code façon HomeKit (pair-setup SRP-6a + pair-verify
+/// Curve25519). Protocole complet et testé hors ligne, mais **dormant** :
+/// aucun chemin de découverte ou de sortie ne l'appelle, et le transport RTSP
+/// réel n'a jamais été confronté à un appareil. Voir l'en-tête du module.
 pub mod pairing;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
@@ -34,6 +35,22 @@ pub struct Airplay2Output {
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
     process: Arc<Mutex<Option<DaemonProcess>>>,
+    pairing: Arc<Mutex<PairingPhase>>,
+}
+
+/// Pairing progress for an AirPlay 2 receiver, updated by the daemon stdout
+/// reader and awaited by the PIN-pairing methods. Most receivers accept the
+/// hard-coded transient PIN (`3939`), but AirPlay-2-only TVs (Samsung, LG…) and
+/// Apple TV require HomeKit PIN pairing: the receiver shows a 4-digit code the
+/// user must type back (Bilou's Samsung S95, #1135).
+#[derive(Clone, Debug, PartialEq)]
+enum PairingPhase {
+    Idle,
+    /// The receiver is displaying a PIN; waiting for the user to submit it.
+    PinRequested,
+    /// Connected/paired successfully.
+    Connected,
+    Failed(String),
 }
 
 struct DaemonProcess {
@@ -78,15 +95,13 @@ impl Airplay2Output {
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
             process: Arc::new(Mutex::new(None)),
+            pairing: Arc::new(Mutex::new(PairingPhase::Idle)),
         }
     }
 
-    async fn ensure_connected(&self) -> Result<(), String> {
-        let mut proc = self.process.lock().await;
-        if proc.is_some() {
-            return Ok(());
-        }
-
+    /// Spawn the daemon, wait for `ready`, and start the single background stdout
+    /// reader that updates playback state AND pairing progress. Does NOT connect.
+    async fn spawn_daemon(&self) -> Result<DaemonProcess, String> {
         let binary = find_daemon_binary();
         info!(binary = %binary, device = %self.name, "airplay2: starting daemon");
 
@@ -100,8 +115,6 @@ impl Airplay2Output {
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
 
-        let mut daemon = DaemonProcess { child, stdin };
-
         // Wait for "ready" event
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -113,20 +126,31 @@ impl Airplay2Output {
             return Err(format!("daemon did not send ready: {line}"));
         }
 
-        // Spawn stdout reader to update position
         let playing = self.playing.clone();
         let position_ms = self.position_ms.clone();
         let device_name = self.name.clone();
+        let pairing = self.pairing.clone();
         tokio::spawn(async move {
             let mut line = String::new();
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        *pairing.lock().await = PairingPhase::Failed("daemon exited".into());
+                        break;
+                    }
                     Ok(_) => {
                         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) {
                             let event = ev["event"].as_str().unwrap_or("");
                             match event {
+                                "pin_requested" => {
+                                    *pairing.lock().await = PairingPhase::PinRequested;
+                                    info!(device = %device_name, "airplay2: receiver is showing a pairing PIN");
+                                }
+                                "connected" | "paired" => {
+                                    *pairing.lock().await = PairingPhase::Connected;
+                                    debug!(device = %device_name, "airplay2: connected/paired");
+                                }
                                 "playing" => {
                                     playing.store(true, Ordering::SeqCst);
                                     debug!(device = %device_name, "airplay2: playing");
@@ -141,19 +165,47 @@ impl Airplay2Output {
                                     }
                                 }
                                 "error" => {
-                                    let msg = ev["message"].as_str().unwrap_or("unknown");
+                                    let msg =
+                                        ev["message"].as_str().unwrap_or("unknown").to_string();
+                                    *pairing.lock().await = PairingPhase::Failed(msg.clone());
                                     warn!(device = %device_name, error = %msg, "airplay2: daemon error");
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        *pairing.lock().await = PairingPhase::Failed("daemon read error".into());
+                        break;
+                    }
                 }
             }
         });
 
-        // Send connect command
+        Ok(DaemonProcess { child, stdin })
+    }
+
+    /// Current pairing progress as a short string for the API/client to poll:
+    /// `idle` | `pin_requested` | `connected` | `failed:<msg>`. Cheap (a quick
+    /// lock), so it never blocks on the 30s human-paced pairing flow.
+    pub async fn pairing_status(&self) -> String {
+        match self.pairing.lock().await.clone() {
+            PairingPhase::Idle => "idle".to_string(),
+            PairingPhase::PinRequested => "pin_requested".to_string(),
+            PairingPhase::Connected => "connected".to_string(),
+            PairingPhase::Failed(e) => format!("failed:{e}"),
+        }
+    }
+
+    async fn ensure_connected(&self) -> Result<(), String> {
+        let mut proc = self.process.lock().await;
+        if proc.is_some() {
+            return Ok(());
+        }
+        *self.pairing.lock().await = PairingPhase::Idle;
+        let mut daemon = self.spawn_daemon().await?;
+        // Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
+        // already-paired receivers. PIN-only receivers need start_pin_pairing().
         daemon
             .send_cmd(&serde_json::json!({
                 "cmd": "connect",
@@ -163,10 +215,50 @@ impl Airplay2Output {
                 "pin": "3939",
             }))
             .await?;
-
         *proc = Some(daemon);
         info!(device = %self.name, "airplay2: daemon connected");
         Ok(())
+    }
+
+    /// Begin HomeKit PIN pairing: spawn the daemon (if needed) and ask the
+    /// receiver to display its 4-digit code. Returns as soon as the command is
+    /// sent; the client polls `pairing_status()` until `pin_requested`, then
+    /// calls `submit_pin` with the code. (#1135)
+    pub async fn start_pin_pairing(&self) -> Result<(), String> {
+        let mut proc = self.process.lock().await;
+        *self.pairing.lock().await = PairingPhase::Idle;
+        if proc.is_none() {
+            *proc = Some(self.spawn_daemon().await?);
+        }
+        proc.as_mut()
+            .unwrap()
+            .send_cmd(&serde_json::json!({
+                "cmd": "pair_pin_start",
+                "ip": self.host,
+                "port": self.port,
+            }))
+            .await
+    }
+
+    /// Finish PIN pairing with the code the user read off the receiver, then
+    /// connect. Returns as soon as the command is sent; the client polls
+    /// `pairing_status()` until `connected` (or `failed:*`). On success the
+    /// daemon persists the pairing identity so later sessions skip the PIN. (#1135)
+    pub async fn submit_pin(&self, pin: &str) -> Result<(), String> {
+        let mut proc = self.process.lock().await;
+        let daemon = proc
+            .as_mut()
+            .ok_or("airplay2: no pairing in progress — call start_pin_pairing first")?;
+        *self.pairing.lock().await = PairingPhase::Idle;
+        daemon
+            .send_cmd(&serde_json::json!({
+                "cmd": "connect",
+                "ip": self.host,
+                "port": self.port,
+                "device_id": self.ap_device_id,
+                "pin": pin,
+            }))
+            .await
     }
 
     async fn send(&self, cmd: &serde_json::Value) -> Result<(), String> {
@@ -191,6 +283,10 @@ impl OutputTarget for Airplay2Output {
 
     fn output_type(&self) -> &str {
         "airplay2"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
@@ -295,6 +391,8 @@ impl OutputTarget for Airplay2Output {
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 
@@ -305,38 +403,132 @@ impl OutputTarget for Airplay2Output {
     }
 }
 
-fn find_daemon_binary() -> String {
-    // Check common locations
-    let candidates = [
-        "airplay-daemon",
-        "/usr/local/bin/airplay-daemon",
-        "/opt/tune-server/airplay-daemon",
-    ];
-    for path in &candidates {
-        if std::path::Path::new(path).exists() {
-            return path.to_string();
+/// Platform-correct daemon filename (`airplay-daemon` or `airplay-daemon.exe`).
+fn daemon_exe_name() -> String {
+    format!("{DAEMON_BINARY}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// A daemon candidate counts only if it is a real, non-empty file. The arm64
+/// Docker image ships a **0-byte placeholder** (`touch dist/arm64/airplay-daemon`)
+/// so AirPlay 2 is meant to fall back to legacy AirPlay 1 there. An existence-only
+/// check would pick that empty file, then fail to exec it at playback time —
+/// breaking AirPlay with NO fallback (worse than legacy). Requiring a non-zero
+/// size makes `daemon_available()` correctly report "no daemon" on arm64. (#700)
+fn is_usable_daemon(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Resolve the daemon binary given the directory of the running executable.
+/// Pure (no PATH lookup) so it can be unit-tested. Checks, in order:
+///   1. next to the tune-server executable — how the release archives bundle it,
+///      wherever the user extracted the zip/tar;
+///   2. well-known absolute install locations (Docker image, manual installs);
+///   3. the current working directory (legacy behaviour).
+/// Returns None if not found on disk (caller then falls back to a PATH probe).
+fn resolve_daemon_path(exe_dir: Option<&std::path::Path>, exe_name: &str) -> Option<String> {
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join(exe_name);
+        if is_usable_daemon(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    // Try `which`
-    if let Ok(output) = std::process::Command::new("which")
-        .arg(DAEMON_BINARY)
+    for abs in [
+        format!("/usr/local/bin/{exe_name}"),
+        format!("/opt/tune-server/{exe_name}"),
+    ] {
+        if is_usable_daemon(std::path::Path::new(&abs)) {
+            return Some(abs);
+        }
+    }
+    if is_usable_daemon(std::path::Path::new(exe_name)) {
+        return Some(exe_name.to_string());
+    }
+    None
+}
+
+/// PATH lookup using the platform locator (`where` on Windows, `which` elsewhere).
+fn which_daemon(exe_name: &str) -> Option<String> {
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(locator)
+        .arg(exe_name)
         .output()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return path;
-        }
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    DAEMON_BINARY.to_string()
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+fn find_daemon_binary() -> String {
+    let exe_name = daemon_exe_name();
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(|p| p.parent());
+    resolve_daemon_path(exe_dir, &exe_name)
+        .or_else(|| which_daemon(&exe_name))
+        .unwrap_or(exe_name)
 }
 
 /// Check if the airplay-daemon binary is available on this system.
 pub fn daemon_available() -> bool {
-    let binary = find_daemon_binary();
-    std::path::Path::new(&binary).exists()
-        || std::process::Command::new("which")
-            .arg(DAEMON_BINARY)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    let exe_name = daemon_exe_name();
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(|p| p.parent());
+    resolve_daemon_path(exe_dir, &exe_name).is_some() || which_daemon(&exe_name).is_some()
+}
+
+#[cfg(test)]
+mod daemon_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_daemon_bundled_next_to_executable() {
+        // The primary native-install path: the daemon sits in the same directory
+        // as the tune-server binary, wherever the archive was extracted.
+        let dir = std::env::temp_dir().join(format!("tune_daemon_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_name = daemon_exe_name();
+        let bin = dir.join(&exe_name);
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+
+        let found = resolve_daemon_path(Some(&dir), &exe_name);
+        assert_eq!(found.as_deref(), Some(bin.to_string_lossy().as_ref()));
+
+        // No exe dir + not in CWD/system dirs → None (caller falls back to PATH).
+        std::fs::remove_file(&bin).unwrap();
+        assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_placeholder_is_not_resolved() {
+        // arm64 Docker ships a 0-byte placeholder so AirPlay 2 falls back to
+        // legacy. An existence-only check would pick it and fail to exec (#700):
+        // a zero-length candidate must be treated as "no daemon".
+        let dir =
+            std::env::temp_dir().join(format!("tune_daemon_empty_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_name = daemon_exe_name();
+        let bin = dir.join(&exe_name);
+        std::fs::write(&bin, b"").unwrap(); // 0 bytes, like `touch`
+
+        assert!(!is_usable_daemon(&bin));
+        assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn daemon_name_has_platform_exe_suffix() {
+        let name = daemon_exe_name();
+        assert!(name.starts_with("airplay-daemon"));
+        assert!(name.ends_with(std::env::consts::EXE_SUFFIX));
+    }
 }

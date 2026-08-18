@@ -3,25 +3,47 @@ use tracing::{debug, info};
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
+/// A catalog row as served by `GET /api/v1/plugins` on mozaiklabs.fr (the
+/// Laravel `Plugin::toApiArray()`). Every non-key field is defaulted: the
+/// catalog schema has grown across eras (python-era rows lack `price`,
+/// `downloads`, `rating`) and a single unknown/missing field must not turn
+/// the whole catalog into an empty list (serde fails the entire Vec).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplacePlugin {
     pub slug: String,
     pub name: String,
+    /// Human-facing name (`display_name` in the Laravel model).
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub author: String,
     /// `None` means free plugin.
+    #[serde(default)]
     pub price: Option<f64>,
+    #[serde(default)]
     pub category: String,
+    #[serde(default, alias = "install_count")]
     pub downloads: u64,
+    #[serde(default, alias = "vote_score")]
     pub rating: f64,
     #[serde(default)]
     pub installed: bool,
+    #[serde(default)]
     pub installed_version: Option<String>,
     /// Legacy field kept for backward compat.
-    #[serde(default)]
+    #[serde(default, alias = "vote_count")]
     pub votes: i64,
+    #[serde(default)]
     pub download_url: Option<String>,
+    /// `wasm` rows are installable by the Rust server; python-era rows are not.
+    #[serde(default)]
+    pub platforms: Option<String>,
+    #[serde(default)]
+    pub install_type: Option<String>,
 }
 
 pub struct PluginMarketplace {
@@ -39,8 +61,12 @@ impl PluginMarketplace {
     }
 
     /// List available plugins from the marketplace catalog.
+    ///
+    /// The Laravel store serves the catalog at `/api/v1/plugins` — the older
+    /// `/api/v1/plugins/catalog` path never existed server-side, so this
+    /// client silently returned an empty catalog (404 → `vec![]`).
     pub async fn list(&self) -> Vec<MarketplacePlugin> {
-        let url = format!("{}/api/v1/plugins/catalog", self.base_url);
+        let url = format!("{}/api/v1/plugins", self.base_url);
         let client = crate::http::client::shared();
 
         match client.get(&url).send().await {
@@ -56,32 +82,29 @@ impl PluginMarketplace {
         }
     }
 
-    /// Fetch detail for a single marketplace plugin by slug.
+    /// Fetch detail for a single marketplace plugin by slug (or package name).
+    ///
+    /// The Laravel store has no per-plugin detail endpoint, so this filters
+    /// the catalog list client-side.
     pub async fn detail(&self, slug: &str) -> Option<MarketplacePlugin> {
-        let url = format!(
-            "{}/api/v1/plugins/catalog/{}",
-            self.base_url,
-            urlencoding::encode(slug)
-        );
-        let client = crate::http::client::shared();
-
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-            Ok(resp) => {
-                debug!(slug, status = %resp.status(), "marketplace_detail_failed");
-                None
-            }
-            Err(e) => {
-                debug!(slug, error = %e, "marketplace_detail_request_failed");
-                None
-            }
-        }
+        self.list()
+            .await
+            .into_iter()
+            .find(|p| p.slug == slug || p.name == slug)
     }
 
-    /// Download a plugin binary/archive by name.
-    pub async fn download(&self, name: &str) -> Result<Vec<u8>, String> {
+    /// Fetch the detached minisign signature for a plugin artifact.
+    ///
+    /// `Ok(None)` means the marketplace does not publish one — the caller
+    /// decides whether that is fatal (see the `plugin_signature_required`
+    /// setting in the server). A transport failure is an `Err`: "the network
+    /// broke" must not be read as "this plugin is unsigned".
+    pub async fn download_signature(&self, name: &str) -> Result<Option<String>, String> {
+        /// A minisign signature is a couple of short base64 lines.
+        const MAX_SIG_BYTES: u64 = 8 * 1024;
+
         let url = format!(
-            "{}/api/v1/plugins/{}/download",
+            "{}/api/v1/plugins/{}/download.minisig",
             self.base_url,
             urlencoding::encode(name)
         );
@@ -91,19 +114,87 @@ impl PluginMarketplace {
             .get(&url)
             .send()
             .await
+            .map_err(|e| format!("plugin signature request failed: {e}"))?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(format!("plugin signature fetch: HTTP {}", resp.status()));
+        }
+        if resp.content_length().unwrap_or(0) > MAX_SIG_BYTES {
+            return Err("plugin signature is implausibly large".into());
+        }
+
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("read plugin signature failed: {e}"))?;
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text))
+    }
+
+    /// Download a plugin binary/archive by name.
+    ///
+    /// The body is read with a hard size cap: `resp.bytes()` buffered the whole
+    /// response into memory unbounded, so a compromised or misbehaving
+    /// marketplace could OOM the server with an oversized (or endless) payload.
+    /// A WASM plugin is comfortably under the cap.
+    ///
+    /// These bytes are **not** authenticated here. The caller must run them
+    /// past the signature check before they touch disk — see
+    /// `verify_plugin_signature` in the server's marketplace routes (audit
+    /// item 8).
+    pub async fn download(&self, name: &str) -> Result<Vec<u8>, String> {
+        /// 50 MiB — generous for a WASM plugin, bounds worst-case memory.
+        const MAX_PLUGIN_BYTES: usize = 50 * 1024 * 1024;
+
+        let url = format!(
+            "{}/api/v1/plugins/{}/download",
+            self.base_url,
+            urlencoding::encode(name)
+        );
+        let client = crate::http::client::long_timeout();
+
+        let mut resp = client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| format!("plugin download request failed: {e}"))?;
 
         if !resp.status().is_success() {
             return Err(format!("plugin download failed: {}", resp.status()));
         }
 
-        let bytes = resp
-            .bytes()
+        // Reject early if the advertised length already exceeds the cap.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_PLUGIN_BYTES as u64 {
+                return Err(format!(
+                    "plugin too large: {len} bytes (max {MAX_PLUGIN_BYTES})"
+                ));
+            }
+        }
+
+        // Stream with a running cap so a missing/lying Content-Length can't
+        // blow past the limit either.
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("failed to read plugin bytes: {e}"))?;
+            .map_err(|e| format!("failed to read plugin bytes: {e}"))?
+        {
+            if bytes.len() + chunk.len() > MAX_PLUGIN_BYTES {
+                return Err(format!(
+                    "plugin exceeds maximum size of {MAX_PLUGIN_BYTES} bytes"
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         info!(plugin = %name, size = bytes.len(), "marketplace_plugin_downloaded");
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Vote for a plugin (up or down).

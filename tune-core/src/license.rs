@@ -54,6 +54,12 @@ pub enum Feature {
     MultiServer,
     DacCalibration,
     BatchConverter,
+    PlaylistsHub,
+    Declick,
+    /// Analyse acoustique CLAP : la passe d'embeddings qui alimente la radio
+    /// acoustique. C'est le traitement le plus lourd du serveur (décodage +
+    /// inférence ONNX multi-thread, ~300 Mo résidents).
+    AcousticAnalysis,
 }
 
 impl Feature {
@@ -84,6 +90,9 @@ impl Feature {
             Feature::MultiServer,
             Feature::DacCalibration,
             Feature::BatchConverter,
+            Feature::PlaylistsHub,
+            Feature::Declick,
+            Feature::AcousticAnalysis,
         ]
     }
 
@@ -100,6 +109,7 @@ impl Feature {
             Feature::ListeningStats => "Listening Stats",
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
+            Feature::AcousticAnalysis => "Acoustic Analysis",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -113,6 +123,28 @@ impl Feature {
             Feature::MultiServer => "Multi-Server",
             Feature::DacCalibration => "DAC Calibration",
             Feature::BatchConverter => "Batch Audio Converter",
+            Feature::PlaylistsHub => "Playlists Hub",
+            Feature::Declick => "Dé-ploc",
+        }
+    }
+
+    /// Whether the feature is actually available / functional right now — a
+    /// PRODUCT decision, independent of licence entitlement. The Premium
+    /// "Fonctionnalités" grid colours each widget from this combined with the
+    /// licence `enabled` flag:
+    ///   - not licensed          → grey  (locked, upsell)
+    ///   - licensed + available   → green (usable, the widget opens its page)
+    ///   - licensed + !available  → red   (entitled but not yet available)
+    ///
+    /// Default is `true` (available). To turn a widget red, add its variant to
+    /// the match arm below — this is the single source of truth.
+    pub fn available(&self) -> bool {
+        match self {
+            // Features licensed by Premium but NOT yet available/functional
+            // (product decision — Bertrand). These show a red cross in the UI.
+            // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
+            Feature::SocialSharing | Feature::WeeklyDigest => false,
+            _ => true,
         }
     }
 }
@@ -120,6 +152,20 @@ impl Feature {
 // ---------------------------------------------------------------------------
 // License state
 // ---------------------------------------------------------------------------
+
+/// Live signal that the premium license is currently held by ANOTHER server
+/// (floating-license single-session model, à la Roon). Set by the heartbeat when
+/// the cloud answers `session_conflict:true`; runtime-only (never persisted) —
+/// the next heartbeat re-establishes the truth. While present it suppresses
+/// premium *here* regardless of the key/account being otherwise valid, and it
+/// carries just enough context for the UI to explain why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConflict {
+    /// Label (or server_id) of the server currently holding the session.
+    pub active_server: Option<String>,
+    /// ISO-8601 timestamp of that server's last heartbeat.
+    pub active_since: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LicenseState {
@@ -139,6 +185,23 @@ pub struct LicenseState {
     /// drives the offline grace window.
     #[serde(default)]
     pub account_premium_checked: Option<String>,
+    /// Qobuz endpoint order signalled by the cloud license validation:
+    /// `true` = route Qobuz API calls through the mozaiklabs proxy first
+    /// (founder account), `false` (default) = call the Qobuz API directly
+    /// first with the proxy as fallback. Absent on older servers → false.
+    #[serde(default)]
+    pub qobuz_proxy_first: bool,
+    /// Paid MODULE entitlements (stable ids, e.g. "diretta") owned by the
+    /// linked account. Separate SKUs — independent of `tier`/premium.
+    /// Persisted like the account premium so entitlements survive restarts
+    /// and offline starts; refreshed by the cloud validation loop.
+    #[serde(default)]
+    pub modules: Vec<String>,
+    /// Live single-session conflict: `Some` while another server holds the
+    /// floating license. Runtime-only — never loaded from settings, so a restart
+    /// starts clean and the next heartbeat restores it if still in conflict.
+    #[serde(default)]
+    pub session_conflict: Option<SessionConflict>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +211,12 @@ pub struct LicenseState {
 /// Free-tier zone cap when not overridden. Configurable at runtime via
 /// `TUNE_FREE_MAX_ZONES` (see `TuneConfig`); premium is always unlimited.
 const DEFAULT_FREE_MAX_ZONES: i64 = 3;
-const GRACE_PERIOD_DAYS: i64 = 30;
+// Offline grace once a key HAS been validated online at least once. Shortened
+// from 30 to 14 days: enough tolerance for an intermittently-connected server,
+// but a revoked or lapsed key falls back to Free sooner. The initial online
+// validation is now mandatory (see `set_license_key`), so this only governs
+// re-validation, never first activation.
+const GRACE_PERIOD_DAYS: i64 = 14;
 
 // ---------------------------------------------------------------------------
 // LicenseManager
@@ -178,7 +246,7 @@ impl LicenseManager {
         let expires_at = settings.get("license_expires_at").ok().flatten();
         let last_validated = settings.get("license_last_validated").ok().flatten();
 
-        let hardware_fingerprint = Self::hardware_fingerprint();
+        let hardware_fingerprint = Self::persistent_fingerprint(&settings);
 
         let mut tier = match tier_str.as_deref() {
             Some("premium") => Tier::Premium,
@@ -221,6 +289,23 @@ impl LicenseManager {
         let account_premium_expires = settings.get("mozaik_premium_expires").ok().flatten();
         let account_premium_checked = settings.get("mozaik_premium_checked").ok().flatten();
 
+        // Qobuz endpoint order (founder flag) — persisted like the account
+        // premium so the order survives restarts and offline starts.
+        let qobuz_proxy_first = settings
+            .get("qobuz_proxy_first")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        // Module entitlements — persisted like the account premium.
+        let modules: Vec<String> = settings
+            .get("mozaik_modules")
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+
         let state = LicenseState {
             tier,
             license_key,
@@ -230,6 +315,9 @@ impl LicenseManager {
             account_premium,
             account_premium_expires,
             account_premium_checked,
+            qobuz_proxy_first,
+            modules,
+            session_conflict: None,
         };
 
         Self {
@@ -274,22 +362,35 @@ impl LicenseManager {
         snapshot
     }
 
-    /// Store a license key and set tier to Premium.
-    /// Actual server-side validation happens via heartbeat later.
+    /// Store a license key **without** granting Premium.
+    ///
+    /// The tier is only promoted to Premium once the licensing server confirms
+    /// the key — via `update_from_server`, called by the heartbeat or an
+    /// immediate `/cloud/license/validate` right after this. Previously this
+    /// stamped `license_tier=premium` + `last_validated=now`, which let ANY
+    /// string unlock Premium locally for the whole 30-day offline grace with no
+    /// server round-trip (a free-ride that survived even a `license_valid:false`
+    /// verdict). Now a key stays "pending" (Free) until a genuine online
+    /// validation succeeds, so a fake key never unlocks anything. Legit users
+    /// are promoted within one validation round-trip.
     pub async fn set_license_key(&self, key: &str) -> Result<(), String> {
         let settings = SettingsRepo::with_backend(self.db.clone());
         settings.set("license_key", key)?;
-        settings.set("license_tier", "premium")?;
-
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        settings.set("license_last_validated", &now)?;
+        // Pending until validated: do NOT set premium or stamp a validation.
+        // Clear any stale timestamp so a re-entered key can't ride a previous
+        // key's grace window.
+        settings.set("license_tier", "free")?;
+        settings.delete("license_last_validated").ok();
 
         let mut state = self.state.write().await;
         state.license_key = Some(key.to_string());
-        state.tier = Tier::Premium;
-        state.last_validated = Some(now);
+        state.tier = Tier::Free;
+        state.last_validated = None;
 
-        info!(key_prefix = &key[..key.len().min(8)], "license_key_set");
+        info!(
+            key_prefix = &key[..key.len().min(8)],
+            "license_key_stored_pending_validation"
+        );
         Ok(())
     }
 
@@ -358,6 +459,104 @@ impl LicenseManager {
         info!(account_premium = premium, "license_account_premium_updated");
     }
 
+    /// Set the Qobuz endpoint order flag from the cloud license validation.
+    /// `true` = proxy-first (founder account); `false` = direct-first (the
+    /// default for every user). Persisted so it survives restarts, mirroring
+    /// `set_account_premium`.
+    pub async fn set_qobuz_proxy_first(&self, proxy_first: bool) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        settings
+            .set(
+                "qobuz_proxy_first",
+                if proxy_first { "true" } else { "false" },
+            )
+            .ok();
+
+        let mut state = self.state.write().await;
+        let changed = state.qobuz_proxy_first != proxy_first;
+        state.qobuz_proxy_first = proxy_first;
+
+        if changed {
+            info!(
+                qobuz_proxy_first = proxy_first,
+                "license_qobuz_proxy_first_updated"
+            );
+        }
+    }
+
+    /// Current Qobuz endpoint order: `true` = proxy-first (founder account).
+    pub async fn qobuz_proxy_first(&self) -> bool {
+        self.state.read().await.qobuz_proxy_first
+    }
+
+    /// Set the paid-module entitlements from the cloud license validation.
+    /// Persisted so entitlements survive restarts and offline starts,
+    /// mirroring `set_account_premium`. The cloud is authoritative: an empty
+    /// list clears previous entitlements (refund / transfer).
+    pub async fn set_modules(&self, modules: Vec<String>) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        settings
+            .set(
+                "mozaik_modules",
+                &serde_json::to_string(&modules).unwrap_or_else(|_| "[]".into()),
+            )
+            .ok();
+
+        let mut state = self.state.write().await;
+        let changed = state.modules != modules;
+        state.modules = modules;
+
+        if changed {
+            info!(modules = ?state.modules, "license_modules_updated");
+        }
+    }
+
+    /// Whether the account owns the paid module `id` (e.g. "diretta").
+    /// Module SKUs are independent of the premium tier.
+    pub async fn has_module(&self, id: &str) -> bool {
+        self.state.read().await.modules.iter().any(|m| m == id)
+    }
+
+    /// Snapshot of the owned module ids (for provider contexts / API responses).
+    pub async fn modules(&self) -> Vec<String> {
+        self.state.read().await.modules.clone()
+    }
+
+    /// Record that the floating license is currently held by ANOTHER server
+    /// (the cloud answered `session_conflict:true`). This gates the effective
+    /// tier down to Free here — an authoritative "not now" — WITHOUT touching the
+    /// key or `last_validated`, so premium snaps back the moment the other server
+    /// stops pinging and the conflict clears. Runtime-only; not persisted.
+    pub async fn set_session_conflict(
+        &self,
+        active_server: Option<String>,
+        active_since: Option<String>,
+    ) {
+        let mut state = self.state.write().await;
+        let was_clear = state.session_conflict.is_none();
+        state.session_conflict = Some(SessionConflict {
+            active_server,
+            active_since,
+        });
+        if was_clear {
+            warn!("license_session_conflict_set (premium suppressed: held by another server)");
+        }
+    }
+
+    /// Clear a previously recorded session conflict (this server (re)took the
+    /// session, or the cloud no longer reports a conflict). No-op if none set.
+    pub async fn clear_session_conflict(&self) {
+        let mut state = self.state.write().await;
+        if state.session_conflict.take().is_some() {
+            info!("license_session_conflict_cleared (session reclaimed here)");
+        }
+    }
+
+    /// Current session conflict, if the license is held elsewhere right now.
+    pub async fn session_conflict(&self) -> Option<SessionConflict> {
+        self.state.read().await.session_conflict.clone()
+    }
+
     /// Clear the account premium (SSO logout / disconnect). The license-key path
     /// is untouched.
     pub async fn clear_account_premium(&self) {
@@ -366,10 +565,14 @@ impl LicenseManager {
         settings.delete("mozaik_premium_expires").ok();
         settings.delete("mozaik_premium_checked").ok();
 
+        settings.delete("mozaik_modules").ok();
+
         let mut state = self.state.write().await;
         state.account_premium = false;
         state.account_premium_expires = None;
         state.account_premium_checked = None;
+        // Module entitlements come from the account — they leave with it.
+        state.modules.clear();
 
         info!("license_account_premium_cleared");
     }
@@ -384,6 +587,28 @@ impl LicenseManager {
         let mut hasher = Sha256::new();
         hasher.update(input.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    /// Stable hardware fingerprint, persisted in `settings` on first use.
+    ///
+    /// The raw [`hardware_fingerprint`] derives from hostname + machine-id, both
+    /// VOLATILE on containerised / NAS installs: a container's `HOSTNAME` is
+    /// often its recreatable id and `/etc/machine-id` can regenerate, so the
+    /// fingerprint changed on every reinstall/restart. The server then rejected
+    /// the (mono-device) license and testers were bounced into the grace/login
+    /// loop and had to be reset by hand (Yacine, Synology; recurring). Anchoring
+    /// it to the settings table — which lives in the library DB the user keeps —
+    /// makes it stable across restarts and reinstalls: computed once, reused
+    /// forever after.
+    fn persistent_fingerprint(settings: &SettingsRepo) -> String {
+        if let Some(fp) = settings.get("hardware_fingerprint").ok().flatten() {
+            if fp.len() == 64 {
+                return fp;
+            }
+        }
+        let fp = Self::hardware_fingerprint();
+        let _ = settings.set("hardware_fingerprint", &fp);
+        fp
     }
 
     /// Zone limit for the free tier (exposed for UI display).
@@ -504,23 +729,90 @@ fn account_premium_active(state: &LicenseState) -> bool {
     }
 }
 
+/// Whether the license *key* currently counts as Premium: tier is Premium, the
+/// key's own expiry (if known) has not passed, and it was validated within the
+/// offline grace window. Mirrors `account_premium_active` so the key gets the
+/// same *live* graceful degradation the SSO account already has: a valid key
+/// survives a transient cloud rejection (bad `license_valid:false` verdict,
+/// fingerprint re-binding) or an offline period, and is only revoked once grace
+/// lapses or on a genuine past-expiry — never on a single bad heartbeat.
+fn key_premium_active(state: &LicenseState) -> bool {
+    if state.tier != Tier::Premium {
+        return false;
+    }
+    // Key expiry (if known): past expiry → not active.
+    if let Some(ref exp) = state.expires_at {
+        if is_expired(exp, 0) {
+            return false;
+        }
+    }
+    // Offline grace: must have been validated (or set) within the window.
+    match state.last_validated {
+        Some(ref validated) => !is_expired(validated, GRACE_PERIOD_DAYS),
+        None => false,
+    }
+}
+
 /// Effective tier = Premium if the license key is premium OR the account premium
 /// (SSO) is active. Otherwise Free.
+///
+/// A live single-session conflict overrides everything: while another server
+/// holds the floating license, premium is suppressed here even though the key /
+/// account are otherwise valid. This is what enforces "one active session at a
+/// time" — and, unlike a transient `license_valid:false`, it is authoritative,
+/// so it is NOT softened by the offline grace window.
 fn effective_tier(state: &LicenseState) -> Tier {
-    if state.tier == Tier::Premium || account_premium_active(state) {
+    if state.session_conflict.is_some() {
+        return Tier::Free;
+    }
+    if key_premium_active(state) || account_premium_active(state) {
         Tier::Premium
     } else {
         Tier::Free
     }
 }
 
+/// Whether an ISO-8601 (`%Y-%m-%dT%H:%M:%SZ`) timestamp lies in the past.
+/// Unlike [`is_expired`] (which fails *closed*: malformed → expired), this fails
+/// *open*: unparseable input returns `false` so malformed server data never
+/// triggers a license revocation. Used by the heartbeat to tell a genuine past
+/// expiry from a transient `license_valid:false` verdict.
+pub fn is_timestamp_past(timestamp: &str) -> bool {
+    match chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") {
+        Ok(parsed) => parsed.and_utc() < chrono::Utc::now(),
+        Err(_) => false,
+    }
+}
+
 /// Check whether an ISO-8601 timestamp is older than `days` from now.
+/// Parse a timestamp coming either from our own settings (`...Z`) or from the
+/// licence server, which emits real ISO 8601 **with an offset**
+/// (`2026-09-09T11:22:56+02:00`).
+///
+/// Only the Zulu shape used to be accepted, and an unparseable value was
+/// treated as expired — so a licence carrying a genuine expiry was read as
+/// already over and the server silently fell back to Free. It never showed
+/// because every licence issued so far was `lifetime`, i.e. `expires_at =
+/// null`: the branch was never taken. The first real one-month subscription
+/// (Bruno Lescarret, 2026-08-09) validated fine against the cloud, then
+/// unlocked nothing.
+fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Offset-aware first: that is what the licence server sends.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Naive `...Z`, the shape we persist in settings ourselves.
+    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
 fn is_expired(timestamp: &str, days: i64) -> bool {
-    let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") else {
-        // If we can't parse, treat as expired.
+    let Some(validated) = parse_timestamp(timestamp) else {
+        // Still fail closed on a genuinely unreadable value — but the shapes we
+        // actually receive are now both understood.
         return true;
     };
-    let validated = parsed.and_utc();
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
     validated < cutoff
 }
@@ -532,6 +824,40 @@ fn is_expired(timestamp: &str, days: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le serveur de licences renvoie une date ISO 8601 **avec décalage**
+    /// (`+02:00`), pas du Zulu. Elle n'était pas parsée, et un échec de parsing
+    /// vaut « expirée » : un abonnement d'un mois parfaitement valide faisait
+    /// retomber le serveur en Free juste après une validation réussie.
+    /// Invisible jusqu'ici, toutes les licences émises étant `lifetime` avec
+    /// `expires_at = null`.
+    #[test]
+    fn a_future_expiry_with_offset_is_not_expired() {
+        let future = (chrono::Utc::now() + chrono::Duration::days(30))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        assert!(
+            !is_expired(&future, 0),
+            "un abonnement qui court encore doit être actif : {future}"
+        );
+    }
+
+    #[test]
+    fn both_timestamp_shapes_are_understood() {
+        // Zulu — ce que l'on persiste soi-même dans les settings.
+        assert!(parse_timestamp("2020-01-01T00:00:00Z").is_some());
+        // Avec décalage — ce que le serveur de licences envoie.
+        assert!(parse_timestamp("2026-09-09T11:22:56+02:00").is_some());
+        // Illisible — on continue d'échouer côté sûr.
+        assert!(parse_timestamp("pas une date").is_none());
+    }
+
+    #[test]
+    fn a_past_expiry_is_still_expired_whatever_the_shape() {
+        assert!(is_expired("2020-01-01T00:00:00Z", 0));
+        assert!(is_expired("2020-01-01T00:00:00+02:00", 0));
+        assert!(is_expired("illisible", 0), "illisible ⇒ échec côté sûr");
+    }
 
     #[test]
     fn tier_serde_roundtrip() {
@@ -550,8 +876,12 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentytwo_features() {
-        assert_eq!(Feature::all_premium().len(), 22);
+    fn all_premium_has_twentyfive_features() {
+        // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
+        // premium doit être un acte conscient, pas un effet de bord. Passé de
+        // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
+        // rien et tournait sur des installations gratuites.
+        assert_eq!(Feature::all_premium().len(), 25);
     }
 
     #[test]
@@ -605,11 +935,38 @@ mod tests {
             tier,
             license_key: None,
             expires_at: None,
-            last_validated: None,
+            // A premium key is always stamped when set/validated; these
+            // account-focused tests model that reality so the key path (which
+            // now requires a recent validation, like the account path) doesn't
+            // spuriously read as lapsed.
+            last_validated: Some(now_iso()),
             hardware_fingerprint: "test".into(),
             account_premium,
             account_premium_expires,
             account_premium_checked,
+            qobuz_proxy_first: false,
+            modules: vec![],
+            session_conflict: None,
+        }
+    }
+
+    fn key_state(
+        tier: Tier,
+        expires_at: Option<String>,
+        last_validated: Option<String>,
+    ) -> LicenseState {
+        LicenseState {
+            tier,
+            license_key: Some("TUNE-TEST-KEY".into()),
+            expires_at,
+            last_validated,
+            hardware_fingerprint: "test".into(),
+            account_premium: false,
+            account_premium_expires: None,
+            account_premium_checked: None,
+            qobuz_proxy_first: false,
+            modules: vec![],
+            session_conflict: None,
         }
     }
 
@@ -692,6 +1049,156 @@ mod tests {
         );
     }
 
+    // ---- effective_tier / license key (live grace) ----
+
+    #[test]
+    fn effective_premium_key_recently_validated() {
+        // Premium key validated now → Premium.
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, Some(now_iso()))),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_key_survives_within_grace() {
+        // Premium key last validated 10 days ago (< 30-day grace) → Premium.
+        // This is JP's case: the cloud rejects the key but a valid key must not
+        // be revoked on a transient `license_valid:false` verdict.
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, Some(past_iso(10)))),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_key_free_when_grace_expired() {
+        // Not validated for 40 days (past the 30-day grace) → degrade to Free.
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, Some(past_iso(40)))),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_key_free_when_never_validated() {
+        assert_eq!(
+            effective_tier(&key_state(Tier::Premium, None, None)),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_key_free_when_expiry_past() {
+        // A genuine past expiry revokes even if recently validated.
+        assert_eq!(
+            effective_tier(&key_state(
+                Tier::Premium,
+                Some(past_iso(1)),
+                Some(now_iso())
+            )),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_key_premium_when_expiry_future() {
+        assert_eq!(
+            effective_tier(&key_state(
+                Tier::Premium,
+                Some(future_iso(30)),
+                Some(now_iso())
+            )),
+            Tier::Premium
+        );
+    }
+
+    // ---- effective_tier / single-session conflict (floating license) ----
+
+    #[test]
+    fn effective_free_during_session_conflict_even_with_valid_key() {
+        // The key is otherwise premium (validated now, no expiry) but another
+        // server holds the session → suppressed to Free here. This is the whole
+        // point of the floating-license single-session rule.
+        let mut s = key_state(Tier::Premium, None, Some(now_iso()));
+        s.session_conflict = Some(SessionConflict {
+            active_server: Some("Maison Paris".into()),
+            active_since: Some(now_iso()),
+        });
+        assert_eq!(effective_tier(&s), Tier::Free);
+    }
+
+    #[test]
+    fn effective_free_during_session_conflict_even_with_account_premium() {
+        // Account (SSO) premium is likewise gated off while another server holds
+        // the session — the conflict overrides both premium sources.
+        let mut s = state(Tier::Free, true, None, Some(now_iso()));
+        s.session_conflict = Some(SessionConflict {
+            active_server: None,
+            active_since: None,
+        });
+        assert_eq!(effective_tier(&s), Tier::Free);
+    }
+
+    #[test]
+    fn effective_premium_restored_when_conflict_clears() {
+        // Clearing the conflict brings premium straight back — the key/account
+        // were never touched, only gated.
+        let mut s = key_state(Tier::Premium, None, Some(now_iso()));
+        s.session_conflict = Some(SessionConflict {
+            active_server: None,
+            active_since: None,
+        });
+        assert_eq!(effective_tier(&s), Tier::Free);
+        s.session_conflict = None;
+        assert_eq!(effective_tier(&s), Tier::Premium);
+    }
+
+    #[tokio::test]
+    async fn set_and_clear_session_conflict_gates_the_manager() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new(backend);
+
+        mgr.set_license_key("TUNE-TEST-1234").await.unwrap();
+        // A stored key is pending (Free) until the licensing server confirms it;
+        // mirror that online validation so the tier is genuinely Premium before
+        // we exercise the session-conflict gating.
+        mgr.update_from_server(Tier::Premium, None).await;
+        assert!(mgr.is_premium().await, "premium after validated activation");
+
+        mgr.set_session_conflict(Some("Maison 2".into()), None)
+            .await;
+        assert!(
+            !mgr.is_premium().await,
+            "premium suppressed while held elsewhere"
+        );
+        assert!(mgr.session_conflict().await.is_some());
+        // The key itself is untouched — the tier snapshot is Free but the key
+        // survives underneath.
+        assert!(mgr.license_state().await.license_key.is_some());
+
+        mgr.clear_session_conflict().await;
+        assert!(mgr.is_premium().await, "premium restored once reclaimed");
+        assert!(mgr.session_conflict().await.is_none());
+    }
+
+    #[test]
+    fn license_state_parses_without_session_conflict() {
+        // Retro-compat: a cached/legacy state blob without the field → None.
+        let json = r#"{
+            "tier": "premium",
+            "license_key": "TUNE-X",
+            "expires_at": null,
+            "last_validated": null,
+            "hardware_fingerprint": "test"
+        }"#;
+        let state: LicenseState = serde_json::from_str(json).unwrap();
+        assert!(state.session_conflict.is_none());
+    }
+
     #[test]
     fn display_names_are_non_empty() {
         for f in Feature::all_premium() {
@@ -726,14 +1233,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_and_clear_license() {
+    async fn set_key_is_pending_until_validated_then_clear() {
         let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let mgr = LicenseManager::new(backend);
 
+        // Storing a key must NOT grant Premium on its own: any string would
+        // otherwise unlock Premium locally for the whole grace window with no
+        // server round-trip. It stays Free ("pending") until validated online.
         mgr.set_license_key("TUNE-TEST-1234").await.unwrap();
+        assert_eq!(mgr.tier().await, Tier::Free, "pending key must stay Free");
+        assert!(!mgr.is_premium().await);
+        assert!(!mgr.check_feature(Feature::CloudRelay).await);
+
+        // A genuine server confirmation (heartbeat / on-demand validate) promotes it.
+        mgr.update_from_server(Tier::Premium, None).await;
         assert_eq!(mgr.tier().await, Tier::Premium);
         assert!(mgr.is_premium().await);
         assert!(mgr.check_feature(Feature::CloudRelay).await);
@@ -742,6 +1258,89 @@ mod tests {
         mgr.clear_license().await;
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
+    }
+
+    #[tokio::test]
+    async fn premium_tier_without_validation_is_inactive_across_restart() {
+        // Simulate a stale/forged state: tier=premium persisted but no validation
+        // timestamp. On (re)load the effective tier must be Free, not Premium.
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings.set("license_key", "TUNE-FORGED-0000").unwrap();
+        settings.set("license_tier", "premium").unwrap();
+        // Note: deliberately NO license_last_validated.
+
+        let mgr = LicenseManager::new(backend);
+        assert_eq!(
+            mgr.tier().await,
+            Tier::Free,
+            "premium without a validation timestamp must degrade to Free"
+        );
+        assert!(!mgr.is_premium().await);
+    }
+
+    // ---- qobuz_proxy_first (founder endpoint order) ----
+
+    #[test]
+    fn license_state_parses_without_qobuz_proxy_first() {
+        // Retro-compat: older servers / cached states without the field → false.
+        let json = r#"{
+            "tier": "free",
+            "license_key": null,
+            "expires_at": null,
+            "last_validated": null,
+            "hardware_fingerprint": "test"
+        }"#;
+        let state: LicenseState = serde_json::from_str(json).unwrap();
+        assert!(!state.qobuz_proxy_first);
+    }
+
+    #[test]
+    fn license_state_parses_with_qobuz_proxy_first() {
+        let json = r#"{
+            "tier": "free",
+            "license_key": null,
+            "expires_at": null,
+            "last_validated": null,
+            "hardware_fingerprint": "test",
+            "qobuz_proxy_first": true
+        }"#;
+        let state: LicenseState = serde_json::from_str(json).unwrap();
+        assert!(state.qobuz_proxy_first);
+    }
+
+    #[tokio::test]
+    async fn set_qobuz_proxy_first_persists_and_updates_state() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new(backend.clone());
+
+        // Default: direct-first.
+        assert!(!mgr.qobuz_proxy_first().await);
+
+        mgr.set_qobuz_proxy_first(true).await;
+        assert!(mgr.qobuz_proxy_first().await);
+        assert!(mgr.license_state().await.qobuz_proxy_first);
+
+        // Persisted in settings (same pattern as mozaik_premium).
+        let settings = SettingsRepo::with_backend(backend.clone());
+        assert_eq!(
+            settings.get("qobuz_proxy_first").unwrap().as_deref(),
+            Some("true")
+        );
+
+        // A new manager over the same backend reloads the flag.
+        let mgr2 = LicenseManager::new(backend);
+        assert!(mgr2.qobuz_proxy_first().await);
+
+        // Re-validation can revoke it.
+        mgr2.set_qobuz_proxy_first(false).await;
+        assert!(!mgr2.qobuz_proxy_first().await);
     }
 
     #[tokio::test]

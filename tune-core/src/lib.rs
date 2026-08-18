@@ -18,6 +18,7 @@ pub mod dashboard;
 pub mod db;
 pub mod db_backup;
 pub mod deezer_proxy;
+pub mod device_catalog;
 pub mod digest;
 pub mod discovery;
 pub mod event_bus;
@@ -42,6 +43,11 @@ pub mod playlist_sync;
 pub mod playlist_transfer;
 pub mod plugin_sdk;
 pub mod plugins;
+/// P0 of the plugin ABI (RFC §3): embedded wasmtime runtime that loads,
+/// instantiates and calls wasm plugins with JSON-over-linear-memory
+/// marshalling under resource limits. Gated behind `plugins-wasm`.
+#[cfg(feature = "plugins-wasm")]
+pub mod plugins_runtime;
 pub mod poller;
 pub mod prefetch;
 pub mod queue_persistence;
@@ -50,9 +56,9 @@ pub mod radio_metadata;
 pub mod remote_discovery;
 pub mod remote_proxy;
 pub mod room_correction;
-pub mod scan_scheduler;
 pub mod scanner;
 pub mod scrobble;
+pub mod secret_envelope;
 pub mod services_manager;
 pub mod skins;
 pub mod sleep_timer;
@@ -61,7 +67,9 @@ pub mod smb_discovery;
 pub mod social;
 pub mod stream_cache;
 pub mod streaming;
+pub mod transcode_cache;
 pub mod updater;
+pub mod upnp_renderer;
 pub mod upnp_server;
 pub mod user_profiles;
 pub mod ytdlp;

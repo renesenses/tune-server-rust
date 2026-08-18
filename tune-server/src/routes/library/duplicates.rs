@@ -180,12 +180,13 @@ pub(super) async fn resolve_duplicate(
         )
         .ok();
 
-    // Reassign play queue references
+    // Reassign play queue references (local rows only — streaming rows have
+    // track_id NULL and are unaffected).
     state
         .backend
         .execute(
             &format!(
-                "UPDATE play_queue SET track_id = {} WHERE track_id = {}",
+                "UPDATE queue_items SET track_id = {} WHERE track_id = {}",
                 make_ph(1),
                 make_ph(2)
             ),

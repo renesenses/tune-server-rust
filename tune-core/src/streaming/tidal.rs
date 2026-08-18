@@ -221,6 +221,83 @@ impl TidalService {
                 .map_err(|e| format!("tmp write init: {e}"))?;
         }
 
+        // Streaming DASH (#1146 Plan C step 2): with TUNE_DASH_STREAM_DECODE, hand
+        // a growth handle to the decoder and download the media segments in the
+        // BACKGROUND, so the FLAC transcode can start on the init segment and
+        // consume fragments as they land — overlapping the download under the
+        // transcode. Return the temp path immediately (only the init is present).
+        if crate::audio::dash_growth::stream_decode_enabled() {
+            use std::io::Write;
+            let init_len = init_data.len() as u64;
+            let growth = crate::audio::dash_growth::DashGrowth::new(init_len);
+            crate::audio::dash_growth::register(&tmp_path, growth.clone());
+
+            // Open the append handle NOW, before returning: the orchestrator
+            // renames the temp to `{path}.decoding` right after we return, and an
+            // FD bound to the inode here survives that rename (POSIX), whereas the
+            // background task might otherwise try to open a path that's gone.
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("tmp reopen (stream): {e}"))?;
+            let client = self.client.clone();
+            let seg = segments.clone();
+            let track_bg = track_id.to_string();
+            let path_bg = tmp_path.clone();
+
+            tokio::spawn(async move {
+                let mut written = init_len;
+                let mut failed = 0u32;
+                for i in 0..seg.segment_count {
+                    let seg_number = seg.start_number + i;
+                    let seg_url = seg
+                        .media_template
+                        .replace("$Number$", &seg_number.to_string());
+                    match client.get(&seg_url).send().await {
+                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                            Ok(data) => {
+                                if let Err(e) = file.write_all(&data) {
+                                    warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_write_failed");
+                                    growth.fail();
+                                    return;
+                                }
+                                written += data.len() as u64;
+                                // Publish the new write frontier so the decoder
+                                // can consume the just-landed fragment.
+                                growth.advance(written);
+                            }
+                            Err(e) => {
+                                warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_segment_read_failed");
+                                failed += 1;
+                            }
+                        },
+                        Ok(resp) => {
+                            warn!(track_id = %track_bg, segment = seg_number, status = resp.status().as_u16(), "tidal_dash_stream_segment_http_error");
+                            failed += 1;
+                        }
+                        Err(e) => {
+                            warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_segment_fetch_error");
+                            failed += 1;
+                        }
+                    }
+                }
+                if failed >= seg.segment_count {
+                    growth.fail();
+                } else {
+                    growth.finish();
+                }
+                debug!(track_id = %track_bg, path = %path_bg, written, failed, "tidal_dash_streaming_download_done");
+            });
+
+            info!(
+                track_id,
+                path = tmp_path.as_str(),
+                segment_count = total,
+                "tidal_dash_streaming_download_started"
+            );
+            return Ok(tmp_path);
+        }
+
         // Download media segments sequentially and append to file.
         // Sequential to avoid overwhelming Tidal CDN and to maintain order.
         // For a typical 3-4 min track at 96kHz/24bit, there are ~54 segments
@@ -595,6 +672,7 @@ impl TidalService {
             track_number: item["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: item["volumeNumber"].as_u64().map(|n| n as u32),
             explicit: item["explicit"].as_bool().unwrap_or(false),
+            isrc: item["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate,
@@ -930,6 +1008,15 @@ impl TidalService {
         }
     }
 
+    /// Les playlists d'une réponse de recherche. Isolé de `search` pour être
+    /// testable : le reste de l'extraction demande un aller-retour HTTP.
+    fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_playlist).collect())
+            .unwrap_or_default()
+    }
+
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -947,8 +1034,13 @@ impl TidalService {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
             image_path: item["picture"].as_str().map(|p| {
+                // 640x640 (not 480x480): Tidal's image CDN does not serve a
+                // 480x480 rendition — that key 403s (AccessDenied), so the
+                // artwork proxy returned 502 and artist images were blank
+                // (Bertrand). 640x640 is a valid size and matches every other
+                // Tidal image URL built in this file.
                 format!(
-                    "https://resources.tidal.com/images/{}/480x480.jpg",
+                    "https://resources.tidal.com/images/{}/640x640.jpg",
                     p.replace('-', "/")
                 )
             }),
@@ -1185,7 +1277,7 @@ impl StreamingService for TidalService {
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let data = self
             .api_get(&format!(
-                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS",
+                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS,PLAYLISTS",
                 urlencoding::encode(query)
             ))
             .await?;
@@ -1207,7 +1299,7 @@ impl StreamingService for TidalService {
             tracks,
             albums,
             artists,
-            playlists: vec![],
+            playlists: Self::search_playlists(&data),
         })
     }
 
@@ -2392,6 +2484,36 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn search_playlists_read_from_the_search_payload() {
+        // Forme réelle d'une réponse /search avec types=…,PLAYLISTS.
+        let data = json!({
+            "tracks": {"items": []},
+            "albums": {"items": []},
+            "artists": {"items": []},
+            "playlists": {"items": [{
+                "uuid": "9f2c-77",
+                "title": "Late Night Jazz",
+                "numberOfTracks": 58,
+                "squareImage": "aa-bb-cc-dd",
+                "creator": {"name": "TIDAL"}
+            }]}
+        });
+        let found = TidalService::search_playlists(&data);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "9f2c-77");
+        assert_eq!(found[0].name, "Late Night Jazz");
+        assert_eq!(found[0].track_count, 58);
+        assert_eq!(found[0].owner.as_deref(), Some("TIDAL"));
+    }
+
+    #[test]
+    fn search_playlists_absent_is_empty_not_a_panic() {
+        // Un compte sans droit sur les playlists, ou une API qui omet le bloc :
+        // la recherche doit rendre les autres résultats, pas échouer.
+        assert!(TidalService::search_playlists(&json!({"tracks": {"items": []}})).is_empty());
+    }
+
+    #[test]
     fn map_track_basic() {
         let json = json!({
             "id": 123,
@@ -2520,7 +2642,11 @@ mod tests {
         assert_eq!(artist.name, "Miles Davis");
         assert!(artist.image_path.is_some());
         let img = artist.image_path.unwrap();
-        assert!(img.contains("480x480"));
+        // 640x640 is a valid Tidal rendition; 480x480 403s (blank artist images).
+        assert!(img.contains("640x640"));
+        assert!(!img.contains("480x480"));
+        // dashes in the picture id become path slashes
+        assert!(img.contains("aa/bb/cc/dd"));
     }
 
     #[test]

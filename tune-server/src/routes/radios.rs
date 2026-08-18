@@ -47,11 +47,109 @@ struct CreateRadio {
     bitrate: Option<i32>,
 }
 
+/// Backfill missing station logos from the mozaiklabs.fr radio directory.
+///
+/// The seeded default stations (migration `seed_default_radios`) and any station
+/// imported without art have no `logo_url`, so the radio list shows the
+/// placeholder mic icon (Pascal, v0.9.21). The public directory at
+/// `/api/v1/radios` carries a curated logo per station; match our local rows to
+/// it by stream URL (then name) and fill in the absolute logo URL. The web
+/// client proxies that URL through the LOCAL server (`artworkUrl` →
+/// `/library/artwork/proxy`), so it displays even behind a strict CSP.
+///
+/// Best-effort and cloud-graceful: any network/parse failure is a no-op (Tune
+/// works fully without mozaiklabs.fr). Never overwrites a logo already set.
+pub async fn refresh_radio_logos(state: &AppState) -> usize {
+    const DIRECTORY_URL: &str = "https://mozaiklabs.fr/api/v1/radios";
+    const BASE: &str = "https://mozaiklabs.fr";
+
+    let directory: Vec<Value> = match tune_core::http::client::shared()
+        .get(DIRECTORY_URL)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => return 0,
+    };
+
+    // Normalize a stream URL for matching: scheme-insensitive, no trailing slash.
+    let norm = |u: &str| {
+        u.trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string()
+    };
+
+    let mut by_url: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for item in &directory {
+        let Some(logo) = item
+            .get("logo_url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let abs = if logo.starts_with("http") {
+            logo.to_string()
+        } else {
+            format!("{BASE}{logo}")
+        };
+        if let Some(su) = item.get("stream_url").and_then(|v| v.as_str()) {
+            by_url.entry(norm(su)).or_insert_with(|| abs.clone());
+        }
+        if let Some(nm) = item.get("name").and_then(|v| v.as_str()) {
+            by_name
+                .entry(nm.trim().to_ascii_lowercase())
+                .or_insert_with(|| abs.clone());
+        }
+    }
+    if by_url.is_empty() && by_name.is_empty() {
+        return 0;
+    }
+
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let mut updated = 0usize;
+    for mut st in repo.list().unwrap_or_default() {
+        if st.logo_url.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            continue; // keep an existing / user-set logo
+        }
+        let logo = by_url
+            .get(&norm(&st.url))
+            .or_else(|| by_name.get(&st.name.trim().to_ascii_lowercase()))
+            .cloned();
+        if let Some(logo) = logo {
+            st.logo_url = Some(logo);
+            if repo.update(&st).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    if updated > 0 {
+        state.event_bus.emit(
+            "library.radios_changed",
+            json!({"action": "logos_refreshed", "updated": updated}),
+        );
+        tracing::info!(updated, "radio_logos_refreshed_from_directory");
+    }
+    updated
+}
+
+async fn refresh_logos_handler(State(state): State<AppState>) -> Json<Value> {
+    let updated = refresh_radio_logos(&state).await;
+    Json(json!({ "updated": updated }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_radios).post(create_radio))
         .route("/search", get(search_radios))
         .route("/favorites", get(list_favorites))
+        .route("/refresh-logos", post(refresh_logos_handler))
         .route("/add", get(add_from_web))
         .route(
             "/{id}",
@@ -533,7 +631,12 @@ async fn import_radios_m3u(
 
 pub fn radio_favorites_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_radio_favorites).post(save_radio_favorite))
+        .route(
+            "/",
+            get(list_radio_favorites)
+                .post(save_radio_favorite)
+                .delete(delete_all_radio_favorites),
+        )
         .route("/count", get(radio_favorites_count))
         .route("/is-favorite", get(is_radio_favorite))
         .route("/save-current", post(save_current_as_favorite))
@@ -629,14 +732,28 @@ async fn save_radio_favorite(
     use tune_core::db::backend::ToSqlValue;
     let artist = body.artist.unwrap_or_default();
     let station = body.station_name.unwrap_or_default();
-    match state.backend.execute(
-        "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?)",
+    match state.backend.execute_returning_id(
+        // `INSERT OR IGNORE` is SQLite-only; the Postgres backend forwards it
+        // verbatim → `syntax error at or near "OR"` (500), so saving a radio
+        // favorite failed on PG (.15) and the heart never lit up. `ON CONFLICT
+        // DO NOTHING` (no target) is valid on both SQLite (3.24+) and Postgres.
+        "INSERT INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         &[&body.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station as &dyn ToSqlValue, &body.cover_url as &dyn ToSqlValue, &body.stream_url as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// Clear the entire radio favorites list (DELETE /radio-favorites).
+// `DELETE FROM radio_favorites` (no WHERE) is portable across SQLite and
+// Postgres. Returns a JSON body (not 204) because the web client does
+// `JSON.parse` on the response and chokes on an empty body.
+async fn delete_all_radio_favorites(State(state): State<AppState>) -> impl IntoResponse {
+    match state.backend.execute("DELETE FROM radio_favorites", &[]) {
+        Ok(_) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -684,12 +801,14 @@ async fn save_current_as_favorite(
     let cover_url = np.cover_path.clone();
 
     use tune_core::db::backend::ToSqlValue;
-    match state.backend.execute(
-        "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?)",
+    match state.backend.execute_returning_id(
+        // Portable upsert-ignore (SQLite `INSERT OR IGNORE` 500s on the PG
+        // backend — see save_radio_favorite above). This is the /save-current
+        // path the heart button hits.
+        "INSERT INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         &[&title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station_name as &dyn ToSqlValue, &cover_url as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id, "title": title, "artist": artist }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -704,15 +823,16 @@ async fn save_current_as_favorite(
 struct CreatePlaylistFromFavBody {
     name: Option<String>,
     playlist_name: Option<String>,
-    #[allow(dead_code)]
-    service: Option<String>, // accepted for forward-compat; not used yet
+    /// Target: "local" (default) or a connected streaming service name
+    /// (e.g. "qobuz", "tidal", "deezer").
+    service: Option<String>,
     limit: Option<usize>,
 }
 
 async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let favorites: Vec<(String, String)> = state
         .backend
         .query_many(
@@ -737,7 +857,7 @@ async fn create_playlist_from_favorites(
             .into_response());
     }
 
-    let (name, limit) = match body {
+    let (name, limit, service) = match body {
         Some(Json(ref b)) => {
             let n = b
                 .playlist_name
@@ -745,9 +865,9 @@ async fn create_playlist_from_favorites(
                 .or(b.name.clone())
                 .unwrap_or_else(|| "Radio Favorites".into());
             let l = b.limit.unwrap_or(200);
-            (n, l)
+            (n, l, b.service.clone())
         }
-        None => ("Radio Favorites".into(), 200),
+        None => ("Radio Favorites".into(), 200, None),
     };
 
     let favorites: Vec<(String, String)> = if limit < favorites.len() {
@@ -756,6 +876,33 @@ async fn create_playlist_from_favorites(
         favorites
     };
 
+    // Beaucoup de radios livrent tout dans le StreamTitle ICY : le favori
+    // arrive alors avec artist vide et title « Artiste - Titre ». Découper
+    // avant matching, sinon le titre composite ne ressemble à aucun vrai
+    // titre et rien ne matche (forum #1234, Xavier).
+    let favorites: Vec<(String, String)> = favorites
+        .into_iter()
+        .map(|(title, artist)| {
+            if artist.trim().is_empty() {
+                if let Some((a, t)) = title.split_once(" - ") {
+                    let (a, t) = (a.trim(), t.trim());
+                    if !a.is_empty() && !t.is_empty() {
+                        return (t.to_string(), a.to_string());
+                    }
+                }
+            }
+            (title, artist)
+        })
+        .collect();
+
+    // Streaming target: resolve each favorite onto the service (smart-matched,
+    // ISRC-aware) and build the playlist there — Hi-Res where the service offers it.
+    let target = service.unwrap_or_else(|| "local".into());
+    if target != "local" {
+        return create_streaming_playlist_from_favorites(&state, &target, &name, &favorites).await;
+    }
+
+    // Local target: match each favorite against the local library.
     let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
     let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     let playlist_id = match repo.create(&name, None, DEFAULT_PROFILE_ID) {
@@ -767,22 +914,117 @@ async fn create_playlist_from_favorites(
         }
     };
 
+    // Même matcher que la cible streaming : l'ancien chemin prenait LE PREMIER
+    // résultat de la recherche plein-texte sans aucun scoring — « Nightswimming »
+    // capté sur FIP pouvait atterrir sur n'importe quelle piste dont le titre
+    // contient le mot. On score les 10 premiers candidats et on refuse sous le
+    // plancher approximatif (0.6), comme côté Qobuz.
+    use tune_core::library::track_matcher::{MatchCandidate, find_best_match};
     let mut matched = 0i64;
+    // Rapport par favori, comme la cible streaming. Sans lui, un « 3 sur 12 »
+    // ne dit pas LESQUELS ont échoué ni pourquoi, et l'utilisateur ne peut ni
+    // corriger un tag ni signaler utilement.
+    let mut report: Vec<serde_json::Value> = Vec::with_capacity(favorites.len());
+    // Deux favoris capturés sur des stations différentes peuvent désigner la
+    // même piste locale : sans ce garde, elle entrait deux fois dans la
+    // playlist.
+    let mut already: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
     for (title, artist) in &favorites {
         let q = if artist.is_empty() {
             title.clone()
         } else {
             format!("{artist} {title}")
         };
-        if let Ok(results) = track_repo.search(&q, 1) {
-            if let Some(track) = results.first() {
-                if let Some(id) = track.id {
-                    repo.add_tracks(playlist_id, &[id], None).ok();
-                    matched += 1;
+        // ⚠ Le `if let Ok(...)` sans branche d'erreur a rendu #1235
+        // indiagnosticable pendant des semaines DU CÔTÉ STREAMING : trois modes
+        // d'échec — recherche en erreur, zéro résultat, score sous le seuil —
+        // produisaient tous le même silence. #1079 l'a instrumenté là-bas ; ce
+        // chemin-ci était resté aveugle.
+        let results = match track_repo.search(&q, 10) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(query = %q, error = %e, "radio_fav_local_search_failed");
+                report.push(json!({"title": title, "artist": artist, "status": "search_failed"}));
+                continue;
+            }
+        };
+        let n = results.len();
+        let candidates: Vec<MatchCandidate> = results
+            .iter()
+            .filter(|t| t.id.is_some())
+            .map(|t| MatchCandidate {
+                title: t.title.clone(),
+                artist_name: t.artist_name.clone().unwrap_or_default(),
+                album_title: t.album_title.clone().unwrap_or_default(),
+                source_id: t.id.unwrap_or(0).to_string(),
+                duration_ms: t.duration_ms,
+                isrc: String::new(),
+                score: 0.0,
+                match_method: String::new(),
+                confidence: String::new(),
+            })
+            .collect();
+        let outcome = find_best_match(title, artist, "", 0, &candidates).best_match;
+        let best = outcome
+            .as_ref()
+            .filter(|m| m.score >= tune_core::streaming::matching::MATCH_APPROX_SCORE);
+
+        let Some(m) = best else {
+            // Distinguer « rien trouvé » de « trouvé mais refusé au seuil » :
+            // le second désigne un tag à corriger, le premier une absence.
+            match outcome.as_ref() {
+                Some(top) => {
+                    tracing::warn!(query = %q, results = n, top = %top.title, score = top.score, "radio_fav_local_match_rejected");
+                    report.push(json!({
+                        "title": title, "artist": artist, "status": "rejected",
+                        "best_candidate": top.title, "score": top.score,
+                    }));
                 }
+                None => {
+                    tracing::info!(query = %q, results = n, "radio_fav_local_no_candidate");
+                    report.push(json!({"title": title, "artist": artist, "status": "not_found"}));
+                }
+            }
+            continue;
+        };
+
+        let Ok(id) = m.source_id.parse::<i64>() else {
+            report.push(json!({"title": title, "artist": artist, "status": "not_found"}));
+            continue;
+        };
+        if !already.insert(id) {
+            report.push(
+                json!({"title": title, "artist": artist, "status": "duplicate", "track_id": id}),
+            );
+            continue;
+        }
+        // `matched` ne s'incrémente QUE si l'ajout a réussi. Auparavant le
+        // compteur montait avant l'écriture : une playlist pouvait annoncer
+        // douze pistes et n'en contenir aucune.
+        match repo.add_tracks(playlist_id, &[id], None) {
+            Ok(_) => {
+                matched += 1;
+                tracing::info!(query = %q, results = n, track_id = id, score = m.score, "radio_fav_local_match_ok");
+                report.push(json!({
+                    "title": title, "artist": artist, "status": "matched",
+                    "track_id": id, "score": m.score,
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "radio_fav_local_add_failed");
+                already.remove(&id);
+                report.push(json!({"title": title, "artist": artist, "status": "add_failed"}));
             }
         }
     }
+
+    tracing::info!(
+        playlist_id,
+        favorites = favorites.len(),
+        matched,
+        "radio_fav_local_playlist_done"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -791,6 +1033,192 @@ async fn create_playlist_from_favorites(
             "name": name,
             "favorites_count": favorites.len(),
             "matched_tracks": matched,
+            "results": report,
+        })),
+    )
+        .into_response())
+}
+
+/// Build the playlist on a streaming service: smart-match (ISRC-aware) each radio
+/// favorite onto the service catalogue via `best_stream_match`, then create the
+/// playlist on that service and add the matched tracks. Returns a per-favorite
+/// report so the client can show what matched and what didn't.
+async fn create_streaming_playlist_from_favorites(
+    state: &AppState,
+    service: &str,
+    name: &str,
+    favorites: &[(String, String)],
+) -> Result<axum::response::Response, AppError> {
+    let svc_arc = {
+        let reg = state.services.lock().await;
+        match reg.get(service) {
+            Some(a) => a,
+            None => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("service '{service}' not found or not connected")
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    };
+    let svc = svc_arc.lock().await;
+
+    let mut matched_ids: Vec<String> = Vec::new();
+    let mut details: Vec<Value> = Vec::new();
+    for (title, artist) in favorites {
+        // radio favorites carry no ISRC/duration, so match on normalized title+artist.
+        //
+        // Requêtes essayées dans l'ordre : « artiste titre », puis titre seul,
+        // puis titre tronqué avant « ( » ou « - ». Le matcher normalise déjà les
+        // suffixes « (feat. X) / (Live) » pour SCORER, mais la REQUÊTE envoyée
+        // au service les contenait encore, et Qobuz ne renvoyait alors aucun
+        // candidat (#1235 : une recherche manuelle sans le suffixe trouvait la
+        // piste). On s'arrête à la première requête qui produit un match sûr ;
+        // à défaut, on garde le meilleur match approximatif (0.6–0.7) rencontré,
+        // exposé `status: "approximate"` — avant, cette bande était jetée et
+        // devenait « not_found ».
+        let mut queries: Vec<String> = Vec::new();
+        if artist.is_empty() {
+            queries.push(title.clone());
+        } else {
+            queries.push(format!("{artist} {title}"));
+            queries.push(title.clone());
+        }
+        let stripped = title
+            .split_once(" (")
+            .map(|(a, _)| a)
+            .unwrap_or(title)
+            .split_once(" - ")
+            .map(|(a, _)| a)
+            .unwrap_or_else(|| title.split_once(" (").map(|(a, _)| a).unwrap_or(title))
+            .trim()
+            .to_string();
+        if !stripped.is_empty() && stripped != *title {
+            if artist.is_empty() {
+                queries.push(stripped.clone());
+            } else {
+                queries.push(format!("{artist} {stripped}"));
+            }
+        }
+
+        // Instrumentation for #1235 (Reivax66: "aucun résultat trouvé" on Qobuz
+        // even though a manual Qobuz search finds the track). Without logging we
+        // cannot tell three very different failure modes apart: the service
+        // search erroring (previously swallowed by `Err(_) => None`), the search
+        // returning zero candidates, or the matcher rejecting every candidate.
+        // Log the query, result count, the top candidate the service returned,
+        // and the accept/reject decision so the next tester log pinpoints it.
+        let mut best: Option<(tune_core::streaming::traits::StreamTrack, f64)> = None;
+        for q in &queries {
+            match svc.search(q, 10).await {
+                Ok(results) => {
+                    let n = results.tracks.len();
+                    let top = results
+                        .tracks
+                        .first()
+                        .map(|t| format!("{} — {}", t.artist, t.title))
+                        .unwrap_or_else(|| "<none>".into());
+                    match tune_core::streaming::matching::best_stream_match_scored(
+                        title,
+                        artist,
+                        "",
+                        0,
+                        &results.tracks,
+                    ) {
+                        Some((t, score))
+                            if score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE =>
+                        {
+                            tracing::info!(service = %service, query = %q, results = n, top = %top, score, "radio_fav_match_ok");
+                            best = Some((t.clone(), score));
+                            break;
+                        }
+                        Some((t, score)) => {
+                            tracing::info!(service = %service, query = %q, results = n, top = %top, score, "radio_fav_match_approx");
+                            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                                best = Some((t.clone(), score));
+                            }
+                        }
+                        None => {
+                            tracing::warn!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_rejected");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(service = %service, query = %q, error = %e, "radio_fav_search_failed");
+                }
+            }
+        }
+        match best {
+            Some((t, score)) => {
+                let sure = score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE;
+                details.push(json!({
+                    "title": title,
+                    "artist": artist,
+                    "matched_title": t.title,
+                    "matched_artist": t.artist,
+                    "matched_id": t.id,
+                    "status": if sure { "matched" } else { "approximate" },
+                }));
+                matched_ids.push(t.id);
+            }
+            None => details.push(json!({
+                "title": title,
+                "artist": artist,
+                "status": "not_found",
+            })),
+        }
+    }
+
+    tracing::info!(
+        service = %service,
+        favorites = favorites.len(),
+        matched = matched_ids.len(),
+        "radio_fav_playlist_matching_done"
+    );
+
+    let mut remote_playlist_id: Option<String> = None;
+    if !matched_ids.is_empty() {
+        match svc
+            .create_playlist(name, Some("Created by Tune from radio favorites"))
+            .await
+        {
+            Ok(pid) => {
+                if let Err(e) = svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                    tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                }
+                remote_playlist_id = Some(pid);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    service = %service,
+                    error = %e,
+                    "radio_fav_create_playlist_failed (service may not support write)"
+                );
+                return Ok((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("could not create playlist on '{service}': {e}"),
+                        "matched_tracks": matched_ids.len(),
+                        "details": details,
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "service": service,
+            "name": name,
+            "favorites_count": favorites.len(),
+            "matched_tracks": matched_ids.len(),
+            "remote_playlist_id": remote_playlist_id,
+            "details": details,
         })),
     )
         .into_response())
@@ -867,6 +1295,7 @@ struct CreateAlarmGlobal {
 
 async fn create_alarm_global(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Json(body): Json<CreateAlarmGlobal>,
 ) -> impl IntoResponse {
     let is_premium = state.license.is_premium().await;
@@ -939,12 +1368,12 @@ async fn create_alarm_global(
     } else {
         Some(multi_zone_ids)
     };
-    match state.backend.execute(
-        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &body.source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue],
+    let profile_id = profile.id();
+    match state.backend.execute_returning_id(
+        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &body.source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

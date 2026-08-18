@@ -29,6 +29,17 @@ pub struct CloudUser {
     /// Subscription end for the account premium (ISO-8601), when known.
     #[serde(default)]
     pub license_expires_at: Option<String>,
+    /// Qobuz endpoint order for this account: `true` = route Qobuz through the
+    /// mozaiklabs proxy first (founder account). Absent on older servers →
+    /// defaults to false (direct-first for every user).
+    #[serde(default)]
+    pub qobuz_proxy_first: bool,
+    /// Paid MODULE entitlements owned by this account, as stable module ids
+    /// (e.g. "diretta"). Separate SKUs, NOT implied by `premium`: a module is
+    /// sold on its own and a premium account owns none by default. Absent on
+    /// older servers → empty (no modules).
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +261,54 @@ fn base64url_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_user_parses_without_qobuz_proxy_first() {
+        // Retro-compat: older servers omit the field → direct-first.
+        let json = r#"{
+            "id": 1,
+            "email": "a@b.fr",
+            "display_name": "A",
+            "is_admin": false,
+            "avatar_url": null
+        }"#;
+        let user: CloudUser = serde_json::from_str(json).unwrap();
+        assert!(!user.qobuz_proxy_first);
+        assert!(!user.premium);
+        assert!(user.modules.is_empty());
+    }
+
+    #[test]
+    fn cloud_user_parses_with_modules() {
+        let json = r#"{
+            "id": 1,
+            "email": "a@b.fr",
+            "display_name": "A",
+            "is_admin": false,
+            "avatar_url": null,
+            "premium": false,
+            "modules": ["diretta"]
+        }"#;
+        let user: CloudUser = serde_json::from_str(json).unwrap();
+        // A module is its own SKU: owning one does not require premium.
+        assert!(!user.premium);
+        assert_eq!(user.modules, vec!["diretta".to_string()]);
+    }
+
+    #[test]
+    fn cloud_user_parses_with_qobuz_proxy_first() {
+        let json = r#"{
+            "id": 1,
+            "email": "a@b.fr",
+            "display_name": "A",
+            "is_admin": false,
+            "avatar_url": null,
+            "premium": true,
+            "qobuz_proxy_first": true
+        }"#;
+        let user: CloudUser = serde_json::from_str(json).unwrap();
+        assert!(user.qobuz_proxy_first);
+    }
 
     #[test]
     fn authorize_url_format() {

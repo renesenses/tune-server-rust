@@ -65,7 +65,9 @@ impl OaatMultiroomOutput {
             stream_counter: Arc::new(AtomicU32::new(1)),
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(200)),
+            // Meme echelle 0–100 que le protocole : 200 rapportait un
+            // volume de 200 %, hors bornes (releve en relisant la PR #1379).
+            volume: Arc::new(AtomicU32::new(100)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             current_uri: Arc::new(Mutex::new(None)),
@@ -541,7 +543,7 @@ impl OutputTarget for OaatMultiroomOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let level = (volume.clamp(0.0, 1.0) * 100.0) as u8;
+        let level = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
         self.volume.store(level as u32, Ordering::SeqCst);
         #[cfg(feature = "oaat")]
         {
@@ -584,6 +586,8 @@ impl OutputTarget for OaatMultiroomOutput {
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

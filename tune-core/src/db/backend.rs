@@ -48,6 +48,26 @@ pub trait DbBackend: Send + Sync {
     /// hood and exposes the latest value here.
     fn last_insert_rowid(&self) -> i64;
 
+    /// Atomically execute an INSERT and return the new row id.
+    ///
+    /// The `execute()` + `last_insert_rowid()` pair is a data race: the two
+    /// calls take the backend lock (or a pooled Postgres connection)
+    /// *separately*, so a concurrent insert can slip in between and make
+    /// `last_insert_rowid()` return the *other* row's id (audit item 5). This
+    /// runs both inside a single `write_tx`, which holds one connection for the
+    /// whole closure, so the id belongs to the insert we just did. The default
+    /// works for every backend (no `RETURNING id` SQL surgery needed); impls
+    /// may override for efficiency.
+    fn execute_returning_id(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<i64, String> {
+        let mut id = 0i64;
+        self.write_tx(&mut |tx| {
+            tx.execute(sql, params)?;
+            id = tx.last_insert_rowid();
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
     /// Read at most one row. Returns the row's columns as `SqlValue`s
     /// in declaration order. The repo decodes them via the `as_i64` /
     /// `as_str` / `as_f64` helpers on `SqlValue`.
@@ -82,6 +102,26 @@ pub trait DbBackend: Send + Sync {
     /// Useful for DDL, PRAGMAs, and multi-statement init.
     /// Returns `Ok(())` on success.
     fn execute_batch(&self, sql: &str) -> Result<(), String>;
+
+    /// Execute the same statement once per row, returning one result per row.
+    ///
+    /// Default: a plain loop over `execute` — identical behavior to the
+    /// caller-side loops it replaces (SQLite batch callers already wrap the
+    /// loop in one BEGIN IMMEDIATE/COMMIT). Postgres overrides this to run
+    /// the whole batch on a SINGLE pooled connection inside one async
+    /// context: one pool acquire and a server-side prepared statement reused
+    /// across rows, instead of per-row (runtime hop + pool acquire + parse +
+    /// autocommit) — the reason a PG scan imported at a fraction of the
+    /// SQLite speed. Per-row error semantics are preserved: a failed row
+    /// reports its error and the batch continues.
+    fn execute_many(&self, sql: &str, rows: &[Vec<SqlValue>]) -> Vec<Result<usize, String>> {
+        rows.iter()
+            .map(|row| {
+                let refs: Vec<&dyn ToSqlValue> = row.iter().map(|v| v as &dyn ToSqlValue).collect();
+                self.execute(sql, &refs)
+            })
+            .collect()
+    }
 
     /// Same as `query_many`, but reads through the write path so the
     /// query sees commits made by the write connection that haven't
@@ -434,6 +474,23 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
 
     fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid()
+    }
+
+    fn execute_returning_id(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<i64, String> {
+        // Hold the write connection across execute + last_insert_rowid so the id
+        // belongs to the insert we just did (audit item 5), WITHOUT opening a
+        // transaction: the trait default wraps this in `write_tx` (BEGIN), which
+        // panics when the caller already has a tx open (e.g. a scan's
+        // `BEGIN IMMEDIATE`). One lock, no BEGIN, works inside or outside a tx.
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let conn = self.connection().lock().unwrap();
+        conn.execute(sql, &refs[..])
+            .map_err(|e| format!("execute: {e}"))?;
+        Ok(conn.last_insert_rowid())
     }
 
     fn query_one(
@@ -789,6 +846,40 @@ impl DbBackend for PostgresBackend {
                         .map_err(|e| format!("pg execute_batch: {e}"))?;
                 }
                 Ok(())
+            })
+        })
+    }
+
+    fn execute_many(&self, sql: &str, rows: &[Vec<SqlValue>]) -> Vec<Result<usize, String>> {
+        let sql_owned = Self::translate_placeholders(sql);
+        let pool = self.pool.clone();
+        let rows_owned: Vec<Vec<SqlValue>> = rows.to_vec();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                // One connection for the whole batch: sqlx caches prepared
+                // statements per connection, so every row after the first is
+                // bind+execute only. No explicit transaction — each row still
+                // autocommits so one bad row doesn't poison the rest (same
+                // semantics as the per-row loop this replaces).
+                let mut conn = match pool.acquire().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = format!("pg execute_many acquire: {e}");
+                        return rows_owned.iter().map(|_| Err(msg.clone())).collect();
+                    }
+                };
+                let mut results = Vec::with_capacity(rows_owned.len());
+                for row in &rows_owned {
+                    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned.clone()));
+                    for v in row {
+                        q = bind_sqlvalue(q, v);
+                    }
+                    match q.execute(&mut *conn).await {
+                        Ok(r) => results.push(Ok(r.rows_affected() as usize)),
+                        Err(e) => results.push(Err(format!("pg execute_many: {e}"))),
+                    }
+                }
+                results
             })
         })
     }

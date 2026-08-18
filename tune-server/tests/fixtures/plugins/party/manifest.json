@@ -1,0 +1,19 @@
+{
+  "id": "party",
+  "name": "Party Mode",
+  "version": "0.1.0",
+  "description": "Party Mode — collaborative queue with voting",
+  "author": "MozAIk Labs",
+  "entry_point": "main.wasm",
+  "permissions": ["queue", "playback", "events"],
+  "min_server_version": "0.9.0",
+  "routes": [
+    { "method": "GET", "path": "/status" },
+    { "method": "POST", "path": "/add" },
+    { "method": "GET", "path": "/queue" },
+    { "method": "POST", "path": "/vote" },
+    { "method": "POST", "path": "/vote/reset" },
+    { "method": "POST", "path": "/enable" },
+    { "method": "POST", "path": "/disable" }
+  ]
+}

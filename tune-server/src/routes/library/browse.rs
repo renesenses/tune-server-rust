@@ -27,7 +27,7 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
-    let roots: Vec<Value> = dirs
+    let mut roots: Vec<Value> = dirs
         .iter()
         .map(|d| {
             let norm = tune_core::scanner::walker::normalize_path(d);
@@ -43,8 +43,9 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             } else {
                 "?1"
             };
+            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
             let count: i64 = match state.backend.query_one(
-                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}"),
+                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
                 &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
             ) {
                 Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -72,23 +73,100 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&norm);
-            json!({ "path": norm, "name": name, "track_count": count })
+            // Whether the configured directory still exists on disk. A stale
+            // music dir (renamed/unmounted share, e.g. a NAS mount that moved)
+            // otherwise shows as an empty phantom folder with no explanation
+            // (Yacine: two configured roots — one gone, one empty — while the
+            // real music sits under a different root). Surfacing this lets the
+            // UI flag "introuvable / vérifier le montage" vs a genuinely empty
+            // but valid directory.
+            let exists = std::path::Path::new(&norm).is_dir();
+            json!({ "path": norm, "name": name, "track_count": count, "exists": exists })
         })
         .collect();
+
+    // Fallback: if no configured music_dir matches any stored path (the
+    // browse_root_zero_tracks drift — e.g. .18 set to /mnt/music while files
+    // live under /data/music), the Répertoires view would show only empty roots
+    // and browsing would go nowhere. Surface the real root inferred from the
+    // data so it still works — the same fallback the Oxygen folder facet uses.
+    let none_populated = roots
+        .iter()
+        .all(|r| r.get("track_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0);
+    if none_populated {
+        if let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref()) {
+            let pattern = tune_core::db::track_repo::folder_like_pattern(&base);
+            let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                "$1"
+            } else {
+                "?1"
+            };
+            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
+            let count: i64 = state
+                .backend
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
+                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+            let dup = roots
+                .iter()
+                .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
+            if count > 0 && !dup {
+                let name = std::path::Path::new(&base)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&base)
+                    .to_string();
+                let exists = std::path::Path::new(&base).is_dir();
+                warn!(root = %base, count, "browse_roots_data_derived_fallback");
+                roots.push(json!({
+                    "path": base, "name": name, "track_count": count,
+                    "exists": exists, "derived": true
+                }));
+            }
+        }
+    }
+
     Ok(Json(json!({ "roots": roots })))
+}
+
+/// Résout le chemin demandé en tenant compte de la forme de normalisation
+/// Unicode réellement utilisée par le système de fichiers.
+///
+/// Tune renvoie les chemins en NFC, et le client les lui renvoie tels quels.
+/// Sur APFS la recherche est insensible à la forme, donc NFC suffit — mais pas
+/// sur un partage réseau : un volume SMB monté depuis macOS est sensible à la
+/// forme, et un dossier accentué créé côté NAS (« CDThèque ») peut n'exister
+/// qu'en NFD. Le chemin était alors déclaré invalide et la navigation
+/// s'arrêtait là (retour Yves Corbat, NAS Synology en SMB).
+///
+/// Renvoie le chemin absolu qui existe réellement, ou `None`.
+fn resolve_browse_path(raw: &str) -> Option<String> {
+    let base = tune_core::scanner::walker::normalize_path(raw);
+    let nfc: String = base.nfc().collect();
+    let nfd: String = base.nfd().collect();
+    // La forme brute est essayée aussi : elle est déjà correcte quand le client
+    // renvoie ce que le système de fichiers a fourni.
+    for candidate in [nfc, nfd, base] {
+        let path = std::path::Path::new(&candidate);
+        if path.is_absolute() && path.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub(super) async fn browse_directory(
     State(state): State<AppState>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let normalized_query: String = tune_core::scanner::walker::normalize_path(&q.path)
-        .nfc()
-        .collect();
+    let normalized_query =
+        resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
     let resolved = std::path::Path::new(&normalized_query);
-    if !resolved.is_absolute() || !resolved.exists() {
-        return Err(AppError::bad_request("invalid path"));
-    }
 
     // Verify path is under a configured music dir.
     // Use std::path::Path::starts_with for OS-aware prefix matching
@@ -100,9 +178,18 @@ pub(super) async fn browse_directory(
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
+    // Comparaison sur une forme Unicode commune : le chemin résolu peut être en
+    // NFD (ce qu'expose le partage SMB) alors que le dossier musical configuré
+    // est en NFC. Sans cela, un chemin pourtant valide était déclaré hors des
+    // dossiers musicaux — le même défaut que la résolution ci-dessus, une ligne
+    // plus loin.
+    let resolved_nfc: String = normalized_query.nfc().collect();
+    let resolved_nfc = std::path::Path::new(&resolved_nfc);
     let music_root = dirs.iter().find(|d| {
-        let norm_dir = tune_core::scanner::walker::normalize_path(d);
-        resolved.starts_with(&norm_dir)
+        let norm_dir: String = tune_core::scanner::walker::normalize_path(d)
+            .nfc()
+            .collect();
+        resolved_nfc.starts_with(&norm_dir)
     });
     let Some(music_root) = music_root else {
         return Err(AppError::bad_request(
@@ -111,46 +198,66 @@ pub(super) async fn browse_directory(
     };
     let music_root = tune_core::scanner::walker::normalize_path(music_root);
 
-    // List subdirectories
+    // List subdirectories. On lit le chemin RÉSOLU, pas `q.path` brut : c'est
+    // celui dont on vient de vérifier l'existence et l'appartenance à un dossier
+    // musical. Lire l'autre revenait à valider un chemin et en ouvrir un second.
     let mut subdirs: Vec<Value> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&q.path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let dir_path: String = path.to_string_lossy().nfc().collect();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let sep = std::path::MAIN_SEPARATOR;
-                let base = dir_path.trim_end_matches(|c| c == '/' || c == '\\');
-                let pattern = format!("{base}{sep}%");
-                let track_count: i64 = match state.backend.query_one(
-                    &format!(
-                        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
-                        if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-                            "$1"
-                        } else {
-                            "?1"
-                        }
-                    ),
-                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-                ) {
-                    Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
-                    Ok(None) => 0,
-                    Err(e) => {
-                        warn!(path = %dir_path, error = %e, "browse_dir_count_failed");
-                        0
-                    }
-                };
-                subdirs.push(json!({ "name": name, "path": dir_path, "track_count": track_count }));
-            }
+    // `read_dir` echouait en silence : le `if let Ok` laissait la liste vide et
+    // l'interface annoncait « Dossier vide » pour un dossier qui n'est pas vide
+    // mais INJOIGNABLE — lecteur reseau non monte, permissions refusees. Sous
+    // Windows le cas est courant : une lettre mappee (`Z:`) appartient a la
+    // session qui l'a creee et reste invisible au processus serveur, a plus
+    // forte raison lance en service (testeur EverSolo, 04/08/2026 : 0 piste
+    // annoncee pour un partage qui en contient 34 169). On remonte desormais la
+    // raison au lieu de mentir (#1190).
+    let mut unreadable: Option<String> = None;
+    match std::fs::read_dir(resolved) {
+        Err(e) => {
+            warn!(path = %resolved.display(), error = %e, "browse_dir_unreadable");
+            unreadable = Some(e.to_string());
         }
-        // conn removed — using state.backend
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let dir_path: String = path.to_string_lossy().nfc().collect();
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let sep = std::path::MAIN_SEPARATOR;
+                    let base = dir_path.trim_end_matches(|c| c == '/' || c == '\\');
+                    let pattern = format!("{base}{sep}%");
+                    let track_count: i64 = match state.backend.query_one(
+                        &format!(
+                            "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}{}",
+                            if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                                "$1"
+                            } else {
+                                "?1"
+                            },
+                            tune_core::db::track_repo::like_escape_clause(state.backend.engine())
+                        ),
+                        &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+                    ) {
+                        Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                        Ok(None) => 0,
+                        Err(e) => {
+                            warn!(path = %dir_path, error = %e, "browse_dir_count_failed");
+                            0
+                        }
+                    };
+                    subdirs.push(
+                        json!({ "name": name, "path": dir_path, "track_count": track_count }),
+                    );
+                }
+            }
+            // conn removed — using state.backend
+        }
     }
     subdirs.sort_by(|a, b| {
         a.get("name")
@@ -176,8 +283,9 @@ pub(super) async fn browse_directory(
                t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path \
                FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
                LEFT JOIN artists ar ON t.artist_id = ar.id \
-               WHERE t.file_path LIKE {ph} \
-               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title"
+               WHERE t.file_path LIKE {ph}{esc} \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+        esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine())
     );
     let rows = state
         .backend
@@ -237,6 +345,11 @@ pub(super) async fn browse_directory(
         "music_root": music_root,
         "directories": subdirs,
         "tracks": tracks,
+        // `accessible: false` distingue « injoignable » de « vide » : sans lui
+        // le client ne peut pas faire la difference et affiche le mauvais
+        // message (#1190). `access_error` porte la raison systeme.
+        "accessible": unreadable.is_none(),
+        "access_error": unreadable,
     })))
 }
 
@@ -256,5 +369,44 @@ pub(super) async fn browse_folders(
             let roots_json = browse_roots(State(state)).await;
             roots_json.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod browse_path_tests {
+    use super::resolve_browse_path;
+    use unicode_normalization::UnicodeNormalization;
+
+    /// Le cas Yves : un dossier accentué créé côté NAS doit être atteignable
+    /// que le client renvoie la forme composée ou décomposée.
+    #[test]
+    fn an_accented_directory_resolves_from_either_normalization_form() {
+        let tmp = std::env::temp_dir().join(format!("tune-browse-{}", std::process::id()));
+        let nfd_name: String = "CDThèque Yves".nfd().collect();
+        let dir = tmp.join(&nfd_name);
+        std::fs::create_dir_all(&dir).expect("création du dossier de test");
+
+        let on_disk = dir.to_string_lossy().to_string();
+        let nfc_form: String = on_disk.nfc().collect();
+        let nfd_form: String = on_disk.nfd().collect();
+
+        for form in [&nfc_form, &nfd_form] {
+            assert!(
+                resolve_browse_path(form).is_some(),
+                "forme non résolue : {form:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_is_refused() {
+        assert!(resolve_browse_path("/chemin/qui/nexiste/pas/du/tout").is_none());
+    }
+
+    #[test]
+    fn a_relative_path_is_refused() {
+        assert!(resolve_browse_path("Musique").is_none());
     }
 }

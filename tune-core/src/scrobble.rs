@@ -309,6 +309,18 @@ mod tests {
     }
 
     #[test]
+    fn skip_before_half_does_not_scrobble_1113() {
+        // Bug #1: pressing Next after a few seconds must NOT scrobble — the
+        // poller only dispatches once this returns true (previously it scrobbled
+        // at play-start, ignoring the threshold entirely).
+        assert!(!should_scrobble(Some(200_000), 3_000));
+        assert!(should_scrobble(Some(200_000), 100_000));
+        // Radio / unknown-length streams report duration 0 and must never
+        // scrobble on a short listen.
+        assert!(!should_scrobble(Some(0), 3_000));
+    }
+
+    #[test]
     fn should_scrobble_unknown_duration() {
         assert!(should_scrobble(None, 240_000));
         assert!(!should_scrobble(None, 200_000));

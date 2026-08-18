@@ -18,6 +18,11 @@ pub struct StreamTrack {
     pub disc_number: Option<u32>,
     pub explicit: bool,
     pub quality: Option<StreamQuality>,
+    /// International Standard Recording Code, when the service exposes it. Enables
+    /// exact cross-service matching (see `streaming::matching::best_stream_match`).
+    /// `#[serde(default)]` so older serialized results without the field still load.
+    #[serde(default)]
+    pub isrc: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -116,6 +121,15 @@ pub struct PlaylistTag {
     pub name: String,
 }
 
+/// Une catégorie de playlists éditoriales avec sa rangée de playlists — la
+/// structure qu'affichent Qobuz et Roon (« Humeurs », « Focus », …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistTagGroup {
+    pub id: String,
+    pub name: String,
+    pub playlists: Vec<StreamPlaylist>,
+}
+
 /// Discovery context of an album/track: its genre and record label. Lets a
 /// client jump from the now-playing track to the genre's expert playlists or
 /// the label's catalogue, without bloating the shared `StreamAlbum` model.
@@ -174,6 +188,25 @@ pub trait StreamingService: Send + Sync {
     }
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let _ = artist_id;
+        Ok(vec![])
+    }
+    /// Artistes similaires SELON LE SERVICE, pour la radio d'autoplay (#1553).
+    ///
+    /// Jusqu'ici « qui ressemble à qui » n'avait qu'une seule reponse possible :
+    /// l'API d'enrichissement mozaiklabs, interrogeable par MBID seulement.
+    /// Or ~10 % des artistes en ont un, et une piste Qobuz n'en transporte
+    /// aucun : la radio streaming n'avait donc jamais de candidats, et la file
+    /// s'arretait en silence (Sandro, 0.9.75).
+    ///
+    /// Le service qui diffuse la piste connait, lui, son propre catalogue.
+    /// Defaut vide : un service sans notion de similarite ne bloque rien, le
+    /// couple appelant/repli reste responsable de la suite.
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let _ = (artist_id, limit);
         Ok(vec![])
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
@@ -256,6 +289,19 @@ pub trait StreamingService: Send + Sync {
     ) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
     }
+    /// Les playlists éditoriales **rangées par catégorie**, une rangée par tag,
+    /// comme le fait le service lui-même (Qobuz : « Artistes Qobuz »,
+    /// « Humeurs », « Focus », « Histoires de labels »…).
+    ///
+    /// Un seul aller-retour pour le client, qui n'a pas à découvrir les tags
+    /// puis à lancer une requête par tag. Optionnellement narrowé par genre,
+    /// comme le sélecteur « Tous les genres » du service.
+    async fn get_featured_playlists_by_tag(
+        &self,
+        _genre: Option<&str>,
+    ) -> Result<Vec<PlaylistTagGroup>, TuneError> {
+        Ok(vec![])
+    }
     /// Discovery context (genre + label) of an album, resolved from the album.
     async fn get_album_context(&self, _album_id: &str) -> Result<AlbumContext, TuneError> {
         Err("album context not supported for this service".into())
@@ -276,6 +322,30 @@ pub trait StreamingService: Send + Sync {
         None
     }
     fn restore_tokens(&mut self, _tokens: &serde_json::Value) -> bool {
+        false
+    }
+
+    /// Whether the blob just restored is a stale shape that must be rewritten.
+    ///
+    /// Set by a service when `restore_tokens` reads a row written by an older
+    /// build that persisted something it no longer should — today, the Qobuz
+    /// plaintext password. Dropping the field from `save_tokens` alone is not
+    /// enough: the old value sits in `settings` until something happens to
+    /// overwrite the row, which for a working token may be never. The registry
+    /// checks this right after restoring and rewrites the row on the spot.
+    fn tokens_need_rewrite(&self) -> bool {
+        false
+    }
+
+    /// Whether the service has established that its session is over and the
+    /// persisted row is worthless — the token was rejected and could not be
+    /// renewed. The caller deletes the row so a restart does not reload a
+    /// credential the provider has already refused.
+    ///
+    /// Distinct from `save_tokens() == None`, which means "nothing to save
+    /// right now" and must leave any existing row alone — `TidalService`
+    /// returns exactly that when its mutex is held.
+    fn session_expired(&self) -> bool {
         false
     }
 
@@ -303,6 +373,7 @@ mod tests {
             track_number: Some(1),
             disc_number: Some(1),
             explicit: false,
+            isrc: Some("USSM19900001".into()),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: 96000,

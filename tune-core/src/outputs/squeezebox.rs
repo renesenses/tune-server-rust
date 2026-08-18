@@ -1,6 +1,6 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
@@ -8,6 +8,44 @@ use super::traits::*;
 
 /// LMS CLI port (telnet-style protocol). NOT 9000 (JSON-RPC/HTTP).
 pub const LMS_CLI_PORT: u16 = 9090;
+
+/// Per-read socket timeout for the LMS CLI. A busy LMS can take a moment to
+/// answer, so a single window used to be too tight (see [`CLI_READ_DEADLINE`]).
+const CLI_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Overall deadline for assembling one CLI response line. The socket read
+/// timeout ([`CLI_READ_TIMEOUT`]) can surface a transient `EAGAIN`
+/// (`WouldBlock`, os error 11) when LMS is slow to send the next chunk; we
+/// retry within this window instead of aborting — a single EAGAIN used to be
+/// treated as fatal and immediately stop the zone (Yacine, Freebox Delta).
+const CLI_READ_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Read one newline-terminated line, tolerating transient
+/// `WouldBlock`/`TimedOut`/`Interrupted` (EAGAIN / EINTR) errors from the
+/// socket read timeout by retrying until `deadline`, rather than aborting the
+/// whole command. Partial bytes read before a transient error are preserved
+/// across retries (`read_line` appends), so the assembled line is complete.
+fn read_line_tolerant<R: BufRead>(reader: &mut R, deadline: Instant) -> Result<String, String> {
+    let mut response = String::new();
+    loop {
+        match reader.read_line(&mut response) {
+            // Ok(0) = EOF, Ok(n) = got a line (or EOF-terminated last line).
+            Ok(_) => return Ok(response),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(format!("LMS CLI read timed out: {e}"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("LMS CLI read failed: {e}")),
+        }
+    }
+}
 
 pub struct SqueezeboxOutput {
     name: String,
@@ -52,10 +90,10 @@ impl SqueezeboxOutput {
         })?;
 
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(CLI_READ_TIMEOUT))
             .map_err(|e| format!("set read timeout: {e}"))?;
         stream
-            .set_write_timeout(Some(Duration::from_secs(3)))
+            .set_write_timeout(Some(CLI_READ_TIMEOUT))
             .map_err(|e| format!("set write timeout: {e}"))?;
 
         let mut writer = stream
@@ -68,10 +106,7 @@ impl SqueezeboxOutput {
         writer.flush().map_err(|e| format!("LMS CLI flush: {e}"))?;
 
         let mut reader = BufReader::new(stream);
-        let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .map_err(|e| format!("LMS CLI read failed: {e}"))?;
+        let response = read_line_tolerant(&mut reader, Instant::now() + CLI_READ_DEADLINE)?;
 
         Ok(response.trim().to_string())
     }
@@ -145,6 +180,22 @@ impl OutputTarget for SqueezeboxOutput {
 
     fn output_type(&self) -> &str {
         "squeezebox"
+    }
+
+    /// Opt out of the poller's position-polling (DLNA-style) gapless. On this
+    /// LMS-CLI proxy, staging the next track is `playlist add` (an append to
+    /// LMS's OWN playlist), and the poller's gapless advance is metadata-only —
+    /// it never re-issues a play. So LMS ends up with an independent, growing
+    /// playlist that Tune no longer commands track-by-track: after end-of-track
+    /// LMS free-runs its own playlist while Tune silently updates now-playing
+    /// (Yacine, zone 7 — repeat=one re-appends the same track, then a random LMS
+    /// track plays with no Tune trace). With gapless off, the poller's
+    /// natural-end path issues an explicit `playlist play <next>` per track,
+    /// keeping Tune in control (and looping a 1-track Repeat queue). Same choice
+    /// as the native slimproto output; small inter-track gap is the accepted
+    /// trade-off for a CLI-driven renderer.
+    fn supports_internal_gapless(&self) -> bool {
+        false
     }
 
     fn host(&self) -> Option<&str> {
@@ -242,6 +293,8 @@ impl OutputTarget for SqueezeboxOutput {
             track_title,
             track_artist,
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 
@@ -297,6 +350,80 @@ mod tests {
             9090,
         );
         assert_eq!(sb.player_id, "00:04:20:ab:cd:ef");
+    }
+
+    // A `Read` that replays a scripted sequence of results, so we can drive
+    // `read_line_tolerant` through transient errors deterministically.
+    struct FlakyReader {
+        steps: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+    }
+    impl std::io::Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(Ok(data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0), // exhausted → EOF
+            }
+        }
+    }
+
+    fn flaky(steps: Vec<std::io::Result<Vec<u8>>>) -> BufReader<FlakyReader> {
+        BufReader::new(FlakyReader {
+            steps: steps.into(),
+        })
+    }
+
+    #[test]
+    fn read_line_tolerant_retries_transient_then_succeeds() {
+        // Two EAGAIN (WouldBlock, os error 11) then the real line → must succeed.
+        let mut r = flaky(vec![
+            Err(std::io::Error::from(ErrorKind::WouldBlock)),
+            Err(std::io::Error::from(ErrorKind::WouldBlock)),
+            Ok(b"player status ok\n".to_vec()),
+        ]);
+        let line = read_line_tolerant(&mut r, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(line, "player status ok\n");
+    }
+
+    #[test]
+    fn read_line_tolerant_preserves_partial_across_retries() {
+        // A chunk without a newline, then WouldBlock, then the remainder: the
+        // reassembled line must contain both halves.
+        let mut r = flaky(vec![
+            Ok(b"abc ".to_vec()),
+            Err(std::io::Error::from(ErrorKind::WouldBlock)),
+            Ok(b"def\n".to_vec()),
+        ]);
+        let line = read_line_tolerant(&mut r, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(line, "abc def\n");
+    }
+
+    #[test]
+    fn read_line_tolerant_times_out_when_deadline_passed() {
+        // Deadline already in the past → the first WouldBlock is fatal.
+        let mut r = flaky(vec![Err(std::io::Error::from(ErrorKind::WouldBlock))]);
+        let err = read_line_tolerant(&mut r, Instant::now() - Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn read_line_tolerant_propagates_hard_error() {
+        // A non-transient error is returned immediately, not retried.
+        let mut r = flaky(vec![Err(std::io::Error::from(ErrorKind::ConnectionReset))]);
+        let err = read_line_tolerant(&mut r, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("read failed"), "got: {err}");
+    }
+
+    #[test]
+    fn read_line_tolerant_eof_returns_available() {
+        // EOF with a prior partial (no newline) → return what we have.
+        let mut r = flaky(vec![Ok(b"partial".to_vec())]);
+        let line = read_line_tolerant(&mut r, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(line, "partial");
     }
 
     #[test]

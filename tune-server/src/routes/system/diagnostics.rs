@@ -11,6 +11,19 @@ use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
 
+/// Number of recent log lines embedded in a bug report (kept modest so the
+/// forum thread stays readable; the "Export logs" button has the full tail).
+const BUG_REPORT_LOG_LINES: usize = 200;
+
+/// Public bug-intake endpoint on the community site. It creates a *moderated*
+/// (pending) forum thread server-side with the site's own credentials — the
+/// distributed Tune server never holds a forum admin token. Same
+/// `/api/v1/community/*` family as the DAC-profile / covers endpoints.
+const BUG_REPORT_SUBMIT_URL: &str = "https://mozaiklabs.fr/api/v1/community/bug-report";
+
+/// The community endpoint caps the thread body at 50k chars; keep headroom.
+const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
+
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::with_backend(state.backend.clone())
         .count()
@@ -22,7 +35,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        migrations::current_version(&state.db).unwrap_or(0)
+        state
+            .db
+            .as_ref()
+            .and_then(|db| migrations::current_version(db).ok())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -35,9 +52,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
 
     // Discovered devices grouped by type
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
     let mut devices_by_type: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for d in &devices {
@@ -53,7 +69,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     drop(registry);
 
     // Audio outputs
-    let audio_backend_pref = &state.config.local_audio_backend;
+    let audio_backend_pref = &state.display_audio_backend();
     let (audio_outputs, audio_backend_name, asio_avail) = {
         #[cfg(feature = "local-audio")]
         {
@@ -177,7 +193,7 @@ pub(super) async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Va
 }
 
 pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
@@ -242,9 +258,62 @@ pub(super) struct LogsQuery {
     lines: Option<usize>,
 }
 
-pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    let max_lines = q.lines.unwrap_or(1000);
+/// Bounded tail window for `/system/logs`. 2 MiB comfortably covers the
+/// default 1000 lines while keeping the read bounded regardless of how large
+/// the append-only log has grown (rotation only runs at startup, so a
+/// long-running server's file can reach hundreds of MB).
+const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
+#[derive(Debug)]
+enum LogTailError {
+    /// No file at the path — fall through to journalctl/syslog fallbacks.
+    Missing,
+    /// The file exists but reading it failed — surfaced as such instead of
+    /// the misleading "No log file found".
+    Unreadable(String),
+}
+
+fn read_log_tail(
+    log_path: &str,
+    max_lines: usize,
+    tail_bytes: u64,
+) -> Result<Vec<String>, LogTailError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match std::fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LogTailError::Missing),
+        Err(e) => return Err(LogTailError::Unreadable(e.to_string())),
+    };
+    let unreadable = |e: std::io::Error| LogTailError::Unreadable(e.to_string());
+    let len = f.metadata().map_err(unreadable)?.len();
+    let start = len.saturating_sub(tail_bytes);
+    f.seek(SeekFrom::Start(start)).map_err(unreadable)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).map_err(unreadable)?;
+
+    let text = String::from_utf8_lossy(&buf);
+    // If we started mid-file the first line is likely truncated — drop it.
+    let body = if start > 0 {
+        text.find('\n').map(|nl| &text[nl + 1..]).unwrap_or("")
+    } else {
+        &text
+    };
+
+    let lines: Vec<&str> = body.lines().rev().take(max_lines).collect();
+    Ok(lines.into_iter().rev().map(str::to_string).collect())
+}
+
+pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
+    collect_recent_logs(q.lines.unwrap_or(1000)).await
+}
+
+/// Collect the most recent server logs (tail): log file first, then
+/// journalctl/syslog (Linux) or stderr files / unified log (macOS). Returns a
+/// `Json<Value>` with `logs`/`lines`/`source`. Shared by the `/logs` endpoint
+/// and the bug report so both surface identical output. Async because the tail
+/// read runs on a blocking pool (spawn_blocking) to keep off the Tokio runtime.
+pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // Try the server's own log file first — same path the writer uses (main),
     // resolved via the shared helper so reader and writer always agree. This is
     // what makes "Export logs" work on Linux under Docker / a bare terminal,
@@ -253,16 +322,37 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         .to_string_lossy()
         .into_owned();
 
-    // Try reading log file
-    if let Ok(content) = std::fs::read_to_string(&log_path) {
-        let lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
-        let lines: Vec<&str> = lines.into_iter().rev().collect();
-        return Json(json!({
-            "logs": lines.join("\n"),
-            "lines": lines.len(),
-            "source": "file",
-            "path": log_path,
-        }));
+    // Read only a bounded tail, off the async runtime. Reading the whole file
+    // with read_to_string both blocked a Tokio worker (same trap as
+    // admin_errors, #1096) and could fail outright on a low-RAM box once the
+    // file had grown large — and that failure fell through to the misleading
+    // "No log file found" fallback, exporting an empty log (Yacine, DS418j
+    // 1 GB RAM).
+    {
+        let path = log_path.clone();
+        let tail =
+            tokio::task::spawn_blocking(move || read_log_tail(&path, max_lines, LOG_TAIL_BYTES))
+                .await;
+        match tail {
+            Ok(Ok(lines)) => {
+                return Json(json!({
+                    "logs": lines.join("\n"),
+                    "lines": lines.len(),
+                    "source": "file",
+                    "path": log_path,
+                }));
+            }
+            Ok(Err(LogTailError::Unreadable(e))) => {
+                return Json(json!({
+                    "logs": format!("Log file exists but could not be read: {e}\nPath: {log_path}"),
+                    "lines": 0,
+                    "source": "file_unreadable",
+                    "path": log_path,
+                }));
+            }
+            // Missing file or a cancelled blocking task: try the fallbacks.
+            Ok(Err(LogTailError::Missing)) | Err(_) => {}
+        }
     }
 
     // Try journalctl on Linux (multiple service names)
@@ -436,6 +526,7 @@ pub(super) async fn get_log_level(State(state): State<AppState>) -> Json<Value> 
 }
 
 pub(super) async fn set_log_level(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<LogLevelBody>,
 ) -> Json<Value> {
@@ -475,7 +566,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
     let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
-        migrations::current_version(&state.db).unwrap_or(0)
+        state
+            .db
+            .as_ref()
+            .and_then(|db| migrations::current_version(db).ok())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -503,9 +598,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     drop(registry);
 
     // Discovered devices
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
-    drop(scanner);
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);
@@ -647,6 +741,23 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Engine: sqlite\n"));
     md.push_str(&format!("- Migration version: {db_version}\n"));
 
+    // Recent logs (tail) — the single most useful part of a bug report. Reuses
+    // the same collector as the /logs endpoint so the report matches what the
+    // "Export logs" button shows.
+    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_LINES).await;
+    let log_text = logs_json["logs"].as_str().unwrap_or("").trim();
+    let log_source = logs_json["source"].as_str().unwrap_or("none");
+    md.push_str(&format!(
+        "\n## Recent Logs (last {BUG_REPORT_LOG_LINES} lines, source: {log_source})\n"
+    ));
+    if log_text.is_empty() {
+        md.push_str("_No logs available._\n");
+    } else {
+        md.push_str("```\n");
+        md.push_str(log_text);
+        md.push_str("\n```\n");
+    }
+
     Json(json!({
         "version": tune_core::version(),
         "engine": "rust",
@@ -699,6 +810,133 @@ pub(super) async fn bug_report_markdown(
         )],
         md,
     )
+}
+
+#[derive(Deserialize)]
+pub(super) struct BugReportSubmitBody {
+    #[serde(default)]
+    description: String,
+}
+
+/// POST /system/bug-report/submit — build the local bug report (diagnostics +
+/// recent logs), prepend the user's free-text description, and forward it to the
+/// mozaiklabs.fr community bug endpoint, which creates a *moderated* (pending)
+/// `bug` forum thread with its own credentials and returns the public URL. Done
+/// server-to-server (this Rust process, not the browser) so it dodges the cloud's
+/// CORS origin allow-list and can attach the instance id / version / OS the
+/// browser doesn't have. The distributed server never holds a forum admin token.
+pub(super) async fn submit_bug_report(
+    State(state): State<AppState>,
+    Json(body): Json<BugReportSubmitBody>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+
+    let description = body.description.trim().to_string();
+
+    // Build the diagnostics + logs report (same content as the preview/markdown).
+    let backend = state.backend.clone();
+    let Json(report) = generate_bug_report(State(state)).await;
+    let report_md = report["markdown"].as_str().unwrap_or("").to_string();
+    if report_md.trim().is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "empty bug report" })),
+        );
+    }
+
+    // Compose the thread body: the user's own words first, then diagnostics.
+    let full_markdown = if description.is_empty() {
+        report_md
+    } else {
+        format!("{description}\n\n---\n\n{report_md}")
+    };
+
+    let version = tune_core::version();
+    let platform = std::env::consts::OS;
+
+    // Title: first non-empty line of the description, else a generic one.
+    let title = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| format!("Bug: {}", l.chars().take(80).collect::<String>()))
+        .unwrap_or_else(|| format!("Bug report — Tune {version} ({platform})"));
+
+    // The site caps the body at 50k chars — truncate the tail (oldest logs) if
+    // the report runs long rather than getting rejected wholesale.
+    let body_md = if full_markdown.chars().count() > BUG_REPORT_MAX_BODY_CHARS {
+        let kept: String = full_markdown
+            .chars()
+            .take(BUG_REPORT_MAX_BODY_CHARS)
+            .collect();
+        format!("{kept}\n\n_…report truncated…_")
+    } else {
+        full_markdown
+    };
+
+    let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    // Contract of the community bug-report endpoint: { title?, body, os?, version?, instance_id? }.
+    let payload = json!({
+        "title": title,
+        "body": body_md,
+        "os": platform,
+        "version": version,
+        "instance_id": instance_id,
+    });
+
+    let client = match tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("http client: {e}") })),
+            );
+        }
+    };
+
+    match client
+        .post(BUG_REPORT_SUBMIT_URL)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            // Site responds { status, thread: { id, slug, url } }.
+            let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            let thread = &data["thread"];
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "url": thread.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                    "slug": thread.get("slug").and_then(|v| v.as_str()).unwrap_or(""),
+                })),
+            )
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            tracing::warn!(status, "bug_report_submit_rejected");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "cloud rejected the report", "status": status })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "bug_report_submit_failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("could not reach the bug service: {e}") })),
+            )
+        }
+    }
 }
 
 pub(super) async fn audio_check() -> Json<Value> {
@@ -1021,5 +1259,48 @@ pub(super) async fn asio_devices(State(_state): State<AppState>) -> Json<Value> 
             "asio_available": false,
             "count": 0,
         }))
+    }
+}
+
+#[cfg(test)]
+mod log_tail_tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_is_missing_not_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.log");
+        match read_log_tail(path.to_str().unwrap(), 10, 1024) {
+            Err(LogTailError::Missing) => {}
+            _ => panic!("expected Missing"),
+        }
+    }
+
+    #[test]
+    fn tail_window_drops_truncated_first_line_and_caps_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        let content: String = (0..100).map(|i| format!("line-{i:03}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        // Window smaller than the file: starts mid-file, first partial line dropped.
+        let lines = read_log_tail(path.to_str().unwrap(), 1000, 95).unwrap();
+        assert!(lines.len() < 100);
+        assert_eq!(lines.last().unwrap(), "line-099");
+        // Every returned line is complete.
+        assert!(lines.iter().all(|l| l.starts_with("line-")));
+
+        // max_lines caps the result at the newest lines.
+        let lines = read_log_tail(path.to_str().unwrap(), 3, u64::MAX).unwrap();
+        assert_eq!(lines, ["line-097", "line-098", "line-099"]);
+    }
+
+    #[test]
+    fn whole_file_when_window_is_larger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.log");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let lines = read_log_tail(path.to_str().unwrap(), 1000, 1024).unwrap();
+        assert_eq!(lines, ["a", "b"]);
     }
 }

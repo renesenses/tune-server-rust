@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
+use crate::routes::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -59,6 +61,17 @@ pub fn router() -> Router<AppState> {
         .route("/preview", post(preview_albums))
 }
 
+/// Normalize a stored `sort_order` value to the bare `asc`/`desc` the
+/// SortOrder enum expects. The tune-core save path stores it JSON-encoded
+/// (`"asc"` with quotes) while this route's save path stores it raw (`asc`);
+/// stripping surrounding quotes tolerates both, avoiding the compile error
+/// `unknown variant "asc", expected asc or desc`.
+fn normalize_sort_order(raw: Option<String>) -> String {
+    raw.map(|s| s.trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "asc".into())
+}
+
 /// Decode a row from `smart_collections` into a JSON object.
 /// Column order: id(0), name(1), rules(2), match_mode(3), sort_by(4),
 /// sort_order(5), max_limit(6), description(7), icon(8), color(9), created_at(10).
@@ -74,7 +87,7 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
         "rules": rules,
         "match_mode": r.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
         "sort_by": r.get(4).and_then(|v| v.as_string()),
-        "sort_order": r.get(5).and_then(|v| v.as_string()).unwrap_or_else(|| "asc".into()),
+        "sort_order": normalize_sort_order(r.get(5).and_then(|v| v.as_string())),
         "max_limit": r.get(6).and_then(|v| v.as_i64()),
         "description": r.get(7).and_then(|v| v.as_string()),
         "icon": r.get(8).and_then(|v| v.as_string()),
@@ -83,7 +96,10 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     })
 }
 
-async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn list_collections(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+) -> Result<Json<Value>, AppError> {
     let rows = state
         .backend
         .query_many(
@@ -94,6 +110,8 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
         )
         .map_err(AppError::internal)?;
 
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -114,7 +132,7 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
             let sort_by = col["sort_by"].as_str().unwrap_or("title");
             let sort_order = col["sort_order"].as_str().unwrap_or("asc");
             let (where_clause, _order, _limit) =
-                build_album_query(&rules_str, match_mode, sort_by, sort_order, None);
+                build_album_query(&rules_str, match_mode, sort_by, sort_order, None, &ctx);
 
             let album_count_sql = format!(
                 "SELECT COUNT(DISTINCT al.id) FROM albums al \
@@ -157,9 +175,20 @@ async fn create_collection(
     let sort_by = body.sort_by.clone();
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
-    state
+    // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
+    let resolver = DbRefResolver::new(&state);
+    smart_refs::check_no_cycle(
+        &resolver,
+        RefKind::SmartCollection,
+        None,
+        &body.name,
+        &rules_json,
+    )
+    .map_err(AppError::bad_request)?;
+
+    let id = state
         .backend
-        .execute(
+        .execute_returning_id(
             "INSERT INTO smart_collections \
          (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -176,8 +205,6 @@ async fn create_collection(
             ],
         )
         .map_err(AppError::internal)?;
-
-    let id = state.backend.last_insert_rowid();
 
     let created = json!({
         "id": id,
@@ -219,6 +246,27 @@ async fn update_collection(
     Path(id): Path<i64>,
     Json(body): Json<UpdateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Refuse les références circulaires avant d'écrire quoi que ce soit.
+    if let Some(ref rules) = body.rules {
+        let self_name = body
+            .name
+            .clone()
+            .or_else(|| {
+                DbRefResolver::new(&state)
+                    .smart_entity(RefKind::SmartCollection, id)
+                    .map(|e| e.name)
+            })
+            .unwrap_or_else(|| format!("#{id}"));
+        let resolver = DbRefResolver::new(&state);
+        smart_refs::check_no_cycle(
+            &resolver,
+            RefKind::SmartCollection,
+            Some(id),
+            &self_name,
+            &rules.to_string(),
+        )
+        .map_err(AppError::bad_request)?;
+    }
     if let Some(ref name) = body.name {
         state.backend.execute(
             "UPDATE smart_collections SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
@@ -307,20 +355,35 @@ async fn delete_collection(
 }
 
 fn resolve_timestamp_sql(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix("now-") {
-        let days: i64 = rest.trim_end_matches('d').parse().unwrap_or(30);
+    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
+    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
+    // through to a literal string ('90d') that no date ever compares against.
+    let rest = input.strip_prefix("now-").unwrap_or(input);
+    let digits = rest.strip_suffix('d').unwrap_or(rest);
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        let days: i64 = digits.parse().unwrap_or(30);
         return format!("DATETIME('now', '-{days} days')");
     }
     format!("'{}'", input.replace('\'', "''"))
 }
 
 /// Build WHERE, ORDER, LIMIT clauses from smart collection criteria (album-level).
-fn build_album_query(
+///
+/// This is THE smart-collection rule engine: the list/albums/preview endpoints,
+/// the Oxygen `collection` facet and `/library/tracks?collection=` all go
+/// through it, so a collection always counts and filters the same set
+/// everywhere. (The legacy `SmartCollection::compile_sql` in tune-core diverged
+/// — raw `any` match_mode read as ALL, `added_at`/`rating`/`play_count` hit
+/// phantom `tracks` columns, unknown fields fell back to `t.title` — which made
+/// whole collections vanish from the facet or count the entire library.)
+/// The WHERE references aliases `al` (albums), `ar` (artists), `t` (tracks).
+pub(crate) fn build_album_query(
     rules_json: &str,
     match_mode: &str,
     sort_by: &str,
     sort_order: &str,
     max_limit: Option<i64>,
+    ctx: &RefCtx,
 ) -> (String, String, String) {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
 
@@ -339,6 +402,9 @@ fn build_album_query(
             ">" | "gt" => ">",
             "<=" | "lte" | "less_than" | "less_equal" => "<=",
             "<" | "lt" => "<",
+            // tune-core seed/editor spelling — same semantics as is_null.
+            "is_empty" | "empty" => "is_null",
+            "is_not_empty" | "not_empty" => "is_not_null",
             other => other,
         };
         let value_raw = rule.get("value");
@@ -350,6 +416,12 @@ fn build_album_query(
             })
             .unwrap_or_default();
         let esc = value.replace('\'', "''");
+
+        // --- règles « référence » (collection / playlist / favori) ---
+        if smart_refs::is_ref_field(field) {
+            conditions.push(smart_refs::album_ref_condition(field, op, &value, ctx));
+            continue;
+        }
 
         // --- credit rules use a subquery, handle separately ---
         if field == "credit" {
@@ -401,14 +473,18 @@ fn build_album_query(
         // --- added_at / last_played_at use timestamp logic ---
         if field == "added_at" {
             let ts = resolve_timestamp_sql(&value);
+            // NB: "greater_than"/"less_than" normalize to ">="/"<=" above, so
+            // both spellings must be matched here — the seeded "🆕 Récents"
+            // (added_at greater_than 90d) used to fall through `_ => continue`,
+            // dropping its only rule and matching the ENTIRE library.
             let cond = match op {
-                ">" => format!(
+                ">" | ">=" => format!(
                     "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') > {ts})"
+                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
                 ),
-                "<" => format!(
+                "<" | "<=" => format!(
                     "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') < {ts})"
+                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
                 ),
                 "between" => {
                     if let Some(arr) = value_raw.and_then(|v| v.as_array()) {
@@ -457,20 +533,20 @@ fn build_album_query(
                      JOIN listen_history lh ON lh.track_id = t3.id \
                      GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
                 ),
-                ("last_played_at", ">") => {
+                ("last_played_at", ">" | ">=") => {
                     let ts = resolve_timestamp_sql(&value);
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
                          JOIN listen_history lh ON lh.track_id = t3.id \
-                         WHERE lh.listened_at > {ts} GROUP BY t3.album_id)"
+                         WHERE lh.listened_at {op} {ts} GROUP BY t3.album_id)"
                     )
                 }
-                ("last_played_at", "<") => {
+                ("last_played_at", "<" | "<=") => {
                     let ts = resolve_timestamp_sql(&value);
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
                          JOIN listen_history lh ON lh.track_id = t3.id \
-                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) < {ts})"
+                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
                     )
                 }
                 ("last_played_at", "is_null") => format!(
@@ -685,6 +761,7 @@ fn load_collection_criteria(
 
 async fn resolve_albums(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
@@ -693,8 +770,16 @@ async fn resolve_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let (where_clause, order, limit_clause) =
-        build_album_query(&rules_json, &match_mode, &sort_by, &sort_order, max_limit);
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let (where_clause, order, limit_clause) = build_album_query(
+        &rules_json,
+        &match_mode,
+        &sort_by,
+        &sort_order,
+        max_limit,
+        &ctx,
+    );
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
 
     // Return a bare array, matching the regular collections endpoint
@@ -708,6 +793,7 @@ async fn resolve_albums(
 
 async fn preview_albums(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
     let rules_json = body.rules.to_string();
@@ -715,9 +801,137 @@ async fn preview_albums(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let (where_clause, order, limit_clause) =
-        build_album_query(&rules_json, match_mode, sort_by, sort_order, body.max_limit);
+    let resolver = DbRefResolver::new(&state);
+    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let (where_clause, order, limit_clause) = build_album_query(
+        &rules_json,
+        match_mode,
+        sort_by,
+        sort_order,
+        body.max_limit,
+        &ctx,
+    );
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_album_query, normalize_sort_order, resolve_timestamp_sql};
+    use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+
+    #[test]
+    fn resolve_timestamp_relative_forms() {
+        // "now-Nd" (editor form) and bare "Nd" (seeded "🆕 Récents") are both
+        // N-days-ago; anything else stays a quoted literal.
+        assert_eq!(
+            resolve_timestamp_sql("now-30d"),
+            "DATETIME('now', '-30 days')"
+        );
+        assert_eq!(resolve_timestamp_sql("90d"), "DATETIME('now', '-90 days')");
+        assert_eq!(resolve_timestamp_sql("90"), "DATETIME('now', '-90 days')");
+        assert_eq!(resolve_timestamp_sql("2024-01-01"), "'2024-01-01'");
+    }
+
+    #[test]
+    fn added_at_greater_than_compiles_instead_of_matching_everything() {
+        // Seeded "🆕 Récents": greater_than normalizes to ">=", which the
+        // added_at branch used to drop entirely — empty WHERE — so the
+        // collection counted the ENTIRE library.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            where_clause.contains("DATETIME('now', '-90 days')"),
+            "added_at rule must compile: {where_clause}"
+        );
+        assert!(where_clause.contains(">="));
+    }
+
+    #[test]
+    fn is_not_empty_alias_compiles() {
+        // tune-core spelling ("is_not_empty") used to be dropped — the seeded
+        // "🖼️ Sans pochette" placeholder rule then matched the whole library.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"cover_path","operator":"is_empty","value":""}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            where_clause.contains("al.cover_path IS NULL"),
+            "is_empty alias must compile: {where_clause}"
+        );
+
+        let rules = r#"[{"field":"format","operator":"is_not_empty","value":""}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(where_clause.contains("t.format IS NOT NULL"));
+    }
+
+    #[test]
+    fn any_mode_joins_with_or() {
+        // Raw 'any' from the seed rows (unquoted in DB) must keep OR semantics;
+        // the legacy tune-core engine silently fell back to ALL.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"genre","operator":"contains","value":"soul"},
+                        {"field":"genre","operator":"contains","value":"funk"}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "any", "title", "asc", None, &ctx);
+        assert!(where_clause.contains(" OR "), "{where_clause}");
+        assert!(!where_clause.contains(" AND "));
+    }
+
+    #[test]
+    fn artist_name_field_compiles() {
+        // Web-editor rules use field "artist_name" and op "=" (Coltrane); the
+        // legacy engine fell back to t.title and matched nothing.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"artist_name","op":"=","value":"John Coltrane"}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "random", "desc", None, &ctx);
+        assert!(
+            where_clause.contains("LOWER(ar.name) = LOWER('John Coltrane')"),
+            "{where_clause}"
+        );
+    }
+
+    #[test]
+    fn favorite_rule_flows_into_album_where_clause() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(2));
+        let (w, _o, _l) = build_album_query(
+            r#"[{"field":"favorite","op":"is","value":"album"}]"#,
+            "all",
+            "title",
+            "asc",
+            None,
+            &ctx,
+        );
+        assert!(w.contains("favorites"), "{w}");
+        assert!(w.contains("profile_id = 2"), "{w}");
+    }
+
+    #[test]
+    fn ref_rule_combines_with_classic_rule() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let (w, _o, _l) = build_album_query(
+            r#"[{"field":"genre","op":"contains","value":"Jazz"},
+                {"field":"in_playlist","op":"in","value":"classic:4"}]"#,
+            "all",
+            "title",
+            "asc",
+            None,
+            &ctx,
+        );
+        assert!(w.contains(" AND "), "{w}");
+        assert!(w.contains("playlist_tracks"), "{w}");
+    }
+
+    #[test]
+    fn normalize_sort_order_tolerates_encodings() {
+        // Raw form (this route's save path).
+        assert_eq!(normalize_sort_order(Some("asc".into())), "asc");
+        assert_eq!(normalize_sort_order(Some("desc".into())), "desc");
+        // Legacy JSON-encoded form (tune-core save path) — the bug source.
+        assert_eq!(normalize_sort_order(Some("\"asc\"".into())), "asc");
+        assert_eq!(normalize_sort_order(Some("\"desc\"".into())), "desc");
+        // Missing / empty -> default.
+        assert_eq!(normalize_sort_order(None), "asc");
+        assert_eq!(normalize_sort_order(Some(String::new())), "asc");
+    }
 }

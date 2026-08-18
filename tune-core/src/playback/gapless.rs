@@ -105,6 +105,9 @@ impl GaplessHandler {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        // A staged queue item is a finite track: only the live
+                        // and proxy paths have an upstream URL to carry.
+                        origin_url: None,
                     };
                     match out.set_next_media(&media).await {
                         Ok(()) => {

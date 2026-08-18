@@ -41,6 +41,18 @@ fn since_days_sql(engine: Engine, column: &str, days: i64) -> String {
 // Generate from natural language prompt
 // ---------------------------------------------------------------------------
 
+/// Pick the longest library artist name that appears in the (already lowercased)
+/// prompt, so "tracks by serge lama" resolves to the artist "Serge Lama" and the
+/// longest match wins (avoids a short name shadowing a specific one). Names under
+/// 3 chars are skipped to avoid spurious substring hits. (#699)
+fn pick_artist_from_prompt(prompt_lc: &str, artist_names: &[String]) -> Option<String> {
+    artist_names
+        .iter()
+        .filter(|name| name.len() >= 3 && prompt_lc.contains(&name.to_lowercase()))
+        .max_by_key(|name| name.len())
+        .cloned()
+}
+
 #[derive(Deserialize)]
 struct GenerateRequest {
     prompt: String,
@@ -81,6 +93,8 @@ async fn generate_smart_playlist(
         ("disco", "disco"),
         ("latin", "latin"),
         ("world", "world"),
+        ("chanson", "chanson"),
+        ("variété", "variété"),
     ];
 
     for (keyword, genre) in &genre_keywords {
@@ -150,13 +164,30 @@ async fn generate_smart_playlist(
         conditions.push("(t.sample_rate > 48000 OR t.bit_depth > 16)".into());
     }
 
-    let where_clause = if conditions.is_empty() {
-        String::new()
+    // Match a library artist named in the prompt (e.g. "tracks by Serge Lama").
+    // The keyword table above only recognises genres/moods/decades, so a query
+    // naming an artist matched nothing and fell through to `ORDER BY RANDOM()`,
+    // returning unrelated tracks (FabienM, #699). Bound as a parameter — the
+    // prompt is user input, unlike the hardcoded genre fragments above.
+    let artist_names: Vec<String> = state
+        .backend
+        .query_many("SELECT name FROM artists", &[])
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+        .collect();
+    let artist_filter = pick_artist_from_prompt(&prompt, &artist_names);
+
+    // Placeholders: the artist (if matched) binds as $1 and LIMIT follows.
+    let (where_clause, limit_ph) = if artist_filter.is_some() {
+        conditions.push(format!("LOWER(ar.name) = LOWER({})", ph(engine, 1)));
+        (format!("WHERE {}", conditions.join(" AND ")), ph(engine, 2))
+    } else if conditions.is_empty() {
+        (String::new(), ph(engine, 1))
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        (format!("WHERE {}", conditions.join(" AND ")), ph(engine, 1))
     };
 
-    let p1 = ph(engine, 1);
     let sql = format!(
         "SELECT t.id, t.title, ar.name, al.title, CAST(t.duration_ms AS BIGINT), \
          t.genre, t.year, CAST(t.bpm AS float8), al.cover_path, t.format \
@@ -165,13 +196,15 @@ async fn generate_smart_playlist(
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          {where_clause} \
          ORDER BY {order_by} \
-         LIMIT {p1}",
+         LIMIT {limit_ph}",
     );
 
-    let rows = state
-        .backend
-        .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+    let mut params: Vec<&dyn ToSqlValue> = Vec::new();
+    if let Some(ref artist) = artist_filter {
+        params.push(artist as &dyn ToSqlValue);
+    }
+    params.push(&limit as &dyn ToSqlValue);
+    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -928,5 +961,50 @@ fn capitalize(s: &str) -> String {
     match c.next() {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names() -> Vec<String> {
+        ["Serge Lama", "Serge Gainsbourg", "Lama", "U2", "Air"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn picks_the_named_artist_from_prompt_699() {
+        // "tracks by serge lama" must resolve to the correctly-tagged artist
+        // instead of falling through to random tracks (#699).
+        assert_eq!(
+            pick_artist_from_prompt("tracks by serge lama", &names()).as_deref(),
+            Some("Serge Lama")
+        );
+    }
+
+    #[test]
+    fn prefers_the_longest_match() {
+        // "serge lama" contains "lama" too — the longer, more specific name wins.
+        assert_eq!(
+            pick_artist_from_prompt("serge lama live", &names()).as_deref(),
+            Some("Serge Lama")
+        );
+    }
+
+    #[test]
+    fn no_artist_in_prompt_returns_none() {
+        assert_eq!(
+            pick_artist_from_prompt("relaxing jazz for the evening", &names()),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_names_under_three_chars() {
+        // "U2" (2 chars) must not match on an incidental "u2" substring.
+        assert_eq!(pick_artist_from_prompt("music from u2 era", &names()), None);
     }
 }

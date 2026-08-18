@@ -275,11 +275,24 @@ async fn apply_profile_handler(
         )
         .map_err(AppError::internal)?;
 
+    // Persister ne suffit pas : sans ceci la correction n'atteint le son qu'a
+    // la piste SUIVANTE sur une zone locale, alors que la reponse annonce deja
+    // `applied: true` (#1725). Une correction de piece se juge a l'oreille,
+    // musique en cours — c'est le geste meme qu'on attend de l'utilisateur.
+    // `zone_id` est textuel sur cette route ; l'orchestrateur indexe par i64.
+    let applique_a_chaud = match zone_id.parse::<i64>() {
+        Ok(id) => state.orchestrator.refresh_zone_eq(id).await,
+        Err(_) => false,
+    };
+
     Ok(Json(json!({
         "applied": true,
         "zone_id": zone_id,
         "profile_name": profile.name,
         "filter_count": profile.filters.len(),
+        // `applied` dit « persiste » ; celui-ci dit « entendu maintenant ».
+        // Faux ne signale pas un echec : rien ne joue, zone non locale, PURE.
+        "applied_live": applique_a_chaud,
     }))
     .into_response())
 }
@@ -303,14 +316,9 @@ async fn upload_ir_handler(
     };
 
     let device_id = zone.output_device_id.unwrap_or_default();
-    if !device_id.starts_with("local:") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "FIR convolution only available on local outputs"})),
-        )
-            .into_response();
-    }
+    let is_local = device_id.starts_with("local:");
 
+    // Persist the IR to disk.
     let ir_dir =
         std::path::PathBuf::from(std::env::var("TUNE_DATA_DIR").unwrap_or_else(|_| ".".into()))
             .join("ir");
@@ -323,28 +331,28 @@ async fn upload_ir_handler(
         )
             .into_response();
     }
+    let ir_path_str = ir_path.to_str().unwrap_or("").to_string();
 
+    // Store the path so the TRANSCODE path picks it up too: the orchestrator's
+    // convolver applies the FIR to the bytes served to a network renderer
+    // (DLNA/UPnP/AirPlay). Room correction is no longer local-output only.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(&format!("ir_path_{zone_id}"), &ir_path_str)
+        .ok();
+
+    // A LOCAL output additionally gets the convolver installed immediately (it
+    // runs its own real-time convolver rather than going through the transcode).
     #[cfg(feature = "local-audio")]
     {
-        let outputs = state.outputs.lock().await;
-        if let Some(output) = outputs.get(&device_id) {
-            let output = output.lock().await;
-            if let Some(local) = output
-                .as_any()
-                .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-            {
-                match local.set_convolver_ir(ir_path.to_str().unwrap_or("")) {
-                    Ok(()) => {
-                        let settings = SettingsRepo::with_backend(state.backend.clone());
-                        settings
-                            .set(
-                                &format!("ir_path_{zone_id}"),
-                                ir_path.to_str().unwrap_or(""),
-                            )
-                            .ok();
-                        return Json(json!({"ok": true, "zone_id": zone_id, "ir_path": ir_path.display().to_string(), "size_bytes": body.len()})).into_response();
-                    }
-                    Err(e) => {
+        if is_local {
+            let outputs = state.outputs.lock().await;
+            if let Some(output) = outputs.get(&device_id) {
+                let output = output.lock().await;
+                if let Some(local) = output
+                    .as_any()
+                    .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                {
+                    if let Err(e) = local.set_convolver_ir(&ir_path_str) {
                         return (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
                             .into_response();
                     }
@@ -352,11 +360,15 @@ async fn upload_ir_handler(
             }
         }
     }
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": "local output not found for this zone"})),
-    )
-        .into_response()
+
+    Json(json!({
+        "ok": true,
+        "zone_id": zone_id,
+        "ir_path": ir_path_str,
+        "size_bytes": body.len(),
+        "applies_to": if is_local { "local" } else { "network (transcode)" },
+    }))
+    .into_response()
 }
 
 /// `POST /room-correction/ir/clear/{zone_id}` — remove FIR convolution
@@ -377,28 +389,35 @@ async fn clear_ir_handler(
     };
 
     let device_id = zone.output_device_id.unwrap_or_default();
+
+    // Drop the stored path (network/transcode) + the file for any zone.
+    SettingsRepo::with_backend(state.backend.clone())
+        .delete(&format!("ir_path_{zone_id}"))
+        .ok();
+    let ir_path =
+        std::path::PathBuf::from(std::env::var("TUNE_DATA_DIR").unwrap_or_else(|_| ".".into()))
+            .join("ir")
+            .join(format!("zone_{zone_id}.wav"));
+    std::fs::remove_file(&ir_path).ok();
+
+    // A local output also drops its live convolver.
     #[cfg(feature = "local-audio")]
     {
-        let outputs = state.outputs.lock().await;
-        if let Some(output) = outputs.get(&device_id) {
-            let output = output.lock().await;
-            if let Some(local) = output
-                .as_any()
-                .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-            {
-                local.clear_convolver();
-                let settings = SettingsRepo::with_backend(state.backend.clone());
-                settings.delete(&format!("ir_path_{zone_id}")).ok();
-                return Json(json!({"ok": true, "zone_id": zone_id})).into_response();
+        if device_id.starts_with("local:") {
+            let outputs = state.outputs.lock().await;
+            if let Some(output) = outputs.get(&device_id) {
+                let output = output.lock().await;
+                if let Some(local) = output
+                    .as_any()
+                    .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                {
+                    local.clear_convolver();
+                }
             }
         }
     }
-    let _ = device_id;
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": "local output not found"})),
-    )
-        .into_response()
+    let _ = &device_id;
+    Json(json!({"ok": true, "zone_id": zone_id})).into_response()
 }
 
 /// `GET /room-correction/ir/status/{zone_id}` — check if FIR is active
@@ -413,26 +432,34 @@ async fn ir_status_handler(
     };
 
     let device_id = zone.output_device_id.unwrap_or_default();
+    let ir_path = SettingsRepo::with_backend(state.backend.clone())
+        .get(&format!("ir_path_{zone_id}"))
+        .ok()
+        .flatten();
+    let has_setting = ir_path.as_deref().map(|p| !p.is_empty()).unwrap_or(false);
+
+    // Local outputs run a live convolver; a network zone applies the IR on the
+    // transcode path, so the stored path is the source of truth there.
     #[cfg(feature = "local-audio")]
     {
-        let outputs = state.outputs.lock().await;
-        if let Some(output) = outputs.get(&device_id) {
-            let output = output.lock().await;
-            if let Some(local) = output
-                .as_any()
-                .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-            {
-                let settings = SettingsRepo::with_backend(state.backend.clone());
-                let ir_path = settings.get(&format!("ir_path_{zone_id}")).ok().flatten();
-                return Json(json!({
-                    "active": local.has_convolver(),
-                    "zone_id": zone_id,
-                    "ir_path": ir_path,
-                }))
-                .into_response();
+        if device_id.starts_with("local:") {
+            let outputs = state.outputs.lock().await;
+            if let Some(output) = outputs.get(&device_id) {
+                let output = output.lock().await;
+                if let Some(local) = output
+                    .as_any()
+                    .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                {
+                    return Json(json!({
+                        "active": local.has_convolver() || has_setting,
+                        "zone_id": zone_id,
+                        "ir_path": ir_path,
+                    }))
+                    .into_response();
+                }
             }
         }
     }
-    let _ = device_id;
-    Json(json!({"active": false, "zone_id": zone_id})).into_response()
+    let _ = &device_id;
+    Json(json!({"active": has_setting, "zone_id": zone_id, "ir_path": ir_path})).into_response()
 }

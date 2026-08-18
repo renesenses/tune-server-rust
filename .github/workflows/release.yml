@@ -19,17 +19,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
+          # The web client mirrors the server's branch topology: RC tags
+          # (v*-rc*) build from tune-web-client's release/v0.9 (0.9.x); stable
+          # v0.8.x tags build from its main. Keeps the two version lines apart.
+          ref: ${{ contains(github.ref_name, '-rc') && 'release/v0.9' || 'main' }}
       - name: Verify web-client version matches release tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # Compare the base X.Y.Z only: a pre-release tag (v0.9.0-rc1) ships the
+          # 0.9.0 web client — bump-all.sh keeps package.json at plain X.Y.Z, the
+          # -rcN suffix lives on the git tag alone.
+          TAG_BASE="${TAG_VERSION%%-*}"
           WEB_VERSION="$(grep -m1 '"version"' package.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-          if [ "$TAG_VERSION" != "$WEB_VERSION" ]; then
-            echo "::error::tune-web-client package.json is $WEB_VERSION but the release tag is $TAG_VERSION."
+          if [ "$TAG_BASE" != "$WEB_VERSION" ]; then
+            echo "::error::tune-web-client package.json is $WEB_VERSION but the release tag base is $TAG_BASE."
             echo "::error::Push the tune-web-client version bump to main BEFORE tagging the server, then re-run this release."
             exit 1
           fi
-          echo "web-client version $WEB_VERSION matches release tag $TAG_VERSION"
+          echo "web-client version $WEB_VERSION matches release tag base $TAG_BASE"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -58,7 +66,7 @@ jobs:
             platform: linux-aarch64
             ext: tar.gz
             cross: true
-            features: oaat,postgres
+            features: oaat,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -68,7 +76,7 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            features: oaat
+            features: oaat,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -85,6 +93,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       ARTIFACT: tune-server-${{ github.ref_name }}-${{ matrix.platform }}
+      # Exposé au niveau du job pour être lisible depuis un `if:` d'étape : le
+      # contexte `secrets` n'y est pas disponible, et un `env:` défini DANS une
+      # étape ne l'est pas non plus pour son propre `if:`.
+      WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -95,6 +107,12 @@ jobs:
         with:
           key: release-${{ matrix.os }}-${{ matrix.target }}
 
+      # C'est ICI que web/ apparaît, et nulle part ailleurs : le dossier n'est
+      # plus commité (#1690). Tout ce que les étapes suivantes empaquettent
+      # sous web/ vient donc du job web-client, c'est-à-dire de
+      # tune-web-client. Tant que la copie périmée était versionnée, ses
+      # bundles survivaient à ce téléchargement (noms hachés différents) et
+      # partaient dans chaque artefact à côté des vrais.
       - uses: actions/download-artifact@v4
         with:
           name: web-client
@@ -108,9 +126,65 @@ jobs:
         shell: bash
         run: echo "TUNE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
+      # ffmpeg minimal audio-only (#1524) : produit par ffmpeg-minimal.yml,
+      # publié sur la release `ffmpeg-minimal` du dépôt, livré à côté de
+      # tune-server pour les encodages AAC/ALAC du convertisseur. Absent →
+      # warning, pas d'échec : l'artefact part sans ffmpeg et l'endpoint
+      # /converter/capabilities grise aac/alac côté interface. Pas de build
+      # musl : un binaire gnu n'y tournerait pas (NAS à userland musl).
+      - name: Fetch bundled ffmpeg (minimal)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ffbundle"
+          if gh release download ffmpeg-minimal --repo "$GITHUB_REPOSITORY" \
+               --pattern "ffmpeg-minimal-${{ matrix.platform }}.tar.gz" \
+               --dir "$RUNNER_TEMP/ffbundle"; then
+            # tar en chemin relatif : le tar GNU de Git-Bash lit « D: » d'un
+            # chemin Windows comme un hote distant (rsh) et echoue —
+            # « Cannot connect to D: resolve failed » (vecu v0.9.71). Le cd +
+            # chemin RELATIF suffit : plus de deux-points, aucun drapeau requis.
+            # Surtout pas --force-local : le bsdtar de macOS ne le connait pas
+            # et les DEUX jobs macOS sont tombes dessus en v0.9.72.
+            (cd "$RUNNER_TEMP/ffbundle" && \
+              tar -xzf "ffmpeg-minimal-${{ matrix.platform }}.tar.gz")
+            ls -la "$RUNNER_TEMP/ffbundle"
+          else
+            echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
+          fi
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+
+      # Garde-fou #1288 : la cible musl n'a d'intérêt que si le binaire est
+      # RÉELLEMENT statique (NAS à vieille userland, Alpine ARM). Une dépendance
+      # native qui repasse en lien dynamique — comme libopus l'a fait en v0.9.53,
+      # cf Cross.toml — casse soit le link, soit le binaire à l'exécution chez
+      # l'utilisateur. `file` fonctionne en cross-arch, contrairement à `ldd`.
+      - name: Verify musl binary is statically linked
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          file -b "$BIN"
+          # Le critère qui fait foi est l'absence de dépendance partagée (NEEDED)
+          # et d'interpréteur dynamique, pas le libellé de `file` : rustc produit
+          # des binaires **static-pie** sur musl, que `file` décrit
+          # « static-pie linked » et non « statically linked ». `readelf` est
+          # indépendant de l'architecture, il lit donc l'ELF arm64 sur un runner
+          # x86_64 — contrairement à `ldd`.
+          NEEDED="$(readelf -d "$BIN" 2>/dev/null | grep NEEDED || true)"
+          INTERP="$(readelf -l "$BIN" 2>/dev/null | grep 'program interpreter' || true)"
+          if [ -n "$NEEDED" ] || [ -n "$INTERP" ]; then
+            echo "::error::Le binaire musl arm64 n'est pas statique — il dépend de bibliothèques partagées."
+            echo "$NEEDED"
+            echo "$INTERP"
+            exit 1
+          fi
+          echo "OK — binaire musl arm64 statique (aucun NEEDED, aucun interpréteur dynamique)"
 
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
@@ -118,7 +192,7 @@ jobs:
 
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -131,29 +205,217 @@ jobs:
 
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+
+      # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
+      # tune-server so AirPlay 2 works on native installs, not just Docker
+      # (#700 / Bilou #1135). Built from a pinned rev of our fork.
+      #
+      # Best-effort PER TARGET: build the real binary or ship NOTHING — never a
+      # placeholder. An empty stub would make daemon_available() return true and
+      # route AirPlay to a broken daemon instead of falling back to AirPlay 1.
+      # If the build fails (e.g. the vendored C on a given toolchain) the artifact
+      # still ships, just without AirPlay 2. Cross targets (arm64 Linux) skipped.
+      - name: Build airplay-daemon
+        if: "!matrix.cross"
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get install -y --no-install-recommends cmake clang
+          fi
+          if cargo install --git https://github.com/renesenses/airplay2-rs \
+               --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
+               airplay-daemon --target ${{ matrix.target }} \
+               --root "$RUNNER_TEMP/apd" --locked; then
+            echo "airplay-daemon built for ${{ matrix.target }}"
+          else
+            echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
+          fi
+
+      - name: Import signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm /tmp/certificate.p12
 
       - name: Package (unix)
         if: runner.os != 'Windows'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           mkdir -p package/web
           cp target/${{ matrix.target }}/release/tune-server package/
           cp -r web/* package/web/
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server web/
+          # Bundle the Party (WASM) plugin next to the tune-server binary so the
+          # plugins-wasm runtime discovers it at startup (plugins/ resolves
+          # exe-relative first). Sourced from the committed test fixture — the
+          # wasm is NOT rebuilt here.
+          mkdir -p package/plugins/party
+          cp tune-server/tests/fixtures/plugins/party/main.wasm package/plugins/party/
+          cp tune-server/tests/fixtures/plugins/party/manifest.json package/plugins/party/
+          # Bundle airplay-daemon next to tune-server if it built for this target.
+          DAEMON=""
+          if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
+            cp "$RUNNER_TEMP/apd/bin/airplay-daemon" package/
+            DAEMON="airplay-daemon"
+          fi
+          # ffmpeg minimal (#1524) : à côté de tune-server, là où resolve_tool()
+          # regarde en premier. Sa licence LGPL voyage avec lui.
+          FFMPEG=""
+          if [ -f "$RUNNER_TEMP/ffbundle/ffmpeg" ]; then
+            cp "$RUNNER_TEMP/ffbundle/ffmpeg" package/
+            chmod 755 package/ffmpeg
+            FFMPEG="ffmpeg"
+            if [ -f "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" ]; then
+              cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" package/
+              FFMPEG="$FFMPEG FFMPEG-LICENSE.txt"
+            fi
+          fi
+          # Sign the binaries that ship in the tarball (Homebrew installs these).
+          #
+          # Without this they keep the linker's ad-hoc signature, whose code
+          # identity is `tune_server-<hash of the binary>` — it changes on every
+          # build. macOS keys the Local Network permission to that identity, so
+          # every release silently revoked the user's grant and the kernel then
+          # dropped every connection to a DLNA/AirPlay device on the LAN
+          # (`tcp drop outgoing ... reason: NECP`, EHOSTUNREACH), surfacing as an
+          # unexplained "soap send: error sending request" with no way to recover
+          # short of restarting the server.
+          #
+          # A Developer ID signature with an explicit --identifier gives a
+          # designated requirement built from the identifier and the team, not
+          # from the binary's hash, so the grant survives upgrades. The .app/.dmg
+          # path already signed the same binary; only the tarball was left out.
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+            codesign --force --options runtime --timestamp \
+              --identifier fr.mozaiklabs.tune-server \
+              --sign "$IDENTITY" package/tune-server
+            if [ -n "$DAEMON" ]; then
+              codesign --force --options runtime --timestamp \
+                --identifier fr.mozaiklabs.airplay-daemon \
+                --sign "$IDENTITY" "package/$DAEMON"
+            fi
+            if [ -f package/ffmpeg ]; then
+              codesign --force --options runtime --timestamp \
+                --identifier fr.mozaiklabs.ffmpeg \
+                --sign "$IDENTITY" package/ffmpeg
+            fi
+            codesign --verify --strict --verbose=2 package/tune-server
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
+          fi
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG web/ plugins/
           cd ..
+
+      # ── Signature Authenticode (Windows) ───────────────────────────────────
+      #
+      # Sans signature, Windows Defender met l'exécutable en quarantaine ou le
+      # tue en silence : un binaire non signé qui fait `taskkill` et sonde le
+      # port 8888 déclenche l'heuristique. Côté utilisateur ça donne « la
+      # fenêtre se ferme après quelques secondes » (Alain Bonnel, Win11, fil
+      # #1313) et « le serveur s'arrête tout seul au bout d'une à deux
+      # minutes » (#1435). Windows 11 avec des définitions récentes est bien
+      # plus agressif que Windows 10 : la population touchée grandit.
+      #
+      # L'étape ne tourne QUE si le certificat est présent. Sans les secrets
+      # elle est ignorée et la release se termine exactement comme aujourd'hui ;
+      # poser `WIN_SIGN_CERT_BASE64` (le .pfx en base64) et `WIN_SIGN_CERT_PWD`
+      # suffit à l'activer, sans autre changement.
+      #
+      # Placée AVANT l'empaquetage : le .zip portable et l'installeur NSIS
+      # embarquent tous deux ce binaire. Le zip est précisément le contournement
+      # donné aux utilisateurs bloqués — le signer aussi est le but même.
+      - name: Sign Windows binaries (si le certificat est présent)
+        if: runner.os == 'Windows' && env.WIN_SIGN_CERT_BASE64 != ''
+        env:
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+
+          # signtool vit dans le SDK Windows, à une version près : prendre la
+          # plus récente plutôt que figer un chemin qui cassera à la prochaine
+          # image de runner.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+
+          $targets = @("target\${{ matrix.target }}\release\tune-server.exe")
+          # airplay-daemon vit dans $RUNNER_TEMP\apd\bin (cargo install --root),
+          # JAMAIS dans target\release : l'ancien Test-Path ne matchait jamais
+          # et le daemon serait parti non signé. Signé en place, la copie vers
+          # le zip et l'installeur (toutes deux après cette étape) le propage.
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            $targets += "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe"
+          }
+          # ffmpeg minimal (#1524) : même motif — signé EN PLACE dans ffbundle,
+          # d'où le zip et l'installeur NSIS le copient tous deux APRÈS cette
+          # étape. Sans lui, tune-server.exe signé lancerait un ffmpeg.exe non
+          # signé — la même heuristique Defender que ce que corrige #1521.
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
+          }
+          # ffmpeg minimal (#1524) : signé EN PLACE dans ffbundle, d'où le zip
+          # et l'installeur NSIS le copient tous deux APRÈS cette étape. Sans
+          # lui, tune-server.exe signé lancerait un ffmpeg.exe non signé — la
+          # même heuristique Defender que ce que cette étape corrige (#1521).
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
+          }
+
+          foreach ($t in $targets) {
+            # /tr = horodatage : c'est lui qui fait qu'une signature reste
+            # valide APRÈS l'expiration du certificat. Sans lui, tout ce qui a
+            # été publié deviendrait non signé le jour de l'expiration.
+            & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+              /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 /v $t
+            if ($LASTEXITCODE -ne 0) { throw "échec de signature : $t" }
+            & $signtool.FullName verify /pa /v $t
+            if ($LASTEXITCODE -ne 0) { throw "signature invalide : $t" }
+          }
+          Remove-Item $pfx -Force
 
       - name: Package (windows zip)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           mkdir package\web
           copy target\${{ matrix.target }}\release\tune-server.exe package\
+          # Bundle airplay-daemon.exe next to tune-server.exe if it built.
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" package\
+          }
+          # ffmpeg minimal (#1524), a cote de tune-server.exe (resolve_tool).
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            copy "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe" package\
+            if (Test-Path "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt") {
+              copy "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt" package\
+            }
+          }
           xcopy web\* package\web\ /E /I /Q
+          # Bundle the Party (WASM) plugin next to tune-server.exe (see unix step).
+          mkdir package\plugins\party
+          copy tune-server\tests\fixtures\plugins\party\main.wasm package\plugins\party\
+          copy tune-server\tests\fixtures\plugins\party\manifest.json package\plugins\party\
           cd package
-          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
+          if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
+          if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
           cd ..
 
       - name: Install NSIS
@@ -165,6 +427,30 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
+          # Include the AirPlay 2 daemon in the installer only if it built for this
+          # target; otherwise the File directive is omitted entirely (no broken or
+          # empty binary that would defeat the AirPlay 1 fallback).
+          $daemonFile = ""
+          if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
+            copy "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe" "target\${{ matrix.target }}\release\airplay-daemon.exe"
+            $daemonFile = 'File "target\${{ matrix.target }}\release\airplay-daemon.exe"'
+          }
+          # ffmpeg minimal (#1524) : meme motif que le daemon — la directive
+          # File n'apparait que si le binaire existe.
+          $ffmpegFile = ""
+          if (Test-Path "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe") {
+            copy "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe" "target\${{ matrix.target }}\release\ffmpeg.exe"
+            $ffmpegFile = 'File "target\${{ matrix.target }}\release\ffmpeg.exe"'
+            if (Test-Path "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt") {
+              copy "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt" "target\${{ matrix.target }}\release\FFMPEG-LICENSE.txt"
+              $ffmpegFile = $ffmpegFile + "`n            File `"target\${{ matrix.target }}\release\FFMPEG-LICENSE.txt`""
+            }
+          }
+          # Stage the Party (WASM) plugin so the installer ships it next to
+          # tune-server.exe (plugins\ resolves exe-relative at runtime).
+          New-Item -ItemType Directory -Force -Path "plugins\party" | Out-Null
+          copy "tune-server\tests\fixtures\plugins\party\main.wasm" "plugins\party\"
+          copy "tune-server\tests\fixtures\plugins\party\manifest.json" "plugins\party\"
           @"
           !include "MUI2.nsh"
           Name "Tune Server"
@@ -184,14 +470,21 @@ jobs:
             nsExec::ExecToLog 'taskkill /F /IM tune-server.exe'
             Sleep 1500
 
-            ; Remove stale web client files from previous version
+            ; Remove stale web client files and bundled plugins from previous version
             RMDir /r "`$INSTDIR\web"
+            RMDir /r "`$INSTDIR\plugins"
 
             SetOverwrite on
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
+            $daemonFile
+            $ffmpegFile
             SetOutPath "`$INSTDIR\web"
             File /r "web\*.*"
+            ; Bundled Party (WASM) plugin, next to tune-server.exe
+            SetOutPath "`$INSTDIR\plugins\party"
+            File "plugins\party\main.wasm"
+            File "plugins\party\manifest.json"
 
             ; Launcher script
             SetOutPath "`$INSTDIR"
@@ -232,20 +525,29 @@ jobs:
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
 
-      - name: Import signing certificate
-        if: runner.os == 'macOS'
+      # L'installeur porte sa propre signature, distincte de celle du binaire
+      # qu'il contient : c'est CE fichier que l'utilisateur double-clique, et
+      # donc celui que SmartScreen juge en premier.
+      - name: Sign Windows installer (si le certificat est présent)
+        if: runner.os == 'Windows' && env.WIN_SIGN_CERT_BASE64 != ''
         env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        shell: pwsh
         run: |
-          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
-          security create-keychain -p actions build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p actions build.keychain
-          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
-          rm /tmp/certificate.p12
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+          & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+            /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 /v "${{ env.ARTIFACT }}-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "échec de signature de l'installeur" }
+          & $signtool.FullName verify /pa /v "${{ env.ARTIFACT }}-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signature d'installeur invalide" }
+          Remove-Item $pfx -Force
+
+      # The keychain is set up before "Package (unix)" so the tarball binaries
+      # get signed too — the DMG below reuses it.
 
       - name: Create DMG (macOS)
         if: runner.os == 'macOS'
@@ -253,12 +555,39 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          VERSION="${{ env.VERSION }}"
+          VERSION="${{ env.TUNE_VERSION }}"
           APP="Tune Server.app"
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources/web"
           cp target/${{ matrix.target }}/release/tune-server "$APP/Contents/Resources/"
+          # AirPlay 2 daemon: bundle it next to tune-server inside the .app so
+          # find_daemon_binary/daemon_available() find it on DMG installs too.
+          # The .tar.gz path already bundled it, but the DMG did not — so every
+          # macOS DMG user fell back to unauthenticated AirPlay 1 and any AirPlay 2
+          # receiver requiring pairing/auth failed with SETUP 403 (Vincent
+          # Guillemin / VUmètre, Luxman NT-07, v0.8.359). Only if it built for
+          # this target — never ship a placeholder (defeats the AirPlay 1 fallback).
+          if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
+            cp "$RUNNER_TEMP/apd/bin/airplay-daemon" "$APP/Contents/Resources/"
+          fi
+          # ffmpeg minimal (#1524) : dans Resources/, à côté de tune-server —
+          # là où resolve_tool() regarde en premier sur une installation DMG.
+          if [ -f "$RUNNER_TEMP/ffbundle/ffmpeg" ]; then
+            cp "$RUNNER_TEMP/ffbundle/ffmpeg" "$APP/Contents/Resources/"
+            chmod 755 "$APP/Contents/Resources/ffmpeg"
+            if [ -f "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" ]; then
+              cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" "$APP/Contents/Resources/"
+            fi
+          fi
           cp -r web/* "$APP/Contents/Resources/web/"
+          # Bundle the Party (WASM) plugin beside tune-server inside the .app so
+          # the plugins-wasm runtime discovers it (plugins/ resolves exe-relative,
+          # i.e. Contents/Resources/plugins/). Without this, DMG installs would
+          # ship the runtime but never load Party. Sourced from the committed
+          # fixture; the wasm is not rebuilt.
+          mkdir -p "$APP/Contents/Resources/plugins/party"
+          cp tune-server/tests/fixtures/plugins/party/main.wasm "$APP/Contents/Resources/plugins/party/"
+          cp tune-server/tests/fixtures/plugins/party/manifest.json "$APP/Contents/Resources/plugins/party/"
           # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
           on run
@@ -299,6 +628,15 @@ jobs:
           if [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
             codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
+            # signing) so the bundle stays valid and notarization does not reject
+            # an unsigned executable.
+            if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
+              codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/airplay-daemon"
+            fi
+            if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
+              codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
+            fi
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
           fi
           DMG_DIR="dmg-staging"
@@ -315,23 +653,65 @@ jobs:
             codesign --force --sign "$IDENTITY" "$DMG_NAME"
           fi
 
+      # Le .tar.gz macOS n'a RIEN à voir avec la notarisation : il n'est pas
+      # ouvert par Gatekeeper. Tant que l'envoi des artefacts venait après
+      # cette étape, un refus d'Apple l'emportait avec le DMG — v0.9.71, 401
+      # sur un mot de passe applicatif révoqué : quatre fichiers macOS perdus,
+      # dont deux sans aucune raison, et la catégorie macOS a disparu de la
+      # page de téléchargement.
+      #
+      # Un DMG non tamponné, lui, ne doit JAMAIS sortir : Gatekeeper le
+      # refuserait chez l'utilisateur, ce qui est pire qu'un fichier absent.
+      # On le supprime donc plutôt que de le publier à moitié, et l'étape
+      # échoue quand même — la préflight doit continuer de voir le défaut.
       - name: Notarize DMG (macOS)
         if: runner.os == 'macOS'
         env:
+          # Preferred path: App Store Connect API key (survives Apple ID
+          # account trouble — the password flow started returning 401s even
+          # after the account was rehabilitated). Falls back to the legacy
+          # Apple ID + app-specific password pair, then to skipping.
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "$APPLE_ID" ]; then echo "No Apple ID, skipping notarization"; exit 0; fi
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          xcrun notarytool submit "$DMG_NAME" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 600
+          notarize_failed() {
+            echo "::error::Notarisation refusée par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
+            rm -f "$DMG_NAME"
+            exit 1
+          }
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
+            # printf '%s' via the env var keeps the PEM newlines intact and
+            # avoids any shell interpretation of the key content.
+            printf '%s' "$ASC_API_KEY_P8" > "$KEY_FILE"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            xcrun notarytool submit "$DMG_NAME" \
+              --key "$KEY_FILE" \
+              --key-id "$ASC_API_KEY_ID" \
+              --issuer "$ASC_API_ISSUER_ID" \
+              --wait --timeout 600 || notarize_failed
+          elif [ -n "$APPLE_ID" ]; then
+            xcrun notarytool submit "$DMG_NAME" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 600 || notarize_failed
+          else
+            echo "No notarization credentials, skipping notarization"
+            exit 0
+          fi
           xcrun stapler staple "$DMG_NAME"
 
+      # `always()` : les artefacts déjà construits partent même si la
+      # notarisation a échoué. Le DMG a été supprimé juste au-dessus dans ce
+      # cas, donc seul ce qui est publiable monte.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ env.ARTIFACT }}
           path: |
@@ -339,6 +719,7 @@ jobs:
             ${{ env.ARTIFACT }}.dmg
             ${{ env.ARTIFACT }}-setup.exe
           retention-days: 1
+          if-no-files-found: warn
 
   release:
     name: Create Release
@@ -350,20 +731,103 @@ jobs:
         with:
           path: artifacts
 
+      # Les sommes sont calculées sur les artefacts DU RUN COURANT. Sur un
+      # re-run partiel, ce run n'a rejoué qu'une partie des jobs : les fichiers
+      # produits par un run antérieur ne sont pas dans `artifacts/` et
+      # disparaissaient donc du SHA256SUMS republié — écrasé par une version
+      # plus pauvre que la précédente.
+      #
+      # Vécu sur v0.9.71 (#1679) : macOS téléversé à 09:31 par un re-run des
+      # seuls jobs Apple, SHA256SUMS régénéré à 10:30 par un autre re-run
+      # partiel — 5 sommes pour 9 fichiers. Les quatre fichiers macOS étaient
+      # publiés mais invérifiables, faute de ligne à comparer.
+      #
+      # Le fichier ne doit donc JAMAIS rétrécir : on repart de celui déjà
+      # publié pour ce tag et on ne remplace que ce que ce run a réellement
+      # reconstruit. Le défaut ne se déclenchait que sur une release réparée en
+      # deux temps, c'est-à-dire quand quelque chose avait déjà mal tourné.
       - name: Checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS.run
           cd ..
 
+          # Le SHA256SUMS déjà publié, s'il existe (absent au premier run).
+          if gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+               --pattern SHA256SUMS --output SHA256SUMS.published 2>/dev/null; then
+            echo "SHA256SUMS déjà publié récupéré ($(wc -l < SHA256SUMS.published) entrées)"
+          else
+            : > SHA256SUMS.published
+            echo "aucun SHA256SUMS publié pour ${GITHUB_REF_NAME} — premier run"
+          fi
+
+          # Union, le run courant l'emportant : on repart des anciennes lignes
+          # dont le NOM DE FICHIER n'a pas été reconstruit par ce run, puis on
+          # ajoute tout ce que ce run a produit. Comparaison sur le basename :
+          # le chemin porte le nom du répertoire d'artefact, qui varie.
+          awk '{ n = $2; sub(/.*\//, "", n); print n }' SHA256SUMS.run | sort -u > .rebuilt
+          awk 'NR==FNR { rebuilt[$0]=1; next }
+               { n = $2; sub(/.*\//, "", n); if (!(n in rebuilt)) print }' \
+              .rebuilt SHA256SUMS.published > SHA256SUMS.kept
+          cat SHA256SUMS.kept SHA256SUMS.run | sort -k2 > SHA256SUMS
+          rm -f SHA256SUMS.run SHA256SUMS.published SHA256SUMS.kept .rebuilt
+
+          # Garde-fou : republier moins que ce qui existait est toujours une
+          # régression, quelle qu'en soit la cause.
+          before=$(gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+                     --json assets --jq '[.assets[].name | select(test("SHA256SUMS")|not)] | length' 2>/dev/null || echo 0)
+          echo "--- SHA256SUMS republié : $(wc -l < SHA256SUMS) entrées (release : ${before} assets binaires) ---"
+          cat SHA256SUMS
+
+      # Sign SHA256SUMS with minisign so the self-update client can verify the
+      # release cryptographically (audit item 8). No-ops until MINISIGN_SECRET_KEY
+      # is configured, so releases keep working during rollout. The client only
+      # enforces once its embedded public key is set (UPDATE_PUBLIC_KEY).
+      - name: Sign checksums (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY not set — skipping release signing"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          # minisign needs the 2-line key format (comment + base64). The secret
+          # may be stored with or without the leading "untrusted comment:" line,
+          # so reconstruct it when absent.
+          case "$MINISIGN_SECRET_KEY" in
+            "untrusted comment:"*) printf '%s\n' "$MINISIGN_SECRET_KEY" ;;
+            *) printf 'untrusted comment: minisign encrypted secret key\n%s\n' "$MINISIGN_SECRET_KEY" ;;
+          esac > minisign.key
+          minisign -S -s minisign.key -m SHA256SUMS -x SHA256SUMS.minisig
+          rm -f minisign.key
+          echo "Signed SHA256SUMS -> SHA256SUMS.minisig"
+
+      # `draft: true` — la release naît INVISIBLE des clients.
+      #
+      # Ce job porte `if: always()`, donc il tourne aussi quand des builds ont
+      # échoué : c'est voulu (on veut les artefacts partiels et les journaux),
+      # mais jusqu'ici il publiait ce demi-résultat au monde entier. v0.9.71 :
+      # release visible à 19:15 avec 7 assets sur 13, run terminé en échec le
+      # lendemain à 07:45 — douze heures pendant lesquelles le client de mise à
+      # jour de Jean Valjean a cherché un SHA256SUMS incomplet, et pendant
+      # lesquelles on lui a répondu que son réseau était en cause (#1588).
+      #
+      # La bascule en public est faite par le job `publish`, tout en bas, une
+      # fois TOUT déposé — image Tune OS comprise, elle qui s'attachait
+      # jusqu'ici à une release déjà visible.
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
             artifacts/**/*.dmg
             artifacts/**/*.exe
-            SHA256SUMS
+            SHA256SUMS*
           generate_release_notes: true
           # Pre-release tags carry a suffix (e.g. v0.9.0-rc2); stable tags are
           # plain vX.Y.Z. Mark suffixed tags as pre-releases and keep them off
@@ -375,9 +839,73 @@ jobs:
   # Docker Hub publication is handled separately by docker.yml on the
   # same tag, so no docker job here.
 
+  # Image appliance x86-64. Appelée ICI, et pas déclenchée par
+  # `on: release: [published]` dans tune-os.yml : la release est créée avec le
+  # `GITHUB_TOKEN`, et GitHub refuse par conception qu'un évènement émis par ce
+  # jeton déclenche un autre workflow. Le déclencheur existait, n'a jamais
+  # fonctionné, et son silence a coûté six versions sans image (0.9.63 → 0.9.68)
+  # sans un seul run en échec pour l'annoncer.
+  #
+  # `needs: release` garantit que l'asset linux-x86_64 est attaché — l'étape
+  # « Resolve version » de tune-os.yml échoue explicitement s'il manque.
+  tune-os-image:
+    name: Build Tune OS image
+    needs: release
+    # Stables uniquement : une RC n'a pas d'image, comme elle n'a pas de tap.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    uses: ./.github/workflows/tune-os.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ github.ref_name }}
+      attach_to_release: true
+
+  # ─── La bascule en public ──────────────────────────────────────────────
+  #
+  # Seul endroit du workflow qui rend une release visible des clients. Elle
+  # ne s'ouvre que si TOUT a abouti : les binaires (`build`), leur dépôt et
+  # leurs sommes de contrôle (`release`), et l'image appliance
+  # (`tune-os-image`), qui s'attachait jusqu'ici à une release déjà publique.
+  #
+  # `always()` est nécessaire pour que le job s'évalue malgré un `needs`
+  # SAUTÉ — une RC n'a pas d'image Tune OS, et sans ça la release resterait
+  # en brouillon pour toujours. Les conditions qui suivent font le tri : un
+  # `skipped` est acceptable, un `failure` ne l'est pas.
+  #
+  # Les identifiants de job à tiret ne peuvent pas s'écrire `needs.tune-os-image`
+  # dans une expression — le tiret y serait lu comme une soustraction. D'où
+  # la notation entre crochets.
+  publish:
+    name: Publish release (drop the draft)
+    needs: [build, release, tune-os-image]
+    if: >-
+      always()
+      && needs.build.result == 'success'
+      && needs.release.result == 'success'
+      && (needs['tune-os-image'].result == 'success' || needs['tune-os-image'].result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Vérifier que la release est complète, puis la publier
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Ce qui est publié doit être vérifiable : SHA256SUMS est la
+          # sentinelle que le client de mise à jour va chercher en premier.
+          # S'il manque, ne rien montrer plutôt que montrer un demi-état.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS'; then
+            echo "::error::SHA256SUMS absent de $TAG — la release reste en brouillon."
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Release $TAG publiée."
+
   homebrew:
     name: Update Homebrew tap
-    needs: release
+    needs: publish
     # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
     # or `brew upgrade` would move stable users onto an RC.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
@@ -412,6 +940,18 @@ jobs:
           # Update version string and caveats
           sed -i "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
           sed -i "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
+
+          # Garantir le caveat de redémarrage après mise à jour (vécu v0.9.71 :
+          # binaire upgradé mais ancien processus toujours en mémoire → « la
+          # MAJ ne marche pas »). Le job ne fait que des sed ciblés, donc la
+          # ligne posée sur le tap survit normalement — cette étape la répare
+          # si la formule est un jour recréée sans elle. Idempotent.
+          if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+            perl -0pi -e 's/(      Background service: brew services start tune-server\n)/$1\n      Après une mise à jour, redémarrez le serveur :\n      brew services restart tune-server (ou relancez tune-server-launcher).\n/' "$F"
+            if ! grep -q "Après une mise à jour, redémarrez le serveur" "$F"; then
+              echo "::warning::Caveat de redémarrage introuvable et point d'ancrage absent — à reporter à la main dans le tap"
+            fi
+          fi
 
           # Update all download URLs — use regex to catch ANY old version, not just OLD_VERSION
           # This handles cases where the formula has stale versions from failed previous updates
@@ -464,7 +1004,10 @@ jobs:
 
   notify-website:
     name: Update mozaiklabs.fr/download
-    needs: [release, homebrew]
+    # `publish` et non `release` : la page de téléchargement ne doit annoncer
+    # qu'une release réellement publique et complète. Le webhook exige ≥3
+    # assets, mais rien ne lui disait jusqu'ici que la liste était finie.
+    needs: [publish, homebrew]
     # Stable tags only — a pre-release must not update the public download page.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
@@ -492,6 +1035,57 @@ jobs:
           echo "Webhook response: HTTP $STATUS"
           if [ "$STATUS" -ge 400 ]; then
             echo "::warning::Webhook returned HTTP $STATUS — /download may not be updated"
+          fi
+
+  android:
+    name: Trigger Android build (tune-server-flutter)
+    needs: [publish]
+    # Stable tags only — un client ne se construit pas sur une pre-release.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    steps:
+      # La CI Android existe déjà dans tune-server-flutter (APK signé +
+      # Firebase App Distribution) mais son déclencheur — poser le tag v* —
+      # était MANUEL et régulièrement oublié (point 14, revue 2026-08-15).
+      # Ce job pose le tag automatiquement, avec deux garde-fous :
+      # - le bump reste la décision de Bertrand : si `bump-all.sh --clients`
+      #   n'est pas passé (pubspec ≠ tag serveur), on n'y touche pas ;
+      # - jamais bloquant pour la release serveur : tout échec = warning.
+      - name: Tag tune-server-flutter (déclenche sa release CI)
+        env:
+          TOKEN: ${{ secrets.CLIENTS_REPO_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::CLIENTS_REPO_TOKEN absent — Android non déclenché. Créer un PAT (contents:write sur renesenses/tune-server-flutter) et l'ajouter aux secrets."
+            exit 0
+          fi
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          AUTH="Authorization: Bearer $TOKEN"
+          API="https://api.github.com/repos/renesenses/tune-server-flutter"
+
+          # Garde-fou drift : ne taguer que si le bump clients est passé.
+          FLUTTER_VER=$(curl -sf -H "$AUTH" "$API/contents/pubspec.yaml?ref=main" \
+            | jq -r .content | base64 -d | grep -E '^version:' | sed 's/version: *//; s/+.*//' || echo "")
+          if [ "$FLUTTER_VER" != "$VER" ]; then
+            echo "::warning::pubspec.yaml de tune-server-flutter ($FLUTTER_VER) ≠ tag serveur ($VER) — bump-all.sh --clients n'est pas passé, Android non déclenché."
+            exit 0
+          fi
+
+          SHA=$(curl -sf -H "$AUTH" "$API/git/ref/heads/main" | jq -r .object.sha)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::warning::Impossible de lire le HEAD de tune-server-flutter — Android non déclenché."
+            exit 0
+          fi
+          STATUS=$(curl -s -o /tmp/resp -w "%{http_code}" -X POST -H "$AUTH" \
+            -d "{\"ref\": \"refs/tags/${TAG}\", \"sha\": \"${SHA}\"}" \
+            "$API/git/refs")
+          if [ "$STATUS" = "201" ]; then
+            echo "Tag ${TAG} posé sur tune-server-flutter (${SHA}) — build Android déclenchée."
+          elif [ "$STATUS" = "422" ] && grep -q "already exists" /tmp/resp; then
+            echo "Tag ${TAG} déjà présent sur tune-server-flutter — rien à faire."
+          else
+            echo "::warning::Pose du tag refusée (HTTP $STATUS) : $(cat /tmp/resp)"
           fi
 
   forum:

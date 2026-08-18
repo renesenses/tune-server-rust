@@ -10,13 +10,103 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use tune_core::http::streamer::{
-    ICY_METAINT, SharedSessions, StreamInfo, StreamSession, build_icy_metadata, build_wav_header,
-    extract_stream_id,
+    ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
+    build_wav_header, build_wav_header_bounded_live, build_wav_header_streaming, extract_stream_id,
 };
+
+/// Tracks one HTTP consumer of a radio→WAV session for the lifetime of its
+/// stream (drops on normal end AND on client disconnect, since the streaming
+/// body future is cancelled at a yield point). Diagnostics for the
+/// "FIP silent after upstream reconnect" case: the PCM channel is
+/// single-consumer, so a second concurrent request would split the stream.
+struct RadioConsumerGuard {
+    session: std::sync::Arc<StreamSession>,
+    started: std::time::Instant,
+    /// Set true when the channel closed cleanly (recv returned None), so the
+    /// Drop path can tell a graceful end from a client disconnect.
+    completed: bool,
+    /// Set true when a NEWER connection claimed the single-consumer channel and
+    /// this one handed it off (a DLNA renderer re-requesting without closing the
+    /// first). That is an expected, internal end — not a client disconnect — so
+    /// the Drop path stays quiet about it.
+    superseded: bool,
+}
+
+/// Can this renderer consume a live radio stream as a chunked, length-less
+/// body?
+///
+/// A libavformat (`Lavf`) renderer can, and in fact *needs* to: it wants the
+/// `0xFFFF_FFFF` indeterminate-length WAV header, without which it treats the
+/// transcoded radio as a bounded PCM file, fills its ~64 MiB read-ahead cache
+/// and stops after ~6 minutes (FIP, .15, commit 3d5a3a8f).
+///
+/// Others cannot. The darTZeel LHC-208 refuses chunked transfer outright and
+/// requires `Content-Length` + `Range` (session support JP + Yves, 01/08).
+/// Everything that plays on it carries a length — local files via `serve_file`,
+/// Qobuz tracks via `proxy_stream`. Radio was the only length-less stream, and
+/// the only one that never started: it connected, waited ~7 s, dropped, and
+/// never came back (#1689).
+///
+/// The two contracts are mutually exclusive, so the response follows the
+/// renderer. An absent or unreadable User-Agent keeps the current behaviour:
+/// only a renderer that positively identifies itself as something other than
+/// Lavf gets the file contract.
+fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
+    match user_agent {
+        Some(ua) if !ua.is_empty() => ua.to_ascii_lowercase().contains("lavf"),
+        _ => true,
+    }
+}
+
+impl RadioConsumerGuard {
+    fn new(session: std::sync::Arc<StreamSession>) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = session.active_consumers.fetch_add(1, Relaxed) + 1;
+        if n > 1 {
+            // Transient: a 2nd request briefly overlaps the first while the
+            // older connection is being handed off (see the supersede logic in
+            // handle_stream). It no longer splits the stream — the older
+            // consumer stops without pulling further chunks — so this is
+            // informational, not an error.
+            info!(
+                stream_id = %session.id,
+                consumers = n,
+                "radio_stream_reconnect — a newer request is taking over the \
+                 single-consumer PCM channel; the older connection is handed off"
+            );
+        }
+        Self {
+            session,
+            started: std::time::Instant::now(),
+            completed: false,
+            superseded: false,
+        }
+    }
+}
+
+impl Drop for RadioConsumerGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let remaining = self
+            .session
+            .active_consumers
+            .fetch_sub(1, Relaxed)
+            .saturating_sub(1);
+        if !self.completed && !self.superseded {
+            info!(
+                stream_id = %self.session.id,
+                connected_secs = self.started.elapsed().as_secs(),
+                remaining_consumers = remaining,
+                "radio_stream_client_disconnect — HTTP consumer dropped mid-stream"
+            );
+        }
+    }
+}
 
 pub async fn handle_head(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
+    req_headers: HeaderMap,
 ) -> Response {
     let stream_id = extract_stream_id(&raw_id);
     // Clone the Arc so we release the sessions lock before any async I/O.
@@ -70,7 +160,19 @@ pub async fn handle_head(
             "transferMode.dlna.org",
             HeaderValue::from_static("Streaming"),
         );
-        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+        // Le HEAD doit annoncer le même contrat que le GET qui suit, sans quoi
+        // un lecteur qui sonde d'abord conclut « pas de longueur » et n'essaie
+        // même pas (#1689).
+        let ua = req_headers.get("User-Agent").and_then(|v| v.to_str().ok());
+        if accepts_chunked_live_stream(ua) {
+            headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+        } else {
+            headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+            headers.insert(
+                "Content-Length",
+                HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
+            );
+        }
     } else {
         headers.insert(
             "transferMode.dlna.org",
@@ -110,14 +212,17 @@ pub async fn handle_stream(
         .get("Range")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
+    // Possédé, pas emprunté : le corps du flux en a besoin après la réponse,
+    // et c'est lui qui décide de la taille annoncée dans l'en-tête WAV d'une
+    // radio (voir wants_indeterminate_wav_length).
     let user_agent = req_headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+        .map(|s| s.to_string());
     info!(
         stream_id,
         range = range_hdr,
-        agent = user_agent,
+        agent = user_agent.as_deref().unwrap_or("-"),
         format = %session.info.format,
         "stream_request"
     );
@@ -132,7 +237,14 @@ pub async fn handle_stream(
     // Proxy mode
     let proxy_url = session.proxy_url.lock().await.clone();
     if let Some(ref url) = proxy_url {
-        return proxy_stream(url, &session.info, session.is_radio, &req_headers).await;
+        return proxy_stream(
+            url,
+            &session.info,
+            session.is_radio,
+            &req_headers,
+            session.clone(),
+        )
+        .await;
     }
 
     // Chunked streaming mode
@@ -151,11 +263,19 @@ pub async fn handle_stream(
     // (DMP-A6/A8) don't need to probe the stream end with seek requests.
     let is_wav = session.info.format == "wav";
     let is_radio = session.is_radio;
-    let wav_length = if is_wav {
+    // A live radio→WAV stream has no length. A Lavf renderer wants it that way
+    // (chunked body + indeterminate WAV header). A renderer that refuses
+    // chunked transfer gets the file contract instead: a large finite
+    // Content-Length, Accept-Ranges, and Range honoured (#1689).
+    let bounded_live = is_wav && is_radio && !accepts_chunked_live_stream(user_agent.as_deref());
+    let wav_length = if is_wav && !is_radio {
         session.info.wav_content_length()
     } else {
         None
     };
+    if is_radio && !bounded_live {
+        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+    }
 
     // DLNA renderers (Marantz SR7009, Eversolo DMP-A8) send Range: bytes=0-
     // even for the initial request and expect a 206 Partial Content response
@@ -179,6 +299,44 @@ pub async fn handle_stream(
         }
     }
 
+    // Radio servie comme un fichier borné. Le lecteur qui refuse le chunké
+    // repart après l'en-tête WAV (`bytes=44-` sur ses fichiers locaux) : on
+    // honore ce Range en n'émettant que la fin de l'en-tête, puis le direct.
+    // Une radio n'a pas de position — au-delà de l'en-tête, « reprendre à N »
+    // ne peut vouloir dire que « donne-moi le direct maintenant ».
+    let mut bounded_status = StatusCode::OK;
+    let mut header_skip: usize = 0;
+    if bounded_live {
+        let total = tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN;
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        let start = req_headers
+            .get("Range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_range_start)
+            .filter(|s| *s < total);
+        match start {
+            Some(start) if start > 0 => {
+                header_skip = start.min(44) as usize;
+                headers.insert("Content-Length", HeaderValue::from(total - start));
+                headers.insert(
+                    "Content-Range",
+                    HeaderValue::from_str(&format!("bytes {start}-{}/{total}", total - 1)).unwrap(),
+                );
+                bounded_status = StatusCode::PARTIAL_CONTENT;
+            }
+            _ => {
+                headers.insert("Content-Length", HeaderValue::from(total));
+            }
+        }
+        info!(
+            stream_id,
+            total,
+            range_start = ?start,
+            header_skip,
+            "radio_bounded_live_response — renderer refuses chunked, serving the file contract"
+        );
+    }
+
     let wants_icy = req_headers
         .get("Icy-MetaData")
         .and_then(|v| v.to_str().ok())
@@ -194,6 +352,11 @@ pub async fn handle_stream(
     let dur_ms = session.info.duration_ms;
 
     let has_icy = wants_icy && (session.track_title.is_some() || session.track_artist.is_some());
+    // Bloc ICY de repli : celui de la piste au moment de la connexion. Pour un
+    // fichier il ne changera jamais, et c'est correct. Pour une RADIO il est
+    // reconstruit a chaque emission depuis le titre courant (voir plus bas) —
+    // sans quoi le renderer affiche eternellement le morceau qui passait quand
+    // il s'est branche (Marantz + Radio Paradise, forum du 10 aout).
     let icy_block = if has_icy {
         build_icy_metadata(
             session.track_artist.as_deref(),
@@ -203,14 +366,53 @@ pub async fn handle_stream(
     } else {
         vec![0u8]
     };
+    let icy_cover = session.cover_url.clone();
+    let icy_stream_id = stream_id.to_string();
 
     let wav_header_included = session
         .wav_header_included
         .load(std::sync::atomic::Ordering::Relaxed);
-    let body = Body::from_stream(async_stream::stream! {
+    let data_ready = session.data_ready.clone();
+    // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
+    // radio, deux vidages de tampon — sont comptes par `corps_compte`.
+    let compteur = session.clone();
+    let flux = async_stream::stream! {
         if is_wav && !wav_header_included {
-            let hdr = build_wav_header(ch, sr, bd, dur_ms);
-            yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
+            // Live radio: a Lavf renderer needs the 0xFFFF_FFFF
+            // indeterminate-length header to keep reading until the connection
+            // closes; a renderer served the file contract gets sizes that match
+            // its Content-Length and stay positive as i32 (#1689). Finite
+            // tracks keep the sized header.
+            let hdr = if is_radio {
+                // Wait until the decoder has probed the upstream so the header
+                // advertises the TRUE sample rate/channels (FIP is 48000, not
+                // the placeholder 44100). Fall back to the StreamInfo values if
+                // the decoder hasn't populated them within a short window.
+                use std::sync::atomic::Ordering::Relaxed;
+                if session.detected_sample_rate.load(Relaxed) == 0 {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        data_ready.notified(),
+                    )
+                    .await;
+                }
+                let det_sr = session.detected_sample_rate.load(Relaxed);
+                let det_ch = session.detected_channels.load(Relaxed);
+                let real_sr = if det_sr != 0 { det_sr } else { sr };
+                let real_ch = if det_ch != 0 { det_ch } else { ch };
+                if bounded_live {
+                    build_wav_header_bounded_live(real_ch, real_sr, bd)
+                } else {
+                    build_wav_header_streaming(real_ch, real_sr, bd)
+                }
+            } else {
+                build_wav_header(ch, sr, bd, dur_ms)
+            };
+            // header_skip n'est non nul que sur une reprise `bytes=N-` d'une
+            // radio bornée : le lecteur a déjà lu l'en-tête et veut le PCM.
+            if header_skip < hdr.len() {
+                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr[header_skip..]));
+            }
         }
 
         if has_icy {
@@ -224,7 +426,17 @@ pub async fn handle_stream(
                     bytes_since_meta += end - offset;
                     offset = end;
                     if bytes_since_meta >= ICY_METAINT {
-                        yield Ok(bytes::Bytes::copy_from_slice(&icy_block));
+                        // Relire le titre courant a CHAQUE emission : c'est la
+                        // seule chose que le renderer verra changer.
+                        let block = match tune_core::http::streamer::radio_now(&icy_stream_id) {
+                            Some((artist, title)) => build_icy_metadata(
+                                artist.as_deref(),
+                                Some(&title),
+                                icy_cover.as_deref(),
+                            ),
+                            None => icy_block.clone(),
+                        };
+                        yield Ok(bytes::Bytes::from(block));
                         bytes_since_meta = 0;
                     }
                 }
@@ -236,8 +448,72 @@ pub async fn handle_stream(
             // but can cause the browser's <audio> element (or the local
             // output's HTTP reader) to stall waiting for the first data
             // after the WAV header, resulting in silence.
-            while let Some(chunk) = session.recv_chunk().await {
-                yield Ok(bytes::Bytes::from(chunk));
+            // The guard counts concurrent consumers and logs how the stream
+            // ends (diagnostics for the FIP silent-after-reconnect case).
+            let mut guard = RadioConsumerGuard::new(session.clone());
+
+            // Claim sole ownership of the single-consumer PCM channel. A DLNA
+            // renderer that re-requests the radio stream (buffer refill /
+            // reconnect) WITHOUT closing its first connection used to leave both
+            // connections calling recv_chunk(), so each PCM chunk went to
+            // whichever connection asked first — the audio was split between the
+            // two sockets and the renderer's live playback only got a fraction
+            // of the bytes → periodic dropouts (radio_stream_concurrent_consumer
+            // on .15). Bumping the epoch supersedes any older consumer; the loop
+            // below (subscribe-then-check + biased select) guarantees the older
+            // one stops without pulling a further chunk, so no chunk is split,
+            // lost, or duplicated at the hand-off.
+            let my_epoch = session.claim_radio_consumer();
+            loop {
+                // Subscribe to the supersede signal and register the waiter
+                // BEFORE checking the epoch. The epoch bump in
+                // claim_radio_consumer happens-before its notify, so a newer
+                // consumer is observed either as a wake here or as a stale epoch
+                // in the check below — never lost. See claim_radio_consumer.
+                let superseded = session.consumer_supersede.notified();
+                tokio::pin!(superseded);
+                superseded.as_mut().enable();
+
+                if !session.is_current_radio_consumer(my_epoch) {
+                    // A newer connection took over. Hand off WITHOUT consuming
+                    // another chunk (biased select never let recv win a race
+                    // against this check either).
+                    guard.superseded = true;
+                    info!(
+                        stream_id = %session.id,
+                        connected_secs = guard.started.elapsed().as_secs(),
+                        "radio_stream_superseded — handed the PCM channel to a \
+                         newer connection (renderer reconnected)"
+                    );
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+                    // Supersede wins ties: if a chunk is also ready we still
+                    // drop the recv future unread, leaving the chunk in the
+                    // channel for the new owner.
+                    _ = &mut superseded => continue,
+                    maybe_chunk = session.recv_chunk() => {
+                        match maybe_chunk {
+                            Some(chunk) => yield Ok(bytes::Bytes::from(chunk)),
+                            None => {
+                                // recv returned None → the PCM channel was closed
+                                // (all senders, incl. the keep-alive, dropped). A
+                                // radio session should stay open across upstream
+                                // reconnects, so this is worth surfacing.
+                                guard.completed = true;
+                                info!(
+                                    stream_id = %session.id,
+                                    connected_secs = guard.started.elapsed().as_secs(),
+                                    "radio_stream_channel_closed — PCM channel ended \
+                                     (senders dropped); renderer will see EOF"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         } else {
             // Coalesce small chunks into larger HTTP writes (target >=64 KB).
@@ -261,12 +537,14 @@ pub async fn handle_stream(
                 yield Ok(bytes::Bytes::from(coalesce_buf));
             }
         }
-    });
+    };
+    let body = corps_compte(flux, compteur);
 
     let status = if use_partial {
         StatusCode::PARTIAL_CONTENT
     } else {
-        StatusCode::OK
+        // 206 déjà décidé plus haut pour une reprise de radio bornée, sinon 200.
+        bounded_status
     };
 
     (status, headers, body).into_response()
@@ -372,6 +650,32 @@ async fn serve_file(
 /// With a faststart map the virtual file is `header (ftyp+moov, in memory)` then
 /// the original file's mdat body; without one it's the plain file. Byte counting
 /// feeds the poller's actively-fetching heuristic.
+/// Envelopper un flux de sortie pour compter ce qu'il sert reellement.
+///
+/// `bytes_sent` n'etait incremente que dans `build_file_body` — le chemin
+/// FICHIER. Radio et mandataire n'y passent pas : leur compteur restait a zero
+/// quels que soient les octets livres. Or `output_reach` (routes/zones.rs) en
+/// deduit « personne n'ecoute », et le diagnostic de zone affiche le meme
+/// chiffre : une zone navigateur jouant une radio etait declaree sans onglet
+/// pendant que l'onglet jouait (Bilou, #1841).
+///
+/// On compte a la SORTIE du flux plutot qu'a chaque `yield` : tous les
+/// morceaux passent par la, y compris ceux qu'on ajoutera. Un compteur qu'il
+/// faut penser a mettre a jour finit toujours par mentir quelque part.
+fn corps_compte<S>(flux: S, compteur: std::sync::Arc<StreamSession>) -> Body
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+{
+    Body::from_stream(futures_util::StreamExt::map(flux, move |morceau| {
+        if let Ok(ref o) = morceau {
+            compteur
+                .bytes_sent
+                .fetch_add(o.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        morceau
+    }))
+}
+
 fn build_file_body(
     faststart: Option<tune_core::audio::faststart::FaststartMap>,
     path: String,
@@ -463,12 +767,176 @@ fn parse_range_start(range: &str) -> Option<u64> {
 
 // ─── HTTPS→HTTP proxy ───────────────────────────────────────────
 
+/// Max number of transparent upstream re-connections after a mid-stream
+/// body error before we give up and end the response.
+const PROXY_MAX_RESUMES: u32 = 5;
+
+/// Max number of URL re-resolutions when a signed CDN URL has expired.
+/// Bounded so a genuinely-dead track can't loop forever.
+const PROXY_MAX_RERESOLVES: u32 = 3;
+
+/// True when an upstream HTTP status indicates an expired/invalid signed URL
+/// (Qobuz/Tidal signatures return 403 Forbidden or 410 Gone once `etsp`
+/// passes). These are re-resolvable — a fresh signed URL for the same file
+/// will succeed; a plain 404/5xx is not, so we don't re-resolve those.
+fn is_expired_url_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::GONE
+}
+
+/// Send a GET for `url` (optionally with `Range: bytes={start}-`) and, if the
+/// request fails to send OR the CDN answers with an expiry status (403/410),
+/// re-resolve a fresh signed URL via `reresolve` and retry — bounded by
+/// `PROXY_MAX_RERESOLVES`. Returns the successful response together with the
+/// URL that produced it (which the caller stores back on the session so later
+/// resumes use the fresh URL). Byte-exactness is preserved: the retry re-uses
+/// the SAME absolute `start` offset against the same file.
+async fn send_with_reresolve(
+    client: &'static reqwest::Client,
+    url: String,
+    start: Option<u64>,
+    reresolve: &Option<ReresolveFn>,
+) -> Result<(reqwest::Response, String), ()> {
+    let mut url = url;
+    let mut attempts: u32 = 0;
+    loop {
+        let mut req = client.get(&url).header("Accept-Encoding", "identity");
+        if let Some(s) = start {
+            req = req.header("Range", format!("bytes={s}-"));
+        }
+        let outcome = req.send().await;
+
+        // Decide whether this attempt needs a fresh URL.
+        let needs_reresolve = match &outcome {
+            Err(e) => {
+                warn!(error = %e, url = %url, "proxy_upstream_error");
+                true
+            }
+            Ok(r) if is_expired_url_status(r.status()) => {
+                warn!(status = %r.status(), url = %url, "proxy_upstream_expired_status");
+                true
+            }
+            Ok(_) => false,
+        };
+
+        if !needs_reresolve {
+            // Safe: matched Ok(_) above.
+            return Ok((outcome.unwrap(), url));
+        }
+
+        let Some(reresolve) = reresolve else {
+            // No re-resolver (local/non-expiring source) — nothing more to do.
+            return Err(());
+        };
+        if attempts >= PROXY_MAX_RERESOLVES {
+            warn!(url = %url, "proxy_reresolve_giveup");
+            return Err(());
+        }
+        attempts += 1;
+        match reresolve().await {
+            Ok(fresh) => {
+                info!(attempts, start = ?start, "proxy_url_reresolved");
+                url = fresh;
+            }
+            Err(e) => {
+                warn!(error = %e, attempts, "proxy_reresolve_failed");
+                return Err(());
+            }
+        }
+    }
+}
+
+/// Build a body that streams `initial` chunks to the client and, on a
+/// mid-stream body error (reqwest "error decoding response body" — a dropped
+/// Akamai keep-alive connection, NOT a content-decode issue since the client
+/// has no compression features), transparently re-fetches the CDN from the
+/// exact byte offset reached and continues. The renderer never sees the drop,
+/// so Hi-Res tracks no longer stop mid-file (#1136).
+///
+/// Bytes are streamed verbatim — no decoding or transformation — so the audio
+/// stays byte-exact. `abs_offset` is the absolute file offset of the first
+/// byte of `initial` (0 for a full fetch, N for a `bytes=N-` resume).
+fn resumable_proxy_body(
+    client: &'static reqwest::Client,
+    upstream_url: String,
+    initial: reqwest::Response,
+    abs_offset: u64,
+    reresolve: Option<ReresolveFn>,
+    compteur: std::sync::Arc<StreamSession>,
+) -> Body {
+    let flux = async_stream::stream! {
+        use futures_util::StreamExt;
+        let mut resp = initial;
+        // Current (possibly re-resolved) CDN URL we reconnect against.
+        let mut url = upstream_url;
+        // Absolute file offset of the next byte we expect to yield.
+        let mut pos = abs_offset;
+        let mut resumes: u32 = 0;
+        loop {
+            let mut stream = resp.bytes_stream();
+            let mut clean_eof = true;
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        pos += chunk.len() as u64;
+                        yield Ok::<_, std::io::Error>(chunk);
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, pos, resumes, "proxy_chunk_error");
+                        clean_eof = false;
+                        break;
+                    }
+                    None => break, // clean end of body
+                }
+            }
+            if clean_eof {
+                break;
+            }
+            if resumes >= PROXY_MAX_RESUMES {
+                warn!(pos, "proxy_resume_giveup");
+                break;
+            }
+            resumes += 1;
+            // Backoff before reconnecting: the CDN just dropped us.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                200u64 * u64::from(resumes),
+            ))
+            .await;
+            // Reconnect at the exact byte offset reached. If the connection
+            // fails to send or the signed URL has expired (403/410), this
+            // re-resolves a fresh signed URL and retries the SAME offset —
+            // byte-exact — so a mid-track URL expiry no longer stops playback.
+            match send_with_reresolve(client, url.clone(), Some(pos), &reresolve).await {
+                Ok((r, fresh_url)) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    if fresh_url != url {
+                        url = fresh_url;
+                    }
+                    info!(pos, resumes, "proxy_resume_reconnect_206");
+                    resp = r;
+                }
+                Ok((r, _)) => {
+                    warn!(status = %r.status(), pos, "proxy_resume_bad_status");
+                    break;
+                }
+                Err(()) => {
+                    warn!(pos, "proxy_resume_upstream_failed");
+                    break;
+                }
+            }
+        }
+    };
+    corps_compte(flux, compteur)
+}
+
 async fn proxy_stream(
     upstream_url: &str,
     info: &StreamInfo,
     is_radio: bool,
     req_headers: &HeaderMap,
+    session: std::sync::Arc<StreamSession>,
 ) -> Response {
+    // Re-resolver for expiring signed CDN URLs (Qobuz/Tidal). Present only for
+    // streaming proxy sessions; None for radio and non-expiring sources.
+    let reresolve = session.reresolve.lock().await.clone();
     let client = if is_radio {
         // Radio streams are infinite — use a client with no total timeout
         // so the connection stays alive until the user stops playback.
@@ -498,24 +966,54 @@ async fn proxy_stream(
     // ranges (FLAC header parsing) are NOT forwarded — forwarding every
     // micro-range hammers Akamai and itself causes the drops.
     const RESUME_RANGE_THRESHOLD: u64 = 1_048_576; // 1 MiB
+    // The 1 MiB threshold exists ONLY to tame the DMP-A8 (Lavf), which fires many
+    // rapid micro-Range requests while parsing the FLAC header — forwarding each
+    // to the CDN hammers Akamai. Other renderers don't do that. The Lumin
+    // firmware (Luxman NT-07 OpenHome, Vincent) instead does a two-step seek:
+    // `bytes=0-` to read the header, then `bytes=244-` to fetch the first audio
+    // frame. When we neither forward that small range nor answer 206 from 244 —
+    // returning 200 from byte 0 — the renderer gets header bytes where it expects
+    // audio, rejects the stream, and loops re-reading the header (peak_pos=0,
+    // stopped after 74s). So keep the 1 MiB threshold ONLY for Lavf; for every
+    // other agent honour any non-zero `bytes=N-` by forwarding it (→ 206 from N).
+    let is_lavf = req_headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ua| ua.to_ascii_lowercase().contains("lavf"));
+    let resume_threshold = if is_lavf { RESUME_RANGE_THRESHOLD } else { 1 };
     let resume_start = range_value
         .as_deref()
         .and_then(parse_range_start)
-        .filter(|&n| n >= RESUME_RANGE_THRESHOLD);
+        .filter(|&n| n >= resume_threshold);
 
-    let mut upstream_req = client.get(upstream_url);
     if let Some(start) = resume_start {
-        upstream_req = upstream_req.header("Range", format!("bytes={start}-"));
-        info!(url = upstream_url, start, "proxy_forward_resume_range");
+        info!(
+            url = upstream_url,
+            start, is_lavf, "proxy_forward_resume_range"
+        );
     }
 
-    let upstream_resp = match upstream_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, url = upstream_url, "proxy_upstream_error");
-            return StatusCode::BAD_GATEWAY.into_response();
+    // Ask the CDN for the raw bytes — `identity` disables any upstream
+    // content-coding so we proxy the FLAC verbatim (byte-exact audio).
+    // send_with_reresolve retries against a FRESH signed URL when the request
+    // fails to send or the CDN returns an expiry status (403/410) — this is the
+    // path the client Range-resume hits when the Qobuz `etsp` signature has
+    // expired mid-track (#1136), which the old single-shot send could not
+    // recover from.
+    let (upstream_resp, upstream_url) =
+        match send_with_reresolve(client, upstream_url.to_string(), resume_start, &reresolve).await
+        {
+            Ok(pair) => pair,
+            Err(()) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+    // Persist a re-resolved URL so later resumes start from the fresh signature.
+    {
+        let mut pu = session.proxy_url.lock().await;
+        if pu.as_deref() != Some(upstream_url.as_str()) {
+            *pu = Some(upstream_url.clone());
         }
-    };
+    }
+    let upstream_url = upstream_url.as_str();
     // Only treat it as a real resume if the CDN honoured the Range (206).
     let resume_start = if upstream_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         resume_start
@@ -579,20 +1077,14 @@ async fn proxy_stream(
         }
         info!(url = upstream_url, start, "proxy_resume_206_from_cdn");
 
-        let body = Body::from_stream(async_stream::stream! {
-            let mut stream = upstream_resp.bytes_stream();
-            use futures_util::StreamExt;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                    Err(e) => {
-                        warn!(error = %e, "proxy_chunk_error");
-                        break;
-                    }
-                }
-            }
-        });
-
+        let body = resumable_proxy_body(
+            client,
+            upstream_url.to_string(),
+            upstream_resp,
+            start,
+            reresolve.clone(),
+            session.clone(),
+        );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -608,7 +1100,7 @@ async fn proxy_stream(
 
         info!(url = upstream_url, "proxy_radio_206_open_ended");
 
-        let body = Body::from_stream(async_stream::stream! {
+        let flux = async_stream::stream! {
             let mut stream = upstream_resp.bytes_stream();
             use futures_util::StreamExt;
             while let Some(chunk_result) = stream.next().await {
@@ -620,7 +1112,8 @@ async fn proxy_stream(
                     }
                 }
             }
-        });
+        };
+        let body = corps_compte(flux, session.clone());
 
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -632,20 +1125,14 @@ async fn proxy_stream(
             HeaderValue::from_str(&format!("bytes 0-{}/{}", cl - 1, cl)).unwrap(),
         );
 
-        let body = Body::from_stream(async_stream::stream! {
-            let mut stream = upstream_resp.bytes_stream();
-            use futures_util::StreamExt;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                    Err(e) => {
-                        warn!(error = %e, "proxy_chunk_error");
-                        break;
-                    }
-                }
-            }
-        });
-
+        let body = resumable_proxy_body(
+            client,
+            upstream_url.to_string(),
+            upstream_resp,
+            0,
+            reresolve.clone(),
+            session.clone(),
+        );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -653,20 +1140,14 @@ async fn proxy_stream(
         headers.insert("Content-Length", HeaderValue::from(cl));
     }
 
-    let body = Body::from_stream(async_stream::stream! {
-        let mut stream = upstream_resp.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                Err(e) => {
-                    warn!(error = %e, "proxy_chunk_error");
-                    break;
-                }
-            }
-        }
-    });
-
+    let body = resumable_proxy_body(
+        client,
+        upstream_url.to_string(),
+        upstream_resp,
+        0,
+        reresolve.clone(),
+        session.clone(),
+    );
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -681,7 +1162,132 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range_start;
+    use super::{accepts_chunked_live_stream, corps_compte, parse_range_start};
+    use tune_core::http::streamer::{
+        LIVE_BOUNDED_TOTAL_LEN, StreamInfo, StreamSession, build_wav_header_bounded_live,
+        build_wav_header_streaming,
+    };
+
+    /// #1841 — le compteur d'octets ne bougeait que sur le chemin fichier.
+    /// Radio et mandataire servaient des octets sans jamais le dire, et
+    /// `output_reach` en concluait que personne n'ecoutait.
+    #[tokio::test]
+    async fn un_flux_servi_incremente_le_compteur_de_la_session() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let session = std::sync::Arc::new(StreamSession::new(
+            "test".into(),
+            StreamInfo::default(),
+            false,
+            4,
+        ));
+        assert_eq!(session.bytes_sent.load(Relaxed), 0);
+
+        let flux = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::from_static(b"defgh")),
+        ]);
+        let body = corps_compte(flux, session.clone());
+
+        // Consommer le corps : c'est la lecture qui compte, pas sa creation.
+        let mut flux_corps = body.into_data_stream();
+        while let Some(morceau) = flux_corps.next().await {
+            morceau.unwrap();
+        }
+
+        assert_eq!(
+            session.bytes_sent.load(Relaxed),
+            8,
+            "trois octets puis cinq — ce que le client a reellement recu"
+        );
+    }
+
+    /// Un corps qui n'est jamais lu n'a rien servi : le compteur doit rester
+    /// a zero, sinon « quelqu'un ecoute » deviendrait vrai des la creation.
+    #[tokio::test]
+    async fn un_corps_non_consomme_ne_compte_rien() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let session = std::sync::Arc::new(StreamSession::new(
+            "test".into(),
+            StreamInfo::default(),
+            false,
+            4,
+        ));
+        let flux = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(b"abc"),
+        )]);
+        let _body = corps_compte(flux, session.clone());
+
+        assert_eq!(session.bytes_sent.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn lavf_renderers_keep_the_chunked_contract() {
+        // The Eversolo DMP-A10/A8 and every other libavformat renderer: without
+        // the chunked, length-less body and its 0xFFFF_FFFF header they treat
+        // the radio as a bounded file and cut every ~6 min (FIP, commit 3d5a3a8f).
+        assert!(accepts_chunked_live_stream(Some("Lavf/58.45.100")));
+        assert!(accepts_chunked_live_stream(Some("lavf/60.3.100")));
+        assert!(accepts_chunked_live_stream(Some(
+            "SomeRenderer (Lavf/59.27.100)"
+        )));
+    }
+
+    #[test]
+    fn other_renderers_get_the_file_contract() {
+        // Yves' darTZeel LHC-208 (#1689): refuses chunked transfer, requires
+        // Content-Length + Range. Everything that plays on it carries a length.
+        assert!(!accepts_chunked_live_stream(Some("player/100")));
+        assert!(!accepts_chunked_live_stream(Some("Sonos/84.1-56110")));
+    }
+
+    #[test]
+    fn unknown_user_agent_keeps_current_behaviour() {
+        // Blast radius: only a renderer that positively identifies itself as
+        // something other than Lavf sees a different response.
+        assert!(accepts_chunked_live_stream(None));
+        assert!(accepts_chunked_live_stream(Some("")));
+    }
+
+    #[test]
+    fn bounded_live_header_matches_the_announced_content_length() {
+        // Le lecteur qui reçoit le contrat fichier lit Content-Length ET les
+        // tailles de l'en-tête : les trois doivent concorder et rester
+        // positives en 32 bits signés.
+        let h = build_wav_header_bounded_live(2, 44100, 16);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert_eq!(data_size as u64 + 44, LIVE_BOUNDED_TOTAL_LEN);
+        assert!(data_size as i32 > 0);
+        assert!(riff_size as i32 > 0);
+        assert!(LIVE_BOUNDED_TOTAL_LEN <= i32::MAX as u64);
+
+        // L'en-tête Lavf est justement celui qui passe en négatif — d'où les
+        // deux contrats.
+        let l = build_wav_header_streaming(2, 44100, 16);
+        assert_eq!(u32::from_le_bytes([l[40], l[41], l[42], l[43]]) as i32, -1);
+    }
+
+    #[test]
+    fn resume_after_the_wav_header_is_the_range_the_renderer_sends() {
+        // Sur ses fichiers WAV locaux, le LHC repart systématiquement à
+        // l'octet 44 — juste après l'en-tête. C'est ce Range qu'il faut
+        // honorer sur la radio bornée : rien de l'en-tête, puis le direct.
+        assert_eq!(parse_range_start("bytes=44-"), Some(44));
+        let skip = parse_range_start("bytes=44-").unwrap().min(44) as usize;
+        assert_eq!(skip, 44, "l'en-tête entier est sauté");
+
+        // Une reprise au-delà de l'en-tête ne peut pas « chercher » dans un
+        // direct : on plafonne le saut à la taille de l'en-tête et on sert le
+        // direct maintenant.
+        let far = parse_range_start("bytes=1048576-").unwrap().min(44) as usize;
+        assert_eq!(far, 44);
+
+        // Le sondage initial (bytes=0-) ne saute rien.
+        assert_eq!(parse_range_start("bytes=0-").unwrap().min(44), 0);
+    }
 
     #[test]
     fn parse_range_start_cases() {

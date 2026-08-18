@@ -27,7 +27,6 @@ pub fn router() -> Router<AppState> {
         .route("/plugins/{name}/install", post(marketplace_install))
         .route("/plugins/{name}/vote", post(marketplace_vote))
         .route("/community/artist-image", post(report_artist_image))
-        .route("/community/genre-correction", post(submit_genre_correction))
         .route("/community/covers", post(submit_community_cover))
         .route("/community/covers/sync", post(sync_community_covers))
         .route("/bridge/status", get(bridge_status))
@@ -248,6 +247,14 @@ async fn sso_callback(
         .set_account_premium(user.premium, user.license_expires_at.clone())
         .await;
 
+    // Qobuz endpoint order (founder flag): persist and push into the live
+    // QobuzService so the order applies without a restart.
+    state
+        .license
+        .set_qobuz_proxy_first(user.qobuz_proxy_first)
+        .await;
+    crate::background::apply_qobuz_proxy_first(&state.services, user.qobuz_proxy_first).await;
+
     // Create or link local profile, then issue a local JWT session
     use tune_core::db::backend::ToSqlValue;
     let existing_id: Option<i64> = state
@@ -285,12 +292,11 @@ async fn sso_callback(
         let default_color = "#6366f1";
         state
             .backend
-            .execute(
+            .execute_returning_id(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
                 &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
             )
-            .ok();
-        state.backend.last_insert_rowid()
+            .unwrap_or(0)
     };
 
     let role = if user.is_admin { "admin" } else { "user" };
@@ -360,6 +366,9 @@ async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
         settings.delete(key).ok();
     }
     state.license.clear_account_premium().await;
+    // Founder endpoint order came from this account — revert to direct-first.
+    state.license.set_qobuz_proxy_first(false).await;
+    crate::background::apply_qobuz_proxy_first(&state.services, false).await;
     info!("sso_disconnected");
     Json(json!({ "connected": false }))
 }
@@ -499,31 +508,6 @@ async fn report_artist_image(
     match tune_core::cloud::community::report_artist_image(
         &body.mbid,
         &body.image_url,
-        base_url.as_deref(),
-    )
-    .await
-    {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct GenreCorrectionRequest {
-    album_id: String,
-    genre: String,
-}
-
-async fn submit_genre_correction(
-    State(state): State<AppState>,
-    Json(body): Json<GenreCorrectionRequest>,
-) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let base_url = settings.get("mozaik_base_url").ok().flatten();
-
-    match tune_core::cloud::community::submit_genre_correction(
-        &body.album_id,
-        &body.genre,
         base_url.as_deref(),
     )
     .await
@@ -829,6 +813,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
             json!({
                 "display_name": f.display_name(),
                 "enabled": enabled,
+                "available": f.available(),
             }),
         );
     }
@@ -839,6 +824,16 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         Some(state.license.free_zone_limit())
     };
 
+    // Floating-license single-session model: when set, `tier` above is already
+    // Free (premium is gated off here) and this object tells the UI WHY — the
+    // license is currently active on another of the user's servers.
+    let session_conflict = ls.session_conflict.as_ref().map(|c| {
+        json!({
+            "active_server": c.active_server,
+            "active_since": c.active_since,
+        })
+    });
+
     Json(json!({
         "tier": ls.tier,
         "license_key": ls.license_key,
@@ -847,6 +842,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         "hardware_fingerprint": ls.hardware_fingerprint,
         "features": features,
         "zone_limit": zone_limit,
+        "session_conflict": session_conflict,
     }))
 }
 
@@ -885,6 +881,74 @@ async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
         json!({"tier": "free", "expires_at": null}),
     );
     Json(json!({"status": "deactivated", "tier": "free"}))
+}
+
+/// Validate the currently-stored license key against mozaiklabs.fr and apply
+/// the authoritative tier via `update_from_server`. Returns the effective tier
+/// afterwards. On an unreachable/erroring server it leaves the cached tier
+/// untouched (a freshly-entered, still-pending key therefore stays Free until a
+/// genuine online confirmation). Shared by the on-demand validate route and the
+/// "set key" route so a newly-entered key is confirmed immediately instead of
+/// unlocking Premium locally with no server round-trip.
+pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::license::Tier {
+    let ls = state.license.license_state().await;
+    let Some(key) = ls.license_key.clone() else {
+        return tune_core::license::Tier::Free;
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+    let payload = json!({
+        "license_key": key,
+        "hardware_fingerprint": ls.hardware_fingerprint,
+        "server_id": server_id,
+        "version": tune_core::version(),
+    });
+
+    let resp = state
+        .http_client
+        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload)
+        .send()
+        .await;
+    let Ok(resp) = resp else {
+        return state.license.tier().await;
+    };
+    if !resp.status().is_success() {
+        return state.license.tier().await;
+    }
+    let Ok(body) = resp.json::<Value>().await else {
+        return state.license.tier().await;
+    };
+
+    // Default false: a missing verdict must NOT unlock a pending key.
+    let valid = body
+        .get("license_valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !valid {
+        // Server rejects it → keep the (Free/pending) cached tier; do not grant.
+        return state.license.tier().await;
+    }
+
+    let tier = match body.get("license_tier").and_then(|v| v.as_str()) {
+        Some("premium") => tune_core::license::Tier::Premium,
+        _ => tune_core::license::Tier::Free,
+    };
+    let expires_at = body
+        .get("license_expires_at")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    state
+        .license
+        .update_from_server(tier, expires_at.clone())
+        .await;
+    state.event_bus.emit(
+        "license.updated",
+        json!({"tier": tier, "expires_at": expires_at}),
+    );
+    tier
 }
 
 /// POST /cloud/license/validate
@@ -979,19 +1043,45 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or(true);
 
     if !valid {
-        info!("license_invalidated_by_server_validate");
-        state
-            .license
-            .update_from_server(tune_core::license::Tier::Free, None)
-            .await;
-        state.event_bus.emit(
-            "license.updated",
-            json!({"tier": "free", "expires_at": null}),
-        );
+        // Mirror the heartbeat guard: a bare `license_valid:false` is NOT an
+        // authoritative revocation. A key is always present here (checked above),
+        // so unless the server returned a genuine PAST `license_expires_at`, keep
+        // the cached premium tier and do NOT persist Free. Persisting Free used
+        // to permanently strip a valid key on a transient rejection (fingerprint
+        // re-binding, server hiccup) — and clicking "Valider" would re-trigger it
+        // even with the heartbeat fixed. Only a true past expiry revokes.
+        let expired_authoritatively = body
+            .get("license_expires_at")
+            .and_then(|v| v.as_str())
+            .map(tune_core::license::is_timestamp_past)
+            .unwrap_or(false);
+
+        if expired_authoritatively {
+            info!("license_invalidated_by_server_validate (authoritative expiry)");
+            state
+                .license
+                .update_from_server(tune_core::license::Tier::Free, None)
+                .await;
+            state.event_bus.emit(
+                "license.updated",
+                json!({"tier": "free", "expires_at": null}),
+            );
+            return Json(json!({
+                "status": "invalid",
+                "tier": "free",
+                "message": "License key is not valid",
+            }))
+            .into_response();
+        }
+
+        // Transient rejection: keep the cached tier — Premium survives within the
+        // offline grace window instead of being permanently revoked.
+        warn!("license_validate_rejected_keeping_cached_tier");
         return Json(json!({
-            "status": "invalid",
-            "tier": "free",
-            "message": "License key is not valid",
+            "status": "cached",
+            "tier": ls.tier,
+            "message": "Server could not confirm the license right now; Premium is retained (grace period).",
+            "cached": true,
         }))
         .into_response();
     }

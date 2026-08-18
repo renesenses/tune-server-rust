@@ -7,6 +7,134 @@ use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
 
+/// Build the `LIKE` pattern that matches every track whose file lives under
+/// `prefix` (recursively). Trailing separators are trimmed so a library pointed
+/// at a share/drive root doesn't produce a doubled separator that matches
+/// nothing (same trap handled in `browse.rs`). The server's `MAIN_SEPARATOR` is
+/// the separator stored in `tracks.file_path` (paths are absolute local paths on
+/// the scanning host), so both the flat filter and the folder facet agree.
+pub fn folder_like_pattern(prefix: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let base = prefix.trim_end_matches(['/', '\\']);
+    format!("{base}{sep}%")
+}
+
+/// SQL suffix that must follow every `LIKE` whose pattern is a **file path**.
+///
+/// Postgres treats a backslash inside a `LIKE` pattern as the default escape
+/// character; SQLite has no default escape character at all. Folder patterns
+/// are built from absolute paths, so on a Windows host the pattern reads
+/// `G:\Blues 2\%` — Postgres consumes the trailing `\%` as a *literal* percent
+/// sign, the pattern degrades to the literal string `G:Blues 2%`, and it
+/// matches no row. Every folder then reports "0 pistes" while the library is
+/// perfectly scanned (JF, Windows + Postgres: all four roots empty in
+/// Répertoires, and the data-derived fallback root fell to zero too because it
+/// reuses the same pattern).
+///
+/// `ESCAPE ''` selects *no* escape character, which is exactly SQLite's
+/// behaviour — so both engines now read the backslash literally. SQLite rejects
+/// an empty ESCAPE string, hence the bare `LIKE` there: its semantics are
+/// already the target ones, so this is a no-op on SQLite by construction.
+///
+/// Known and unchanged on both engines: `%` and `_` inside a real folder name
+/// still act as wildcards (over-match, never under-match). Escaping them would
+/// require an escape character, which is what we are deliberately giving up.
+pub fn like_escape_clause(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => " ESCAPE ''",
+        Engine::Sqlite => "",
+    }
+}
+
+/// The longest common directory prefix of all `tracks.file_path` — the real
+/// library root inferred from the data. Fallback for the folder views (Oxygen
+/// facet, browse "Répertoires") when `music_dirs` is stale and its configured
+/// roots match no stored path (the browse_root_zero_tracks drift: e.g. .18 set
+/// to /mnt/music while files live under /data/music). For sorted strings
+/// LCP(all) == LCP(min, max), so two aggregates suffice — no full scan. Returns
+/// the directory (trailing separator dropped), or None if the library is empty
+/// or the common prefix has no separator.
+pub fn derive_common_root(backend: &dyn DbBackend) -> Option<String> {
+    let agg = |f: &str| -> Option<String> {
+        backend
+            .query_one(
+                &format!(
+                    "SELECT {f}(file_path) FROM tracks \
+                     WHERE file_path IS NOT NULL AND file_path <> ''"
+                ),
+                &[],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_string()))
+    };
+    let (min, max) = (agg("MIN")?, agg("MAX")?);
+    let lcp = common_prefix(&min, &max);
+    // Trim back to the last separator → a directory (handles both / and \ so it
+    // works whichever separator the scanning host stored).
+    let idx = lcp.rfind(['/', '\\'])?;
+    let root = &lcp[..idx];
+    (!root.is_empty()).then(|| root.to_string())
+}
+
+/// Longest common (char-boundary-safe) prefix of two strings.
+pub(crate) fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let mut end = 0;
+    for ((i, ca), cb) in a.char_indices().zip(b.chars()) {
+        if ca != cb {
+            break;
+        }
+        end = i + ca.len_utf8();
+    }
+    &a[..end]
+}
+
+#[cfg(test)]
+mod common_root_tests {
+    use super::common_prefix;
+
+    #[test]
+    fn common_prefix_is_the_shared_directory() {
+        // Real .18 case: min/max of the library share "/data/music/".
+        assert_eq!(
+            common_prefix("/data/music/10. x.flac", "/data/music/V_DSF/y.dsf"),
+            "/data/music/"
+        );
+        assert_eq!(common_prefix("/a/b", "/a/c"), "/a/");
+        assert_eq!(common_prefix("/x", "/y"), "/");
+        assert_eq!(common_prefix("same", "same"), "same");
+        // Multibyte: must cut on a char boundary, never mid-codepoint.
+        assert_eq!(common_prefix("/muské/a", "/muskà/b"), "/musk");
+    }
+}
+
+#[cfg(test)]
+mod like_escape_tests {
+    use super::{Engine, like_escape_clause};
+
+    /// Regression guard for the Windows + Postgres "Dossier vide" bug: a folder
+    /// pattern built from `G:\Blues 2` ends in `\%`, which Postgres reads as an
+    /// escaped — hence literal — percent sign unless the escape mechanism is
+    /// switched off. Verified against PostgreSQL 15: without the clause the
+    /// count is 0, with it the count is right. Deleting this suffix silently
+    /// empties the Répertoires view and the Oxygen folder drill-down for every
+    /// Windows user on Postgres — and only for them, which is why it went
+    /// unnoticed.
+    #[test]
+    fn postgres_disables_the_backslash_escape() {
+        assert_eq!(like_escape_clause(Engine::Postgres), " ESCAPE ''");
+    }
+
+    /// SQLite has no default escape character, so a bare LIKE already reads the
+    /// backslash literally — and it *rejects* an empty ESCAPE string
+    /// ("ESCAPE expression must be a single character"). The clause must stay
+    /// empty here: this is a correctness constraint, not a style choice.
+    #[test]
+    fn sqlite_keeps_the_bare_like() {
+        assert_eq!(like_escape_clause(Engine::Sqlite), "");
+    }
+}
+
 /// Engine-agnostic SQL builders for track_repo.
 ///
 /// Complex dynamic queries (search() FTS5, list_doubtful() aggregate,
@@ -17,7 +145,14 @@ pub mod sql {
     use super::SqlDialect;
 
     pub fn select_track() -> &'static str {
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+        // `album_artist` falls back to the album's canonical artist (`albums.
+        // artist_id`, e.g. "Various Artists" for a compilation) when the per-file
+        // ALBUMARTIST tag is missing. Without this, the Oxygen "by genre" view —
+        // which groups a *filtered subset* of an album's tracks client-side — has
+        // no album_artist to key on and shows track 1's artist for compilations
+        // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
+        // position, so row parsing is unchanged.
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN artists aal ON al.artist_id = aal.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -32,10 +167,10 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path";
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
-        let placeholders: Vec<String> = (1..=27).map(|i| d.placeholder(i)).collect();
+        let placeholders: Vec<String> = (1..=28).map(|i| d.placeholder(i)).collect();
         format!(
             "INSERT INTO tracks ({INSERT_COLS}) VALUES ({})",
             placeholders.join(", ")
@@ -134,6 +269,14 @@ pub mod sql {
     pub fn update_audio_hash<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE tracks SET audio_hash = {} WHERE file_path = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn update_duration<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET duration_ms = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -333,7 +476,7 @@ impl TrackRepo {
 
     fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::insert, sql::insert);
-        let params: [&dyn ToSqlValue; 27] = [
+        let params: [&dyn ToSqlValue; 28] = [
             &track.title,
             &track.album_id,
             &track.artist_id,
@@ -361,8 +504,16 @@ impl TrackRepo {
             &track.label,
             &track.musicbrainz_recording_id,
             &track.comments,
+            &track.cover_path,
         ];
-        self.db.execute(&sql, &params).map_err(TuneError::Db)?;
+        // Capture the new track id atomically, BEFORE the file_first_seen
+        // insert below — otherwise `last_insert_rowid()` at the end returns that
+        // side-table's row id for any newly-seen file (intervening-insert race,
+        // audit item 5).
+        let id = self
+            .db
+            .execute_returning_id(&sql, &params)
+            .map_err(TuneError::Db)?;
 
         // Record the library "first seen" timestamp for local files, keyed by
         // path in a side table that survives a full rescan (delete_all wipes
@@ -387,7 +538,7 @@ impl TrackRepo {
             }
         }
 
-        Ok(self.db.last_insert_rowid())
+        Ok(id)
     }
 
     pub fn create(&self, track: &Track) -> Result<i64, TuneError> {
@@ -438,6 +589,18 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::delete, sql::delete);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        // Drop any queue entry referencing this track. The FK ON DELETE CASCADE
+        // is present on a fresh schema but absent on DBs created by the
+        // unified-queue migration, so a stale queue_items row would otherwise
+        // linger and later break set_queue with a FK error (JP Borderies).
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let _ = self.db.execute(
+            &format!("DELETE FROM queue_items WHERE track_id = {ph}"),
+            &params,
+        );
         Ok(())
     }
 
@@ -450,6 +613,10 @@ impl TrackRepo {
             let _ = tx.execute("DELETE FROM albums", &[]);
             let _ = tx.execute("DELETE FROM artists", &[]);
             let _ = tx.execute("DELETE FROM track_credits", &[]);
+            // Clear local (track-backed) queue entries too — CASCADE is missing
+            // on migrated DBs, so wiping the library must not leave a queue
+            // pointing at deleted tracks (JP Borderies).
+            let _ = tx.execute("DELETE FROM queue_items WHERE track_id IS NOT NULL", &[]);
             Ok(())
         })?;
         Ok(count)
@@ -500,6 +667,24 @@ impl TrackRepo {
         label: Option<&str>,
         composer: Option<&str>,
         q: Option<&str>,
+        artist: Option<&str>,
+        country: Option<&str>,
+        mood: Option<&str>,
+        source_media: Option<&str>,
+        folder: Option<&str>,
+        rating: Option<i32>,
+        collection_ids: Option<&[i64]>,
+        collection_track_ids: Option<&[i64]>,
+        // Facettes Oxygen « lot 1 ». Les prédicats SQL ci-dessous sont les
+        // JUMEAUX de ceux de `routes::library::facets::build_conditions` (autre
+        // crate) : une facette qui compterait autrement que la liste qu'elle
+        // filtre serait pire qu'une facette absente.
+        favorite: Option<&str>,
+        playlist: Option<&str>,
+        untagged: Option<&str>,
+        // Année d'ENREGISTREMENT (`albums.original_year`) — distincte de
+        // `year`, qui est celle de l'édition.
+        original_year: Option<i32>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -564,6 +749,151 @@ impl TrackRepo {
             conditions.push(format!("LOWER(t.composer) LIKE LOWER({})", make_ph(idx)));
             owned_params.push(SqlValue::Text(format!("%{}%", cmp)));
             idx += 1;
+        }
+
+        if let Some(a) = artist {
+            // The artist name lives on the joined `artists` table (tracks stores
+            // only artist_id) — `tracks` has no artist_name column, so the old
+            // `t.artist_name` predicate raised a SQL error that list_tracks
+            // swallowed into an empty result: clicking an Oxygen "Artistes" facet
+            // returned zero tracks (forum #1189). The base query + count both
+            // LEFT JOIN artists ar, so filter on ar.name.
+            conditions.push(format!("ar.name = {}", make_ph(idx)));
+            owned_params.push(SqlValue::Text(a.to_string()));
+            idx += 1;
+        }
+
+        // Extended-tag filters via the open `track_metadata` k/v store. The key
+        // is a fixed literal; only the value is a bound parameter.
+        for (opt, key) in [
+            (country, "release_country"),
+            (mood, "mood"),
+            (source_media, "source_media"),
+        ] {
+            if let Some(v) = opt {
+                conditions.push(format!(
+                    "EXISTS (SELECT 1 FROM track_metadata tm \
+                     WHERE tm.track_id = t.id AND tm.key = '{key}' AND tm.value = {})",
+                    make_ph(idx)
+                ));
+                owned_params.push(SqlValue::Text(v.to_string()));
+                idx += 1;
+            }
+        }
+
+        // Folder facet (Oxygen drill-down): restrict to tracks whose file lives
+        // under the selected directory subtree. The current breadcrumb path IS
+        // the filter — recursive so a parent folder includes its sub-folders.
+        if let Some(fld) = folder.filter(|s| !s.is_empty()) {
+            conditions.push(format!(
+                "t.file_path LIKE {}{}",
+                make_ph(idx),
+                like_escape_clause(self.db.engine())
+            ));
+            owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
+            idx += 1;
+        }
+
+        // Album rating (profile 1): tracks inherit their album's rating.
+        if let Some(r) = rating {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM album_ratings arr \
+                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND arr.rating = {})",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Int(r as i64));
+            idx += 1;
+        }
+
+        // Manual collection: album ids are our own i64s (parsed from the
+        // collections setting JSON by the caller), so inlining the IN list is
+        // injection-safe. An empty set matches nothing.
+        if let Some(ids) = collection_ids {
+            if ids.is_empty() {
+                conditions.push("1 = 0".to_string());
+            } else {
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conditions.push(format!("t.album_id IN ({list})"));
+            }
+        }
+
+        // Smart collection: the caller resolved its rules to concrete track ids
+        // (our own i64s), inlined the same injection-safe way as album ids above.
+        // An empty set matches nothing.
+        if let Some(ids) = collection_track_ids {
+            if ids.is_empty() {
+                conditions.push("1 = 0".to_string());
+            } else {
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conditions.push(format!("t.id IN ({list})"));
+            }
+        }
+
+        // L'année d'enregistrement vit sur l'ALBUM : jointure par EXISTS.
+        if let Some(y) = original_year {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND alo.original_year = {})",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Int(y as i64));
+            idx += 1;
+        }
+
+        // Favoris du profil 1 : la piste elle-même, ou son album.
+        if let Some(kind) = favorite.filter(|s| !s.is_empty()) {
+            match kind {
+                "album" => conditions.push(
+                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                     AND f.item_type = 'album' AND f.item_id = t.album_id)"
+                        .to_string(),
+                ),
+                "track" => conditions.push(
+                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                     AND f.item_type = 'track' AND f.item_id = t.id)"
+                        .to_string(),
+                ),
+                // Valeur inconnue : ne rien filtrer plutôt que tout exclure.
+                _ => {}
+            }
+        }
+
+        if let Some(name) = playlist.filter(|s| !s.is_empty()) {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
+                 WHERE pt.track_id = t.id AND LOWER(pl.name) = LOWER({}))",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Text(name.to_string()));
+            idx += 1;
+        }
+
+        // Étiquette manquante : liste FERMÉE, le SQL ne dépend jamais de
+        // l'entrée brute. « Manquant » = NULL ou chaîne vide (un tag effacé
+        // laisse souvent une chaîne vide, et l'utilisateur ne fait pas la
+        // différence).
+        if let Some(field) = untagged.filter(|s| !s.is_empty()) {
+            let missing = match field {
+                "genre" => Some("(t.genre IS NULL OR t.genre = '')"),
+                "year" => Some("(t.year IS NULL OR t.year = 0)"),
+                "artist" => Some("t.artist_id IS NULL"),
+                "album" => Some("t.album_id IS NULL"),
+                "cover" => Some(
+                    "(t.album_id IS NULL OR EXISTS (SELECT 1 FROM albums al \
+                      WHERE al.id = t.album_id AND (al.cover_path IS NULL OR al.cover_path = '')))",
+                ),
+                _ => None,
+            };
+            if let Some(cond) = missing {
+                conditions.push(cond.to_string());
+            }
         }
 
         if let Some(query) = q {
@@ -636,10 +966,37 @@ impl TrackRepo {
         Ok(())
     }
 
+    /// Persist a duration recovered at play time (see the orchestrator's
+    /// play-time backfill) so a track scanned with `duration_ms = 0` self-heals.
+    pub fn update_duration(&self, id: i64, duration_ms: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::update_duration, sql::update_duration);
+        let params: [&dyn ToSqlValue; 2] = [&duration_ms, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Hydrate tracks for a set of ids in ONE query. Order is not preserved
+    /// (SQL `IN` is unordered) — the caller reorders (e.g. by acoustic-similarity
+    /// rank). Ids are trusted i64 from our own queries, so inlining them is safe
+    /// and avoids a variable-length placeholder list across dialects.
+    pub fn list_by_ids(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
+        let rows = self.db.query_many_strong(&sql, &[])?;
         Ok(rows.iter().map(row_to_track).collect())
     }
 
@@ -707,6 +1064,35 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&path];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+    }
+
+    /// `(file_path, album_artist)` of every track whose file path begins with
+    /// `dir_prefix`. Used by the file-watcher to decide compilation status for a
+    /// single re-imported file from its already-scanned siblings — a folder with
+    /// 2+ distinct album_artists is a various-artists compilation (JP Borderies).
+    /// The caller filters to direct children of the folder.
+    pub fn siblings_album_artists(
+        &self,
+        dir_prefix: &str,
+    ) -> Result<Vec<(String, Option<String>)>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let esc = like_escape_clause(self.db.engine());
+        let sql =
+            format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}{esc}");
+        let like = format!("{dir_prefix}%");
+        let params: [&dyn ToSqlValue; 1] = [&like];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|c| {
+                let fp = c.first().and_then(|v| v.as_string())?;
+                let aa = c.get(1).and_then(|v| v.as_string());
+                Some((fp, aa))
+            })
+            .collect())
     }
 
     pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
@@ -846,6 +1232,7 @@ impl TrackRepo {
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
             if track.title.to_lowercase().contains("personal jesus") {
                 tracing::warn!(
@@ -857,7 +1244,7 @@ impl TrackRepo {
                     "BUG_TRACE_insert_personal_jesus"
                 );
             }
-            let params: [&dyn ToSqlValue; 27] = [
+            let params: [&dyn ToSqlValue; 28] = [
                 &track.title,
                 &track.album_id,
                 &track.artist_id,
@@ -885,9 +1272,32 @@ impl TrackRepo {
                 &track.label,
                 &track.musicbrainz_recording_id,
                 &track.comments,
+                &track.cover_path,
             ];
-            if self.db.execute(&insert_sql, &params).is_ok() {
-                count += 1;
+            row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+        }
+        // One backend call for the whole batch: on Postgres this reuses a
+        // single connection + prepared statement instead of a per-row
+        // runtime hop (see DbBackend::execute_many).
+        for (track, res) in tracks
+            .iter()
+            .zip(self.db.execute_many(&insert_sql, &row_params))
+        {
+            match res {
+                Ok(_) => count += 1,
+                // Previously this failure was swallowed silently: the scanner
+                // reported "files=N errors=0" while the tracks never landed in
+                // the library (JP Borderies: ~205 tracks in DB vs ~779 on disk
+                // after a delete + full rescan). Log it so the drop is visible
+                // and the root cause (stale album_id/artist_id FK from an
+                // importer cache surviving a batch rollback) is diagnosable.
+                Err(e) => tracing::warn!(
+                    file = ?track.file_path,
+                    album_id = ?track.album_id,
+                    artist_id = ?track.artist_id,
+                    error = %e,
+                    "track_insert_failed_in_batch"
+                ),
             }
         }
         Ok(count)
@@ -902,6 +1312,9 @@ impl TrackRepo {
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let update_sql = self.dialect_sql(sql::update, sql::update);
         let mut count = 0usize;
+        // Rows without an id are skipped, so collect the params first and
+        // batch them through one execute_many call (see create_batch).
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
             let Some(id) = track.id else { continue };
             let params: [&dyn ToSqlValue; 25] = [
@@ -931,8 +1344,12 @@ impl TrackRepo {
                 &track.comments,
                 &id,
             ];
-            if self.db.execute(&update_sql, &params).is_ok() {
-                count += 1;
+            row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+        }
+        for res in self.db.execute_many(&update_sql, &row_params) {
+            match res {
+                Ok(_) => count += 1,
+                Err(e) => tracing::warn!(error = %e, "track_update_failed_in_batch"),
             }
         }
         Ok(count)
@@ -1154,6 +1571,54 @@ mod tests {
         db
     }
 
+    /// Forum #1312. A track filed under a folder-named album must be able to
+    /// carry its own artwork, and a track without one must still show its
+    /// album's — the fallback is what keeps every normal album unchanged.
+    #[test]
+    fn track_cover_overrides_album_cover_and_falls_back_to_it() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("Audio Formats", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        albums
+            .update_cover_path(album_id, "album-sleeve-hash")
+            .unwrap();
+
+        let repo = TrackRepo::new(db.clone());
+
+        // The file that lent its artwork to the whole folder before #1312.
+        let mut owned = Track::new("Les grands restaurants".into());
+        owned.album_id = Some(album_id);
+        owned.artist_id = Some(artist_id);
+        owned.file_path = Some("/music/Audio Formats/alliye.flac".into());
+        owned.cover_path = Some("its-own-hash".into());
+        let owned_id = repo.create(&owned).unwrap();
+
+        // A file in the same folder with no embedded artwork.
+        let mut bare = Track::new("Take five".into());
+        bare.album_id = Some(album_id);
+        bare.artist_id = Some(artist_id);
+        bare.file_path = Some("/music/Audio Formats/jarreau.wav".into());
+        let bare_id = repo.create(&bare).unwrap();
+
+        assert_eq!(
+            repo.get(owned_id).unwrap().unwrap().cover_path.as_deref(),
+            Some("its-own-hash"),
+            "a track with its own cover must not show the album's"
+        );
+        assert_eq!(
+            repo.get(bare_id).unwrap().unwrap().cover_path.as_deref(),
+            Some("album-sleeve-hash"),
+            "a track without its own cover must fall back to the album's"
+        );
+    }
+
     #[test]
     fn dedup_display_collapses_content_duplicates() {
         // Same album, same hash → the copy is hidden, first kept.
@@ -1212,6 +1677,23 @@ mod tests {
     }
 
     #[test]
+    fn update_duration_backfills_a_zero_duration_track() {
+        // A track scanned with duration_ms = 0 (scan timeout / unreadable DSD)
+        // is what the play-time backfill repairs. Verify the persist path.
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut track = Track::new("Silent Length".into());
+        track.file_path = Some("/music/mystery.dsf".into());
+        track.duration_ms = 0;
+        let id = repo.create(&track).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().duration_ms, 0);
+
+        repo.update_duration(id, 207_000).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().duration_ms, 207_000);
+    }
+
+    #[test]
     fn crud_track() {
         let db = test_db();
         let artist_repo = ArtistRepo::new(db.clone());
@@ -1248,6 +1730,92 @@ mod tests {
 
         repo.delete(id).unwrap();
         assert!(repo.get(id).unwrap().is_none());
+    }
+
+    // Bilou / Oxygen "by genre": a compilation whose files carry NO ALBUMARTIST
+    // tag must still report the album's canonical artist ("Various Artists"),
+    // not the per-track guest artist — otherwise the client-side album grouping
+    // over a genre-filtered subset shows track 1's artist.
+    #[test]
+    fn album_artist_falls_back_to_album_canonical_when_tag_missing() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let va = artist_repo
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let guest = artist_repo
+            .create(&Artist::new("Guest One".into()))
+            .unwrap();
+        let alid = album_repo
+            .get_or_create("Comp", va, None)
+            .unwrap()
+            .id
+            .unwrap();
+
+        let mut track = Track::new("Song".into());
+        track.album_id = Some(alid);
+        track.artist_id = Some(guest);
+        track.album_artist = None; // file has no ALBUMARTIST tag
+        let id = repo.create(&track).unwrap();
+
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.artist_name.as_deref(), Some("Guest One"));
+        assert_eq!(fetched.album_artist.as_deref(), Some("Various Artists"));
+    }
+
+    // Regression: a real per-file ALBUMARTIST tag still wins over the fallback.
+    #[test]
+    fn album_artist_tag_wins_over_album_canonical() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("The Band".into())).unwrap();
+        let alid = album_repo
+            .get_or_create("LP", aid, None)
+            .unwrap()
+            .id
+            .unwrap();
+
+        let mut track = Track::new("Tune".into());
+        track.album_id = Some(alid);
+        track.artist_id = Some(aid);
+        track.album_artist = Some("Tagged Albumartist".into());
+        let id = repo.create(&track).unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().album_artist.as_deref(),
+            Some("Tagged Albumartist")
+        );
+    }
+
+    #[test]
+    fn list_by_ids_hydrates_requested_tracks_only() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        let mut a = Track::new("A".into());
+        a.file_path = Some("/a.flac".into());
+        let mut b = Track::new("B".into());
+        b.file_path = Some("/b.flac".into());
+        let mut c = Track::new("C".into());
+        c.file_path = Some("/c.flac".into());
+        let ia = repo.create(&a).unwrap();
+        let _ib = repo.create(&b).unwrap();
+        let ic = repo.create(&c).unwrap();
+
+        let mut titles: Vec<String> = repo
+            .list_by_ids(&[ia, ic])
+            .unwrap()
+            .iter()
+            .map(|t| t.title.clone())
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["A".to_string(), "C".to_string()]);
+        assert!(repo.list_by_ids(&[]).unwrap().is_empty());
     }
 
     #[test]

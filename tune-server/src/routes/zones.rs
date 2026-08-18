@@ -1,16 +1,18 @@
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use tune_core::audio::formats::AudioFormat;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::{Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
+use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
 use tune_core::playback::{PlayState, ZoneState};
 
@@ -40,6 +42,18 @@ struct RenameZone {
     name: String,
 }
 
+/// Rend un `null` JSON distinguable d'un champ absent : `Deserialize` n'est
+/// appelé que si le champ est PRÉSENT (le `default` couvre l'absence), donc
+/// envelopper son résultat dans `Some` donne `Some(None)` pour `null` et
+/// `Some(Some(v))` pour une valeur.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
 #[derive(Deserialize)]
 struct PatchZone {
     name: Option<String>,
@@ -50,6 +64,14 @@ struct PatchZone {
     gapless_enabled: Option<bool>,
     sync_delay_ms: Option<i32>,
     /// Max output sample rate in Hz (e.g. 96000, 88200). null = no limit (passthrough).
+    ///
+    /// `Option<Option<_>>` seul ne suffit PAS : serde désérialise un `null`
+    /// explicite en `None` extérieur, indistinguable d'un champ absent — le
+    /// handler ne voyait donc jamais la demande d'effacement, et « Aucune »
+    /// dans l'UI n'a jamais été enregistrable (Cyrille, forum 1320). Le
+    /// désérialiseur dédié rétablit les trois états : champ absent → `None`,
+    /// `null` → `Some(None)` (effacer), valeur → `Some(Some(v))`.
+    #[serde(default, deserialize_with = "double_option")]
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
@@ -57,6 +79,10 @@ struct PatchZone {
     autoplay_enabled: Option<bool>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
     dsd_mode: Option<String>,
+    /// Décalage des paroles synchronisées, en ms (positif = paroles retardées).
+    /// Compense la latence entre ce que le serveur sait et ce que l'auditeur
+    /// entend — tampon de Tune puis du renderer (#1328).
+    lyrics_offset_ms: Option<i32>,
     /// Force native FLAC to a DLNA renderer even if it doesn't advertise FLAC
     /// (empty/failed GetProtocolInfo Sink) — for renderers that decode FLAC but
     /// under-report (Denon Ceol N12).
@@ -64,19 +90,105 @@ struct PatchZone {
     /// When enabled, serve ALAC straight to the renderer (bit-perfect, no FLAC
     /// transcode). Only for renderers that decode ALAC natively.
     alac_passthrough: Option<bool>,
+    /// Servir l'AAC tel quel au renderer qui le décode, au lieu de le
+    /// transcoder en FLAC (#1424). Opt-in : un renderer peut annoncer l'AAC
+    /// et le refuser en pratique.
+    aac_passthrough: Option<bool>,
     /// When enabled, transcode lossless to WAV/LPCM (not FLAC) for this DLNA
     /// renderer — skips the slow FLAC encoder for hi-res and avoids renderers
     /// whose ALAC decoder pops at start (LHC-56). Overrides alac_passthrough.
     dlna_lpcm: Option<bool>,
+    /// When enabled, cap output to 16-bit for this DLNA renderer. For renderers
+    /// that advertise `audio/flac` but only decode 16-bit (Ruark R3, #1137):
+    /// downconverts hi-res to 16-bit FLAC instead of serving silent 24-bit direct.
+    dlna_cap_16bit: Option<bool>,
+    /// When enabled, serve genuine 24-bit WAV (instead of the 16-bit LPCM
+    /// fallback) to a DLNA renderer that advertises `audio/L24`. The UI only
+    /// offers this after the capability probe reports 24-bit LPCM support.
+    dlna_wav24: Option<bool>,
+    /// Per-zone SetAVTransportURI→Play delay in ms (0 = use config default). Lets
+    /// a renderer with a cold-start under-run buffer before its transport clock
+    /// starts (first seconds hachées — Cyrille, Yamaha R-N2000A).
+    dlna_play_delay_ms: Option<i64>,
+    /// Marque choisie par l'utilisateur dans le catalogue (ou « Autre »).
+    /// Persistée en setting `zone_{id}_brand`. Chaîne vide = efface l'override.
+    brand: Option<String>,
+    /// Trim de gain du renderer en dB (±12), pour harmoniser le niveau perçu
+    /// entre appareils. Persisté en setting `zone_{id}_gain_trim_db` ; `0`
+    /// efface. Appliqué UNIQUEMENT au volume envoyé au device — le volume
+    /// affiché et persisté reste celui de l'utilisateur. Sans effet sur une
+    /// zone `fixed_volume` (bit-perfect assumé, le DAC gère).
+    gain_trim_db: Option<f64>,
+    /// La zone s'annonce en MediaRenderer UPnP (#1750). Persisté en setting
+    /// `zone_{id}_upnp_renderer` ; défaut off. L'activation réveille
+    /// l'annonceur SSDP pour une annonce immédiate.
+    upnp_renderer: Option<bool>,
+    /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
+    /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
+    model: Option<String>,
+}
+
+/// Injecte l'identité appareil d'une zone dans son JSON de sortie :
+/// - `brand` / `model` : override choisi par l'utilisateur (peut être `null`) ;
+/// - `detected_manufacturer` / `detected_model` : détection UPnP du device
+///   assigné (peut être `null`).
+///
+/// Le client affiche en priorité l'override utilisateur, sinon la détection
+/// UPnP (override > détection).
+fn inject_device_identity(
+    obj: &mut serde_json::Map<String, Value>,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    detected: Option<&tune_core::discovery::device::DiscoveredDevice>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let brand = settings
+        .get(&format!("zone_{zone_id}_brand"))
+        .ok()
+        .flatten();
+    let model = settings
+        .get(&format!("zone_{zone_id}_model"))
+        .ok()
+        .flatten();
+    obj.insert("brand".into(), json!(brand));
+    obj.insert("model".into(), json!(model));
+    let trim = settings
+        .get(&format!("zone_{zone_id}_gain_trim_db"))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    obj.insert("gain_trim_db".into(), json!(trim));
+    let upnp_renderer = settings
+        .get(&format!("zone_{zone_id}_upnp_renderer"))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    obj.insert("upnp_renderer".into(), json!(upnp_renderer));
+    obj.insert(
+        "detected_manufacturer".into(),
+        json!(detected.and_then(|d| d.manufacturer.clone())),
+    );
+    obj.insert(
+        "detected_model".into(),
+        json!(detected.and_then(|d| d.model.clone())),
+    );
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_zones).post(create_zone))
+        .route(
+            "/",
+            get(list_zones).post(create_zone).delete(delete_all_zones),
+        )
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        .route("/{id}/convolver/response", get(convolver_response))
+        .route("/{id}/renderer-capabilities", post(renderer_capabilities))
+        .route("/{id}/device-presets", get(get_device_presets))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
@@ -125,20 +237,165 @@ async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> imp
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
 
+    // Headphone crossfeed config (local output only). Defaults when unset:
+    // disabled, amount 0.30, delay 0.30 ms.
+    let crossfeed = read_crossfeed_config(&settings, id);
+
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
             "zone_id": id,
             "dsp_preset_id": preset_id,
             "dsp_enabled": enabled,
             "eq_profile": eq_profile.unwrap_or_default(),
+            "crossfeed": crossfeed,
         }))
         .into_response(),
         Err(_) => Json(json!({
             "zone_id": id,
             "eq_profile": eq_profile.unwrap_or_default(),
+            "crossfeed": crossfeed,
         }))
         .into_response(),
     }
+}
+
+/// Cache of computed convolver responses, keyed by zone id. The value pairs
+/// the filter fingerprint (path + size + mtime) with the full response body:
+/// re-uploading an IR rewrites the file, so the fingerprint changes and the
+/// entry is recomputed on the next read — no explicit invalidation hook needed.
+static CONVOLVER_RESPONSE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i64, (String, Value)>>,
+> = std::sync::OnceLock::new();
+
+/// `GET /zones/{id}/convolver/response` — frequency response of the zone's FIR
+/// convolver, for visualisation. Not premium-gated: applying an IR is, reading
+/// the resulting curve is not.
+///
+/// The running convolver only keeps its IR in FFT-partitioned form, so the taps
+/// are re-read from the persisted IR file (`ir_path_{zone_id}` setting — same
+/// source of truth as `restore_convolvers` and the transcode path). Multi-
+/// channel IRs are summarised by channel 0: averaging L/R taps would let
+/// inter-channel phase differences cancel and distort the magnitude curve.
+async fn convolver_response(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    match repo.get(id) {
+        Ok(Some(_)) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "zone not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let ir_path = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(&format!("ir_path_{id}"))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty());
+    let Some(ir_path) = ir_path else {
+        return Json(json!({"loaded": false})).into_response();
+    };
+    let Ok(meta) = std::fs::metadata(&ir_path) else {
+        // Path persisted but file gone (moved data dir…): nothing to plot.
+        return Json(json!({"loaded": false})).into_response();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let fingerprint = format!("{ir_path}|{}|{mtime}", meta.len());
+
+    let cache = CONVOLVER_RESPONSE_CACHE.get_or_init(Default::default);
+    if let Some((fp, body)) = cache.lock().expect("convolver cache poisoned").get(&id) {
+        if *fp == fingerprint {
+            return Json(body.clone()).into_response();
+        }
+    }
+
+    // ~200 log-spaced points × up to 128k taps of f64 accumulation: fast, but
+    // not "handler on the async runtime" fast — compute on the blocking pool.
+    let computed = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (ir, sample_rate) = tune_core::audio::convolver::Convolver::read_ir_taps(&ir_path)?;
+        if sample_rate == 0 {
+            return Err("IR sample rate is 0".into());
+        }
+        let taps = &ir[0]; // channel 0 (see handler doc)
+        let f_hi = 20_000.0f64.min(sample_rate as f64 * 0.45);
+        let freqs = tune_core::audio::convolver::log_freq_grid(200, 20.0, f_hi);
+        let points: Vec<Value> =
+            tune_core::audio::convolver::fir_frequency_response(taps, sample_rate, &freqs)
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "f": (p.freq_hz * 10.0).round() / 10.0,
+                        "db": (p.magnitude_db * 100.0).round() / 100.0,
+                        "phase_deg": (p.phase_deg * 100.0).round() / 100.0,
+                    })
+                })
+                .collect();
+        let latency_ms = taps.len() as f64 / 2.0 / sample_rate as f64 * 1000.0;
+        Ok(json!({
+            "loaded": true,
+            "taps": taps.len(),
+            "sample_rate": sample_rate,
+            "latency_ms": (latency_ms * 10.0).round() / 10.0,
+            "points": points,
+        }))
+    })
+    .await;
+
+    match computed {
+        Ok(Ok(body)) => {
+            cache
+                .lock()
+                .expect("convolver cache poisoned")
+                .insert(id, (fingerprint, body.clone()));
+            Json(body).into_response()
+        }
+        Ok(Err(e)) => {
+            warn!(zone_id = id, error = %e, "convolver_response_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("read IR: {e}")})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(zone_id = id, error = %e, "convolver_response_join_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "response computation failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Read the `zone_{id}_crossfeed` settings row into a normalised JSON object,
+/// falling back to defaults (disabled, amount 0.30, delay 0.30 ms) for any
+/// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`.
+fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, id: i64) -> Value {
+    let stored: Option<Value> = settings
+        .get(&format!("zone_{id}_crossfeed"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let v = stored.unwrap_or(Value::Null);
+    let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+    let amount = v.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.30);
+    let delay_ms = v.get("delay_ms").and_then(|d| d.as_f64()).unwrap_or(0.30);
+    json!({
+        "enabled": enabled,
+        "amount": amount,
+        "delay_ms": delay_ms,
+    })
 }
 
 async fn set_zone_dsp(
@@ -157,13 +414,57 @@ async fn set_zone_dsp(
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
     // Handle eq_profile if present
+    let mut eq_applique_a_chaud = false;
     if let Some(eq_val) = body.get("eq_profile") {
         if let Ok(profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
         {
             let key = format!("zone_{id}_eq_profile");
             let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+            // Persister ne suffit pas : sans ceci le reglage n'atteint le son
+            // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
+            // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
+            // ne le faisait pas.
+            eq_applique_a_chaud = state.orchestrator.refresh_zone_eq(id).await;
         }
+    }
+
+    // Handle crossfeed sub-object if present (local-output headphone effect).
+    // Same premium gate (Feature::DspEq) as the EQ path above. Ranges clamped:
+    // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
+    let mut crossfeed_saved: Option<Value> = None;
+    let mut cf_applique_a_chaud = false;
+    if let Some(cf_val) = body.get("crossfeed") {
+        let enabled = cf_val
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let amount = cf_val
+            .get("amount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.30)
+            .clamp(0.0, 0.5);
+        let delay_ms = cf_val
+            .get("delay_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.30)
+            .clamp(0.0, 5.0);
+        let normalised = json!({
+            "enabled": enabled,
+            "amount": amount,
+            "delay_ms": delay_ms,
+        });
+        let key = format!("zone_{id}_crossfeed");
+        let _ = settings.set(
+            &key,
+            &serde_json::to_string(&normalised).unwrap_or_default(),
+        );
+        crossfeed_saved = Some(normalised);
+        // Meme raison que pour l'egaliseur juste au-dessus : persister ne
+        // suffit pas. Sans ceci, activer le crossfeed ou deplacer `amount` /
+        // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
+        // (#1786).
+        cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
     }
 
     let preset_id = body["dsp_preset_id"].as_i64();
@@ -176,6 +477,15 @@ async fn set_zone_dsp(
         "dsp_preset_id": preset_id,
         "dsp_enabled": enabled,
         "eq_profile": body.get("eq_profile"),
+        "crossfeed": crossfeed_saved,
+        // Meme contrat que `POST /zones/{id}/eq` : vrai quand le reglage vient
+        // d'atteindre le son d'un flux en cours. Faux ne signale PAS un echec
+        // (rien ne joue, zone non locale, mode PURE) — c'est ce qui permet a un
+        // client de dire « prendra effet a la piste suivante » au lieu de
+        // laisser croire a un egaliseur muet.
+        "eq_applied_live": eq_applique_a_chaud,
+        // Idem pour le crossfeed (#1786).
+        "crossfeed_applied_live": cf_applique_a_chaud,
     }))
     .into_response()
 }
@@ -282,14 +592,115 @@ pub async fn create_zone_handler(
 }
 
 /// Public wrapper for use from ws.rs snapshot builder.
+/// Complète le JSON `current_track` d'une zone avec l'ancrage temporel de
+/// métadonnée : `metadata_changed_at` (epoch ms, horloge serveur) et
+/// `metadata_age_ms` (âge calculé côté serveur — le client s'ancre dessus
+/// sans dépendre de la synchronisation de son horloge). Utilisé par les
+/// paroles des pistes radio pour caler les lignes sur le début du morceau
+/// détecté dans le flux.
+pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, ps: &ZoneState) {
+    let (Some(ts), Some(age)) = (ps.metadata_changed_at_ms, ps.metadata_age_ms()) else {
+        return;
+    };
+    if let Some(track) = obj.get_mut("current_track").and_then(|v| v.as_object_mut()) {
+        track.insert("metadata_changed_at".into(), json!(ts));
+        track.insert("metadata_age_ms".into(), json!(age));
+    }
+}
+
+/// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
+/// tire son flux n'est plus un démarrage lent mais un silence.
+///
+/// Le client web branche son `<audio>` sur `stream_url` dès qu'il a l'état de
+/// la zone ; les premiers octets partent en une seconde ou deux. Douze
+/// secondes laissent de la marge à un poste lent sans laisser l'utilisateur
+/// dans le noir.
+const BROWSER_UNATTENDED_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Où va réellement le son de cette zone, dit au client.
+///
+/// `online` ne suffit pas : il répond « la sortie répond-elle ? », pas « y
+/// a-t-il une sortie ? », et il vaut `true` en permanence pour une zone
+/// navigateur — y compris quand aucun navigateur n'écoute. Or ces deux états
+/// produisent exactement le même tableau qu'une lecture réussie : la file se
+/// remplit, le flux est décodé, la position avance, et rien ne sort.
+///
+/// Ils n'étaient visibles que dans un WARN de journal. Bilou (#1499) a ouvert
+/// **deux** fils forum sur un défaut BluOS inexistant avant qu'on lise ses
+/// logs : neuf lectures sur la zone « Ce PC », `output_sent=false` neuf fois.
+/// L'interface ne lui laissait aucune autre piste que son matériel.
+///
+/// - `"ok"` — le son a une destination.
+/// - `"no_output"` — aucune sortie associée à la zone. La lecture est refusée
+///   en amont (`zone_no_output_device`) ; ce champ le dit **avant** le clic.
+/// - `"browser_unattended"` — zone navigateur en lecture depuis assez
+///   longtemps pour que ce ne soit plus un démarrage, dont pas un octet n'a
+///   été tiré : l'onglet qui devait jouer n'est pas là.
+pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
+    // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
+    // On ne le demande au streamer que pour une zone navigateur en lecture,
+    // pour ne rien changer au coût de la liste des zones.
+    let pulled = if zone.output_type.as_deref() == Some("browser")
+        && matches!(ps.state, PlayState::Playing)
+    {
+        match ps
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => state
+                .streamer
+                .stream_bytes_sent(sid)
+                .await
+                .is_some_and(|n| n > 0),
+            None => false,
+        }
+    } else {
+        false
+    };
+    output_reach_of(zone, ps, pulled)
+}
+
+/// La décision seule, sans I/O — c'est elle que les tests couvrent.
+fn output_reach_of(zone: &Zone, ps: &ZoneState, browser_stream_pulled: bool) -> &'static str {
+    if zone.output_type.as_deref() != Some("browser") {
+        return if zone.output_device_id.is_none() {
+            "no_output"
+        } else {
+            "ok"
+        };
+    }
+
+    // Zone navigateur : la sortie, c'est l'onglet. On ne peut pas la
+    // découvrir, seulement constater qu'elle consomme — ou non.
+    if !matches!(ps.state, PlayState::Playing) {
+        return "ok";
+    }
+    // `last_play_started_at` est `#[serde(skip)]` : après une restauration
+    // d'état il vaut `None`, et on ne conclut rien. Le sens du défaut est le
+    // bon — on préfère taire un silence réel que d'en inventer un.
+    if !ps
+        .last_play_started_at
+        .is_some_and(|t| t.elapsed() >= BROWSER_UNATTENDED_GRACE)
+    {
+        return "ok";
+    }
+    if browser_stream_pulled {
+        "ok"
+    } else {
+        "browser_unattended"
+    }
+}
+
 pub fn build_signal_path_pub(
     ps: &ZoneState,
     zone: &Zone,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
+    wire: Option<&StreamInfo>,
 ) -> Option<Value> {
-    build_signal_path(ps, zone, backend, renderer_label, audio_backend)
+    build_signal_path(ps, zone, backend, renderer_label, audio_backend, wire)
 }
 
 /// Build the `signal_path` object for a zone's current playback.
@@ -297,18 +708,128 @@ pub fn build_signal_path_pub(
 ///
 /// `audio_backend` is the active audio backend name ("ASIO", "WASAPI",
 /// "CoreAudio", "ALSA") used for local zones' signal path display.
+///
+/// `wire` décrit ce qui part RÉELLEMENT sur le fil pour la session en cours
+/// (`AudioStreamer::stream_output_wire`) : conteneur, fréquence, profondeur.
+/// `None` quand il n'y a pas de session vivante (sortie locale, avant démarrage).
+///
+/// C'est la source de vérité, et elle prime sur toute déduction. Cette fonction
+/// rejouait les règles de l'orchestrateur pour deviner ce qui était servi ; à
+/// chaque évolution du chemin audio il fallait répliquer la règle ici, et un
+/// oubli faisait mentir l'affichage. Le renderer, lui, affiche ce qu'il reçoit
+/// — d'où les écarts constatés par Yves sur darTZeel LHC-208 et Eversolo
+/// DMP-A10, tous deux en passthrough natif.
+/// Is a WAV/LPCM wire feed to a DLNA/OpenHome renderer bit-perfect?
+///
+/// Three cases share the WAV wire: a native WAV source (passthrough), the
+/// zone forcing 16-bit LPCM (`dlna_lpcm`), or a FLAC/ALAC source that the
+/// orchestrator fell back to WAV for. A **native WAV** source is sent
+/// byte-for-byte at any bit depth, so it is always bit-perfect. The FLAC/ALAC→WAV
+/// fallback is plain 16-bit LPCM unless `dlna_wav24` preserves the full 24 bits,
+/// so it is bit-perfect only when the source already fits 16 bits or the 24-bit
+/// override is on.
+/// L'égaliseur de cette zone modifie-t-il réellement le signal ?
+///
+/// Miroir exact de `Orchestrator::load_eq_processor` : mode PURE d'abord — il
+/// court-circuite tout traitement, donc un profil enregistré n'y change rien —
+/// puis profil activé ET gains audibles. Sans ce miroir, l'indicateur
+/// bit-perfect et le chemin audio répondraient à deux questions différentes.
+fn zone_eq_alters_signal(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> bool {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return false;
+    }
+    let Some(profile) = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())
+    else {
+        return false;
+    };
+    if !profile.enabled {
+        return false;
+    }
+    // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
+    tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2).is_enabled()
+}
+
+/// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
+///
+/// Miroir de `Orchestrator::zone_replaygain_changes_audio`, pour la même
+/// raison que `zone_eq_alters_signal` : sans lui, le panneau annoncerait
+/// « Bit-Perfect » pendant qu'un gain multiplie chaque échantillon (même
+/// famille d'écart que l'EQ ignoré du verdict, #1548/#1559 — ici #1627).
+/// Mode PURE d'abord : le gain n'y est jamais appliqué, donc jamais d'étape.
+/// Ensuite le facteur EFFECTIF (tags + pré-ampli + anti-écrêtage) : un mode
+/// « track » sans tag stocké ne change rien au signal et n'affiche donc rien.
+///
+/// Retourne la description de l'étape (« ReplayGain (track, -4.2 dB) ») quand
+/// le gain s'applique, `None` sinon. La granularité affichée est celle qui a
+/// FOURNI la valeur : en mode album sans tags d'album, c'est le gain de piste
+/// qui joue, et c'est lui qu'on nomme.
+fn zone_replaygain_step(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    track_id: Option<i64>,
+) -> Option<String> {
+    use tune_core::audio::replaygain::{ReplayGainSettings, gain_factor, stored_gain_detail};
+    // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return None;
+    }
+    let tid = track_id?;
+    let settings = ReplayGainSettings::load(backend);
+    let (gain, source) = stored_gain_detail(backend, tid, settings.mode)?;
+    let factor = gain_factor(gain, settings);
+    // Même seuil que l'orchestrateur (`zone_replaygain_changes_audio`).
+    if (factor - 1.0).abs() <= 1e-6 {
+        return None;
+    }
+    // Le dB affiché est celui qui multiplie réellement les échantillons
+    // (pré-ampli et anti-écrêtage compris), pas le tag brut.
+    let applied_db = 20.0 * factor.log10();
+    let label = match source {
+        tune_core::audio::replaygain::ReplayGainMode::Album => "album",
+        _ => "track",
+    };
+    Some(format!("ReplayGain ({label}, {applied_db:+.1} dB)"))
+}
+
+fn wav_wire_bit_perfect(
+    is_lossless: bool,
+    source_is_wav: bool,
+    dlna_wav24: bool,
+    bit_depth: i32,
+) -> bool {
+    is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
+}
+
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
+    wire: Option<&StreamInfo>,
 ) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
     }
 
     let np = ps.now_playing.as_ref()?;
+
+    // Conteneur réellement servi (None hors session : sortie locale, démarrage).
+    let output_container = wire.map(|w| w.format.as_str());
+    // Fréquence et profondeur réellement émises. Une session fraîchement créée
+    // peut encore porter des zéros (`StreamInfo::default`) : on ne retient que
+    // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
+    let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
+    let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
 
     // Look up track details for format/sample_rate/bit_depth
     let track = np.track_id.and_then(|tid| {
@@ -340,6 +861,12 @@ fn build_signal_path(
         np.sample_rate
             .map(|v| v as i32)
             .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
+            // Dernier recours quand ni la lecture en cours ni la base ne
+            // savent : le fil, qui décrit ce qui part vraiment. Sans lui on
+            // affichait 44100 en dur — une valeur inventée, affirmée avec le
+            // même aplomb qu'une vraie mesure, et fausse dès que le fichier
+            // était en Hi-Res (métadonnées non lues au scan).
+            .or_else(|| wire_sample_rate.map(|v| v as i32))
             .unwrap_or(44100)
     };
     let bit_depth = if is_dsd {
@@ -352,6 +879,7 @@ fn build_signal_path(
         np.bit_depth
             .map(|v| v as i32)
             .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
+            .or_else(|| wire_bit_depth.map(|v| v as i32))
             .unwrap_or(16)
     };
 
@@ -370,14 +898,18 @@ fn build_signal_path(
         // from_extension() returned None and the signal path showed "Unknown"
         // (Yves: NAS as source). Recognize the codec from the raw string instead.
         let l = fmt_str.to_lowercase();
-        if l.contains("aac") || l.contains("mp4") || l.contains("m4a") {
+        let is_m4a = l.contains("mp4") || l.contains("m4a") || l.contains("aac");
+        if l.contains("alac") || (is_m4a && bit_depth >= 24) {
+            // audio/mp4 (M4A) is ambiguous ALAC vs AAC — same container/MIME. A
+            // DIDL res@bitsPerSample >= 24 means lossless ALAC, not lossy AAC
+            // (Yves: NAS ALAC read 24-bit by the DartZeel but shown as AAC here).
+            "ALAC"
+        } else if is_m4a {
             "AAC"
         } else if l.contains("mp3") || l.contains("mpeg") {
             "MP3"
         } else if l.contains("flac") {
             "FLAC"
-        } else if l.contains("alac") {
-            "ALAC"
         } else if l.contains("wav") {
             "WAV"
         } else if l.contains("ogg") || l.contains("vorbis") {
@@ -388,19 +920,55 @@ fn build_signal_path(
             "Unknown"
         }
     };
-    let is_lossless = source_format.as_ref().is_some_and(|f| f.is_lossless());
+    // For a media-server source (no from_extension AudioFormat) the lossless
+    // verdict follows the recognized codec name, so a 24-bit ALAC is no longer
+    // shown "Avec perte" (Yves).
+    let is_lossless = source_format
+        .as_ref()
+        .map(|f| f.is_lossless())
+        .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
 
-    // Determine if DSP is active
+    // Determine if DSP is active.
+    //
+    // Deux sources, et il faut les DEUX : la colonne dsp_preset_id/dsp_enabled
+    // de la zone, et le profil d'égaliseur `zone_{id}_eq_profile`. C'est ce
+    // dernier qu'écrit le panneau EQ de « Lecture en cours » et que lit le
+    // chemin audio (`Orchestrator::zone_has_active_eq`) — l'indicateur ne le
+    // consultait pas.
+    //
+    // Conséquence : Tune pouvait afficher « Bit-Perfect » alors qu'un
+    // égaliseur modifiait réellement le signal. Pour un logiciel dont c'est
+    // l'argument central, promettre une pureté qu'on ne tient pas est le pire
+    // des deux sens possibles de l'erreur (signalement Bilou).
+    let zid = zone.id.unwrap_or(0);
     let dsp_enabled = ZoneRepo::with_backend(backend.clone())
-        .get_dsp_config(zone.id.unwrap_or(0))
+        .get_dsp_config(zid)
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || zone_eq_alters_signal(&backend, zid);
+
+    // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
+    // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
+    // en tient compte. `None` en PURE, en mode off, ou sans gain stocké.
+    let replaygain_step = zone_replaygain_step(&backend, zid, np.track_id);
 
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
-    let volume_full = zone.fixed_volume || ps.volume >= 1.0 || ps.volume <= 0.0; // 0.0 means no software vol set
+    //
+    // La valeur affichée est `zone.volume` (la base), PAS `ps.volume` : c'est
+    // elle que la page expose comme curseur (GET /zones/{id}). `ps.volume` est
+    // une copie mémoire qui ment dans deux cas : jamais initialisée depuis la
+    // base au démarrage (0,5 par défaut pour une zone locale/navigateur —
+    // seules les zones réseau sont resemées à la découverte), et modifiée par
+    // les régleurs internes (alarmes, minuterie de sommeil, IA) qui n'écrivaient
+    // pas la base. Résultat : le panneau bit-perfect affichait « Volume 20 % »
+    // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
+    // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
+    // Bebelalu55 #1480). Une seule source pour les deux affichages.
+    let ui_volume = (zone.volume as f64 / 100.0).clamp(0.0, 1.0);
+    let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
@@ -419,12 +987,51 @@ fn build_signal_path(
     let zone_id = zone.id.unwrap_or(0);
     let dlna_lpcm =
         is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
+    // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
+    // signal path shows a real 16-bit downconvert instead of a phantom
+    // bit-perfect passthrough when the source is hi-res.
+    let dlna_cap_16bit = is_network_output
+        && bit_depth > 16
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_cap_16bit(zone_id);
+    // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
+    // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
+    // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
+    let dlna_wav24 = is_network_output
+        && bit_depth > 16
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
+    // Même règle que l'orchestrateur, par la MÊME fonction : sur une source
+    // FLAC dont la zone demande le FLAC natif, le forçage WAV ne s'applique pas
+    // — il vise le décodeur ALAC du renderer. Sans ce miroir, le chemin du
+    // signal annoncerait un transcodage vers WAV là où le fil porte du FLAC,
+    // c'est-à-dire exactement le genre d'affichage inventé que ce dépôt traque.
+    let source_is_flac = source_format == Some(AudioFormat::Flac);
+    let native_flac_opt_in =
+        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_native_flac(zone_id);
+    let dlna_lpcm = tune_core::orchestrator::wav_override_applies(
+        dlna_lpcm,
+        source_is_flac,
+        native_flac_opt_in,
+    );
+    let dlna_wav24 = tune_core::orchestrator::wav_override_applies(
+        dlna_wav24,
+        source_is_flac,
+        native_flac_opt_in,
+    );
     let alac_passthrough = source_format == Some(AudioFormat::Alac)
         && is_network_output
         && !dlna_lpcm
+        && !dlna_wav24
+        && !dlna_cap_16bit
         && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
+    // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
+    let aac_passthrough = source_format == Some(AudioFormat::Aac)
+        && is_network_output
+        && !dlna_lpcm
+        && !dlna_wav24
+        && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
     let needs_transcode_for_output = is_network_output
         && !alac_passthrough
+        && !aac_passthrough
         && source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna());
@@ -435,10 +1042,45 @@ fn build_signal_path(
             .as_ref()
             .is_some_and(|f| *f != AudioFormat::Wav);
 
+    // The renderer may be served WAV/LPCM even for a FLAC/ALAC source when it
+    // does not advertise `audio/flac` (`orchestrator::dlna_needs_wav`, decided
+    // by async SOAP negotiation this synchronous builder cannot replay). Trust
+    // the live session's real container over the static transcode-target guess
+    // so the path shows "ALAC → WAV" instead of a phantom "ALAC → FLAC" (Sevy,
+    // LHC-52). Only "wav" changes the verdict; anything else keeps prior logic.
+    let wire_wav = output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if needs_transcode_for_output {
-                let target = source_format.unwrap().dlna_transcode_target();
+            if wire_wav || dlna_lpcm || dlna_wav24 {
+                // Renderer served WAV/LPCM, not FLAC — the signal path must say
+                // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
+                // "→ FLAC" label, LHC). Three causes, same wire: the zone forces
+                // 16-bit LPCM (`dlna_lpcm`) or genuine 24-bit WAV (`dlna_wav24`),
+                // or the renderer doesn't advertise `audio/flac` and the
+                // orchestrator fell back to WAV (`dlna_needs_wav`) — detected here
+                // from the live session's real container (`wire_wav`), which the
+                // synchronous builder cannot renegotiate. The plain LPCM fallback
+                // is 16-bit (audio/L16), bit-perfect only when the lossless source
+                // already fits 16 bits (Sevy, #1137). The opt-in `dlna_wav24` path
+                // preserves the full 24-bit source, so it stays bit-perfect.
+                // A *native* WAV source is served byte-for-byte (WAV never
+                // transcodes for DLNA), so it is bit-perfect at any depth
+                // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
+                // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
+                let wav_bit_perfect = wav_wire_bit_perfect(
+                    is_lossless,
+                    matches!(source_format, Some(AudioFormat::Wav)),
+                    dlna_wav24,
+                    bit_depth,
+                );
+                (wav_bit_perfect, "DLNA/UPnP", "WAV")
+            } else if needs_transcode_for_output || dlna_cap_16bit {
+                // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
+                // an otherwise-direct FLAC source (Ruark R3, #1137).
+                let target = source_format
+                    .map(|f| f.dlna_transcode_target())
+                    .unwrap_or(AudioFormat::Flac);
                 (false, "DLNA/UPnP", target.display_name())
             } else {
                 // FLAC, WAV, MP3, AAC → passthrough (bit-perfect for lossless)
@@ -503,9 +1145,16 @@ fn build_signal_path(
             .max_sample_rate
             .is_some_and(|max| (sample_rate as u32) > max);
 
-    // Overall bit-perfect: lossless source + no transcoding + no DSP + no resampling.
-    // Volume is excluded — it's a user preference, not a signal degradation.
-    let bit_perfect = is_lossless && transport_bit_perfect && !dsp_enabled && !resampling_active;
+    // Overall bit-perfect: lossless source + no transcoding + no DSP + no
+    // resampling + no ReplayGain. Volume is excluded — it's a user preference,
+    // not a signal degradation. ReplayGain, lui, multiplie chaque échantillon :
+    // l'orchestrateur le traite déjà comme l'EQ (`zone_replaygain_changes_audio`
+    // force le chemin transcodé), le verdict doit dire la même chose (#1627).
+    let bit_perfect = is_lossless
+        && transport_bit_perfect
+        && !dsp_enabled
+        && !resampling_active
+        && replaygain_step.is_none();
 
     // Build steps
     let source_desc = if is_dsd {
@@ -538,16 +1187,63 @@ fn build_signal_path(
         }));
     }
 
-    // Transcoding step (only if transcoding occurs)
-    let transcode_active =
-        needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
+    // Transcoding step (only if transcoding occurs). Include the zone-forced
+    // WAV/LPCM (dlna_lpcm), 16-bit-cap (dlna_cap_16bit) and async WAV-fallback
+    // (wire_wav) paths: all re-encode the stream, so the step must appear even
+    // when the source format itself wouldn't need transcoding for DLNA (a FLAC
+    // source with LPCM/cap-16, or an ALAC/FLAC source to a renderer that fell
+    // back to WAV) — otherwise the path claimed a bit-perfect passthrough that
+    // isn't happening (LHC: renderer shows WAV 16/44 while Tune showed ALAC→FLAC;
+    // Sevy: LHC-52 served WAV while Tune showed ALAC→FLAC).
+    let wire_transcode = wire_wav && !matches!(format_name, "WAV");
+    let transcode_active = needs_transcode_for_output
+        || oaat_transcodes
+        || output_type == "airplay"
+        || dlna_lpcm
+        || dlna_wav24
+        || dlna_cap_16bit
+        || wire_transcode;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
-        // lossy domain conversion (see the "oaat" transport arm above).
-        let transcode_lossless = is_oaat && is_lossless && !is_dsd;
+        // lossy domain conversion (see the "oaat" transport arm above). A DLNA
+        // WAV/LPCM output likewise preserves the samples only when the source
+        // already fits the 16-bit LPCM cap — unless the zone opted into genuine
+        // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
+        let wav_output = wire_wav || dlna_lpcm || dlna_wav24;
+        let transcode_lossless = (is_oaat && is_lossless && !is_dsd)
+            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16));
+        // Reflect the OUTPUT resolution the renderer actually receives: 24-bit
+        // for the opt-in 24-bit WAV path, 16-bit when the zone caps to 16-bit OR
+        // serves the plain LPCM fallback (audio/L16 is 16-bit), and the
+        // max-sample-rate cap when set.
+        //
+        // Quand le fil renseigne ces valeurs, elles PRIMENT : elles décrivent
+        // ce que le renderer reçoit, là où les règles ci-dessous ne font que
+        // rejouer les décisions de l'orchestrateur et prennent du retard à
+        // chaque évolution du chemin audio.
+        let out_bit_depth = wire_bit_depth.map(|v| v as i32).unwrap_or(if dlna_wav24 {
+            bit_depth.min(24)
+        } else if dlna_cap_16bit || wav_output {
+            bit_depth.min(16)
+        } else {
+            bit_depth
+        });
+        let out_sample_rate = wire_sample_rate.map(|v| v as i32).unwrap_or_else(|| {
+            zone.max_sample_rate
+                .map(|m| (sample_rate as u32).min(m) as i32)
+                .unwrap_or(sample_rate)
+        });
+        let out_desc = if out_sample_rate >= 1000 {
+            format!(
+                "{output_format_name} {sr}kHz/{out_bit_depth}bit",
+                sr = out_sample_rate / 1000
+            )
+        } else {
+            format!("{output_format_name} {out_sample_rate}Hz/{out_bit_depth}bit")
+        };
         steps.push(json!({
             "name": "Transcoder",
-            "description": format!("{format_name} \u{2192} {output_format_name}"),
+            "description": format!("{source_desc} \u{2192} {out_desc}"),
             "bit_perfect": transcode_lossless,
         }));
     }
@@ -564,11 +1260,23 @@ fn build_signal_path(
         }));
     }
 
+    // ReplayGain step — placé avant Volume/DSP, comme dans le chemin réel
+    // (le gain est appliqué avant l'égaliseur, orchestrator.rs). Jamais en
+    // PURE, jamais en mode off, jamais sans gain stocké : l'étape n'existe
+    // que quand un facteur ≠ 1 multiplie réellement les échantillons.
+    if let Some(desc) = &replaygain_step {
+        steps.push(json!({
+            "name": "ReplayGain",
+            "description": desc,
+            "bit_perfect": false,
+        }));
+    }
+
     // Volume step (informational — does not affect bit-perfect status)
     if !volume_full {
         steps.push(json!({
             "name": "Volume",
-            "description": format!("Volume {}%", (ps.volume * 100.0).round() as i32),
+            "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
             "bit_perfect": true,
         }));
     }
@@ -623,7 +1331,7 @@ fn build_signal_path(
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
-    let devices = state.scanner.lock().await.devices().await;
+    let devices = state.scanner.devices().await;
     // Manually-added devices (e.g. legacy DLNA renderers that never appear in
     // SSDP discovery) are registered as outputs but absent from `devices`.
     // Treat a registered output as online too, otherwise its zone is shown
@@ -638,7 +1346,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             .and_then(|s| s.parse().ok());
     #[cfg(feature = "local-audio")]
     let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     let mut result = Vec::new();
@@ -656,6 +1364,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 }),
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
+            inject_metadata_anchor(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
             obj.insert(
@@ -670,12 +1379,32 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-            let signal_path =
-                build_signal_path(&ps, z, &state.backend, renderer_label, audio_backend);
+            let wire = match ps
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref())
+            {
+                Some(sid) => state.streamer.stream_output_wire(sid).await,
+                None => None,
+            };
+            let signal_path = build_signal_path(
+                &ps,
+                z,
+                &state.backend,
+                renderer_label,
+                audio_backend,
+                wire.as_ref(),
+            );
             obj.insert("signal_path".into(), json!(signal_path));
+            // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
+            obj.insert("resolving".into(), json!(ps.resolving));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
+            obj.insert(
+                "lyrics_offset_ms".into(),
+                json!(zone_repo.get_lyrics_offset_ms(zone_id)),
+            );
             obj.insert(
                 "dlna_native_flac".into(),
                 json!(zone_repo.get_dlna_native_flac(zone_id)),
@@ -684,9 +1413,51 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "alac_passthrough".into(),
                 json!(zone_repo.get_alac_passthrough(zone_id)),
             );
+            obj.insert(
+                "aac_passthrough".into(),
+                json!(zone_repo.get_aac_passthrough(zone_id)),
+            );
             obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
+            obj.insert(
+                "dlna_cap_16bit".into(),
+                json!(zone_repo.get_dlna_cap_16bit(zone_id)),
+            );
+            obj.insert(
+                "dlna_wav24".into(),
+                json!(zone_repo.get_dlna_wav24(zone_id)),
+            );
+            obj.insert(
+                "dlna_play_delay_ms".into(),
+                json!(zone_repo.get_dlna_play_delay_ms(zone_id)),
+            );
+            // `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL
+            // de `ZoneRepo` (migration v36 pouvant echouer en silence sous
+            // Windows), donc `row_to_zone` le met a `false` sans exception —
+            // et la serialisation de la zone propageait ce faux jusqu'au
+            // client. Le bouton AutoPlay retombait donc a chaque
+            // resynchronisation, alors que le reglage etait bien en base et
+            // correctement lu par le poller (Sandro, 0.9.70). On lit la vraie
+            // valeur par l'accesseur prevu pour ca, comme les autres reglages
+            // de zone ci-dessus.
+            obj.insert(
+                "autoplay_enabled".into(),
+                json!(zone_repo.get_autoplay_enabled(zone_id)),
+            );
+            let detected_dev = z
+                .output_device_id
+                .as_deref()
+                .and_then(|did| devices.iter().find(|d| d.id == did));
+            inject_device_identity(obj, &state.backend, zone_id, detected_dev);
             let online = match z.output_type.as_deref() {
-                Some("local") | Some("browser") => true,
+                // Browser zones have no output device by design (the web
+                // client pulls stream_url itself) — always online.
+                Some("browser") => true,
+                // A local zone is online as long as it still has a device
+                // assigned; an orphan row without output_device_id can never
+                // play (Yacine, 24/07) and must be reported offline so
+                // clients grey it out. Other types already fall through to
+                // unwrap_or(false) when output_device_id is NULL.
+                Some("local") => z.output_device_id.is_some(),
                 _ => z
                     .output_device_id
                     .as_deref()
@@ -696,6 +1467,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     .unwrap_or(false),
             };
             obj.insert("online".into(), json!(online));
+            obj.insert(
+                "output_reach".into(),
+                json!(output_reach(&state, z, &ps).await),
+            );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -722,7 +1497,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
     let repo = ZoneRepo::with_backend(state.backend.clone());
     #[cfg(feature = "local-audio")]
     let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     match repo.get(id) {
@@ -739,6 +1514,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     }),
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
+                inject_metadata_anchor(obj, &ps);
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 // Expose the queue index too so the client can refresh the
@@ -746,17 +1522,37 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 // whole queue (expensive under a large shuffle queue, #1096).
                 obj.insert("queue_position".into(), json!(ps.queue_position));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
-                let devices = state.scanner.lock().await.devices().await;
+                let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
                     state.outputs.lock().await.list().into_iter().collect();
                 let renderer_label = zone
                     .output_device_id
                     .as_deref()
                     .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-                let signal_path =
-                    build_signal_path(&ps, &zone, &state.backend, renderer_label, audio_backend);
+                let wire = match ps
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.as_deref())
+                {
+                    Some(sid) => state.streamer.stream_output_wire(sid).await,
+                    None => None,
+                };
+                let signal_path = build_signal_path(
+                    &ps,
+                    &zone,
+                    &state.backend,
+                    renderer_label,
+                    audio_backend,
+                    wire.as_ref(),
+                );
                 obj.insert("signal_path".into(), json!(signal_path));
+                // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
+                obj.insert("resolving".into(), json!(ps.resolving));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
+                obj.insert(
+                    "lyrics_offset_ms".into(),
+                    json!(repo.get_lyrics_offset_ms(id)),
+                );
                 obj.insert(
                     "dlna_native_flac".into(),
                     json!(repo.get_dlna_native_flac(id)),
@@ -765,9 +1561,34 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "alac_passthrough".into(),
                     json!(repo.get_alac_passthrough(id)),
                 );
+                obj.insert(
+                    "aac_passthrough".into(),
+                    json!(repo.get_aac_passthrough(id)),
+                );
                 obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
+                obj.insert("dlna_cap_16bit".into(), json!(repo.get_dlna_cap_16bit(id)));
+                obj.insert("dlna_wav24".into(), json!(repo.get_dlna_wav24(id)));
+                obj.insert(
+                    "dlna_play_delay_ms".into(),
+                    json!(repo.get_dlna_play_delay_ms(id)),
+                );
+                // Meme correction que dans la liste : la valeur serialisee
+                // depuis la struct vaut toujours `false`.
+                obj.insert(
+                    "autoplay_enabled".into(),
+                    json!(repo.get_autoplay_enabled(id)),
+                );
+                let detected_dev = zone
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|did| devices.iter().find(|d| d.id == did));
+                inject_device_identity(obj, &state.backend, id, detected_dev);
                 let online = match zone.output_type.as_deref() {
-                    Some("local") | Some("browser") => true,
+                    // Same rules as list_zones: browser zones need no device;
+                    // a local zone without output_device_id is an orphan that
+                    // can never play → offline.
+                    Some("browser") => true,
+                    Some("local") => zone.output_device_id.is_some(),
                     _ => zone
                         .output_device_id
                         .as_deref()
@@ -778,6 +1599,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                         .unwrap_or(false),
                 };
                 obj.insert("online".into(), json!(online));
+                obj.insert(
+                    "output_reach".into(),
+                    json!(output_reach(&state, &zone, &ps).await),
+                );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
                 if let Some(ref np) = ps.now_playing {
@@ -868,6 +1693,14 @@ async fn patch_zone(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
+    if let Some(offset) = body.lyrics_offset_ms {
+        // Borne large mais finie : au-dela d'une minute ce n'est plus un
+        // reglage de latence, et une valeur folle desynchroniserait tout.
+        let clamped = offset.clamp(-60_000, 60_000);
+        if let Err(e) = repo.update_lyrics_offset_ms(id, clamped) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
     if let Some(native_flac) = body.dlna_native_flac {
         if let Err(e) = repo.update_dlna_native_flac(id, native_flac) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
@@ -878,12 +1711,378 @@ async fn patch_zone(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
+    if let Some(passthrough) = body.aac_passthrough {
+        if let Err(e) = repo.update_aac_passthrough(id, passthrough) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
     if let Some(lpcm) = body.dlna_lpcm {
         if let Err(e) = repo.update_dlna_lpcm(id, lpcm) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
+    if let Some(cap) = body.dlna_cap_16bit {
+        if let Err(e) = repo.update_dlna_cap_16bit(id, cap) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(wav24) = body.dlna_wav24 {
+        if let Err(e) = repo.update_dlna_wav24(id, wav24) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(delay) = body.dlna_play_delay_ms {
+        let delay = delay.max(0) as u64;
+        if let Err(e) = repo.update_dlna_play_delay_ms(id, delay) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // Apply live to the already-registered output so the new delay takes
+        // effect on the next play without a rebuild/restart. 0 = fall back to the
+        // config default (`[device_delays]` / `dlna_play_delay_ms`) by name.
+        if let Some(device_id) = repo.get(id).ok().flatten().and_then(|z| z.output_device_id) {
+            let output = { state.outputs.lock().await.get(&device_id) };
+            if let Some(output) = output {
+                let guard = output.lock().await;
+                // `name()` is an OutputTarget trait method → read it on the trait
+                // object before downcasting to the concrete DlnaOutput.
+                let effective = if delay > 0 {
+                    delay
+                } else {
+                    state.config.play_delay_for(guard.name())
+                };
+                if let Some(dlna) = guard.as_any().downcast_ref::<DlnaOutput>() {
+                    dlna.set_play_delay(effective);
+                }
+            }
+        }
+    }
+    // Marque / modèle choisis par l'utilisateur → settings zone_{id}_brand/model.
+    // Chaîne vide = suppression de l'override (retour à la détection UPnP).
+    if let Some(ref brand) = body.brand {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_brand");
+        let r = if brand.trim().is_empty() {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, brand.trim())
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(ref model) = body.model {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_model");
+        let r = if model.trim().is_empty() {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, model.trim())
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    // Opt-in MediaRenderer UPnP (#1750) → setting zone_{id}_upnp_renderer.
+    if let Some(enabled) = body.upnp_renderer {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_upnp_renderer");
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
+        crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
+    }
+    // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
+    if let Some(db) = body.gain_trim_db {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_gain_trim_db");
+        let clamped = db.clamp(-12.0, 12.0);
+        let r = if clamped == 0.0 {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, &format!("{clamped}"))
+        };
+        if let Err(e) = r {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // Effet immédiat : re-pousser le volume courant au device (le trim est
+        // composé dans orchestrator.set_volume). Sans ça, il faudrait attendre
+        // le prochain coup de curseur.
+        if let Ok(Some(z)) = repo.get(id) {
+            if !z.fixed_volume {
+                if let Some(ref did) = z.output_device_id {
+                    state
+                        .orchestrator
+                        .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
+                        .await;
+                }
+            }
+        }
+    }
+    // Correction de marque/modele : la remonter a mozaiklabs.fr.
+    //
+    // Le catalogue d'appareils est fige dans le binaire ; ces corrections sont
+    // la seule matiere qui permette de le faire evoluer a partir du parc reel.
+    // Envoi anonyme et sans attente : la reponse HTTP a l'utilisateur ne doit
+    // dependre en rien de la disponibilite du site.
+    if body.brand.is_some() || body.model.is_some() {
+        push_device_correction(&state, id).await;
+        // Dans la foulée : les réglages qui marchent chez cet utilisateur pour
+        // cet appareil identifié (#1743) — c'est au moment où il nomme son
+        // appareil qu'on sait à quoi rattacher le préréglage.
+        push_device_preset(&state, id).await;
+    }
+
     get_zone(State(state), Path(id)).await.into_response()
+}
+
+/// Remonte au catalogue communautaire la marque/modele corriges d'une zone.
+///
+/// Ne part que si l'override est complet (marque ET modele) : une correction
+/// partielle n'apprend rien de reutilisable au catalogue.
+///
+/// Soumis au meme consentement que la telemetrie (`TUNE_TELEMETRY`) : c'est la
+/// porte deja etablie pour « cette instance parle-t-elle au cloud », et en
+/// ajouter une seconde pour la meme question fragmenterait le reglage sans
+/// rien clarifier.
+///
+/// Volontairement anonyme : ni identifiant d'instance, ni nom de zone. Le
+/// serveur n'attend pas la reponse et n'echoue jamais la-dessus.
+/// Réglages de renderer non-défaut d'une zone, sous la forme partagée avec le
+/// catalogue communautaire (clés du RendererConfig + trim). Vide quand la zone
+/// est aux défauts — un préréglage qui ne règle rien n'apprend rien.
+fn renderer_settings_snapshot(state: &AppState, zone_id: i64) -> serde_json::Map<String, Value> {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let mut out = serde_json::Map::new();
+    if repo.get_dlna_native_flac(zone_id) {
+        out.insert("dlna_native_flac".into(), json!(true));
+    }
+    if repo.get_alac_passthrough(zone_id) {
+        out.insert("alac_passthrough".into(), json!(true));
+    }
+    if repo.get_aac_passthrough(zone_id) {
+        out.insert("aac_passthrough".into(), json!(true));
+    }
+    if repo.get_dlna_lpcm(zone_id) {
+        out.insert("dlna_lpcm".into(), json!(true));
+    }
+    if repo.get_dlna_cap_16bit(zone_id) {
+        out.insert("dlna_cap_16bit".into(), json!(true));
+    }
+    if repo.get_dlna_wav24(zone_id) {
+        out.insert("dlna_wav24".into(), json!(true));
+    }
+    let delay = repo.get_dlna_play_delay_ms(zone_id);
+    if delay > 0 {
+        out.insert("dlna_play_delay_ms".into(), json!(delay));
+    }
+    let trim = settings
+        .get(&format!("zone_{zone_id}_gain_trim_db"))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if trim != 0.0 {
+        out.insert("gain_trim_db".into(), json!(trim));
+    }
+    out
+}
+
+/// Identité (marque, modèle) d'une zone pour le catalogue communautaire :
+/// override utilisateur d'abord, sinon détection UPnP de l'appareil assigné.
+async fn zone_identity_for_catalog(state: &AppState, zone_id: i64) -> Option<(String, String)> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let key = |k: &str| {
+        settings
+            .get(&format!("zone_{zone_id}_{k}"))
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+    };
+    let (mut brand, mut model) = (key("brand"), key("model"));
+    if brand.is_none() || model.is_none() {
+        let zone = ZoneRepo::with_backend(state.backend.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()?;
+        let devices = state.scanner.devices().await;
+        let detected = zone
+            .output_device_id
+            .as_deref()
+            .and_then(|did| devices.iter().find(|d| d.id == did));
+        if brand.is_none() {
+            brand = detected.and_then(|d| d.manufacturer.clone());
+        }
+        if model.is_none() {
+            model = detected.and_then(|d| d.model.clone());
+        }
+    }
+    match (brand, model) {
+        (Some(b), Some(m)) => Some((b, m)),
+        _ => None,
+    }
+}
+
+/// GET /zones/{id}/device-presets — les préréglages communautaires pour
+/// l'appareil de la zone (#1743). Proxy serveur vers mozaiklabs : le
+/// navigateur ne parle jamais au site (CORS, vie privée), et un site
+/// injoignable rend une liste vide — jamais une erreur, la page Appareils
+/// n'a pas à dépendre du réseau extérieur.
+async fn get_device_presets(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let empty = || Json(json!({"presets": []})).into_response();
+    let Some((brand, model)) = zone_identity_for_catalog(&state, id).await else {
+        return empty();
+    };
+    let zone = ZoneRepo::with_backend(state.backend.clone())
+        .get(id)
+        .ok()
+        .flatten();
+    let Ok(client) = tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return empty();
+    };
+    let mut req = client
+        .get("https://mozaiklabs.fr/api/v1/community/devices/presets")
+        .query(&[("brand", brand.as_str()), ("model", model.as_str())]);
+    if let Some(ot) = zone.as_ref().and_then(|z| z.output_type.clone()) {
+        req = req.query(&[("output_type", ot)]);
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+            Ok(v) => Json(v).into_response(),
+            Err(_) => empty(),
+        },
+        Ok(r) => {
+            tracing::debug!(status = %r.status(), "device_presets_fetch_non_success");
+            empty()
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "device_presets_fetch_failed");
+            empty()
+        }
+    }
+}
+
+/// Partage les réglages de renderer d'une zone identifiée avec le catalogue
+/// communautaire (#1743). Mêmes principes que push_device_correction :
+/// anonyme, gaté télémétrie, best-effort en tâche de fond. Ne part que si
+/// marque ET modèle sont connus et qu'au moins un réglage diffère des
+/// défauts.
+async fn push_device_preset(state: &AppState, zone_id: i64) {
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+        return;
+    }
+    let Some((brand, model)) = zone_identity_for_catalog(state, zone_id).await else {
+        return;
+    };
+    let settings_map = renderer_settings_snapshot(state, zone_id);
+    if settings_map.is_empty() {
+        return;
+    }
+    let zone = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten();
+    let payload = json!({
+        "brand": brand,
+        "model": model,
+        "output_type": zone.and_then(|z| z.output_type),
+        "settings": Value::Object(settings_map),
+    });
+    tokio::spawn(async move {
+        let Ok(client) = tune_core::http::client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return;
+        };
+        match client
+            .post("https://mozaiklabs.fr/api/v1/community/devices/presets")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::debug!(status = %r.status(), "device_preset_pushed"),
+            Err(e) => tracing::debug!(error = %e, "device_preset_push_failed"),
+        }
+    });
+}
+
+async fn push_device_correction(state: &AppState, zone_id: i64) {
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+        return;
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let brand = settings
+        .get(&format!("zone_{zone_id}_brand"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    let model = settings
+        .get(&format!("zone_{zone_id}_model"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    // L'un OU l'autre suffit. Exiger les deux écartait le cas le plus fréquent :
+    // la marque seule est corrigée, parce que c'est elle que la déduction par OUI
+    // se trompe, tandis que le modèle est généralement bien annoncé par
+    // l'appareil. Ces corrections partielles ne partaient jamais, et le catalogue
+    // communautaire — qui n'existe que pour les recueillir — s'en trouvait privé
+    // de sa matière la plus courante.
+    if brand.is_none() && model.is_none() {
+        return;
+    }
+
+    let zone = match ZoneRepo::with_backend(state.backend.clone()).get(zone_id) {
+        Ok(Some(z)) => z,
+        _ => return,
+    };
+    let devices = state.scanner.devices().await;
+    let detected = zone
+        .output_device_id
+        .as_deref()
+        .and_then(|did| devices.iter().find(|d| d.id == did));
+
+    // Le champ non corrigé part en chaîne vide et non en null : côté site, ces
+    // colonnes entrent dans la clé d'unicité, où un null est « jamais égal » —
+    // chaque renvoi créerait une ligne de plus au lieu d'incrémenter le compteur.
+    let payload = json!({
+        "detected_manufacturer": detected.and_then(|d| d.manufacturer.clone()),
+        "detected_model": detected.and_then(|d| d.model.clone()),
+        "brand": brand.unwrap_or_default(),
+        "model": model.unwrap_or_default(),
+        "output_type": zone.output_type,
+    });
+
+    tokio::spawn(async move {
+        let Ok(client) = tune_core::http::client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return;
+        };
+        match client
+            .post("https://mozaiklabs.fr/api/v1/community/devices")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::debug!(status = %r.status(), "device_correction_pushed"),
+            Err(e) => tracing::debug!(error = %e, "device_correction_push_failed"),
+        }
+    });
 }
 
 async fn create_zone(
@@ -891,7 +2090,34 @@ async fn create_zone(
     Json(body): Json<CreateZone>,
 ) -> impl IntoResponse {
     let output_type = body.output_type.as_deref();
-    let output_device_id = body.output_device_id.as_deref();
+
+    // Une sortie locale s'identifie par `local:{nom}` — c'est ce préfixe, et
+    // lui seul, qui dit à l'orchestrateur « carte son » plutôt que « renderer
+    // réseau » (`orchestrator.rs`, une dizaine de `starts_with("local:")`).
+    //
+    // Un client qui envoie le nom nu crée donc une zone que rien ne peut
+    // jouer : la lecture part sur le chemin réseau, télécharge la piste
+    // entière, la décode, la ré-encode, puis pousse une URL vers un appareil
+    // qui n'existe pas. Plus d'une minute d'attente, et aucun son (DEvir,
+    // #1823). La zone échappe en prime au dédoublonnage, qui regroupe par
+    // `output_device_id` : elle double la zone correcte du même appareil.
+    //
+    // On répare ici plutôt qu'au seul appelant : le serveur se met à jour
+    // avant le client, et un client déjà installé continuerait sinon à créer
+    // des zones mortes.
+    let device_id_normalise = body.output_device_id.as_deref().map(|d| {
+        if output_type == Some("local") && !d.starts_with("local:") {
+            warn!(
+                device_id = d,
+                corrige = format!("local:{d}"),
+                "create_zone_local_device_id_sans_prefixe_corrige"
+            );
+            format!("local:{d}")
+        } else {
+            d.to_string()
+        }
+    });
+    let output_device_id = device_id_normalise.as_deref();
 
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
     // A previously soft-deleted zone (is_hidden=1) is resurrected so the user's
@@ -941,9 +2167,8 @@ async fn create_zone(
             };
             if !already_registered {
                 // Look up the discovered device and register its DLNA output
-                let scanner = state.scanner.lock().await;
+                let scanner = &state.scanner;
                 let devices = scanner.devices().await;
-                drop(scanner);
 
                 let disc = devices.iter().find(|d| d.id == device_id);
                 if let Some(dev) = disc {
@@ -1043,6 +2268,94 @@ async fn create_zone(
     }
 }
 
+/// POST /zones/{id}/renderer-capabilities — on-demand "discovery check" for the
+/// renderer-config UI. Probes the zone's DLNA renderer via GetProtocolInfo and
+/// returns which audio formats its `Sink` advertises (FLAC, WAV/LPCM 16 & 24,
+/// ALAC/AAC, MP3, DSD), so the user can pick a sensible output override with
+/// evidence. Only meaningful for dlna/openhome zones with a live renderer.
+async fn renderer_capabilities(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zone = match repo.get(id) {
+        Ok(Some(z)) => z,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "zone_not_found" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !matches!(zone.output_type.as_deref(), Some("dlna") | Some("openhome")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "not_a_dlna_renderer",
+                "message": "Renderer capability discovery is only available for DLNA/OpenHome zones.",
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(device_id) = zone.output_device_id.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no_output_device" })),
+        )
+            .into_response();
+    };
+
+    // The GetProtocolInfo probe needs the registered DlnaOutput (it holds the
+    // ConnectionManager URL). If the renderer hasn't been played yet it may not
+    // be registered — try to register it from the discovered device first, same
+    // as create_zone does, so the check works without playing a track first.
+    let mut output = { state.outputs.lock().await.get(device_id) };
+    if output.is_none() {
+        let disc = {
+            let scanner = &state.scanner;
+            let devices = scanner.devices().await;
+            devices.iter().find(|d| d.id == device_id).cloned()
+        };
+        if let Some(dev) = disc {
+            register_dlna_output_from_device(&dev, &state).await;
+            output = { state.outputs.lock().await.get(device_id) };
+        }
+    }
+
+    let Some(output) = output else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "probed": false,
+                "reason": "renderer_offline",
+                "message": "The renderer is not currently online/discovered. Make sure it is powered on and on the same network, then try again.",
+            })),
+        )
+            .into_response();
+    };
+
+    // Hold the output lock for the SOAP round-trip (on-demand, user-initiated,
+    // rare) — same pattern the orchestrator uses for its per-track probe.
+    let caps = {
+        let guard = output.lock().await;
+        match guard.as_any().downcast_ref::<DlnaOutput>() {
+            Some(dlna) => dlna.probe_capabilities().await,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "not_a_dlna_output" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    Json(json!(caps)).into_response()
+}
+
 /// Register a DLNA output from a discovered device.
 /// Fetches the device description XML to find AVTransport/RenderingControl URLs,
 /// then registers the output in the global registry.
@@ -1073,7 +2386,8 @@ async fn register_dlna_output_from_device(
 
     // If cached service URLs are available, use them
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
-        let delay = state.config.play_delay_for(&dev.name);
+        let delay =
+            crate::config::resolve_play_delay(&state.backend, &state.config, &dev.id, &dev.name);
         let dlna = DlnaOutput::new(
             dev.name.clone(),
             dev.id.clone(),
@@ -1103,7 +2417,12 @@ async fn register_dlna_output_from_device(
                             .get("connectionmanager")
                             .or_else(|| service_urls.get("ConnectionManager"))
                             .map(|p| format!("{base}{p}"));
-                        let delay = state.config.play_delay_for(&dev.name);
+                        let delay = crate::config::resolve_play_delay(
+                            &state.backend,
+                            &state.config,
+                            &dev.id,
+                            &dev.name,
+                        );
                         let dlna = DlnaOutput::new(
                             dev.name.clone(),
                             dev.id.clone(),
@@ -1127,6 +2446,31 @@ async fn register_dlna_output_from_device(
     }
 
     false
+}
+
+/// DELETE /zones — soft-delete every zone and clear the free-tier
+/// activation markers, so a Free user whose 3-zone quota is consumed by
+/// stale renderers can start over and explicitly re-create the zones he
+/// wants (discovery never resurrects hidden zones, only POST /zones does).
+async fn delete_all_zones(State(state): State<AppState>) -> impl IntoResponse {
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let ids: Vec<i64> = repo
+        .list()
+        .map(|zs| zs.iter().filter_map(|z| z.id).collect())
+        .unwrap_or_default();
+    match repo.delete_all() {
+        Ok(_) => {
+            info!(count = ids.len(), "all_zones_deleted_quota_reset");
+            for id in ids {
+                state.event_bus.emit_typed(
+                    tune_core::event_types::EventType::ZoneDeleted,
+                    json!({"id": id}),
+                );
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn delete_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
@@ -1213,23 +2557,126 @@ async fn rename_zone(
 
 #[derive(Deserialize)]
 struct CreateGroup {
-    name: String,
+    /// Optional. The web client groups a *selection* of zones and has no name
+    /// to offer, so it never sent this field; when it was mandatory serde
+    /// rejected the whole body and axum answered a bare `422 Unprocessable
+    /// Entity` with no text at all — the unexplained code the tester saw
+    /// (#1702). Absent or blank, the group is named after its zones.
+    #[serde(default)]
+    name: Option<String>,
     zone_ids: Vec<i64>,
+    /// The zone the others follow. Sent by the web client; defaults to the
+    /// first zone of the selection.
+    #[serde(default)]
+    leader_id: Option<i64>,
+}
+
+/// Why a set of zones cannot form a group.
+///
+/// Kept separate from the HTTP layer so the rules can be unit-tested without a
+/// database, and so every refusal is forced to carry the words explaining it.
+#[derive(Debug, PartialEq)]
+enum GroupRefusal {
+    /// Fewer than two *distinct* zones.
+    NotEnoughZones,
+    /// A zone id that no longer exists (stale list on the client's side).
+    UnknownZone(i64),
+    /// Two zones bound to the same output. Tune creates one zone per
+    /// discovered output and duplicates do happen ("PC" and "Haut parleurs"
+    /// on one sound card, #1702): grouping them would send the same stream
+    /// twice to a single device. Both names travel with the refusal so the
+    /// message can say *which* zones clash.
+    SameOutput(String, String),
+}
+
+/// Check a grouping request against the zones that actually exist.
+///
+/// Returns the de-duplicated zone ids, in request order, when the group is
+/// legitimate.
+fn validate_group(zone_ids: &[i64], zones: &[Zone]) -> Result<Vec<i64>, GroupRefusal> {
+    let mut unique: Vec<i64> = Vec::new();
+    for &id in zone_ids {
+        if !unique.contains(&id) {
+            unique.push(id);
+        }
+    }
+    if unique.len() < 2 {
+        return Err(GroupRefusal::NotEnoughZones);
+    }
+
+    // (output device, name of the zone that claimed it first)
+    let mut claimed: Vec<(&str, &str)> = Vec::new();
+    for &id in &unique {
+        let zone = zones
+            .iter()
+            .find(|z| z.id == Some(id))
+            .ok_or(GroupRefusal::UnknownZone(id))?;
+        // A zone with no output device is an orphan, not a duplicate: several
+        // of them share "nothing", which is not the same output.
+        let Some(device) = zone.output_device_id.as_deref().filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        if let Some((_, first)) = claimed.iter().find(|(d, _)| *d == device) {
+            return Err(GroupRefusal::SameOutput(
+                (*first).to_string(),
+                zone.name.clone(),
+            ));
+        }
+        claimed.push((device, zone.name.as_str()));
+    }
+    Ok(unique)
+}
+
+/// Turn a refusal into the error envelope the web client understands:
+/// `error` is the machine code, `message` the sentence it displays.
+fn group_refusal_response(refusal: &GroupRefusal, lang: &str) -> axum::response::Response {
+    let (status, code, message) = match refusal {
+        GroupRefusal::NotEnoughZones => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "group_needs_two_zones",
+            crate::i18n::t(lang, "zonegroup.needsTwoZones"),
+        ),
+        GroupRefusal::UnknownZone(id) => (
+            StatusCode::NOT_FOUND,
+            "group_unknown_zone",
+            crate::i18n::t(lang, "zonegroup.unknownZone").replace("{id}", &id.to_string()),
+        ),
+        GroupRefusal::SameOutput(a, b) => (
+            StatusCode::CONFLICT,
+            "group_same_output",
+            crate::i18n::t(lang, "zonegroup.sameOutput")
+                .replace("{a}", a)
+                .replace("{b}", b),
+        ),
+    };
+    warn!(code, message = %message, "zone_group_refused");
+    (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
 
 async fn list_groups(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let groups: Vec<Value> = settings
+    let mut groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    // Groups stored before #1702 have no `group_id`. The web client keys its
+    // "dissolve" button on that field and was putting `undefined` in the URL,
+    // so an existing group could not be undone. Derive it from `id` on read.
+    for group in &mut groups {
+        if group.get("group_id").is_none()
+            && let Some(id) = group.get("id").and_then(|v| v.as_i64())
+        {
+            group["group_id"] = json!(id.to_string());
+        }
+    }
     Json(json!(groups))
 }
 
 async fn create_group(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateGroup>,
 ) -> Result<impl IntoResponse, AppError> {
     // Premium gate: Multiroom sync requires Premium
@@ -1242,6 +2689,34 @@ async fn create_group(
         return Ok(resp);
     }
 
+    let lang = crate::i18n::lang_from_header(&headers);
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default();
+    let zone_ids = match validate_group(&body.zone_ids, &zones) {
+        Ok(ids) => ids,
+        Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
+    };
+
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            zone_ids
+                .iter()
+                .filter_map(|id| zones.iter().find(|z| z.id == Some(*id)))
+                .map(|z| z.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        });
+    let leader_id = body
+        .leader_id
+        .filter(|id| zone_ids.contains(id))
+        .unwrap_or(zone_ids[0]);
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -1251,20 +2726,23 @@ async fn create_group(
         .unwrap_or_default();
 
     let id = groups.len() as i64 + 1;
-    groups.push(json!({
+    let group = json!({
         "id": id,
-        "name": body.name,
-        "zone_ids": body.zone_ids,
-    }));
+        "group_id": id.to_string(),
+        "name": name,
+        "leader_id": leader_id,
+        "zone_ids": zone_ids,
+    });
+    groups.push(group.clone());
 
     settings
         .set("zone_groups", &serde_json::to_string(&groups)?)
         .ok();
     state.event_bus.emit_typed(
         tune_core::event_types::EventType::GroupCreated,
-        json!({ "id": id, "name": body.name, "zone_ids": body.zone_ids }),
+        json!({ "id": id, "name": name, "zone_ids": zone_ids }),
     );
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
+    Ok((StatusCode::CREATED, Json(group)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1593,4 +3071,949 @@ async fn set_group_delay(
         )
         .ok();
     Json(json!(delays))
+}
+
+#[cfg(test)]
+mod signal_path_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::playback::NowPlaying;
+
+    fn dlna_zone() -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    // Hi-res ALAC source, currently playing, with a live stream session.
+    fn alac_hires_playing() -> ZoneState {
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("alac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Décrit un fil réel : conteneur + fréquence + profondeur effectivement
+    /// servies. Passer 0 en fréquence ou profondeur simule une session qui ne
+    /// les connaît pas encore — l'affichage doit alors retomber sur les règles.
+    fn wire(format: &str, sample_rate: u32, bit_depth: u16) -> StreamInfo {
+        StreamInfo {
+            format: format.into(),
+            sample_rate,
+            bit_depth,
+            ..Default::default()
+        }
+    }
+
+    fn step_desc(v: &Value, name: &str) -> Option<String> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|s| s.get("description").and_then(|d| d.as_str()))
+            .map(String::from)
+    }
+
+    // ------------------------------------------------------------------
+    // Garde-fou : le fil prime, quelles que soient les combinaisons.
+    //
+    // Ce module a une raison d'être précise. `build_signal_path` rejouait les
+    // décisions de l'orchestrateur pour deviner ce qui partait sur le réseau, si
+    // bien que chaque évolution du chemin audio devait être répliquée ici à la
+    // main. Le même bug est revenu six fois sous des formes différentes
+    // (ALAC→FLAC fantôme, cap 16 bits, WAV 24, égaliseur ignoré) parce qu'on
+    // ajoutait un miroir de plus à chaque fois, sans jamais supprimer la cause.
+    //
+    // Le test ci-dessous ne simule PAS l'orchestrateur — ce serait un faux
+    // garde-fou, qui ne ferait que dupliquer une troisième fois les mêmes
+    // règles. Il verrouille l'invariant qui rend les miroirs inoffensifs :
+    // **quand la session de flux renseigne le format réellement servi, c'est lui
+    // qui s'affiche, et aucun réglage de zone ne peut le contredire.**
+    //
+    // Concrètement : si quelqu'un rajoute demain une règle qui écrase la valeur
+    // du fil, ce test casse, et il casse en nommant la combinaison fautive.
+    #[test]
+    fn wire_always_wins_over_every_zone_flag_combination() {
+        // Source hi-res ALAC, fil réellement servi en WAV 96 kHz / 24 bits.
+        // Plusieurs de ces réglages « voudraient » plafonner à 16 bits.
+        let served = wire("wav", 96_000, 24);
+        let expected = "ALAC 96kHz/24bit \u{2192} WAV 96kHz/24bit";
+
+        for lpcm in [false, true] {
+            for cap16 in [false, true] {
+                for wav24 in [false, true] {
+                    for alac_direct in [false, true] {
+                        let (backend, zone) = dlna_zone();
+                        let repo = ZoneRepo::with_backend(backend.clone());
+                        let id = zone.id.unwrap();
+                        repo.update_dlna_lpcm(id, lpcm).unwrap();
+                        repo.update_dlna_cap_16bit(id, cap16).unwrap();
+                        repo.update_dlna_wav24(id, wav24).unwrap();
+                        repo.update_alac_passthrough(id, alac_direct).unwrap();
+                        let zone = repo.get(id).unwrap().unwrap();
+
+                        let sp = build_signal_path(
+                            &alac_hires_playing(),
+                            &zone,
+                            &backend,
+                            Some("darTZeel LHC-208"),
+                            "none",
+                            Some(&served),
+                        )
+                        .unwrap();
+
+                        // Une combinaison peut légitimement ne pas afficher
+                        // d'étape Transcodeur ; ce qui ne se pardonne pas, c'est
+                        // d'en afficher une qui contredise le fil.
+                        if let Some(desc) = transcoder_desc(&sp) {
+                            assert_eq!(
+                                desc, expected,
+                                "lpcm={lpcm} cap16={cap16} wav24={wav24} alac_direct={alac_direct} : \
+                                 l'affichage contredit le fil reellement servi"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Second invariant, complémentaire : le CONTENEUR affiché est celui du fil.
+    // C'est le bug d'origine de Sevy (#1043) — le fil était en WAV et le chemin
+    // annonçait FLAC — remis sous test de façon systématique.
+    #[test]
+    fn wire_container_is_never_contradicted() {
+        for (container, label) in [("wav", "WAV"), ("flac", "FLAC")] {
+            let (backend, zone) = dlna_zone();
+            let sp = build_signal_path(
+                &alac_hires_playing(),
+                &zone,
+                &backend,
+                Some("Eversolo DMP-A10"),
+                "none",
+                Some(&wire(container, 96_000, 24)),
+            )
+            .unwrap();
+            if let Some(desc) = transcoder_desc(&sp) {
+                assert!(
+                    desc.contains(label),
+                    "fil={container} mais l'affichage dit: {desc}"
+                );
+            }
+        }
+    }
+
+    fn transcoder_desc(v: &Value) -> Option<String> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Transcoder"))
+            .and_then(|s| s.get("description").and_then(|d| d.as_str()))
+            .map(String::from)
+    }
+
+    // Sevy, LHC-52: the renderer is served WAV/LPCM (it does not advertise
+    // audio/flac), so the path must show the REAL wire container, not the
+    // static ALAC→FLAC transcode guess. The output is 16-bit LPCM, so the
+    // hi-res 24-bit source reads as downconverted (not bit-perfect).
+    #[test]
+    fn dlna_wav_wire_shows_alac_to_wav() {
+        let (backend, zone) = dlna_zone();
+        let ps = alac_hires_playing();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("LHC-52"),
+            "none",
+            Some(&wire("wav", 96_000, 16)),
+        )
+        .unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} WAV 96kHz/16bit")
+        );
+        // Hi-res source truncated to the 16-bit LPCM cap → not bit-perfect,
+        // but still a lossless source.
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Regression guard: with no live session container (None) the display keeps
+    // its prior behaviour — ALAC transcodes to FLAC for DLNA.
+    #[test]
+    fn dlna_without_session_keeps_flac_target() {
+        let (backend, zone) = dlna_zone();
+        let ps = alac_hires_playing();
+        let sp = build_signal_path(&ps, &zone, &backend, Some("LHC-52"), "none", None).unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
+        );
+    }
+
+    // A FLAC-advertising renderer (wire = flac) is unaffected by the override.
+    #[test]
+    fn dlna_flac_wire_keeps_flac_target() {
+        let (backend, zone) = dlna_zone();
+        let ps = alac_hires_playing();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} FLAC 96kHz/24bit")
+        );
+    }
+
+    // #1504 (Jean Valjean) / #1480 (Bebelalu55) : le panneau bit-perfect doit
+    // afficher LE MÊME volume que la page. La page montre `zone.volume` (base) ;
+    // `ps.volume` est une copie mémoire qui peut être périmée (0,5 par défaut
+    // après un redémarrage, ou laissée par une alarme/minuterie qui n'écrivait
+    // pas la base). L'étape Volume se lit donc depuis la base, quelle que soit
+    // la valeur mémoire.
+    #[test]
+    fn volume_step_reads_persisted_zone_volume_not_stale_memory() {
+        let (backend, zone) = dlna_zone();
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = zone.id.unwrap();
+        repo.update_volume(id, 20).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+
+        // Copie mémoire périmée : le défaut 0,5 d'un ZoneState jamais resemé.
+        let mut ps = alac_hires_playing();
+        ps.volume = 0.5;
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
+        assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 20%"));
+    }
+
+    // Réciproque : curseur de la page à 100 % → pas d'étape Volume, même si la
+    // copie mémoire traîne à 20 % (c'était exactement l'affichage signalé).
+    #[test]
+    fn volume_step_hidden_when_persisted_volume_is_full() {
+        let (backend, zone) = dlna_zone();
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = zone.id.unwrap();
+        repo.update_volume(id, 100).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+
+        let mut ps = alac_hires_playing();
+        ps.volume = 0.2;
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
+        assert_eq!(step_desc(&sp, "Volume"), None);
+    }
+
+    // Native WAV 24-bit source, served byte-for-byte over the WAV wire.
+    fn wav24_playing() -> ZoneState {
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    // Sandro/Progman: a NATIVE WAV 24-bit source is passthrough (WAV never
+    // transcodes for DLNA), so it must read bit-perfect even with dlna_wav24 off
+    // — the badge previously showed red for WAV 24-bit direct.
+    #[test]
+    fn dlna_native_wav24_is_bit_perfect() {
+        let (backend, zone) = dlna_zone();
+        let ps = wav24_playing();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Diretta"),
+            "none",
+            Some(&wire("wav", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Yves, darTZeel LHC-208 et Eversolo DMP-A10 : zones en passthrough natif,
+    // donc AUCUNE étape de transcodage — la seule ligne portant une résolution
+    // est « Source ». Quand le scan n'a pas renseigné la piste (bibliothèque
+    // NAS), les valeurs retombaient sur 44100 Hz et 16 bits écrits en dur, et
+    // Tune affichait donc une résolution inventée pendant que le DAC lisait la
+    // vraie. Le fil est maintenant consulté avant d'en arriver là.
+    #[test]
+    fn passthrough_without_metadata_reads_the_wire_not_a_default() {
+        let (backend, zone) = dlna_zone();
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("flac".into()),
+            sample_rate: None,
+            bit_depth: None,
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("darTZeel LHC-208"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("FLAC 96kHz/24bit"),
+            "sans metadonnees, la resolution doit venir du fil et non du repli 44100/16"
+        );
+    }
+
+    // Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
+    // celui d'avant. Ce test existe pour que la suppression du repli soit un
+    // choix explicite si elle a lieu un jour, pas un effet de bord.
+    #[test]
+    fn no_wire_no_metadata_still_falls_back() {
+        let (backend, zone) = dlna_zone();
+        let np = NowPlaying {
+            title: "Track".into(),
+            format: Some("flac".into()),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+        let sp = build_signal_path(&ps, &zone, &backend, Some("LHC"), "none", None).unwrap();
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("FLAC 44kHz/16bit")
+        );
+    }
+
+    // Le fil prime sur la règle. Ici la zone force le LPCM 16 bits, mais la
+    // session sert réellement du 24 bits : c'est le 24 qui doit s'afficher.
+    // Auparavant la règle gagnait et l'affichage annonçait une troncature qui
+    // n'avait pas lieu.
+    #[test]
+    fn wire_resolution_wins_over_mirrored_rule() {
+        let (backend, zone) = dlna_zone();
+        ZoneRepo::with_backend(backend.clone())
+            .update_dlna_lpcm(zone.id.unwrap(), true)
+            .unwrap();
+        let ps = alac_hires_playing();
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Eversolo DMP-A10"),
+            "none",
+            Some(&wire("wav", 96_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("ALAC 96kHz/24bit \u{2192} WAV 96kHz/24bit")
+        );
+    }
+
+    #[test]
+    fn wav_wire_native_wav_is_bit_perfect_any_depth() {
+        assert!(wav_wire_bit_perfect(true, true, false, 24)); // native WAV 24-bit, flag off
+        assert!(wav_wire_bit_perfect(true, true, false, 16));
+    }
+
+    #[test]
+    fn wav_wire_flac_fallback_capped_at_16_bit() {
+        // FLAC/ALAC → WAV fallback (source not WAV): 24-bit needs the override.
+        assert!(!wav_wire_bit_perfect(true, false, false, 24));
+        assert!(wav_wire_bit_perfect(true, false, false, 16)); // fits plain 16-bit LPCM
+        assert!(wav_wire_bit_perfect(true, false, true, 24)); // dlna_wav24 preserves 24-bit
+    }
+
+    #[test]
+    fn wav_wire_lossy_source_never_bit_perfect() {
+        assert!(!wav_wire_bit_perfect(false, true, true, 16));
+    }
+
+    // ------------------------------------------------------------------
+    // ReplayGain dans le chemin du signal (#1627). Miroir de
+    // `Orchestrator::zone_replaygain_changes_audio` : le panneau ne doit pas
+    // annoncer « Bit-Perfect » pendant qu'un gain multiplie chaque
+    // échantillon — même famille d'écart que l'EQ ignoré du verdict
+    // (#1548/#1559, signalement Bilou).
+
+    /// Comme `dlna_zone()`, mais avec les migrations appliquées : les tags
+    /// ReplayGain vivent dans `track_metadata`, table créée par la migration 34
+    /// et NON par `init_schema()`. Sans elle, la lecture du gain échoue et le
+    /// test « pas d'étape » passerait pour la mauvaise raison.
+    fn dlna_zone_migrated() -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    /// Une piste FLAC en base, taguée `rg_track_gain` (et rien d'autre), et
+    /// l'état de lecture qui la joue. Le fil sert du FLAC : sans ReplayGain ce
+    /// chemin est un passthrough bit-perfect — le contraste que les tests
+    /// veulent.
+    fn flac_track_with_rg_tag(backend: &Arc<dyn DbBackend>, gain_tag: &str) -> (i64, ZoneState) {
+        let mut t = tune_core::db::models::Track::new("Piste".into());
+        t.format = Some("flac".into());
+        t.sample_rate = Some(96_000);
+        t.bit_depth = Some(24);
+        let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+            .set(tid, "rg_track_gain", gain_tag)
+            .unwrap();
+        let np = NowPlaying {
+            title: "Piste".into(),
+            track_id: Some(tid),
+            format: Some("flac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+        (tid, ps)
+    }
+
+    // RG actif (mode track, tag -4.2 dB) → étape présente avec le gain
+    // appliqué, et le verdict bit-perfect tombe — alors que le même chemin
+    // sans RG est un passthrough FLAC bit-perfect.
+    #[test]
+    fn replaygain_active_shows_step_and_breaks_bit_perfect() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "ReplayGain").as_deref(),
+            Some("ReplayGain (track, -4.2 dB)")
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+        // Le RG ne rend pas la SOURCE lossy : le badge qualité reste vert.
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // RG off (défaut) : la même piste taguée n'affiche rien et reste
+    // bit-perfect — le réglage, pas le tag, décide.
+    #[test]
+    fn replaygain_off_shows_nothing_and_stays_bit_perfect() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Mode track SANS tag stocké : gain effectif = 1, donc rien — l'étape
+    // suit le facteur réellement appliqué, pas le réglage (miroir du seuil
+    // de `zone_replaygain_changes_audio`).
+    #[test]
+    fn replaygain_mode_on_without_stored_gain_shows_nothing() {
+        let (backend, zone) = dlna_zone_migrated();
+        let mut t = tune_core::db::models::Track::new("Piste".into());
+        t.format = Some("flac".into());
+        let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+        let np = NowPlaying {
+            title: "Piste".into(),
+            track_id: Some(tid),
+            format: Some("flac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // PURE : le gain n'est jamais appliqué (orchestrator.rs, sortie locale et
+    // chemin transcodé), donc jamais d'étape — quel que soit le réglage.
+    #[test]
+    fn replaygain_never_shown_in_pure_mode() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+        settings
+            .set(
+                &format!("zone_{}_audiophile", zone.id.unwrap()),
+                r#"{"enabled":true}"#,
+            )
+            .unwrap();
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // Mode album sur une piste qui n'a que le tag de piste : c'est le gain de
+    // piste qui s'applique (repli de `stored_gain_detail`), et l'étape doit
+    // nommer ce qui joue vraiment — « track », pas le réglage « album ».
+    #[test]
+    fn replaygain_album_mode_falls_back_to_track_and_says_so() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "album")
+            .unwrap();
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "ReplayGain").as_deref(),
+            Some("ReplayGain (track, -4.2 dB)")
+        );
+    }
+}
+
+/// #1499 — une zone qui « joue » sans destination doit le dire.
+///
+/// Deux situations produisent le même symptôme (file remplie, position qui
+/// avance, aucun son) et ne se distinguaient que dans les journaux : la zone
+/// sans sortie associée, et la zone navigateur dont aucun onglet ne tire le
+/// flux. Bilou a ouvert deux fils forum sur un défaut BluOS inexistant faute
+/// de ce signal.
+#[cfg(test)]
+mod output_reach_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::playback::NowPlaying;
+
+    fn zone_with(output_type: Option<&str>, device: Option<&str>) -> Zone {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend);
+        let id = repo.create("Ce PC", output_type, device).unwrap();
+        repo.get(id).unwrap().unwrap()
+    }
+
+    /// Zone navigateur en lecture depuis `started_ago`, avec une session.
+    fn browser_playing_since(started_ago: Duration) -> ZoneState {
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Track".into(),
+                stream_id: Some("sid-1".into()),
+                ..Default::default()
+            }),
+            last_play_started_at: Instant::now().checked_sub(started_ago),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zone_sans_sortie_est_signalee_avant_le_clic() {
+        let zone = zone_with(Some("local"), None);
+        assert_eq!(
+            output_reach_of(&zone, &ZoneState::default(), false),
+            "no_output"
+        );
+    }
+
+    #[test]
+    fn zone_avec_sortie_ne_signale_rien() {
+        let zone = zone_with(Some("dlna"), Some("dev-1"));
+        assert_eq!(output_reach_of(&zone, &ZoneState::default(), false), "ok");
+    }
+
+    #[test]
+    fn zone_navigateur_a_larret_ne_signale_rien() {
+        // Une zone navigateur n'a jamais de périphérique : sans lecture en
+        // cours il n'y a rien à reprocher.
+        let zone = zone_with(Some("browser"), None);
+        assert_eq!(output_reach_of(&zone, &ZoneState::default(), false), "ok");
+    }
+
+    #[test]
+    fn zone_navigateur_qui_demarre_beneficie_du_delai() {
+        let zone = zone_with(Some("browser"), None);
+        let ps = browser_playing_since(Duration::from_secs(2));
+        assert_eq!(
+            output_reach_of(&zone, &ps, false),
+            "ok",
+            "un onglet qui vient de recevoir stream_url n'a pas encore tiré d'octets"
+        );
+    }
+
+    #[test]
+    fn zone_navigateur_ecoutee_ne_signale_rien() {
+        let zone = zone_with(Some("browser"), None);
+        let ps = browser_playing_since(Duration::from_secs(60));
+        assert_eq!(output_reach_of(&zone, &ps, true), "ok");
+    }
+
+    #[test]
+    fn zone_navigateur_sans_personne_au_bout_est_signalee() {
+        let zone = zone_with(Some("browser"), None);
+        let ps = browser_playing_since(Duration::from_secs(60));
+        assert_eq!(
+            output_reach_of(&zone, &ps, false),
+            "browser_unattended",
+            "une minute de lecture sans un octet tiré : personne n'écoute"
+        );
+    }
+
+    #[test]
+    fn etat_restaure_ne_conclut_rien() {
+        // `last_play_started_at` est `#[serde(skip)]` : après un redémarrage il
+        // vaut None. On ne doit pas inventer un silence sur cette absence.
+        let zone = zone_with(Some("browser"), None);
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Track".into(),
+                stream_id: Some("sid-1".into()),
+                ..Default::default()
+            }),
+            last_play_started_at: None,
+            ..Default::default()
+        };
+        assert_eq!(output_reach_of(&zone, &ps, false), "ok");
+    }
+}
+
+#[cfg(test)]
+mod patch_zone_deserialize_tests {
+    use super::PatchZone;
+
+    // #1320 (Cyrille) — « Aucune » ne persistait jamais : un `null` explicite
+    // sur `max_sample_rate` se désérialisait en `None` extérieur, donc le
+    // handler le confondait avec un champ absent et n'effaçait rien. Ces
+    // trois états sont le contrat du PATCH ; le premier test échoue contre
+    // le code d'avant (sans `deserialize_with = "double_option"`).
+
+    #[test]
+    fn explicit_null_means_clear_the_cap() {
+        let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": null}"#).unwrap();
+        assert_eq!(
+            p.max_sample_rate,
+            Some(None),
+            "un null explicite doit demander l'effacement, pas être ignoré"
+        );
+    }
+
+    #[test]
+    fn absent_field_means_leave_untouched() {
+        let p: PatchZone = serde_json::from_str(r#"{"name": "Salon"}"#).unwrap();
+        assert_eq!(p.max_sample_rate, None);
+    }
+
+    #[test]
+    fn value_means_set_the_cap() {
+        let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": 705600}"#).unwrap();
+        assert_eq!(p.max_sample_rate, Some(Some(705_600)));
+    }
+}
+
+#[cfg(test)]
+mod zone_group_tests {
+    use super::{CreateGroup, GroupRefusal, validate_group};
+    use tune_core::db::zone_repo::Zone;
+
+    // #1702 (Bilou, fil 1392) — deux zones pointant sur la même sortie : le
+    // groupement répondait « 422 unprocessable entity », un code nu, sans
+    // phrase. Deux causes distinctes, testées séparément :
+    //   1. le client web n'envoie pas de `name`, et serde rejetait le corps
+    //      avant même d'atteindre le handler → 422 d'axum, sans texte ;
+    //   2. rien ne vérifiait la sortie partagée, donc aucun message ne
+    //      pouvait l'expliquer.
+
+    fn zone(id: i64, name: &str, device: Option<&str>) -> Zone {
+        Zone {
+            id: Some(id),
+            name: name.to_string(),
+            output_type: Some("local".into()),
+            output_device_id: device.map(str::to_string),
+            volume: 50,
+            muted: false,
+            online: true,
+            gapless_enabled: false,
+            group_id: None,
+            sync_delay_ms: 0,
+            last_position_ms: 0,
+            last_track_id: None,
+            last_track_source: None,
+            last_track_source_id: None,
+            max_sample_rate: None,
+            fixed_volume: false,
+            autoplay_enabled: false,
+        }
+    }
+
+    #[test]
+    fn payload_without_name_is_accepted() {
+        // Le corps exact qu'envoie le client web. Il échouait ici.
+        let body: CreateGroup =
+            serde_json::from_str(r#"{"leader_id": 1, "zone_ids": [1, 2]}"#).unwrap();
+        assert_eq!(body.zone_ids, vec![1, 2]);
+        assert_eq!(body.leader_id, Some(1));
+        assert_eq!(body.name, None);
+    }
+
+    #[test]
+    fn two_zones_on_the_same_output_are_refused_by_name() {
+        let zones = vec![
+            zone(1, "PC", Some("hw:0,0")),
+            zone(2, "Haut parleurs", Some("hw:0,0")),
+        ];
+        assert_eq!(
+            validate_group(&[1, 2], &zones),
+            Err(GroupRefusal::SameOutput(
+                "PC".into(),
+                "Haut parleurs".into()
+            )),
+            "le refus doit nommer les deux zones pour que le message soit lisible"
+        );
+    }
+
+    #[test]
+    fn two_zones_on_distinct_outputs_are_accepted() {
+        let zones = vec![
+            zone(1, "Salon", Some("hw:0,0")),
+            zone(2, "Cuisine", Some("hw:1,0")),
+        ];
+        assert_eq!(validate_group(&[1, 2], &zones), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn zones_without_an_output_are_not_duplicates_of_each_other() {
+        // Deux zones orphelines ne partagent pas « la même sortie » : elles
+        // n'en ont aucune. Les refuser ici afficherait un message faux.
+        let zones = vec![zone(1, "Salon", None), zone(2, "Cuisine", None)];
+        assert_eq!(validate_group(&[1, 2], &zones), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn the_same_zone_twice_is_not_a_group() {
+        let zones = vec![zone(1, "Salon", Some("hw:0,0"))];
+        assert_eq!(
+            validate_group(&[1, 1], &zones),
+            Err(GroupRefusal::NotEnoughZones)
+        );
+    }
+
+    #[test]
+    fn a_single_zone_is_not_a_group() {
+        let zones = vec![
+            zone(1, "Salon", Some("hw:0,0")),
+            zone(2, "Cuisine", Some("hw:1,0")),
+        ];
+        assert_eq!(
+            validate_group(&[1], &zones),
+            Err(GroupRefusal::NotEnoughZones)
+        );
+    }
+
+    #[test]
+    fn a_vanished_zone_is_named_in_the_refusal() {
+        let zones = vec![zone(1, "Salon", Some("hw:0,0"))];
+        assert_eq!(
+            validate_group(&[1, 7], &zones),
+            Err(GroupRefusal::UnknownZone(7))
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_collapsed_not_flagged_as_same_output() {
+        let zones = vec![
+            zone(1, "Salon", Some("hw:0,0")),
+            zone(2, "Cuisine", Some("hw:1,0")),
+        ];
+        assert_eq!(validate_group(&[1, 2, 1], &zones), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn every_refusal_has_a_french_sentence() {
+        for key in [
+            "zonegroup.needsTwoZones",
+            "zonegroup.unknownZone",
+            "zonegroup.sameOutput",
+        ] {
+            let msg = crate::i18n::t("fr", key);
+            assert_ne!(
+                msg, key,
+                "{key} n'a pas de traduction : le client afficherait la clé"
+            );
+            assert!(msg.len() > 20, "{key} doit expliquer, pas juste nommer");
+        }
+    }
+}
+
+#[cfg(test)]
+mod aac_passthrough_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    fn zone_repo() -> (Arc<dyn DbBackend>, i64) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+        (backend, id)
+    }
+
+    /// Le réglage doit être ÉTEINT par défaut.
+    ///
+    /// C'est l'invariant central de cette fonctionnalité : un renderer qui
+    /// annonce l'AAC peut le refuser dans un conteneur ou à un débit donné.
+    /// Activé d'office, cela produirait un silence inexpliqué chez ceux dont le
+    /// matériel a menti — le pire symptôme, celui qu'on ne relie jamais à sa
+    /// cause. Celui qui l'active sait ce que son appareil fait vraiment.
+    #[test]
+    fn aac_passthrough_is_off_until_the_user_asks_for_it() {
+        let (backend, id) = zone_repo();
+        let repo = ZoneRepo::with_backend(backend);
+        assert!(
+            !repo.get_aac_passthrough(id),
+            "le passthrough AAC ne doit jamais être actif par défaut"
+        );
+        repo.update_aac_passthrough(id, true).unwrap();
+        assert!(repo.get_aac_passthrough(id));
+        repo.update_aac_passthrough(id, false).unwrap();
+        assert!(!repo.get_aac_passthrough(id));
+    }
+
+    /// Les deux réglages sont indépendants : activer l'AAC ne doit pas activer
+    /// l'ALAC, et réciproquement. Ils partagent le conteneur MP4 côté format,
+    /// ce qui rend la confusion facile à écrire et invisible à l'usage.
+    #[test]
+    fn aac_and_alac_settings_never_leak_into_each_other() {
+        let (backend, id) = zone_repo();
+        let repo = ZoneRepo::with_backend(backend);
+        repo.update_aac_passthrough(id, true).unwrap();
+        assert!(repo.get_aac_passthrough(id));
+        assert!(
+            !repo.get_alac_passthrough(id),
+            "activer l'AAC a activé l'ALAC"
+        );
+        repo.update_aac_passthrough(id, false).unwrap();
+        repo.update_alac_passthrough(id, true).unwrap();
+        assert!(repo.get_alac_passthrough(id));
+        assert!(
+            !repo.get_aac_passthrough(id),
+            "activer l'ALAC a activé l'AAC"
+        );
+    }
 }

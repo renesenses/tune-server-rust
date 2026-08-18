@@ -35,7 +35,14 @@ WORKDIR /app
 COPY dist/${TARGETARCH}/tune-server /app/tune-server
 COPY dist/${TARGETARCH}/librespot /usr/local/bin/librespot
 COPY dist/${TARGETARCH}/airplay-daemon /usr/local/bin/airplay-daemon
+# web/ n'est pas commité (#1690) : docker.yml le FABRIQUE dans le contexte de
+# build, juste avant, en construisant renesenses/tune-web-client. Construire
+# cette image à la main sans cette étape échouera ici — c'est voulu, plutôt que
+# d'embarquer silencieusement une interface périmée.
 COPY web/ /app/web/
+# Bundled Party (WASM) plugin, next to /app/tune-server (arch-independent). The
+# plugins-wasm runtime resolves plugins/ exe-relative, i.e. /app/plugins.
+COPY dist/plugins/ /app/plugins/
 
 RUN chmod +x /app/tune-server /usr/local/bin/librespot /usr/local/bin/airplay-daemon && \
     chown -R root:root /app && chmod -R 755 /app

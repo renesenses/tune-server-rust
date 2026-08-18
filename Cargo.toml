@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge"]
+members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
@@ -8,9 +8,11 @@ exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.305"
+version = "0.9.84"
 edition = "2024"
-license = "MIT"
+# Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
+# old value misdeclared far broader rights to audit/SBOM tools (issue #1147).
+license = "BUSL-1.1"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
 repository = "https://github.com/renesenses/tune-server-rust"
 
@@ -21,10 +23,14 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
-pyo3 = { version = "0.24", features = ["extension-module"] }
 lofty = "0.24"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "query", "form", "multipart"] }
 walkdir = "2"
+# Décodage des pochettes pour l'empreinte perceptuelle (#1470). Uniquement
+# JPEG et PNG : ce sont les seuls formats que `COVER_FILE_NAMES` accepte, et
+# les codecs par défaut de la crate (AVIF, TIFF, EXR…) tireraient une dizaine
+# de dépendances transitives qui ne serviraient jamais.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rayon = "1.10"
 notify = "7"
 md-5 = "0.10"
@@ -53,8 +59,9 @@ chrono = "0.4"
 cbc = "0.1"
 regex = "1"
 csv = "1"
-symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg"] }
+symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg", "mkv"] }
 rubato = "3"
+audiopus = "0.3.0-rc.0"
 thiserror = "2"
 unicode-normalization = "0.1"
 oaat-core = { git = "https://github.com/renesenses/oaat", rev = "a5d5503", default-features = false }
@@ -63,6 +70,15 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 dotenvy = "0.15"
+
+# Chromecast fix (#1185): rust_cast 0.21.0 with a patched TLS verifier that
+# tolerates the X.509 v1 self-signed certificates presented by older
+# Chromecast devices (rustls-webpki refuses to parse v1 certs, so the stock
+# signature-verification helpers abort the handshake with
+# `UnsupportedCertVersion` even under connect_without_host_verification).
+# See vendor/rust_cast/src/lib.rs, `accept_unparseable_cert`.
+[patch.crates-io]
+rust_cast = { path = "vendor/rust_cast" }
 
 [profile.dev]
 opt-level = 0

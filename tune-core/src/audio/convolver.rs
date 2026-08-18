@@ -77,26 +77,79 @@ impl Convolver {
         }
     }
 
-    /// Load impulse response from a WAV file.
-    pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
+    /// Parse a WAV impulse response into per-channel f32 taps + its sample
+    /// rate. Walks the RIFF chunks so extra chunks before `data` don't break it.
+    fn read_wav_ir(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
         let data = std::fs::read(path).map_err(|e| format!("read IR: {e}"))?;
-        if data.len() < 44 {
-            return Err("IR file too short".into());
+        if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+            return Err("not a RIFF/WAVE file".into());
         }
 
-        let channels = u16::from_le_bytes([data[22], data[23]]) as usize;
-        let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-        let bits = u16::from_le_bytes([data[34], data[35]]) as usize;
-        let data_start = 44usize;
+        // Walk the RIFF chunks to locate `fmt ` and `data` at their REAL
+        // offsets. Impulse WAVs exported by REW / rePhase / Dirac often carry
+        // extra chunks (fact, PEAK, LIST/INFO, cue…) before `data`, so a fixed
+        // 44-byte header offset misreads them into noise.
+        let mut format_tag: u16 = 1; // 1 = PCM int, 3 = IEEE float
+        let mut channels: usize = 0;
+        let mut sample_rate: u32 = 0;
+        let mut bits: usize = 0;
+        let mut data_range: Option<(usize, usize)> = None;
+        let mut pos = 12usize;
+        while pos + 8 <= data.len() {
+            let id = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+            let declared =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            let body = pos + 8;
+            // Clamp to what's actually present so a truncated final chunk can't
+            // index out of bounds.
+            let size = declared.min(data.len() - body);
+            match &id {
+                b"fmt " if size >= 16 => {
+                    format_tag = u16::from_le_bytes([data[body], data[body + 1]]);
+                    channels = u16::from_le_bytes([data[body + 2], data[body + 3]]) as usize;
+                    sample_rate = u32::from_le_bytes([
+                        data[body + 4],
+                        data[body + 5],
+                        data[body + 6],
+                        data[body + 7],
+                    ]);
+                    bits = u16::from_le_bytes([data[body + 14], data[body + 15]]) as usize;
+                    // WAVE_FORMAT_EXTENSIBLE: the effective format tag lives in
+                    // the first 2 bytes of the sub-format GUID.
+                    if format_tag == 0xFFFE && size >= 40 {
+                        format_tag = u16::from_le_bytes([data[body + 24], data[body + 25]]);
+                    }
+                }
+                b"data" => data_range = Some((body, body + size)),
+                _ => {}
+            }
+            // Chunks are word-aligned: an odd size carries a trailing pad byte.
+            pos = body + size + (size & 1);
+        }
+
+        let (dstart, dend) = data_range.ok_or("missing data chunk")?;
+        if channels == 0 {
+            return Err("missing or invalid fmt chunk".into());
+        }
         let bytes_per_sample = bits / 8;
-        let total_samples = (data.len() - data_start) / bytes_per_sample;
+        if bytes_per_sample == 0 {
+            return Err(format!("unsupported bit depth: {bits}"));
+        }
+        let is_float = format_tag == 3;
+
+        let total_samples = (dend - dstart) / bytes_per_sample;
         let samples_per_channel = total_samples / channels;
+        if samples_per_channel == 0 {
+            return Err("IR has no samples".into());
+        }
 
         tracing::info!(
             path,
             channels,
             sample_rate,
             bits,
+            is_float,
             samples_per_channel,
             "convolver_ir_loaded"
         );
@@ -104,34 +157,89 @@ impl Convolver {
         let mut ir = vec![Vec::with_capacity(samples_per_channel); channels];
         for i in 0..samples_per_channel {
             for ch in 0..channels {
-                let offset = data_start + (i * channels + ch) * bytes_per_sample;
-                let sample = match bits {
-                    16 => {
-                        let v = i16::from_le_bytes([data[offset], data[offset + 1]]);
-                        v as f32 / 32768.0
-                    }
-                    24 => {
-                        let v = i32::from_le_bytes([
-                            0,
-                            data[offset],
-                            data[offset + 1],
-                            data[offset + 2],
-                        ]);
+                let o = dstart + (i * channels + ch) * bytes_per_sample;
+                let sample = match (bits, is_float) {
+                    (16, false) => i16::from_le_bytes([data[o], data[o + 1]]) as f32 / 32768.0,
+                    (24, false) => {
+                        // 24-bit LE placed in the top 3 bytes of an i32 for
+                        // correct sign extension, then scaled by 2^31.
+                        let v = i32::from_le_bytes([0, data[o], data[o + 1], data[o + 2]]);
                         v as f32 / 2147483648.0
                     }
-                    32 => f32::from_le_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]),
-                    _ => 0.0,
+                    (32, false) => {
+                        let v =
+                            i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                        v as f32 / 2147483648.0
+                    }
+                    (32, true) => {
+                        f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                    }
+                    (64, true) => f64::from_le_bytes([
+                        data[o],
+                        data[o + 1],
+                        data[o + 2],
+                        data[o + 3],
+                        data[o + 4],
+                        data[o + 5],
+                        data[o + 6],
+                        data[o + 7],
+                    ]) as f32,
+                    _ => {
+                        return Err(format!(
+                            "unsupported WAV sample format: {bits}-bit {}",
+                            if is_float { "float" } else { "int" }
+                        ));
+                    }
                 };
                 ir[ch].push(sample);
             }
         }
 
+        Ok((ir, sample_rate))
+    }
+
+    /// Load an impulse response from a WAV file (any sample rate / channels).
+    pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
+        let (ir, _sr) = Self::read_wav_ir(path)?;
         Ok(Self::new(&ir, block_size))
+    }
+
+    /// Read the raw taps of a WAV impulse response (per channel) plus its
+    /// sample rate, WITHOUT building a convolver. The running [`Convolver`]
+    /// only keeps the IR in FFT-partitioned form, so anything that needs the
+    /// time-domain coefficients again (e.g. the `/convolver/response`
+    /// visualisation endpoint) re-reads them from the persisted file.
+    pub fn read_ir_taps(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
+        Self::read_wav_ir(path)
+    }
+
+    /// Load an IR for a specific stream rate + channel count. Requires the IR's
+    /// sample rate to match (resampling is a follow-up); a mono IR is duplicated
+    /// to the stream's channel count. Used by the transcode path so the FIR can
+    /// apply to network renderers, not just the local output.
+    pub fn from_wav_for(
+        path: &str,
+        block_size: usize,
+        target_sr: u32,
+        target_channels: usize,
+    ) -> Result<Self, String> {
+        let (ir, sr) = Self::read_wav_ir(path)?;
+        if sr != target_sr {
+            return Err(format!(
+                "IR sample rate {sr} Hz != stream rate {target_sr} Hz — export the FIR at {target_sr} Hz"
+            ));
+        }
+        let adapted = if ir.len() == target_channels {
+            ir
+        } else if ir.len() == 1 {
+            vec![ir[0].clone(); target_channels]
+        } else {
+            return Err(format!(
+                "IR has {} channels, stream has {target_channels}",
+                ir.len()
+            ));
+        };
+        Ok(Self::new(&adapted, block_size))
     }
 
     /// Process interleaved f32 samples in-place.
@@ -210,6 +318,158 @@ impl Convolver {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    /// Convolve a whole interleaved buffer offline (one-shot), in place and at
+    /// the same length as the input. `process_interleaved` leaves the final
+    /// partial (< block_size) frames unprocessed (they'd stay dry → an audible
+    /// click at the buffer end); pad up to the next block boundary so that last
+    /// block is flushed too, then truncate back. The IR decay *past* the buffer
+    /// end is dropped (a few ms of tail) — acceptable for room correction.
+    ///
+    /// Use a FRESH Convolver per buffer (no carried-over state across tracks).
+    pub fn process_offline(&mut self, samples: &mut Vec<f32>) {
+        let ch = self.channels;
+        if ch == 0 || samples.is_empty() {
+            return;
+        }
+        let orig_len = samples.len();
+        let frames = orig_len / ch;
+        let rem = frames % self.block_size;
+        if rem != 0 {
+            let pad = (self.block_size - rem) * ch;
+            samples.extend(std::iter::repeat(0.0).take(pad));
+        }
+        self.process_interleaved(samples);
+        samples.truncate(orig_len);
+    }
+
+    /// Apply the convolver to interleaved integer PCM bytes in place, matching
+    /// the layout the transcode pipeline hands to `EqProcessor::process_pcm`
+    /// (little-endian, `bit_depth` of 16/24/32). Decodes to f32, convolves
+    /// offline, and writes the samples back with soft clamping.
+    pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        let ch = self.channels;
+        if ch == 0 || pcm.is_empty() {
+            return;
+        }
+        let bps = (bit_depth / 8) as usize;
+        if bps == 0 {
+            return;
+        }
+        let total = pcm.len() / bps;
+        let mut buf: Vec<f32> = Vec::with_capacity(total);
+        for i in 0..total {
+            let o = i * bps;
+            let s = match bit_depth {
+                16 => i16::from_le_bytes([pcm[o], pcm[o + 1]]) as f32 / 32768.0,
+                24 => {
+                    let v = i32::from_le_bytes([0, pcm[o], pcm[o + 1], pcm[o + 2]]);
+                    v as f32 / 2147483648.0
+                }
+                32 => {
+                    let v = i32::from_le_bytes([pcm[o], pcm[o + 1], pcm[o + 2], pcm[o + 3]]);
+                    v as f32 / 2147483648.0
+                }
+                _ => return,
+            };
+            buf.push(s);
+        }
+        self.process_offline(&mut buf);
+        for i in 0..total {
+            let o = i * bps;
+            let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+            match bit_depth {
+                16 => {
+                    let v = (s * 32767.0).round() as i16;
+                    pcm[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                24 => {
+                    let v = (s * 8_388_607.0).round() as i32;
+                    let b = v.to_le_bytes();
+                    pcm[o] = b[0];
+                    pcm[o + 1] = b[1];
+                    pcm[o + 2] = b[2];
+                }
+                32 => {
+                    let v = (s * 2_147_483_647.0).round() as i32;
+                    pcm[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One point of a FIR frequency response, as served by the
+/// `/zones/{id}/convolver/response` endpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsePoint {
+    pub freq_hz: f64,
+    pub magnitude_db: f64,
+    pub phase_deg: f64,
+}
+
+/// Log-spaced frequency grid (`n` points from `f_lo` to `f_hi` inclusive).
+pub fn log_freq_grid(n: usize, f_lo: f64, f_hi: f64) -> Vec<f64> {
+    if n == 0 || f_lo <= 0.0 || f_hi <= f_lo {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![f_lo];
+    }
+    let ratio = (f_hi / f_lo).ln();
+    (0..n)
+        .map(|i| f_lo * (ratio * i as f64 / (n - 1) as f64).exp())
+        .collect()
+}
+
+/// Evaluate the frequency response of a FIR filter at arbitrary frequencies by
+/// DIRECT summation: H(f) = Σ h[n]·e^(−j2πfn/fs), accumulated in f64. No FFT —
+/// the target grid is log-spaced, which an FFT bin grid can't serve without
+/// interpolation, and ~200 freqs × 128k taps stays a few tens of millions of
+/// f64 ops. The unit phasor is advanced by complex rotation (one sin/cos pair
+/// per frequency); f64 rotation drift over 128k steps is ~1e-11, negligible.
+///
+/// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
+/// which JSON can't carry); phase is the principal atan2 value in degrees.
+pub fn fir_frequency_response(
+    taps: &[f32],
+    sample_rate: u32,
+    freqs_hz: &[f64],
+) -> Vec<ResponsePoint> {
+    let fs = sample_rate as f64;
+    if taps.is_empty() || fs <= 0.0 {
+        return Vec::new();
+    }
+    freqs_hz
+        .iter()
+        .map(|&f| {
+            let theta = -2.0 * std::f64::consts::PI * f / fs;
+            let (wi, wr) = theta.sin_cos();
+            // Unit phasor e^(−j2πfn/fs), advanced by multiplication with w.
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for &h in taps {
+                let h = h as f64;
+                re += h * cr;
+                im += h * ci;
+                let nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+            let mag = (re * re + im * im).sqrt();
+            let magnitude_db = if mag > 1e-10 {
+                20.0 * mag.log10()
+            } else {
+                -200.0
+            };
+            ResponsePoint {
+                freq_hz: f,
+                magnitude_db,
+                phase_deg: im.atan2(re).to_degrees(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -238,5 +498,160 @@ mod tests {
         conv.process_interleaved(&mut samples);
         assert!((samples[0] - 1.0).abs() < 0.01);
         assert!((samples[1] - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn from_wav_skips_extra_chunks_before_data() {
+        // Identity IR (4 taps, 16-bit mono @48k) with a spurious LIST chunk
+        // inserted before `data` — exactly what the old fixed-44-byte parser
+        // misread into noise. The chunk-walking parser must still find `data`.
+        let ir_i16: [i16; 4] = [32767, 0, 0, 0];
+        let mut wav: Vec<u8> = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&[0, 0, 0, 0]); // RIFF size — patched below
+        wav.extend_from_slice(b"WAVE");
+        // fmt  (PCM)
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // format = PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // channels
+        wav.extend_from_slice(&48_000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&(48_000u32 * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        // spurious chunk before data
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(b"INFO");
+        // data
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&((ir_i16.len() * 2) as u32).to_le_bytes());
+        for s in ir_i16 {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+        let path = std::env::temp_dir().join("tune_ir_extrachunks_test.wav");
+        std::fs::write(&path, &wav).unwrap();
+        let mut conv = Convolver::from_wav(path.to_str().unwrap(), 4).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let mut samples = vec![1.0, 0.5, 0.25, 0.125];
+        conv.process_interleaved(&mut samples);
+        for (i, &s) in samples.iter().enumerate() {
+            assert!(
+                (s - [1.0, 0.5, 0.25, 0.125][i]).abs() < 0.01,
+                "sample {i}: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_offline_flushes_last_partial_block() {
+        // IR = [1.0, 0.5], block 4. A 6-frame buffer is not a block multiple,
+        // so the streaming path alone leaves frames 4-5 dry; process_offline
+        // must flush them. Convolving an impulse yields the IR then silence.
+        let ir = vec![vec![1.0f32, 0.5]];
+        let mut conv = Convolver::new(&ir, 4);
+        let mut samples = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        conv.process_offline(&mut samples);
+        assert_eq!(samples.len(), 6, "length must be preserved");
+        let expected = [1.0, 0.5, 0.0, 0.0, 0.0, 0.0];
+        for (i, &e) in expected.iter().enumerate() {
+            assert!(
+                (samples[i] - e).abs() < 0.001,
+                "frame {i}: {} != {e}",
+                samples[i]
+            );
+        }
+    }
+
+    #[test]
+    fn process_pcm_16bit_round_trip() {
+        let ir = vec![vec![1.0f32, 0.5]];
+        let mut conv = Convolver::new(&ir, 4);
+        let frames: [i16; 6] = [32767, 0, 0, 0, 0, 0];
+        let mut pcm: Vec<u8> = Vec::new();
+        for f in frames {
+            pcm.extend_from_slice(&f.to_le_bytes());
+        }
+        conv.process_pcm(&mut pcm, 16);
+        let out: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert!((out[0] as i32 - 32767).abs() < 4, "out0={}", out[0]);
+        assert!((out[1] as i32 - 16383).abs() < 4, "out1={}", out[1]); // 0.5 * full-scale
+        for (i, &v) in out.iter().enumerate().skip(2) {
+            assert!(v.abs() < 4, "out{i}={v}");
+        }
+    }
+
+    #[test]
+    fn frequency_response_unit_impulse_is_flat_0db() {
+        // δ[n] → H(f) = 1 everywhere: 0 dB, 0° phase.
+        let taps = vec![1.0f32, 0.0, 0.0, 0.0];
+        let freqs = log_freq_grid(50, 20.0, 20_000.0);
+        assert_eq!(freqs.len(), 50);
+        assert!((freqs[0] - 20.0).abs() < 1e-9);
+        assert!((freqs[49] - 20_000.0).abs() < 1e-6);
+        for p in fir_frequency_response(&taps, 48_000, &freqs) {
+            assert!(
+                p.magnitude_db.abs() < 1e-6,
+                "{} Hz: {} dB",
+                p.freq_hz,
+                p.magnitude_db
+            );
+            assert!(
+                p.phase_deg.abs() < 1e-6,
+                "{} Hz: {}°",
+                p.freq_hz,
+                p.phase_deg
+            );
+        }
+    }
+
+    #[test]
+    fn frequency_response_pure_delay_flat_linear_phase() {
+        // δ[n−1] → |H| = 1 (0 dB), phase = −360·f/fs degrees (no wrap below
+        // fs/2 for a 1-sample delay).
+        let taps = vec![0.0f32, 1.0];
+        let fs = 48_000u32;
+        let freqs = log_freq_grid(50, 20.0, 20_000.0);
+        for p in fir_frequency_response(&taps, fs, &freqs) {
+            assert!(
+                p.magnitude_db.abs() < 1e-6,
+                "{} Hz: {} dB",
+                p.freq_hz,
+                p.magnitude_db
+            );
+            let expected = -360.0 * p.freq_hz / fs as f64;
+            assert!(
+                (p.phase_deg - expected).abs() < 1e-6,
+                "{} Hz: {}° != {expected}°",
+                p.freq_hz,
+                p.phase_deg
+            );
+        }
+    }
+
+    #[test]
+    fn frequency_response_two_tap_average_lowpass() {
+        // h = [0.5, 0.5] → |H(f)| = cos(πf/fs): −3.01 dB at fs/4, plunging
+        // toward −∞ near fs/2 (floored at −200 dB by the implementation).
+        let taps = vec![0.5f32, 0.5];
+        let fs = 48_000u32;
+        let pts = fir_frequency_response(&taps, fs, &[12_000.0, 23_990.0]);
+        assert!(
+            (pts[0].magnitude_db - (-3.0103)).abs() < 0.01,
+            "fs/4: {} dB",
+            pts[0].magnitude_db
+        );
+        assert!(
+            pts[1].magnitude_db < -60.0,
+            "near fs/2: {} dB",
+            pts[1].magnitude_db
+        );
     }
 }

@@ -1,0 +1,8 @@
+# cargo-audit ignore list — kept in sync with deny.toml's [advisories] ignore
+# and the CI cargo-audit step. The release preflight runs bare `cargo audit`,
+# which reads THIS file (not deny.toml), so the allowlist must live here too.
+[advisories]
+# The wasmtime advisories RUSTSEC-2026-0222/0223 were fixed by bumping wasmtime
+# to 47.0.3 (the "no drop-in bump" excuse no longer holds), so the ignore list
+# is empty again — cargo audit now blocks on any new advisory.
+ignore = []

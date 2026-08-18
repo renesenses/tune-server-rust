@@ -5,6 +5,21 @@ pub struct AudioLevels {
     pub peak_left: f64,
     pub peak_right: f64,
     pub spectrum: Vec<f32>,
+    /// Niveau ABSOLU de chaque bande, en dBFS.
+    ///
+    /// `spectrum` ci-dessus est une *forme* : chaque trame y est divisée par sa
+    /// propre bande la plus forte, donc la dominante vaut toujours 1,0 et un
+    /// pianissimo s'affiche comme un tutti. Ce champ-ci dit le vrai niveau, sur
+    /// la même échelle que `rms_*_db` / `peak_*_db`, ce qui permet à un client
+    /// de tracer un analyseur gradué au lieu d'une silhouette.
+    ///
+    /// Les deux coexistent volontairement : `spectrum` reste le contrat des
+    /// clients déjà déployés (application iOS comprise).
+    pub spectrum_db: Vec<f32>,
+    /// Durée audio couverte par ces niveaux — permet au forwarder de
+    /// l'orchestrateur de cadencer l'émission sur l'horloge de lecture
+    /// (le décodage va bien plus vite que le temps réel).
+    pub window: std::time::Duration,
 }
 
 impl AudioLevels {
@@ -21,6 +36,10 @@ impl AudioLevels {
         to_db(self.peak_right)
     }
 }
+
+/// Plancher des niveaux par bande. Aligné sur celui de `to_db` : au-dessous,
+/// c'est du silence, et un client n'a rien à y afficher.
+pub const SPECTRUM_FLOOR_DB: f32 = -96.0;
 
 fn to_db(linear: f64) -> f32 {
     if linear <= 0.0 {
@@ -68,12 +87,22 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
         return AudioLevels::default();
     }
 
+    // Une seule FFT pour les deux formes : les recalculer séparément
+    // doublerait le coût d'analyse, déjà en cause dans #1110.
+    let spectrum = analyze_spectrum(pcm, bit_depth, channels, 32, sample_rate);
+
     AudioLevels {
         rms_left: (sum_sq_l / frames as f64).sqrt(),
         rms_right: (sum_sq_r / frames as f64).sqrt(),
         peak_left: peak_l,
         peak_right: peak_r,
-        spectrum: compute_spectrum(pcm, bit_depth, channels, 32, sample_rate),
+        spectrum_db: spectrum.db,
+        spectrum: spectrum.shape,
+        window: if sample_rate > 0 {
+            std::time::Duration::from_secs_f64(frames as f64 / sample_rate as f64)
+        } else {
+            std::time::Duration::ZERO
+        },
     }
 }
 
@@ -104,6 +133,15 @@ fn read_sample(frame: &[u8], offset: usize, bytes: usize, bit_depth: u16) -> f64
     raw / max_val
 }
 
+/// Le spectre d'une trame, sous ses deux formes.
+#[derive(Debug, Clone, Default)]
+pub struct Spectrum {
+    /// Forme normalisée trame par trame (0..1) — contrat historique.
+    pub shape: Vec<f32>,
+    /// Niveau absolu par bande, en dBFS.
+    pub db: Vec<f32>,
+}
+
 /// Compute spectrum bins from PCM data using a simple FFT.
 /// Returns `bins` magnitude values (0.0..1.0) spread across the frequency range.
 pub fn compute_spectrum(
@@ -113,14 +151,37 @@ pub fn compute_spectrum(
     bins: usize,
     sample_rate: u32,
 ) -> Vec<f32> {
+    analyze_spectrum(pcm, bit_depth, channels, bins, sample_rate).shape
+}
+
+/// Analyse spectrale d'une trame : une FFT, deux lectures.
+///
+/// `shape` conserve la normalisation trame-par-trame attendue par les clients
+/// déjà déployés ; `db` donne le niveau absolu de chaque bande en dBFS.
+///
+/// Référence du 0 dBFS : les échantillons sont ramenés à ±1, la fenêtre de Hann
+/// a un gain cohérent de 0,5, donc une sinusoïde pleine échelle tombant au
+/// centre d'une raie donne une magnitude de `n/4`. C'est cette valeur qui sert
+/// de référence, et c'est ce qui rend la lecture comparable à `peak_*_db`.
+pub fn analyze_spectrum(
+    pcm: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    bins: usize,
+    sample_rate: u32,
+) -> Spectrum {
+    let empty = || Spectrum {
+        shape: vec![0.0; bins],
+        db: vec![SPECTRUM_FLOOR_DB; bins],
+    };
     if pcm.is_empty() || channels == 0 || bins == 0 {
-        return vec![0.0; bins];
+        return empty();
     }
 
     let bytes_per_sample = (bit_depth / 8) as usize;
     let frame_size = bytes_per_sample * channels as usize;
     if frame_size == 0 {
-        return vec![0.0; bins];
+        return empty();
     }
 
     // Extract mono samples (mix L+R), max 2048 samples for FFT
@@ -204,6 +265,9 @@ pub fn compute_spectrum(
     let freq_max = nyquist.min(20000.0);
     let log_ratio = freq_max / freq_min;
     let mut result = vec![0.0f32; bins];
+    let mut result_db = vec![SPECTRUM_FLOOR_DB; bins];
+    // Sinusoïde pleine échelle au centre d'une raie, fenêtre de Hann : n/4.
+    let full_scale = (n as f64) / 4.0;
     for b in 0..bins {
         let hz_low = freq_min * log_ratio.powf(b as f64 / bins as f64);
         let hz_high = freq_min * log_ratio.powf((b + 1) as f64 / bins as f64);
@@ -213,17 +277,32 @@ pub fn compute_spectrum(
         let f_high = f_high.max(f_low + 1).min(half);
 
         let mut sum = 0.0;
+        let mut sum_sq = 0.0;
         let count = (f_high - f_low).max(1);
         for i in f_low..f_high {
             sum += mags[i];
+            sum_sq += mags[i] * mags[i];
         }
         let avg = sum / count as f64;
         // Normalize to 0..1, apply some compression
         let normalized = (avg / max_mag).powf(0.6);
         result[b] = normalized as f32;
+
+        // Niveau absolu : énergie de la bande, pas moyenne des magnitudes —
+        // une raie isolée dans une bande large ne doit pas être diluée par ses
+        // voisines silencieuses.
+        let band_mag = (sum_sq / count as f64).sqrt() * (count as f64).sqrt();
+        result_db[b] = if band_mag <= 0.0 || full_scale <= 0.0 {
+            SPECTRUM_FLOOR_DB
+        } else {
+            ((20.0 * (band_mag / full_scale).log10()) as f32).clamp(SPECTRUM_FLOOR_DB, 6.0)
+        };
     }
 
-    result
+    Spectrum {
+        shape: result,
+        db: result_db,
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +327,80 @@ mod tests {
         let levels = compute_levels(&pcm, 16, 2, 44100);
         assert!(levels.peak_left_db() > -1.0);
         assert!(levels.peak_right_db() > -1.0);
+    }
+
+    /// PCM stéréo d'une sinusoïde à `freq`, d'amplitude `amp` (1.0 = pleine échelle).
+    fn sine_pcm(freq: f64, amp: f64, sr: u32, frames: usize) -> Vec<u8> {
+        let mut pcm = Vec::with_capacity(frames * 4);
+        for i in 0..frames {
+            let t = i as f64 / sr as f64;
+            let sample = amp * (2.0 * std::f64::consts::PI * freq * t).sin();
+            let val = (sample * i16::MAX as f64) as i16;
+            pcm.extend_from_slice(&val.to_le_bytes()); // left
+            pcm.extend_from_slice(&val.to_le_bytes()); // right
+        }
+        pcm
+    }
+
+    /// Indice de la bande logarithmique (20 Hz–20 kHz) contenant `freq`.
+    fn bin_of(freq: f64, bins: usize, sr: u32) -> usize {
+        let nyquist = sr as f64 / 2.0;
+        let ratio = nyquist.min(20000.0) / 20.0;
+        (((freq / 20.0).log10() / ratio.log10()) * bins as f64) as usize
+    }
+
+    #[test]
+    fn spectrum_db_reads_absolute_level() {
+        // Une sinusoïde pleine échelle doit lire ~0 dBFS dans SA bande, et le
+        // niveau doit SUIVRE l'amplitude : c'est tout l'intérêt du champ, là où
+        // `spectrum` (normalisé trame par trame) donne 1,0 dans les deux cas.
+        let sr = 44100u32;
+        let bins = 32usize;
+        let b440 = bin_of(440.0, bins, sr);
+
+        let full = analyze_spectrum(&sine_pcm(440.0, 1.0, sr, 2048), 16, 2, bins, sr);
+        let quiet = analyze_spectrum(&sine_pcm(440.0, 0.1, sr, 2048), 16, 2, bins, sr);
+
+        assert!(
+            (full.db[b440] - 0.0).abs() < 3.0,
+            "pleine échelle lue à {} dBFS dans la bande {b440}",
+            full.db[b440]
+        );
+        // −20 dB d'amplitude → −20 dB de niveau.
+        let delta = full.db[b440] - quiet.db[b440];
+        assert!(
+            (delta - 20.0).abs() < 3.0,
+            "écart plein/−20 dB mesuré à {delta} dB"
+        );
+        // La forme, elle, ne distingue pas les deux : c'est le défaut corrigé.
+        assert!((full.shape[b440] - quiet.shape[b440]).abs() < 0.05);
+    }
+
+    #[test]
+    fn spectrum_db_is_quiet_away_from_the_tone() {
+        let sr = 44100u32;
+        let bins = 32usize;
+        let s = analyze_spectrum(&sine_pcm(440.0, 1.0, sr, 2048), 16, 2, bins, sr);
+        let b440 = bin_of(440.0, bins, sr);
+        // Une bande deux octaves plus haut ne doit pas voir la fondamentale.
+        let far = bin_of(4000.0, bins, sr);
+        assert!(
+            s.db[far] < s.db[b440] - 30.0,
+            "fuite à 4 kHz : {} dBFS contre {} dBFS à 440 Hz",
+            s.db[far],
+            s.db[b440]
+        );
+    }
+
+    #[test]
+    fn spectrum_db_floors_on_silence() {
+        let s = analyze_spectrum(&vec![0u8; 4096], 16, 2, 32, 44100);
+        assert_eq!(s.db.len(), 32);
+        assert!(
+            s.db.iter().all(|&d| d <= SPECTRUM_FLOOR_DB + 0.01),
+            "le silence ne descend pas au plancher : {:?}",
+            &s.db[..4]
+        );
     }
 
     #[test]

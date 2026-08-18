@@ -88,27 +88,34 @@ pub(super) async fn artist_bio(
             .into_response();
         }
     }
-    let Some(ref mbid) = artist.musicbrainz_id else {
-        return Json(json!({"artist": artist.name, "bio": null, "error": "no MusicBrainz ID"}))
-            .into_response();
-    };
+    // Community artist-bio API is keyed by NAME (AI-generated on demand) — NO
+    // MusicBrainz id required, so it works for the whole library, most of which
+    // has no MBID. Mirrors the album path.
     let lang = q.lang.as_deref().unwrap_or("fr");
-    let cache_key = format!("cache:bio:{mbid}:{lang}");
+    let cache_key = format!("cache:artistbio:{}:{lang}", artist.name);
     if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
     }
     match state
         .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
+        .get("https://mozaiklabs.fr/api/v1/artists/bio")
+        .query(&[("name", artist.name.as_str())])
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.backend, &cache_key, &data);
-            Json(data).into_response()
+            let out = json!({
+                "artist": artist.name,
+                "bio": data.get("bio").cloned().unwrap_or(Value::Null),
+                "source": data.get("source").cloned().unwrap_or(Value::Null),
+            });
+            if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
+                api_cache_set(&state.backend, &cache_key, &out);
+            }
+            Json(out).into_response()
         }
-        _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
+        _ => Json(json!({"artist": artist.name, "bio": null})).into_response(),
     }
 }
 
@@ -321,14 +328,21 @@ pub(super) async fn artist_image_report(
     body: Option<Json<ImageReportBody>>,
 ) -> impl IntoResponse {
     let reason = body.and_then(|Json(b)| b.reason);
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("reported_artist_image_{id}");
-    let val = json!({
-        "artist_id": id,
-        "reason": reason,
-        "reported_at": now_iso_utc(),
-    });
-    settings.set(&key, &val.to_string()).ok();
+    // Recorded in metadata_reports like every other report. It used to be
+    // stashed as a settings key (reported_artist_image_{id}), which no code
+    // could list or aggregate and which never reached the community backend.
+    tune_core::db::metadata_report_repo::MetadataReportRepo::with_backend(state.backend.clone())
+        .insert(
+            "artist_image",
+            Some(id),
+            None,
+            None,
+            None,
+            reason.as_deref().unwrap_or("incorrect_image"),
+            None,
+            &now_iso_utc(),
+        )
+        .ok();
     // Also remove the wrong image locally so the artist shows a placeholder and
     // a fresh image is re-fetched on the next enrichment (Jean Valjean #1096:
     // "supprimer les images incorrectes en appuyant sur le drapeau").

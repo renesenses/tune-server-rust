@@ -2,9 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # La ligne de release doit etre couverte comme main : c'est d'elle que
+    # sortent les tags v0.9.x. Sans cela, une PR vers release/v0.9 n'etait
+    # verifiee que par test-postgres.yml (seul workflow dont le trigger
+    # pull_request n'a pas de filtre de branche) — donc ni fmt, ni clippy, ni
+    # cargo test, ni compilation. Trois defauts sont passes ainsi le 8 aout
+    # 2026 et n'ont ete revels qu'en construisant la branche elle-meme : un
+    # test OAAT instable (#1358), une migration PG non declaree (#1364), et
+    # l'incident #875 en juillet avait deja le meme mecanisme.
+    branches: [main, release/v0.9]
   pull_request:
-    branches: [main]
+    branches: [main, release/v0.9]
   workflow_dispatch:
 
 env:
@@ -33,6 +41,67 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
+
+  # La CI validait `--features oaat` alors que les binaires publies embarquent
+  # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
+  # depuis au moins la 0.9.61 : `dj_plugin.rs` est derriere
+  # `#![cfg(feature = "dj")]`, jamais compile ici, et `plugin_routes.rs`
+  # comptait les greffons en supposant qu'aucun n'etait compile (#1427).
+  #
+  # Ce job execute la suite avec LE JEU LIVRE. Sans lui, ces tests
+  # redeviennent invisibles a la premiere occasion.
+  test-shipped-features:
+    name: Test (jeu de fonctionnalites livre)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Meme dependance systeme que le job de build : sans elle, la compilation
+      # s'arrete sur « Package alsa was not found in the pkg-config ».
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+
+  # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
+  # `audio-embedding` feature, now shipped in the release + docker builds. This
+  # job compile-checks it in isolation so a break surfaces on the PR rather than
+  # only at release time. `load-dynamic` needs no onnxruntime binary at build.
+  #
+  # Il EXECUTE aussi les tests de `tune-core` derriere cette fonctionnalite —
+  # dix-sept a ce jour — que rien ne lancait. Aucune tache ne les couvrait :
+  #   `test`                  : --features oaat, donc sans audio-embedding ;
+  #   `test-shipped-features` : -p tune-server SEUL, donc pas tune-core ;
+  #   ce job                  : `cargo check`, donc compilation sans execution.
+  #
+  # Le module entier est sous `#[cfg(feature = "audio-embedding")]`
+  # (`audio/mod.rs`) : ces tests ne s'executaient donc QUE sur la machine de
+  # celui qui pensait a passer la fonctionnalite a la main. Meme motif que
+  # `test-shipped-features`, qui existe parce que neuf tests de greffons
+  # echouaient en silence depuis la 0.9.61 (#1427).
+  #
+  # `provision_and_embed` est `#[ignore]` (il telecharge le modele) : il reste
+  # hors de cette execution, comme avant.
+  audio-embedding:
+    name: Audio embedding feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `audio-embedding` pulls audio crates (via ort/cpal deps) that link ALSA;
+      # install it like the main build job does, or the compile-check fails on
+      # `Package alsa was not found in the pkg-config`.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo check -p tune-server --features audio-embedding
+      - run: cargo test -p tune-core --features audio-embedding
 
   build:
     name: Build ${{ matrix.target }}
@@ -76,7 +145,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -84,15 +153,33 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+
+      # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
+      # NOT covered by the build above, so ASIO code compiled only at release
+      # time — a compile error there (e.g. #803 ASIO stall guardrails) slipped
+      # past PR CI and would only surface in the release build. Compile-check it
+      # here with the ASIO SDK so the asio path is gated on every PR.
+      - name: Download ASIO SDK (Windows)
+        if: "!matrix.cross && runner.os == 'Windows'"
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.steinberg.net/asiosdk" -OutFile asiosdk.zip
+          Expand-Archive -Path asiosdk.zip -DestinationPath asiosdk -Force
+          $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
+          echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
+
+      - name: ASIO feature compile-check (Windows)
+        if: "!matrix.cross && runner.os == 'Windows'"
+        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }}
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -162,12 +249,48 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
+    # advisories that forced continue-on-error are fixed (bump to 47.0.3).
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
+        with:
+          # Only the unmaintained-warning advisories with no available fix are
+          # ignored (paste, instant — transitive, no runtime path). Kept in sync
+          # with deny.toml. Every vulnerability, wasmtime included, now blocks.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+
+  widget:
+    name: Widget (compilation)
+    # tune-widget echappait a TOUT filet : le Cargo.toml racine l'exclut du
+    # workspace (exclusion voulue — sans elle, cargo fmt --all remonte les deps
+    # GUI/webkit et casse la CI Linux headless), et widget.yml ne se declenche
+    # que sur un tag widget-v*. Aucun tag de ce genre n'ayant jamais existe, ce
+    # workflow n'avait jamais tourne : au premier tag, le 12 aout 2026, il a
+    # echoue des l'installation du CLI Tauri sur une rouille invisible depuis
+    # des mois. Ce job compile le widget a chaque PR pour que le prochain tag
+    # ne soit plus le premier essai.
+    #
+    # macOS et pas ubuntu : le widget ne livre que des DMG (cf la matrice de
+    # widget.yml), et Tauri y compile sans les paquets webkit d'apt.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tune-widget/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --release
+        working-directory: tune-widget/src-tauri
+      # Le widget porte des tests unitaires depuis le seuil de disposition mini
+      # (`parse_version`), mais personne ne les executait : `cargo test` a la
+      # racine ne voit pas une crate exclue du workspace. Ils passaient donc
+      # pour verifies sans l'avoir jamais ete.
+      - run: cargo test
+        working-directory: tune-widget/src-tauri

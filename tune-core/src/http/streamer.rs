@@ -5,9 +5,36 @@ use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
-use crate::audio::wav::build_wav_header_with_duration;
+use crate::audio::wav::{
+    build_wav_header_bounded_live as wav_header_bounded_live,
+    build_wav_header_streaming as wav_header_streaming, build_wav_header_with_duration,
+};
+
+pub use crate::audio::wav::{LIVE_BOUNDED_DATA_SIZE, LIVE_BOUNDED_TOTAL_LEN};
 
 pub const ICY_METAINT: usize = 16384;
+
+/// A boxed, cloneable async closure that re-resolves a fresh signed CDN URL
+/// for the track backing a proxy session.
+///
+/// Streaming services (Qobuz, Tidal, …) hand out short-TTL signed CDN URLs
+/// (Qobuz embeds `etsp=<unix-expiry>` + `hmac=`; the TTL is ~60 min). On a
+/// long Hi-Res track — or after a long pause — the URL expires mid-playback,
+/// so a client-triggered `Range: bytes=N-` resume against the stored URL fails
+/// at the connection/auth level (reqwest "error sending request", or 403/410).
+/// Re-fetching the SAME expired URL can never succeed; the proxy layer instead
+/// calls this to obtain a FRESH signed URL for the same file and resumes the
+/// Range request byte-exact.
+///
+/// The future resolves to a fresh `https://…` CDN URL for the same track and
+/// quality, or an error string. It is `Send` and captures only cheap
+/// clones (an `Arc` registry handle + the service name / track id / quality),
+/// so it can be invoked any number of times over the life of the session.
+pub type ReresolveFn = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamInfo {
@@ -51,17 +78,59 @@ pub struct StreamSession {
     /// DLNA renderer gets the metadata up front without seeking to the file end.
     pub faststart: std::sync::Mutex<Option<crate::audio::faststart::FaststartMap>>,
     pub proxy_url: Mutex<Option<String>>,
+    /// Re-resolver for the proxied CDN URL. Set for streaming proxy sessions
+    /// whose signed URL can expire (Qobuz/Tidal). When a proxied upstream
+    /// request fails to send or returns 403/410 (expired signature), the proxy
+    /// layer calls this to fetch a fresh signed URL and resumes byte-exact.
+    /// `None` for local files, radio, and non-expiring sources.
+    pub reresolve: Mutex<Option<ReresolveFn>>,
     pub track_title: Option<String>,
     pub track_artist: Option<String>,
     pub track_album: Option<String>,
     pub cover_url: Option<String>,
     pub bit_perfect: bool,
     pub is_radio: bool,
+    /// True audio format detected by the radio decoder once the upstream is
+    /// probed. The WAV header advertised to the renderer is built from the
+    /// hard-coded `info` (44100/16/2) at request time — but a station may
+    /// decode at a different rate (FIP is 48000). The decoder publishes the
+    /// real rate/channels here so the header can reflect them instead of
+    /// declaring 44100 for a 48000 stream (which plays ~8.8% too slow and
+    /// skews the renderer's byte accounting). `0` means "not yet detected".
+    pub detected_sample_rate: std::sync::atomic::AtomicU32,
+    pub detected_channels: std::sync::atomic::AtomicU16,
     pub wav_header_included: std::sync::atomic::AtomicBool,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// Number of HTTP requests currently streaming this session. The radio→WAV
+    /// channel is single-consumer (`rx` behind a Mutex): a second concurrent
+    /// reader would race the first for each PCM chunk and split the stream. This
+    /// counter surfaces that case for diagnostics (a renderer that re-requests
+    /// without closing its first connection — DMP-A8 FIP silent-after-reconnect).
+    pub active_consumers: std::sync::atomic::AtomicU32,
+    /// Monotonic token identifying the CURRENT owner of the single-consumer
+    /// radio PCM channel. A DLNA renderer that re-requests the radio stream
+    /// (buffer refill / reconnect) without closing its first connection would
+    /// otherwise have BOTH connections race `recv_chunk()` for each PCM chunk,
+    /// splitting the audio between them → dropouts. Each new radio consumer
+    /// calls `claim_radio_consumer()` to bump this and supersede the older
+    /// connection, which then hands off the channel and ends. `0` = no consumer.
+    pub consumer_epoch: std::sync::atomic::AtomicU64,
+    /// Wakes an older radio consumer the instant a newer one claims the channel
+    /// so it releases the `rx` lock promptly instead of staying parked in
+    /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_radio_consumer`.
+    pub consumer_supersede: std::sync::Arc<tokio::sync::Notify>,
     pub first_request: std::sync::Arc<tokio::sync::Notify>,
     pub data_ready: std::sync::Arc<tokio::sync::Notify>,
+    /// True once the PRODUCER task feeding this session (the radio decode
+    /// thread) has exited — whatever the exit path: clean upstream EOF,
+    /// `radio_reconnect_giving_up`, consumer dropped, error or panic. Several
+    /// of those paths log only at `debug!`, so in production the producer can
+    /// die with **no visible trace** while the session object stays alive.
+    /// `Orchestrator::resume` reads this to detect that resuming a webradio
+    /// would feed silence (nothing produces PCM anymore) and re-plays the
+    /// station instead (#1629).
+    pub producer_done: std::sync::atomic::AtomicBool,
 }
 
 impl StreamSession {
@@ -77,17 +146,24 @@ impl StreamSession {
             file_path: Mutex::new(None),
             faststart: std::sync::Mutex::new(None),
             proxy_url: Mutex::new(None),
+            reresolve: Mutex::new(None),
             track_title: None,
             track_artist: None,
             track_album: None,
             cover_url: None,
             bit_perfect,
             is_radio: false,
+            detected_sample_rate: std::sync::atomic::AtomicU32::new(0),
+            detected_channels: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            active_consumers: std::sync::atomic::AtomicU32::new(0),
+            consumer_epoch: std::sync::atomic::AtomicU64::new(0),
+            consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
+            producer_done: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -95,14 +171,104 @@ impl StreamSession {
         self.rx.lock().await.recv().await
     }
 
+    /// Register a new HTTP consumer of the single-consumer radio PCM channel and
+    /// return its epoch token. Any consumer registered earlier is SUPERSEDED:
+    /// its epoch no longer matches (so `is_current_radio_consumer` returns
+    /// false) and it is woken via `consumer_supersede` so it drops its pending
+    /// `recv_chunk()` (releasing the `rx` lock) and ends — handing the channel
+    /// to this newest connection instead of racing it for each PCM chunk.
+    ///
+    /// The consumer loop must use the lost-wakeup-free pattern: subscribe to
+    /// `consumer_supersede` (create + `enable()` the `Notified`) BEFORE calling
+    /// `is_current_radio_consumer`, so the epoch bump (which happens-before the
+    /// notify) is observed either as a wake or as a stale epoch. That, together
+    /// with a `biased` select that polls the supersede branch first, guarantees
+    /// a superseded consumer stops WITHOUT pulling a further chunk (no split,
+    /// no loss, no duplication at the swap).
+    pub fn claim_radio_consumer(&self) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let epoch = self.consumer_epoch.fetch_add(1, SeqCst) + 1;
+        // Wake any older consumer currently parked so it re-checks its epoch.
+        self.consumer_supersede.notify_waiters();
+        epoch
+    }
+
+    /// True while `epoch` (from `claim_radio_consumer`) is still the current
+    /// channel owner. Becomes false once a newer consumer claims the channel.
+    pub fn is_current_radio_consumer(&self, epoch: u64) -> bool {
+        self.consumer_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == epoch
+    }
+
     pub async fn close_sender(&self) {
         self.tx.lock().await.take();
         self._keep_alive_tx.lock().await.take();
+    }
+
+    /// Current fill of the mpsc channel backing this session as
+    /// `(buffered_messages, max_messages)`, or `None` once the channel has been
+    /// closed (its keep-alive sender was dropped by `close_sender`) — the caller
+    /// can no longer measure fill and should stop waiting on it.
+    ///
+    /// `buffered_messages = max_capacity - capacity`: the chunks a producer has
+    /// pushed that no HTTP reader has consumed yet. Used ONLY by the initial
+    /// DLNA prebuffer barrier (#1259) to tell how much audio has accumulated in
+    /// a transcode/radio channel before `Play` is sent. Read-only — it never
+    /// touches the stream itself.
+    pub async fn channel_fill(&self) -> Option<(usize, usize)> {
+        let guard = self._keep_alive_tx.lock().await;
+        guard.as_ref().map(|tx| {
+            let max = tx.max_capacity();
+            (max.saturating_sub(tx.capacity()), max)
+        })
     }
 }
 
 /// Type alias for the shared sessions map, used by both core and server.
 pub type SharedSessions = Arc<Mutex<HashMap<String, Arc<StreamSession>>>>;
+
+// ---------------------------------------------------------------------------
+// Métadonnées ICY en direct — canal latéral entre le poller et le flux
+// ---------------------------------------------------------------------------
+//
+// Le bloc ICY envoyé à un renderer était construit UNE FOIS, à la connexion,
+// puis réémis à l'identique toutes les 16 Ko. Un Marantz branché sur Radio
+// Paradise affichait donc éternellement le morceau qui passait à l'instant du
+// branchement (signalé sur le forum, 10 août).
+//
+// Le titre courant existe pourtant : le poller l'obtient déjà via
+// `radio_metadata::fetch_radio_metadata` et met à jour le now-playing de la
+// zone — c'est ce que l'interface web affiche. Mais les deux sous-systèmes
+// s'ignorent : la session de flux n'a pas de zone, et le poller n'a pas les
+// sessions.
+//
+// Plutôt que de faire traverser `SharedSessions` au constructeur du poller —
+// qui n'en a besoin que pour ça — ce registre étroit fait le lien, par
+// `stream_id`, la seule clé que les deux connaissent déjà. Il est délibérément
+// minuscule : une entrée par flux radio en cours.
+static RADIO_NOW: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Option<String>, String)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Publier le titre courant d'un flux radio. Appelé par le poller quand il
+/// détecte un changement de morceau.
+pub fn publish_radio_now(stream_id: &str, artist: Option<String>, title: String) {
+    if let Ok(mut map) = RADIO_NOW.lock() {
+        map.insert(stream_id.to_string(), (artist, title));
+    }
+}
+
+/// Lire le titre courant d'un flux radio, s'il a été publié.
+pub fn radio_now(stream_id: &str) -> Option<(Option<String>, String)> {
+    RADIO_NOW.lock().ok()?.get(stream_id).cloned()
+}
+
+/// Oublier un flux terminé — sans quoi le registre grossirait indéfiniment.
+pub fn forget_radio_now(stream_id: &str) {
+    if let Ok(mut map) = RADIO_NOW.lock() {
+        map.remove(stream_id);
+    }
+}
 
 pub struct AudioStreamer {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
@@ -144,20 +310,133 @@ impl AudioStreamer {
         (id, tx, data_ready)
     }
 
+    /// End the session's INPUT: drop the keep-alive sender so readers drain
+    /// the buffered chunks and then see a real EOF. The keep-alive exists so
+    /// DLNA reconnects survive mid-track, but for FINITE programme content the
+    /// producer must call this when it is done writing — otherwise the HTTP
+    /// body never ends and a pull output that relies on EOF for its internal
+    /// gapless (OAAT) hangs at end of track: watchdog "stall", supervisor
+    /// restarts the SAME track (silence puis « le dernier repart », Bertrand,
+    /// .18, 28/07). Radio sessions are infinite by design and never call this.
+    pub async fn end_session_input(&self, stream_id: &str) {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() };
+        if let Some(s) = session {
+            s.close_sender().await;
+            info!(stream_id, "stream_session_input_ended");
+        }
+    }
+
+    /// True when the producer task that feeds `stream_id` has exited (see
+    /// `StreamSession::producer_done`), or when the session no longer exists
+    /// at all — both mean nothing will ever produce another PCM chunk, so a
+    /// paused webradio zone resuming on this session would render silence.
+    /// Only meaningful for radio decode sessions; a proxy/file session never
+    /// sets the flag and reports `false` while it exists.
+    pub async fn radio_producer_done(&self, stream_id: &str) -> bool {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(stream_id) {
+            Some(s) => s.producer_done.load(std::sync::atomic::Ordering::Relaxed),
+            None => true,
+        }
+    }
+
     pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
-        let notify = {
+        let session = {
             let sessions = self.sessions.lock().await;
-            sessions.get(stream_id).map(|s| s.data_ready.clone())
+            sessions.get(stream_id).cloned()
         };
-        let Some(notify) = notify else {
+        let Some(session) = session else {
             return false;
         };
+        // A proxy session (Qobuz/Tidal direct pass-through) serves on demand: it
+        // holds no buffered data until the renderer pulls the URL, so `data_ready`
+        // is never notified. Waiting the full `timeout_ms` therefore always times
+        // out and delays the gapless SetNext by that budget (5s). On short tracks
+        // — opera recitatives on an OpenHome renderer (Luxman NT-07) — the next
+        // track is armed too late and the renderer loops the current one. A proxy
+        // is "ready" the moment it exists, so don't wait.
+        if session.proxy_url.lock().await.is_some() {
+            return true;
+        }
         tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            notify.notified(),
+            session.data_ready.notified(),
         )
         .await
         .is_ok()
+    }
+
+    /// Initial-play prebuffer barrier for DLNA (#1259).
+    ///
+    /// Block until roughly `target_bytes` of audio has accumulated in the
+    /// session's mpsc channel, so a DLNA renderer's clock does not start against
+    /// a still-cold decode pipeline (~5s of micro-dropouts at track start —
+    /// biblio/Qobuz/radio, macOS). Local/USB output already prefills its ring
+    /// buffer before starting the DAC (`outputs/local.rs`); this reproduces that
+    /// for the network path, which had NO server-side prebuffer.
+    ///
+    /// Returns `true` as soon as the target is reached, and `true` immediately
+    /// for sessions that must NOT be waited on:
+    ///   - proxy sessions (direct CDN passthrough, served on demand — never fill
+    ///     the mpsc channel, so waiting would hang),
+    ///   - file sessions (`serve_file`, already on disk, Range-seekable),
+    ///   - unknown or already-closed sessions.
+    /// Only genuine transcode/radio channel sessions are actually awaited.
+    ///
+    /// Returns `false` when `timeout` elapses first — the hard cap so a slow or
+    /// very short source never freezes the start of playback. The caller sends
+    /// `Play` regardless; a `false` just means "started with less than the full
+    /// target buffered".
+    pub async fn wait_prefill_ready(
+        &self,
+        stream_id: &str,
+        target_bytes: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() };
+        let Some(session) = session else {
+            return true;
+        };
+        // serve_file / proxy passthrough: no mpsc channel to prefill. Blocking
+        // here would wait the full timeout for data that never flows through the
+        // channel — so treat them as ready immediately (this is the channel-only
+        // gate that excludes the serve_file passthrough).
+        if session.proxy_url.lock().await.is_some() || session.file_path.lock().await.is_some() {
+            return true;
+        }
+        if target_bytes == 0 {
+            return true;
+        }
+        // Chunk size used by the transcode / prefetch producers (exact for the
+        // dominant WAV transcode path). Radio chunks may be smaller, so the byte
+        // target is reached with fewer messages → a slightly shorter, still-safe
+        // prebuffer. Only used to translate the byte target into channel
+        // messages, the unit tokio's mpsc exposes.
+        const ASSUMED_CHUNK_BYTES: u64 = 32768;
+        let mut target_chunks = (target_bytes / ASSUMED_CHUNK_BYTES).max(1);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match session.channel_fill().await {
+                // Channel closed (producer done / gone): nothing more will be
+                // buffered, so stop waiting rather than burn the whole timeout.
+                None => return true,
+                Some((buffered, max)) => {
+                    // Clamp so a full channel always satisfies the target: a
+                    // source with less than `target_bytes` total simply fills
+                    // what it can; the timeout then caps the wait.
+                    if max > 0 {
+                        target_chunks = target_chunks.min(max as u64);
+                    }
+                    if buffered as u64 >= target_chunks {
+                        return true;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     pub async fn create_file_session(
@@ -202,6 +481,7 @@ impl AudioStreamer {
         String,
         mpsc::Sender<Vec<u8>>,
         std::sync::Arc<tokio::sync::Notify>,
+        Arc<StreamSession>,
     ) {
         let id = uuid::Uuid::new_v4().to_string();
         let mut session = StreamSession::new(id.clone(), info, false, buffer_size);
@@ -213,12 +493,13 @@ impl AudioStreamer {
             .take()
             .expect("freshly created session has tx");
         let data_ready = session.data_ready.clone();
+        let session = Arc::new(session);
         self.sessions
             .lock()
             .await
-            .insert(id.clone(), Arc::new(session));
+            .insert(id.clone(), session.clone());
         info!(stream_id = %id, "radio_stream_session_created");
-        (id, tx, data_ready)
+        (id, tx, data_ready, session)
     }
 
     pub async fn create_proxy_session(
@@ -227,10 +508,25 @@ impl AudioStreamer {
         upstream_url: String,
         is_radio: bool,
     ) -> String {
+        self.create_proxy_session_with_reresolve(info, upstream_url, is_radio, None)
+            .await
+    }
+
+    /// Like `create_proxy_session` but also stores a re-resolver so the proxy
+    /// layer can obtain a fresh signed CDN URL when the stored one expires
+    /// mid-track (Qobuz/Tidal short-TTL signatures — #1136).
+    pub async fn create_proxy_session_with_reresolve(
+        &self,
+        info: StreamInfo,
+        upstream_url: String,
+        is_radio: bool,
+        reresolve: Option<ReresolveFn>,
+    ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut session = StreamSession::new(id.clone(), info, false, 128);
         session.is_radio = is_radio;
         *session.proxy_url.lock().await = Some(upstream_url);
+        *session.reresolve.lock().await = reresolve;
         self.sessions
             .lock()
             .await
@@ -265,6 +561,9 @@ impl AudioStreamer {
             }
         }
         let removed = self.sessions.lock().await.remove(stream_id);
+        // Le registre des titres radio suit la vie de la session : sans ça il
+        // grossirait d'une entree par flux ecoute, et pour toujours.
+        forget_radio_now(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.
         // Only delete files under the system temp dir with the tune-transcode prefix
         // to avoid accidentally removing actual music files.
@@ -287,8 +586,53 @@ impl AudioStreamer {
         format!("http://{server_ip}:{}/stream/{stream_id}.{ext}", self.port)
     }
 
+    /// Real output container actually served for a live session
+    /// (`StreamInfo.format`, e.g. "wav" / "flac"). The signal-path display uses
+    /// it to show the TRANSCODED wire container instead of a statically-guessed
+    /// transcode target: a DLNA renderer that does not advertise `audio/flac`
+    /// is served WAV/LPCM even for a FLAC/ALAC source (negotiated async via
+    /// `dlna_needs_wav`), which the synchronous `build_signal_path` cannot
+    /// replay (Sevy, forum affichage-chemin-du-signal — showed "ALAC → FLAC"
+    /// while the wire was WAV). Returns `None` for an unknown session.
+    /// Format RÉELLEMENT servi sur le fil pour cette session — conteneur,
+    /// fréquence, profondeur, canaux.
+    ///
+    /// C'est la seule source de vérité sur ce que le renderer reçoit : le
+    /// chemin du signal déduisait auparavant ces valeurs en rejouant les règles
+    /// de l'orchestrateur, si bien qu'il pouvait annoncer autre chose que ce
+    /// qui partait vraiment (Yves : darTZeel LHC-208 et Eversolo DMP-A10 en
+    /// passthrough natif affichent la bonne résolution, Tune non).
+    pub async fn stream_output_wire(&self, stream_id: &str) -> Option<StreamInfo> {
+        self.sessions
+            .lock()
+            .await
+            .get(stream_id)
+            .map(|s| s.info.clone())
+    }
+
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
+    }
+
+    /// Taille totale du flux d'une session **fichier**, en octets.
+    ///
+    /// `info.file_size` s'il est renseigné, sinon la taille du fichier sur
+    /// disque — la même source que l'en-tête `Content-Length` servi au renderer.
+    /// Renvoie `None` pour une session sans fichier (radio, flux décodé à la
+    /// volée) : on ne peut alors rien conclure sur ce qui a été consommé.
+    ///
+    /// Sert à distinguer « le renderer a fini le morceau » de « le renderer a
+    /// calé » : on ne peut pas finir de jouer un fichier qu'on n'a pas reçu.
+    pub async fn stream_total_bytes(&self, stream_id: &str) -> Option<u64> {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() }?;
+        if session.is_radio {
+            return None;
+        }
+        if let Some(sz) = session.info.file_size {
+            return Some(sz);
+        }
+        let path = session.file_path.lock().await.clone()?;
+        tokio::fs::metadata(path).await.ok().map(|m| m.len())
     }
 
     pub async fn stream_bytes_sent(&self, stream_id: &str) -> Option<u64> {
@@ -385,6 +729,21 @@ pub fn build_wav_header(
     build_wav_header_with_duration(channels, sample_rate, bit_depth, duration_ms)
 }
 
+/// Build a WAV header for an infinite live radio stream, using the streaming
+/// (`0xFFFF_FFFF`) indeterminate-length convention so a Lavf DLNA renderer
+/// keeps reading until the connection closes instead of stopping after it has
+/// buffered the finite `data` size.
+pub fn build_wav_header_streaming(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    wav_header_streaming(channels, sample_rate, bit_depth)
+}
+
+/// Build a WAV header for a live radio stream served with the *file* contract
+/// (`Content-Length` + `Range`) that chunked-hostile renderers require — the
+/// darTZeel LHC-208 will not start without it (#1689).
+pub fn build_wav_header_bounded_live(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    wav_header_bounded_live(channels, sample_rate, bit_depth)
+}
+
 /// Check if a file path is a temporary transcode file created by the
 /// pre-transcode pipeline.  Only these files should be auto-deleted
 /// when a session is removed — never actual music files.
@@ -477,7 +836,46 @@ mod tests {
         streamer.remove_session(&id).await;
     }
 
+    /// Le registre des titres radio rend le bloc ICY VIVANT.
+    ///
+    /// C'est tout l'objet du correctif : avant, le bloc etait construit une
+    /// fois a la connexion et reemis a l'identique toutes les 16 Ko — un
+    /// Marantz branche sur Radio Paradise affichait eternellement le morceau
+    /// du moment ou il s'etait branche.
     #[test]
+    fn radio_now_changes_the_icy_block_between_two_emissions() {
+        let sid = "test-flux-radio-1";
+        forget_radio_now(sid);
+
+        // Rien de publie : le flux se rabat sur le bloc de la connexion.
+        assert!(radio_now(sid).is_none());
+
+        publish_radio_now(sid, Some("Pink Floyd".into()), "Time".into());
+        let (a1, t1) = radio_now(sid).expect("titre publie");
+        let bloc1 = build_icy_metadata(a1.as_deref(), Some(&t1), None);
+
+        // Le morceau suivant passe a l'antenne.
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into());
+        let (a2, t2) = radio_now(sid).expect("titre publie");
+        let bloc2 = build_icy_metadata(a2.as_deref(), Some(&t2), None);
+
+        assert_ne!(bloc1, bloc2, "le bloc ICY doit suivre le morceau courant");
+        assert!(String::from_utf8_lossy(&bloc2).contains("Miles Davis - So What"));
+
+        forget_radio_now(sid);
+    }
+
+    /// Un flux termine ne doit rien laisser derriere lui : sans ca le registre
+    /// grossirait d'une entree par radio ecoutee, indefiniment.
+    #[test]
+    fn forgetting_a_stream_clears_its_entry() {
+        let sid = "test-flux-radio-2";
+        publish_radio_now(sid, None, "Un titre".into());
+        assert!(radio_now(sid).is_some());
+        forget_radio_now(sid);
+        assert!(radio_now(sid).is_none());
+    }
+
     fn icy_metadata_block() {
         let block = build_icy_metadata(Some("Artist"), Some("Title"), None);
         assert!(block.len() > 1);
@@ -517,6 +915,271 @@ mod tests {
             .create_proxy_session(info, "https://cdn.tidal.com/track.flac".into(), false)
             .await;
         assert!(!id.is_empty());
+        streamer.remove_session(&id).await;
+    }
+
+    // A proxy session serves on demand and never notifies `data_ready`. The
+    // gapless poller must NOT block on it (a 5s wait per transition armed the
+    // next track too late → OpenHome/Luxman looped short opera tracks). It must
+    // report ready immediately.
+    #[tokio::test]
+    async fn wait_data_ready_returns_immediately_for_proxy() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let id = streamer
+            .create_proxy_session(info, "https://cdn.qobuz.com/track.flac".into(), false)
+            .await;
+        let t0 = std::time::Instant::now();
+        let ready = streamer.wait_data_ready(&id, 5000).await;
+        assert!(ready, "a proxy session must report data ready");
+        assert!(
+            t0.elapsed().as_millis() < 500,
+            "must not wait the full timeout for a proxy"
+        );
+        streamer.remove_session(&id).await;
+    }
+
+    // A non-proxy session that never produces data still times out (unchanged).
+    #[tokio::test]
+    async fn wait_data_ready_times_out_for_non_proxy_without_data() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let (id, _tx, _dr) = streamer.create_session(info, false, 128).await;
+        assert!(
+            !streamer.wait_data_ready(&id, 100).await,
+            "no data → times out"
+        );
+        streamer.remove_session(&id).await;
+    }
+
+    // Claiming a new radio consumer supersedes the previous one: only the
+    // latest epoch is "current". This is the primitive that lets a DLNA
+    // renderer's reconnect take over the single-consumer PCM channel instead of
+    // racing the first connection for each chunk.
+    #[tokio::test]
+    async fn radio_consumer_claim_supersedes_previous() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (_id, _tx, _dr, session) = streamer.create_radio_session(info, 256).await;
+
+        let e1 = session.claim_radio_consumer();
+        assert!(session.is_current_radio_consumer(e1));
+        let e2 = session.claim_radio_consumer();
+        assert_ne!(e1, e2);
+        assert!(
+            !session.is_current_radio_consumer(e1),
+            "the first consumer is superseded once a second claims the channel"
+        );
+        assert!(session.is_current_radio_consumer(e2));
+    }
+
+    // End-to-end hand-off: when a 2nd connection claims the channel, the 1st
+    // must stop WITHOUT stealing any further chunk, and every chunk sent after
+    // the hand-off must reach the 2nd connection only — no split, no loss, no
+    // duplication. This mirrors the loop in `handle_stream`'s radio branch
+    // (subscribe-then-check epoch + biased select on supersede).
+    #[tokio::test]
+    async fn radio_consumer_handoff_does_not_split_stream() {
+        use std::sync::Arc;
+
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (_id, tx, _dr, session) = streamer.create_radio_session(info, 256).await;
+
+        // Faithful copy of the handler's radio consumer loop. Returns every
+        // chunk this connection actually pulled from the channel.
+        async fn consume(
+            session: Arc<StreamSession>,
+            claimed: tokio::sync::oneshot::Sender<()>,
+            out: mpsc::UnboundedSender<Vec<u8>>,
+        ) -> Vec<Vec<u8>> {
+            let my_epoch = session.claim_radio_consumer();
+            let _ = claimed.send(()); // establish happens-before for the test
+            let mut got = Vec::new();
+            loop {
+                let superseded = session.consumer_supersede.notified();
+                tokio::pin!(superseded);
+                superseded.as_mut().enable();
+                if !session.is_current_radio_consumer(my_epoch) {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = &mut superseded => continue,
+                    maybe = session.recv_chunk() => match maybe {
+                        Some(c) => {
+                            let _ = out.send(c.clone());
+                            got.push(c);
+                        }
+                        None => break,
+                    }
+                }
+            }
+            got
+        }
+
+        // Consumer 1 claims first.
+        let (c1_ready_tx, c1_ready_rx) = tokio::sync::oneshot::channel();
+        let (c1_out_tx, mut c1_out_rx) = mpsc::unbounded_channel();
+        let h1 = tokio::spawn(consume(session.clone(), c1_ready_tx, c1_out_tx));
+        c1_ready_rx.await.unwrap();
+
+        // A chunk sent now must go to consumer 1.
+        tx.send(vec![1u8]).await.unwrap();
+        assert_eq!(c1_out_rx.recv().await.unwrap(), vec![1u8]);
+
+        // Consumer 2 claims — supersedes consumer 1 (bump + notify happen-before
+        // the send below via the oneshot await).
+        let (c2_ready_tx, c2_ready_rx) = tokio::sync::oneshot::channel();
+        let (c2_out_tx, mut c2_out_rx) = mpsc::unbounded_channel();
+        let h2 = tokio::spawn(consume(session.clone(), c2_ready_tx, c2_out_tx));
+        c2_ready_rx.await.unwrap();
+
+        // Every chunk from here on must reach consumer 2, never consumer 1.
+        tx.send(vec![2u8]).await.unwrap();
+        assert_eq!(c2_out_rx.recv().await.unwrap(), vec![2u8]);
+        tx.send(vec![3u8]).await.unwrap();
+        assert_eq!(c2_out_rx.recv().await.unwrap(), vec![3u8]);
+
+        // Close the channel so both loops end.
+        drop(tx);
+        session.close_sender().await;
+
+        let c1_got = h1.await.unwrap();
+        let c2_got = h2.await.unwrap();
+
+        assert_eq!(
+            c1_got,
+            vec![vec![1u8]],
+            "the superseded consumer must have pulled ONLY its pre-handoff chunk"
+        );
+        assert_eq!(
+            c2_got,
+            vec![vec![2u8], vec![3u8]],
+            "the new consumer must receive every post-handoff chunk, in order"
+        );
+    }
+
+    // #1259 prebuffer barrier: a proxy session has no mpsc channel to fill, so
+    // waiting must return ready IMMEDIATELY (blocking would hang for the whole
+    // timeout — and on a live proxy, forever).
+    #[tokio::test]
+    async fn wait_prefill_ready_returns_immediately_for_proxy() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let id = streamer
+            .create_proxy_session(info, "https://cdn.qobuz.com/track.flac".into(), false)
+            .await;
+        let t0 = std::time::Instant::now();
+        assert!(
+            streamer
+                .wait_prefill_ready(&id, 1_000_000, std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(t0.elapsed().as_millis() < 500, "must not wait for a proxy");
+        streamer.remove_session(&id).await;
+    }
+
+    // A file (serve_file) session is already on disk — excluded from prebuffer,
+    // returns ready immediately.
+    #[tokio::test]
+    async fn wait_prefill_ready_returns_immediately_for_file() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..Default::default()
+        };
+        let id = streamer
+            .create_file_session(info, "/music/test.flac".into(), false)
+            .await;
+        let t0 = std::time::Instant::now();
+        assert!(
+            streamer
+                .wait_prefill_ready(&id, 1_000_000, std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(t0.elapsed().as_millis() < 500, "must not wait for a file");
+        streamer.remove_session(&id).await;
+    }
+
+    // A channel session returns ready as soon as enough chunks are buffered.
+    #[tokio::test]
+    async fn wait_prefill_ready_reached_once_buffered() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (id, tx, _dr) = streamer.create_session(info, false, 256).await;
+        // Target = 1 chunk (32768 bytes). Push two 32KB chunks; nobody consumes.
+        tx.send(vec![0u8; 32768]).await.unwrap();
+        tx.send(vec![0u8; 32768]).await.unwrap();
+        assert!(
+            streamer
+                .wait_prefill_ready(&id, 32768, std::time::Duration::from_secs(2))
+                .await,
+            "target reached once >= 1 chunk is buffered"
+        );
+        drop(tx);
+        streamer.remove_session(&id).await;
+    }
+
+    // A channel session that never buffers enough must time out (return false)
+    // rather than block forever — the cap that keeps a slow/short source from
+    // freezing the start of playback. The keep-alive sender holds the channel
+    // open so channel_fill keeps reporting (never None) for the whole wait.
+    #[tokio::test]
+    async fn wait_prefill_ready_times_out_when_underfilled() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (id, _tx, _dr) = streamer.create_session(info, false, 256).await;
+        // Never send anything; target needs many chunks → must time out.
+        let t0 = std::time::Instant::now();
+        assert!(
+            !streamer
+                .wait_prefill_ready(&id, 10_000_000, std::time::Duration::from_millis(150))
+                .await,
+            "underfilled channel must time out, not hang"
+        );
+        assert!(t0.elapsed().as_millis() >= 150);
         streamer.remove_session(&id).await;
     }
 

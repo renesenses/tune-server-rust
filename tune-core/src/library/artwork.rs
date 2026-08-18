@@ -188,6 +188,7 @@ pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     // this release.
     for size in ["front-1200", "front-500"] {
         let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
+        crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
         let Ok(resp) = client.get(&url).send().await else {
             continue;
         };
@@ -222,6 +223,7 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -254,6 +256,7 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -275,6 +278,59 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
 /// artwork cache, and updates the album's `cover_path` in the database.
 ///
 /// Respects MusicBrainz rate limit: max 1 request/second.
+/// Upscale an Apple `artworkUrl100` (a 100x100 thumbnail) to a full-resolution
+/// rendition by swapping the size segment (e.g. `.../100x100bb.jpg` ->
+/// `.../1200x1200bb.jpg`). Returns `None` if the URL isn't in the expected form.
+fn itunes_hires_url(art100: &str) -> Option<String> {
+    if art100.contains("100x100bb") {
+        Some(art100.replace("100x100bb", "1200x1200bb"))
+    } else {
+        None
+    }
+}
+
+/// Apple/iTunes cover-art fallback (port of #769, adapted to the v0.9
+/// enrichment structure). Cover Art Archive is sparse and the MusicBrainz
+/// release match is strict, so many local albums never get a cover. Apple's
+/// catalog is far denser for mainstream music and needs no MBID — search by
+/// artist + title and download the highest-res rendition available.
+async fn fetch_itunes_cover(artist: &str, title: &str) -> Option<Vec<u8>> {
+    let term = format!("{artist} {title}");
+    let url = format!(
+        "https://itunes.apple.com/search?term={}&media=music&entity=album&limit=1",
+        urlencoding::encode(&term)
+    );
+    let client = crate::http::client::builder()
+        .user_agent(MB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let art100 = data
+        .get("results")?
+        .as_array()?
+        .first()?
+        .get("artworkUrl100")?
+        .as_str()?;
+    async fn dl(client: &reqwest::Client, u: &str) -> Option<Vec<u8>> {
+        let r = client.get(u).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.bytes().await.ok().map(|b| b.to_vec())
+    }
+    if let Some(hi) = itunes_hires_url(art100)
+        && let Some(bytes) = dl(&client, &hi).await
+    {
+        return Some(bytes);
+    }
+    dl(&client, art100).await
+}
+
 pub async fn batch_enrich_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
@@ -316,9 +372,9 @@ pub async fn batch_enrich_artwork(
         let mbid_to_use = if let Some(id) = resolved_mbid {
             Some(id)
         } else {
-            // Search MusicBrainz for the release
+            // Search MusicBrainz for the release (the shared MB rate limiter
+            // inside `search_musicbrainz_release` enforces the ~1 req/s spacing).
             searched += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
             let found = search_musicbrainz_release(artist, title).await;
             if let Some(ref id) = found {
                 // Store the discovered MBID on the album for future use
@@ -331,19 +387,34 @@ pub async fn batch_enrich_artwork(
             found
         };
 
-        let Some(ref mbid_val) = mbid_to_use else {
+        // Step 2: Cover Art Archive first (needs an MBID; the shared MB rate
+        // limiter inside `fetch_cover_art` enforces the ~1 req/s spacing);
+        // fall back to Apple/iTunes artwork, which needs no MBID and has a far
+        // denser catalog for mainstream music. Without this fallback, albums
+        // with no MB match or no CAA image never got a cover (Fabien: 0/22).
+        let mut fetched: Option<Vec<u8>> = None;
+        if let Some(ref mbid_val) = mbid_to_use {
+            fetched = fetch_cover_art(mbid_val).await;
+            if fetched.is_none() {
+                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
+            }
+        } else {
             debug!(album_id, album = %title, artist = %artist, "batch_artwork_no_mbid");
-            failed += 1;
-            continue;
-        };
+        }
+        if fetched.is_none() && artist != "Unknown Artist" {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            fetched = fetch_itunes_cover(artist, title).await;
+            if fetched.is_some() {
+                debug!(album_id, album = %title, "batch_artwork_itunes_found");
+            }
+        }
 
-        // Step 2: Fetch cover from Cover Art Archive
-        // Rate limit: wait 1.1s between CAA requests
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
-        match fetch_cover_art(mbid_val).await {
+        match fetched {
             Some(data) => {
-                let hash = artwork_hash(mbid_val);
+                let key = mbid_to_use
+                    .clone()
+                    .unwrap_or_else(|| format!("{artist}|{title}"));
+                let hash = artwork_hash(&key);
                 std::fs::create_dir_all(&cache_dir).ok();
                 if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
                     album_repo.update_cover_path(*album_id, &hash).ok();
@@ -363,7 +434,7 @@ pub async fn batch_enrich_artwork(
             }
             None => {
                 failed += 1;
-                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
+                debug!(album_id, album = %title, artist = %artist, "batch_artwork_not_found");
             }
         }
     }
@@ -576,6 +647,7 @@ async fn fetch_artist_image_musicbrainz_full(
     mbid: &str,
 ) -> Option<Vec<u8>> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
+    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -736,44 +808,24 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    // Single choke point for every artwork/artist-image download: log *why* a
-    // fetch produced nothing so an enrichment run that "finds nothing" can be
-    // diagnosed (rate-limit vs genuinely absent vs network), instead of every
-    // failure being an indistinguishable `None` (#1096). Behaviour is unchanged
-    // — all four failure cases still return `None`.
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(url, error = %e, "artwork_download_network_error");
-            return None;
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        if status.as_u16() == 429 || status.as_u16() == 503 {
+    // Single choke point for every artwork/artist-image download: classify the
+    // failure via the shared `FetchOutcome` so an enrichment run that "finds
+    // nothing" can be diagnosed — rate-limit vs genuinely absent vs network —
+    // instead of every failure being an indistinguishable `None` (#1096).
+    // Behaviour is unchanged: all failure cases still return `None`.
+    match crate::http::fetch::fetch_bytes(client, url, 1000).await {
+        crate::http::fetch::FetchOutcome::Success(bytes) => Some(bytes),
+        crate::http::fetch::FetchOutcome::RateLimited => {
+            // Counter read per-run by the enrichment batch to report throttling.
             ARTWORK_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                url,
-                status = status.as_u16(),
-                "artwork_download_rate_limited"
-            );
-        } else {
-            debug!(url, status = status.as_u16(), "artwork_download_http_error");
+            warn!(url, "artwork_download_rate_limited");
+            None
         }
-        return None;
-    }
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(url, error = %e, "artwork_download_read_error");
-            return None;
+        other => {
+            debug!(url, reason = other.reason(), "artwork_download_failed");
+            None
         }
-    };
-    if bytes.len() < 1000 {
-        debug!(url, len = bytes.len(), "artwork_download_too_small");
-        return None;
     }
-    Some(bytes.to_vec())
 }
 
 /// Run batch artist image enrichment for all artists with an MBID but no image.
@@ -929,6 +981,41 @@ async fn batch_enrich_artist_artwork_inner(
                 }
             }
             Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
+        }
+    }
+
+    // Artists WITHOUT an MBID are excluded by every list above (they all
+    // require musicbrainz_id), yet the enrichment loop below can resolve an
+    // MBID from the name and fall back to by-name image sources. Untagged
+    // artists therefore stayed grey forever in normal mode — the whole batch
+    // even reported "all have images" while these were simply never looked at
+    // (Fabien: 171/1183 artists unmatched, Tidal premium, grey squares).
+    // Include (a) those with no image at all, and (b) those whose stored
+    // image is a remote URL / missing cache file (Tidal stores unusable
+    // remote URLs), so the loop can localize a real picture. (Port of #769.)
+    if !force {
+        let before_no_mbid = artists.len();
+        match artist_repo.list_without_image_no_mbid() {
+            Ok(no_img) => {
+                for (id, name) in no_img {
+                    artists.push((id, name, String::new()));
+                }
+            }
+            Err(e) => warn!(error = %e, "batch_artist_artwork_no_mbid_list_failed"),
+        }
+        match artist_repo.list_with_image_no_mbid() {
+            Ok(with_img) => {
+                for (id, name, image_path) in with_img {
+                    if !cached_artwork_exists(&cache_dir, &image_path) {
+                        artists.push((id, name, String::new()));
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_no_mbid_list_failed"),
+        }
+        let added_no_mbid = artists.len() - before_no_mbid;
+        if added_no_mbid > 0 {
+            info!(added_no_mbid, "batch_artist_artwork_no_mbid_included");
         }
     }
 
@@ -1243,6 +1330,33 @@ pub fn save_embedded_cover(
     None
 }
 
+/// Pochette du DOSSIER d'un fichier, mise en cache — sans jamais regarder les
+/// tags du fichier lui-même.
+///
+/// Sert à choisir la pochette d'un ALBUM, où l'ordre de priorité n'est pas le
+/// même que pour une piste. Une `cover.jpg` posée dans le dossier est un choix
+/// délibéré de l'utilisateur ; une pochette intégrée à UNE piste est un
+/// accident de tag. Sur une compilation « maison », c'est la seconde qui
+/// gagnait et se retrouvait attribuée à tout le répertoire (testeur, forum).
+pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
+    let folder_cover = find_folder_cover(audio_path)?;
+    // Le hachage porte sur le CHEMIN DE LA POCHETTE, pas sur celui de la piste :
+    // toutes les pistes du dossier partagent ainsi la même entrée de cache au
+    // lieu d'en dupliquer une par fichier.
+    let hash = artwork_hash(&folder_cover.to_string_lossy());
+    for ext in ["jpg", "png"] {
+        if cache_dir.join(format!("{hash}.{ext}")).exists() {
+            return Some(hash);
+        }
+    }
+    let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
+    let ext = folder_cover
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg");
+    save_to_cache(&data, cache_dir, &hash, ext).map(|_| hash)
+}
+
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
@@ -1327,6 +1441,23 @@ pub fn backfill_embedded_covers(
     let mut filled = 0usize;
     for (album_id, _title, _artist, _mbid) in &coverless {
         let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
+
+        // La pochette du DOSSIER d'abord : elle décrit l'album, là où une
+        // pochette intégrée ne décrit qu'une piste. Sur une compilation
+        // « maison », la première piste taguée imposait sa jaquette à tout le
+        // répertoire — un disque de Brel illustré par la pochette du seul titre
+        // dont le fichier portait une image.
+        if let Some(hash) = tracks
+            .iter()
+            .filter_map(|t| t.file_path.as_ref())
+            .find_map(|p| folder_cover_hash(Path::new(p), cache_dir))
+        {
+            if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
+                filled += 1;
+            }
+            continue;
+        }
+
         for track in &tracks {
             let Some(ref file_path) = track.file_path else {
                 continue;
@@ -1348,6 +1479,45 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le cas du testeur : une compilation « maison » où UNE seule piste porte
+    /// une pochette intégrée. C'est la pochette du DOSSIER qui doit décrire
+    /// l'album, pas celle d'un fichier isolé.
+    #[test]
+    fn folder_cover_wins_and_is_shared_by_every_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("Compilation maison");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpg"), b"POCHETTE-DU-DOSSIER").unwrap();
+        let t1 = music.join("01 - Brel.flac");
+        let t2 = music.join("02 - Barbara.flac");
+        std::fs::write(&t1, b"").unwrap();
+        std::fs::write(&t2, b"").unwrap();
+
+        let cache = dir.path().join("cache");
+        let h1 = folder_cover_hash(&t1, &cache).expect("pochette de dossier trouvée");
+        let h2 = folder_cover_hash(&t2, &cache).expect("pochette de dossier trouvée");
+
+        // Deux pistes du même dossier partagent LA MÊME entrée de cache : le
+        // hachage porte sur la pochette, pas sur le fichier audio.
+        assert_eq!(h1, h2);
+        assert_eq!(
+            std::fs::read(cache.join(format!("{h1}.jpg"))).unwrap(),
+            b"POCHETTE-DU-DOSSIER"
+        );
+    }
+
+    /// Sans pochette dans le dossier, rien n'est inventé — l'appelant retombe
+    /// alors sur l'extraction des tags, comme avant.
+    #[test]
+    fn no_folder_cover_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("Album nu");
+        std::fs::create_dir_all(&music).unwrap();
+        let t = music.join("01.flac");
+        std::fs::write(&t, b"").unwrap();
+        assert!(folder_cover_hash(&t, &dir.path().join("cache")).is_none());
+    }
 
     #[test]
     fn extended_path_windows_and_noop() {
@@ -1389,6 +1559,15 @@ mod tests {
                 .unwrap(),
             "album/cover.jpg"
         );
+    }
+
+    #[test]
+    fn itunes_hires_url_upscales() {
+        assert_eq!(
+            itunes_hires_url("https://x/100x100bb.jpg").as_deref(),
+            Some("https://x/1200x1200bb.jpg")
+        );
+        assert!(itunes_hires_url("https://x/cover.jpg").is_none());
     }
 
     #[test]

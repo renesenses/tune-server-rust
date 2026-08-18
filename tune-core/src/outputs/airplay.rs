@@ -314,7 +314,12 @@ async fn url_to_local_path(url: &str) -> Result<(String, Option<TempFileGuard>),
         return Ok((path.to_string(), None));
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        let resp = reqwest::get(url)
+        // Client partagé (voir `crate::http::client`) : TLS webpki plutôt que
+        // le vérificateur de plateforme, et un délai d'attente — une piste
+        // entière transite ici, d'où `long_timeout`.
+        let resp = crate::http::client::long_timeout()
+            .get(url)
+            .send()
             .await
             .map_err(|e| format!("download {url}: {e}"))?;
         if !resp.status().is_success() {
@@ -482,6 +487,8 @@ impl OutputTarget for AirplayOutput {
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 

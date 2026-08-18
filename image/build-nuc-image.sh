@@ -19,7 +19,7 @@ if [[ "$TUNE_VERSION" == "--version" ]]; then
 fi
 
 IMAGE_NAME="tune-os-x86_64"
-IMAGE_SIZE="2G"
+IMAGE_SIZE="3G"
 DEBIAN_RELEASE="bookworm"
 DEBIAN_MIRROR="http://deb.debian.org/debian"
 WORK_DIR="/tmp/tune-os-build"
@@ -114,13 +114,18 @@ mount "$PART_ROOT" "$ROOTFS"
 mkdir -p "${ROOTFS}/boot/efi"
 mount "$PART_EFI" "${ROOTFS}/boot/efi"
 
-log "Bootstrapping Debian ${DEBIAN_RELEASE}..."
+log "Bootstrapping Debian ${DEBIAN_RELEASE} (base minimale)..."
+# Base minimale seulement : le reste s'installe via apt en chroot, qui sait
+# ordonner les dépendances (le configure naïf de debootstrap échoue sur
+# polkitd ↔ default-logind).
 debootstrap --arch=amd64 --variant=minbase \
-    --include=systemd,systemd-sysv,dbus,udev,kmod,linux-image-amd64,\
-grub-efi-amd64,sudo,curl,ca-certificates,avahi-daemon,libnss-mdns,\
-alsa-utils,libasound2,wpasupplicant,networkmanager,openssh-server,\
-locales,procps,iproute2,less,nano \
-    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR"
+    --components=main,contrib,non-free-firmware \
+    --include=systemd,systemd-sysv \
+    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR" || {
+    err "debootstrap failed — dernières lignes de debootstrap.log :"
+    tail -n 200 "${ROOTFS}/debootstrap/debootstrap.log" 2>/dev/null || true
+    exit 1
+}
 
 ok "Debian bootstrap complete"
 
@@ -129,6 +134,31 @@ mount --bind /dev "${ROOTFS}/dev"
 mount --bind /dev/pts "${ROOTFS}/dev/pts"
 mount -t proc proc "${ROOTFS}/proc"
 mount -t sysfs sys "${ROOTFS}/sys"
+
+# --- Install packages with apt (proper dependency ordering) ---
+log "Installing packages via apt..."
+cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE} main contrib non-free-firmware
+deb http://security.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free-firmware
+EOF
+
+# Prevent services from starting inside the chroot
+printf '#!/bin/sh\nexit 101\n' > "${ROOTFS}/usr/sbin/policy-rc.d"
+chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
+
+# non-free-firmware: WiFi chipsets of consumer PCs (Intel/Realtek/Atheros/Broadcom)
+chroot "$ROOTFS" bash -ec "
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq \
+        dbus udev kmod linux-image-amd64 grub-efi-amd64 sudo curl \
+        ca-certificates avahi-daemon libnss-mdns alsa-utils wpasupplicant \
+        network-manager openssh-server \
+        firmware-iwlwifi firmware-realtek firmware-atheros firmware-brcm80211 \
+        wireless-regdb cloud-guest-utils cifs-utils smbclient exfatprogs ntfs-3g \
+        locales procps iproute2 less nano
+"
+ok "Packages installed"
 
 # --- Configure the system ---
 log "Configuring system..."
@@ -169,6 +199,42 @@ EOF
 # Enable mDNS (tune.local)
 sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' "${ROOTFS}/etc/nsswitch.conf"
 
+# Appliance marker: unlocks /api/v1/appliance (WiFi setup from the web UI)
+# and the appliance flag in /system/config — see docs/APPLIANCE.md
+echo "Tune OS appliance image" > "${ROOTFS}/etc/tune-appliance"
+
+# Une appliance ne dort jamais : sur un portable, logind suspend au rabat
+# du capot (retour Stéphane : « la machine ne répond plus » — Asus).
+mkdir -p "${ROOTFS}/etc/systemd/logind.conf.d"
+cat > "${ROOTFS}/etc/systemd/logind.conf.d/tune-no-sleep.conf" <<EOF
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+IdleAction=ignore
+EOF
+chroot "$ROOTFS" systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+# Autologin console : l'utilisateur ne tape jamais de mot de passe sur la box
+# (retour Gil : « le mot de passe, je vois pas trop pourquoi »). Le mot de
+# passe reste requis pour SSH et sudo.
+mkdir -p "${ROOTFS}/etc/systemd/system/getty@tty1.service.d"
+cat > "${ROOTFS}/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin tune --noclear %I $TERM
+EOF
+
+# USB storage: auto-mount partitions under /media/<kernel> (headless, no udisks
+# session). exFAT/NTFS/FAT mount root-owned world-readable — enough for scanning.
+mkdir -p "${ROOTFS}/media"
+cat > "${ROOTFS}/etc/udev/rules.d/99-tune-usb-mount.rules" <<'EOF'
+ACTION=="add", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-mount --no-block --automount=yes --collect $devnode /media/%k"
+ACTION=="remove", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-umount /media/%k"
+EOF
+
 # SSH: enable but disable password auth by default (key only)
 mkdir -p "${ROOTFS}/etc/ssh/sshd_config.d"
 cat > "${ROOTFS}/etc/ssh/sshd_config.d/tune.conf" <<EOF
@@ -200,10 +266,31 @@ EOF
 ok "System configured"
 
 # --- Install Tune Server ---
-log "Downloading Tune Server v${TUNE_VERSION}..."
-curl -sL "$TUNE_TARBALL_URL" -o "${WORK_DIR}/tune.tar.gz"
+# TUNE_TARBALL_PATH : archive déjà récupérée par l'appelant (la CI la télécharge
+# avec le jeton, seule façon de lire les assets d'une release en BROUILLON —
+# c'est l'état dans lequel naît toute release depuis #1588). Sans lui, on
+# retombe sur l'URL publique, qui ne marche que sur une release publiée.
+if [[ -n "${TUNE_TARBALL_PATH:-}" && -f "${TUNE_TARBALL_PATH}" ]]; then
+    log "Using pre-fetched Tune Server tarball: ${TUNE_TARBALL_PATH}"
+    cp "${TUNE_TARBALL_PATH}" "${WORK_DIR}/tune.tar.gz"
+else
+    log "Downloading Tune Server v${TUNE_VERSION}..."
+    # -f : un 404 doit échouer ici, et non se transformer en page HTML écrite
+    # dans tune.tar.gz — non vide, donc indétectable par un simple test -s.
+    curl -fsSL "$TUNE_TARBALL_URL" -o "${WORK_DIR}/tune.tar.gz" || {
+        err "Download failed: ${TUNE_TARBALL_URL}"
+        exit 1
+    }
+fi
+
 if [[ ! -s "${WORK_DIR}/tune.tar.gz" ]]; then
-    err "Download failed: ${TUNE_TARBALL_URL}"
+    err "Empty tarball: ${TUNE_TARBALL_URL}"
+    exit 1
+fi
+# Le test qui manquait : une page d'erreur passe le test de taille, pas celui-ci.
+if ! gzip -t "${WORK_DIR}/tune.tar.gz" 2>/dev/null; then
+    err "Not a gzip archive (page d'erreur ?): ${TUNE_TARBALL_URL}"
+    head -c 200 "${WORK_DIR}/tune.tar.gz" >&2 || true
     exit 1
 fi
 
@@ -223,19 +310,22 @@ mkdir -p "${ROOTFS}/mnt/music"
 
 # Tune configuration
 mkdir -p "${ROOTFS}/opt/tune/data"
+# Format PLAT (cf. tune.toml.example) — les sections [server]/[library]
+# ne sont pas lues et le serveur retombait sur db_path relatif ("tune.db")
+# dans /opt/tune, en lecture seule (ProtectSystem=strict) → crash-loop.
 cat > "${ROOTFS}/opt/tune/tune.toml" <<EOF
 # Tune OS default configuration
 # Edit via web UI at http://tune.local:8888/settings
 
-[server]
 port = 8888
-data_dir = "/opt/tune/data"
+db_path = "/opt/tune/data/tune.db"
+web_dir = "/opt/tune/web"
+artwork_dir = "/opt/tune/data/artwork_cache"
+auto_scan = true
+log_level = "info"
 
-[library]
-music_dirs = ["/mnt/music"]
-
-[audio]
-backend = "auto"
+# /media : disques USB auto-montés ; /mnt/music : montages NAS manuels
+music_dirs = ["/mnt/music", "/media"]
 EOF
 
 # --- Systemd service ---
@@ -247,8 +337,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=tune
-Group=audio
+# Root sur l'image appliance : le serveur pilote nmcli (config WiFi) et
+# mount.cifs (partages SMB) directement — cf. /etc/tune-appliance.
+User=root
 WorkingDirectory=/opt/tune
 ExecStart=/opt/tune/tune-server
 Restart=always
@@ -261,15 +352,46 @@ LimitNOFILE=65536
 LimitRTPRIO=95
 LimitMEMLOCK=infinity
 
-# Hardening
+# Hardening (root, mais système en lecture seule hors chemins listés)
 ProtectSystem=strict
-ReadWritePaths=/opt/tune/data /mnt/music /tmp
+# /opt/tune entier : l'auto-update remplace le binaire et web/ in place
+# (install_unix sur current_exe) — /opt/tune/data seul bloquait la MAJ.
+ReadWritePaths=/opt/tune /mnt /media /tmp
 ProtectHome=yes
-NoNewPrivileges=yes
 PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# --- Port 80 → 8888 proxy ---
+# Browsers (Chrome HTTPS-First, Safari) silently upgrade http:// links to
+# https://; with only :8888 open the TLS attempt is refused and the user sees
+# a dead link unless they hand-edit the URL back to http (retour Bertrand,
+# tune-e32f.local). Serving port 80 lets the URL drop scheme AND port
+# (tune-xxxx.local), and the browsers' https→http fallback then works.
+# systemd-socket-proxyd ships with systemd — no extra package, no firewall.
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.socket" <<EOF
+[Unit]
+Description=Tune OS web UI on port 80 (proxied to :8888)
+
+[Socket]
+ListenStream=80
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.service" <<EOF
+[Unit]
+Description=Proxy port 80 to the Tune web UI on :8888
+Requires=tune-web80.socket
+After=tune.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8888
+PrivateTmp=yes
+PrivateNetwork=no
 EOF
 
 # Enable services
@@ -277,6 +399,7 @@ chroot "$ROOTFS" systemctl enable tune.service
 chroot "$ROOTFS" systemctl enable NetworkManager
 chroot "$ROOTFS" systemctl enable avahi-daemon
 chroot "$ROOTFS" systemctl enable ssh
+chroot "$ROOTFS" systemctl enable tune-web80.socket
 
 ok "Tune systemd service installed"
 
@@ -307,6 +430,9 @@ fi
 MAC=$(ip link show | grep -m1 'link/ether' | awk '{print $2}' | tr -d ':' | tail -c 5)
 if [[ -n "$MAC" ]]; then
     hostnamectl set-hostname "tune-${MAC}"
+    # Keep the printed URL truthful: tune.local dies with the rename
+    # (retour Stéphane : « machine injoignable après redémarrage »)
+    sed -i "s|http://tune\.local|http://tune-${MAC}.local|" /etc/motd
 fi
 
 touch "$MARKER"
@@ -335,17 +461,47 @@ cat > "${ROOTFS}/etc/motd" <<EOF
 
   ♫  Tune OS v${TUNE_VERSION}
   ─────────────────────────────
-  Web UI:    http://tune.local:8888
-  Music:     /mnt/music
+  Web UI:    http://tune.local   (ou http://tune.local:8888)
+  Music:     USB drives auto-mount under /media
+             NAS/SMB shares: web UI → Settings → Network
+  WiFi:      web UI → Settings → Network (first boot: ethernet)
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
   User:      tune / tune
 
-  Mount your NAS music share:
-    sudo mount -t cifs //nas/music /mnt/music -o guest
-    (add to /etc/fstab for permanent mount)
+EOF
+
+# Login screen (before login): live hostname via agetty (\n). L'IP n'utilise
+# PAS \4 : agetty rend /etc/issue avant l'acquisition DHCP → champ vide
+# (retour Stéphane). Un dispatcher NetworkManager réécrit le fichier dès que
+# le réseau monte ; agetty relit /etc/issue à chaque affichage du prompt.
+cat > "${ROOTFS}/etc/issue" <<'EOF'
+
+  Tune OS — Web UI : http://\n.local
 
 EOF
+
+cat > "${ROOTFS}/etc/NetworkManager/dispatcher.d/50-tune-issue" <<'EOF'
+#!/bin/bash
+# Tune OS : affiche l'URL et l'IP réelles sur l'écran de login.
+case "$2" in
+    up|dhcp4-change|hostname) ;;
+    *) exit 0 ;;
+esac
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+HN=$(hostname)
+{
+    echo ""
+    if [ -n "$IP" ]; then
+        echo "  Tune OS — Web UI : http://${HN}.local   (IP : http://${IP})"
+    else
+        echo "  Tune OS — Web UI : http://${HN}.local"
+    fi
+    echo ""
+} > /etc/issue
+exit 0
+EOF
+chmod +x "${ROOTFS}/etc/NetworkManager/dispatcher.d/50-tune-issue"
 
 # --- Install GRUB ---
 log "Installing GRUB bootloader..."
@@ -374,6 +530,7 @@ ok "GRUB installed"
 
 # --- Cleanup ---
 log "Cleaning up rootfs..."
+rm -f "${ROOTFS}/usr/sbin/policy-rc.d"
 chroot "$ROOTFS" apt-get clean
 rm -rf "${ROOTFS}/var/cache/apt/archives"/*.deb
 rm -rf "${ROOTFS}/var/lib/apt/lists"/*

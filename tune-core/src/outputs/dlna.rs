@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reqwest::Client;
 use tokio::io::AsyncWriteExt;
@@ -7,10 +7,25 @@ use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use crate::http::error as http_error;
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const SOAP_MAX_RETRIES: usize = 2;
+
+/// Préfixe des erreurs SOAP dues à un **timeout**, par opposition à un refus de
+/// connexion.
+///
+/// La distinction porte une information que l'orchestrateur exploite : un
+/// timeout ne prouve pas que la commande a été rejetée. La requête a très bien
+/// pu atteindre un renderer lent et être exécutée — nous n'avons simplement pas
+/// eu la réponse à temps. Détruire la session de flux dans ce cas garantit que
+/// le renderer, lorsqu'il ira chercher l'URL, tombera sur un 404 et affichera
+/// « chanson non trouvée » (Cyrus Stream X2 de JP).
+///
+/// Toute modification de cette chaîne doit suivre dans
+/// `orchestrator::command_may_have_landed`.
+pub const SOAP_TIMEOUT_PREFIX: &str = "soap timeout:";
 /// Timeout for the fire-and-forget Stop sent before SetAVTransportURI.
 /// Kept short (2s) because we don't need the response — SetAVTransportURI
 /// implicitly stops the current track on compliant renderers.
@@ -25,7 +40,10 @@ pub struct DlnaOutput {
     client: Client,
     /// Short-timeout client used for fire-and-forget Stop before play.
     stop_client: Client,
-    play_delay_ms: u64,
+    /// Pause between SetAVTransportURI and Play, in ms. Interior-mutable so a
+    /// per-zone override (Settings → renderer panel) can be applied live to the
+    /// already-registered output without rebuilding it. 0 = no delay.
+    play_delay_ms: AtomicU64,
     /// Alternates between false ("1") and true ("2") so that consecutive
     /// DIDL items sent via SetAVTransportURI / SetNextAVTransportURI use
     /// different item IDs.  Renderers like Marantz ND8006 cache DIDL
@@ -82,16 +100,28 @@ impl DlnaOutput {
                 ))
                 .build()
                 .unwrap_or_default(),
-            play_delay_ms: 0,
+            play_delay_ms: AtomicU64::new(0),
             next_item_id_flip: AtomicBool::new(false),
             micromega_ip,
             connection_manager_url,
         }
     }
 
-    pub fn with_play_delay(mut self, delay_ms: u64) -> Self {
-        self.play_delay_ms = delay_ms;
+    pub fn with_play_delay(self, delay_ms: u64) -> Self {
+        self.play_delay_ms.store(delay_ms, Ordering::Relaxed);
         self
+    }
+
+    /// Update the SetAVTransportURI→Play delay on an already-registered output
+    /// (via &self downcast in the zone PATCH handler). Takes effect on the next
+    /// play; no rebuild needed.
+    pub fn set_play_delay(&self, delay_ms: u64) {
+        self.play_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    /// Current SetAVTransportURI→Play delay in ms.
+    pub fn play_delay_ms(&self) -> u64 {
+        self.play_delay_ms.load(Ordering::Relaxed)
     }
 
     /// Send a SOAP action without retries and with the short-timeout client.
@@ -127,7 +157,7 @@ impl DlnaOutput {
             .await
         {
             Ok(_) => Ok(()),
-            Err(e) => Err(format!("soap_fast: {e}")),
+            Err(e) => Err(format!("soap_fast: {}", http_error::chain(&e))),
         }
     }
 
@@ -151,6 +181,7 @@ impl DlnaOutput {
 
         let soap_action = format!("{service}#{action}");
         let mut last_err = String::new();
+        let mut last_was_timeout = false;
 
         for attempt in 0..=SOAP_MAX_RETRIES {
             if attempt > 0 {
@@ -170,17 +201,25 @@ impl DlnaOutput {
             {
                 Ok(resp) => match resp.text().await {
                     Ok(text) => return Ok(text),
-                    Err(e) => last_err = format!("soap read: {e}"),
+                    Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
                 },
                 Err(e) if e.is_connect() || e.is_timeout() => {
-                    last_err = format!("soap send: {e}");
+                    last_was_timeout = e.is_timeout();
+                    last_err = format!("soap send: {}", http_error::chain(&e));
                 }
-                Err(e) => return Err(format!("soap send: {e}")),
+                Err(e) => return Err(format!("soap send: {}", http_error::chain(&e))),
             }
         }
 
+        http_error::hint_if_local_network_denied(&last_err);
         warn!(device = %self.name, action, error = %last_err, "soap_all_retries_failed");
-        Err(last_err)
+        // Voir SOAP_TIMEOUT_PREFIX : un timeout laisse la commande peut-être
+        // exécutée, un refus de connexion non.
+        if last_was_timeout {
+            Err(format!("{SOAP_TIMEOUT_PREFIX} {last_err}"))
+        } else {
+            Err(last_err)
+        }
     }
 
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
@@ -199,8 +238,16 @@ impl DlnaOutput {
     }
 
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
-        let is_dsd = media.mime_type.contains("dsd") || media.mime_type.contains("dsf");
-        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
+        Self::didl_metadata_mime(media, item_id, media.mime_type)
+    }
+
+    /// Like [`Self::didl_metadata`] but announces an explicit `mime` instead of
+    /// `media.mime_type`. Used to align the announced MIME with the renderer's
+    /// GetProtocolInfo Sink spelling (Beoplay A9 / Sink audio/x-flac, forum
+    /// 714) and for the 714 PCM fallback.
+    fn didl_metadata_mime(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
+        let is_dsd = mime.contains("dsd") || mime.contains("dsf");
+        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
             .dlna_art_profile(true)
@@ -307,19 +354,109 @@ impl OutputTarget for DlnaOutput {
         }
 
         let item_id = self.next_item_id();
-        let metadata = Self::didl_metadata(media, item_id);
-        let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
-            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
-            media.url
-        )).await?;
 
-        if set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>") {
+        // First attempt: announce `media.mime_type` UNCHANGED — exactly the
+        // previous behaviour. The Sink is NOT probed here: a healthy renderer
+        // (Sonos & co) accepts this MIME, so the happy path does ZERO extra
+        // GetProtocolInfo round-trip (no latency added in nominal playback).
+        // The Sink is probed ONLY when a 714 actually occurs (see below).
+        let mut attempt_mime = media.mime_type.to_string();
+        // Sink probed lazily on the first 714 and reused across the ≤2 retries.
+        let mut sink: Vec<String> = Vec::new();
+        let mut tried_exact = false;
+        let mut tried_fallback = false;
+        loop {
+            let metadata = Self::didl_metadata_mime(media, item_id, &attempt_mime);
+            let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
+                "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
+                media.url
+            )).await?;
+
+            if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
+                break;
+            }
+
+            // Error 714 ("Illegal MIME-type"): the renderer parsed the DIDL but
+            // its ConnectionManager Sink does not list the announced MIME.
+            // Beoplay A9 / Sink audio/x-flac, forum 714: strict renderers (B&O,
+            // Lyngdorf) reject `audio/flac` when their Sink only lists
+            // `audio/x-flac`, even though they decode the stream. ONLY here (on
+            // a real 714) do we pay a single GetProtocolInfo probe, then retry
+            // up to twice: (a) with the exact Sink spelling, (b) with a PCM
+            // profile the Sink lists. Strict renderers gate on the announced
+            // MIME but decode by content, so a Sink-accepted label lets the
+            // actual FLAC bytes through.
+            let is_714 = set_uri_resp.contains(">714<")
+                || set_uri_resp.to_lowercase().contains("illegal mime");
+
+            if is_714 && (!tried_exact || !tried_fallback) {
+                // Probe the Sink once, on the first 714 only.
+                if sink.is_empty() {
+                    sink = self.get_protocol_info().await.unwrap_or_default();
+                }
+
+                // Retry (a): announce the exact spelling the Sink lists
+                // (e.g. audio/x-flac) if it differs from what we just sent.
+                if !tried_exact {
+                    tried_exact = true;
+                    let exact = advertised_mime_for_sink(media.mime_type, &sink);
+                    if !exact.eq_ignore_ascii_case(&attempt_mime) {
+                        warn!(
+                            device = %self.name,
+                            advertised_mime = %attempt_mime,
+                            exact_mime = %exact,
+                            sink = ?sink,
+                            "dlna_set_uri_714_exact_spelling_retry"
+                        );
+                        attempt_mime = exact;
+                        continue;
+                    }
+                }
+
+                // Retry (b): fall back to a PCM MIME the Sink lists (audio/wav
+                // then audio/L16) if we have not tried it yet.
+                if !tried_fallback {
+                    tried_fallback = true;
+                    if let Some(fb) = fallback_mime_from_sink(&sink) {
+                        if !fb.eq_ignore_ascii_case(&attempt_mime) {
+                            warn!(
+                                device = %self.name,
+                                advertised_mime = %attempt_mime,
+                                fallback_mime = %fb,
+                                sink = ?sink,
+                                "dlna_set_uri_714_pcm_fallback_retry"
+                            );
+                            attempt_mime = fb;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if is_714 {
+                // Surface the exact MIME + Sink so the mismatch is diagnosable
+                // from a single log line (Mickaël, #1146: TIDAL → Beoplay 714).
+                warn!(
+                    device = %self.name,
+                    advertised_mime = %attempt_mime,
+                    live_stream = media.live_stream,
+                    sink_entries = sink.len(),
+                    sink = ?sink,
+                    response = %set_uri_resp,
+                    "dlna_set_uri_illegal_mime_714"
+                );
+                return Err(format!(
+                    "SetAVTransportURI rejected 714 Illegal MIME-type: renderer Sink does not accept advertised MIME '{attempt_mime}' (sink has {} entries); rejected: {set_uri_resp}",
+                    sink.len()
+                ));
+            }
             warn!(device = %self.name, response = %set_uri_resp, "dlna_set_uri_error");
             return Err(format!("SetAVTransportURI rejected: {set_uri_resp}"));
         }
 
-        if self.play_delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
+        let play_delay = self.play_delay_ms.load(Ordering::Relaxed);
+        if play_delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(play_delay)).await;
         }
 
         // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
@@ -364,7 +501,7 @@ impl OutputTarget for DlnaOutput {
             return Err(last_err);
         }
 
-        info!(device = %self.name, url = media.url, delay_ms = self.play_delay_ms, "dlna_play");
+        info!(device = %self.name, url = media.url, delay_ms = play_delay, "dlna_play");
         Ok(())
     }
 
@@ -441,15 +578,26 @@ impl OutputTarget for DlnaOutput {
                     .await?;
                 if grc_resp.contains("UPnPError") || grc_resp.contains("<errorCode>") {
                     warn!(device = %self.name, level, response = %grc_resp, "sonos_group_volume_rejected");
-                } else {
-                    debug!(device = %self.name, level, "sonos_group_volume_ok");
+                    return Err(format!(
+                        "« {} » a refusé le réglage de volume. Réglez-le sur l'appareil lui-même.",
+                        self.name
+                    ));
                 }
+                debug!(device = %self.name, level, "sonos_group_volume_ok");
                 return Ok(());
             }
+            // The renderer answered, and said no. Reporting Ok() here — as this
+            // did — made the slider move, the value persist, and nothing come
+            // out of the speakers any louder: three layers agreeing on a change
+            // that never happened (Eric, forum, renderer Diretta + PC vu comme
+            // zone DLNA). Say it instead.
             warn!(device = %self.name, level, response = %resp, "dlna_set_volume_rejected");
-        } else {
-            debug!(device = %self.name, level, "dlna_set_volume_ok");
+            return Err(format!(
+                "« {} » a refusé le réglage de volume. Réglez-le sur l'appareil lui-même.",
+                self.name
+            ));
         }
+        debug!(device = %self.name, level, "dlna_set_volume_ok");
         Ok(())
     }
 
@@ -531,6 +679,8 @@ impl OutputTarget for DlnaOutput {
             track_title: extract_tag(&position_resp, "dc:title"),
             track_artist: extract_tag(&position_resp, "dc:creator"),
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 
@@ -589,43 +739,69 @@ pub struct DsdCapability {
     pub dsf_mime: Option<String>,
 }
 
+/// Read native DSD support out of a non-empty GetProtocolInfo Sink.
+///
+/// Split out of `probe_dsd_support` so the parsing can be unit-tested without a
+/// live renderer: the caller owns the "did the probe even succeed" question
+/// (`Option`), this owns "what does the Sink say".
+///
+/// `dsf_mime` keeps the renderer's own spelling of the MIME (3rd colon-separated
+/// field of `http-get:*:audio/dsf:*`), because some renderers only accept the
+/// exact MIME they advertise rather than the generic `application/x-dsd`.
+fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
+    let mut cap = DsdCapability::default();
+    for proto in protocols {
+        let lower = proto.to_lowercase();
+        if lower.contains("x-dsd")
+            || lower.contains("audio/dsf")
+            || lower.contains("audio/x-dsf")
+            || lower.contains("application/x-dsd")
+            || lower.contains("application/dsf")
+            || lower.contains("audio/vnd.dsd")
+        {
+            cap.supports_dsf = true;
+            if cap.dsf_mime.is_none() {
+                let parts: Vec<&str> = proto.split(':').collect();
+                if parts.len() >= 3 {
+                    cap.dsf_mime = Some(parts[2].trim().to_string());
+                }
+            }
+        }
+        if lower.contains("audio/dff") || lower.contains("x-dff") || lower.contains("audio/x-dff") {
+            cap.supports_dff = true;
+        }
+    }
+    cap
+}
+
 impl DlnaOutput {
-    pub async fn probe_dsd_support(&self) -> DsdCapability {
+    /// Probe the renderer's GetProtocolInfo Sink for native DSD support.
+    ///
+    /// `Some(cap)` when the Sink was actually read — including a conclusive
+    /// "this renderer does not do DSD" (all flags false). `None` when the probe
+    /// was **inconclusive**: GetProtocolInfo failed, or the Sink came back
+    /// empty. The caller must fall back conservatively for `None` but must NOT
+    /// cache it — same rule as `supports_mime` below. A transient
+    /// GetProtocolInfo failure (renderer asleep, busy, or slow to answer right
+    /// after discovery) would otherwise pin a DSD-capable renderer to the
+    /// DSD→PCM transcode path for the whole session, with no way to recover
+    /// short of restarting the server.
+    pub async fn probe_dsd_support(&self) -> Option<DsdCapability> {
         let protocols = match self.get_protocol_info().await {
             Ok(p) => p,
             Err(e) => {
                 warn!(device = %self.name, error = %e, "dsd_probe_protocol_info_failed");
-                return DsdCapability::default();
+                return None;
             }
         };
-        debug!(device = %self.name, protocols = ?protocols, "dsd_probe_protocol_info_raw");
-        let mut cap = DsdCapability::default();
-        for proto in &protocols {
-            let lower = proto.to_lowercase();
-            if lower.contains("x-dsd")
-                || lower.contains("audio/dsf")
-                || lower.contains("audio/x-dsf")
-                || lower.contains("application/x-dsd")
-                || lower.contains("application/dsf")
-                || lower.contains("audio/vnd.dsd")
-            {
-                cap.supports_dsf = true;
-                if cap.dsf_mime.is_none() {
-                    let parts: Vec<&str> = proto.split(':').collect();
-                    if parts.len() >= 3 {
-                        cap.dsf_mime = Some(parts[2].trim().to_string());
-                    }
-                }
-            }
-            if lower.contains("audio/dff")
-                || lower.contains("x-dff")
-                || lower.contains("audio/x-dff")
-            {
-                cap.supports_dff = true;
-            }
+        if protocols.is_empty() {
+            debug!(device = %self.name, "dsd_probe_empty_sink");
+            return None;
         }
+        debug!(device = %self.name, protocols = ?protocols, "dsd_probe_protocol_info_raw");
+        let cap = parse_dsd_capability(&protocols);
         info!(device = %self.name, supports_dsf = cap.supports_dsf, supports_dff = cap.supports_dff, dsf_mime = ?cap.dsf_mime, protocols_count = protocols.len(), "dsd_probe_result");
-        cap
+        Some(cap)
     }
 
     /// Probe the renderer's GetProtocolInfo Sink to check if a given MIME type
@@ -655,6 +831,88 @@ impl DlnaOutput {
         }
         info!(device = %self.name, mime, protocols_count = protocols.len(), "dlna_mime_not_supported_by_renderer");
         Some(false)
+    }
+
+    /// One-shot capability probe for the renderer-config UI: reads the
+    /// GetProtocolInfo `Sink` ONCE and summarises which audio formats it
+    /// advertises, so the user can pick a sensible output override (native FLAC,
+    /// native ALAC, forced WAV/LPCM…) with evidence rather than by trial. A
+    /// failed/empty probe returns `probed: false` (inconclusive — the renderer
+    /// may still decode more than it advertises; the negotiation fallbacks stay
+    /// in charge).
+    pub async fn probe_capabilities(&self) -> RendererCapabilities {
+        match self.get_protocol_info().await {
+            Ok(sink) if !sink.is_empty() => renderer_caps_from_sink(sink),
+            _ => RendererCapabilities::default(),
+        }
+    }
+}
+
+/// What a DLNA renderer advertises in its GetProtocolInfo `Sink`. `probed` is
+/// false when the Sink could not be read (empty/timeout) — everything else is
+/// then meaningless and the UI should say "couldn't read capabilities".
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RendererCapabilities {
+    pub probed: bool,
+    pub flac: bool,
+    /// Plain `audio/wav` / `audio/x-wav`.
+    pub wav: bool,
+    /// 16-bit LPCM (`audio/L16`) — the standard DLNA WAV profile.
+    pub lpcm16: bool,
+    /// 24-bit LPCM (`audio/L24`) — gates the "WAV 24-bit" override.
+    pub lpcm24: bool,
+    pub alac: bool,
+    pub aac: bool,
+    pub mp3: bool,
+    pub dsd: bool,
+    /// Raw Sink entries, for an advanced/debug view.
+    pub sink: Vec<String>,
+}
+
+/// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
+/// around the SOAP call).
+fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
+    // Param-aware match: LPCM entries carry `;rate=…;channels=…` after the MIME
+    // (`audio/L16;rate=44100;channels=2`), so we compare the base MIME only.
+    // Also accepts the `audio/x-…` legacy variant and the `*` wildcard, like
+    // `protocol_sink_supports_mime` (which only handles the param-less case).
+    let has = |want: &str| -> bool {
+        let want = want.to_lowercase();
+        let alt = want
+            .strip_prefix("audio/x-")
+            .map(|r| format!("audio/{r}"))
+            .or_else(|| want.strip_prefix("audio/").map(|r| format!("audio/x-{r}")));
+        sink.iter().any(|p| {
+            let Some(field) = p.split(':').nth(2) else {
+                return false;
+            };
+            let mime = field.trim().to_lowercase();
+            let base = mime.split(';').next().unwrap_or(&mime).trim();
+            base == want || base == "*" || alt.as_deref() == Some(base)
+        })
+    };
+    let dsd = sink.iter().any(|p| {
+        let l = p.to_lowercase();
+        l.contains("x-dsd")
+            || l.contains("audio/dsf")
+            || l.contains("audio/dff")
+            || l.contains("audio/x-dsf")
+            || l.contains("audio/x-dff")
+            || l.contains("audio/vnd.dsd")
+            || l.contains("application/x-dsd")
+    });
+    RendererCapabilities {
+        probed: true,
+        flac: has("audio/flac"),
+        wav: has("audio/wav"),
+        lpcm16: has("audio/l16"),
+        lpcm24: has("audio/l24"),
+        // ALAC is rarely advertised distinctly; renderers expose it as m4a/mp4.
+        alac: has("audio/x-m4a") || has("audio/alac") || has("audio/mp4"),
+        aac: has("audio/aac") || has("audio/mp4"),
+        mp3: has("audio/mpeg"),
+        dsd,
+        sink,
     }
 }
 
@@ -687,6 +945,69 @@ fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
     false
 }
 
+/// Base MIME (third colon-separated field, params stripped) of a Sink entry
+/// such as `http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM`.
+fn sink_entry_base_mime(entry: &str) -> Option<String> {
+    let field = entry.split(':').nth(2)?;
+    let mime = field.trim();
+    Some(mime.split(';').next().unwrap_or(mime).trim().to_string())
+}
+
+/// Choose the MIME spelling to announce in the DIDL / SetAVTransportURI given
+/// the renderer's GetProtocolInfo `Sink`.
+///
+/// Beoplay A9 / Sink audio/x-flac, forum 714: strict renderers (B&O, Lyngdorf)
+/// reject SetAVTransportURI with 714 "Illegal MIME-type" when the announced
+/// MIME differs from the exact spelling listed in their Sink, even though they
+/// can decode the stream. If `desired` is already listed we keep it; if only a
+/// known alias is listed (`audio/flac`↔`audio/x-flac`, `audio/mpeg`↔`audio/mp3`,
+/// `audio/wav`↔`audio/x-wav`) we announce the spelling the Sink actually lists;
+/// otherwise `desired` is returned unchanged (empty/unknown Sink ⇒ previous
+/// behaviour, no regression).
+fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
+    let listed: Vec<String> = sink
+        .iter()
+        .filter_map(|e| sink_entry_base_mime(e))
+        .collect();
+    // Already listed verbatim (case-insensitive): announce as-is.
+    if listed.iter().any(|b| b.eq_ignore_ascii_case(desired)) {
+        return desired.to_string();
+    }
+    let aliases: &[&str] = match desired.to_lowercase().as_str() {
+        "audio/flac" => &["audio/x-flac"],
+        "audio/x-flac" => &["audio/flac"],
+        "audio/mpeg" => &["audio/mp3"],
+        "audio/mp3" => &["audio/mpeg"],
+        "audio/wav" => &["audio/x-wav"],
+        "audio/x-wav" => &["audio/wav"],
+        _ => &[],
+    };
+    for alias in aliases {
+        if let Some(found) = listed.iter().find(|b| b.eq_ignore_ascii_case(alias)) {
+            return found.clone();
+        }
+    }
+    desired.to_string()
+}
+
+/// Pick a universally-decodable PCM MIME the renderer's `Sink` lists, for the
+/// one-shot 714 fallback (Beoplay A9 / forum 714). Prefers WAV, then LPCM
+/// (`audio/L16`), returning the exact spelling the Sink uses so the announced
+/// MIME passes the renderer's strict Sink check. `None` when the Sink lists no
+/// PCM profile.
+fn fallback_mime_from_sink(sink: &[String]) -> Option<String> {
+    for want in ["audio/wav", "audio/x-wav", "audio/l16"] {
+        if let Some(found) = sink
+            .iter()
+            .filter_map(|e| sink_entry_base_mime(e))
+            .find(|b| b.eq_ignore_ascii_case(want))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -698,6 +1019,74 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caps_from_sink_maps_advertised_formats() {
+        // A typical hi-fi renderer Sink: FLAC (x- variant), 16-bit LPCM, MP3,
+        // AAC/MP4, and DSF — but NOT 24-bit LPCM.
+        let sink = vec![
+            "http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM".to_string(),
+            "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3".to_string(),
+            "http-get:*:audio/mp4:*".to_string(),
+            "http-get:*:audio/x-dsf:*".to_string(),
+        ];
+        let c = renderer_caps_from_sink(sink);
+        assert!(c.probed);
+        assert!(c.flac, "x-flac must count as FLAC");
+        assert!(c.lpcm16, "audio/L16 present");
+        assert!(!c.lpcm24, "no audio/L24 advertised");
+        assert!(c.mp3 && c.aac && c.dsd);
+    }
+
+    #[test]
+    fn parse_dsd_capability_keeps_the_renderer_own_mime() {
+        // Yamaha R-N2000A-shaped Sink: the renderer advertises its own spelling
+        // of the DSD MIME, and we must serve that one back rather than the
+        // generic application/x-dsd (cf. the passthrough path in orchestrator).
+        let sink = vec![
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+            "http-get:*:audio/dsf:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&sink);
+        assert!(cap.supports_dsf);
+        assert!(!cap.supports_dff);
+        assert_eq!(cap.dsf_mime.as_deref(), Some("audio/dsf"));
+    }
+
+    #[test]
+    fn parse_dsd_capability_reports_no_dsd_for_a_pcm_only_sink() {
+        // A conclusive negative — distinct from a failed probe, which never
+        // reaches this function (probe_dsd_support returns None instead).
+        let sink = vec![
+            "http-get:*:audio/mpeg:*".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&sink);
+        assert!(!cap.supports_dsf);
+        assert!(!cap.supports_dff);
+        assert_eq!(cap.dsf_mime, None);
+    }
+
+    #[test]
+    fn parse_dsd_capability_detects_dff_and_x_dsd_variants() {
+        let sink = vec![
+            "http-get:*:audio/x-dsd:*".to_string(),
+            "http-get:*:audio/x-dff:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&sink);
+        assert!(cap.supports_dsf, "x-dsd counts as DSD");
+        assert!(cap.supports_dff);
+        assert_eq!(cap.dsf_mime.as_deref(), Some("audio/x-dsd"));
+    }
+
+    #[test]
+    fn caps_from_sink_flags_l24_when_present() {
+        let sink = vec!["http-get:*:audio/L24;rate=96000;channels=2:*".to_string()];
+        let c = renderer_caps_from_sink(sink);
+        assert!(c.lpcm24, "audio/L24 gates the WAV 24-bit override");
+        assert!(!c.flac);
+    }
 
     #[test]
     fn protocol_sink_matches_x_flac_variant() {
@@ -716,6 +1105,62 @@ mod tests {
             "audio/flac",
             &["http-get:*:*:*".to_string()]
         ));
+    }
+
+    #[test]
+    fn advertised_mime_rewrites_flac_to_sink_x_flac() {
+        // Beoplay A9 (forum 714): Sink lists audio/x-flac but NOT audio/flac.
+        // We must announce the exact spelling the Sink lists, else 714.
+        let sink = vec![
+            "http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".to_string(),
+            "http-get:*:audio/wav:*".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM".to_string(),
+        ];
+        assert_eq!(
+            advertised_mime_for_sink("audio/flac", &sink),
+            "audio/x-flac"
+        );
+    }
+
+    #[test]
+    fn advertised_mime_keeps_exact_sink_spelling() {
+        // Sink lists audio/flac verbatim → announce it unchanged.
+        let sink = vec!["http-get:*:audio/flac:DLNA.ORG_PN=FLAC".to_string()];
+        assert_eq!(advertised_mime_for_sink("audio/flac", &sink), "audio/flac");
+    }
+
+    #[test]
+    fn advertised_mime_unchanged_when_alias_absent() {
+        // Neither audio/flac nor audio/x-flac listed, and empty Sink → keep
+        // the desired MIME unchanged (previous behaviour, no regression).
+        let sink = vec!["http-get:*:audio/mpeg:*".to_string()];
+        assert_eq!(advertised_mime_for_sink("audio/flac", &sink), "audio/flac");
+        assert_eq!(advertised_mime_for_sink("audio/flac", &[]), "audio/flac");
+    }
+
+    #[test]
+    fn advertised_mime_rewrites_mpeg_mp3_alias() {
+        let sink = vec!["http-get:*:audio/mp3:*".to_string()];
+        assert_eq!(advertised_mime_for_sink("audio/mpeg", &sink), "audio/mp3");
+    }
+
+    #[test]
+    fn fallback_mime_prefers_wav_then_l16() {
+        let sink = vec![
+            "http-get:*:audio/x-flac:*".to_string(),
+            "http-get:*:audio/wav:*".to_string(),
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+        ];
+        assert_eq!(fallback_mime_from_sink(&sink).as_deref(), Some("audio/wav"));
+
+        let sink_l16 = vec!["http-get:*:audio/L16;rate=44100;channels=2:*".to_string()];
+        assert_eq!(
+            fallback_mime_from_sink(&sink_l16).as_deref(),
+            Some("audio/L16")
+        );
+
+        let sink_none = vec!["http-get:*:audio/x-flac:*".to_string()];
+        assert_eq!(fallback_mime_from_sink(&sink_none), None);
     }
 
     #[test]
@@ -991,5 +1436,48 @@ mod tests {
         assert!(didl_2.contains("id=\"2\""), "second track should have id=2");
         assert!(didl_1.contains("Track 1"));
         assert!(didl_2.contains("Track 2"));
+    }
+
+    #[test]
+    fn native_flac_next_track_didl_is_complete() {
+        // #1132 (native FLAC): the gapless SetNextAVTransportURI DIDL must carry
+        // the SAME full metadata as the initial SetAVTransportURI item — title,
+        // artist, album, protocolInfo (format), duration AND a size that matches
+        // the bytes the renderer will actually receive. A queued item missing
+        // any of these makes the Marantz ND 8006 lose the format/duration/
+        // progress display when it transitions to the next track. Both the
+        // current-track and next-track paths build via `didl_metadata`, so a
+        // single assertion covers the queued item too.
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/track2.flac",
+                mime_type: "audio/flac",
+                title: Some("So What"),
+                artist: Some("Miles Davis"),
+                album: Some("Kind of Blue"),
+                duration_ms: Some(562_000),
+                file_size: Some(50_000_000),
+                sample_rate: Some(96_000),
+                bit_depth: Some(24),
+                channels: Some(2),
+                ..Default::default()
+            },
+            "2",
+        );
+        assert!(didl.contains("So What"), "title present");
+        assert!(didl.contains("Miles Davis"), "artist present");
+        assert!(didl.contains("Kind of Blue"), "album present");
+        assert!(didl.contains("audio/flac"), "format/protocolInfo present");
+        assert!(didl.contains("DLNA.ORG_OP=01"), "DLNA flags present");
+        assert!(
+            didl.contains("duration=\"0:09:22.000\""),
+            "duration present on the queued FLAC item"
+        );
+        assert!(
+            didl.contains("size=\"50000000\""),
+            "size present on the queued FLAC item"
+        );
+        assert!(didl.contains("sampleFrequency=\"96000\""));
+        assert!(didl.contains("bitsPerSample=\"24\""));
     }
 }

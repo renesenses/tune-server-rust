@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -147,6 +148,7 @@ pub(super) async fn create_album(
         musicbrainz_release_group_id: None,
         release_date: None,
         original_date: None,
+        added_at: None,
     };
     let id = repo
         .create(&album)
@@ -202,6 +204,13 @@ pub(super) async fn get_album(
             if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
                 obj.insert("bio_provenance".into(), prov);
             }
+            // Dynamic Range, when the files carry the tag (#303, #1418). Absent
+            // from the payload rather than null when untagged, so a client can
+            // simply test for the key instead of distinguishing "no tag" from
+            // "measured zero" — DR0 is a real value.
+            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range(id)) {
+                obj.insert("dynamic_range".into(), Value::String(dr));
+            }
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -228,10 +237,11 @@ pub(super) async fn album_tracks(
 
 pub(super) async fn quick_fav_album(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<QuickFavQuery>,
 ) -> Json<Value> {
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     let repo = ProfileRepo::with_backend(state.backend.clone());
     let is_fav = repo.is_favorite(profile_id, "album", id).unwrap_or(false);
     if is_fav {
@@ -244,11 +254,12 @@ pub(super) async fn quick_fav_album(
 
 pub(super) async fn rate_album(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Json(body): Json<RateRequest>,
 ) -> impl IntoResponse {
     let repo = RatingRepo::with_backend(state.backend.clone());
-    let profile_id = body.profile_id.unwrap_or(1);
+    let profile_id = body.profile_id.unwrap_or_else(|| profile.id());
     match repo.rate_album(id, profile_id, body.rating, body.note.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -257,11 +268,12 @@ pub(super) async fn rate_album(
 
 pub(super) async fn get_album_rating(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Query(q): Query<RatingQuery>,
 ) -> impl IntoResponse {
     let repo = RatingRepo::with_backend(state.backend.clone());
-    let profile_id = q.profile_id.unwrap_or(1);
+    let profile_id = q.profile_id.unwrap_or_else(|| profile.id());
     match repo.get_rating(id, profile_id) {
         Ok(Some(r)) => Json(json!(r)).into_response(),
         Ok(None) => Json(json!({ "rating": null, "album_id": id })).into_response(),
@@ -328,35 +340,45 @@ pub(super) async fn album_bio(
             .into_response();
         }
     }
-    // Resolve artist MBID for the API call
-    let mbid = if let Some(aid) = album.artist_id {
-        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-        artist_repo
-            .get(aid)
-            .ok()
-            .flatten()
-            .and_then(|a| a.musicbrainz_id)
-    } else {
-        None
-    };
-    let Some(mbid) = mbid else {
-        return Json(
-            json!({"album": album.title, "bio": null, "error": "no artist MusicBrainz ID"}),
-        )
-        .into_response();
-    };
+    // Community album-bio API is keyed by NAME (title + artist) and generated
+    // on demand by the cloud — NO MusicBrainz id required, so it works for
+    // every album. The old code proxied to the artist-MBID endpoint (wrong URL
+    // too) and failed for the whole library, which has no MBIDs (#bios).
+    let artist_name = album.artist_name.clone().or_else(|| {
+        album.artist_id.and_then(|aid| {
+            ArtistRepo::with_backend(state.backend.clone())
+                .get(aid)
+                .ok()
+                .flatten()
+                .map(|a| a.name)
+        })
+    });
+    let artist_q = artist_name.as_deref().unwrap_or("");
     let lang = q.lang.as_deref().unwrap_or("fr");
+    let cache_key = format!("cache:albumbio:{}:{artist_q}:{lang}", album.title);
+    if let Some(cached) = super::api_cache_get(&state.backend, &cache_key) {
+        return Json(cached).into_response();
+    }
     match state
         .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
+        .get("https://mozaiklabs.fr/api/v1/albums/bio")
+        .query(&[("title", album.title.as_str()), ("artist", artist_q)])
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            Json(data).into_response()
+            let out = json!({
+                "album": album.title,
+                "bio": data.get("bio").cloned().unwrap_or(Value::Null),
+                "source": data.get("source").cloned().unwrap_or(Value::Null),
+            });
+            if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
+                super::api_cache_set(&state.backend, &cache_key, &out);
+            }
+            Json(out).into_response()
         }
-        _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
+        _ => Json(json!({"album": album.title, "bio": null})).into_response(),
     }
 }
 
@@ -685,6 +707,49 @@ pub(super) async fn update_album(
     repo.update(&album).ok();
 
     Json(album.to_json()).into_response()
+}
+
+// --- Album extended metadata endpoints ---
+
+/// GET /api/v1/library/albums/{id}/metadata
+/// Returns all extended metadata key-value pairs for an album.
+pub(super) async fn album_metadata_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
+
+    let repo = AlbumMetadataRepo::with_backend(state.backend.clone());
+    match repo.get_all(id) {
+        Ok(meta) => Json(json!(meta)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// PUT /api/v1/library/albums/{id}/metadata
+/// Batch-sets album-level extended metadata from a JSON object body.
+/// DB only — propagating album fields into each track's file tags stays the
+/// job of POST /library/write-tags {album_id}, so a save is never O(tracks).
+pub(super) async fn album_metadata_put(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
+
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
+    match album_repo.get(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "album not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+
+    let repo = AlbumMetadataRepo::with_backend(state.backend.clone());
+    if let Err(e) = repo.set_batch(id, &body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+
+    Json(json!({"status": "ok", "fields": body.len()})).into_response()
 }
 
 #[derive(Deserialize)]

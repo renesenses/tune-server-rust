@@ -19,6 +19,61 @@ pub struct PgTestResult {
     pub version: String,
 }
 
+/// Create the target database when it does not exist yet, by connecting to
+/// the maintenance `postgres` database on the same server. No user should
+/// have to open psql just to run CREATE DATABASE (JP, PG migration).
+/// Returns Ok(true) if the database was created, Ok(false) if nothing to do.
+pub async fn ensure_database(url: &str) -> Result<bool, String> {
+    // Split "…/dbname[?query]" — everything before the last '/' is the server part.
+    let (server, rest) = url
+        .rsplit_once('/')
+        .ok_or_else(|| "invalid connection string (no database path)".to_string())?;
+    let (db, query) = match rest.split_once('?') {
+        Some((d, q)) => (d, Some(q)),
+        None => (rest, None),
+    };
+    if db.is_empty() {
+        return Err("invalid connection string (empty database name)".to_string());
+    }
+    // Guard the identifier: CREATE DATABASE cannot take a bind parameter, so
+    // refuse anything that would need quoting/escaping.
+    if !db
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "database name '{db}' contains unsupported characters"
+        ));
+    }
+    let maint = match query {
+        Some(q) => format!("{server}/postgres?{q}"),
+        None => format!("{server}/postgres"),
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&maint)
+        .await
+        .map_err(|e| format!("maintenance connection failed: {e}"))?;
+    let exists: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+    )
+    .bind(db)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| format!("pg_database check failed: {e}"))?;
+    if exists {
+        pool.close().await;
+        return Ok(false);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db}\"")))
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("CREATE DATABASE failed: {e}"))?;
+    pool.close().await;
+    Ok(true)
+}
+
 /// Test a PostgreSQL connection: connect, run SELECT 1, fetch version.
 pub async fn test_connection(url: &str) -> Result<PgTestResult, String> {
     let pool = PgPoolOptions::new()
@@ -78,9 +133,16 @@ const MIGRATION_TABLES: &[&str] = &[
     "tracks",
     "track_credits",
     "track_metadata",
+    "album_metadata",
     "playlists",
     "playlist_tracks",
     "zones",
+    // Unified queue (v0.9 rc.2). Current SQLite DBs carry the queue here;
+    // migrate_to_unified_queue() drops the legacy play_queue / streaming_queue
+    // tables after copying, so those two below are only for pre-unification DBs
+    // and are harmlessly skipped ("no columns or does not exist") when absent.
+    // Without queue_items here the queue would NOT migrate at all.
+    "queue_items",
     "play_queue",
     "streaming_queue",
     "listen_history",
@@ -103,8 +165,18 @@ const MIGRATION_TABLES: &[&str] = &[
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
-/// Uses simple types (TEXT/BIGINT/INTEGER/DOUBLE PRECISION) for maximum
-/// compatibility with the SQLite data being copied.
+///
+/// Numeric columns (year, track_number, duration_ms, sample_rate, …) are
+/// declared TEXT here ON PURPOSE: `insert_batch`/`bind_migration_value` bind
+/// every copied SQLite value as a TEXT parameter (SQLite is dynamically typed,
+/// so this is the only universally-safe binding), and PG has no implicit
+/// text→integer cast for an INSERT — a numeric column type here would make the
+/// data copy fail. The intended numeric types are restored AFTER the copy by
+/// the idempotent heal migrations run_pg_migrations() applies at PG startup
+/// (010 albums/tracks, 011 listen_history, 012 the rest). The forced restart
+/// into PostgreSQL after a migrate (routes/system/database.rs) guarantees that
+/// convergence runs before the first real query. Do NOT switch these columns to
+/// numeric types without also making the copy bind them natively.
 ///
 /// Every CREATE TABLE uses IF NOT EXISTS and every INSERT for seed data
 /// uses ON CONFLICT DO NOTHING, making this fully idempotent.
@@ -117,6 +189,11 @@ CREATE TABLE IF NOT EXISTS artists (
     musicbrainz_id TEXT,
     discogs_id TEXT,
     bio TEXT,
+    bio_source TEXT,
+    bio_source_url TEXT,
+    bio_license TEXT,
+    bio_lang TEXT,
+    bio_fetched_at TEXT,
     image_path TEXT,
     image_source TEXT
 );
@@ -141,10 +218,18 @@ CREATE TABLE IF NOT EXISTS albums (
     sample_rate TEXT,
     bit_depth TEXT,
     bio TEXT,
+    bio_source TEXT,
+    bio_source_url TEXT,
+    bio_license TEXT,
+    bio_lang TEXT,
+    bio_fetched_at TEXT,
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,
-    original_date TEXT
+    original_date TEXT,
+    -- The folder on disk holding this release. What identifies an album: see
+    -- `scanner::album_folder`.
+    folder_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -180,7 +265,12 @@ CREATE TABLE IF NOT EXISTS tracks (
     acoustid_fingerprint TEXT,
     acoustid_confidence TEXT,
     trailing_silence_ms TEXT,
-    synced_lyrics TEXT
+    synced_lyrics TEXT,
+    cover_path TEXT,
+    -- Pistes virtuelles CUE (#1763) : cf le commentaire de CORE_SCHEMA.
+    cue_media_path TEXT,
+    cue_start_ms BIGINT,
+    cue_end_ms BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -198,6 +288,26 @@ CREATE TABLE IF NOT EXISTS track_metadata (
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (track_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS album_metadata (
+    album_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (album_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS metadata_reports (
+    id BIGSERIAL PRIMARY KEY,
+    entity TEXT NOT NULL,
+    entity_id BIGINT,
+    mbid TEXT,
+    field TEXT,
+    value TEXT,
+    reason TEXT NOT NULL,
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    pushed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS playlists (
@@ -233,7 +343,18 @@ CREATE TABLE IF NOT EXISTS zones (
     max_sample_rate TEXT,
     fixed_volume TEXT DEFAULT 0,
     dsp_preset_id TEXT,
-    dsp_enabled TEXT DEFAULT 0
+    dsp_enabled TEXT DEFAULT 0,
+    autoplay_enabled TEXT DEFAULT 0,
+    is_hidden TEXT DEFAULT 0,
+    last_play_state TEXT DEFAULT 'stopped',
+    dsd_mode TEXT DEFAULT 'auto',
+    dlna_native_flac TEXT DEFAULT 0,
+    host TEXT,
+    alac_passthrough TEXT DEFAULT 0,
+    aac_passthrough TEXT DEFAULT 0,
+    dlna_lpcm TEXT DEFAULT 0,
+    dlna_cap_16bit TEXT DEFAULT 0,
+    lyrics_offset_ms TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
@@ -257,6 +378,37 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
     duration_ms TEXT DEFAULT 0
 );
 
+-- Unified queue (v0.9 rc.2): replaces the play_queue / streaming_queue split.
+CREATE TABLE IF NOT EXISTS queue_items (
+    id TEXT PRIMARY KEY,
+    zone_id TEXT NOT NULL,
+    position TEXT NOT NULL DEFAULT 0,
+    is_current TEXT DEFAULT 0,
+    track_id TEXT,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    duration_ms TEXT DEFAULT 0,
+    track_number TEXT,
+    disc_number TEXT
+);
+
+-- One-time copy of the split tables into queue_items. Idempotent: the guard
+-- runs only while queue_items is empty. IDs are prefixed to avoid collisions
+-- between the two source tables.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM queue_items LIMIT 1) THEN
+        INSERT INTO queue_items (id, zone_id, position, is_current, track_id, source, duration_ms)
+            SELECT 'lq_' || id, zone_id, position, is_current, track_id, 'local', '0' FROM play_queue;
+        INSERT INTO queue_items (id, zone_id, position, is_current, source, source_id, title, artist, album, cover_url, duration_ms)
+            SELECT 'sq_' || id, zone_id, position, '0', source, source_id, title, artist, album, cover_url, duration_ms FROM streaming_queue;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS listen_history (
     id TEXT PRIMARY KEY,
     track_id TEXT,
@@ -267,7 +419,10 @@ CREATE TABLE IF NOT EXISTS listen_history (
     duration_ms TEXT DEFAULT 0,
     listened_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     zone_id TEXT,
-    cover_url TEXT
+    cover_url TEXT,
+    source_id TEXT,
+    album_id TEXT,
+    profile_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -321,8 +476,17 @@ CREATE TABLE IF NOT EXISTS favorites (
     item_type TEXT NOT NULL,
     item_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    item_name TEXT,
+    item_artist TEXT,
+    item_path TEXT,
     UNIQUE(profile_id, item_type, item_id)
 );
+-- Instantané d'identité des favoris (SQLite v66 / PG 017) : nécessaire ici
+-- aussi pour qu'une base PG créée par cette migration de données accepte la
+-- copie des colonnes présentes côté SQLite.
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
 CREATE TABLE IF NOT EXISTS streaming_favorites (
@@ -380,6 +544,7 @@ CREATE TABLE IF NOT EXISTS smart_playlists (
     sort_by TEXT DEFAULT 'title',
     sort_order TEXT DEFAULT 'asc',
     max_tracks TEXT,
+    match_mode TEXT NOT NULL DEFAULT 'all',
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     updated_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
@@ -447,6 +612,7 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
     author TEXT,
     image_url TEXT,
     description TEXT,
+    source_id TEXT,
     last_checked TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
@@ -498,6 +664,20 @@ CREATE TABLE IF NOT EXISTS track_source_links (
     UNIQUE(track_id, service)
 );
 
+-- LRCLIB lyrics cache (SQLite migration v43 / PG script 008). Present here
+-- too because a database created by THIS sqlite→pg migration records
+-- schema_version 99 and therefore never replays the numbered PG scripts:
+-- without this block such a DB has no lyrics_cache at all (drift).
+CREATE TABLE IF NOT EXISTS lyrics_cache (
+    track_id BIGINT PRIMARY KEY,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    synced_lyrics TEXT,
+    plain_lyrics TEXT,
+    source TEXT NOT NULL DEFAULT 'lrclib',
+    fetched_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
@@ -516,20 +696,122 @@ CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_t
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
+CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
 CREATE INDEX IF NOT EXISTS idx_track_source_links_track ON track_source_links(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(service);
 CREATE INDEX IF NOT EXISTS idx_offline_cache_source ON offline_cache(source, source_id);
 CREATE INDEX IF NOT EXISTS idx_offline_cache_status ON offline_cache(status);
 CREATE INDEX IF NOT EXISTS idx_sync_snapshots_link ON sync_link_snapshots(playlist_link_id, side);
 
--- Schema version tracking
+-- Schema version tracking. `version` MUST be INTEGER: the migration runner
+-- (migrations.rs run_pg_migrations) and the numbered SQL scripts read/insert
+-- integer versions, and a TEXT column made `COALESCE(MAX(version), 0)` abort
+-- at startup on data-migrated databases (JF, v0.9.13). The runner also heals
+-- existing TEXT columns in place at startup.
 CREATE TABLE IF NOT EXISTS schema_version (
-    version TEXT PRIMARY KEY,
+    version INTEGER PRIMARY KEY,
     applied_at TIMESTAMPTZ DEFAULT now(),
     name TEXT NOT NULL
 );
+-- Re-migration onto a database created before the INTEGER fix: convert the
+-- legacy TEXT column in place BEFORE the INSERT below touches it. Values are
+-- digit strings, the cast is safe; no-op (trivial rewrite) when already INTEGER.
+ALTER TABLE schema_version ALTER COLUMN version TYPE INTEGER USING version::integer;
 INSERT INTO schema_version (version, name) VALUES (99, 'sqlite_migration')
     ON CONFLICT (version) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Idempotent column back-fills for ALREADY-CREATED PG databases.
+--
+-- A PG database created by an EARLIER version of this migration is missing
+-- columns that later SQLite migrations added (bio provenance, zone playback/
+-- DLNA flags, listen_history profile scoping, smart_playlists match_mode).
+-- Without these, the data copy fails with `column "X" does not exist` and the
+-- whole table is silently skipped (tester JP, forum). `ADD COLUMN IF NOT EXISTS`
+-- brings such a DB up to date without a manual drop; it is a no-op on a fresh DB
+-- (the CREATE TABLEs above already carry these columns). Types/defaults mirror
+-- the CREATE TABLEs (booleans stay TEXT 0/1 to match the copied SQLite data).
+-- ─────────────────────────────────────────────────────────────────────
+
+-- artists / albums: bio provenance (SQLite migration v54)
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source_url TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_license TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_lang TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source_url TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
+
+-- alarms: owning profile (SQLite migration v64)
+ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
+
+-- zones: playback state + DLNA/DSD flags (SQLite migrations v36/v38/v39/v40/v50
+-- and the post-migration safety pass: alac_passthrough / dlna_lpcm /
+-- dlna_cap_16bit / host)
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped';
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto';
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_native_flac TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS aac_passthrough TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
+
+-- listen_history: streaming source id + album id + profile scoping (v32/v37/v45)
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
+
+-- smart_playlists: match_mode (SQLite migration v48)
+ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
+
+-- podcast_subscriptions: streaming source id (SQLite migration v59)
+ALTER TABLE podcast_subscriptions ADD COLUMN IF NOT EXISTS source_id TEXT;
+
+-- queue_items: per-album numbering for streaming tracks (SQLite migration v64)
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
+"#;
+
+/// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
+/// PRECISION (001 creates it DOUBLE on fresh installs; an mtime is numeric by
+/// nature, and `file_first_seen.first_seen_at` is already DOUBLE).
+/// `PG_FULL_SCHEMA` above deliberately creates it TEXT — the data copy binds
+/// every parameter as text, so converting BEFORE the copy would abort the
+/// whole `tracks` INSERT ("column is of type double precision but expression
+/// is of type text") and the library would arrive empty. Migration 013,
+/// replayed by `run_pg_migrations` right after the copy, normally performs
+/// the TEXT → DOUBLE conversion; this block repeats it so a failure in an
+/// earlier numbered migration cannot strand the drifted TEXT column (that
+/// TEXT/DOUBLE drift between install vintages is what broke the added_at
+/// album sort — see album_repo.rs list_sorted). Idempotent: strict no-op once
+/// the column is DOUBLE. '' (SQLite dynamic-typing garbage carried over by
+/// the text copy) becomes NULL, like any non-numeric value (regex guard
+/// mirrors migration 013). No Rust write path can produce '' — the model
+/// field is `Option<f64>` and binds natively — so once converted the column
+/// stays clean.
+const PG_NORMALIZE_FILE_MTIME: &str = r#"
+DO $$
+DECLARE
+    cur_type TEXT;
+BEGIN
+    SELECT data_type INTO cur_type
+      FROM information_schema.columns
+     WHERE table_name = 'tracks' AND column_name = 'file_mtime';
+    IF cur_type IN ('text', 'character varying') THEN
+        UPDATE tracks SET file_mtime = NULL WHERE file_mtime = '';
+        ALTER TABLE tracks ALTER COLUMN file_mtime TYPE DOUBLE PRECISION
+            USING (CASE WHEN file_mtime ~ '^-?[0-9]+(\.[0-9]+)?$'
+                        THEN file_mtime::double precision END);
+        RAISE NOTICE 'pg_migrate: tracks.file_mtime % -> double precision', cur_type;
+    END IF;
+END $$;
 "#;
 
 /// Run the full SQLite → PostgreSQL migration.
@@ -603,7 +885,33 @@ pub async fn migrate_sqlite_to_pg(
         }
     }
 
-    // No sequence reset needed — all PKs are TEXT in migration schema
+    // Bring the freshly-migrated database up to the latest schema right now —
+    // most importantly migration 012, which converts the TEXT `id` columns this
+    // schema creates back to auto-incrementing BIGINT with a sequence (a fresh
+    // install gets BIGSERIAL from 001). Without it the migrated DB inherits
+    // SQLite's dynamic typing and rejects every NEW insert that omits `id`
+    // ("null value in column \"id\" ... violates not-null constraint" — the
+    // scan sees the files but writes 0, JF). Startup runs the migrations too,
+    // but the migrate route only restarts when persisting the DATABASE_URL
+    // succeeds, so doing it here guarantees a usable database regardless.
+    // Idempotent: the startup pass then finds nothing to do.
+    if let Err(e) = crate::db::migrations::run_pg_migrations(&pool).await {
+        tracing::warn!(error = %e, "pg_migrate_post_migration_upgrade_failed");
+        result
+            .errors
+            .push(format!("post-migration schema upgrade failed: {e}"));
+    }
+
+    // Belt and braces: even if the upgrade above failed before migration 013
+    // could run, tracks.file_mtime must leave here with its canonical DOUBLE
+    // PRECISION type (see PG_NORMALIZE_FILE_MTIME). No-op when 013 already
+    // converted it.
+    if let Err(e) = sqlx::raw_sql(PG_NORMALIZE_FILE_MTIME).execute(&pool).await {
+        tracing::warn!(error = %e, "pg_migrate_file_mtime_normalize_failed");
+        result
+            .errors
+            .push(format!("file_mtime normalisation failed: {e}"));
+    }
 
     let elapsed = start.elapsed();
     info!(
@@ -677,6 +985,7 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
     let conflict_clause = match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
+        "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
         "favorites" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "item_tags" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",

@@ -108,6 +108,55 @@ pub mod sql {
         )
     }
 
+    pub fn get_id_by_folder<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id FROM albums WHERE folder_path = {} LIMIT 1",
+            d.placeholder(1)
+        )
+    }
+
+    /// Albums homonymes déjà rattachés à un AUTRE dossier, avec leur dossier
+    /// et les numéros de piste qu'ils occupent : de quoi décider si le dossier
+    /// courant est l'éclat d'une même compilation (#1440).
+    pub fn scattered_candidates<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT a.id, a.folder_path, \
+             (SELECT GROUP_CONCAT(t.track_number) FROM tracks t WHERE t.album_id = a.id) \
+             FROM albums a \
+             WHERE LOWER(a.title) = LOWER({}) AND a.folder_path IS NOT NULL \
+             AND a.folder_path <> {} LIMIT 50",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_folder_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT folder_path FROM albums WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_folder_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET folder_path = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_artist_name<D: SqlDialect>(d: &D) -> String {
+        format!("SELECT name FROM artists WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn set_artist_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET artist_id = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {}, release_date = {}, original_date = {} WHERE id = {}",
@@ -151,6 +200,22 @@ pub mod sql {
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5)
+        )
+    }
+
+    /// Ecrit l'annee EN ECRASANT la valeur existante.
+    ///
+    /// `update_dates` ci-dessus fait un COALESCE et ne remplace jamais rien :
+    /// c'est ce qu'il faut quand on comble un trou laisse par le scan. Une
+    /// correction validee par l'utilisateur est le cas oppose — la valeur en
+    /// place est justement celle qu'il veut changer. Deux besoins contraires,
+    /// deux requetes ; les confondre rendrait l'arbitrage sans effet, en
+    /// silence.
+    pub fn set_year<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET year = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -393,8 +458,7 @@ impl AlbumRepo {
             &album.release_date,
             &album.original_date,
         ];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     /// Look up an album by (title, artist, year), or create it.
@@ -424,8 +488,7 @@ impl AlbumRepo {
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&title, &artist_id, &year];
-        self.db.execute(&create_sql, &params)?;
-        let id = self.db.last_insert_rowid();
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
         let mut album = Album::new(title.to_string());
         album.id = Some(id);
         album.artist_id = Some(artist_id);
@@ -453,22 +516,303 @@ impl AlbumRepo {
             );
             let params: [&dyn ToSqlValue; 1] = [&release_id];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return Ok(row_to_album(&row));
+                let mut album = row_to_album(&row);
+                self.reclaim_unknown_artist(&mut album, artist_id)?;
+                return Ok(album);
             }
         }
         if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
-            return Ok(found);
+            // Don't collapse two DISTINCT MusicBrainz releases that merely share
+            // title+artist+year. If we were handed an MBID and the album matched
+            // by title already carries a *different* one, they are separate
+            // editions — fall through and create a new album instead of merging
+            // (Dominique: two releases with distinct MUSICBRAINZ_ALBUMID were
+            // being fused into one). When either side lacks an MBID we keep the
+            // old behaviour so partially-tagged albums stay together.
+            let conflicting_mbid = matches!(
+                (mbid, found.musicbrainz_release_id.as_deref()),
+                (Some(incoming), Some(existing)) if incoming != existing
+            );
+            if !conflicting_mbid {
+                return Ok(found);
+            }
         }
         let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
         let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
-        self.db.execute(&create_sql, &params)?;
-        let id = self.db.last_insert_rowid();
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
         let mut album = Album::new(title.to_string());
         album.id = Some(id);
         album.artist_id = Some(artist_id);
         album.year = year;
         album.musicbrainz_release_id = mbid.map(String::from);
         Ok(album)
+    }
+
+    /// The album a folder holds, creating it if this is the folder's first track.
+    ///
+    /// The folder on disk is what identifies a release, so it is tried first.
+    /// That is what keeps an edition together when its discs differ in sample
+    /// rate — a box set mixing 24/192, 16/44.1 and 24/48 is one album, not three
+    /// — and what keeps two separate rips of the same album apart without
+    /// resorting to a "(96kHz/24bit)" suffix on the title.
+    ///
+    /// Falling back to [`Self::get_or_create_with_mbid`] keeps every existing
+    /// rule intact (MusicBrainz release id, title + artist + year), with one
+    /// added condition: a candidate already claimed by a *different* folder is
+    /// not reused, or the second rip would be merged into the first. A candidate
+    /// with no folder yet — every album indexed before this column existed —
+    /// adopts this one, so a library converts as it is rescanned rather than
+    /// duplicating.
+    pub fn get_or_create_for_folder(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+    ) -> Result<Album, TuneError> {
+        self.get_or_create_for_folder_with_track(folder, title, artist_id, year, mbid, None)
+    }
+
+    /// Variante qui connaît le numéro de la piste en cours d'indexation, seule
+    /// information permettant de recoller une compilation éparpillée par
+    /// artiste sans risquer de fusionner deux homonymes (#1440).
+    pub fn get_or_create_for_folder_with_track(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+        track_number: Option<i32>,
+    ) -> Result<Album, TuneError> {
+        if folder.is_empty() {
+            return self.get_or_create_with_mbid(title, artist_id, year, mbid);
+        }
+
+        // Le disque a-t-il déjà une entrée, posée par un dossier frère ? Le
+        // rangement Qobuz d'une compilation met chaque piste dans le dossier
+        // de SON artiste ; sans ce rattrapage, une anthologie de 41 titres
+        // produit 41 albums d'une piste.
+        if self.find_id_by_folder(folder)?.is_none() {
+            if let Some(id) = self.find_scattered_compilation(folder, title, track_number)? {
+                let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+                let params: [&dyn ToSqlValue; 1] = [&id];
+                if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                    tracing::debug!(
+                        album_id = id,
+                        folder,
+                        title,
+                        ?track_number,
+                        "scattered_compilation_reattached"
+                    );
+                    return Ok(row_to_album(&row));
+                }
+            }
+        }
+
+        if let Some(id) = self.find_id_by_folder(folder)? {
+            // `_strong` like every other read on this path: the scanner runs
+            // inside a `BEGIN IMMEDIATE`, so a pooled reader would not see rows
+            // written moments ago by this same transaction.
+            let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+            let params: [&dyn ToSqlValue; 1] = [&id];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                let mut album = row_to_album(&row);
+                // Un album créé alors que son premier fichier était encore en
+                // cours d'écriture (tags illisibles) est retombé sur « Unknown
+                // Artist ». Le dossier étant l'identité de l'album, chaque
+                // rescan retournait cette ligne telle quelle : l'artiste ne se
+                // corrigeait jamais, même une fois toutes les pistes taguées
+                // (bug .15 : centaines d'albums « Unknown Artist » dont les
+                // pistes portent le bon artiste). On répare ici, au moment où
+                // un vrai artiste se présente pour ce dossier.
+                self.reclaim_unknown_artist(&mut album, artist_id)?;
+                return Ok(album);
+            }
+        }
+
+        let candidate = self.get_or_create_with_mbid(title, artist_id, year, mbid)?;
+        let Some(id) = candidate.id else {
+            return Ok(candidate);
+        };
+
+        match self.folder_path_of(id)? {
+            // Already ours, or freshly created by the call above.
+            Some(existing) if existing == folder => Ok(candidate),
+            // Another folder owns it: this is a distinct release that merely
+            // shares title, artist and year. Give it its own row.
+            Some(_) => {
+                let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
+                let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
+                let new_id = self.db.execute_returning_id(&create_sql, &params)?;
+                self.set_folder_path(new_id, folder)?;
+                let mut album = Album::new(title.to_string());
+                album.id = Some(new_id);
+                album.artist_id = Some(artist_id);
+                album.year = year;
+                album.musicbrainz_release_id = mbid.map(String::from);
+                Ok(album)
+            }
+            // Indexed before folders were recorded (or just created): claim it.
+            None => {
+                self.set_folder_path(id, folder)?;
+                Ok(candidate)
+            }
+        }
+    }
+
+    /// Rend à l'album son vrai artiste quand il est resté sur « Unknown Artist ».
+    ///
+    /// Ne touche à rien sauf si TOUTES ces conditions tiennent :
+    /// - l'artiste actuel de l'album est « Unknown Artist » (ou `artist_id`
+    ///   NULL / ligne artiste disparue) ;
+    /// - l'artiste demandé existe et n'est pas lui-même « Unknown Artist ».
+    ///
+    /// Un album correctement attribué n'est donc jamais réassigné (deux vrais
+    /// artistes en désaccord = éditions distinctes, on ne tranche pas ici), et
+    /// un fichier encore sans tags ne rétrograde jamais un album déjà résolu.
+    fn reclaim_unknown_artist(
+        &self,
+        album: &mut Album,
+        requested_artist_id: i64,
+    ) -> Result<(), TuneError> {
+        if album.artist_id == Some(requested_artist_id) {
+            return Ok(());
+        }
+        let currently_unknown = match (album.artist_id, album.artist_name.as_deref()) {
+            (None, _) => true,
+            // artist_id présent mais ligne artiste absente (LEFT JOIN → NULL).
+            (Some(_), None) => true,
+            (Some(_), Some(name)) => {
+                name.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+            }
+        };
+        if !currently_unknown {
+            return Ok(());
+        }
+        let name_sql = self.dialect_sql(sql::get_artist_name, sql::get_artist_name);
+        let params: [&dyn ToSqlValue; 1] = [&requested_artist_id];
+        let Some(requested_name) = self
+            .db
+            .query_one_strong(&name_sql, &params)?
+            .and_then(|row| row.first()?.as_string())
+        else {
+            return Ok(());
+        };
+        if requested_name.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME) {
+            return Ok(());
+        }
+        let Some(album_id) = album.id else {
+            return Ok(());
+        };
+        let set_sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+        let set_params: [&dyn ToSqlValue; 2] = [&requested_artist_id, &album_id];
+        self.db.execute(&set_sql, &set_params)?;
+        tracing::info!(
+            album_id,
+            album = %album.title,
+            previous_artist = ?album.artist_name,
+            new_artist = %requested_name,
+            "album_artist_reclaimed_from_unknown"
+        );
+        album.artist_id = Some(requested_artist_id);
+        album.artist_name = Some(requested_name);
+        Ok(())
+    }
+
+    /// The id of the album a folder holds, if one is recorded.
+    /// L'album auquel rattacher une piste dont le dossier est l'éclat d'une
+    /// compilation rangée par artiste (#1440).
+    ///
+    /// Trois conditions doivent tenir ENSEMBLE, et la troisième est celle qui
+    /// protège les homonymes : même titre, dossiers frères éparpillés (voir
+    /// [`crate::scanner::compilation::is_scattered_sibling`]), et un numéro de
+    /// piste encore libre dans l'album candidat. Deux « Greatest Hits »
+    /// distincts commencent tous deux à la piste 1 : ils ne fusionnent pas.
+    pub fn find_scattered_compilation(
+        &self,
+        folder: &str,
+        title: &str,
+        track_number: Option<i32>,
+    ) -> Result<Option<i64>, TuneError> {
+        use crate::scanner::compilation::{
+            folder_cover_fingerprint, is_scattered_sibling, track_number_is_free,
+        };
+        if track_number.is_none() || folder.is_empty() {
+            return Ok(None);
+        }
+        // La pochette du dossier est le SEUL signal qui identifie un disque.
+        //
+        // Le numéro de piste libre ne suffit pas au scan : l'album se remplit
+        // progressivement, donc la piste 1 d'un second volume arrive quand
+        // l'album ne contient encore que les pistes 5, 12, 18 du premier — elle
+        // est absorbée, et de proche en proche les volumes se confondent.
+        // Constaté sur .18 : les quatre volumes « ALLOPOP » écrasés en un seul
+        // album de 71 pistes, chaque numéro en quatre exemplaires.
+        //
+        // Sans pochette on renonce : mieux vaut deux albums de trop qu'un
+        // disque avalé par un autre.
+        let Some(empreinte) = folder_cover_fingerprint(folder) else {
+            return Ok(None);
+        };
+        let sql = self.dialect_sql(sql::scattered_candidates, sql::scattered_candidates);
+        let params: [&dyn ToSqlValue; 2] = [&title, &folder];
+        for row in self.db.query_many_strong(&sql, &params)? {
+            let Some(id) = row.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(cand_folder) = row.get(1).and_then(|v| v.as_str()).map(String::from) else {
+                continue;
+            };
+            if !is_scattered_sibling(folder, &cand_folder) {
+                continue;
+            }
+            // Même titre, dossiers frères — mais est-ce le MÊME disque ?
+            if !folder_cover_fingerprint(&cand_folder).is_some_and(|f| f.matches(&empreinte)) {
+                continue;
+            }
+            let taken: Vec<i32> = row
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|csv| {
+                    csv.split(',')
+                        .filter_map(|n| n.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if track_number_is_free(track_number, &taken) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn find_id_by_folder(&self, folder: &str) -> Result<Option<i64>, TuneError> {
+        let sql = self.dialect_sql(sql::get_id_by_folder, sql::get_id_by_folder);
+        let params: [&dyn ToSqlValue; 1] = [&folder];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .and_then(|row| row.first()?.as_i64()))
+    }
+
+    /// The folder recorded for an album, `None` when it predates the column.
+    pub fn folder_path_of(&self, album_id: i64) -> Result<Option<String>, TuneError> {
+        let sql = self.dialect_sql(sql::get_folder_path, sql::get_folder_path);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .and_then(|row| row.first()?.as_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    pub fn set_folder_path(&self, album_id: i64, folder: &str) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_folder_path, sql::set_folder_path);
+        let params: [&dyn ToSqlValue; 2] = [&folder, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
     }
 
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
@@ -557,6 +901,14 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Ecrit l'annee en ecrasant celle en place — voir `sql::set_year`.
+    pub fn set_year(&self, album_id: i64, year: i32) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_year, sql::set_year);
+        let params: [&dyn ToSqlValue; 2] = [&year, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_cover_path, sql::update_cover_path);
         let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
@@ -599,13 +951,22 @@ impl AlbumRepo {
             })
             .collect::<Vec<_>>();
         let _ = p;
+        // genre/genres are fill-only (COALESCE) but must heal the empty-string
+        // case: `create_minimal` leaves genre NULL, yet a track can carry
+        // genre = '' (an empty tag frame), which the old `t.genre IS NOT NULL`
+        // subquery would happily pick and COALESCE into the album — pinning it
+        // to '' forever (COALESCE(albums.genre='' , …) never re-fills, and the
+        // completeness card counts genre != '' so it read as "without genre" for
+        // the whole catalogue, identical to the cover card — #3 Fabien). NULLIF
+        // treats a stored '' as re-fillable and the `!= ''` guard only ever
+        // sources a real, non-empty genre. Valid on SQLite and PostgreSQL.
         let sql = format!(
             "UPDATE albums SET
                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = {} AND t.format IS NOT NULL LIMIT 1)),
                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = {})),
                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = {})),
-                genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL LIMIT 1)),
-                genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL LIMIT 1)),
+                genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)),
+                genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)),
                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = {}))
             WHERE id = {}",
             plist[0], plist[1], plist[2], plist[3], plist[4], plist[5], plist[6]
@@ -835,14 +1196,21 @@ impl AlbumRepo {
             // ids happen to be the highest), hence the "only the first few albums
             // are sorted" report (Bilou, #1102).
             "added_at" | "added_date" => format!(
-                // file_first_seen.first_seen_at is DOUBLE, but tracks.file_mtime
-                // is TEXT in the Postgres schema — a bare COALESCE(double, text)
-                // is a hard error on PG ("types double precision and text cannot
-                // be matched"), so the sort silently returned no albums on .15
-                // (empty library → "black screen" on the clients). Cast the
-                // fallback to a number; NULLIF guards against empty strings.
-                // Valid on SQLite too (REAL affinity).
-                "(SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(t.file_mtime, '') AS DOUBLE PRECISION))) \
+                // file_first_seen.first_seen_at is DOUBLE, but the type of
+                // tracks.file_mtime on Postgres depends on the install vintage:
+                // TEXT on some installs (bug #550 fixed that case), DOUBLE
+                // PRECISION on others (.15) — schema drift between PG installs.
+                // A bare COALESCE(double, text) is a hard error on the TEXT
+                // installs, and NULLIF(double_col, '') is a hard error at
+                // *parse/analyze* time on the DOUBLE installs ("invalid input
+                // syntax for type double precision"), which made the sort
+                // return no albums on .15 (empty library → "black screen" on
+                // the clients) — and added_at is the handler's default sort,
+                // so every list was empty. Cast the column to TEXT first so
+                // the expression is valid whichever type the column has;
+                // NULLIF guards against empty strings. Valid on SQLite too
+                // (soft affinities).
+                "(SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) \
                   FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
                   WHERE t.album_id = a.id) {dir} NULLS LAST, a.id {dir}"
             ),
@@ -892,9 +1260,20 @@ impl AlbumRepo {
         next_ph += 1;
         let offset_ph = make_ph(next_ph);
 
+        // Expose the added-at timestamp as a 25th column when sorting by it,
+        // so the client can render a chronological scrubber. Same expression
+        // as the ORDER BY — the planner evaluates the correlated subquery once.
+        let base_select = if matches!(sort, "added_at" | "added_date") {
+            sql::select_album().replacen(
+                " FROM albums a",
+                ", (SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))                    FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path                    WHERE t.album_id = a.id) AS added_at FROM albums a",
+                1,
+            )
+        } else {
+            sql::select_album().to_string()
+        };
         let sql = format!(
-            "{}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}",
-            sql::select_album()
+            "{base_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
         );
 
         bind_values.push(SqlValue::Int(limit));
@@ -910,6 +1289,37 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
+    }
+
+    /// When `album_id` points at an album row that has NO tracks (a stale or
+    /// duplicate row), find another album with the SAME title + artist that DOES
+    /// have tracks — the row the Artists view reaches. Returns the sibling id
+    /// with the most tracks, or `None` if there is no populated sibling.
+    ///
+    /// This is why the same album could 400 ("no tracks to play") from the flat
+    /// Albums/Genres/Years grids (which can surface the empty row) yet play fine
+    /// from the Artists view (which reaches the populated row) — Pascal, v0.9.21.
+    pub fn find_populated_sibling(&self, album_id: i64) -> Result<Option<i64>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT a.id FROM albums a \
+             JOIN albums s ON s.id = {ph} \
+             WHERE a.id <> s.id \
+               AND LOWER(a.title) = LOWER(s.title) \
+               AND ((a.artist_id = s.artist_id) OR (a.artist_id IS NULL AND s.artist_id IS NULL)) \
+               AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id) \
+             ORDER BY (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) DESC \
+             LIMIT 1"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_i64()))
     }
 
     /// Match albums where `genre` appears in either the legacy
@@ -1014,6 +1424,39 @@ impl AlbumRepo {
 
     /// Bio provenance (source, url, license, lang, fetched_at) for the
     /// album-detail endpoint. Returns None when no sourced bio is recorded.
+    /// The album's Dynamic Range, as tagged by an external analyser.
+    ///
+    /// The value is written per track by the scanner (`track_metadata['dr_album']`,
+    /// read from the Vorbis `ALBUM DYNAMIC RANGE` field) because that is where
+    /// the tag physically lives — in each file — while it describes the album as
+    /// a whole. Any one track therefore answers for the album, hence `LIMIT 1`.
+    ///
+    /// Returns `None` when no track carries the tag, which is the common case:
+    /// tagging DR is a deliberate step most libraries never take. The caller
+    /// must render nothing at all rather than an empty field.
+    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "SELECT tm.value FROM track_metadata tm \
+                 JOIN tracks t ON t.id = tm.track_id \
+                 WHERE t.album_id = ? AND tm.key = 'dr_album' AND tm.value <> '' \
+                 LIMIT 1"
+            }
+            Engine::Postgres => {
+                "SELECT tm.value FROM track_metadata tm \
+                 JOIN tracks t ON t.id = tm.track_id \
+                 WHERE t.album_id = $1 AND tm.key = 'dr_album' AND tm.value <> '' \
+                 LIMIT 1"
+            }
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(sql, &params)?
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .filter(|s| !s.trim().is_empty()))
+    }
+
     pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {
         let sql = match self.db.engine() {
             Engine::Sqlite => {
@@ -1065,6 +1508,9 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         genre: cols.get(6).and_then(|v| v.as_string()),
         // Index 23 (after the 23-col select): a.genres
         genres: cols.get(23).and_then(|v| v.as_string()),
+        // Index 24: added_at — present only on the added-date sorted listing
+        // (list_filtered injects the column); None for every other query.
+        added_at: cols.get(24).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
         cover_path: cols.get(9).and_then(|v| v.as_string()),
@@ -1089,6 +1535,7 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::Artist;
@@ -1097,6 +1544,150 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// Pose une piste numérotée sur un album, comme le fait le scan.
+    fn seed_track(db: &SqliteDb, album_id: i64, artist_id: i64, n: i32, path: &str) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let mut t = Track::new(format!("piste {n}"));
+        t.album_id = Some(album_id);
+        t.artist_id = Some(artist_id);
+        t.track_number = n;
+        t.file_path = Some(path.into());
+        TrackRepo::new(db.clone()).create(&t).unwrap();
+    }
+
+    /// Crée un dossier d'album avec sa pochette, comme sur disque.
+    ///
+    /// `motif` désigne le disque ; `qualite` fait varier l'encodage d'un
+    /// dossier à l'autre, comme le fait Qobuz. Deux dossiers d'un même disque
+    /// n'ont donc pas un octet en commun — ce qui est exactement le cas que la
+    /// comparaison par SHA-256 ratait (#1470).
+    fn dossier_avec_pochette(
+        base: &std::path::Path,
+        artiste: &str,
+        album: &str,
+        motif: u32,
+        qualite: u8,
+    ) -> String {
+        let d = base.join(artiste).join(album);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("cover.jpg"),
+            crate::scanner::compilation::pochette_de_test(motif, 96, qualite),
+        )
+        .unwrap();
+        d.to_string_lossy().into_owned()
+    }
+
+    /// #1440 — cas RÉEL : l'anthologie « OUF » rangée par artiste de piste.
+    /// Même pochette dans chaque dossier ⇒ un seul album.
+    #[test]
+    fn a_scattered_anthology_lands_in_one_album() {
+        const TITLE: &str = "OUF L'anthologie Souterraine 2015-2017";
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("Corte Real".into())).unwrap();
+        let a2 = artists.create(&Artist::new("Alligator".into())).unwrap();
+        let f1 = dossier_avec_pochette(tmp.path(), "Corte Real", TITLE, 1, 92);
+        let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, 1, 55);
+
+        let first = arepo
+            .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1))
+            .unwrap();
+        seed_track(&db, first.id.unwrap(), a1, 1, &format!("{f1}/01.flac"));
+
+        let second = arepo
+            .get_or_create_for_folder_with_track(&f2, TITLE, a2, None, None, Some(3))
+            .unwrap();
+        assert_eq!(second.id, first.id, "même disque, même pochette : un album");
+    }
+
+    /// #1440 — deux « Greatest Hits » distincts : pochettes différentes ET
+    /// numéros qui se chevauchent. Aucune fusion.
+    #[test]
+    fn two_real_greatest_hits_stay_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let a1 = artists.create(&Artist::new("Pat Benatar".into())).unwrap();
+        let a2 = artists.create(&Artist::new("Police".into())).unwrap();
+        let f1 = dossier_avec_pochette(tmp.path(), "Pat Benatar", "Greatest Hits", 1, 92);
+        let f2 = dossier_avec_pochette(tmp.path(), "Police", "Greatest Hits", 3, 92);
+
+        let first = arepo
+            .get_or_create_for_folder_with_track(
+                &f1,
+                "Greatest Hits",
+                a1,
+                Some(2005),
+                None,
+                Some(1),
+            )
+            .unwrap();
+        seed_track(&db, first.id.unwrap(), a1, 1, &format!("{f1}/01.flac"));
+
+        let second = arepo
+            .get_or_create_for_folder_with_track(
+                &f2,
+                "Greatest Hits",
+                a2,
+                Some(1992),
+                None,
+                Some(1),
+            )
+            .unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    /// LA RÉGRESSION livrée en #1442, reproduite : quatre volumes « ALLOPOP »
+    /// éclatés par artiste, dont les pistes arrivent ENTRELACÉES.
+    ///
+    /// Le seul critère du numéro libre les avalait les uns après les autres —
+    /// la piste 1 du volume 2 se présentait quand l'album ne contenait encore
+    /// que les pistes 5 et 12 du volume 1. Résultat observé sur .18 : un album
+    /// de 71 pistes avec chaque numéro en quatre exemplaires. La pochette du
+    /// dossier est ce qui les sépare.
+    #[test]
+    fn four_interleaved_volumes_never_collapse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+
+        // (artiste, volume, numéro) dans un ordre volontairement entrelacé.
+        let arrivees: [(&str, usize, i32); 8] = [
+            ("Diane", 0, 5),
+            ("Tristan", 1, 12),
+            ("Gatien", 0, 12),
+            ("Ma Fraisse", 2, 5),
+            ("Loup", 1, 1),
+            ("Nina", 2, 1),
+            ("Oscar", 3, 5),
+            ("Pia", 3, 1),
+        ];
+        let mut vus = std::collections::HashSet::new();
+        for (artiste, vol, num) in arrivees {
+            let f =
+                dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", vol as u32, 60 + (num as u8));
+            let aid = artists.create(&Artist::new(artiste.into())).unwrap();
+            let album = arepo
+                .get_or_create_for_folder_with_track(&f, "ALLOPOP", aid, None, None, Some(num))
+                .unwrap();
+            let id = album.id.unwrap();
+            seed_track(&db, id, aid, num, &format!("{f}/{num:02}.flac"));
+            vus.insert(id);
+        }
+
+        assert_eq!(
+            vus.len(),
+            4,
+            "quatre pochettes ⇒ quatre albums, pas un seul (régression #1442)"
+        );
     }
 
     #[test]
@@ -1120,6 +1711,55 @@ mod tests {
 
         repo.delete(id).unwrap();
         assert!(repo.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_quality_backfills_genre_ignoring_empty_string_tracks() {
+        // Regression for #3 (Fabien): `create_minimal` leaves albums.genre NULL,
+        // and one of the album's tracks carries genre = '' (an empty tag frame).
+        // The old backfill (`t.genre IS NOT NULL LIMIT 1` + `COALESCE(albums.genre,…)`)
+        // could pick the empty track and pin albums.genre to '' — which the
+        // completeness card counts as "without genre", making the genre card
+        // read the whole catalogue as missing (identical to the cover card).
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+
+        let artist_id = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let album = repo
+            .get_or_create("Kind of Blue", artist_id, Some(1959))
+            .unwrap();
+        let album_id = album.id.unwrap();
+        // Album row created minimally: genre is NULL.
+        assert_eq!(repo.get(album_id).unwrap().unwrap().genre, None);
+
+        // Two tracks: one with an empty-string genre, one with a real genre.
+        db.execute_batch(&format!(
+            "INSERT INTO tracks (title, album_id, artist_id, genre) VALUES ('So What', {album_id}, {artist_id}, '');
+             INSERT INTO tracks (title, album_id, artist_id, genre) VALUES ('Blue in Green', {album_id}, {artist_id}, 'Jazz');"
+        ))
+        .unwrap();
+
+        repo.update_quality_from_tracks(album_id).unwrap();
+        assert_eq!(
+            repo.get(album_id).unwrap().unwrap().genre.as_deref(),
+            Some("Jazz"),
+            "backfill must skip the empty-string track and pick the real genre"
+        );
+
+        // Now poison the album with '' directly and confirm NULLIF heals it.
+        db.execute_batch(&format!(
+            "UPDATE albums SET genre = '' WHERE id = {album_id};"
+        ))
+        .unwrap();
+        repo.update_quality_from_tracks(album_id).unwrap();
+        assert_eq!(
+            repo.get(album_id).unwrap().unwrap().genre.as_deref(),
+            Some("Jazz"),
+            "an already-empty album genre must be re-filled from a real track genre"
+        );
     }
 
     #[test]
@@ -1150,6 +1790,43 @@ mod tests {
         let deleted = repo.delete_orphans().unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(repo.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn find_populated_sibling_resolves_duplicate_empty_album() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let aid = artist_repo
+            .create(&Artist::new("Muddy Waters".into()))
+            .unwrap();
+
+        // Two album rows for the same title+artist: one populated, one empty —
+        // the duplicate that makes "play album" 400 from the flat grids.
+        let mut populated = Album::new("Folk Singer".into());
+        populated.artist_id = Some(aid);
+        let populated_id = arepo.create(&populated).unwrap();
+        let mut empty = Album::new("Folk Singer".into());
+        empty.artist_id = Some(aid);
+        let empty_id = arepo.create(&empty).unwrap();
+
+        let mut t = Track::new("My Home Is in the Delta".into());
+        t.album_id = Some(populated_id);
+        t.artist_id = Some(aid);
+        t.file_path = Some("/blues/folk-singer/01.flac".into());
+        trepo.create(&t).unwrap();
+
+        // The empty duplicate resolves to the populated sibling.
+        assert_eq!(
+            arepo.find_populated_sibling(empty_id).unwrap(),
+            Some(populated_id)
+        );
+        // The populated album has no *other* populated sibling → None.
+        assert_eq!(arepo.find_populated_sibling(populated_id).unwrap(), None);
     }
 
     #[test]
@@ -1495,6 +2172,43 @@ mod tests {
     }
 
     #[test]
+    fn get_or_create_with_mbid_distinct_releases_do_not_merge() {
+        // Two editions with the SAME title+artist+year but DIFFERENT MusicBrainz
+        // release ids must stay separate (Dominique) — while a later track of
+        // the same album that is missing its MBID rejoins one of them instead of
+        // creating a third phantom album.
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+
+        let a1 = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), Some("mbid-aaa"))
+            .unwrap();
+        let a2 = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), Some("mbid-bbb"))
+            .unwrap();
+        assert_ne!(a1.id, a2.id, "distinct MBIDs must not collapse");
+        assert_eq!(repo.count().unwrap(), 2);
+
+        // Same MBID again → returns the existing album, no new row.
+        let a1_again = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), Some("mbid-aaa"))
+            .unwrap();
+        assert_eq!(a1_again.id, a1.id);
+
+        // Untagged track (no MBID) matches by title+artist+year — must not spawn
+        // a third album.
+        let untagged = repo
+            .get_or_create_with_mbid("Kind of Blue", aid, Some(1959), None)
+            .unwrap();
+        assert!(untagged.id == a1.id || untagged.id == a2.id);
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
     fn update_quality_from_tracks() {
         let db = test_db();
         let artist_repo = ArtistRepo::new(db.clone());
@@ -1712,6 +2426,61 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_range_reads_the_tag_from_any_track_of_the_album() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = test_db();
+        // `track_metadata` arrives by migration, not by CORE_SCHEMA, so the
+        // in-memory fixture does not have it. Create it here rather than run the
+        // whole migration chain: this test is about the join, not the schema.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_metadata (
+                 track_id INTEGER NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (track_id, key)
+             );",
+        )
+        .unwrap();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Tri Repetae".into())).unwrap();
+        let mut t1 = Track::new("Dael".into());
+        t1.album_id = Some(album_id);
+        t1.file_path = Some("/m/1.flac".into());
+        let id1 = trepo.create(&t1).unwrap();
+        let mut t2 = Track::new("Clipper".into());
+        t2.album_id = Some(album_id);
+        t2.file_path = Some("/m/2.flac".into());
+        let id2 = trepo.create(&t2).unwrap();
+
+        // No tag anywhere yet: nothing to show, and that is the common case.
+        assert_eq!(arepo.dynamic_range(album_id).unwrap(), None);
+
+        // The tag lives in each file; the scanner therefore writes it per track
+        // even though it describes the album. Tagging the SECOND track proves
+        // the lookup does not just read the first one.
+        mrepo.set(id2, "dr_album", "12").unwrap();
+        assert_eq!(
+            arepo.dynamic_range(album_id).unwrap().as_deref(),
+            Some("12")
+        );
+
+        // An empty value must not masquerade as a measurement.
+        mrepo.set(id1, "dr_album", "").unwrap();
+        mrepo.delete(id2, "dr_album").unwrap();
+        assert_eq!(arepo.dynamic_range(album_id).unwrap(), None);
+
+        // DR0 is a real measurement on a crushed master, not an absence.
+        mrepo.set(id1, "dr_album", "0").unwrap();
+        assert_eq!(arepo.dynamic_range(album_id).unwrap().as_deref(), Some("0"));
+    }
+
+    #[test]
     fn client_sort_key_aliases_match_canonical() {
         // The web client's sort dropdown sends "added_date" and "original_year"
         // (LibraryView AlbumSortKey), but the SQL layer's canonical keys are
@@ -1864,6 +2633,46 @@ mod tests {
     }
 
     #[test]
+    fn added_at_mtime_expression_is_column_type_agnostic() {
+        // On Postgres, tracks.file_mtime is TEXT on some installs and DOUBLE
+        // PRECISION on others (schema drift between install vintages — .15 is
+        // DOUBLE). The sort expression must be valid for both: it casts the
+        // column to TEXT before the NULLIF/CAST-to-double dance. SQLite's
+        // soft affinities let one column hold both representations, so store
+        // a numeric mtime, a text mtime and an empty-string mtime and check
+        // the sort still works and orders by the numeric value.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+        let c = arepo.create(&Album::new("C".into())).unwrap();
+        for (album_id, path) in [(a, "/a.flac"), (b, "/b.flac"), (c, "/c.flac")] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            trepo.create(&t).unwrap();
+        }
+        // Force the three storage classes: REAL (double installs), TEXT
+        // (text installs), and the empty string NULLIF must neutralise.
+        db.execute_batch(
+            "UPDATE tracks SET file_mtime = 3000.0 WHERE file_path = '/a.flac';
+             UPDATE tracks SET file_mtime = '1000' WHERE file_path = '/b.flac';
+             UPDATE tracks SET file_mtime = '' WHERE file_path = '/c.flac';
+             DELETE FROM file_first_seen;",
+        )
+        .unwrap();
+
+        let desc = arepo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        let titles: Vec<_> = desc.into_iter().map(|al| al.title).collect();
+        // A (3000) before B (1000); C has no usable timestamp → NULLS LAST.
+        assert_eq!(titles, vec!["A", "B", "C"]);
+    }
+
+    #[test]
     fn with_backend_constructor_full() {
         // All methods now go through DbBackend — no more sqlite_legacy.
         let db = test_db();
@@ -1881,5 +2690,258 @@ mod tests {
         assert_eq!(a.id, a2.id);
         // list_by_genre returns an empty list rather than erroring.
         assert!(repo.list_by_genre("Jazz").unwrap().is_empty());
+    }
+
+    /// One folder is one album, whatever the tracks' sample rates.
+    ///
+    /// The case that motivated this: a box set whose discs are 24/192, 16/44.1
+    /// and 24/48 used to become three albums titled "X", "X (192kHz/24bit)" and
+    /// "X (48kHz/24bit)" because the quality tier was appended to the title.
+    #[test]
+    fn one_folder_is_one_album_across_quality_tiers() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo
+            .create(&Artist::new("Green Day".into()))
+            .unwrap();
+        let folder = "/music/Green Day/American Idiot";
+
+        let first = repo
+            .get_or_create_for_folder(folder, "American Idiot", aid, Some(2004), None)
+            .unwrap();
+        let second = repo
+            .get_or_create_for_folder(folder, "American Idiot", aid, Some(2004), None)
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            repo.folder_path_of(first.id.unwrap()).unwrap().as_deref(),
+            Some(folder)
+        );
+    }
+
+    /// Two folders are two albums, even sharing title, artist and year — this is
+    /// what the `quality_split` setting promises ("if the same album exists in CD
+    /// and Hi-Res, create two separate entries"), now without a suffix in the
+    /// title: the client renders the quality from `sample_rate`/`bit_depth`.
+    #[test]
+    fn two_folders_stay_two_albums() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo
+            .create(&Artist::new("Pink Floyd".into()))
+            .unwrap();
+
+        let cd = repo
+            .get_or_create_for_folder(
+                "/music/PF/Division Bell",
+                "The Division Bell",
+                aid,
+                Some(1994),
+                None,
+            )
+            .unwrap();
+        let hires = repo
+            .get_or_create_for_folder(
+                "/music/PF/Division Bell (24-192)",
+                "The Division Bell",
+                aid,
+                Some(1994),
+                None,
+            )
+            .unwrap();
+
+        assert_ne!(cd.id, hires.id, "two rips must not be merged");
+        assert_eq!(cd.title, hires.title, "and neither title carries a suffix");
+    }
+
+    /// An album indexed before folders were recorded adopts the first folder that
+    /// claims it, so a library converts as it is rescanned instead of doubling.
+    #[test]
+    fn a_folderless_album_is_adopted_not_duplicated() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo.create(&Artist::new("The Who".into())).unwrap();
+
+        // As the old scanner would have left it: no folder recorded.
+        let legacy = repo.get_or_create("Tommy", aid, Some(1969)).unwrap();
+        assert!(repo.folder_path_of(legacy.id.unwrap()).unwrap().is_none());
+
+        let rescanned = repo
+            .get_or_create_for_folder("/music/The Who/Tommy", "Tommy", aid, Some(1969), None)
+            .unwrap();
+
+        assert_eq!(legacy.id, rescanned.id, "the existing row must be reused");
+        assert_eq!(
+            repo.folder_path_of(legacy.id.unwrap()).unwrap().as_deref(),
+            Some("/music/The Who/Tommy")
+        );
+    }
+
+    /// With no folder to go on, identity falls back to exactly what it was.
+    #[test]
+    fn an_empty_folder_falls_back_to_title_and_artist() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo.create(&Artist::new("Nobody".into())).unwrap();
+
+        let a = repo
+            .get_or_create_for_folder("", "Untitled", aid, None, None)
+            .unwrap();
+        let b = repo
+            .get_or_create_for_folder("", "Untitled", aid, None, None)
+            .unwrap();
+        assert_eq!(a.id, b.id);
+        assert!(repo.folder_path_of(a.id.unwrap()).unwrap().is_none());
+    }
+
+    /// The MusicBrainz rule still wins where it applies: two distinct releases
+    /// in two folders stay distinct, and the same release id is not duplicated.
+    #[test]
+    fn musicbrainz_identity_survives_folder_identity() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let aid = artist_repo.create(&Artist::new("Artist".into())).unwrap();
+
+        let one = repo
+            .get_or_create_for_folder("/m/A", "Album", aid, Some(2000), Some("mbid-1"))
+            .unwrap();
+        let two = repo
+            .get_or_create_for_folder("/m/B", "Album", aid, Some(2000), Some("mbid-2"))
+            .unwrap();
+        assert_ne!(one.id, two.id);
+
+        // Same folder, same release id → same row.
+        let again = repo
+            .get_or_create_for_folder("/m/A", "Album", aid, Some(2000), Some("mbid-1"))
+            .unwrap();
+        assert_eq!(one.id, again.id);
+    }
+
+    /// Reproduction du bug .15 : le watcher voit le premier fichier d'un
+    /// dossier pendant son écriture (tags artiste illisibles) → l'album est
+    /// créé sous « Unknown Artist ». Au rescan avec les vrais tags, le dossier
+    /// retrouvait la même ligne et la retournait telle quelle : l'album restait
+    /// « Unknown Artist » pour toujours, alors que toutes ses pistes portaient
+    /// le bon artiste. L'album doit reprendre le vrai artiste.
+    #[test]
+    fn folder_album_reclaims_real_artist_over_unknown() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let unknown = artist_repo
+            .create(&Artist::new(
+                crate::db::artist_repo::UNKNOWN_ARTIST_NAME.into(),
+            ))
+            .unwrap();
+        let real = artist_repo
+            .create(&Artist::new("Shearwater".into()))
+            .unwrap();
+        let folder = "/music/Shearwater/The New World";
+
+        // Premier passage : fichier en cours d'écriture, artiste inconnu.
+        let created = repo
+            .get_or_create_for_folder(folder, "The New World", unknown, None, None)
+            .unwrap();
+        assert_eq!(created.artist_id, Some(unknown));
+
+        // Rescan avec les tags complets : même album, artiste réparé.
+        let healed = repo
+            .get_or_create_for_folder(folder, "The New World", real, None, None)
+            .unwrap();
+        assert_eq!(
+            healed.id, created.id,
+            "le dossier doit rester un seul album"
+        );
+        assert_eq!(healed.artist_id, Some(real));
+        assert_eq!(healed.artist_name.as_deref(), Some("Shearwater"));
+
+        // Et la réparation est persistée, pas seulement sur la valeur retournée.
+        let reread = repo.get(created.id.unwrap()).unwrap().unwrap();
+        assert_eq!(reread.artist_id, Some(real));
+    }
+
+    /// L'inverse ne doit jamais se produire : un fichier encore sans tags
+    /// (résolu « Unknown Artist ») ne rétrograde pas un album déjà attribué.
+    #[test]
+    fn unknown_artist_never_downgrades_a_resolved_album() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let real = artist_repo
+            .create(&Artist::new("Ben Harper".into()))
+            .unwrap();
+        let unknown = artist_repo
+            .create(&Artist::new(
+                crate::db::artist_repo::UNKNOWN_ARTIST_NAME.into(),
+            ))
+            .unwrap();
+        let folder = "/music/Ben Harper/No Mercy In This Land";
+
+        let created = repo
+            .get_or_create_for_folder(folder, "No Mercy In This Land", real, None, None)
+            .unwrap();
+        let after = repo
+            .get_or_create_for_folder(folder, "No Mercy In This Land", unknown, None, None)
+            .unwrap();
+        assert_eq!(after.id, created.id);
+        assert_eq!(
+            after.artist_id,
+            Some(real),
+            "l'album garde son vrai artiste"
+        );
+    }
+
+    /// Deux vrais artistes en désaccord sur un même dossier : on ne tranche
+    /// pas, l'album garde son attribution d'origine (comportement inchangé).
+    #[test]
+    fn a_real_artist_mismatch_is_left_alone() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let first = artist_repo.create(&Artist::new("Artist A".into())).unwrap();
+        let second = artist_repo.create(&Artist::new("Artist B".into())).unwrap();
+        let folder = "/music/A/Album";
+
+        let created = repo
+            .get_or_create_for_folder(folder, "Album", first, None, None)
+            .unwrap();
+        let after = repo
+            .get_or_create_for_folder(folder, "Album", second, None, None)
+            .unwrap();
+        assert_eq!(after.id, created.id);
+        assert_eq!(after.artist_id, Some(first));
+    }
+
+    /// Même réparation sur le chemin MusicBrainz : un album retrouvé par son
+    /// release id alors qu'il est resté « Unknown Artist » reprend le vrai
+    /// artiste entrant.
+    #[test]
+    fn mbid_album_reclaims_real_artist_over_unknown() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        let unknown = artist_repo
+            .create(&Artist::new(
+                crate::db::artist_repo::UNKNOWN_ARTIST_NAME.into(),
+            ))
+            .unwrap();
+        let real = artist_repo
+            .create(&Artist::new("Orquesta Akokán".into()))
+            .unwrap();
+
+        let created = repo
+            .get_or_create_with_mbid("Orquesta Akokán", unknown, None, Some("mbid-akokan"))
+            .unwrap();
+        let healed = repo
+            .get_or_create_with_mbid("Orquesta Akokán", real, None, Some("mbid-akokan"))
+            .unwrap();
+        assert_eq!(healed.id, created.id);
+        assert_eq!(healed.artist_id, Some(real));
     }
 }

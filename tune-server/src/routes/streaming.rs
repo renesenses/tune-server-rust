@@ -138,6 +138,10 @@ pub fn router() -> Router<AppState> {
             "/{service}/featured-playlists",
             get(service_featured_playlists),
         )
+        .route(
+            "/{service}/featured-playlists/by-tag",
+            get(service_featured_playlists_by_tag),
+        )
         .route("/{service}/new-releases", get(service_new_releases))
         .route("/{service}/genres", get(service_genres))
         .route(
@@ -414,6 +418,24 @@ async fn service_featured_playlists(
         .await)
 }
 
+#[derive(Deserialize)]
+struct ByTagQuery {
+    genre: Option<String>,
+}
+
+/// Les playlists éditoriales rangées par catégorie, comme le service les
+/// présente. Un seul appel : le client n'a pas à lire les tags puis à lancer
+/// une requête par tag.
+async fn service_featured_playlists_by_tag(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+    Query(q): Query<ByTagQuery>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_featured_playlists_by_tag(q.genre.as_deref())
+        .await)
+}
+
 async fn service_album_context(
     State(state): State<AppState>,
     Path((service, album_id)): Path<(String, String)>,
@@ -451,9 +473,22 @@ async fn service_remove_favorite(
 
 // ---------------------------------------------------------------------------
 
+/// Last successful `list_services` snapshot. `status_all()` locks every service
+/// mutex to read its live auth status; during playback a service mutex is held
+/// by the streaming operation, so the lock blocks and the 10s timeout fires. The
+/// old code then returned `unwrap_or_default()` = an EMPTY map, which makes the
+/// client believe no service is authenticated and silently drops Qobuz favoris /
+/// playlists mid-playback (forum #1156). Serving the last-known snapshot instead
+/// keeps the gate stable across those transient timeouts.
+fn services_snapshot_cache() -> &'static Mutex<serde_json::Map<String, Value>> {
+    static CACHE: std::sync::OnceLock<Mutex<serde_json::Map<String, Value>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(serde_json::Map::new()))
+}
+
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
     // Timeout to avoid blocking the Settings page if a streaming service auth check hangs
-    let map = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let fresh = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let registry = state.services.lock().await;
         let services = registry.status_all().await;
         let mut map = serde_json::Map::new();
@@ -464,9 +499,26 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
         }
         map
     })
-    .await
-    .unwrap_or_default();
-    Json(Value::Object(map))
+    .await;
+
+    match fresh {
+        Ok(map) => {
+            // Refresh the cache so a later timeout can fall back to this snapshot.
+            *services_snapshot_cache().lock().await = map.clone();
+            Json(Value::Object(map))
+        }
+        Err(_) => {
+            // Degrade to the last-known snapshot instead of an empty map, so a
+            // transient timeout (e.g. a service mutex held during playback) does
+            // not wipe the authenticated-service gate on the client (#1156).
+            let cached = services_snapshot_cache().lock().await.clone();
+            tracing::warn!(
+                cached_services = cached.len(),
+                "list_services timed out; serving cached snapshot"
+            );
+            Json(Value::Object(cached))
+        }
+    }
 }
 
 async fn service_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
@@ -646,7 +698,19 @@ async fn service_favorites(
 ) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
-        Err(e) => return e.into_response(),
+        // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
+        // items) has no streaming favorites. Return an empty list (200) rather
+        // than a plain-text 404 so the web client's `.json()` doesn't blow up
+        // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
+        // GET /streaming/upnp/favorites/tracks 404).
+        Err(_) => {
+            let empty = match fav_type.as_str() {
+                "albums" => json!({ "albums": [] }),
+                "artists" => json!({ "artists": [] }),
+                _ => json!({ "tracks": [] }),
+            };
+            return Json(empty).into_response();
+        }
     };
     let mut svc = svc.lock().await;
     let result = match fav_type.as_str() {

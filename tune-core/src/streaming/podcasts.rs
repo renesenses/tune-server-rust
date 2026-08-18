@@ -1,3 +1,4 @@
+use quick_xml::escape::unescape;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -781,7 +782,17 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
         .strip_prefix("<![CDATA[")
         .and_then(|s| s.strip_suffix("]]>"))
         .unwrap_or(text);
-    Some(text.to_string())
+    Some(decode_entities(text))
+}
+
+/// Decode XML/HTML entities (e.g. `&apos;` → `'`, `&amp;` → `&`, `&#233;` → `é`).
+/// Radio France and other feeds encode apostrophes/accents outside of CDATA,
+/// so the raw text would otherwise display `L&apos;intégrale`.
+fn decode_entities(text: &str) -> String {
+    match unescape(text) {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => text.to_string(),
+    }
 }
 
 fn extract_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
@@ -871,6 +882,17 @@ mod tests {
     fn extract_tag_cdata() {
         let xml = r#"<title><![CDATA[My Title]]></title>"#;
         assert_eq!(extract_tag(xml, "title"), Some("My Title".into()));
+    }
+    #[test]
+    fn extract_tag_decodes_entities() {
+        // Radio France encodes apostrophes/accents as entities outside CDATA.
+        let xml = r#"<title>L&apos;int&#233;grale de L&apos;After Foot</title>"#;
+        assert_eq!(
+            extract_tag(xml, "title"),
+            Some("L'intégrale de L'After Foot".into())
+        );
+        let amp = r#"<title>Rock &amp; Roll</title>"#;
+        assert_eq!(extract_tag(amp, "title"), Some("Rock & Roll".into()));
     }
     #[test]
     fn extract_attr_basic() {

@@ -36,7 +36,6 @@ tune-server-rust/
       playback.rs         # PlaybackManager (state machine)
       poller.rs           # Position poller for outputs
       scrobble.rs         # Last.fm scrobbling
-  tune-pyo3/              # PyO3 bindings (legacy bridge, kept for compatibility)
   tune-server/            # Axum HTTP binary
     src/
       main.rs             # Entry point, auto-scan, file watcher, SSDP/mDNS init
@@ -303,7 +302,7 @@ volumes:
   tune-data:
 ```
 
-The Docker image uses a multi-stage build: Rust compilation on `rust:1-slim-bookworm`, runtime on `debian:bookworm-slim` with FFmpeg and ca-certificates.
+The Docker image uses a multi-stage build: Rust compilation on `rust:1-slim-bookworm`, runtime on `debian:bookworm-slim` with ca-certificates (FFmpeg left the project in v0.8.46 — decoding and encoding are native).
 
 ---
 
@@ -319,7 +318,7 @@ Three GitHub Actions workflows:
 
 ## Migration History
 
-The original plan described 8 phases over ~20 months. In practice, the migration was completed in roughly 4 weeks of intensive development (May 2026), going directly from Phase 0 (tooling) to a feature-complete server. The PyO3 bridge (`tune-pyo3`) was built but the decision was made early to port everything to pure Rust rather than maintaining a hybrid Python/Rust architecture.
+The original plan described 8 phases over ~20 months. In practice, the migration was completed in roughly 4 weeks of intensive development (May 2026), going directly from Phase 0 (tooling) to a feature-complete server. The PyO3 bridge (`tune-pyo3`) was built but the decision was made early to port everything to pure Rust rather than maintaining a hybrid Python/Rust architecture. The crate was removed from the repository in August 2026: it had stopped compiling against current `tune-core`, and its pinned `pyo3` 0.24 sat in the RUSTSEC-2026-0176/0177 vulnerable range for a bridge nothing used any more.
 
 | Milestone | Date | Description |
 |-----------|------|-------------|

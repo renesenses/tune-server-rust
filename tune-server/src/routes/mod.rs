@@ -1,7 +1,9 @@
 pub mod active_profile;
 pub mod ai;
+pub mod airplay_pairing;
+pub mod appliance;
+pub mod appliance_storage;
 pub mod archive;
-pub mod bandcamp;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
@@ -9,12 +11,12 @@ pub mod connect;
 pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
+pub mod declick;
 pub mod deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
 pub mod digest;
 pub mod discogs;
-pub mod dj;
 pub mod eq_pro;
 pub mod export;
 pub mod graphql;
@@ -62,6 +64,7 @@ pub mod skins;
 pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
+pub mod smart_refs;
 pub mod snapcast;
 pub mod social;
 pub mod sonos;
@@ -70,10 +73,12 @@ pub mod spotify_connect;
 pub mod squeezebox;
 pub mod stream_handler;
 pub mod streaming;
+pub mod support;
 pub mod system;
 pub mod tagger;
 pub mod tags;
 pub mod upnp;
+pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod visualizer;
 pub mod voice;
@@ -227,7 +232,31 @@ async fn api_fallback(
         .into_response()
 }
 
+/// Minimal HTML-entity escaping for untrusted text reflected into a page on the
+/// server's own origin. Order matters: `&` first so we don't double-escape.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 pub fn router(state: AppState) -> Router {
+    router_with_plugins(state, Vec::new())
+}
+
+/// Build the app router, mounting plugin-contributed routes under
+/// `/api/v1/ext/{plugin_name}`.
+///
+/// They are nested *inside* the `/api/v1` tree, before its layers are
+/// applied, so a plugin route gets the same auth, analytics and body-limit
+/// treatment as a core one. Mounting them at the top level instead would
+/// silently make every plugin endpoint unauthenticated.
+pub fn router_with_plugins(
+    state: AppState,
+    plugin_routers: crate::plugins::PluginRouters,
+) -> Router {
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -274,13 +303,18 @@ pub fn router(state: AppState) -> Router {
         .nest("/library/smart-collections", smart_collections::router())
         .nest("/export", export::router())
         .nest("/network", network::router())
+        .nest(
+            "/appliance",
+            appliance::router().merge(appliance_storage::router()),
+        )
         .nest("/dashboard", dashboard::router())
         .nest("/digest", digest::router())
         .nest("/peers", peers::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
         .nest("/marketplace", marketplace::router())
-        .nest("/dj", dj::router())
+        // DJ mode moved to the `dj` native plugin (P5, #917); with that feature
+        // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
         .nest("/playlist-transfer", playlist_transfer::router())
@@ -292,7 +326,6 @@ pub fn router(state: AppState) -> Router {
         .nest("/listenbrainz", listenbrainz::router())
         .nest("/scrobbler", scrobbler::router())
         .nest("/soundcloud", soundcloud::router())
-        .nest("/bandcamp", bandcamp::router())
         .nest("/archive", archive::router())
         .nest("/discogs", discogs::router())
         .nest("/setlistfm", setlistfm::router())
@@ -308,6 +341,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/dac-calibration", dac_calibration::router())
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
+        .nest("/outputs", airplay_pairing::router())
         .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
@@ -319,6 +353,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())
         .nest("/converter", converter::router())
+        .nest("/declick", declick::router())
         .nest("/shazam", shazam::router())
         .nest("/social", social::router())
         .nest("/home", home::router())
@@ -327,6 +362,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/upnp", upnp::router())
         .nest("/auth", crate::auth::router())
         .nest("/cloud", cloud::router())
+        .nest("/support", support::router())
         .nest("/multi-server", multi_server::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
@@ -365,7 +401,27 @@ pub fn router(state: AppState) -> Router {
             "/services/lastfm/disconnect",
             axum::routing::post(service_tokens::lastfm_disconnect),
         )
-        .fallback(api_fallback)
+        .fallback(api_fallback);
+
+    // Plugin routes. `nest_service` because a plugin router is `Router<()>`
+    // (already stated) while `api` is still `Router<AppState>` — nesting it
+    // as a service is the only way to combine the two, and it keeps the
+    // plugin's internal state entirely its own.
+    //
+    // One consequence: the nested service owns everything under its prefix, so
+    // an unknown sub-path answers with axum's bare 404 rather than
+    // `api_fallback`'s JSON body. Left deliberately — forcing our fallback on
+    // the plugin router would take away its ability to answer its own 404s,
+    // which matters more than a uniform error shape under /ext.
+    let api = plugin_routers
+        .into_iter()
+        .fold(api, |api, (plugin_name, plugin_router)| {
+            let mount = format!("/ext/{plugin_name}");
+            tracing::info!(plugin = %plugin_name, mount = %format!("/api/v1{mount}"), "plugin_routes_mounted");
+            api.nest_service(&mount, plugin_router)
+        });
+
+    let api = api
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
@@ -397,11 +453,13 @@ pub fn router(state: AppState) -> Router {
         .nest("/ws", ws::router())
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
-        .with_state(state)
+        .with_state(state.clone())
         .route("/add-station", get(|axum::extract::Query(q): axum::extract::Query<radios::AddFromWebQuery>| async move {
+            // q.name is attacker-controlled and reflected into HTML on the
+            // server's own origin — escape it or it is a reflected XSS.
             axum::response::Html(format!(
                 r#"<!DOCTYPE html><html><body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#4ade80">✓ Radio ajoutée</h1><p><strong>{}</strong></p><p style="color:#888">Vous pouvez fermer cet onglet.</p></div></body></html>"#,
-                q.name
+                html_escape(&q.name)
             ))
         }))
         .merge(stream_handler::router(streamer_sessions))
@@ -410,6 +468,14 @@ pub fn router(state: AppState) -> Router {
     if let Some(upnp) = upnp_routes {
         app = app.nest("/upnp", upnp);
     }
+
+    // MediaRenderer:1 par zone (#1750) — routes toujours montées, mais
+    // chaque handler vérifie l'opt-in `zone_{id}_upnp_renderer` (404 sinon)
+    // et seules les zones opt-in sont annoncées en SSDP.
+    app = app.nest(
+        "/upnp/renderer",
+        upnp_media_renderer::router().with_state(state.clone()),
+    );
 
     // Mount all installed skins on /{skin_id}
     for (skin_id, skin_path) in mountable_skins {
@@ -451,4 +517,226 @@ pub fn router(state: AppState) -> Router {
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(CompressionLayer::new())
     .layer(CorsLayer::permissive())
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::html_escape;
+
+    #[test]
+    fn escapes_html_metacharacters() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x&y")</script>"#),
+            "&lt;script&gt;alert(&quot;x&amp;y&quot;)&lt;/script&gt;"
+        );
+        assert_eq!(html_escape("O'Brien"), "O&#x27;Brien");
+        assert_eq!(html_escape("plain radio"), "plain radio");
+    }
+}
+
+/// Garde-fou : écrire `zone_{id}_eq_profile` sans rafraîchir la sortie qui joue.
+///
+/// L'égaliseur n'atteint le son d'une zone locale que si quelqu'un rebâtit
+/// l'`EqProcessor` et l'installe — `Orchestrator::refresh_zone_eq`. Persister
+/// la clé ne suffit pas : le réglage n'agit alors qu'à la piste SUIVANTE, et la
+/// route répond quand même 200 (ou `applied: true`). C'est ce silence qui a
+/// produit #1372, #1555 et #1688, et le correctif de #1725 n'avait branché
+/// qu'un des quatre points d'écriture.
+///
+/// Ce test relit les sources plutôt que d'exercer les routes : la propriété à
+/// garder est structurelle — « tout fichier qui écrit cette clé rafraîchit » —
+/// et aucun harnais HTTP ne la vérifierait aussi simplement.
+///
+/// Granularité volontairement au FICHIER, pas à la ligne : plus grossier, mais
+/// robuste aux déplacements de code. Un fichier qui ne ferait que LIRE la clé
+/// déclencherait un faux positif ; il irait dans `LECTURE_SEULE` avec sa raison.
+#[cfg(test)]
+mod eq_refresh_guard {
+    use std::fs;
+    use std::path::Path;
+
+    /// Fichiers qui mentionnent une clé sans jamais l'écrire. Vide aujourd'hui.
+    const LECTURE_SEULE: &[&str] = &[];
+
+    /// Les réglages DSP par zone qui n'atteignent le son que si quelqu'un
+    /// rafraîchit la sortie vivante, et la méthode qui le fait.
+    ///
+    /// `zone_*_eq_profile` a coûté quatre omissions (#1725), `zone_*_crossfeed`
+    /// une de plus (#1786). Toute nouvelle clé de ce type doit rejoindre cette
+    /// table AVANT sa première route d'écriture, pas après le signalement.
+    const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
+        ("_eq_profile", "refresh_zone_eq"),
+        ("_crossfeed", "refresh_zone_crossfeed"),
+    ];
+
+    #[test]
+    fn every_route_writing_a_dsp_setting_refreshes_the_live_output() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        let mut sources: Vec<(String, String)> = Vec::new();
+
+        let mut piles = vec![racine.clone()];
+        while let Some(dir) = piles.pop() {
+            for entree in fs::read_dir(&dir).expect("lecture de src/routes") {
+                let chemin = entree.expect("entrée de répertoire").path();
+                if chemin.is_dir() {
+                    piles.push(chemin);
+                    continue;
+                }
+                if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let nom = chemin
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                sources.push((
+                    nom,
+                    fs::read_to_string(&chemin).expect("lecture du fichier"),
+                ));
+            }
+        }
+
+        for (cle, rafraichisseur) in REGLAGES_A_RAFRAICHIR {
+            let concernes: Vec<&(String, String)> =
+                sources.iter().filter(|(_, s)| s.contains(cle)).collect();
+            assert!(
+                !concernes.is_empty(),
+                "le garde-fou ne trouve aucun fichier touchant `zone_*{cle}` — \
+                 la clé a probablement été renommée, et ce test ne garde plus rien"
+            );
+            let fautifs: Vec<&str> = concernes
+                .iter()
+                .filter(|(nom, _)| !LECTURE_SEULE.contains(&nom.as_str()))
+                .filter(|(_, s)| !s.contains(rafraichisseur))
+                .map(|(nom, _)| nom.as_str())
+                .collect();
+            assert!(
+                fautifs.is_empty(),
+                "ces routes écrivent `zone_*{cle}` sans appeler \
+                 `Orchestrator::{rafraichisseur}` : {fautifs:?}\n\
+                 Sans lui, le réglage n'atteint le son qu'à la piste SUIVANTE sur une \
+                 zone locale, alors que la réponse annonce un succès (#1725, #1786).\n\
+                 Ajouter, après le `settings.set(...)` :\n    \
+                 let applique = state.orchestrator.{rafraichisseur}(zone_id).await;\n\
+                 puis exposer `applied_live` dans la réponse. Si le fichier ne fait que \
+                 LIRE la clé, l'inscrire dans `LECTURE_SEULE` avec sa raison."
+            );
+        }
+    }
+}
+
+/// Garde-fou : une feature de plugin absente des builds de release.
+///
+/// Les binaires publiés sont construits avec `--no-default-features` et une
+/// liste EXPLICITE de features (`.github/workflows/ci.yml`). Mettre une feature
+/// dans `[features] default` n'a donc **aucun effet** sur ce qui est livré —
+/// `default` n'est jamais consulté.
+///
+/// C'est exactement l'erreur commise sur Bandcamp (#1768) : la feature a été
+/// ajoutée à `default`, tout est passé au vert, et le plugin était absent des
+/// binaires 0.9.82. Le job `Test (jeu de fonctionnalités livré)` disait la
+/// vérité — il teste la liste explicite, qui ne le contenait pas.
+///
+/// Ce test relit `ci.yml` **et `release.yml`** et exige que toute feature
+/// déclarant un plugin in-tree (`dep:tune-*`) figure dans chaque liste de
+/// features qui produit un binaire.
+///
+/// ⚠️ La première version de ce garde-fou ne lisait que `ci.yml` — le fichier
+/// des PR. Or les binaires téléchargés sont construits par `release.yml`. Le
+/// correctif de Bandcamp y a donc été déclaré vert alors que le plugin restait
+/// absent des cinq listes de `release.yml` : la même erreur, un cran plus haut.
+/// Dans `release.yml` les listes vivent à DEUX endroits — les lignes de build
+/// explicites, et les entrées `features:` de la matrice, injectées plus loin
+/// via `--features ${{ matrix.features }}`. Les deux sont vérifiées.
+#[cfg(test)]
+mod plugin_feature_ships_guard {
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn every_in_tree_plugin_feature_is_in_the_release_builds() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo = fs::read_to_string(racine.join("Cargo.toml")).expect("Cargo.toml");
+        let ci = fs::read_to_string(racine.join("../.github/workflows/ci.yml")).expect("ci.yml");
+        let rel = fs::read_to_string(racine.join("../.github/workflows/release.yml"))
+            .expect("release.yml");
+
+        // Une feature « plugin » se reconnaît à sa dépendance optionnelle
+        // `dep:tune-<nom>` — c'est la forme qu'ont dj, karaoke et bandcamp.
+        let plugins: Vec<String> = cargo
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let (nom, reste) = l.split_once(" = [")?;
+                if !reste.contains("dep:tune-") {
+                    return None;
+                }
+                Some(nom.trim().to_string())
+            })
+            .collect();
+
+        assert!(
+            plugins.len() >= 3,
+            "le garde-fou n'a reconnu que {} feature(s) de plugin — la forme              `nom = [\"dep:tune-…\"]` a changé, et ce test ne garde plus rien",
+            plugins.len()
+        );
+
+        // Toutes les listes de features qui produisent un binaire, dans les
+        // DEUX fichiers. Une liste interpolée (`${{ matrix.features }}`) est
+        // ignorée : sa vraie valeur est l'entrée `features:` de la matrice,
+        // captée juste en dessous.
+        let mut listes: Vec<(&str, String)> = Vec::new();
+        for (fichier, contenu) in [("ci.yml", &ci), ("release.yml", &rel)] {
+            for l in contenu.lines() {
+                let t = l.trim();
+                if t.contains("build --release") && t.contains("--features") {
+                    let liste = t
+                        .split("--features")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+                    if !liste.is_empty() && !liste.contains("${{") {
+                        listes.push((fichier, liste.to_string()));
+                    }
+                } else if let Some(liste) = t.strip_prefix("features:") {
+                    let liste = liste.trim();
+                    if !liste.is_empty() && !liste.contains("${{") {
+                        listes.push((fichier, liste.to_string()));
+                    }
+                }
+            }
+        }
+        assert!(
+            listes.iter().any(|(f, _)| *f == "ci.yml"),
+            "aucune liste de features trouvée dans ci.yml — le garde-fou ne garde plus rien"
+        );
+        assert!(
+            listes.iter().any(|(f, _)| *f == "release.yml"),
+            "aucune liste de features trouvée dans release.yml — or c'est CE \
+             fichier qui construit les binaires téléchargés"
+        );
+
+        let mut manquants = Vec::new();
+        for p in &plugins {
+            for (fichier, liste) in &listes {
+                let present = liste.split(',').any(|f| f.trim() == p);
+                if !present {
+                    manquants.push(format!("{p} absent d'une liste de {fichier} : {liste}"));
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            manquants.is_empty(),
+            "ces plugins ne seront PAS dans les binaires publiés : {manquants:?}\n\
+             Les builds de release utilisent `--no-default-features` : ajouter la \
+             feature à `[features] default` ne change RIEN à ce qui est livré.\n\
+             Il faut l'ajouter aux listes `--features …` de \
+             `.github/workflows/ci.yml` (#1768)."
+        );
+    }
 }

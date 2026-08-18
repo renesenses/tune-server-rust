@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tune-output-api = { path = "../tune-output-api" }
+# Only for the plugin SDK's router registration — see the `plugin-http` feature.
+axum = { workspace = true, optional = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,6 +20,7 @@ socket2 = { workspace = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
+image = { workspace = true }
 zip = { workspace = true }
 realfft = "3"
 rayon = { workspace = true }
@@ -32,12 +36,20 @@ urlencoding = { workspace = true }
 cpal = { version = "0.17", optional = true }
 rust_cast = { workspace = true }
 sha2 = { workspace = true }
+# Authenticated backup encryption (audit item 7): Argon2id KDF + XChaCha20-Poly1305.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }
 regex = { workspace = true }
 csv = { workspace = true }
 symphonia = { workspace = true }
+# SPIKE (#1145): pure-Rust Monkey's Audio (.ape) decoder, MIT/Apache-2.0.
+# Evaluated as a replacement for the "not supported" fallback. Not production.
+ape-decoder = "0.3.2"
+audiopus = { workspace = true }
 rubato = { workspace = true }
 unicode-normalization = { workspace = true }
 oaat-core = { workspace = true, optional = true }
@@ -50,6 +62,40 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], 
 # rustls version reqwest resolves (0.23).
 rustls = "0.23"
 webpki-roots = "0.26"
+# Real OS hostname (gethostname(2)) for network identity — mDNS instance name +
+# peer-info name. Env HOSTNAME/COMPUTERNAME is unset under systemd, so the old
+# env-only derivation collided every instance on "tune-server" (#1112, #1127).
+# Already in the lockfile transitively, so this is a near-free direct dep.
+hostname = "0.4"
+# Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
+# behind the `plugins-wasm` feature so the default server build is unchanged.
+# default-features trimmed to compiler + runtime + WAT parsing; no async,
+# component-model, gc, threads, profiling, pooling, coredump, debug.
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
+# ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
+# keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
+# compile time — and the shared lib is loaded at runtime next to the model
+# (downloaded on activation). Feature-gated so the default build never pulls it.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+# Runtime provisioning of the onnxruntime shared lib for `load-dynamic`: we fetch
+# Microsoft's official onnxruntime release archives (which ship real shared libs,
+# unlike ort's static-link dists) and unpack them — `.tgz` via flate2+tar,
+# Windows `.zip` via the `zip` crate already in deps. Gated behind
+# `audio-embedding`, so the default build pulls none of this.
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+# CLAP text tower tokenizer (natural-language acoustic search, Phase 3). Loads the
+# published RoBERTa `tokenizer.json`. `default-features = false` drops the CLI-only
+# extras (progressbar/hf-hub/esaxx training), but `onig` is kept: on native targets
+# tokenizers routes its regex `SysRegex` through oniguruma, and the RoBERTa
+# ByteLevel pre-tokenizer's split IS a regex — so `onig` is required for correct
+# tokenization, not optional. Gated behind `audio-embedding` with the ONNX stack.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Linux : nice/ionice des threads du pool de scan (scanner/walker.rs).
+# macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
+libc = "0.2"
 
 # AirPlay 2 HomeKit-style pairing (pair-setup SRP-6a + pair-verify Curve25519).
 # All pinned to the RustCrypto digest 0.10 / sha2 0.10 generation used across
@@ -67,12 +113,44 @@ objc2-core-audio = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 axum = { workspace = true }
+# Lean criterion (no plotters/rayon) — just the bench harness.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "dsd_to_pcm"
+harness = false
 
 [features]
 default = ["local-audio"]
 local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
+# Lets plugins mount HTTP routes through `PluginContext::register_router`.
+# Gated so tune-cli — which links tune-core but serves no HTTP — does not
+# have to build axum. tune-server enables it.
+plugin-http = ["dep:axum"]
+# P0 of the plugin ABI: embed wasmtime to load/instantiate/call wasm plugins
+# with JSON-over-linear-memory marshalling under resource limits. NOT in
+# default — the default server build must not pull in wasmtime.
+plugins-wasm = ["dep:wasmtime"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]
 postgres = ["dep:sqlx"]
+# Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
+# only builds that opt in pull `ort`, so the standard 6-target matrix is
+# untouched. The onnxruntime shared lib + model are provided at runtime.
+audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
+
+[build-dependencies]
+cc = "1"
+
+# AAC natif Windows (#1527) : Media Foundation via le crate `windows` —
+# même version 0.62 que celle que cpal tire déjà, donc aucune compilation
+# dupliquée sur les cibles Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }

@@ -1,3 +1,20 @@
+# ── Stage 0: Web client ──────────────────────────────────────────────
+# Le client web n'est PAS dans ce dépôt (#1690) : il vit dans
+# renesenses/tune-web-client et part en asset de release. On le construit ici,
+# comme le fait .github/workflows/docker.yml pour l'image publiée — c'est la
+# seule façon d'obtenir une image de dev dont l'interface correspond au code
+# serveur qu'elle embarque. Branche `main` : c'est celle qui livre côté web
+# (l'inverse du serveur, cf. CLAUDE.md).
+FROM node:22-bookworm-slim AS web
+ARG WEB_CLIENT_REF=main
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /web
+RUN git clone --depth 1 -b "$WEB_CLIENT_REF" \
+      https://github.com/renesenses/tune-web-client.git . && \
+    npm ci && npm run build
+
 # ── Stage 1: Builder ─────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
 
@@ -11,18 +28,17 @@ WORKDIR /build
 
 # Cache dependencies: copy manifests and build with dummy sources
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p tune-core/src tune-pyo3/src tune-server/src/routes tune-cli/src tune-ffi/src tune-bridge/src
+RUN mkdir -p tune-core/src tune-server/src/routes tune-cli/src tune-ffi/src tune-bridge/src
 COPY tune-core/Cargo.toml tune-core/
-COPY tune-pyo3/Cargo.toml tune-pyo3/
 COPY tune-server/Cargo.toml tune-server/
 COPY tune-cli/Cargo.toml tune-cli/
 COPY tune-ffi/Cargo.toml tune-ffi/
 COPY tune-bridge/Cargo.toml tune-bridge/
 RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     echo 'fn main() {}' > tune-cli/src/main.rs && \
-    touch tune-core/src/lib.rs tune-pyo3/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
-    cargo build --release --package tune-server --no-default-features --features oaat 2>/dev/null || true && \
-    rm -rf tune-core/src tune-pyo3/src tune-server/src tune-cli/src
+    touch tune-core/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
+    cargo build --release --package tune-server --no-default-features --features oaat,dj,karaoke,plugins-wasm,audio-embedding 2>/dev/null || true && \
+    rm -rf tune-core/src tune-server/src tune-cli/src
 
 # Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
 RUN cargo install librespot --no-default-features --features "alsa-backend" \
@@ -38,13 +54,15 @@ RUN cargo install --git https://github.com/renesenses/airplay2-rs \
 
 # Build real source — clean dummy artifacts to force recompilation
 COPY tune-core/ tune-core/
-COPY tune-pyo3/ tune-pyo3/
 COPY tune-server/ tune-server/
 COPY tune-cli/ tune-cli/
 COPY tune-ffi/ tune-ffi/
 COPY tune-bridge/ tune-bridge/
+# Même jeu de features que .github/workflows/docker.yml : une image construite
+# depuis ce Dockerfile sans audio-embedding renvoyait available:false et l'entrée
+# Ambiance disparaissait de l'UI sans aucun message (#19 de la revue 2026-08-15).
 RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-server && \
-    cargo build --release --package tune-server --no-default-features --features oaat && \
+    cargo build --release --package tune-server --no-default-features --features oaat,dj,karaoke,plugins-wasm,audio-embedding && \
     strip target/release/tune-server
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
@@ -65,7 +83,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/tune-server /app/tune-server
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
 COPY --from=builder /usr/local/cargo/bin/airplay-daemon /usr/local/bin/airplay-daemon
-COPY web/ /app/web/
+COPY --from=web /web/dist/ /app/web/
 
 # Ensure tune user can read the app but not write
 RUN chown -R root:root /app && chmod -R 755 /app

@@ -427,6 +427,14 @@ async fn import_m3u_file(
     }
 
     if file_content.is_empty() {
+        // No importable field arrived. Common causes: the multipart body
+        // exceeded axum's DefaultBodyLimit (a large .m3u), a field-decode error
+        // (the `while let Ok(Some(field))` loop then exits early), or no "file"
+        // part was sent. An M3U import that produced nothing otherwise left no
+        // server-side trace at all (JP / Dominique, v0.9.28).
+        tracing::warn!(
+            "m3u_import_file_empty — no importable 'file' field (body too large, or decode error)"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no file provided"})),
@@ -438,13 +446,37 @@ async fn import_m3u_file(
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Imported Playlist".into());
 
+    tracing::info!(name = %name, bytes = file_content.len(), "m3u_import_file_received");
+
     // Parse M3U and match tracks
     let mut track_ids: Vec<i64> = Vec::new();
     let mut total_entries = 0u32;
     let mut matched = 0u32;
+    // Keep only a small SAMPLE of not-found paths for the response; count the
+    // rest. A giant playlist (e.g. a 909k-entry radio dump, Dominique) would
+    // otherwise return ~80 MB of JSON and freeze the browser.
+    let mut not_found_count = 0u32;
     let mut not_found_paths: Vec<String> = Vec::new();
+    const MAX_NOT_FOUND_SAMPLE: usize = 100;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
+
+    // Load every local file_path → id ONCE (single query) for O(1) exact-path
+    // matching. The old loop ran one get_by_path AND one FTS search() PER line;
+    // on a large .m3u whose paths don't match the library layout exactly, every
+    // line fell through to the (expensive, unaccent+LIKE+joins) search, so
+    // thousands of sequential FTS queries hung the request for minutes and the
+    // UI stayed stuck on "loading" until a refresh (Dominique: large M3U
+    // freezes). One map lookup replaces the N point queries.
+    let path_to_id = track_repo.get_all_local_file_info().unwrap_or_default();
+
+    // The FTS fallback (filename→search) stays for paths that don't match
+    // exactly, but is BOUNDED: a fully-mismatched huge playlist can't run an
+    // unbounded number of costly searches. Beyond the cap, unmatched lines are
+    // recorded as not-found without searching (logged once).
+    const MAX_SEARCH_FALLBACKS: u32 = 500;
+    let mut search_fallbacks = 0u32;
+    let mut fallback_capped = false;
 
     for line in file_content.lines() {
         let line = line.trim();
@@ -454,31 +486,47 @@ async fn import_m3u_file(
 
         total_entries += 1;
 
-        // Try exact path match first
-        if let Ok(Some(track)) = track_repo.get_by_path(line) {
-            if let Some(id) = track.id {
-                track_ids.push(id);
-                matched += 1;
-                continue;
-            }
+        // Exact path match (O(1) map lookup).
+        if let Some((id, _, _)) = path_to_id.get(line) {
+            track_ids.push(*id);
+            matched += 1;
+            continue;
         }
 
-        // Try matching by filename (stem) via search
-        let filename = std::path::Path::new(line)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(line);
-        if let Ok(results) = track_repo.search(filename, 1) {
-            if let Some(track) = results.first() {
-                if let Some(id) = track.id {
-                    track_ids.push(id);
-                    matched += 1;
-                    continue;
+        // Filename-stem FTS fallback, bounded.
+        if search_fallbacks < MAX_SEARCH_FALLBACKS {
+            search_fallbacks += 1;
+            let filename = std::path::Path::new(line)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(line);
+            if let Ok(results) = track_repo.search(filename, 1) {
+                if let Some(track) = results.first() {
+                    if let Some(id) = track.id {
+                        track_ids.push(id);
+                        matched += 1;
+                        continue;
+                    }
                 }
             }
+        } else {
+            fallback_capped = true;
         }
 
-        not_found_paths.push(line.to_string());
+        not_found_count += 1;
+        if not_found_paths.len() < MAX_NOT_FOUND_SAMPLE {
+            not_found_paths.push(line.to_string());
+        }
+    }
+
+    if fallback_capped {
+        tracing::warn!(
+            total_entries,
+            matched,
+            search_cap = MAX_SEARCH_FALLBACKS,
+            "m3u_import_search_fallback_capped — many entries don't match library paths; \
+             fuzzy search skipped past the cap to avoid a long-running import"
+        );
     }
 
     // Create playlist and add tracks
@@ -488,6 +536,14 @@ async fn import_m3u_file(
             if !track_ids.is_empty() {
                 repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
             }
+            tracing::info!(
+                playlist_id,
+                name = %name,
+                total_entries,
+                matched,
+                not_found = not_found_count,
+                "m3u_import_file_complete"
+            );
             (
                 StatusCode::CREATED,
                 Json(json!({
@@ -495,14 +551,19 @@ async fn import_m3u_file(
                     "name": name,
                     "total_entries": total_entries,
                     "matched": matched,
-                    "not_found": not_found_paths.len(),
+                    "not_found": not_found_count,
+                    // Sample only (capped) — full count is in `not_found`.
                     "not_found_paths": not_found_paths,
+                    "not_found_truncated": (not_found_count as usize) > not_found_paths.len(),
                     "track_count": track_ids.len(),
                 })),
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "m3u_import_file_create_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
@@ -733,19 +794,118 @@ struct ImportM3uUrl {
     name: Option<String>,
 }
 
+/// Reject addresses that must never be reachable via a user-supplied URL:
+/// loopback, private, link-local (incl. 169.254.169.254 cloud metadata),
+/// CGNAT, and their IPv6 equivalents. Blocks the SSRF pivot into internal
+/// services. (`Ipv6Addr::is_unique_local`/`is_unicast_link_local` are still
+/// unstable, so the v6 ranges are matched by prefix.)
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // 100.64/10 CGNAT
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Fetch a user-supplied URL with SSRF guards: http(s) only, resolved host must
+/// not be private/reserved, redirects disabled (a 3xx could bounce to an
+/// internal address), a request timeout, and a hard body-size cap.
+async fn fetch_url_guarded(
+    raw_url: &str,
+    max_bytes: usize,
+) -> Result<String, (StatusCode, String)> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid url".to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only http(s) urls are allowed".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or((StatusCode::BAD_REQUEST, "missing host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut resolved = false;
+    for addr in tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "dns resolution failed".to_string()))?
+    {
+        resolved = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "url resolves to a private or reserved address".to_string(),
+            ));
+        }
+    }
+    if !resolved {
+        return Err((StatusCode::BAD_GATEWAY, "host did not resolve".to_string()));
+    }
+
+    // Construit depuis `tune_core::http::client::builder()` pour hériter du TLS
+    // webpki, en conservant les deux réglages voulus ici : aucune redirection
+    // (une redirection contournerait le contrôle d'adresse privée ci-dessus) et
+    // un délai d'attente court.
+    let client = tune_core::http::client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("client build: {e}"),
+            )
+        })?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("fetch failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("upstream status {}", resp.status()),
+        ));
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("read failed: {e}")))?
+    {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "playlist too large".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| (StatusCode::BAD_REQUEST, "non-utf8 content".to_string()))
+}
+
 async fn import_m3u_url(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Json(body): Json<ImportM3uUrl>,
 ) -> impl IntoResponse {
-    let m3u_content = match reqwest::get(&body.url).await {
-        Ok(resp) => match resp.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("read failed: {e}")).into_response();
-            }
-        },
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("fetch failed: {e}")).into_response(),
+    // 5 MiB is plenty for an M3U/M3U8 playlist and bounds memory use.
+    let m3u_content = match fetch_url_guarded(&body.url, 5 * 1024 * 1024).await {
+        Ok(text) => text,
+        Err((status, msg)) => return (status, msg).into_response(),
     };
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
@@ -798,12 +958,11 @@ async fn share_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> i
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 
-    // Generate a pseudo-random token from high-resolution clock
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let token = format!("{:032x}", nanos ^ (id as u128 * 0x517cc1b727220a95));
+    // Unguessable share token: 128 bits from a CSPRNG. The old token was
+    // `clock_nanos XOR (id * constant)` — derived from the share time and the
+    // playlist id, so anyone who knew roughly when a playlist was shared could
+    // brute-force the token and read it (audit — predictable share tokens).
+    let token = uuid::Uuid::new_v4().simple().to_string();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("playlist_share_{id}");
     if let Err(e) = settings.set(&key, &token) {
@@ -1313,5 +1472,45 @@ mod linn_tests {
             "http://10.0.0.1:9790/minimserver/*/x/11*20Joe*20Jackson*20-*20Look*20Sharp!.flac",
         );
         assert_eq!(stem, "11 Joe Jackson - Look Sharp!");
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::is_blocked_ip;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn blocks_internal_and_reserved_addresses() {
+        for s in [
+            "127.0.0.1",       // loopback
+            "10.1.2.3",        // private
+            "192.168.0.1",     // private
+            "172.16.5.4",      // private
+            "169.254.169.254", // link-local / cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",         // unspecified
+            "::1",             // v6 loopback
+            "fe80::1",         // v6 link-local
+            "fc00::1",         // v6 unique-local
+        ] {
+            assert!(is_blocked_ip(&ip(s)), "{s} should be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        for s in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(!is_blocked_ip(&ip(s)), "{s} should be allowed");
+        }
     }
 }

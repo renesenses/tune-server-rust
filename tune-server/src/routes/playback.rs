@@ -7,13 +7,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use tune_core::db::play_queue_repo::PlayQueueRepo;
+use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
 
 use crate::error::AppError;
-use crate::routes::active_profile::DEFAULT_PROFILE_ID;
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
 /// Map an orchestrator play error to an appropriate HTTP status code.
@@ -33,6 +33,51 @@ fn play_error_response(e: String) -> axum::response::Response {
                 "feature": "Unlimited Zones",
                 "message": msg,
                 "upgrade_url": "https://mozaiklabs.fr/pricing",
+            })),
+        )
+            .into_response();
+    }
+    // Orphan-zone sentinel from orchestrator.play(): the zone row has no
+    // output_device_id, so playback can never produce sound (Yacine, 24/07).
+    // 409 Conflict: the request is well-formed but the zone's state makes it
+    // impossible — the client should surface the message and grey the zone
+    // (it is also reported online:false by GET /zones).
+    if let Some(msg) = e.strip_prefix("zone_no_output_device:") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zone_no_output_device",
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
+    // Stale-output sentinel from orchestrator.play(): the zone points at an
+    // output device that has vanished, and no live output of the same name could
+    // be re-bound automatically (#1287 — none found, or several, so binding one
+    // would be a guess). 409 like the orphan-zone case: well-formed request, the
+    // zone's state makes it impossible. The message is already actionable, the
+    // client just surfaces it.
+    if let Some(msg) = e.strip_prefix("zone_output_unavailable:") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zone_output_unavailable",
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
+    // Missing-file sentinel from orchestrator.play(): the track's file_path no
+    // longer exists on disk (moved/deleted drive, stale scan). 404 so the client
+    // shows a real error instead of the track "playing" silently (JP).
+    if let Some(path) = e.strip_prefix("file_not_found:") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "file_not_found",
+                "message": format!("File not found: {path} — it may have been moved or deleted. Rescan your library."),
+                "path": path,
             })),
         )
             .into_response();
@@ -59,11 +104,38 @@ fn play_error_response(e: String) -> axum::response::Response {
     {
         StatusCode::BAD_GATEWAY
     } else if e.contains("offline") || e.contains("Output device") {
+        // A renderer that rejects our stream (e.g. a Samsung TV faulting on
+        // SetAVTransportURI / an unsupported protocolInfo) is surfaced by the
+        // orchestrator as "Output device error: …". That is a device-side
+        // rejection, not a bug in Tune → 503, so the client shows a clean
+        // "device refused" instead of a scary "Erreur 500" (Bilou, #1135).
         StatusCode::SERVICE_UNAVAILABLE
+    } else if e.contains("transcode") || e.contains("decode") || e.contains("corrupted source") {
+        // Media-processing failure (FLAC→WAV transcode for a renderer that
+        // doesn't advertise FLAC, a corrupt/unsupported source, a decode
+        // timeout). This is an upstream/content problem, not an internal Tune
+        // fault → 502 Bad Gateway rather than a blunt 500 (Bilou, #1135).
+        StatusCode::BAD_GATEWAY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (code, e).into_response()
+    // JSON body like the sentinel branches above, so clients can show the
+    // actual message instead of the bare status line ("503 Service
+    // Unavailable") they fell back to when the body was plain text
+    // (forum #1183). HTTP codes are unchanged.
+    let error_kind = match code {
+        StatusCode::BAD_GATEWAY => "upstream_error",
+        StatusCode::SERVICE_UNAVAILABLE => "device_unavailable",
+        _ => "playback_error",
+    };
+    (
+        code,
+        Json(json!({
+            "error": error_kind,
+            "message": e,
+        })),
+    )
+        .into_response()
 }
 
 /// Persist the queue state for a zone to disk (non-blocking).
@@ -110,6 +182,11 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_position": zone_state.queue_position,
         "muted": zone_state.muted,
     });
+    // Ancrage temporel de la métadonnée courante (paroles radio) — mêmes
+    // champs que GET /zones et GET /zones/{id}.
+    if let Some(obj) = v.as_object_mut() {
+        crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
+    }
     // Include stream_url ONLY for browser playback zones, so the web client can
     // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
     // / AirPlay / SlimProto / local), an open web-client tab that fetched this URL
@@ -119,6 +196,13 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // sound comes back").
     let is_browser_zone =
         zone_db.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
+    // Où va le son — même champ que GET /zones et GET /zones/{id} (#1499).
+    if let Some(ref zone) = zone_db {
+        v.as_object_mut().unwrap().insert(
+            "output_reach".into(),
+            json!(crate::routes::zones::output_reach(state, zone, &zone_state).await),
+        );
+    }
     if is_browser_zone {
         if let Some(ref np) = zone_state.now_playing {
             if let Some(ref stream_id) = np.stream_id {
@@ -145,26 +229,38 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // nextAndSync refreshes via GET /zones/{id}, which does include it
     // (forum #1012, Bilou).
     if let Some(ref zone) = zone_db {
-        let devices = state.scanner.lock().await.devices().await;
+        let devices = state.scanner.devices().await;
         let renderer_label = zone
             .output_device_id
             .as_deref()
             .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
         #[cfg(feature = "local-audio")]
         let audio_backend =
-            tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+            tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
+        let wire = match zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => state.streamer.stream_output_wire(sid).await,
+            None => None,
+        };
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &zone_state,
             zone,
             &state.backend,
             renderer_label,
             audio_backend,
+            wire.as_ref(),
         );
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
+        v.as_object_mut()
+            .unwrap()
+            .insert("resolving".into(), json!(zone_state.resolving));
     }
     v
 }
@@ -207,6 +303,12 @@ struct PlayRequest {
     duration_ms: Option<i64>,
     seek_ms: Option<u64>,
     temp_file_path: Option<String>,
+    // Real resolution/codec for a media-server (source="upnp") item, passed by
+    // the client from the DIDL res@ attributes so the signal path shows the true
+    // rate/bit-depth and ALAC-vs-AAC instead of "AAC 44kHz/16bit" (Yves, NAS).
+    sample_rate: Option<u32>,
+    bit_depth: Option<u16>,
+    media_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -417,9 +519,19 @@ async fn set_queue_retrying(
 
 async fn play(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     body: Option<Json<PlayRequest>>,
 ) -> impl IntoResponse {
+    // A user-initiated play starts (or takes over) the listening session on
+    // this zone: stamp the caller's profile so record_listen — and every
+    // autoplay / gapless advance that inherits it — tags listen_history to the
+    // right person. Transport (next/previous/resume) reuses this owner; after a
+    // restart the in-memory session resets to None → NULL until the next play.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     // When called with an empty body (e.g. Play after Stop), resume the
     // current track instead of returning 400 "no track source specified".
     let body = match body {
@@ -445,18 +557,16 @@ async fn play(
                     duration_ms: Some(np.duration_ms),
                     seek_ms: None,
                     temp_file_path: None,
+                    sample_rate: None,
+                    bit_depth: None,
+                    media_format: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
                         // Restore queue_length from DB so the poller can
                         // advance tracks (fixes repeat-all after restart).
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                        let local_c = qr.count(zone_id).unwrap_or(0);
-                        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                        // Combined length: a zone can hold a local queue AND a
-                        // streaming queue at once. Sum them so queue-end detection
-                        // doesn't drop the streaming tail → silence (Sandro S1b).
-                        let q_len = local_c + stream_c;
+                        let q_len = qr.count_all(zone_id).unwrap_or(0);
                         if q_len > 0 {
                             let cur_pos = state.playback.get_state(zone_id).await.queue_position;
                             state
@@ -472,12 +582,7 @@ async fn play(
                         tracing::warn!(zone_id, error = %e, "play_resume_failed_trying_queue");
                         // Fallback: try to play from queue position 0
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                        let local_c = qr.count(zone_id).unwrap_or(0);
-                        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                        // Combined length: a zone can hold a local queue AND a
-                        // streaming queue at once. Sum them so queue-end detection
-                        // doesn't drop the streaming tail → silence (Sandro S1b).
-                        let q_len = local_c + stream_c;
+                        let q_len = qr.count_all(zone_id).unwrap_or(0);
                         if q_len > 0 {
                             let pos = current.queue_position.min(q_len - 1);
                             state.playback.update_queue_info(zone_id, pos, q_len).await;
@@ -497,12 +602,7 @@ async fn play(
             // No now_playing — try queue fallback
             {
                 let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                let local_c = qr.count(zone_id).unwrap_or(0);
-                let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                // Combined length: a zone can hold a local queue AND a
-                // streaming queue at once. Sum them so queue-end detection
-                // doesn't drop the streaming tail → silence (Sandro S1b).
-                let q_len = local_c + stream_c;
+                let q_len = qr.count_all(zone_id).unwrap_or(0);
                 if q_len > 0 {
                     let current = state.playback.get_state(zone_id).await;
                     let pos = current.queue_position.min(q_len - 1);
@@ -533,6 +633,9 @@ async fn play(
                             duration_ms: None,
                             seek_ms: None,
                             temp_file_path: None,
+                            sample_rate: None,
+                            bit_depth: None,
+                            media_format: None,
                         };
                         if let Ok(result) = state.orchestrator.play(orch_req).await {
                             return Json(
@@ -604,6 +707,8 @@ async fn play(
                     t.cover_path.clone(),
                     t.duration_ms as i64,
                     Some(source.clone()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
                 )
             })
             .collect();
@@ -628,9 +733,23 @@ async fn play(
             duration_ms: Some(first.duration_ms as i64),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
+                // Re-assert queue length AFTER play(). The pre-play
+                // update_queue_info above is a silent no-op when the zone's
+                // in-memory state doesn't exist yet, and play() then creates that
+                // state with queue_length=0 — so a streaming album/playlist on a
+                // fresh zone stopped after track 1 (next_position saw an empty
+                // queue → the poller stopped instead of advancing). The local
+                // track path already re-asserts after play(); mirror it here.
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
@@ -688,6 +807,8 @@ async fn play(
                     t.cover_path.clone(),
                     t.duration_ms as i64,
                     Some(source.clone()),
+                    t.track_number.map(|n| n as i64),
+                    t.disc_number.map(|n| n as i64),
                 )
             })
             .collect();
@@ -712,9 +833,23 @@ async fn play(
             duration_ms: Some(first.duration_ms as i64),
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
+                // Re-assert queue length AFTER play(). The pre-play
+                // update_queue_info above is a silent no-op when the zone's
+                // in-memory state doesn't exist yet, and play() then creates that
+                // state with queue_length=0 — so a streaming album/playlist on a
+                // fresh zone stopped after track 1 (next_position saw an empty
+                // queue → the poller stopped instead of advancing). The local
+                // track path already re-asserts after play(); mirror it here.
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
@@ -730,11 +865,20 @@ async fn play(
     {
         let source_id_val = body.source_id.clone().unwrap_or_default();
         let source_for_q = body.source.clone();
-        let title_val = body.title.clone().unwrap_or_default();
-        let artist_val = body.artist_name.clone().unwrap_or_default();
-        let album_val = body.album_title.clone();
-        let cover_val = body.cover_path.clone();
-        let duration_val = body.duration_ms.unwrap_or(0);
+        // Same empty-title backfill as the queue_add sites: don't persist a blank
+        // title for the row we're about to make the queue (DEvir 0.9.22).
+        let (title_val, artist_val, album_val, cover_val, duration_val) =
+            resolve_streaming_queue_meta(
+                &state,
+                source_for_q.as_deref().unwrap_or_default(),
+                &source_id_val,
+                body.title.as_deref(),
+                body.artist_name.as_deref(),
+                body.album_title.as_deref(),
+                body.cover_path.as_deref(),
+                body.duration_ms,
+            )
+            .await;
 
         let output_device_id = body.output_device_id.or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -757,6 +901,9 @@ async fn play(
             duration_ms: body.duration_ms,
             seek_ms: None,
             temp_file_path: None,
+            sample_rate: body.sample_rate,
+            bit_depth: body.bit_depth,
+            media_format: body.media_format,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -767,30 +914,38 @@ async fn play(
                 // single-track queue would truncate the album down to the current
                 // title (Pierre M: "Si STOP et relance, la file d'attente se
                 // limite au titre en cours").
-                let existing = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-                let existing_idx = existing.iter().position(|it| {
-                    it["source_id"].as_str() == Some(source_id_val.as_str())
+                let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
+                let existing = entries.iter().find(|e| {
+                    e.source_id.as_deref() == Some(source_id_val.as_str())
                         && (source_for_q.is_none()
-                            || it["source"].as_str() == source_for_q.as_deref())
+                            || e.source.as_deref() == source_for_q.as_deref())
                 });
-                if let Some(idx) = existing_idx {
+                if let Some(e) = existing {
+                    // Keep the full queue, just move the current position onto it
+                    // (its unified position, valid whether the queue is mixed).
                     state
                         .playback
-                        .update_queue_info(zone_id, idx as i64, existing.len() as i64)
+                        .update_queue_info(zone_id, e.position, entries.len() as i64)
                         .await;
                 } else {
-                    // Persist single streaming track to DB so GET /queue returns it
-                    let queue_item = vec![(
-                        source_id_val,
-                        title_val,
-                        artist_val,
-                        album_val,
-                        cover_val,
-                        duration_val,
-                        source_for_q,
-                    )];
-                    if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_item) {
-                        warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                    // Not queued yet — make this single streaming track the queue.
+                    queue_repo.clear(zone_id).ok();
+                    if let Err(e) = queue_repo.append(
+                        zone_id,
+                        &[QueueInput::Streaming {
+                            source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                            source_id: source_id_val,
+                            title: title_val,
+                            artist: artist_val,
+                            album: album_val,
+                            cover_url: cover_val,
+                            duration_ms: duration_val,
+                            // Single-track play request carries no album numbering.
+                            track_number: None,
+                            disc_number: None,
+                        }],
+                    ) {
+                        warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
                     }
                     state.playback.update_queue_info(zone_id, 0, 1).await;
                 }
@@ -804,12 +959,41 @@ async fn play(
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
-        track_repo
+        let mut ids: Vec<i64> = track_repo
             .list_by_album(album_id)
             .unwrap_or_default()
             .iter()
             .filter_map(|t| t.id)
-            .collect()
+            .collect();
+        if ids.is_empty() {
+            // The clicked album row has no tracks. This happens when the flat
+            // Albums/Genres/Years grids surface a stale/duplicate album row whose
+            // tracks actually live under a sibling row of the same title+artist —
+            // the row the Artists view reaches. That mismatch is exactly why the
+            // same album played from Artists but returned 400 "no tracks to play"
+            // from those grids (Pascal, Totaldac, v0.9.21). Recover by resolving
+            // the populated sibling instead of hard-failing.
+            if let Some(sibling) =
+                tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+                    .find_populated_sibling(album_id)
+                    .ok()
+                    .flatten()
+            {
+                ids = track_repo
+                    .list_by_album(sibling)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t.id)
+                    .collect();
+                if !ids.is_empty() {
+                    info!(
+                        zone_id,
+                        album_id, sibling, "album_play_recovered_via_populated_sibling"
+                    );
+                }
+            }
+        }
+        ids
     } else if let Some(playlist_id) = body.playlist_id {
         tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
             .get_track_ids(playlist_id)
@@ -844,6 +1028,9 @@ async fn play(
                 duration_ms: Some(np.duration_ms),
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -851,17 +1038,12 @@ async fn play(
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => play_error_response(e),
             };
         }
         // No now_playing — try queue fallback (same as empty-body path)
         let qr_fallback = PlayQueueRepo::with_backend(state.backend.clone());
-        let local_c = qr_fallback.count(zone_id).unwrap_or(0);
-        let stream_c = qr_fallback.count_streaming(zone_id).unwrap_or(0);
-        // Combined length: a zone can hold a local queue AND a
-        // streaming queue at once. Sum them so queue-end detection
-        // doesn't drop the streaming tail → silence (Sandro S1b).
-        let q_len = local_c + stream_c;
+        let q_len = qr_fallback.count_all(zone_id).unwrap_or(0);
         if q_len > 0 {
             let current = state.playback.get_state(zone_id).await;
             let pos = current.queue_position.min(q_len - 1);
@@ -879,8 +1061,17 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    if let Err(e) = set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
-        warn!(zone_id, error = %e, "set_queue_failed");
+    match set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
+        Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
+        Err(e) => {
+            // Never proceed on the STALE queue: track 1 would play now and the
+            // natural-end advance would then resurrect whatever the DB still
+            // holds from yesterday (Villerio: album play drifting into old
+            // Qobuz autoplay leftovers). An emptied queue stops cleanly at the
+            // end of track 1 instead — the lesser evil, and diagnosable.
+            warn!(zone_id, error = %e, "set_queue_failed_clearing");
+            let _ = queue_repo.clear(zone_id);
+        }
     }
 
     // When a container (album/playlist) is requested alongside a track_id,
@@ -933,17 +1124,15 @@ async fn play(
             .or_else(|| track.as_ref().map(|t| t.duration_ms)),
         seek_ms: body.seek_ms,
         temp_file_path: body.temp_file_path,
+        sample_rate: body.sample_rate,
+        bit_depth: body.bit_depth,
+        media_format: body.media_format,
     };
 
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
             let qr = PlayQueueRepo::with_backend(state.backend.clone());
-            let local_c = qr.count(zone_id).unwrap_or(0);
-            let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-            // Combined length: a zone can hold a local queue AND a
-            // streaming queue at once. Sum them so queue-end detection
-            // doesn't drop the streaming tail → silence (Sandro S1b).
-            let q_len = local_c + stream_c;
+            let q_len = qr.count_all(zone_id).unwrap_or(0);
             let q_len = if q_len > 0 {
                 q_len
             } else {
@@ -956,7 +1145,7 @@ async fn play(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -993,18 +1182,16 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 duration_ms: Some(np.duration_ms),
                 seek_ms: None,
                 temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
                     // Restore queue_length from DB so the poller can
                     // advance tracks (fixes repeat-all after restart).
                     let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                    let local_c = qr.count(zone_id).unwrap_or(0);
-                    let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                    // Combined length: a zone can hold a local queue AND a
-                    // streaming queue at once. Sum them so queue-end detection
-                    // doesn't drop the streaming tail → silence (Sandro S1b).
-                    let q_len = local_c + stream_c;
+                    let q_len = qr.count_all(zone_id).unwrap_or(0);
                     if q_len > 0 {
                         let cur_pos = state.playback.get_state(zone_id).await.queue_position;
                         state
@@ -1015,7 +1202,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => play_error_response(e),
             };
         }
     }
@@ -1074,7 +1261,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                    Err(e) => play_error_response(e),
                 };
             }
         }
@@ -1095,6 +1282,9 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     duration_ms: None,
                     seek_ms: None,
                     temp_file_path: None,
+                    sample_rate: None,
+                    bit_depth: None,
+                    media_format: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -1105,7 +1295,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                    Err(e) => play_error_response(e),
                 };
             }
         }
@@ -1117,12 +1307,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
     // populated — it may be zero after a server restart.
     {
         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-        let local_c = qr.count(zone_id).unwrap_or(0);
-        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-        // Combined length: a zone can hold a local queue AND a
-        // streaming queue at once. Sum them so queue-end detection
-        // doesn't drop the streaming tail → silence (Sandro S1b).
-        let q_len = local_c + stream_c;
+        let q_len = qr.count_all(zone_id).unwrap_or(0);
         if q_len > 0 {
             let cur_pos = state.playback.get_state(zone_id).await.queue_position;
             state
@@ -1146,8 +1331,34 @@ async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<V
     Json(build_zone_json(&state, zone_id).await)
 }
 
+/// Reject playback commands on an orphan zone (a DB row with no
+/// output_device_id): next/previous spawn play_from_queue fire-and-forget and
+/// answer 200 before the orchestrator runs, so its zone_no_output_device error
+/// would only ever reach the logs. Check up front and return the same 409 the
+/// play route produces. Browser zones are exempt (no output device by design).
+fn reject_if_zone_has_no_output_device(
+    state: &AppState,
+    zone_id: i64,
+) -> Option<axum::response::Response> {
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()?;
+    if zone.output_device_id.is_none() && zone.output_type.as_deref() != Some("browser") {
+        warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_without_output_device");
+        return Some(play_error_response(format!(
+            "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
+            zone.name
+        )));
+    }
+    None
+}
+
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_next_requested");
+    if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
+        return resp;
+    }
     let current = state.playback.get_state(zone_id).await;
 
     // Manual skip: ignore repeat-one so the button always changes track (#1110).
@@ -1169,6 +1380,9 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
 
 async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
+    if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
+        return resp;
+    }
     let current = state.playback.get_state(zone_id).await;
 
     if current.position_ms > 3000 {
@@ -1210,16 +1424,33 @@ async fn set_volume(
     Path(zone_id): Path<i64>,
     Json(body): Json<VolumeRequest>,
 ) -> Json<Value> {
+    // Le verrou du mode PURE mord ICI, pas seulement dans l'interface : le
+    // volume est un multiplicateur appliqué à chaque échantillon, et une zone
+    // annoncée « bit-perfect » qui atténue ne l'est pas. Un curseur grisé côté
+    // web ne protège de rien — un autre client, une télécommande ou un appel
+    // direct passeraient à côté. La valeur *effective* est renvoyée, ce qui
+    // fait remonter le curseur au lieu de le laisser mentir.
+    let volume =
+        tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, body.volume as f32)
+            as f64;
+    if (volume - body.volume).abs() > f64::EPSILON {
+        tracing::debug!(
+            zone_id,
+            requested = body.volume,
+            applied = volume,
+            "volume_forced_by_audiophile_lock"
+        );
+    }
     let device_id = get_zone_device_id(&state, zone_id);
     state
         .orchestrator
-        .set_volume(zone_id, body.volume, device_id.as_deref())
+        .set_volume(zone_id, volume, device_id.as_deref())
         .await;
-    let vol_int = (body.volume * 100.0).round() as i32;
+    let vol_int = (volume * 100.0).round() as i32;
     tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .update_volume(zone_id, vol_int)
         .ok();
-    Json(json!({ "volume": body.volume }))
+    Json(json!({ "volume": volume }))
 }
 
 async fn toggle_shuffle(
@@ -1253,40 +1484,83 @@ async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> J
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let ps = state.playback.get_state(zone_id).await;
 
-    // A zone can hold BOTH a local play_queue and a streaming_queue at once
-    // (a Qobuz track added while a local file plays). Return ONE combined list —
-    // local first (positions 0..L), then streaming (L..L+S) — matching the
-    // combined position space the poller and orchestrator advance through.
-    // The old either/or logic hid the streaming rows when a local queue was
-    // present (Progman: an added Qobuz track was invisible and never played).
-    // Playing a streaming album normally clears the local table via
-    // set_streaming_queue, so usually exactly one is populated; merging is safe
-    // and only surfaces genuine mixed queues.
-    let local = queue_repo.get_queue(zone_id).unwrap_or_default();
-    let local_count = local.len();
-    let streaming = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-
-    let mut tracks: Vec<Value> = Vec::with_capacity(local_count + streaming.len());
-    for it in &local {
-        tracks.push(serde_json::to_value(it).unwrap_or(Value::Null));
-    }
-    for (i, it) in streaming.iter().enumerate() {
-        let mut v = it.clone();
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("position".into(), json!(local_count + i));
-        }
-        tracks.push(v);
-    }
-
-    // Position: the current local item if one is marked current, otherwise the
-    // playback state's combined queue position (a streaming item is current).
-    let position = local
+    // One ordered list across the unified single position space (local +
+    // streaming). `get_ordered` reads the whole `queue_items` table for the zone
+    // in `position` order, COALESCE-ing the display fields from the tracks join
+    // (local) or the inline columns (streaming).
+    let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
+    let position = entries
         .iter()
-        .position(|i| i.is_current)
+        .position(|e| e.is_current)
         .map(|p| p as i64)
         .unwrap_or(ps.queue_position);
-    let length = tracks.len();
+    let length = entries.len();
+    let tracks: Vec<Value> = entries
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+        .collect();
     Json(json!({ "tracks": tracks, "position": position, "length": length }))
+}
+
+/// A client-supplied streaming title is usable only if it is present AND
+/// non-empty. An empty string means the metadata wasn't resolved yet (the
+/// enqueue race that produced `title: Some("")`), and must fall through to a
+/// `get_track()` backfill rather than being persisted as a blank title.
+fn client_title_is_usable(title: Option<&str>) -> bool {
+    title.is_some_and(|s| !s.is_empty())
+}
+
+/// Resolve display metadata for a streaming queue entry, returning
+/// `(title, artist, album, cover_url, duration_ms)`.
+///
+/// Mirrors the play-time guard in the orchestrator (`resolve_streaming_url`):
+/// a title that is absent OR empty triggers a `get_track()` backfill. The
+/// three enqueue sites used to guard on `title.is_some()` only, so a payload
+/// of `title: Some("")` — an upcoming track enqueued before the streaming
+/// service had resolved its metadata — was persisted with a blank title. The
+/// queue-list path does no backfill, so that blank reached the clients, which
+/// render an empty title as "Unknown Track" (DEvir, 0.9.22 — intermittent, only
+/// while the track waits in line; it self-corrected once it became current
+/// because the play path *did* backfill). Same asymmetry as the duration bug
+/// (#944), on the title. Folding the three copies into one helper also removes
+/// the divergence that caused this.
+///
+/// The client payload wins whenever it carries a real (non-empty) title, so the
+/// network call only happens in the degraded empty-title case.
+async fn resolve_streaming_queue_meta(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+    title: Option<&str>,
+    artist: Option<&str>,
+    album: Option<&str>,
+    cover: Option<&str>,
+    duration_ms: Option<i64>,
+) -> (String, String, Option<String>, Option<String>, i64) {
+    if client_title_is_usable(title) {
+        return (
+            title.unwrap_or_default().to_string(),
+            artist.unwrap_or_default().to_string(),
+            album.map(str::to_string),
+            cover.map(str::to_string),
+            duration_ms.unwrap_or(0),
+        );
+    }
+
+    let registry = state.services.lock().await;
+    if let Some(svc) = registry.get(source) {
+        let svc = svc.lock().await;
+        if let Ok(t) = svc.get_track(source_id).await {
+            return (
+                t.title,
+                t.artist,
+                t.album,
+                t.cover_path,
+                t.duration_ms as i64,
+            );
+        }
+    }
+    ("Unknown".into(), String::new(), None, None, 0)
 }
 
 async fn queue_add(
@@ -1296,165 +1570,105 @@ async fn queue_add(
 ) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
-    // --- Streaming track: add to streaming queue ---
-    if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
-        // Resolve metadata if not provided by the client
-        let (title, artist, album, cover, duration) = if body.title.is_some() {
-            (
-                body.title.clone().unwrap_or_default(),
-                body.artist_name.clone().unwrap_or_default(),
-                body.album_title.clone(),
-                body.cover_path.clone(),
-                body.duration_ms.unwrap_or(0),
-            )
-        } else {
-            // Fetch track metadata from the streaming service
-            let registry = state.services.lock().await;
-            if let Some(svc) = registry.get(source) {
-                let svc = svc.lock().await;
-                match svc.get_track(source_id).await {
-                    Ok(t) => (
-                        t.title,
-                        t.artist,
-                        t.album,
-                        t.cover_path,
-                        t.duration_ms as i64,
-                    ),
-                    Err(_) => ("Unknown".into(), String::new(), None, None, 0),
-                }
-            } else {
-                ("Unknown".into(), String::new(), None, None, 0)
-            }
-        };
+    // Build a single, source-agnostic list of items, then insert them at
+    // `body.position` (the client sends current+1 for "Play Next") in the
+    // unified queue. `insert_at` shifts existing rows to open the gap, so a
+    // streaming track added "next" while a local album plays now lands right
+    // after the current track instead of at the end of the album (Sandro S1).
+    let mut inputs: Vec<QueueInput> = Vec::new();
 
-        let queue_item = vec![(
-            source_id.clone(),
+    // Single streaming track.
+    if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
+        let (title, artist, album, cover, duration) = resolve_streaming_queue_meta(
+            &state,
+            source,
+            source_id,
+            body.title.as_deref(),
+            body.artist_name.as_deref(),
+            body.album_title.as_deref(),
+            body.cover_path.as_deref(),
+            body.duration_ms,
+        )
+        .await;
+        inputs.push(QueueInput::Streaming {
+            source: source.clone(),
+            source_id: source_id.clone(),
             title,
             artist,
             album,
-            cover,
-            duration,
-            Some(source.clone()),
-        )];
-        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_item) {
-            warn!(zone_id, error = %e, "append_streaming_queue_failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let total = local_count + streaming_count;
-        let current_pos = state.playback.get_state(zone_id).await.queue_position;
-        state
-            .playback
-            .update_queue_info(zone_id, current_pos, total)
-            .await;
-        persist_queue_async(&state, zone_id);
-        let total = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        return (
-            StatusCode::CREATED,
-            Json(json!({ "added": 1, "queue_length": total })),
-        )
-            .into_response();
+            cover_url: cover,
+            duration_ms: duration,
+            // The queue-add request has no track/disc fields.
+            track_number: None,
+            disc_number: None,
+        });
     }
 
-    // --- Batch streaming tracks: [{source, source_id, ...}] ---
-    if !body.tracks.is_empty() {
-        let mut queue_items = Vec::with_capacity(body.tracks.len());
-        for item in &body.tracks {
-            let (title, artist, album, cover, duration) = if item.title.is_some() {
-                (
-                    item.title.clone().unwrap_or_default(),
-                    item.artist_name.clone().unwrap_or_default(),
-                    item.album_title.clone(),
-                    item.cover_path.clone(),
-                    item.duration_ms.unwrap_or(0),
-                )
-            } else {
-                let registry = state.services.lock().await;
-                if let Some(svc) = registry.get(&item.source) {
-                    let svc = svc.lock().await;
-                    match svc.get_track(&item.source_id).await {
-                        Ok(t) => (
-                            t.title,
-                            t.artist,
-                            t.album,
-                            t.cover_path,
-                            t.duration_ms as i64,
-                        ),
-                        Err(_) => ("Unknown".into(), String::new(), None, None, 0),
-                    }
-                } else {
-                    ("Unknown".into(), String::new(), None, None, 0)
-                }
-            };
-            queue_items.push((
-                item.source_id.clone(),
-                title,
-                artist,
-                album,
-                cover,
-                duration,
-                Some(item.source.clone()),
-            ));
-        }
-        let count = queue_items.len();
-        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_items) {
-            warn!(zone_id, error = %e, "batch_append_streaming_queue_failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
-        let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let total = local_count + streaming_count;
-        let current_pos = state.playback.get_state(zone_id).await.queue_position;
-        state
-            .playback
-            .update_queue_info(zone_id, current_pos, total)
-            .await;
-        persist_queue_async(&state, zone_id);
-        state.event_bus.emit(
-            "playback.queue.track_added",
-            json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
-        );
-        return (
-            StatusCode::CREATED,
-            Json(json!({ "added": count, "queue_length": total })),
+    // Batch streaming tracks: [{source, source_id, ...}]
+    for item in &body.tracks {
+        let (title, artist, album, cover, duration) = resolve_streaming_queue_meta(
+            &state,
+            &item.source,
+            &item.source_id,
+            item.title.as_deref(),
+            item.artist_name.as_deref(),
+            item.album_title.as_deref(),
+            item.cover_path.as_deref(),
+            item.duration_ms,
         )
-            .into_response();
+        .await;
+        inputs.push(QueueInput::Streaming {
+            source: item.source.clone(),
+            source_id: item.source_id.clone(),
+            title,
+            artist,
+            album,
+            cover_url: cover,
+            duration_ms: duration,
+            // Batch streaming items carry no track/disc number.
+            track_number: None,
+            disc_number: None,
+        });
     }
 
-    // --- Local tracks ---
-    let mut ids = body.track_ids;
+    // Local tracks.
+    let mut local_ids = body.track_ids.clone();
     if let Some(single) = body.track_id {
-        ids.push(single);
+        local_ids.push(single);
     }
-    if ids.is_empty() {
+    for id in &local_ids {
+        inputs.push(QueueInput::Local { track_id: *id });
+    }
+
+    if inputs.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             "track_ids, track_id, source+source_id, or tracks[] required".to_string(),
         )
             .into_response();
     }
-    match queue_repo.add_tracks(zone_id, &ids, body.position) {
-        Ok(_) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0);
-            let current_pos = state.playback.get_state(zone_id).await.queue_position;
-            state
-                .playback
-                .update_queue_info(zone_id, current_pos, new_length)
-                .await;
-            persist_queue_async(&state, zone_id);
-            state.event_bus.emit(
-                "playback.queue.track_added",
-                json!({ "zone_id": zone_id, "added": ids.len(), "queue_length": new_length }),
-            );
-            (
-                StatusCode::CREATED,
-                Json(json!({ "added": ids.len(), "queue_length": new_length })),
-            )
-                .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+
+    let count = inputs.len();
+    if let Err(e) = queue_repo.insert_at(zone_id, &inputs, body.position) {
+        warn!(zone_id, error = %e, "queue_insert_failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    let total = queue_repo.count_all(zone_id).unwrap_or(0);
+    let current_pos = state.playback.get_state(zone_id).await.queue_position;
+    state
+        .playback
+        .update_queue_info(zone_id, current_pos, total)
+        .await;
+    persist_queue_async(&state, zone_id);
+    state.event_bus.emit(
+        "playback.queue.track_added",
+        json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
+    );
+    (
+        StatusCode::CREATED,
+        Json(json!({ "added": count, "queue_length": total })),
+    )
+        .into_response()
 }
 
 async fn queue_move(
@@ -1465,24 +1679,23 @@ async fn queue_move(
     // Queue order changed — invalidate prefetched track
     state.orchestrator.clear_prefetch().await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
-    let mut items = queue_repo.get_queue(zone_id).unwrap_or_default();
-    let from = body.from_position as usize;
-    let to = body.to_position as usize;
-
-    if from < items.len() && to < items.len() {
-        let item = items.remove(from);
-        items.insert(to, item);
-        let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
-        queue_repo.set_queue(zone_id, &track_ids).ok();
-        persist_queue_async(&state, zone_id);
-        state.event_bus.emit(
-            "playback.queue.moved",
-            json!({ "zone_id": zone_id, "from": from, "to": to }),
-        );
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, "position out of range").into_response()
+    let total = queue_repo.count_all(zone_id).unwrap_or(0);
+    let from = body.from_position;
+    let to = body.to_position;
+    if from < 0 || to < 0 || from >= total || to >= total {
+        return (StatusCode::BAD_REQUEST, "position out of range").into_response();
     }
+    // Unified move: reorders across the whole queue (local + streaming), which
+    // the old local-only path could not do.
+    if let Err(e) = queue_repo.move_pos(zone_id, from, to) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    persist_queue_async(&state, zone_id);
+    state.event_bus.emit(
+        "playback.queue.moved",
+        json!({ "zone_id": zone_id, "from": from, "to": to }),
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn queue_jump(
@@ -1499,7 +1712,7 @@ async fn queue_jump(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -1529,37 +1742,10 @@ async fn queue_remove(
     state.orchestrator.clear_prefetch().await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
-    // Try the local play_queue first.
-    match queue_repo.remove_at(zone_id, position) {
+    // One position space: remove the row at `position` regardless of source.
+    match queue_repo.remove_pos(zone_id, position) {
         Ok(true) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0)
-                + queue_repo.count_streaming(zone_id).unwrap_or(0);
-            let current_pos = state.playback.get_state(zone_id).await.queue_position;
-            let adjusted_pos = if position < current_pos {
-                current_pos - 1
-            } else {
-                current_pos
-            };
-            state
-                .playback
-                .update_queue_info(zone_id, adjusted_pos, new_length)
-                .await;
-            persist_queue_async(&state, zone_id);
-            state.event_bus.emit(
-                "playback.queue.track_removed",
-                json!({ "zone_id": zone_id, "position": position }),
-            );
-            return Json(json!({ "queue_length": new_length })).into_response();
-        }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        Ok(false) => { /* fall through to streaming_queue */ }
-    }
-
-    // Fall back to the streaming_queue (Tidal, Qobuz, Deezer, etc.).
-    match queue_repo.remove_streaming_at(zone_id, position) {
-        Ok(true) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0)
-                + queue_repo.count_streaming(zone_id).unwrap_or(0);
+            let new_length = queue_repo.count_all(zone_id).unwrap_or(0);
             let current_pos = state.playback.get_state(zone_id).await.queue_position;
             let adjusted_pos = if position < current_pos {
                 current_pos - 1
@@ -1588,6 +1774,7 @@ async fn queue_remove(
 
 async fn save_queue_as_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<SaveAsPlaylistRequest>,
 ) -> impl IntoResponse {
@@ -1601,7 +1788,7 @@ async fn save_queue_as_playlist(
         .name
         .unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
-    match playlist_repo.create(&name, None, DEFAULT_PROFILE_ID) {
+    match playlist_repo.create(&name, None, profile.id()) {
         Ok(id) => {
             playlist_repo.add_tracks(id, &track_ids, None).ok();
             (
@@ -1694,26 +1881,94 @@ struct EqSettings {
     bands: Option<Vec<Value>>,
 }
 
-async fn get_eq(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
+    profile
+        .bands
+        .iter()
+        .map(|b| json!({"freq": b.freq, "gain": b.gain, "q": b.q, "type": b.band_type}))
+        .collect()
+}
+
+/// Read the zone's expert-mode EQ (bands stored in `zone_{id}_eq_profile`).
+///
+/// These two handlers were STUBS until 0.9.48: the web Expert equalizer
+/// POSTed here, the server echoed the body back and persisted NOTHING — the
+/// UI showed the EQ as applied with zero audible effect (found by measuring
+/// the stream served by .18: EQ on/off captures were md5-identical).
+async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let profile: tune_core::audio::eq::EqProfile = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let bands = eq_bands_json(&profile);
     Json(json!({
         "zone_id": zone_id,
-        "enabled": false,
-        "preset": "flat",
-        "bands": [],
+        "enabled": profile.enabled && !bands.is_empty(),
+        "preset": if bands.is_empty() { "flat" } else { "custom" },
+        "bands": bands,
     }))
 }
 
+/// Persist the zone's expert-mode EQ bands into the SAME per-zone profile the
+/// orchestrator reads (`zone_{id}_eq_profile`), preserving the profiler tilt
+/// fields. Same premium gate as the /dsp path.
 async fn set_eq(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<EqSettings>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return resp;
+    }
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let key = format!("zone_{zone_id}_eq_profile");
+    let mut profile: tune_core::audio::eq::EqProfile = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    if let Some(bands) = &body.bands {
+        profile.bands = bands
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+    }
+    if let Some(enabled) = body.enabled {
+        profile.enabled = enabled;
+    }
+    let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+
+    // Persister ne suffit pas : sans ceci, le reglage n'atteignait le son qu'a
+    // la piste SUIVANTE sur une zone locale, alors que la reponse valait 200
+    // (#1725). On regle un egaliseur musique en cours, a l'oreille — et trois
+    // utilisateurs ont rapporte « l'egaliseur ne fonctionne pas » avant ca.
+    // Sans effet quand rien ne joue, hors zone locale, ou en mode PURE.
+    let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+
+    let bands = eq_bands_json(&profile);
     Json(json!({
         "zone_id": zone_id,
-        "enabled": body.enabled.unwrap_or(false),
+        "enabled": profile.enabled,
         "preset": body.preset.unwrap_or_else(|| "custom".into()),
-        "bands": body.bands.unwrap_or_default(),
+        "bands": bands,
+        // Vrai quand le reglage vient d'atteindre le son d'un flux en cours.
+        // Faux ne signale PAS un echec : rien ne joue, la zone n'est pas
+        // locale, ou elle est en PURE. Expose pour qu'un client puisse dire
+        // « prendra effet a la piste suivante » plutot que de laisser croire
+        // a un egaliseur muet — c'est ce silence qui a produit #1372, #1555
+        // et #1688.
+        "applied_live": applique_a_chaud,
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1842,15 +2097,7 @@ async fn do_transfer(
         .get_streaming_queue(from_zone)
         .unwrap_or_default();
     if !streaming_items.is_empty() {
-        let tracks: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        )> = streaming_items
+        let tracks: Vec<tune_core::db::play_queue_repo::StreamingQueueItem> = streaming_items
             .iter()
             .map(|item| {
                 (
@@ -1861,6 +2108,8 @@ async fn do_transfer(
                     item["cover_path"].as_str().map(String::from),
                     item["duration_ms"].as_i64().unwrap_or(0),
                     item["source"].as_str().map(String::from),
+                    item["track_number"].as_i64(),
+                    item["disc_number"].as_i64(),
                 )
             })
             .collect();
@@ -1875,29 +2124,59 @@ async fn do_transfer(
         streaming_items.len() as i64
     };
 
+    // Position et état AVANT de toucher quoi que ce soit : la piste doit
+    // reprendre là où elle en était, pas redémarrer à zéro (point 17, revue
+    // 2026-08-15 — play_from_queue prend un index de file, pas des ms).
+    let source_position_ms = current.position_ms.max(0) as u64;
+    let source_paused = current.state == tune_core::playback::PlayState::Paused;
+
     // Transfer now-playing and playback state
     let np = current.now_playing.unwrap();
     state.playback.play(target_zone, np).await;
-    state.playback.set_volume(target_zone, current.volume).await;
+    let target_db_zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(target_zone)
+        .ok()
+        .flatten();
+    // Le volume de la CIBLE, pas celui de la source : chaque zone garde son
+    // niveau (les renderers n'ont pas la même sensibilité — c'était le
+    // symptôme que le trim par renderer corrige, autant ne plus l'aggraver).
+    let target_volume = target_db_zone
+        .as_ref()
+        .map(|z| f64::from(z.volume) / 100.0)
+        .unwrap_or(current.volume);
+    state.playback.set_volume(target_zone, target_volume).await;
     state
         .playback
         .update_queue_info(target_zone, current.queue_position, queue_length)
         .await;
 
     // Start playback on the target device via the orchestrator if a device is assigned
-    let has_output = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .get(target_zone)
-        .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id)
-        .is_some();
-    if has_output {
-        if let Err(e) = state
+    let target_device = target_db_zone.and_then(|z| z.output_device_id);
+    if let Some(ref did) = target_device {
+        match state
             .orchestrator
             .play_from_queue(target_zone, current.queue_position)
             .await
         {
-            warn!(target_zone, error = %e, "transfer_play_on_target_failed");
+            Ok(_) => {
+                // Reprendre à la position de la source. Sous 3 s on repart du
+                // début (même seuil que la route seek) — inutile de chercher
+                // dans un flux qui vient de démarrer.
+                if source_position_ms > 3000 {
+                    state
+                        .orchestrator
+                        .seek(target_zone, source_position_ms, Some(did))
+                        .await;
+                }
+                // Une source en pause reste en pause sur la cible : transférer
+                // ne veut pas dire relancer.
+                if source_paused {
+                    state.orchestrator.pause(target_zone, Some(did)).await;
+                }
+            }
+            Err(e) => {
+                warn!(target_zone, error = %e, "transfer_play_on_target_failed");
+            }
         }
     }
 
@@ -1987,6 +2266,7 @@ struct CreateAlarm {
 
 async fn create_alarm(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<CreateAlarm>,
 ) -> impl IntoResponse {
@@ -1995,12 +2275,12 @@ async fn create_alarm(
     let source_type = body.source_type.unwrap_or_else(|| "playlist".into());
     let volume = body.volume.unwrap_or(0.3);
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
-    match state.backend.execute(
-        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue],
+    let profile_id = profile.id();
+    match state.backend.execute_returning_id(
+        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
-        Ok(_) => {
-            let id = state.backend.last_insert_rowid();
+        Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -2129,12 +2409,15 @@ async fn invoke_zone_pin(
         duration_ms: None,
         seek_ms: None,
         temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -2188,6 +2471,25 @@ async fn set_audiophile(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
     settings.set(&key, &body.to_string()).ok();
+
+    // Verrou armé : passer en PURE remonte le volume tout de suite. Sans ça,
+    // la zone resterait à 20 % avec un curseur gelé sur 20 % — le pire des
+    // deux mondes, ni bit-perfect ni réglable.
+    if tune_core::audio::audiophile::volume_lock_enabled(&state.backend)
+        && body
+            .get("enabled")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false)
+    {
+        let device_id = get_zone_device_id(&state, zone_id);
+        state
+            .orchestrator
+            .set_volume(zone_id, 1.0, device_id.as_deref())
+            .await;
+        tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .update_volume(zone_id, 100)
+            .ok();
+    }
     Json(body)
 }
 
@@ -2282,6 +2584,11 @@ pub struct ShuffleAllQuery {
     artist_id: Option<i64>,
 }
 
+/// Maximum number of tracks a single "shuffle all" enqueues. Enqueuing an entire
+/// large library (Yves, 50k) froze the web UI and gains nothing musically — a few
+/// hundred randomly-shuffled tracks is a "shuffle all" for all practical use.
+const SHUFFLE_MAX_TRACKS: i64 = 500;
+
 pub async fn shuffle_all(
     State(state): State<AppState>,
     Query(q): Query<ShuffleAllQuery>,
@@ -2318,12 +2625,15 @@ pub async fn shuffle_all(
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
             .unwrap_or_default()
     } else {
-        // Whole-library shuffle: queue every track, not just 100 (tester wanted
-        // to shuffle the entire library). Album/artist shuffles above are
-        // already uncapped, so this makes the no-filter case consistent. IDs are
-        // i64s so even a large library is cheap to hold; the Fisher-Yates below
-        // reshuffles them anyway.
-        track_repo.random_ids(i64::MAX).unwrap_or_default()
+        // Whole-library shuffle: take a random SHUFFLE_MAX_TRACKS sample straight
+        // from the DB rather than every row. Enqueuing an entire 50k-track library
+        // froze the web UI (rendering the queue) and served no purpose — a random
+        // few-hundred is a "shuffle all" in every practical sense (Yves, 50k
+        // library). random_ids already returns a random subset, so we don't load
+        // the whole table just to discard most of it.
+        track_repo
+            .random_ids(SHUFFLE_MAX_TRACKS)
+            .unwrap_or_default()
     };
     if all_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();
@@ -2343,8 +2653,22 @@ pub async fn shuffle_all(
         all_ids.swap(i, j);
     }
 
+    // Cap the enqueued set uniformly (a filtered path — album/artist — could also
+    // be large). A queue of a few hundred shuffled tracks never freezes the UI.
+    all_ids.truncate(SHUFFLE_MAX_TRACKS as usize);
+
     let zone_id = q.zone_id.unwrap_or(1);
-    queue_repo.set_queue(zone_id, &all_ids).ok();
+    // Was `.ok()` — the only call site that swallowed a set_queue failure
+    // with no trace: track 1 played while the STALE queue stayed in the DB,
+    // and the natural-end advance then resurrected yesterday's entries
+    // (Villerio: album play continued into old Qobuz autoplay leftovers).
+    match queue_repo.set_queue(zone_id, &all_ids) {
+        Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
+        Err(e) => {
+            warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
+            let _ = queue_repo.clear(zone_id);
+        }
+    }
 
     let first_id = all_ids[0];
     let track = track_repo.get(first_id).ok().flatten();
@@ -2363,6 +2687,9 @@ pub async fn shuffle_all(
         duration_ms: track.as_ref().map(|t| t.duration_ms),
         seek_ms: None,
         temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -2378,7 +2705,7 @@ pub async fn shuffle_all(
             }
             Json(resp).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => play_error_response(e),
     }
 }
 
@@ -2457,4 +2784,97 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_title_is_usable;
+    use super::play_error_response;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn empty_title_is_not_usable_and_triggers_backfill() {
+        // The regression: a present-but-empty title must be treated as
+        // unresolved, so the enqueue path backfills via get_track instead of
+        // persisting a blank that clients render as "Unknown Track" (DEvir).
+        assert!(!client_title_is_usable(Some("")));
+        assert!(!client_title_is_usable(None));
+        // A real title from the client wins — no network call.
+        assert!(client_title_is_usable(Some("Beat It")));
+        // A single space is a real (if odd) title, not the empty-race sentinel.
+        assert!(client_title_is_usable(Some(" ")));
+    }
+
+    async fn parts(e: &str) -> (StatusCode, serde_json::Value) {
+        let resp = play_error_response(e.to_string());
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Forum #1183: a device-side rejection (e.g. the legacy AirPlay path
+    /// getting a 403 on ANNOUNCE from an AirPlay 2-only TV) used to reach the
+    /// web as a plain-text body it ignored, showing only "503 Service
+    /// Unavailable". The body must now be JSON {"error", "message"} like the
+    /// sentinel branches — with the HTTP codes unchanged.
+    #[tokio::test]
+    async fn device_offline_is_json_503() {
+        let (status, body) = parts("Output device error: ANNOUNCE returned 403").await;
+        // "403" also matches the upstream list, but "Output device" errors are
+        // classified first-match by contains(); the current mapping sends this
+        // through the upstream branch (502) because "403" appears in the list
+        // checked first. Assert whatever code the mapping yields is untouched:
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "upstream_error");
+        assert!(body["message"].as_str().unwrap().contains("ANNOUNCE"));
+
+        let (status, body) = parts("Output device error: renderer rejected stream").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "device_unavailable");
+        assert_eq!(
+            body["message"],
+            "Output device error: renderer rejected stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_is_json_502() {
+        let (status, body) = parts("Tidal stream url extraction failed").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "upstream_error");
+        assert_eq!(body["message"], "Tidal stream url extraction failed");
+    }
+
+    #[tokio::test]
+    async fn unknown_error_is_json_500() {
+        let (status, body) = parts("something exploded").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "playback_error");
+        assert_eq!(body["message"], "something exploded");
+    }
+
+    #[tokio::test]
+    async fn sentinel_branches_unchanged() {
+        let (status, body) = parts("premium_required:3 zones max en Free").await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body["error"], "premium_required");
+
+        let (status, body) = parts("zone_no_output_device:aucune sortie").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_no_output_device");
+        assert_eq!(body["message"], "aucune sortie");
+
+        // #1287 : sortie disparue et rebind impossible (aucun homonyme, ou
+        // plusieurs). Message actionnable relayé tel quel au client.
+        let (status, body) =
+            parts("zone_output_unavailable:La sortie de cette zone n'est plus disponible.").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_output_unavailable");
+        assert_eq!(
+            body["message"],
+            "La sortie de cette zone n'est plus disponible."
+        );
+    }
 }

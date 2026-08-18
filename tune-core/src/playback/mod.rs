@@ -38,6 +38,42 @@ pub struct NowPlaying {
     pub year: Option<i32>,
 }
 
+impl NowPlaying {
+    /// Canonical mapping from a library [`Track`](crate::db::models::Track) row
+    /// to a local `NowPlaying`.
+    ///
+    /// Centralises the audio-metadata fields (`format`, `sample_rate`,
+    /// `bit_depth`, `genre`, `year`) so every "now playing" surface reports the
+    /// **source** resolution — the file's real depth (16/24) from the library
+    /// row — rather than the transcoded output format. Local playback forces a
+    /// 32-bit WAV to the DAC; without this, the label flickered "32-bit then
+    /// correct to 16" on the first tracks (see `play_inner` and the gapless
+    /// `advance_queue_metadata` path).
+    ///
+    /// `source`/`source_id`/`cover_path` are taken verbatim from the row; callers
+    /// that need URL-resolved cover art or a zone-derived source override those
+    /// fields on the returned value. `stream_id` is always `None` (local rows are
+    /// not streamed sessions).
+    pub fn from_track(track: &crate::db::models::Track) -> Self {
+        Self {
+            track_id: track.id,
+            title: track.title.clone(),
+            artist_name: track.artist_name.clone(),
+            album_title: track.album_title.clone(),
+            cover_path: track.cover_path.clone(),
+            duration_ms: track.duration_ms,
+            source: track.source.clone(),
+            source_id: track.source_id.clone(),
+            stream_id: None,
+            format: track.format.clone(),
+            sample_rate: track.sample_rate.map(|v| v as u32),
+            bit_depth: track.bit_depth.map(|v| v as u32),
+            genre: track.genre.clone(),
+            year: track.year,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneState {
     pub zone_id: i64,
@@ -61,6 +97,22 @@ pub struct ZoneState {
     /// shuffle track is `shuffle_order[shuffle_index + 1]`.
     #[serde(skip)]
     pub shuffle_index: i64,
+    /// La piste est en cours de résolution : Tune a accepté la demande mais
+    /// n'a pas encore d'URL jouable.
+    ///
+    /// Ajouté pour YouTube, où l'extraction peut prendre très longtemps. Mesuré
+    /// chez un testeur (forum #1359) : **32 secondes** entre le clic et le
+    /// premier son, parce que les deux surfaces natives sont refusées par
+    /// YouTube (« Sign in to confirm you're not a bot ») et que tout repart sur
+    /// `yt-dlp`. Pendant ce temps l'écran ne montrait rien, et il a signalé
+    /// « la lecture ne se lance pas » — ce qui, de son point de vue, était vrai.
+    ///
+    /// Champ ADDITIF volontairement : `PlayState` est traité dans 77 `match`,
+    /// dont dix-huit dans le poller qui pilote la fin de piste et l'enchaînement.
+    /// Y ajouter une variante aurait obligé à trancher son cas partout, pour un
+    /// besoin d'affichage. Ce booléen ne modifie aucune décision de lecture.
+    #[serde(default)]
+    pub resolving: bool,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -84,6 +136,75 @@ pub struct ZoneState {
     /// the slider from bouncing back on slow DLNA renderers.
     #[serde(skip)]
     pub last_volume_set_at: Option<Instant>,
+    /// Timestamp of the last stall-recovery restart of this zone, stamped by
+    /// the OAAT stall supervisor. The supervisor replays the CURRENT track
+    /// from 0; the poller reads this to suppress a gapless position-reset
+    /// auto-advance for a brief window afterwards, so that from-zero replay is
+    /// not misread as a real track transition (which would run now-playing one
+    /// track ahead of the audio — Xavier, OAAT Tune Endpoint).
+    #[serde(skip)]
+    pub last_restart_at: Option<Instant>,
+    /// Wall-clock instant the CURRENT track was last (re)started via `play()`.
+    /// Read by the orchestrator to coalesce a redundant controller
+    /// double-dispatch: a `play()` for the track already playing that arrives a
+    /// few seconds after it started is a re-tap and must NOT re-send
+    /// SetAVTransportURI+Play, which restarts a network renderer from byte 0
+    /// (Revox S100 "plays ~10s then jumps to 0" — #1271). A deliberate replay of
+    /// the same track lands far later (older timestamp) and is untouched.
+    #[serde(skip)]
+    pub last_play_started_at: Option<Instant>,
+    /// Profile that owns the current listening session on this zone. Set by
+    /// user-initiated play handlers (from the `X-Profile-Id` header) and by the
+    /// alarm scheduler; read by the orchestrator when writing `listen_history`.
+    /// Autoplay / gapless advances reuse the zone without touching it, so they
+    /// inherit the session owner for free. `None` → the listen is tagged NULL
+    /// (server-initiated, no owner) rather than misattributed to a person.
+    #[serde(default)]
+    pub session_profile_id: Option<i64>,
+    /// Instant de la dernière mise en pause (`None` hors pause). Pour une
+    /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
+    /// un flux live continue de se périmer pendant la pause (connexion
+    /// icecast, tampon de la sortie, horodatage des paquets), et au-delà de
+    /// quelques secondes la reprise doit REJOUER la station comme au premier
+    /// lancement plutôt que de reprendre un pipeline mort (#1629).
+    #[serde(skip)]
+    pub paused_at: Option<Instant>,
+    /// Horloge murale (epoch ms UTC) du dernier changement de métadonnée
+    /// titre/artiste du now-playing. Pour une radio, c'est l'instant où le
+    /// serveur a détecté le changement de morceau dans le flux (ICY / API
+    /// livemeta) : le client s'en sert comme ancrage temporel des paroles
+    /// synchronisées (position ≈ maintenant − metadata_changed_at). Stampé au
+    /// `play()` et dans `update_now_playing` uniquement quand titre/artiste
+    /// changent réellement — le rappel périodique d'une métadonnée identique
+    /// ne doit pas faire repartir l'ancrage de zéro.
+    #[serde(default)]
+    pub metadata_changed_at_ms: Option<i64>,
+}
+
+/// Vrai quand la nouvelle métadonnée now-playing change d'identité
+/// (titre ou artiste) par rapport à l'ancienne — c'est CE changement qui
+/// redémarre l'ancrage temporel des paroles, pas un simple rafraîchissement.
+fn metadata_identity_changed(old: Option<&NowPlaying>, new: &NowPlaying) -> bool {
+    old.is_none_or(|o| o.title != new.title || o.artist_name != new.artist_name)
+}
+
+/// Epoch UTC en millisecondes (horloge murale du serveur).
+pub(crate) fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl ZoneState {
+    /// Âge (ms) de la dernière métadonnée now-playing, calculé sur l'horloge
+    /// du serveur. Les routes zone l'exposent tel quel : le client pose son
+    /// ancrage local (`maintenant_client − âge`) sans jamais comparer horloge
+    /// client et horloge serveur.
+    pub fn metadata_age_ms(&self) -> Option<i64> {
+        self.metadata_changed_at_ms
+            .map(|ts| (epoch_ms() - ts).max(0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +221,7 @@ impl Default for ZoneState {
             zone_id: 0,
             state: PlayState::Stopped,
             now_playing: None,
+            resolving: false,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -111,8 +233,13 @@ impl Default for ZoneState {
             shuffle_index: -1,
             track_generation: 0,
             play_seq: 0,
+            paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_restart_at: None,
+            last_play_started_at: None,
+            session_profile_id: None,
+            metadata_changed_at_ms: None,
         }
     }
 }
@@ -157,6 +284,15 @@ pub struct PlaybackEvent {
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
+    /// Un [`crate::audio::tap::ZoneTap`] par zone — le tap PCM que le
+    /// forwarder de niveaux alimente et que les plugins d'analyse consomment.
+    /// Verrou synchrone : accès courts, jamais tenus à travers un await.
+    zone_taps: std::sync::Mutex<HashMap<i64, Arc<crate::audio::tap::ZoneTap>>>,
+    /// Génération des forwarders de niveaux, par zone. Un forwarder capture
+    /// la valeur au spawn et s'arrête dès qu'elle change. Bumpée par l'avance
+    /// gapless : contrairement à `play_seq`, elle invalide les niveaux sans
+    /// toucher à la sémantique des lectures en cours.
+    levels_gens: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl Default for PlaybackManager {
@@ -171,7 +307,36 @@ impl PlaybackManager {
         Self {
             zones: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            zone_taps: std::sync::Mutex::new(HashMap::new()),
+            levels_gens: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// La génération de niveaux d'une zone (créée au premier accès).
+    pub fn levels_gen(&self, zone_id: i64) -> Arc<std::sync::atomic::AtomicU64> {
+        self.levels_gens
+            .lock()
+            .expect("levels_gens lock")
+            .entry(zone_id)
+            .or_default()
+            .clone()
+    }
+
+    /// Invalide tous les forwarders de niveaux vivants de la zone.
+    pub fn bump_levels_gen(&self, zone_id: i64) {
+        self.levels_gen(zone_id)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Le tap PCM d'une zone (créé au premier accès). Voir
+    /// [`crate::audio::tap`] pour le contrat.
+    pub fn zone_tap(&self, zone_id: i64) -> Arc<crate::audio::tap::ZoneTap> {
+        self.zone_taps
+            .lock()
+            .expect("zone_taps lock")
+            .entry(zone_id)
+            .or_default()
+            .clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<PlaybackEvent> {
@@ -194,6 +359,8 @@ impl PlaybackManager {
             zone_id,
             ..Default::default()
         });
+        // On tient une URL jouable : la recherche est finie.
+        state.resolving = false;
         state.position_ms = position_ms;
         state.now_playing = Some(np);
         state.state = PlayState::Stopped;
@@ -227,6 +394,24 @@ impl PlaybackManager {
             .unwrap_or(0)
     }
 
+    /// Marque la zone comme « en cours de résolution », ou lève le drapeau.
+    ///
+    /// Levé avant une extraction potentiellement longue (YouTube via `yt-dlp` :
+    /// 32 s mesurées), retombé dès que `play()` s'exécute — c'est-à-dire dès
+    /// qu'une URL jouable existe. N'influence aucune décision de lecture : ce
+    /// drapeau ne sert qu'à ce que l'interface puisse dire « je cherche »
+    /// plutôt que de rester muette.
+    pub async fn set_resolving(&self, zone_id: i64, value: bool) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .resolving = value;
+    }
+
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -244,11 +429,27 @@ impl PlaybackManager {
             .last_seek_at
             .map(|t| t.elapsed().as_secs() < 5)
             .unwrap_or(false);
+        // La recherche est finie : on tient une URL jouable, c'est tout l'objet
+        // de cet appel. Sans cette ligne le drapeau levé par l'orchestrateur
+        // avant `resolve_stream` n'était JAMAIS abaissé sur le chemin qui
+        // réussit — seuls deux chemins d'erreur le faisaient. Le commentaire de
+        // `play_inner` affirmait pourtant « le drapeau retombe dans play() » :
+        // l'intention était écrite, l'instruction manquait, et la zone restait
+        // annoncée « recherche en cours » pendant toute la lecture.
+        state.resolving = false;
         state.state = PlayState::Playing;
+        state.paused_at = None;
         if !is_recent_seek {
             state.position_ms = 0;
         }
+        // Stamp the (re)start instant so the orchestrator can coalesce a
+        // redundant controller double-dispatch of this same track (#1271).
+        state.last_play_started_at = Some(Instant::now());
+        // np is no longer read after this — the event payload is built from
+        // `state` via now_playing_event_data() below — so move instead of clone.
         state.now_playing = Some(np);
+        // Nouveau morceau → nouvel ancrage temporel de métadonnée.
+        state.metadata_changed_at_ms = Some(epoch_ms());
         state.track_generation = state.track_generation.wrapping_add(1);
         // Preserve last_seek_at if a seek just happened (< 5s ago) — the
         // orchestrator recreates the stream during seek, which calls play().
@@ -269,6 +470,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Paused;
+            state.paused_at = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
             event: "paused".into(),
@@ -281,6 +483,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Playing;
+            state.paused_at = None;
         }
         self.emit(PlaybackEvent {
             event: "resumed".into(),
@@ -292,7 +495,12 @@ impl PlaybackManager {
     pub async fn stop(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         let data = if let Some(state) = zones.get_mut(&zone_id) {
+            // Un arrêt met fin à toute recherche en cours : sans cela, une
+            // lecture interrompue pendant `resolve_stream` laissait la zone
+            // annoncée « recherche en cours » alors qu'elle est à l'arrêt.
+            state.resolving = false;
             state.state = PlayState::Stopped;
+            state.paused_at = None;
             state.last_seek_at = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
@@ -312,15 +520,30 @@ impl PlaybackManager {
     pub async fn stop_and_clear(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
+            state.resolving = false;
             state.state = PlayState::Stopped;
+            state.paused_at = None;
             state.now_playing = None;
             state.position_ms = 0;
+            state.metadata_changed_at_ms = None;
         }
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
             data: serde_json::json!({}),
         });
+    }
+
+    /// Stamp a stall-recovery restart for this zone. Called by the OAAT stall
+    /// supervisor right after it replays the current track, so the poller can
+    /// suppress a phantom gapless auto-advance triggered by the from-zero
+    /// position drop (which would otherwise put now-playing one track ahead of
+    /// the audio).
+    pub async fn mark_restart(&self, zone_id: i64) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.last_restart_at = Some(Instant::now());
+        }
     }
 
     pub async fn seek(&self, zone_id: i64, position_ms: i64) {
@@ -413,6 +636,21 @@ impl PlaybackManager {
         });
     }
 
+    /// Record which profile owns the current listening session on this zone.
+    /// Uses `entry` so a handler can stamp the session BEFORE the first
+    /// `play()` creates the zone (otherwise the first track would tag NULL).
+    /// No event is emitted — this is internal attribution, not UI state.
+    pub async fn set_session_profile(&self, zone_id: i64, profile_id: Option<i64>) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .session_profile_id = profile_id;
+    }
+
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
@@ -463,6 +701,12 @@ impl PlaybackManager {
     pub async fn update_now_playing(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
+            // Ancrage temporel : re-stampé uniquement quand titre/artiste
+            // changent vraiment. Un rafraîchissement de la même métadonnée
+            // (poll ICY périodique) ne doit pas remettre les paroles à zéro.
+            if metadata_identity_changed(state.now_playing.as_ref(), &np) {
+                state.metadata_changed_at_ms = Some(epoch_ms());
+            }
             state.now_playing = Some(np);
         }
         let data = zones
@@ -506,6 +750,16 @@ fn now_playing_event_data(state: &ZoneState) -> serde_json::Value {
             "track_generation".into(),
             serde_json::json!(state.track_generation),
         );
+        // Ancrage temporel des paroles radio : instant (serveur) du dernier
+        // changement titre/artiste + âge déjà calculé côté serveur, pour que
+        // le client n'ait pas à comparer deux horloges différentes.
+        if let Some(ts) = state.metadata_changed_at_ms {
+            obj.insert("metadata_changed_at".into(), serde_json::json!(ts));
+            obj.insert(
+                "metadata_age_ms".into(),
+                serde_json::json!((epoch_ms() - ts).max(0)),
+            );
+        }
     }
     v
 }
@@ -519,6 +773,7 @@ mod tests {
         let mut state = ZoneState {
             zone_id: 1,
             state: PlayState::Playing,
+            resolving: false,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),
@@ -538,8 +793,13 @@ mod tests {
             shuffle_index: -1,
             track_generation: 7,
             play_seq: 0,
+            paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_restart_at: None,
+            last_play_started_at: None,
+            session_profile_id: None,
+            metadata_changed_at_ms: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -556,6 +816,64 @@ mod tests {
         let empty = now_playing_event_data(&state);
         assert_eq!(empty["queue_position"], 3);
         assert!(empty.get("track_id").is_none());
+    }
+
+    #[test]
+    fn metadata_identity_change_detection() {
+        let np = |title: &str, artist: Option<&str>| NowPlaying {
+            title: title.into(),
+            artist_name: artist.map(|s| s.to_string()),
+            source: "radio".into(),
+            ..Default::default()
+        };
+        let old = np("So What", Some("Miles Davis"));
+        // Pas d'ancien now-playing → changement.
+        assert!(metadata_identity_changed(None, &old));
+        // Même titre/artiste (poll ICY répété) → pas de changement.
+        assert!(!metadata_identity_changed(
+            Some(&old),
+            &np("So What", Some("Miles Davis"))
+        ));
+        // Titre différent, artiste différent, ou artiste qui apparaît → changement.
+        assert!(metadata_identity_changed(
+            Some(&old),
+            &np("Blue in Green", Some("Miles Davis"))
+        ));
+        assert!(metadata_identity_changed(
+            Some(&old),
+            &np("So What", Some("Bill Evans"))
+        ));
+        assert!(metadata_identity_changed(Some(&old), &np("So What", None)));
+    }
+
+    #[tokio::test]
+    async fn update_now_playing_stamps_anchor_only_on_identity_change() {
+        let pm = PlaybackManager::new();
+        let np = |title: &str| NowPlaying {
+            title: title.into(),
+            artist_name: Some("FIP".into()),
+            source: "radio".into(),
+            ..Default::default()
+        };
+        pm.play(9, np("Premier titre")).await;
+        let anchor1 = pm.get_state(9).await.metadata_changed_at_ms;
+        assert!(anchor1.is_some(), "play() doit poser l'ancrage");
+
+        // Même métadonnée re-poussée : l'ancrage NE bouge PAS.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        pm.update_now_playing(9, np("Premier titre")).await;
+        assert_eq!(pm.get_state(9).await.metadata_changed_at_ms, anchor1);
+
+        // Changement de titre : l'ancrage est re-stampé (>= précédent).
+        pm.update_now_playing(9, np("Deuxième titre")).await;
+        let anchor2 = pm.get_state(9).await.metadata_changed_at_ms;
+        assert!(anchor2.unwrap() > anchor1.unwrap());
+
+        // L'événement WS embarque l'ancrage + un âge calculé côté serveur.
+        let state = pm.get_state(9).await;
+        let data = now_playing_event_data(&state);
+        assert_eq!(data["metadata_changed_at"], anchor2.unwrap());
+        assert!(data["metadata_age_ms"].as_i64().unwrap() >= 0);
     }
 
     #[tokio::test]
@@ -601,5 +919,102 @@ mod tests {
         let mut sorted = order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn from_track_maps_all_metadata_fields() {
+        let mut track = crate::db::models::Track::new("Blue in Green".into());
+        track.id = Some(42);
+        track.artist_name = Some("Miles Davis".into());
+        track.album_title = Some("Kind of Blue".into());
+        track.cover_path = Some("/covers/kob.jpg".into());
+        track.duration_ms = 337_000;
+        track.source = "local".into();
+        track.source_id = Some("row-42".into());
+        track.format = Some("flac".into());
+        track.sample_rate = Some(44_100);
+        track.bit_depth = Some(24);
+        track.genre = Some("Jazz".into());
+        track.year = Some(1959);
+
+        let np = NowPlaying::from_track(&track);
+        assert_eq!(np.track_id, Some(42));
+        assert_eq!(np.title, "Blue in Green");
+        assert_eq!(np.artist_name.as_deref(), Some("Miles Davis"));
+        assert_eq!(np.album_title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(np.cover_path.as_deref(), Some("/covers/kob.jpg"));
+        assert_eq!(np.duration_ms, 337_000);
+        assert_eq!(np.source, "local");
+        assert_eq!(np.source_id.as_deref(), Some("row-42"));
+        // Local rows are not streamed sessions.
+        assert_eq!(np.stream_id, None);
+        assert_eq!(np.format.as_deref(), Some("flac"));
+        // i32 → u32 casts on the audio-format fields.
+        assert_eq!(np.sample_rate, Some(44_100));
+        assert_eq!(np.bit_depth, Some(24));
+        assert_eq!(np.genre.as_deref(), Some("Jazz"));
+        assert_eq!(np.year, Some(1959));
+    }
+
+    #[test]
+    fn from_track_preserves_source_over_output_bit_depth() {
+        // The source depth (24) must survive verbatim — the constructor never
+        // substitutes the 32-bit WAV output depth used for local DAC playback.
+        let mut track = crate::db::models::Track::new("t".into());
+        track.bit_depth = Some(24);
+        track.sample_rate = Some(96_000);
+        assert_eq!(NowPlaying::from_track(&track).bit_depth, Some(24));
+        assert_eq!(NowPlaying::from_track(&track).sample_rate, Some(96_000));
+
+        // Missing audio metadata maps to None, not a fabricated default.
+        let bare = crate::db::models::Track::new("bare".into());
+        let np = NowPlaying::from_track(&bare);
+        assert_eq!(np.bit_depth, None);
+        assert_eq!(np.sample_rate, None);
+        assert_eq!(np.format, None);
+    }
+
+    /// Le drapeau de recherche doit retomber quand la lecture démarre.
+    ///
+    /// Il ne retombait QUE sur deux chemins d'erreur de `play_inner`. Sur le
+    /// chemin qui réussit, rien ne l'abaissait : `play()` n'y touchait pas, et
+    /// son `entry().or_insert_with()` ne réinitialise une zone existante pour
+    /// personne. Une zone restait donc annoncée « recherche en cours » pendant
+    /// toute sa lecture — au point que l'indication ne voulait plus rien dire,
+    /// ce qui est pire que son absence.
+    ///
+    /// Le commentaire de `play_inner` affirmait pourtant : « Le drapeau retombe
+    /// dans `play()`, dès qu'une URL jouable existe ». L'intention était écrite
+    /// et l'instruction manquait ; seul un test pouvait faire la différence.
+    #[tokio::test]
+    async fn la_recherche_se_termine_quand_la_lecture_demarre() {
+        let pm = super::PlaybackManager::new();
+        pm.set_resolving(1, true).await;
+        assert!(
+            pm.get_state(1).await.resolving,
+            "le drapeau doit être levé avant la résolution"
+        );
+
+        pm.play(1, super::NowPlaying::default()).await;
+
+        assert!(
+            !pm.get_state(1).await.resolving,
+            "une lecture qui démarre signifie qu'une URL jouable existe : la \
+             recherche est finie"
+        );
+    }
+
+    /// Même exigence à l'arrêt : une lecture interrompue pendant la résolution
+    /// laissait la zone à l'arrêt ET annoncée « recherche en cours ».
+    #[tokio::test]
+    async fn un_arret_met_fin_a_la_recherche() {
+        let pm = super::PlaybackManager::new();
+        pm.set_resolving(1, true).await;
+        pm.stop(1).await;
+        assert!(!pm.get_state(1).await.resolving);
+
+        pm.set_resolving(2, true).await;
+        pm.stop_and_clear(2).await;
+        assert!(!pm.get_state(2).await.resolving);
     }
 }

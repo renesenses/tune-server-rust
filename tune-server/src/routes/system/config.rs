@@ -64,7 +64,7 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
     // Use timeout to avoid blocking if scanner/outputs mutex is held (e.g. during SSDP scan)
     let devices = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        state.scanner.lock().await.devices().await.len()
+        state.scanner.devices().await.len()
     })
     .await
     .unwrap_or(0);
@@ -113,12 +113,28 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
-        ("enrich_on_scan", json!(false)),
+        // Default on (unchanged behaviour); scan.rs treats unset as enabled.
+        // The web toggle writes "false" to opt out (JF Paquet).
+        ("enrich_on_scan", json!(true)),
+        // Folder → playlist discovery at scan time — opt-in (Frédéric).
+        ("scan_folder_playlists", json!(false)),
+        // Import of .m3u/.pls files found at scan time. A different feature
+        // from the one above, and default ON since it always behaved that way.
+        // The web toggle writes "false" to opt out (JP Borderies).
+        ("scan_import_playlists", json!(true)),
+        // Le mode PURE impose-t-il le volume à 100 % ? Inactif par défaut :
+        // cocher « Audiophile » ne doit pas changer le niveau sans prévenir.
+        ("audiophile_lock_volume", json!(false)),
         ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
         ("prefetch_mode", json!("30s")),
+        // ReplayGain application at playback. Off by default: it multiplies
+        // every sample, so it must be an explicit choice, never a surprise.
+        ("replaygain_mode", json!("off")),
+        ("replaygain_preamp_db", json!(0.0)),
+        ("replaygain_prevent_clipping", json!(true)),
         (
             "local_audio_backend",
             json!(state.config.local_audio_backend),
@@ -147,6 +163,14 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     config
         .entry("onboarding_completed".to_string())
         .or_insert(json!(onboarding_complete));
+    // DSD → LPCM streaming toggle (Settings → Lecture). PATCH stores it as a
+    // raw "true"/"false" string; surface it as a real boolean (default false)
+    // so the toggle reflects the persisted state.
+    let dsd_lpcm_stream = config
+        .get("dsd_lpcm_stream")
+        .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
+        .unwrap_or(false);
+    config.insert("dsd_lpcm_stream".to_string(), json!(dsd_lpcm_stream));
     // Derived boolean: web client checks discogs_token_set to display badge.
     // Check both the DB setting and the env/toml fallback so that users
     // who set TUNE_DISCOGS_TOKEN in .env or tune.toml also see it as configured.
@@ -160,6 +184,14 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .is_some_and(|s| !s.is_empty());
     config.insert("discogs_token_set".to_string(), json!(discogs_token_set));
+    // Appliance mode (Tune OS image): unlocks the host network settings UI.
+    config.insert(
+        "appliance".to_string(),
+        json!(crate::routes::appliance::is_appliance()),
+    );
+    // Adresses d'accès depuis un autre appareil (Android ne résout pas .local :
+    // l'IP est la seule voie universelle — harmonique131, forum-hifi p.25).
+    config.insert("server_urls".to_string(), json!(server_urls(state.port)));
     // Premium licensing info
     let license_state = state.license.license_state().await;
     let premium_tier = license_state.tier;
@@ -248,6 +280,7 @@ pub(super) async fn get_settings(
 pub(super) struct ConfigPatch(pub(super) serde_json::Map<String, Value>);
 
 pub(super) async fn update_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -292,13 +325,19 @@ pub(super) async fn get_theme(
     Json(json!({ "theme": theme }))
 }
 
-pub(super) async fn get_env() -> Json<Value> {
-    let port = std::env::var("TUNE_PORT").unwrap_or_else(|_| "8085".into());
-    let db = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
-
+pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
+    // Report what the server actually resolved, not the raw environment: the
+    // old version fell back to a hard-coded "tune.db" and to port 8085, so a
+    // support page could confidently name a database the server had never
+    // opened — and named a SQLite file even on a PostgreSQL deployment.
+    let engine = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => "postgres",
+        tune_core::db::engine::Engine::Sqlite => "sqlite",
+    };
     Json(json!({
-        "TUNE_PORT": port,
-        "TUNE_DB_PATH": db,
+        "TUNE_PORT": state.port.to_string(),
+        "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),
+        "engine": engine,
     }))
 }
 
@@ -515,6 +554,7 @@ pub(super) struct AddMusicDir {
 }
 
 pub(super) async fn add_music_dir(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<AddMusicDir>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -558,17 +598,28 @@ pub(super) async fn add_music_dir(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    if !dirs.contains(&normalized) {
+    let newly_added = !dirs.contains(&normalized);
+    if newly_added {
         dirs.push(normalized);
     }
 
     settings
         .set("music_dirs", &serde_json::to_string(&dirs)?)
         .ok();
+
+    // Scan right away so the new folder's tracks appear without an app restart.
+    // Previously add_music_dir only saved the path: the startup scan and the
+    // file-watcher are both initialised once at boot with the old dir list, so a
+    // folder added later was neither scanned nor watched — it only showed up
+    // after a restart (Jean-Pierre).
+    if newly_added {
+        super::scan::spawn_library_scan(state.clone(), false, None).await;
+    }
     Ok(Json(json!({ "dirs": dirs })).into_response())
 }
 
 pub(super) async fn remove_music_dir(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<AddMusicDir>,
 ) -> Result<Json<Value>, AppError> {
@@ -592,7 +643,7 @@ pub(super) async fn remove_music_dir(
     Ok(Json(json!({ "dirs": dirs })))
 }
 
-pub(super) async fn restart() -> impl IntoResponse {
+pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
     tokio::spawn(async {
         // Let the HTTP response flush before we swap the process image.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -609,6 +660,9 @@ pub(super) async fn restart() -> impl IntoResponse {
             use std::os::unix::process::CommandExt;
             if let Ok(exe) = std::env::current_exe() {
                 let args: Vec<String> = std::env::args().skip(1).collect();
+                // Ne pas rouvrir le navigateur au redémarrage : l'onglet existant
+                // se reconnecte tout seul (Jean, forum #1236 — deux onglets).
+                unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
                 tracing::info!(exe = %exe.display(), "restart_reexec");
                 let err = std::process::Command::new(&exe).args(&args).exec();
                 // exec() only returns on failure → fall back to spawn+exit so a
@@ -623,6 +677,45 @@ pub(super) async fn restart() -> impl IntoResponse {
             }
         }
 
+        // WINDOWS: we can't exec() in place. A plain restart is NOT swapping the
+        // binary (unlike the update flow, which must exit and let tune-update.bat
+        // do the PID-gated swap), so we CAN relaunch the SAME exe ourselves:
+        // spawn a fresh copy, then exit. Without this, `exit(0)` just killed Tune
+        // on a bare Windows install with no supervisor (Mika, #1209: "Network
+        // error: server unreachable" then "Failed to load zones" — the server
+        // never came back and had to be relaunched by hand). The listening socket
+        // is created non-inheritable (socket2 sets WSA_FLAG_NO_HANDLE_INHERIT), so
+        // the child does NOT inherit it and this process's exit fully releases
+        // port 8888; the child's bind() retries for ~20s (main.rs) to cover the
+        // brief release window. On a supervised install the child simply races the
+        // supervisor's relaunch and whichever loses exits cleanly on the bind
+        // guard — no crash loop.
+        #[cfg(windows)]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                tracing::info!(exe = %exe.display(), "restart_windows_spawn");
+                match std::process::Command::new(&exe)
+                    .args(&args)
+                    // Onglet existant déjà connecté — pas de nouvel onglet (#1236).
+                    .env_remove("TUNE_OPEN_BROWSER")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        tracing::info!(pid = child.id(), "restart_windows_new_process_spawned");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "restart_windows_spawn_failed — manual restart required");
+                    }
+                }
+                // Give the child a moment to start before we release the port.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
         std::process::exit(0);
     });
     Json(json!({ "status": "restarting" }))
@@ -633,72 +726,108 @@ pub(super) async fn restart() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// Full catalog of available extended metadata fields.
-/// (key, label_fr, category)
-const METADATA_FIELDS: &[(&str, &str, &str)] = &[
+/// (key, label_fr, category, scope)
+///
+/// `scope` says which entity a field belongs to — "track", "album" or "both" —
+/// so clients can build track/album editors from the catalog instead of
+/// hardcoding their own whitelist (the web UI's ALBUM_RELEVANT_KEYS).
+const METADATA_FIELDS: &[(&str, &str, &str, &str)] = &[
     // Identification
-    ("album_artist", "Artiste de l'album", "Identification"),
-    ("sort_artist", "Tri artiste", "Identification"),
-    ("sort_album", "Tri album", "Identification"),
-    ("disc_number", "N° disque", "Identification"),
-    ("disc_subtitle", "Sous-titre disque", "Identification"),
-    ("track_number", "N° piste", "Identification"),
-    ("genre", "Genre", "Identification"),
-    ("genres", "Genres (multi)", "Identification"),
-    ("year", "Année", "Identification"),
+    (
+        "album_artist",
+        "Artiste de l'album",
+        "Identification",
+        "both",
+    ),
+    ("sort_artist", "Tri artiste", "Identification", "both"),
+    ("sort_album", "Tri album", "Identification", "album"),
+    ("disc_number", "N° disque", "Identification", "track"),
+    (
+        "disc_subtitle",
+        "Sous-titre disque",
+        "Identification",
+        "track",
+    ),
+    ("track_number", "N° piste", "Identification", "track"),
+    ("genre", "Genre", "Identification", "both"),
+    ("genres", "Genres (multi)", "Identification", "both"),
+    ("year", "Année", "Identification", "both"),
     // Crédits
-    ("composer", "Compositeur", "Crédits"),
-    ("conductor", "Chef d'orchestre", "Crédits"),
-    ("lyricist", "Parolier", "Crédits"),
-    ("performer", "Interprète", "Crédits"),
-    ("remixer", "Remixeur", "Crédits"),
-    ("label", "Label", "Crédits"),
-    ("producer", "Producteur", "Crédits"),
+    ("composer", "Compositeur", "Crédits", "both"),
+    ("conductor", "Chef d'orchestre", "Crédits", "both"),
+    ("lyricist", "Parolier", "Crédits", "both"),
+    ("performer", "Interprète", "Crédits", "both"),
+    ("remixer", "Remixeur", "Crédits", "both"),
+    ("label", "Label", "Crédits", "both"),
+    ("producer", "Producteur", "Crédits", "both"),
     // Classification
-    ("bpm", "BPM", "Classification"),
-    ("mood", "Ambiance", "Classification"),
-    ("grouping", "Regroupement", "Classification"),
-    ("compilation", "Compilation", "Classification"),
+    ("bpm", "BPM", "Classification", "track"),
+    ("mood", "Ambiance", "Classification", "both"),
+    ("grouping", "Regroupement", "Classification", "both"),
+    ("compilation", "Compilation", "Classification", "album"),
     // Texte
-    ("comment", "Commentaire", "Texte"),
-    ("lyrics", "Paroles", "Texte"),
+    ("comment", "Commentaire", "Texte", "both"),
+    ("lyrics", "Paroles", "Texte", "track"),
     // Identifiants
-    ("isrc", "ISRC", "Identifiants"),
-    ("barcode", "Code-barres", "Identifiants"),
-    ("catalog_number", "Réf. catalogue", "Identifiants"),
-    ("media_type", "Support", "Identifiants"),
+    ("isrc", "ISRC", "Identifiants", "track"),
+    ("barcode", "Code-barres", "Identifiants", "album"),
+    ("catalog_number", "Réf. catalogue", "Identifiants", "album"),
+    ("media_type", "Support", "Identifiants", "album"),
     (
         "musicbrainz_recording_id",
         "MusicBrainz Recording ID",
         "Identifiants",
+        "track",
     ),
     (
         "musicbrainz_release_id",
         "MusicBrainz Release ID",
         "Identifiants",
+        "album",
     ),
     (
         "musicbrainz_release_group_id",
         "MusicBrainz Release Group ID",
         "Identifiants",
+        "album",
     ),
+    (
+        "mb_release_track_id",
+        "MusicBrainz Release Track ID",
+        "Identifiants",
+        "track",
+    ),
+    ("release_country", "Pays de sortie", "Identifiants", "album"),
     // Dates
-    ("release_date", "Date de sortie", "Dates"),
-    ("original_date", "Date originale", "Dates"),
-    ("original_year", "Année originale", "Dates"),
+    ("release_date", "Date de sortie", "Dates", "album"),
+    ("original_date", "Date originale", "Dates", "album"),
+    ("original_year", "Année originale", "Dates", "album"),
     // Technique
-    ("format", "Format audio", "Technique"),
-    ("sample_rate", "Fréquence d'échantillonnage", "Technique"),
-    ("bit_depth", "Profondeur de bits", "Technique"),
-    ("channels", "Canaux", "Technique"),
-    ("duration_ms", "Durée", "Technique"),
-    ("file_size", "Taille du fichier", "Technique"),
-    ("file_path", "Chemin du fichier", "Technique"),
-    ("encoder", "Encodeur", "Technique"),
-    ("copyright", "Copyright", "Technique"),
-    ("language", "Langue", "Technique"),
+    ("format", "Format audio", "Technique", "track"),
+    (
+        "sample_rate",
+        "Fréquence d'échantillonnage",
+        "Technique",
+        "track",
+    ),
+    ("bit_depth", "Profondeur de bits", "Technique", "track"),
+    ("channels", "Canaux", "Technique", "track"),
+    ("duration_ms", "Durée", "Technique", "track"),
+    ("file_size", "Taille du fichier", "Technique", "track"),
+    ("file_path", "Chemin du fichier", "Technique", "track"),
+    ("encoder", "Encodeur", "Technique", "track"),
+    (
+        "encoder_software",
+        "Logiciel d'encodage",
+        "Technique",
+        "track",
+    ),
+    ("source_media", "Support (MEDIA)", "Technique", "track"),
+    ("copyright", "Copyright", "Technique", "both"),
+    ("language", "Langue", "Technique", "both"),
     // ReplayGain
-    ("rg_track_gain", "ReplayGain piste", "ReplayGain"),
-    ("rg_album_gain", "ReplayGain album", "ReplayGain"),
+    ("rg_track_gain", "ReplayGain piste", "ReplayGain", "track"),
+    ("rg_album_gain", "ReplayGain album", "ReplayGain", "album"),
 ];
 
 const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
@@ -710,6 +839,10 @@ const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
     "format",
     "sample_rate",
     "bit_depth",
+    "release_country",
+    "mb_release_track_id",
+    "encoder_software",
+    "source_media",
 ];
 
 fn metadata_fields_key(pid: i64) -> String {
@@ -763,12 +896,13 @@ pub(super) async fn get_metadata_fields(
 
     // Group fields by category (stable French key), preserving catalog order.
     let mut categories: Vec<(&str, Vec<Value>)> = Vec::new();
-    for &(key, _label, category) in METADATA_FIELDS {
+    for &(key, _label, category, scope) in METADATA_FIELDS {
         let enabled = enabled_keys.iter().any(|k| k == key);
         let field = json!({
             "key": key,
             "label": crate::i18n::t(&lang, &format!("metafield.{key}")),
             "enabled": enabled,
+            "scope": scope,
         });
 
         if let Some(cat) = categories.iter_mut().find(|(name, _)| *name == category) {
@@ -806,8 +940,8 @@ pub(super) async fn set_metadata_fields(
         .filter_map(|k| {
             METADATA_FIELDS
                 .iter()
-                .find(|(key, _, _)| *key == k.as_str())
-                .map(|(key, _, _)| *key)
+                .find(|(key, _, _, _)| *key == k.as_str())
+                .map(|(key, _, _, _)| *key)
         })
         .collect();
     let json_val = serde_json::to_string(&valid_keys).unwrap_or_else(|_| "[]".into());
@@ -881,24 +1015,65 @@ pub(super) async fn set_license(
     State(state): State<AppState>,
     Json(body): Json<LicenseBody>,
 ) -> impl IntoResponse {
-    match state.license.set_license_key(&body.key).await {
-        Ok(()) => Json(json!({
-            "status": "ok",
-            "tier": "premium",
-        }))
-        .into_response(),
-        Err(e) => (
+    // Store the key as "pending" (no Premium granted yet), then confirm it with
+    // the licensing server before unlocking anything. A fake key therefore never
+    // unlocks Premium, while a genuine key is activated in this same round-trip.
+    if let Err(e) = state.license.set_license_key(&body.key).await {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "status": "error",
-                "message": e,
-            })),
+            Json(json!({"status": "error", "message": e})),
         )
-            .into_response(),
+            .into_response();
     }
+
+    let tier = crate::routes::cloud::validate_stored_license(&state).await;
+    let premium = tier == tune_core::license::Tier::Premium;
+    let ls = state.license.license_state().await;
+    Json(json!({
+        "status": if premium { "ok" } else { "pending" },
+        "tier": ls.tier,
+        "message": if premium {
+            "Licence validée : Premium activé."
+        } else {
+            "Clé enregistrée. Premium s'activera dès qu'elle sera validée en ligne (vérifiez votre connexion et la clé)."
+        },
+    }))
+    .into_response()
 }
 
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
     state.license.clear_license().await;
     Json(json!({ "status": "ok", "tier": "free" }))
+}
+
+/// URLs d'accès au serveur depuis un autre appareil du réseau.
+/// Priorité à TUNE_ADVERTISE_IP (VPN/NordVPN : l'IP détectée serait celle du
+/// tunnel), sinon l'IP LAN détectée par la sonde UDP ; plus le nom mDNS
+/// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
+/// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
+/// est mis en cache.
+pub(super) fn server_urls(port: u16) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
+        if !ip.is_empty() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+    }
+    if urls.is_empty() {
+        if let Some(ip) = tune_core::discovery::ssdp::get_local_ip() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+    }
+    static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let host = HOSTNAME.get_or_init(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    });
+    if !host.is_empty() && host != "localhost" && !host.contains('.') {
+        urls.push(format!("http://{host}.local:{port}"));
+    }
+    urls
 }

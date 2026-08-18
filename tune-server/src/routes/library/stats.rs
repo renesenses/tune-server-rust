@@ -58,96 +58,55 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
 pub(super) async fn completeness_stats(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let total_tracks: i64 = conn
-        .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
-        .unwrap_or(0);
-    let with_genre: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let with_year: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let with_artist: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE artist_id IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let with_album: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE album_id IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let with_cover: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a WHERE a.cover_path IS NOT NULL AND a.cover_path != ''", [], |row| row.get(0)).unwrap_or(0);
-    let total_albums: i64 = conn
-        .query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
-        .unwrap_or(0);
-    let with_mbid: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''", [], |row| row.get(0)).unwrap_or(0);
-    // Count the ALBUM's own genre/year column — the exact field the Metadata
-    // view displays, edits and filters on (`no_genre` = albums where a.genre is
-    // empty). The old queries counted albums having ≥1 TRACK with a genre/year,
-    // a different set: the "Genre manquant" badge (105) then never matched the
-    // actual list of albums missing a genre (7) — Reivax66, #1091.
-    let albums_with_genre: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM albums WHERE genre IS NOT NULL AND genre != ''",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let albums_with_year: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    drop(conn);
+    // Go through state.backend, NOT state.db: state.db is always the raw
+    // SQLite handle, which on a PostgreSQL deployment is a leftover empty
+    // database — every count read 0, so the four Metadata cards all showed
+    // the same "0/0 = 100%" figure (Fabien-4, v0.9.13). Same engine routing
+    // as library_stats above; the SQL itself is dialect-neutral.
+    let b = &state.backend;
+    let sql = "SELECT \
+         (SELECT COUNT(*) FROM tracks), \
+         (SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''), \
+         (SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL), \
+         (SELECT COUNT(*) FROM tracks WHERE artist_id IS NOT NULL), \
+         (SELECT COUNT(*) FROM tracks WHERE album_id IS NOT NULL), \
+         (SELECT COUNT(DISTINCT a.id) FROM albums a WHERE a.cover_path IS NOT NULL AND a.cover_path != ''), \
+         (SELECT COUNT(*) FROM albums), \
+         (SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''), \
+         (SELECT COUNT(*) FROM albums WHERE genre IS NOT NULL AND genre != ''), \
+         (SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0), \
+         (SELECT COUNT(*) FROM albums al LEFT JOIN artists ar ON ar.id = al.artist_id \
+          WHERE al.artist_id IS NULL OR ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist'), \
+         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
+         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) \
+          AND (image_path IS NULL OR image_path = ''))";
+    let row = b
+        .query_one(sql, &[])
+        .map_err(AppError::internal)?
+        .unwrap_or_default();
+    let get = |i: usize| row.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
 
-    // Count only album-artists — the same set the library shows — so the
-    // completeness figures match the artist total elsewhere. Counting every row
-    // in `artists` over-counted by ~the number of compilation/track-only artists
-    // (Bilou: 1808 vs 1505 real artists).
-    let (total_artists, artists_without_image): (i64, i64) = {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-        let total = conn
-            .query_row(
-                "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        // Real "without image" count over the same album-artist set — was
-        // previously just `total_artists`, i.e. every artist reported as missing.
-        let without_image = conn
-            .query_row(
-                "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) AND (image_path IS NULL OR image_path = '')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        (total, without_image)
-    };
+    // Column comments preserved from the per-query version:
+    // - albums_with_genre/year count the ALBUM's own genre/year column — the
+    //   exact field the Metadata view displays, edits and filters on
+    //   (Reivax66, #1091: track-based counts never matched the album list).
+    // - albums_without_artist shares the total_albums denominator so the four
+    //   cards show consistent X/Y (Fabien, v0.9.4).
+    // - total_artists counts only album-artists — the set the library shows
+    //   (Bilou: 1808 vs 1505 real artists).
+    let total_tracks = get(0);
+    let with_genre = get(1);
+    let with_year = get(2);
+    let with_artist = get(3);
+    let with_album = get(4);
+    let with_cover = get(5);
+    let total_albums = get(6);
+    let with_mbid = get(7);
+    let albums_with_genre = get(8);
+    let albums_with_year = get(9);
+    let albums_without_artist = get(10);
+    let total_artists = get(11);
+    let artists_without_image = get(12);
 
     let genre_pct = if total_tracks > 0 {
         with_genre as f64 / total_tracks as f64 * 100.0
@@ -205,6 +164,7 @@ pub(super) async fn completeness_stats(
         "albums_without_genre": total_albums - albums_with_genre,
         "albums_without_year": total_albums - albums_with_year,
         "tracks_without_artist": total_tracks - with_artist,
+        "albums_without_artist": albums_without_artist,
         "artists_without_image": artists_without_image,
         "genre_pct": genre_pct.round(),
         "year_pct": year_pct.round(),

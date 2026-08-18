@@ -17,6 +17,8 @@ pub struct PlayCall {
 pub struct MockOutput {
     id: String,
     name: String,
+    output_type: String,
+    host: Option<String>,
     state: Arc<Mutex<TransportState>>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -32,6 +34,8 @@ impl MockOutput {
         Self {
             id: id.into(),
             name: name.into(),
+            output_type: "mock".into(),
+            host: None,
             state: Arc::new(Mutex::new(TransportState::Stopped)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
@@ -41,6 +45,20 @@ impl MockOutput {
             stop_calls: Arc::new(AtomicU64::new(0)),
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Override the reported `output_type` (default "mock"), so tests can model
+    /// a specific protocol (e.g. "dlna" vs "squeezebox").
+    pub fn with_type(mut self, output_type: &str) -> Self {
+        self.output_type = output_type.into();
+        self
+    }
+
+    /// Override the reported `host` (default `None`), so tests can model two
+    /// outputs living on the same LMS box (same-device dedup).
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.host = Some(host.into());
+        self
     }
 
     pub async fn set_state(&self, state: TransportState) {
@@ -102,7 +120,11 @@ impl OutputTarget for MockOutput {
     }
 
     fn output_type(&self) -> &str {
-        "mock"
+        &self.output_type
+    }
+
+    fn host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
@@ -157,11 +179,17 @@ impl OutputTarget for MockOutput {
             track_title: None,
             track_artist: None,
             ended_naturally: false,
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
     }
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::traits::*;
 use crate::TuneError;
@@ -17,13 +17,141 @@ pub struct QobuzService {
     user_auth_token: Option<String>,
     username: Option<String>,
     subscription: Option<String>,
-    use_proxy: bool,
+    /// Endpoint order: `false` (default) = direct Qobuz API first with the
+    /// mozaiklabs proxy as fallback; `true` = proxy first with direct as
+    /// fallback (founder accounts, signalled by the cloud license via the
+    /// optional `qobuz_proxy_first` field).
+    proxy_first: bool,
     stored_username: Option<String>,
+    /// Password from the interactive login, kept for `auto_relogin` — **memory
+    /// only, never persisted**. `save_tokens` deliberately omits it; see the
+    /// note there.
     stored_password: Option<String>,
     enabled_override: Option<bool>,
+    /// Last auto-relogin attempt, successful or not — see `auto_relogin`.
+    last_relogin_attempt: Option<std::time::Instant>,
+    /// Set when `restore_tokens` read a pre-fix row carrying `stored_password`.
+    needs_token_rewrite: bool,
+    /// Set when Qobuz rejected the token and no relogin was possible — the
+    /// session is over and the persisted row is worthless.
+    session_expired: bool,
+}
+
+/// (primary, fallback) API bases for the given endpoint order.
+///
+/// `proxy_first == false` (default, all users): direct Qobuz API first,
+/// mozaiklabs proxy as fallback. `proxy_first == true` (founder account):
+/// proxy first, direct as fallback.
+fn endpoint_order(proxy_first: bool) -> (&'static str, &'static str) {
+    if proxy_first {
+        (API_PROXY, API_BASE)
+    } else {
+        (API_BASE, API_PROXY)
+    }
+}
+
+/// Error from a single API attempt against one base URL.
+#[derive(Debug)]
+enum AttemptError {
+    /// Network-level failure (timeout, DNS, connect) — eligible for fallback.
+    Network(String),
+    /// HTTP error status. 5xx is eligible for fallback; 4xx is final.
+    Http { status: u16, body: String },
+    /// Body of a successful response failed to parse — final, no fallback.
+    Json(String),
+}
+
+impl AttemptError {
+    /// Whether the other endpoint should be tried (network error or 5xx).
+    fn transient(&self) -> bool {
+        match self {
+            Self::Network(_) => true,
+            Self::Http { status, .. } => *status >= 500,
+            Self::Json(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(e) => write!(f, "{e}"),
+            Self::Http { status, body } => write!(f, "{status} {body}"),
+            Self::Json(e) => write!(f, "json: {e}"),
+        }
+    }
+}
+
+/// Log the primary-endpoint failure that triggers the fallback, keeping the
+/// historical proxy-first event names and their direct-first mirrors.
+fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
+    match (proxy_first, err) {
+        (true, AttemptError::Http { status, .. }) => {
+            info!(path, status, "qobuz_proxy_5xx_trying_direct");
+        }
+        (true, _) => info!(path, error = %err, "qobuz_proxy_failed_trying_direct"),
+        (false, AttemptError::Http { status, .. }) => {
+            info!(path, status, "qobuz_direct_5xx_trying_proxy");
+        }
+        (false, _) => info!(path, error = %err, "qobuz_direct_failed_trying_proxy"),
+    }
+}
+
+/// Traduit le type de favori du client (pluriel) en paramètre attendu par
+/// l'API Qobuz.
+fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
+    match fav_type {
+        "tracks" => Ok("track_ids"),
+        "albums" => Ok("album_ids"),
+        "artists" => Ok("artist_ids"),
+        _ => Err(format!("unknown favorite type: {fav_type}").into()),
+    }
+}
+
+/// Offsets des pages restant à charger après la première page d'un endpoint
+/// paginé Qobuz.
+///
+/// Reproduit la condition d'arrêt de l'ancienne boucle séquentielle : on ne
+/// continue que si la première page était PLEINE et que `total` annonce des
+/// éléments au-delà. Un `total` incohérent (0 alors que la page est pleine)
+/// arrête la pagination, comme avant.
+fn remaining_page_offsets(first_count: usize, total: usize, page_size: usize) -> Vec<usize> {
+    if first_count < page_size || total <= first_count {
+        return Vec::new();
+    }
+    (page_size..total).step_by(page_size).collect()
+}
+
+/// Trace le résultat d'une écriture de favori chez Qobuz.
+///
+/// Sans cette trace, un favori qui n'arrive jamais dans l'app Qobuz ne laisse
+/// aucune empreinte exploitable : l'appel HTTP réussit, le cœur bascule dans
+/// Tune, et le rapport du testeur se réduit à « ça ne marche pas ». On veut
+/// pouvoir répondre depuis ses logs (retour Fabien, 08/08/2026).
+fn log_favorite_result(
+    op: &str,
+    fav_type: &str,
+    item_id: &str,
+    res: &Result<serde_json::Value, String>,
+) {
+    match res {
+        Ok(body) => info!(op, fav_type, item_id, response = %body, "qobuz_favorite_ok"),
+        Err(e) => warn!(op, fav_type, item_id, error = %e, "qobuz_favorite_failed"),
+    }
 }
 
 impl QobuzService {
+    /// Écrire un favori exige le jeton utilisateur : l'app_id seul identifie
+    /// l'application, pas le compte. Sans jeton, Qobuz accepte la requête sans
+    /// rien enregistrer — un succès en trompe-l'œil. On refuse avant d'émettre.
+    fn require_user_token(&self, op: &str) -> Result<(), TuneError> {
+        if self.user_auth_token.is_none() {
+            warn!(op, "qobuz_favorite_no_user_token");
+            return Err("session Qobuz non authentifiée : reconnecte le compte Qobuz".into());
+        }
+        Ok(())
+    }
+
     pub fn new(app_id: String, app_secret: String) -> Self {
         Self {
             client: crate::http::client::builder()
@@ -36,15 +164,23 @@ impl QobuzService {
             user_auth_token: None,
             username: None,
             subscription: None,
-            use_proxy: true,
+            proxy_first: false,
             stored_username: None,
             stored_password: None,
             enabled_override: None,
+            last_relogin_attempt: None,
+            needs_token_rewrite: false,
+            session_expired: false,
         }
     }
 
-    fn api_base(&self) -> &str {
-        if self.use_proxy { API_PROXY } else { API_BASE }
+    /// Set the endpoint order: `true` = proxy first (founder account, from the
+    /// cloud license `qobuz_proxy_first` flag), `false` = direct first.
+    pub fn set_proxy_first(&mut self, proxy_first: bool) {
+        if proxy_first != self.proxy_first {
+            info!(proxy_first, "qobuz_endpoint_order_changed");
+        }
+        self.proxy_first = proxy_first;
     }
 
     async fn refresh_credentials(&mut self) {
@@ -65,12 +201,37 @@ impl QobuzService {
         }
     }
 
+    /// GET against the primary endpoint for the configured order, falling back
+    /// to the other endpoint on a network error or 5xx (symmetric fallback).
     async fn api_get(
         &self,
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let base = self.api_base();
+        let (primary, fallback) = endpoint_order(self.proxy_first);
+        match self.api_get_at(primary, path, params).await {
+            Ok(v) => Ok(v),
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, path, &err);
+                self.api_get_at(fallback, path, params).await.map_err(|e| {
+                    info!(path, error = %e, "qobuz_fallback_api_error");
+                    format!("qobuz {path}: {e}")
+                })
+            }
+            Err(err) => {
+                info!(path, error = %err, "qobuz_api_error");
+                Err(format!("qobuz {path}: {err}"))
+            }
+        }
+    }
+
+    /// One GET attempt against a specific API base.
+    async fn api_get_at(
+        &self,
+        base: &str,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, AttemptError> {
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
         let mut query: Vec<(&str, &str)> = params.to_vec();
@@ -86,61 +247,35 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) if self.use_proxy => {
-                // Proxy unreachable (timeout/network) — fallback to direct API
-                info!(path, error = %e, "qobuz_proxy_failed_trying_direct");
-                return self.api_get_direct(path, params).await;
-            }
-            Err(e) => return Err(format!("qobuz api: {e}")),
-        };
-
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            // If proxy returned 5xx, try direct
-            if self.use_proxy && status >= 500 {
-                info!(path, status, "qobuz_proxy_5xx_trying_direct");
-                return self.api_get_direct(path, params).await;
-            }
-            info!(path, status, body = %body, "qobuz_api_error");
-            return Err(format!("qobuz {path}: {status} {body}"));
+            return Err(AttemptError::Http { status, body });
         }
 
-        resp.json().await.map_err(|e| format!("qobuz json: {e}"))
+        resp.json()
+            .await
+            .map_err(|e| AttemptError::Json(e.to_string()))
     }
 
-    /// Direct API call bypassing the proxy. Used as fallback when proxy is down.
-    async fn api_get_direct(
+    /// One page of a paginated Qobuz endpoint.
+    async fn api_get_page(
         &self,
         path: &str,
-        params: &[(&str, &str)],
+        base_params: &[(&str, &str)],
+        offset: usize,
+        limit: usize,
     ) -> Result<serde_json::Value, String> {
-        let url = format!("{API_BASE}{path}");
-        let app_id = self.app_id.as_str();
-        let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("app_id", app_id));
-
-        let mut req = self
-            .client
-            .get(&url)
-            .query(&query)
-            .header("X-App-Id", app_id);
-
-        if let Some(ref token) = self.user_auth_token {
-            req = req.header("X-User-Auth-Token", token.as_str());
-        }
-
-        let resp = req.send().await.map_err(|e| format!("qobuz direct: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            info!(path, status, body = %body, "qobuz_direct_api_error");
-            return Err(format!("qobuz {path}: {status} {body}"));
-        }
-
-        resp.json().await.map_err(|e| format!("qobuz json: {e}"))
+        let offset_str = offset.to_string();
+        let limit_str = limit.to_string();
+        let mut params: Vec<(&str, &str)> = base_params.to_vec();
+        params.push(("limit", &limit_str));
+        params.push(("offset", &offset_str));
+        self.api_get(path, &params).await
     }
 
     /// Fetch all pages from a paginated Qobuz endpoint.
@@ -148,51 +283,100 @@ impl QobuzService {
     /// `path` / `base_params` define the request. `items_key` is the top-level
     /// JSON key that wraps the `items` array (e.g. "tracks", "albums", "artists").
     /// The Qobuz API caps each page at 50 items regardless of the requested limit.
+    ///
+    /// Perf: the first page tells us `total`; the remaining pages are fetched
+    /// CONCURRENTLY (capped at `MAX_CONCURRENT_PAGES` so a large favorites
+    /// library doesn't hammer the Qobuz API). Before this, a user with 2000
+    /// favorite tracks paid 40 sequential round-trips per view — the "slow
+    /// favorites display" reports from heavy Qobuz users.
     async fn api_get_all_pages(
         &self,
         path: &str,
         base_params: &[(&str, &str)],
         items_key: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
-        let mut all_items: Vec<serde_json::Value> = Vec::new();
-        let mut offset: usize = 0;
+        const MAX_CONCURRENT_PAGES: usize = 4;
 
-        loop {
-            let offset_str = offset.to_string();
-            let limit_str = PAGE_SIZE.to_string();
-            let mut params: Vec<(&str, &str)> = base_params.to_vec();
-            params.push(("limit", &limit_str));
-            params.push(("offset", &offset_str));
+        // First page: learn `total` and keep the first-page diagnostics.
+        let data = self.api_get_page(path, base_params, 0, PAGE_SIZE).await?;
 
-            let data = self.api_get(path, &params).await?;
+        let mut all_items: Vec<serde_json::Value> = data[items_key]["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let count = all_items.len();
+        let total = data[items_key]["total"].as_u64().unwrap_or(0) as usize;
 
-            let items = data[items_key]["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+        debug!(
+            path,
+            items_key,
+            offset = 0usize,
+            count,
+            total,
+            accumulated = all_items.len(),
+            "qobuz_paginate"
+        );
 
-            let count = items.len();
-            all_items.extend(items);
-
-            let total = data[items_key]["total"].as_u64().unwrap_or(0) as usize;
-
-            debug!(
-                path,
-                items_key,
-                offset,
-                count,
-                total,
-                accumulated = all_items.len(),
-                "qobuz_paginate"
-            );
-
-            offset += count;
-
-            // Stop when we got fewer items than a full page, or we've reached the total
-            if count < PAGE_SIZE || offset >= total {
-                break;
+        // Diagnostic for the "favorites empty while playlists load" reports
+        // (Stéphane): on the FIRST page, surface at INFO the counts so a normal
+        // tester log tells us whether Qobuz returned nothing (total==0 → an
+        // API/account issue) or returned rows we then dropped (total>0 but
+        // count==0 → a response-shape/mapping mismatch on our side). When the
+        // items_key sub-object is entirely absent we log the top-level keys
+        // the response DID carry, to catch Qobuz nesting the data elsewhere.
+        {
+            let key_present = data.get(items_key).map(|v| !v.is_null()).unwrap_or(false);
+            if total == 0 && count == 0 {
+                let top_keys: Vec<&str> = data
+                    .as_object()
+                    .map(|m| m.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                warn!(
+                    path,
+                    items_key,
+                    key_present,
+                    response_keys = ?top_keys,
+                    "qobuz_favorites_empty"
+                );
+            } else {
+                info!(path, items_key, count, total, "qobuz_favorites_first_page");
             }
+        }
+
+        let offsets = remaining_page_offsets(count, total, PAGE_SIZE);
+        if offsets.is_empty() {
+            return Ok(all_items);
+        }
+
+        // `buffered` preserves page order, so the merged list matches what the
+        // sequential loop produced.
+        let pages: Vec<Result<Vec<serde_json::Value>, String>> =
+            futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
+                let data = self
+                    .api_get_page(path, base_params, offset, PAGE_SIZE)
+                    .await?;
+                let items = data[items_key]["items"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                debug!(
+                    path,
+                    items_key,
+                    offset,
+                    count = items.len(),
+                    total,
+                    "qobuz_paginate"
+                );
+                Ok(items)
+            }))
+            .buffered(MAX_CONCURRENT_PAGES)
+            .collect()
+            .await;
+
+        for page in pages {
+            all_items.extend(page?);
         }
 
         Ok(all_items)
@@ -218,6 +402,7 @@ impl QobuzService {
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["media_number"].as_u64().map(|n| n as u32),
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
+            isrc: item["isrc"].as_str().map(Into::into),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: item["maximum_sampling_rate"]
@@ -267,7 +452,20 @@ impl QobuzService {
         }
     }
 
-    /// Map a Qobuz featured/editorial playlist item to StreamPlaylist.
+    /// Les playlists d'une réponse de `/catalog/search`. Isolé de `search` pour
+    /// être testable : le reste de l'extraction demande un aller-retour HTTP.
+    ///
+    /// `/catalog/search` renvoie ses playlists dans la même forme que les
+    /// sélections éditoriales, d'où le convertisseur partagé.
+    fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
+            .unwrap_or_default()
+    }
+
+    /// Map a Qobuz playlist item (editorial selection or search hit) to
+    /// StreamPlaylist.
     fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
         StreamPlaylist {
             id: item["id"]
@@ -294,14 +492,13 @@ impl QobuzService {
         }
     }
 
-    async fn login_internal(
-        &mut self,
+    /// One login attempt against a specific API base.
+    async fn login_at(
+        &self,
+        base: &str,
         username: &str,
         password: &str,
-    ) -> Result<AuthStatus, String> {
-        self.refresh_credentials().await;
-
-        let base = self.api_base();
+    ) -> Result<serde_json::Value, AttemptError> {
         let resp = self
             .client
             .post(format!("{base}/user/login"))
@@ -309,19 +506,53 @@ impl QobuzService {
             .form(&[("username", username), ("password", password)])
             .send()
             .await
-            .map_err(|e| format!("qobuz login: {e}"))?;
+            .map_err(|e| AttemptError::Network(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            info!(status, body = %body, "qobuz_login_failed");
-            return Err(format!("qobuz login {status}: {body}"));
+            return Err(AttemptError::Http { status, body });
         }
 
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        resp.json()
+            .await
+            .map_err(|e| AttemptError::Json(e.to_string()))
+    }
+
+    /// Login following the configured endpoint order. Direct-first by default so
+    /// user credentials never transit through the VPS unless the direct API is
+    /// unreachable (network error or 5xx) — proxy-first for founder accounts.
+    async fn login_internal(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<AuthStatus, String> {
+        self.refresh_credentials().await;
+
+        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let data = match self.login_at(primary, username, password).await {
+            Ok(d) => d,
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, "/user/login", &err);
+                self.login_at(fallback, username, password)
+                    .await
+                    .map_err(|e| {
+                        info!(error = %e, "qobuz_login_failed");
+                        format!("qobuz login: {e}")
+                    })?
+            }
+            Err(err) => {
+                info!(error = %err, "qobuz_login_failed");
+                return Err(format!("qobuz login: {err}"));
+            }
+        };
+
         self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
         self.username = data["user"]["display_name"].as_str().map(Into::into);
         self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
+        // A fresh session clears the expiry flag, whether this login came from
+        // the user or from `auto_relogin`.
+        self.session_expired = false;
 
         info!(username = ?self.username, "qobuz_authenticated");
         Ok(self.auth_status_internal())
@@ -337,6 +568,20 @@ impl QobuzService {
     }
 
     async fn auto_relogin(&mut self) -> bool {
+        // Cooldown : pendant une coupure (proxy mozaiklabs down + direct
+        // bloqué), chaque appel en échec relançait un login complet — une
+        // tempête de relogins toutes les ~2 s qui ressemble à du trafic de
+        // bot et fait rate-limiter l'IP par Akamai (403 en cascade, .18 le
+        // 28/07). Une tentative par minute suffit largement à récupérer dès
+        // que le réseau revient.
+        const RELOGIN_COOLDOWN: Duration = Duration::from_secs(60);
+        if let Some(t) = self.last_relogin_attempt
+            && t.elapsed() < RELOGIN_COOLDOWN
+        {
+            debug!("qobuz_auto_relogin_cooldown");
+            return false;
+        }
+        self.last_relogin_attempt = Some(std::time::Instant::now());
         if let (Some(u), Some(p)) = (self.stored_username.clone(), self.stored_password.clone()) {
             info!("qobuz_auto_relogin");
             self.login_internal(&u, &p).await.is_ok()
@@ -345,12 +590,33 @@ impl QobuzService {
         }
     }
 
+    /// POST against the primary endpoint for the configured order, falling back
+    /// to the other endpoint on a network error or 5xx (same order as api_get).
     async fn api_post(
         &self,
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let base = self.api_base();
+        let (primary, fallback) = endpoint_order(self.proxy_first);
+        match self.api_post_at(primary, path, params).await {
+            Ok(v) => Ok(v),
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, path, &err);
+                self.api_post_at(fallback, path, params)
+                    .await
+                    .map_err(|e| format!("qobuz {path}: {e}"))
+            }
+            Err(err) => Err(format!("qobuz {path}: {err}")),
+        }
+    }
+
+    /// One POST attempt against a specific API base.
+    async fn api_post_at(
+        &self,
+        base: &str,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, AttemptError> {
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
         // Qobuz's Akamai edge rejects a body-less POST with HTTP 411 (Length
@@ -372,11 +638,14 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = req.send().await.map_err(|e| format!("qobuz post: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("qobuz {path}: {status} {body}"));
+            return Err(AttemptError::Http { status, body });
         }
         resp.json()
             .await
@@ -421,6 +690,20 @@ impl QobuzService {
                 ],
             )
             .await?;
+
+        // Qobuz returns a 30-second preview (audio/mpeg, URL carries `range=20-30`,
+        // `"sample": true`) instead of an error when the requested format_id is
+        // above the subscription's entitlement — e.g. asking for Hi-Res (27) on a
+        // "streaming-studio" CD-max plan. Accepting it silently makes playback cut
+        // at exactly 30s (DLNA renderers download the whole preview, then stall;
+        // Qobuz → DMP-A8, .15). Reject a sample so `get_track_url` falls down the
+        // quality ladder to a format the subscription can actually stream in full.
+        if data["sample"].as_bool().unwrap_or(false) {
+            info!(track_id, format_id, "qobuz_sample_preview_rejected");
+            return Err(format!(
+                "qobuz returned a 30s sample for format_id {format_id} — not entitled at this quality"
+            ));
+        }
 
         let url = data["url"].as_str().ok_or("no url")?.to_string();
         let mime = data["mime_type"]
@@ -569,7 +852,7 @@ impl StreamingService for QobuzService {
             tracks,
             albums,
             artists,
-            playlists: vec![],
+            playlists: Self::search_playlists(&data),
         })
     }
 
@@ -804,6 +1087,17 @@ impl StreamingService for QobuzService {
                 id: "most-streamed".into(),
                 name: "Most Streamed".into(),
             },
+            // Les deux rangées de l'onglet « Le goût de Qobuz », que Tune
+            // n'exposait pas alors que l'API les sert depuis toujours (Fabien,
+            // comparaison avec Roon).
+            FeaturedSection {
+                id: "ideal-discography".into(),
+                name: "Ideal Discography".into(),
+            },
+            FeaturedSection {
+                id: "qobuzissims".into(),
+                name: "Qobuzissimes".into(),
+            },
         ])
     }
 
@@ -902,18 +1196,33 @@ impl StreamingService for QobuzService {
                             .map(Into::into)
                             .or_else(|| item["id"].as_u64().map(|i| i.to_string()))
                             .or_else(|| item["slug"].as_str().map(Into::into))?;
-                        // name is a localized object {en, fr, ...} or a plain string.
+                        // Le libellé est, selon les entrées : une chaîne, un
+                        // objet localisé {en, fr, …}, ou — c'est le cas courant
+                        // chez Qobuz — un objet localisé ENCODÉ EN JSON dans
+                        // `name_json`. Sans cette dernière branche, aucune des
+                        // 13 catégories ne trouvait son nom et toutes
+                        // retombaient sur leur slug : les rangées s'appelaient
+                        // « artist », « mood », « label ».
+                        let localized = |v: &serde_json::Value| -> Option<String> {
+                            let obj = v.as_object()?;
+                            obj.get("fr")
+                                .or_else(|| obj.get("en"))
+                                .or_else(|| obj.values().next())
+                                .and_then(|s| s.as_str())
+                                .map(String::from)
+                        };
                         let name = item["name"]
                             .as_str()
                             .map(String::from)
-                            .or_else(|| item["name"]["en"].as_str().map(String::from))
+                            .or_else(|| localized(&item["name"]))
                             .or_else(|| {
-                                item["name"]
-                                    .as_object()
-                                    .and_then(|m| m.values().next())
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
+                                item["name_json"]
+                                    .as_str()
+                                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                                    .as_ref()
+                                    .and_then(localized)
                             })
+                            .or_else(|| localized(&item["name_json"]))
                             .unwrap_or_else(|| id.clone());
                         Some(PlaylistTag { id, name })
                     })
@@ -923,24 +1232,85 @@ impl StreamingService for QobuzService {
         Ok(tags)
     }
 
+    /// Les playlists éditoriales Qobuz, celles composées par leurs équipes.
+    ///
+    /// Le client appelle `GET /streaming/{service}/featured`, donc `get_featured`.
+    /// Qobuz était le seul service à ne pas la surcharger — Tidal, Deezer et
+    /// Spotify le font — et héritait donc de l'implémentation par défaut du
+    /// trait, qui renvoie une liste vide. Le carrousel « Playlists en vedette »
+    /// ne s'affichait jamais pour Qobuz, alors que tout existait par ailleurs :
+    /// la récupération ci-dessous, et même une route dédiée que personne
+    /// n'appelait (retour Fabien).
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        self.get_featured_playlists(None, None).await
+    }
+
     async fn get_featured_playlists(
         &self,
         tag: Option<&str>,
         genre: Option<&str>,
     ) -> Result<Vec<StreamPlaylist>, TuneError> {
-        let mut params: Vec<(&str, &str)> = vec![("type", "editor-picks"), ("limit", "50")];
+        // Une seule page de 50 laissait la majorité du catalogue éditorial
+        // dehors — « il manque beaucoup de playlists éditoriales Qobuz »
+        // (Fabien). On pagine, avec un plafond : sans tag, Qobuz en expose
+        // plusieurs milliers, et personne ne fait défiler ça.
+        const MAX: usize = 500;
+        let mut params: Vec<(&str, &str)> = vec![("type", "editor-picks")];
         if let Some(t) = tag {
             params.push(("tags", t));
         }
         if let Some(g) = genre {
             params.push(("genre_ids", g));
         }
-        let data = self.api_get("/playlist/getFeatured", &params).await?;
-        let playlists = data["playlists"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
-            .unwrap_or_default();
-        Ok(playlists)
+        let mut items = self
+            .api_get_all_pages("/playlist/getFeatured", &params, "playlists")
+            .await?;
+        items.truncate(MAX);
+        Ok(items.iter().map(Self::map_featured_playlist).collect())
+    }
+
+    /// Une rangée par tag Qobuz, dans l'ordre où Qobuz les publie.
+    ///
+    /// Les tags sont interrogés en parallèle (une requête chacun, une page) :
+    /// séquentiellement, une dizaine d'allers-retours mettaient la vue à
+    /// plusieurs secondes. Un tag qui échoue ou qui ne renvoie rien est
+    /// simplement absent — une rangée vide n'apprend rien à personne.
+    async fn get_featured_playlists_by_tag(
+        &self,
+        genre: Option<&str>,
+    ) -> Result<Vec<PlaylistTagGroup>, TuneError> {
+        /// Playlists par rangée : au-delà, le carrousel ne sert plus à rien et
+        /// la vue s'alourdit. Le détail d'un tag reste accessible par
+        /// `get_featured_playlists(tag)`, qui pagine.
+        const PER_TAG: usize = 50;
+
+        let tags = self.get_playlist_tags().await?;
+        let rows = futures_util::future::join_all(tags.into_iter().map(|tag| async move {
+            let limit = PER_TAG.to_string();
+            let mut params: Vec<(&str, &str)> = vec![
+                ("type", "editor-picks"),
+                ("tags", tag.id.as_str()),
+                ("limit", &limit),
+            ];
+            if let Some(g) = genre {
+                params.push(("genre_ids", g));
+            }
+            let data = self.api_get("/playlist/getFeatured", &params).await.ok()?;
+            let playlists: Vec<StreamPlaylist> = data["playlists"]["items"]
+                .as_array()
+                .map(|items| items.iter().map(Self::map_featured_playlist).collect())
+                .unwrap_or_default();
+            if playlists.is_empty() {
+                return None;
+            }
+            Some(PlaylistTagGroup {
+                id: tag.id,
+                name: tag.name,
+                playlists,
+            })
+        }))
+        .await;
+        Ok(rows.into_iter().flatten().collect())
     }
 
     async fn get_album_context(&self, album_id: &str) -> Result<AlbumContext, TuneError> {
@@ -973,24 +1343,20 @@ impl StreamingService for QobuzService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let key = match fav_type {
-            "tracks" => "track_ids",
-            "albums" => "album_ids",
-            "artists" => "artist_ids",
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_post("/favorite/create", &[(key, item_id)]).await?;
+        let key = favorite_key(fav_type)?;
+        self.require_user_token("favorite/create")?;
+        let res = self.api_post("/favorite/create", &[(key, item_id)]).await;
+        log_favorite_result("create", fav_type, item_id, &res);
+        res?;
         Ok(())
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let key = match fav_type {
-            "tracks" => "track_ids",
-            "albums" => "album_ids",
-            "artists" => "artist_ids",
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_post("/favorite/delete", &[(key, item_id)]).await?;
+        let key = favorite_key(fav_type)?;
+        self.require_user_token("favorite/delete")?;
+        let res = self.api_post("/favorite/delete", &[(key, item_id)]).await;
+        log_favorite_result("delete", fav_type, item_id, &res);
+        res?;
         Ok(())
     }
 
@@ -1052,6 +1418,31 @@ impl StreamingService for QobuzService {
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
+    }
+
+    /// `artist/getSimilarArtists` — la reponse de Qobuz a « et apres ? ».
+    ///
+    /// `artist/get` refuse `extra=similarArtists` (400, « accepted values are
+    /// albums, tracks, playlists, ... ») : c'est bien un point d'entree
+    /// distinct. Verifie sur le catalogue reel : Pink Floyd (38324) rend 72
+    /// artistes, King Crimson en tete.
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let limit = limit.to_string();
+        let data = self
+            .api_get(
+                "/artist/getSimilarArtists",
+                &[("artist_id", artist_id), ("limit", &limit)],
+            )
+            .await?;
+        let artists = data["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_artist).collect())
+            .unwrap_or_default();
+        Ok(artists)
     }
 
     async fn create_playlist(
@@ -1177,16 +1568,51 @@ impl StreamingService for QobuzService {
             return Ok(false);
         }
         let test = self.api_get("/user/get", &[]).await;
-        if let Err(ref e) = test
-            && (e.contains("401") || e.contains("403"))
-            && self.auto_relogin().await
-        {
+        let Err(ref e) = test else {
+            return Ok(false);
+        };
+        // Only a rejected session is conclusive. A timeout or a 5xx says
+        // nothing about the token and must not cost the user their session.
+        if !(e.contains("401") || e.contains("403")) {
+            return Ok(false);
+        }
+        if self.auto_relogin().await {
             info!("qobuz_token_refreshed_via_relogin");
             return Ok(true);
         }
-        Ok(false)
+        // Qobuz rejected the token and we cannot get a new one. Drop it: while
+        // it stayed in place, `auth_status` still answered `authenticated:
+        // true`, so the UI showed the service connected, the friendly "session
+        // expired, reconnect in Settings" branch in `get_track_url` (which
+        // tests for a *missing* token) never ran, and playback failed with a
+        // raw `qobuz /track/getFileUrl: 401`. Clearing it makes every one of
+        // those report the truth.
+        warn!("qobuz_session_expired_token_cleared");
+        self.user_auth_token = None;
+        self.subscription = None;
+        self.session_expired = true;
+        // `username` is kept on purpose: the account is still known, it just
+        // needs a password again, and the client can name it in the prompt.
+        Ok(true)
     }
 
+    fn session_expired(&self) -> bool {
+        self.session_expired
+    }
+
+    /// The persisted blob deliberately carries **no password**.
+    ///
+    /// It used to. `settings.auth_tokens_qobuz` held `stored_password` in the
+    /// clear next to the token, so anyone who could read `tune.db` — a backup,
+    /// a copied WAL, a support bundle — walked away with the account password
+    /// itself, not a revocable session. The API responses were already redacted
+    /// (`is_secret_key` in `routes/system/config.rs`); the file on disk was not.
+    ///
+    /// The password now lives in memory only, for the lifetime of the process,
+    /// so `auto_relogin` still recovers from an expired token without a round
+    /// trip to the user. Across a restart it is gone: if the stored token has
+    /// expired by then, the user re-authenticates once. That is the trade —
+    /// a rare re-login against a password that is never written down.
     fn save_tokens(&self) -> Option<serde_json::Value> {
         let token = self.user_auth_token.as_ref()?;
         Some(serde_json::json!({
@@ -1196,7 +1622,6 @@ impl StreamingService for QobuzService {
             "app_id": self.app_id,
             "app_secret": self.app_secret,
             "stored_username": self.stored_username,
-            "stored_password": self.stored_password,
         }))
     }
 
@@ -1212,11 +1637,22 @@ impl StreamingService for QobuzService {
                 self.app_secret = secret.into();
             }
             self.stored_username = tokens["stored_username"].as_str().map(Into::into);
-            self.stored_password = tokens["stored_password"].as_str().map(Into::into);
+            // A row written before this field was dropped still carries the
+            // plaintext password. Do not load it into the session — flag the row
+            // so the registry rewrites it without the field, which is what
+            // actually removes the secret from disk.
+            if tokens.get("stored_password").is_some_and(|v| !v.is_null()) {
+                warn!("qobuz_legacy_plaintext_password_purged");
+                self.needs_token_rewrite = true;
+            }
             true
         } else {
             false
         }
+    }
+
+    fn tokens_need_rewrite(&self) -> bool {
+        self.needs_token_rewrite
     }
 
     async fn post_restore(&mut self) {
@@ -1237,6 +1673,168 @@ fn md5_hex(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_playlists_read_from_the_search_payload() {
+        // /catalog/search renvoie ses playlists dans la même forme que les
+        // sélections éditoriales — c'est ce que ce test verrouille.
+        let data = json!({
+            "tracks": {"items": []},
+            "albums": {"items": []},
+            "artists": {"items": []},
+            "playlists": {"items": [{
+                "id": 5471203,
+                "name": "Jazz pour la nuit",
+                "tracks_count": 58,
+                "owner": {"name": "Qobuz"}
+            }]}
+        });
+        let found = QobuzService::search_playlists(&data);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "5471203");
+        assert_eq!(found[0].name, "Jazz pour la nuit");
+        assert_eq!(found[0].track_count, 58);
+        assert_eq!(found[0].owner.as_deref(), Some("Qobuz"));
+    }
+
+    #[test]
+    fn search_playlists_absent_is_empty_not_a_panic() {
+        assert!(QobuzService::search_playlists(&json!({"tracks": {"items": []}})).is_empty());
+    }
+
+    #[test]
+    fn endpoint_order_direct_first_by_default() {
+        // All users: direct Qobuz API first, mozaiklabs proxy as fallback.
+        assert_eq!(endpoint_order(false), (API_BASE, API_PROXY));
+    }
+
+    #[test]
+    fn endpoint_order_proxy_first_for_founder() {
+        // Founder account (license `qobuz_proxy_first`): proxy first.
+        assert_eq!(endpoint_order(true), (API_PROXY, API_BASE));
+    }
+
+    #[test]
+    fn remaining_page_offsets_stops_on_a_partial_first_page() {
+        // 37 favoris : tout tient dans la première page, rien à précharger.
+        assert!(remaining_page_offsets(37, 37, 50).is_empty());
+        // Page vide (compte sans favoris).
+        assert!(remaining_page_offsets(0, 0, 50).is_empty());
+    }
+
+    #[test]
+    fn remaining_page_offsets_stops_when_total_is_reached_or_inconsistent() {
+        // total == première page : terminé.
+        assert!(remaining_page_offsets(50, 50, 50).is_empty());
+        // total incohérent (0 alors que la page est pleine) : on s'arrête,
+        // comme l'ancienne boucle séquentielle (offset >= total).
+        assert!(remaining_page_offsets(50, 0, 50).is_empty());
+    }
+
+    #[test]
+    fn remaining_page_offsets_covers_the_whole_library_in_page_steps() {
+        // 2000 favoris (cas des rapports de lenteur) : pages 50..1950.
+        let offsets = remaining_page_offsets(50, 2000, 50);
+        assert_eq!(offsets.first(), Some(&50));
+        assert_eq!(offsets.last(), Some(&1950));
+        assert_eq!(offsets.len(), 39);
+        // Dernière page partielle : 230 favoris → 50, 100, 150, 200.
+        assert_eq!(remaining_page_offsets(50, 230, 50), vec![50, 100, 150, 200]);
+        // Un seul élément au-delà de la première page.
+        assert_eq!(remaining_page_offsets(50, 51, 50), vec![50]);
+    }
+
+    #[test]
+    fn favorite_key_maps_the_plural_types_sent_by_the_client() {
+        assert_eq!(favorite_key("tracks").unwrap(), "track_ids");
+        assert_eq!(favorite_key("albums").unwrap(), "album_ids");
+        assert_eq!(favorite_key("artists").unwrap(), "artist_ids");
+        assert!(
+            favorite_key("track").is_err(),
+            "le singulier n'est pas le contrat"
+        );
+    }
+
+    #[test]
+    fn writing_a_favorite_without_a_user_token_is_refused_up_front() {
+        // Sans jeton utilisateur, Qobuz accepte la requête sans rien
+        // enregistrer : on doit échouer avant de l'émettre, pas rapporter un
+        // succès que l'app Qobuz dément.
+        let svc = QobuzService::new("app".into(), "secret".into());
+        assert!(svc.user_auth_token.is_none());
+        let err = svc.require_user_token("favorite/create").unwrap_err();
+        assert!(
+            err.to_string().contains("Qobuz"),
+            "le message doit désigner le compte à reconnecter, obtenu : {err}"
+        );
+    }
+
+    #[test]
+    fn map_similar_artists_payload() {
+        // Charge utile reelle de /artist/getSimilarArtists?artist_id=38324
+        // (Pink Floyd, 72 resultats) : la radio d'autoplay lit `artists.items`,
+        // pas la racine — une erreur de chemin rendrait zero candidat en
+        // silence, exactement le bug #1553.
+        let payload = json!({
+            "artists": {
+                "limit": 3,
+                "offset": 0,
+                "total": 72,
+                "items": [
+                    {"id": 1191678, "name": "King Crimson", "albums_count": 87},
+                    {"id": 26718, "name": "Yes", "albums_count": 120},
+                    {"id": 43821, "name": "Queen", "albums_count": 64},
+                ]
+            }
+        });
+        let artists: Vec<_> = payload["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(QobuzService::map_artist).collect())
+            .unwrap_or_default();
+        assert_eq!(artists.len(), 3);
+        assert_eq!(artists[0].id, "1191678");
+        assert_eq!(artists[0].name, "King Crimson");
+    }
+
+    #[test]
+    fn map_similar_artists_missing_payload_is_empty_not_a_panic() {
+        // Un artiste sans voisins connus rend un objet sans `artists` : la
+        // radio doit rendre zero candidat, pas paniquer dans le poller.
+        let payload = json!({"status": "success"});
+        let artists: Vec<crate::streaming::traits::StreamArtist> = payload["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(QobuzService::map_artist).collect())
+            .unwrap_or_default();
+        assert!(artists.is_empty());
+    }
+
+    #[test]
+    fn new_service_defaults_to_direct_first() {
+        let svc = QobuzService::new("id".into(), "secret".into());
+        assert!(!svc.proxy_first);
+    }
+
+    #[test]
+    fn attempt_error_transient_classification() {
+        // Network errors and 5xx fall back to the other endpoint; 4xx and
+        // JSON parse errors are final.
+        assert!(AttemptError::Network("timeout".into()).transient());
+        assert!(
+            AttemptError::Http {
+                status: 502,
+                body: String::new()
+            }
+            .transient()
+        );
+        assert!(
+            !AttemptError::Http {
+                status: 401,
+                body: String::new()
+            }
+            .transient()
+        );
+        assert!(!AttemptError::Json("eof".into()).transient());
+    }
 
     #[test]
     fn map_track_basic() {
@@ -1490,6 +2088,124 @@ mod tests {
         let mut svc = QobuzService::new("app".into(), "secret".into());
         let tokens = json!({"nothing": "here"});
         assert!(!svc.restore_tokens(&tokens));
+    }
+
+    #[test]
+    fn qobuz_save_tokens_never_persists_the_password() {
+        // The whole point of the fix: an authenticated session writes a blob
+        // that a reader of tune.db cannot turn into account credentials.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.user_auth_token = Some("token123".into());
+        svc.stored_username = Some("testuser".into());
+        svc.stored_password = Some("hunter2".into());
+
+        let tokens = svc
+            .save_tokens()
+            .expect("authenticated, so a blob is written");
+
+        assert!(tokens.get("stored_password").is_none());
+        assert_eq!(tokens["stored_username"], "testuser");
+        assert_eq!(tokens["user_auth_token"], "token123");
+        assert!(
+            !tokens.to_string().contains("hunter2"),
+            "the password must not reach disk under any key"
+        );
+    }
+
+    #[test]
+    fn qobuz_restore_drops_legacy_password_and_asks_for_a_rewrite() {
+        // A row written by a pre-fix build. The password must not be loaded into
+        // the session, and the service must ask for the row to be rewritten.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        let tokens = json!({
+            "user_auth_token": "token123",
+            "username": "testuser",
+            "stored_username": "testuser",
+            "stored_password": "hunter2",
+        });
+
+        assert!(svc.restore_tokens(&tokens));
+        assert_eq!(svc.stored_password, None);
+        assert!(svc.tokens_need_rewrite());
+
+        // And what gets written back is clean.
+        let rewritten = svc.save_tokens().expect("token restored");
+        assert!(!rewritten.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn qobuz_restore_clean_row_needs_no_rewrite() {
+        // No stale field, no write: startup must not churn the settings row on
+        // every boot once the DB has been migrated.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        let tokens = json!({
+            "user_auth_token": "token123",
+            "stored_username": "testuser",
+        });
+
+        assert!(svc.restore_tokens(&tokens));
+        assert!(!svc.tokens_need_rewrite());
+    }
+
+    #[test]
+    fn qobuz_auto_relogin_still_works_within_the_session() {
+        // The password stays in memory after an interactive login, so an expired
+        // token is recovered without prompting. Only a restart forces a re-login.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.stored_username = Some("testuser".into());
+        svc.stored_password = Some("hunter2".into());
+        assert!(svc.stored_password.is_some());
+
+        // Restoring from disk is the case that cannot: nothing to relogin with.
+        let mut restored = QobuzService::new("app".into(), "secret".into());
+        restored.restore_tokens(&json!({
+            "user_auth_token": "token123",
+            "stored_username": "testuser",
+        }));
+        assert_eq!(restored.stored_password, None);
+    }
+
+    #[test]
+    fn qobuz_fresh_service_reports_no_expired_session() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        assert!(!svc.session_expired());
+        assert!(!svc.auth_status_internal().authenticated);
+    }
+
+    #[test]
+    fn qobuz_cleared_session_reports_disconnected() {
+        // The state `refresh_if_needed` leaves behind once Qobuz has refused the
+        // token: `authenticated` must be false, or the UI keeps showing the
+        // service as connected while every call 401s.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.user_auth_token = None;
+        svc.subscription = None;
+        svc.username = Some("testuser".into());
+        svc.session_expired = true;
+
+        let status = svc.auth_status_internal();
+        assert!(!status.authenticated);
+        assert!(svc.session_expired());
+        // The account stays named so the prompt can address it.
+        assert_eq!(status.username.as_deref(), Some("testuser"));
+        // And nothing is persisted for a session that no longer exists.
+        assert!(svc.save_tokens().is_none());
+    }
+
+    #[test]
+    fn qobuz_login_clears_the_expired_flag() {
+        // Reconnecting must undo the expiry, otherwise the row would be deleted
+        // again right after a successful login.
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.session_expired = true;
+
+        // What `login_internal` does on success, without the network round trip.
+        svc.user_auth_token = Some("fresh".into());
+        svc.session_expired = false;
+
+        assert!(!svc.session_expired());
+        assert!(svc.auth_status_internal().authenticated);
+        assert!(svc.save_tokens().is_some());
     }
 
     #[test]

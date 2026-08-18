@@ -1,0 +1,140 @@
+name: Tune OS Image
+
+# Build de l'image appliance Debian x86-64 (clé USB, Rufus/Etcher).
+#
+# Appelé par `release.yml` (workflow_call) une fois les assets attachés, plus
+# le dispatch manuel pour reconstruire une image a posteriori.
+#
+# ⚠️ NE PAS remettre `on: release: [published]`. Ce déclencheur était là et
+# n'a JAMAIS fonctionné : `release.yml` crée la release avec le `GITHUB_TOKEN`
+# par défaut, et GitHub refuse par conception qu'un évènement émis par ce jeton
+# déclenche un autre workflow. Résultat : aucune image entre 0.9.62 et 0.9.68,
+# sans le moindre run en échec pour le signaler. Le seul run jamais parti d'un
+# évènement `release` (v0.9.62) correspond à une republication **manuelle**
+# après retrait — donc à un jeton humain.
+#
+# `workflow_call` n'a pas ce problème : le job tourne dans le run de
+# `release.yml`, il n'y a pas de nouvel évènement à filtrer.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version Tune (X.Y.Z sans v, ou 'latest')"
+        required: false
+        type: string
+        default: "latest"
+      attach_to_release:
+        description: "Attacher l'image à la release GitHub vX.Y.Z"
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version Tune (X.Y.Z sans v, ou 'latest')"
+        required: false
+        default: "latest"
+      attach_to_release:
+        description: "Attacher l'image à la release GitHub vX.Y.Z"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-image:
+    name: Build Tune OS x86_64 image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            VERSION=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name | sed 's/^v//')
+          fi
+          test -n "$VERSION"
+          # L'asset binaire doit exister avant de builder l'image
+          gh release view "v$VERSION" --repo "${{ github.repository }}" \
+            --json assets --jq '.assets[].name' | grep -q "linux-x86_64.tar.gz" \
+            || { echo "::error::asset linux-x86_64.tar.gz absent de la release v$VERSION"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Le tarball est récupéré ICI, sur le runner, avec le jeton — et pas dans
+      # le conteneur par une URL publique.
+      #
+      # Depuis #1588 la release naît en BROUILLON : ses assets ne sont plus
+      # servis par `releases/download/...`, qui répond une page 404. Le `curl`
+      # du script recevait donc du HTML, l'écrivait dans tune.tar.gz — non vide,
+      # donc son test `-s` passait — et le `tar` mourait cinquante lignes plus
+      # loin sur « gzip: stdin: not in gzip format ». v0.9.76 : deux cycles de
+      # CI perdus, et une release bloquée en brouillon par sa propre garde.
+      #
+      # `gh release download` passe par l'API et voit les brouillons.
+      - name: Télécharger le tarball serveur (brouillon compris)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          OUT="$PWD/image/tune-server-v$V-linux-x86_64.tar.gz"
+          gh release download "v$V" --repo "${{ github.repository }}" \
+            --pattern "tune-server-v$V-linux-x86_64.tar.gz" --output "$OUT" --clobber
+          # Vérifier que c'est bien une archive, pas une page d'erreur.
+          gzip -t "$OUT" || { echo "::error::$OUT n'est pas une archive gzip"; exit 1; }
+          echo "TUNE_TARBALL_PATH=/repo/image/tune-server-v$V-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+
+      # Build dans un conteneur bookworm : le debootstrap d'ubuntu-22.04
+      # échoue à configurer les paquets de base de bookworm (polkitd).
+      # --privileged : losetup/chroot ; le noyau est partagé avec le runner.
+      - name: Build image (debian bookworm container)
+        run: |
+          docker run --rm --privileged -v "$PWD":/repo -w /repo -v /dev:/dev \
+            -e TUNE_TARBALL_PATH="$TUNE_TARBALL_PATH" \
+            debian:bookworm bash -ec '
+              apt-get update -qq
+              apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null
+              ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}" || {
+                echo "=== debootstrap.log (fin) ==="
+                tail -n 150 /tmp/tune-os-build/rootfs/debootstrap/debootstrap.log 2>/dev/null || true
+                exit 1
+              }'
+
+      - name: Sanity check
+        run: |
+          IMG="image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz"
+          sudo chown -R "$(id -u):$(id -g)" image/output
+          ls -lh image/output/
+          test -s "$IMG"
+          # Une image plausible fait plusieurs centaines de Mo compressée
+          SIZE=$(stat -c%s "$IMG")
+          if [ "$SIZE" -lt 200000000 ]; then
+            echo "::error::image anormalement petite ($SIZE octets)"; exit 1
+          fi
+          sha256sum "$IMG" > "$IMG.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tune-os-x86_64-v${{ steps.ver.outputs.version }}
+          path: |
+            image/output/*.img.gz
+            image/output/*.sha256
+          retention-days: 7
+          compression-level: 0
+
+      - name: Attach to release
+        if: ${{ inputs.attach_to_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "v${{ steps.ver.outputs.version }}" \
+            image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz \
+            image/output/tune-os-x86_64-v${{ steps.ver.outputs.version }}.img.gz.sha256 \
+            --repo "${{ github.repository }}" --clobber

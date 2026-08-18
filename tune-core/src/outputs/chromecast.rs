@@ -2,6 +2,26 @@ use tracing::info;
 
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 
+/// rust_cast opens a plain blocking `TcpStream` with no connect/read timeout:
+/// a Chromecast that vanished from the network (sleep, Wi-Fi drop — some flap
+/// every few minutes) turns that connect into a minutes-long hang that
+/// strands a blocking-pool thread. Probe with a bounded connect first so a
+/// dead host fails fast.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `true` when `host:port` accepts a TCP connection within `timeout`. Returns
+/// `true` on resolution failure so rust_cast surfaces the real error itself.
+fn probe_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => TcpStream::connect_timeout(&addr, timeout).is_ok(),
+            None => true,
+        },
+        Err(_) => true,
+    }
+}
+
 pub struct ChromecastOutput {
     name: String,
     device_id: String,
@@ -315,6 +335,9 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
+            if !probe_reachable(&host, port, PROBE_TIMEOUT) {
+                return Ok(OutputStatus::default());
+            }
             let device = match rust_cast::CastDevice::connect_without_host_verification(&host, port)
             {
                 Ok(d) => d,
@@ -412,6 +435,8 @@ impl OutputTarget for ChromecastOutput {
                 track_title: None,
                 track_artist: None,
                 ended_naturally,
+                // A renderer plays at 1x: keep the poller's wall-clock guards.
+                realtime: true,
             })
         })
         .await
@@ -422,9 +447,168 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
-            rust_cast::CastDevice::connect_without_host_verification(&host, port).is_ok()
+            probe_reachable(&host, port, PROBE_TIMEOUT)
+                && rust_cast::CastDevice::connect_without_host_verification(&host, port).is_ok()
         })
         .await
         .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn reachable_host_probes_true() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_reachable(
+            "127.0.0.1",
+            port,
+            std::time::Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn dead_host_probes_false_fast() {
+        // Bind then drop: the port is closed, connect is refused immediately.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let start = std::time::Instant::now();
+        assert!(!probe_reachable(
+            "127.0.0.1",
+            port,
+            std::time::Duration::from_millis(500)
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn unresolvable_host_falls_through_true() {
+        // rust_cast must surface the real error itself.
+        assert!(probe_reachable(
+            "definitely-not-a-real-host.invalid",
+            8009,
+            std::time::Duration::from_millis(500)
+        ));
+    }
+}
+
+/// Regression tests for forum bug #1185: Chromecast devices presenting a
+/// self-signed X.509 **v1** certificate were rejected during the TLS
+/// handshake with `invalid peer certificate: Other(OtherError(
+/// UnsupportedCertVersion))` — rustls-webpki refuses to parse v1 certs, so
+/// the stock signature-verification helpers failed before rust_cast's
+/// accept-everything `verify_server_cert` was even relevant. Fixed by the
+/// vendored rust_cast patch (vendor/rust_cast, `accept_unparseable_cert`).
+#[cfg(test)]
+mod cast_tls_tests {
+    use rust_cast::NoCertificateVerification;
+    use rustls::DigitallySignedStruct;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::internal::msgs::codec::{Codec, Reader};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    /// Genuine X.509 v1 self-signed cert (what 1st/2nd-gen Chromecasts and
+    /// Chromecast Audio present).
+    const CERT_V1: &[u8] = include_bytes!("../../tests/fixtures/chromecast_x509_v1.der");
+    /// X.509 v3 control cert (parseable by webpki).
+    const CERT_V3: &[u8] = include_bytes!("../../tests/fixtures/chromecast_x509_v3.der");
+
+    /// DigitallySignedStruct::new is pub(crate); build one through the wire
+    /// codec: scheme (u16) + u16-length-prefixed signature bytes.
+    fn dummy_dss(scheme: u16) -> DigitallySignedStruct {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&scheme.to_be_bytes());
+        bytes.extend_from_slice(&256u16.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 256]);
+        DigitallySignedStruct::read(&mut Reader::init(&bytes)).unwrap()
+    }
+
+    /// rsa_pkcs1_sha256 — what a TLS 1.2 Chromecast handshake uses.
+    const RSA_PKCS1_SHA256: u16 = 0x0401;
+    /// rsa_pss_rsae_sha256 — a scheme valid in TLS 1.3.
+    const RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+
+    #[test]
+    fn stock_helper_rejects_v1_cert_proving_the_bug() {
+        // Control: the unpatched code path (rustls' own helper) fails on the
+        // v1 cert at *parse* time — this is exactly the #1185 failure mode.
+        let cert = CertificateDer::from(CERT_V1);
+        let err = rustls::crypto::verify_tls12_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PKCS1_SHA256),
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(_))
+            ),
+            "expected UnsupportedCertVersion-class parse error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn patched_verifier_accepts_v1_cert_tls12() {
+        let cert = CertificateDer::from(CERT_V1);
+        let res = NoCertificateVerification.verify_tls12_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PKCS1_SHA256),
+        );
+        assert!(
+            res.is_ok(),
+            "v1 cert must be tolerated (LAN, unverified): {res:?}"
+        );
+    }
+
+    #[test]
+    fn patched_verifier_accepts_v1_cert_tls13() {
+        let cert = CertificateDer::from(CERT_V1);
+        let res = NoCertificateVerification.verify_tls13_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PSS_RSAE_SHA256),
+        );
+        assert!(
+            res.is_ok(),
+            "v1 cert must be tolerated (LAN, unverified): {res:?}"
+        );
+    }
+
+    #[test]
+    fn patched_verifier_still_rejects_bad_signature_on_parseable_cert() {
+        // The patch must NOT blanket-accept: a parseable (v3) cert with a
+        // garbage signature keeps failing the standard signature check.
+        let cert = CertificateDer::from(CERT_V3);
+        let res = NoCertificateVerification.verify_tls12_signature(
+            b"message",
+            &cert,
+            &dummy_dss(RSA_PKCS1_SHA256),
+        );
+        assert!(
+            res.is_err(),
+            "bad signature on parseable cert must still fail"
+        );
+    }
+
+    #[test]
+    fn verify_server_cert_accepts_v1_cert() {
+        let cert = CertificateDer::from(CERT_V1);
+        let server_name = ServerName::try_from("192.168.1.75").unwrap();
+        let res = NoCertificateVerification.verify_server_cert(
+            &cert,
+            &[],
+            &server_name,
+            &[],
+            UnixTime::now(),
+        );
+        assert!(res.is_ok());
     }
 }

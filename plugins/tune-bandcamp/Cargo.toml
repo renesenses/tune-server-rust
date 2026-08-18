@@ -1,0 +1,25 @@
+[package]
+name = "tune-bandcamp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# In-tree native plugin (#1768). Extracted from tune-server's always-on core
+# (`routes/bandcamp.rs`) into a `TunePlugin`, gated behind tune-server's
+# `bandcamp` feature — même trajet que `tune-dj` avant lui.
+#
+# Aucune dépendance audio : ce plugin ne fait que parler HTTP à Bandcamp. Il
+# n'a donc besoin d'aucun `HostServices` — son routeur est sans état et passe
+# par le client HTTP partagé de `tune_core`.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Nommé dans la signature du helper d'erreur commun. `tune-core` ne réexporte
+# pas reqwest, et `tune-karaoke` le déclare de la même façon.
+reqwest = { workspace = true }
+# Lot 2 : mémoriser le pseudo et le fan_id resolus (SettingsRepo).
+tokio = { workspace = true }

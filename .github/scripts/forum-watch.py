@@ -15,6 +15,7 @@ Required env vars:
 """
 import json
 import os
+import re
 import sys
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -22,11 +23,25 @@ from urllib.error import HTTPError
 FORUM_BASE = "https://mozaiklabs.fr/api/v1/forum"
 GITHUB_API = "https://api.github.com"
 
+# Label d'exemption : une issue qui le porte n'est jamais refermée automatiquement.
+KEEP_OPEN_LABEL = "keep-open"
+
 FORUM_TOKEN = os.environ["FORUM_TOKEN"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID", "")
 GIST_TOKEN = os.environ.get("GIST_TOKEN", GITHUB_TOKEN)
 REPO = os.environ["GITHUB_REPOSITORY"]
+
+
+def forum_thread_url(slug):
+    """URL publique d'un fil du forum.
+
+    Le segment est « threads » au PLURIEL : `/forum/thread/{slug}` renvoie 404.
+    Le script a écrit la forme au singulier pendant des mois — le champ « Lien »
+    de toutes les issues [Forum] créées jusqu'au 2026-08-09 pointe donc vers une
+    page inexistante. Passer par cette fonction plutôt que de recomposer l'URL.
+    """
+    return f"https://mozaiklabs.fr/forum/threads/{slug}"
 
 
 def http_get(url, headers=None):
@@ -106,8 +121,87 @@ def create_github_issue(title, body, labels):
     )
 
 
+def list_open_forum_issues():
+    """Issues ouvertes portant le label `forum-feedback`, page par page."""
+    out, page = [], 1
+    while True:
+        batch = http_get(
+            f"{GITHUB_API}/repos/{REPO}/issues"
+            f"?state=open&labels=forum-feedback&per_page=100&page={page}",
+            {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+        )
+        if not batch:
+            break
+        # L'API `issues` renvoie aussi les pull requests : on les écarte.
+        out.extend(i for i in batch if "pull_request" not in i)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def close_issue(number, comment):
+    http_post(
+        f"{GITHUB_API}/repos/{REPO}/issues/{number}/comments",
+        {"body": comment},
+        {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+    )
+    http_patch(
+        f"{GITHUB_API}/repos/{REPO}/issues/{number}",
+        {"state": "closed", "state_reason": "completed"},
+        {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+    )
+
+
+def close_issues_for_resolved_threads(threads):
+    """Ferme les issues dont le fil forum est passé à `resolved`.
+
+    Sans cela, le dépôt accumule indéfiniment : le watcher crée une issue par
+    fil mais rien ne la referme jamais. Au 2026-08-10, **309 des 563 issues
+    ouvertes** avaient leur fil déjà résolu — plus d'une sur deux ne
+    correspondait à rien de vivant, et le backlog en devenait inexploitable.
+
+    Seul `resolved` ferme. Un fil `closed` reste ouvert ici volontairement :
+    c'est le statut posé quand on renvoie le suivi vers GitHub en disant au
+    testeur « le sujet n'est pas réglé, il vit désormais dans l'issue » —
+    la fermer trahirait la promesse faite.
+
+    Le label `keep-open` exempte une issue de cette passe. Sans lui, aucune
+    décision humaine ne survivait : garder délibérément une issue ouverte alors
+    que son fil est résolu — le temps d'une relecture, ou parce que le défaut
+    persiste malgré ce qu'en pense l'auteur du fil — était défait à l'exécution
+    suivante, en silence et sans recours.
+    """
+    resolved = {
+        t.get("slug"): t
+        for t in threads
+        if t.get("slug") and t.get("status") == "resolved"
+    }
+    if not resolved:
+        return 0
+    closed = 0
+    for issue in list_open_forum_issues():
+        labels = {l.get("name") for l in issue.get("labels") or []}
+        if KEEP_OPEN_LABEL in labels:
+            continue
+        m = re.search(r"forum/thread[s]?/([A-Za-z0-9\-]+)", issue.get("body") or "")
+        if not m or m.group(1) not in resolved:
+            continue
+        try:
+            close_issue(
+                issue["number"],
+                "Fermeture automatique : le fil forum d'origine est passé à "
+                "**résolu**.\n\nSi le défaut existe encore, rouvrez cette issue "
+                "ou ouvrez un nouveau fil — le forum reste la porte d'entrée.",
+            )
+            print(f"Closed issue #{issue['number']} (thread resolved)")
+            closed += 1
+        except Exception as e:
+            print(f"Failed to close issue #{issue['number']}: {e}", file=sys.stderr)
+    return closed
+
+
 def strip_html(text):
-    import re
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
@@ -131,9 +225,32 @@ def main():
         if author == "Admin":
             continue
 
+        # Nos propres annonces ne sont pas des signalements.
+        #
+        # Le filtre sur l'auteur « Admin » ci-dessus ne suffit plus : les notes
+        # de version sont publiées sous le compte **Bertrand** depuis qu'on les
+        # signe, et non plus sous le compte de publication. Chaque release
+        # fabriquait donc une issue « [Forum] Tune vX.Y.Z — Notes de version »
+        # que personne ne fermait jamais : 34 accumulées entre la 0.9.41 et la
+        # 0.9.82, soit 8 % du fond de tickets ouvert, pour zéro travail réel.
+        #
+        # On filtre sur le TYPE plutôt que sur l'auteur ou le titre : c'est ce
+        # qui porte l'intention (« ceci est une annonce »), là où l'auteur peut
+        # changer et où un titre se reformule.
+        #
+        # ⚠️ On saute la création du FIL, surtout pas son suivi : un testeur qui
+        # répond sous les notes de version pour signaler que la nouvelle version
+        # casse quelque chose est exactement le signal qu'on veut recevoir. La
+        # détection de réponses, plus bas, continue donc de tourner.
+        is_announcement = (t.get("type") or "").lower() == "release"
+
         # New thread?
         if tid > last_thread_id:
-            new_threads.append(t)
+            if not is_announcement:
+                new_threads.append(t)
+            # L'identifiant avance dans tous les cas : sans cela, une annonce
+            # non retenue resterait éternellement « nouvelle » et le curseur
+            # n'atteindrait jamais les fils suivants.
             max_thread_id = max(max_thread_id, tid)
 
         # New replies?
@@ -159,7 +276,7 @@ def main():
         body = (
             f"**Auteur** : {t.get('author','?')}\n"
             f"**Date** : {t.get('created_at','?')}\n"
-            f"**Lien** : https://mozaiklabs.fr/forum/thread/{t.get('slug','')}\n\n"
+            f"**Lien** : {forum_thread_url(t.get('slug',''))}\n\n"
             f"**Extrait** :\n\n> {strip_html(t.get('body',''))[:500]}"
         )
         title = f"[Forum] {t.get('title','(no title)')}"
@@ -175,7 +292,7 @@ def main():
             f"**Réponse de** : {r.get('author','?')}\n"
             f"**Sur le thread** : {t.get('title','(no title)')}\n"
             f"**Date** : {r.get('created_at','?')}\n"
-            f"**Lien** : https://mozaiklabs.fr/forum/thread/{t.get('slug','')}\n\n"
+            f"**Lien** : {forum_thread_url(t.get('slug',''))}\n\n"
             f"**Contenu** :\n\n> {strip_html(r.get('body',''))[:500]}"
         )
         title = f"[Forum reply] {t.get('title','(no title)')[:60]}"
@@ -186,10 +303,17 @@ def main():
         except Exception as e:
             print(f"Failed to create issue for reply: {e}", file=sys.stderr)
 
+    # Refermer ce qui a été résolu côté forum, sinon le dépôt accumule.
+    try:
+        closed = close_issues_for_resolved_threads(threads)
+    except Exception as e:
+        closed = 0
+        print(f"close pass failed: {e}", file=sys.stderr)
+
     state = {"last_thread_id": max_thread_id, "thread_reply_counts": new_reply_counts}
     save_state(state)
 
-    print(f"Done. {created} new GitHub issue(s) created.")
+    print(f"Done. {created} new issue(s) created, {closed} closed.")
 
 
 if __name__ == "__main__":

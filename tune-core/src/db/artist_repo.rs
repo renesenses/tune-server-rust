@@ -6,6 +6,12 @@ use super::models::Artist;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
 
+/// Nom de l'artiste de repli quand un fichier est indexé sans tag artiste
+/// lisible (typiquement un fichier encore en cours d'écriture au moment où
+/// le watcher le voit). Partagé entre le scanner et les repos pour que la
+/// détection « artiste inconnu » compare toujours la même chaîne.
+pub const UNKNOWN_ARTIST_NAME: &str = "Unknown Artist";
+
 /// Engine-agnostic SQL builders for artist_repo.
 ///
 /// `COLLATE NOCASE` (SQLite-only) is replaced by `LOWER(col)` for
@@ -114,6 +120,10 @@ pub mod sql {
 
     pub fn list_without_mbid() -> &'static str {
         "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
+    }
+
+    pub fn list_with_image_no_mbid() -> &'static str {
+        "SELECT id, name, image_path FROM artists WHERE image_path IS NOT NULL AND image_path != '' AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
 
     pub fn list_without_image_no_mbid() -> &'static str {
@@ -227,8 +237,7 @@ impl ArtistRepo {
             &artist.image_path,
             &artist.image_source,
         ];
-        self.db.execute(&sql, &params)?;
-        Ok(self.db.last_insert_rowid())
+        Ok(self.db.execute_returning_id(&sql, &params)?)
     }
 
     /// Sequential `query_one_strong` + `execute` + `last_insert_rowid`
@@ -262,8 +271,7 @@ impl ArtistRepo {
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
-        self.db.execute(&create_sql, &params)?;
-        let id = self.db.last_insert_rowid();
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
         Ok(Artist {
             id: Some(id),
             name: name.to_string(),
@@ -478,6 +486,23 @@ impl ArtistRepo {
 
     /// Return all artists without image AND without MBID.
     /// Each entry is (artist_id, name).
+    /// Artists that HAVE an image_path but NO MBID — used to re-queue untagged
+    /// artists whose stored image is a remote URL / missing cache file so
+    /// enrichment can localize a real picture (port of #769).
+    pub fn list_with_image_no_mbid(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_image_no_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
     pub fn list_without_image_no_mbid(&self) -> Result<Vec<(i64, String)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_image_no_mbid(), &[])?;
         Ok(rows

@@ -8,9 +8,18 @@
 </head>
 <body>
   <div id="app">
-    <header>
+    <!-- data-tauri-drag-region : la fenêtre mini n'a pas de décorations, donc
+         pas de barre de titre à saisir. Sans zone de glissement déclarée, elle
+         est clouée là où le système l'a posée (Sandro). L'attribut est sur le
+         bandeau, PAS sur ses enfants interactifs : une zone de glissement
+         avale les clics, et le sélecteur de zone comme le bouton de fermeture
+         cesseraient de répondre. -->
+    <header data-tauri-drag-region>
       <select id="zone-select"></select>
-      <button id="btn-close" title="Masquer">×</button>
+      <div class="header-actions">
+        <button id="btn-expand" title="Ouvrir la fenêtre complète">⤢</button>
+        <button id="btn-close" title="Masquer">×</button>
+      </div>
     </header>
 
     <div id="cover-container">

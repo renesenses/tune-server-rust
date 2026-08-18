@@ -369,6 +369,37 @@ pub fn smart_radio(
 
     debug!(seed_genre = ?genre, seed_artist = ?artist, "smart_radio_seed");
 
+    // --- Acoustic neighbours: tracks that SOUND like the seed, ranked by CLAP
+    // cosine. This is the strongest continuity signal, so it goes first. Empty
+    // when the seed has no embedding (un-analysed library), leaving the metadata
+    // paths below as the fallback — zero regression.
+    if let Some(tid) = seed_track_id {
+        let neigh = crate::audio::embedding_store::acoustic_neighbors(backend, tid, count);
+        if !neigh.is_empty() {
+            let ids: Vec<i64> = neigh.iter().map(|(id, _)| *id).collect();
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT {TRACK_COLS} \
+                 FROM tracks t \
+                 LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
+                 LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+                 WHERE t.id IN ({placeholders})"
+            );
+            let params: Vec<&dyn ToSqlValue> = ids.iter().map(|id| id as &dyn ToSqlValue).collect();
+            if let Ok(rows) = backend.query_many(&sql, &params) {
+                // SQL `IN` loses ordering; re-emit in descending-cosine order.
+                for (id, _) in &neigh {
+                    if let Some(r) = rows
+                        .iter()
+                        .find(|r| r.first().and_then(|v| v.as_i64()) == Some(*id))
+                    {
+                        results.push(row_to_track(r, "acoustic"));
+                    }
+                }
+            }
+        }
+    }
+
     // --- Same genre tracks ---
     if let Some(ref g) = genre {
         let half = (count_i64 / 2).max(5);
@@ -522,8 +553,41 @@ pub fn smart_radio(
         }
     }
 
+    // Acoustic, genre and co-occurrence sources can surface the same track;
+    // keep the first (highest-priority) occurrence and cap at the request.
+    dedup_and_cap(&mut results, count);
+
     info!(count = results.len(), "smart_radio_generated");
     results
+}
+
+/// Deduplicate a radio queue in place, preserving priority order, then cap it.
+///
+/// Two keys are collapsed: the track id, and a normalised `artist \u{1} title`
+/// content key. The content key is what stops duplicate rips / alternate
+/// versions of the *same recording* (a library that imported an album twice)
+/// from playing back-to-back — id dedup alone misses those, since they carry
+/// distinct track ids. A track with an empty title has no reliable content key
+/// and is kept on its (already unique) id.
+fn dedup_and_cap(results: &mut Vec<RecommendedTrack>, count: usize) {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_keys = std::collections::HashSet::new();
+    results.retain(|t| {
+        if !seen_ids.insert(t.track_id) {
+            return false;
+        }
+        let title = t.title.trim();
+        if title.is_empty() {
+            return true;
+        }
+        let key = format!(
+            "{}\u{1}{}",
+            t.artist.as_deref().unwrap_or("").trim().to_lowercase(),
+            title.to_lowercase()
+        );
+        seen_keys.insert(key)
+    });
+    results.truncate(count);
 }
 
 // ---------------------------------------------------------------------------
@@ -547,4 +611,76 @@ pub fn get_cached_daily_mixes(backend: &Arc<dyn DbBackend>) -> Option<Vec<DailyM
 
     let json_str = settings.get("ai_daily_mixes").ok()??;
     serde_json::from_str(&json_str).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(id: i64, artist: &str, title: &str) -> RecommendedTrack {
+        RecommendedTrack {
+            track_id: id,
+            title: title.to_string(),
+            artist: (!artist.is_empty()).then(|| artist.to_string()),
+            album: None,
+            genre: None,
+            duration_ms: 0,
+            cover_path: None,
+            reason: "acoustic".to_string(),
+        }
+    }
+
+    #[test]
+    fn dedup_collapses_duplicate_rips_by_content_key() {
+        // Same recording imported twice → distinct ids, identical artist/title.
+        let mut v = vec![
+            track(49457, "The Dave Brubeck Quartet", "Kathy's Waltz"),
+            track(49464, "The Dave Brubeck Quartet", "Kathy's Waltz"),
+            track(49312, "The Oscar Peterson Trio", "D. & E."),
+        ];
+        dedup_and_cap(&mut v, 30);
+        assert_eq!(
+            v.iter().map(|t| t.track_id).collect::<Vec<_>>(),
+            vec![49457, 49312]
+        );
+    }
+
+    #[test]
+    fn dedup_is_case_and_whitespace_insensitive() {
+        let mut v = vec![
+            track(1, "Diana Krall", "Stop This World"),
+            track(2, "  diana krall ", "  STOP THIS WORLD  "),
+        ];
+        dedup_and_cap(&mut v, 30);
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_songs_and_same_title_across_artists() {
+        let mut v = vec![
+            track(1, "The Oscar Peterson Trio", "The Girl From Ipanema"),
+            track(2, "Stan Getz", "The Girl From Ipanema"), // same title, other artist → kept
+            track(3, "The Oscar Peterson Trio", "Corcovado"),
+        ];
+        dedup_and_cap(&mut v, 30);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn dedup_keeps_empty_title_tracks_on_id() {
+        let mut v = vec![track(1, "", ""), track(2, "", "")];
+        dedup_and_cap(&mut v, 30);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn dedup_preserves_priority_order_then_caps() {
+        let mut v = vec![
+            track(1, "A", "one"),
+            track(2, "B", "two"),
+            track(3, "C", "three"),
+        ];
+        dedup_and_cap(&mut v, 2);
+        assert_eq!(v.iter().map(|t| t.track_id).collect::<Vec<_>>(), vec![1, 2]);
+    }
 }

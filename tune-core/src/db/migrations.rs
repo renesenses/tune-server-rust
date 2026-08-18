@@ -1,5 +1,6 @@
 use tracing::info;
 
+use super::migration_status;
 use super::sqlite::SqliteDb;
 
 struct Migration {
@@ -7,6 +8,19 @@ struct Migration {
     name: &'static str,
     up: &'static str,
 }
+
+/// v0.9 — collapse the two per-source position spaces into ONE contiguous space
+/// per zone. After the unified copy (v52), local rows sit at 0..L-1 and
+/// streaming rows at 0..S-1 (overlapping); shift streaming rows up by the zone's
+/// local count so the whole queue is one ordered sequence 0..L+S-1, which the
+/// unified repo/orchestrator expect. Runs exactly once via version tracking, so
+/// it can't double-shift an already-unified queue.
+const RENUMBER_QUEUE_POSITIONS_SQL: &str = "UPDATE queue_items \
+    SET position = position + ( \
+        SELECT COUNT(*) FROM queue_items q2 \
+        WHERE q2.zone_id = queue_items.zone_id AND q2.track_id IS NOT NULL \
+    ) \
+    WHERE track_id IS NULL;";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -180,6 +194,7 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
     author TEXT,
     image_url TEXT,
     description TEXT,
+    source_id TEXT,
     last_checked TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
@@ -440,8 +455,13 @@ INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP No
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Metal', 'https://icecast.radiofrance.fr/fipmetal-hifi.aac', 'Metal', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Hip-Hop', 'https://icecast.radiofrance.fr/fiphiphop-hifi.aac', 'Hip-Hop', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Sacré français', 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac', 'Chanson française', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Latino', 'https://icecast.radiofrance.fr/fiplatino-hifi.aac', 'Latino', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Tout nouveau', 'https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac', 'Éclectique', 'France');
+-- 'FIP Latino' (fiplatino) and 'FIP Tout nouveau' (fiptoutnouveautoutchaud) used
+-- to be seeded here and are deliberately gone: Radio France no longer serves
+-- either slug. Both answer 404 while every other FIP webradio above answers 200
+-- (checked 2026-08-08, and every plausible spelling — fiplatina, fipsalsa,
+-- fiptoutnouveau — 404s too). They shipped as two stations that could never
+-- play. Migration 70 removes them from databases that already seeded them.
+-- Do not re-add without checking the URL first. Forum #626 (Jean Valjean).
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique', 'https://icecast.radiofrance.fr/francemusique-hifi.aac', 'Classique', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Classique Easy', 'https://icecast.radiofrance.fr/francemusiqueeasyclassique-hifi.aac', 'Classique', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Classique Plus', 'https://icecast.radiofrance.fr/francemusiqueclassiqueplus-hifi.aac', 'Classique', 'France');
@@ -626,7 +646,29 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
 ",
     },
     Migration {
+        // v0.9 — unified queue (kept at 52; existing release/v0.9 DBs already
+        // applied it here). The actual work is done idempotently by
+        // migrate_to_unified_queue() in init_schema, so the marker is a no-op.
         version: 52,
+        name: "unified_queue_items",
+        up: "",
+    },
+    Migration {
+        // v0.9 — one contiguous position space per zone (streaming rows move
+        // from 0..S-1 to L..L+S-1). Runs after init_schema's unified copy.
+        version: 53,
+        name: "unify_queue_positions",
+        up: RENUMBER_QUEUE_POSITIONS_SQL,
+    },
+    Migration {
+        version: 54,
+        name: "bio_provenance",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
+    // Brought over from main in the main→release/v0.9 merge (numbered 55/56 so
+    // they run on existing release/v0.9 DBs, whose highest applied version is 54).
+    Migration {
+        version: 55,
         name: "add_streaming_auth",
         up: "
 CREATE TABLE IF NOT EXISTS streaming_auth (
@@ -635,15 +677,10 @@ CREATE TABLE IF NOT EXISTS streaming_auth (
 );
 ",
     },
-    // Create streaming_queue eagerly. It used to be created lazily on first
-    // write in play_queue_repo, so on a FRESH database any code that READS it
-    // before the first write — the startup orphan cleanup (startup.rs) and the
-    // Deezer/streaming connect path — hit \"no such table: streaming_queue\"
-    // (forum: Yan Tasset, Bilou; Dominique's log). Schema mirrors
-    // play_queue_repo::sql::CREATE_STREAMING_QUEUE_SQLITE; IF NOT EXISTS makes
-    // it a no-op on DBs where the table already exists.
+    // streaming_queue is also created unconditionally in init_schema (the
+    // idempotent guarantee); this numbered marker mirrors main. IF NOT EXISTS.
     Migration {
-        version: 53,
+        version: 56,
         name: "create_streaming_queue_table",
         up: "
 CREATE TABLE IF NOT EXISTS streaming_queue (
@@ -661,12 +698,10 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
 ",
     },
     Migration {
-        version: 54,
-        name: "bio_provenance",
-        up: "", // Applied programmatically via add_column_if_missing
-    },
-    Migration {
-        version: 55,
+        // Renumbered from 55 (its value on the main line): on release/v0.9,
+        // 55/56 are already taken by the streaming migrations that the
+        // main→v0.9 merge renumbered, so this lands at 57.
+        version: 57,
         name: "add_profile_id_to_playlists",
         up: "", // Applied programmatically via add_column_if_missing (existing rows → profile 1)
     },
@@ -676,7 +711,9 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
     // the local/streaming_queue split. Metadata (title/artist/album/cover) is
     // stored so the favorites list needs no per-item hydration for streaming.
     Migration {
-        version: 56,
+        // Renumbered from 56 (its value on main): on release/v0.9, 56 is already
+        // taken by create_streaming_queue_table (main→v0.9 merge), so this is 58.
+        version: 58,
         name: "add_streaming_favorites",
         up: "
 CREATE TABLE IF NOT EXISTS streaming_favorites (
@@ -695,7 +732,339 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (
 CREATE INDEX IF NOT EXISTS idx_streaming_favorites_profile ON streaming_favorites(profile_id, item_type);
 ",
     },
+    // Podcast subscriptions gained a `source_id` column so the client can match a
+    // subscription by its streaming source id (Apple Podcasts id) rather than
+    // feed_url alone — the "+ S'abonner" button stayed active because the browse
+    // list keys on source_id while the subscription only stored feed_url (Fabien).
+    Migration {
+        version: 59,
+        name: "add_source_id_to_podcast_subscriptions",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
+    // A folder on disk is what says "these files are one release". Storing it
+    // makes album identity explicit instead of inferred from title + quality:
+    // an edition whose discs differ in sample rate stays one album, and two
+    // separate rips of the same album stay two. NULL on every pre-existing row
+    // until a rescan, and the lookup falls back to title+artist then, so an
+    // un-rescanned library keeps working exactly as before.
+    Migration {
+        version: 60,
+        name: "add_folder_path_to_albums",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
+    // The quality tier the old scanner appended to album TITLES ("Album
+    // (96kHz/24bit)") is machine-written noise: clients render the real quality
+    // from sample_rate/bit_depth, and the folder now decides identity. Strip it
+    // once, here, rather than on every scan — rewriting titles at scan time
+    // would fight a user's own metadata edits.
+    //
+    // A rescan alone does not clean these: an album matched by its MusicBrainz
+    // release id keeps the row it already had, suffix and all.
+    Migration {
+        version: 61,
+        name: "strip_quality_suffix_from_album_titles",
+        up: "", // Applied programmatically: needs the parser, not SQL.
+    },
+    // Stripping the suffixes leaves behind the rows the split had created: one
+    // release showing up as several same-titled albums. Fold them back together
+    // by the rule that now decides identity — the folder on disk — so an upgrade
+    // fixes the library it finds instead of waiting for a full rescan (expensive
+    // on a NAS, and it would not clean an album matched by MusicBrainz id
+    // anyway). Albums in DIFFERENT folders are never folded: a CD rip and a
+    // hi-res copy are meant to stay two entries.
+    Migration {
+        version: 62,
+        name: "merge_albums_split_by_quality",
+        up: "", // Applied programmatically: needs the folder rule, not SQL.
+    },
+    // Audio embeddings (CLAP) for acoustic "sounds-like" radio. One 512-d vector
+    // per track, computed in the background analysis pass (piggybacks the
+    // ReplayGain decode) and stored as a BLOB; smart_radio ranks candidates by
+    // cosine similarity. Empty until the opt-in pass runs — nothing else changes.
+    Migration {
+        version: 63,
+        name: "track_audio_embedding",
+        up: "
+CREATE TABLE IF NOT EXISTS track_audio_embedding (
+    track_id    INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    model       TEXT    NOT NULL,
+    embedding   BLOB    NOT NULL,
+    analyzed_at INTEGER
+);
+",
+    },
+    // Alarm ownership (chantier 2 / C2): which profile a scheduled alarm belongs
+    // to, so its playback is tagged to that person's listening history. Nullable
+    // — legacy alarms have no owner and stay NULL (never guessed). Applied via
+    // add_column_if_missing below for idempotency.
+    Migration {
+        version: 64,
+        name: "add_alarms_profile_id",
+        up: "", // Applied programmatically (idempotent add_column_if_missing).
+    },
+    // A streaming album's own track/disc numbers were lost once enqueued: the
+    // unified queue stored `position` but not the album's numbering, so a
+    // multi-disc streaming album showed disc 2 continuing at 25,26… instead of
+    // restarting at 1. Persist them alongside the inline streaming metadata.
+    // NULL on every pre-existing row and on local items (which read the numbers
+    // from the joined `tracks` row), so nothing else changes.
+    Migration {
+        version: 65,
+        name: "add_queue_item_track_disc_number",
+        up: "", // Applied programmatically via add_column_if_missing (idempotent).
+    },
+    // Instantané d'identité des favoris : les favoris référencent des rowids
+    // d'albums/pistes/artistes, mais ces ids ne survivent pas à un rescan qui
+    // recrée les items (racines music déplacées, library clear, fusion de
+    // doublons) — cœurs éteints et filtre « Favoris » vide (bug .18, v0.9.50).
+    // On fige titre/artiste/chemin à l'ajout du favori pour re-rattacher
+    // l'item vivant par identité (db::favorites_reconcile). NULL sur les
+    // favoris existants ; backfillé à la première réconciliation.
+    Migration {
+        version: 66,
+        name: "add_favorites_identity_snapshot",
+        up: "", // Applied programmatically via add_column_if_missing (idempotent).
+    },
+    // The seeded "🖼️ Sans pochette" collection carried a placeholder rule
+    // (`format is_not_empty` — i.e. every track in the library) instead of an
+    // actual no-cover test; the rule engine supports `cover_path is_empty`, so
+    // point the seed at it. Guarded on the exact placeholder rules string so a
+    // user-customized collection is never touched; idempotent by the same
+    // guard. Fresh installs seed the placeholder in migration 41 and correct it
+    // here in the same run.
+    Migration {
+        version: 67,
+        name: "fix_sans_pochette_rule",
+        up: "
+UPDATE smart_collections
+SET rules = '[{\"field\":\"cover_path\",\"operator\":\"is_empty\",\"value\":\"\"}]'
+WHERE name LIKE '%pochette%'
+  AND rules = '[{\"field\":\"format\",\"operator\":\"is_not_empty\",\"value\":\"\"}]';
+",
+    },
+    Migration {
+        version: 68,
+        name: "add_album_metadata_table",
+        up: "
+CREATE TABLE IF NOT EXISTS album_metadata (
+    album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (album_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
+",
+    },
+    // Signalements de métadonnées : jusqu'ici le seul report (image artiste)
+    // squattait la table settings (clé reported_artist_image_{id}) — aucune
+    // liste, aucune agrégation, aucun envoi cloud possible.
+    Migration {
+        version: 69,
+        name: "add_metadata_reports_table",
+        up: "
+CREATE TABLE IF NOT EXISTS metadata_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity TEXT NOT NULL,
+    entity_id INTEGER,
+    mbid TEXT,
+    field TEXT,
+    value TEXT,
+    reason TEXT NOT NULL,
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    pushed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_metadata_reports_entity ON metadata_reports(entity, entity_id);
+",
+    },
+    Migration {
+        version: 70,
+        name: "drop_dead_fip_webradios",
+        // Two seeded FIP webradios have no stream left: Radio France answers 404
+        // on both slugs while every other seeded FIP answers 200. They were dead
+        // rows in every library created before this migration — a user picking
+        // them got silence and no explanation (forum #626, Jean Valjean).
+        //
+        // Matched on the URL, never on the name: the name is what the user may
+        // have edited, the URL is what identifies the dead stream. A station the
+        // user retargeted to a working URL therefore survives, and a favourite
+        // pointing at one of these rows loses a station that could not play
+        // anyway. Idempotent — a second run deletes nothing.
+        up: "
+DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiplatino-hifi.aac';
+DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac';
+",
+    },
+    Migration {
+        version: 71,
+        name: "add_tracks_cover_path",
+        // Column added programmatically below (add_column_if_missing) so a
+        // re-run on a db that already has it is a no-op rather than an error.
+        up: "",
+    },
+    Migration {
+        version: 72,
+        name: "add_zones_lyrics_offset_ms",
+        // Colonne ajoutee par add_column_if_missing ci-dessous : un re-passage
+        // sur une base qui l'a deja est alors sans effet plutot qu'en erreur.
+        up: "",
+    },
+    // Compilations déjà indexées, éclatées en un album par artiste (#1440) :
+    // le scanner ne les produit plus, mais les bibliothèques existantes les
+    // gardent. Le travail réel est dans `merge_scattered_compilations`.
+    Migration {
+        version: 73,
+        name: "merge_scattered_compilations",
+        up: "SELECT 1;",
+    },
+    // Corrections que la communauté propose sur les métadonnées de cet
+    // instance. Elles arrivent du cloud et attendent la validation de
+    // l'utilisateur : `decision` NULL = en attente.
+    //
+    // Local d'abord, comme les signalements : la ligne est ce qui fait foi, et
+    // le renvoi de la décision au cloud est un effet de bord au-dessus. Une
+    // décision prise hors ligne n'est pas perdue, elle repart au cycle suivant.
+    Migration {
+        version: 74,
+        name: "add_metadata_proposals_table",
+        up: "
+CREATE TABLE IF NOT EXISTS metadata_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity TEXT NOT NULL,
+    cloud_entity_id INTEGER NOT NULL,
+    local_id INTEGER NOT NULL,
+    title TEXT,
+    artist TEXT,
+    field TEXT NOT NULL,
+    current_value TEXT,
+    proposed_value TEXT,
+    servers_count INTEGER NOT NULL DEFAULT 0,
+    fetched_at TEXT NOT NULL,
+    decision TEXT,
+    decided_at TEXT,
+    pushed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_proposals_key
+    ON metadata_proposals(entity, cloud_entity_id, field);
+CREATE INDEX IF NOT EXISTS idx_metadata_proposals_pending
+    ON metadata_proposals(decision, servers_count);
+",
+    },
+    Migration {
+        version: 75,
+        name: "dsd_replaygain_rescale",
+        up: "
+-- #1638 : le decimateur DSD->PCM applique desormais l'echelle SACD (+6 dB).
+-- Les ReplayGain calcules par NOTRE analyse sur l'ancienne echelle sont faux
+-- de ~6 dB : on les efface pour que le sweep les recalcule. Portee stricte :
+-- 1) les pistes DSD passees par l'analyse (sentinelle rg_analyzed) — les RG
+--    venus des TAGS du fichier (pas de sentinelle) sont preserves ;
+-- 2) les cles d'ALBUM de tout album contenant une telle piste (le gain
+--    d'album mele les LUFS de toutes les pistes) — sans toucher aux gains de
+--    PISTE des voisines PCM.
+DELETE FROM track_metadata
+WHERE key IN ('rg_analyzed','rg_track_gain','rg_track_peak','rg_album_gain','rg_album_peak','rg_skipped_oversized')
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    JOIN track_metadata m ON m.track_id = t.id AND m.key = 'rg_analyzed'
+    WHERE lower(COALESCE(t.format,'')) IN ('dsd','dsf','dff','dsdiff')
+       OR lower(t.file_path) LIKE '%.dsf'
+       OR lower(t.file_path) LIKE '%.dff'
+  );
+
+DELETE FROM track_metadata
+WHERE key IN ('rg_album_gain','rg_album_peak')
+  AND track_id IN (
+    SELECT t2.id FROM tracks t2
+    WHERE t2.album_id IS NOT NULL AND t2.album_id IN (
+      SELECT t.album_id FROM tracks t
+      WHERE (lower(COALESCE(t.format,'')) IN ('dsd','dsf','dff','dsdiff')
+          OR lower(t.file_path) LIKE '%.dsf'
+          OR lower(t.file_path) LIKE '%.dff')
+        AND t.album_id IS NOT NULL
+    )
+  );
+",
+    },
+    Migration {
+        version: 76,
+        name: "cue_virtual_tracks",
+        // Les colonnes elles-memes sont posees par add_column_if_missing (voir
+        // plus bas) : un ALTER TABLE ici planterait en « duplicate column name »
+        // sur une base neuve, ou CORE_SCHEMA les a deja.
+        //
+        // Ce qui se joue ici est l'UNICITE. `tracks.file_path` est UNIQUE, et
+        // une feuille CUE produit N pistes pointant vers LE MEME fichier. Plutot
+        // que de retirer cette contrainte — impossible en ligne sous SQLite,
+        // qui exigerait de reconstruire toute la table `tracks` —, les pistes
+        // virtuelles laissent `file_path` NUL (UNIQUE tolere plusieurs NULL, sur
+        // les deux moteurs) et portent le vrai chemin dans `cue_media_path`.
+        //
+        // ⚠️ `up:` est VIDE a dessein. Le runner execute `up:` AVANT les blocs
+        // `if migration.version == N`, donc un CREATE INDEX ecrit ici porterait
+        // sur des colonnes pas encore ajoutees, echouerait, et un echec de
+        // migration casse tout le runner (vecu chez JF, sentinelle 99).
+        // Colonnes ET index sont donc poses ensemble, dans le bloc de version.
+        up: "",
+    },
 ];
+
+/// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
+/// tables into the unified `queue_items` table. Idempotent: copies only when
+/// `queue_items` is empty, so re-runs never duplicate. Tolerant of a missing
+/// `streaming_queue` table (it is lazily created by the repo). Created without
+/// FK constraints so orphaned rows migrate cleanly; the fresh CORE_SCHEMA
+/// version carries the FKs.
+fn migrate_to_unified_queue(db: &SqliteDb) {
+    let conn = db.connection().lock().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queue_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zone_id INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            is_current INTEGER DEFAULT 0,
+            track_id INTEGER,
+            source TEXT,
+            source_id TEXT,
+            title TEXT,
+            artist TEXT,
+            album TEXT,
+            cover_url TEXT,
+            duration_ms INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_items_zone_id ON queue_items(zone_id);",
+    )
+    .ok();
+
+    // Only copy once — when the unified table has no rows yet.
+    let already: i64 = conn
+        .query_row("SELECT COUNT(*) FROM queue_items", [], |r| r.get(0))
+        .unwrap_or(0);
+    if already > 0 {
+        return;
+    }
+
+    // Local rows: keep track_id, tag source='local'. Display fields stay NULL
+    // (joined from tracks at read time, as before).
+    conn.execute_batch(
+        "INSERT INTO queue_items (zone_id, position, is_current, track_id, source, duration_ms)
+         SELECT zone_id, position, is_current, track_id, 'local', 0 FROM play_queue;",
+    )
+    .ok();
+
+    // Streaming rows: inline metadata. Tolerant if streaming_queue is absent.
+    conn.execute_batch(
+        "INSERT INTO queue_items (zone_id, position, is_current, source, source_id, title, artist, album, cover_url, duration_ms)
+         SELECT zone_id, position, 0, source, source_id, title, artist, album, cover_url, duration_ms FROM streaming_queue;",
+    )
+    .ok();
+
+    // Data is now in queue_items — drop the legacy split tables. This runs only
+    // on the one-time copy pass (the early return above skips it afterwards),
+    // so the drop always immediately follows a successful copy.
+    conn.execute_batch("DROP TABLE IF EXISTS play_queue; DROP TABLE IF EXISTS streaming_queue;")
+        .ok();
+}
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
     let conn = db.connection().lock().unwrap();
@@ -714,6 +1083,440 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
             "ALTER TABLE {table} ADD COLUMN {column} {col_type};"
         ))
         .ok();
+    }
+}
+
+/// Undo the quality tier the old scanner wrote into album titles.
+///
+/// Reads the candidates, strips with
+/// [`crate::scanner::quality::strip_quality_suffix`] — a parser, so titles whose
+/// parentheses hold something real ("Remastered", a year) are left alone — and
+/// writes back only what actually changed. The `albums_fts` update trigger keeps
+/// search in step.
+///
+/// Not merged with any same-titled album that may now exist: two rows sharing a
+/// title are legitimate once the folder decides identity (a CD rip and a hi-res
+/// copy), and the client tells them apart by their quality badge.
+fn strip_quality_suffixes_from_album_titles(db: &SqliteDb) {
+    let candidates: Vec<(i64, String)> = {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, title FROM albums \
+             WHERE title LIKE '%Hz)%' OR title LIKE '%bit)%' \
+                OR title LIKE '%Hz/%' OR title LIKE '%Hz %'",
+        ) else {
+            return;
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => return,
+        }
+    };
+
+    let mut renamed = 0usize;
+    for (id, title) in candidates {
+        let stripped = crate::scanner::quality::strip_quality_suffix(&title);
+        if stripped.is_empty() || stripped == title {
+            continue;
+        }
+        let params: [&dyn rusqlite::types::ToSql; 2] = [&stripped, &id];
+        if db
+            .execute("UPDATE albums SET title = ? WHERE id = ?", &params)
+            .is_ok()
+        {
+            renamed += 1;
+        }
+    }
+    if renamed > 0 {
+        info!(renamed, "album_quality_suffixes_stripped");
+    }
+}
+
+/// Recolle les compilations déjà indexées en un album par artiste (#1440).
+///
+/// Le rangement Qobuz d'une compilation met chaque piste dans le dossier de SON
+/// artiste : une anthologie de quarante titres devient quarante albums d'une
+/// piste. Le scanner sait désormais l'éviter à l'import, mais les bibliothèques
+/// existantes gardent leurs fausses entrées — 22 familles et 172 lignes sur un
+/// serveur de test de 2 144 albums.
+///
+/// Applique EXACTEMENT les mêmes critères que le chemin de scan
+/// ([`crate::scanner::compilation`]) : même titre, dossiers frères éparpillés,
+/// et numéros de piste qui ne se chevauchent pas. La grappe entière est
+/// abandonnée à la première collision — deux « Greatest Hits » distincts
+/// commencent tous deux à la piste 1, et rien ne doit les rapprocher.
+///
+/// La ligne survivante est le plus petit id, comme pour la fusion par qualité :
+/// c'est la plus ancienne, donc celle dont la pochette et la note sont établies.
+fn merge_scattered_compilations(db: &SqliteDb) {
+    use crate::scanner::compilation::is_scattered_sibling;
+    use std::collections::HashMap;
+
+    // titre normalisé -> [(id, dossier, numéros de piste)]
+    let mut by_title: HashMap<String, Vec<(i64, String, Vec<i32>)>> = HashMap::new();
+    {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT a.id, a.title, a.folder_path FROM albums a \
+             WHERE a.folder_path IS NOT NULL AND a.folder_path <> '' ORDER BY a.id",
+        ) else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        let albums: Vec<(i64, String, String)> = rows.filter_map(Result::ok).collect();
+        drop(stmt);
+        for (id, title, folder) in albums {
+            let mut nums = Vec::new();
+            if let Ok(mut ts) = conn.prepare(
+                "SELECT track_number FROM tracks WHERE album_id = ? AND track_number IS NOT NULL",
+            ) {
+                if let Ok(r) = ts.query_map([id], |row| row.get::<_, i64>(0)) {
+                    nums = r.filter_map(Result::ok).map(|n| n as i32).collect();
+                }
+            }
+            by_title
+                .entry(title.trim().to_lowercase())
+                .or_default()
+                .push((id, folder, nums));
+        }
+    }
+
+    let mut merged = 0usize;
+    for (_, albums) in by_title {
+        if albums.len() < 2 {
+            continue;
+        }
+        // Grappes de dossiers frères éparpillés, par rattachement transitif.
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for (i, (_, folder, _)) in albums.iter().enumerate() {
+            match clusters.iter_mut().find(|c| {
+                c.iter()
+                    .any(|&j| is_scattered_sibling(folder, &albums[j].1))
+            }) {
+                Some(c) => c.push(i),
+                None => clusters.push(vec![i]),
+            }
+        }
+
+        // Une grappe peut contenir PLUSIEURS volumes portant le même titre :
+        // « ALLOPOP » en compte quatre, soit 41 dossiers sous `Qobuz/`. On les
+        // sépare par l'empreinte de la pochette DÉPOSÉE dans le dossier —
+        // copiée à l'identique dans tous les dossiers d'un même volume, alors
+        // que la jaquette extraite des pistes, elle, diffère à chaque fichier
+        // (mesuré sur .18 : 41 dossiers → 4 pochettes → 4 volumes).
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
+        for cluster in clusters.iter().filter(|c| c.len() > 1) {
+            let empreintes: Vec<_> = cluster
+                .iter()
+                .map(|&i| crate::scanner::compilation::folder_cover_fingerprint(&albums[i].1))
+                .collect();
+            let (groupes, sans_pochette) = crate::scanner::compilation::group_by_cover(&empreintes);
+            // Sans pochette, aucune séparation possible : la grappe reste
+            // entière et c'est le chevauchement des numéros qui tranchera.
+            // Mais des dossiers sans pochette au milieu d'autres qui en ont ne
+            // se rattachent à rien : on ne devine pas à quel volume ils vont.
+            if sans_pochette.len() == cluster.len() && cluster.len() > 1 {
+                partitions.push(cluster.clone());
+                continue;
+            }
+            for membres in groupes {
+                if membres.len() > 1 {
+                    partitions.push(membres.into_iter().map(|k| cluster[k]).collect());
+                }
+            }
+        }
+
+        for cluster in &partitions {
+            // Un seul numéro en double dans la partition et on renonce : ce
+            // sont des homonymes, pas les éclats d'un même disque.
+            let mut seen: Vec<i32> = Vec::new();
+            let mut collision = false;
+            for &i in cluster {
+                for n in &albums[i].2 {
+                    if seen.contains(n) {
+                        collision = true;
+                        break;
+                    }
+                    seen.push(*n);
+                }
+                if collision {
+                    break;
+                }
+            }
+            if collision || seen.is_empty() {
+                continue;
+            }
+
+            let mut ids: Vec<i64> = cluster.iter().map(|&i| albums[i].0).collect();
+            ids.sort_unstable();
+            let Some((keep, absorbed)) = ids.split_first() else {
+                continue;
+            };
+            let conn = db.connection().lock().unwrap();
+            for drop_id in absorbed {
+                for sql in [
+                    "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                    "UPDATE listen_history SET album_id = ? WHERE album_id = ?",
+                    "UPDATE OR IGNORE album_ratings SET album_id = ? WHERE album_id = ?",
+                    "UPDATE OR IGNORE metadata_suggestions SET album_id = ? WHERE album_id = ?",
+                ] {
+                    let params: [&dyn rusqlite::types::ToSql; 2] = [keep, drop_id];
+                    conn.execute(sql, &params[..]).ok();
+                }
+                let params: [&dyn rusqlite::types::ToSql; 1] = [drop_id];
+                conn.execute("DELETE FROM albums WHERE id = ?", &params[..])
+                    .ok();
+                merged += 1;
+            }
+        }
+    }
+
+    if merged > 0 {
+        info!(merged, "scattered_compilations_merged");
+    }
+
+    split_wrongly_merged_albums(db);
+}
+
+/// Redécoupe les albums fusionnés à tort par la régression des 0.9.66/0.9.67
+/// (#1470) : un même album y porte les pistes de plusieurs disques.
+///
+/// Recoller ne suffit pas — les bibliothèques déjà rescannées ont le problème
+/// INVERSE. Sur .18, les quatre volumes « ALLOPOP » tiennent dans un album de
+/// 71 pistes, chaque numéro en quatre exemplaires.
+///
+/// Critère unique, le même que partout ailleurs : la pochette déposée dans le
+/// dossier de chaque piste. Deux pochettes dans un album ⇒ deux disques. Le
+/// plus gros groupe reste sur la ligne d'origine, qui garde ainsi sa pochette,
+/// sa biographie et sa note ; les autres reçoivent une ligne neuve.
+///
+/// Une piste dont le dossier n'a pas de pochette ne bouge pas : on ne devine
+/// pas à quel disque la rattacher.
+fn split_wrongly_merged_albums(db: &SqliteDb) {
+    use crate::scanner::compilation::{CoverFingerprint, folder_cover_fingerprint, group_by_cover};
+    use std::collections::HashMap;
+
+    // album -> dossier -> pistes
+    let mut par_album: HashMap<i64, HashMap<String, Vec<i64>>> = HashMap::new();
+    {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT t.id, t.album_id, t.file_path FROM tracks t \
+             WHERE t.album_id IS NOT NULL AND t.file_path IS NOT NULL",
+        ) else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        for (track_id, album_id, path) in rows.filter_map(Result::ok) {
+            let Some(folder) = crate::scanner::album_folder::album_folder(&path) else {
+                continue;
+            };
+            par_album
+                .entry(album_id)
+                .or_default()
+                .entry(folder)
+                .or_default()
+                .push(track_id);
+        }
+    }
+
+    // Une pochette se décode UNE fois par dossier, pas une fois par piste :
+    // .18 compte 49 000 pistes pour 2 300 albums, soit vingt fois trop de
+    // décodages JPEG si l'on interrogeait le disque piste à piste.
+    let mut empreintes: HashMap<&str, Option<CoverFingerprint>> = HashMap::new();
+    for dossiers in par_album.values() {
+        for dossier in dossiers.keys() {
+            empreintes
+                .entry(dossier.as_str())
+                .or_insert_with(|| folder_cover_fingerprint(dossier));
+        }
+    }
+
+    let mut separes = 0usize;
+    for (album_id, par_dossier) in &par_album {
+        if par_dossier.len() < 2 {
+            continue;
+        }
+        // Ordre déterminé par le nom du dossier : l'itération d'une table de
+        // hachage ne l'est pas, et c'est elle qui décide quel groupe garde la
+        // ligne d'origine en cas d'égalité de taille.
+        let mut dossiers: Vec<&String> = par_dossier.keys().collect();
+        dossiers.sort();
+        let cles: Vec<Option<CoverFingerprint>> = dossiers
+            .iter()
+            .map(|d| empreintes.get(d.as_str()).copied().flatten())
+            .collect();
+        // Les dossiers sans pochette ne bougent pas : ils restent sur la ligne
+        // d'origine, faute de savoir à quel disque les rattacher.
+        let (groupes, _sans_pochette) = group_by_cover(&cles);
+        if groupes.len() < 2 {
+            continue;
+        }
+        // Le plus gros groupe garde la ligne d'origine.
+        let mut groupes: Vec<Vec<i64>> = groupes
+            .into_iter()
+            .map(|membres| {
+                membres
+                    .into_iter()
+                    .flat_map(|k| par_dossier[dossiers[k]].iter().copied())
+                    .collect()
+            })
+            .collect();
+        groupes.sort_by_key(|pistes| std::cmp::Reverse(pistes.len()));
+        let album_id = *album_id;
+        let conn = db.connection().lock().unwrap();
+        let Ok((titre, artist_id, year)) = conn.query_row(
+            "SELECT title, artist_id, year FROM albums WHERE id = ?",
+            [album_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        ) else {
+            continue;
+        };
+        for pistes in groupes.iter().skip(1) {
+            let params: [&dyn rusqlite::types::ToSql; 3] = [&titre, &artist_id, &year];
+            if conn
+                .execute(
+                    "INSERT INTO albums (title, artist_id, year) VALUES (?, ?, ?)",
+                    &params[..],
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let nouveau = conn.last_insert_rowid();
+            for piste in pistes {
+                let params: [&dyn rusqlite::types::ToSql; 2] = [&nouveau, piste];
+                conn.execute("UPDATE tracks SET album_id = ? WHERE id = ?", &params[..])
+                    .ok();
+            }
+            separes += 1;
+        }
+    }
+
+    if separes > 0 {
+        info!(separes, "wrongly_merged_albums_split");
+    }
+}
+
+/// Fold same-titled albums that share a folder back into one row.
+///
+/// The old quality split turned one release into several albums, one per tier.
+/// Grouping by (artist, title, album folder) puts those back together while
+/// leaving apart what should be: two rips in two folders keep their own rows.
+///
+/// The surviving row is the lowest id — the one the library has had longest, so
+/// its cover, biography and rating are the ones kept. Rows referencing the
+/// absorbed albums (`tracks`, `listen_history`, `album_ratings`,
+/// `metadata_suggestions`) are repointed first; a rating already present on the
+/// survivor wins, since `album_ratings` is unique per (album, profile).
+fn merge_albums_split_by_quality(db: &SqliteDb) {
+    use std::collections::HashMap;
+
+    // (artist_id, title, album folder) -> album ids, ascending.
+    let mut groups: HashMap<(i64, String, String), Vec<i64>> = HashMap::new();
+    {
+        let conn = db.connection().lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT a.id, COALESCE(a.artist_id, 0), a.title, \
+                    (SELECT t.file_path FROM tracks t WHERE t.album_id = a.id ORDER BY t.id LIMIT 1) \
+             FROM albums a ORDER BY a.id",
+        ) else {
+            return;
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        });
+        let Ok(rows) = rows else { return };
+        for (id, artist_id, title, first_path) in rows.filter_map(Result::ok) {
+            // No track, no folder, nothing to merge on.
+            let Some(folder) = first_path
+                .as_deref()
+                .and_then(crate::scanner::album_folder::album_folder)
+                .filter(|f| !f.is_empty())
+            else {
+                continue;
+            };
+            groups
+                .entry((artist_id, title.trim().to_lowercase(), folder))
+                .or_default()
+                .push(id);
+        }
+    }
+
+    let mut merged = 0usize;
+    for ((_, _, folder), ids) in groups {
+        let Some((keep, absorbed)) = ids.split_first() else {
+            continue;
+        };
+        if absorbed.is_empty() {
+            // Single row: still record its folder so the scanner recognises it
+            // without a rescan.
+            let params: [&dyn rusqlite::types::ToSql; 2] = [&folder, keep];
+            db.execute(
+                "UPDATE albums SET folder_path = ? WHERE id = ? AND folder_path IS NULL",
+                &params,
+            )
+            .ok();
+            continue;
+        }
+        for drop_id in absorbed {
+            for sql in [
+                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                "UPDATE listen_history SET album_id = ? WHERE album_id = ?",
+                "UPDATE OR IGNORE album_ratings SET album_id = ? WHERE album_id = ?",
+                "UPDATE OR IGNORE metadata_suggestions SET album_id = ? WHERE album_id = ?",
+            ] {
+                let params: [&dyn rusqlite::types::ToSql; 2] = [keep, drop_id];
+                // A table may not exist on an old database — ignore and go on.
+                db.execute(sql, &params).ok();
+            }
+            let params: [&dyn rusqlite::types::ToSql; 1] = [drop_id];
+            db.execute("DELETE FROM albums WHERE id = ?", &params).ok();
+            merged += 1;
+        }
+        let params: [&dyn rusqlite::types::ToSql; 2] = [&folder, keep];
+        db.execute("UPDATE albums SET folder_path = ? WHERE id = ?", &params)
+            .ok();
+        let params: [&dyn rusqlite::types::ToSql; 1] = [keep];
+        db.execute(
+            "UPDATE albums SET track_count = \
+             (SELECT COUNT(*) FROM tracks WHERE album_id = albums.id) WHERE id = ?",
+            &params,
+        )
+        .ok();
+    }
+    if merged > 0 {
+        info!(merged, "albums_split_by_quality_merged");
     }
 }
 
@@ -885,16 +1688,38 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         info!(version = 1, "migration_marked_existing");
     }
 
+    // Ce qui reste à faire, AVANT de le faire : sans ce décompte il n'y avait
+    // rien à annoncer — ni dans le journal, ni à l'écran d'attente (#1701). Le
+    // « +1 » est la passe finale (colonnes de sûreté, file unifiée, ANALYZE),
+    // qui tourne à chaque démarrage et pèse, elle aussi, sur une grosse base.
+    let floor = current_version.max(if tables_exist { 1 } else { 0 });
+    let pending = MIGRATIONS.iter().filter(|m| m.version > floor).count();
+    let started = std::time::Instant::now();
+    migration_status::begin("sqlite", pending + 1);
+    if pending > 0 {
+        info!(
+            from = floor,
+            to = latest_version(),
+            pending,
+            "migration_start"
+        );
+    }
+
+    let mut done = 0usize;
     for migration in MIGRATIONS {
-        if migration.version <= current_version.max(if tables_exist { 1 } else { 0 }) {
+        if migration.version <= floor {
             continue;
         }
 
         info!(
             version = migration.version,
             name = migration.name,
+            step = done + 1,
+            total = pending + 1,
             "migration_applying"
         );
+        migration_status::advance(migration.name, done);
+        let step_started = std::time::Instant::now();
 
         if !migration.up.is_empty() {
             db.execute_batch(migration.up)?;
@@ -917,6 +1742,19 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 11 {
             add_column_if_missing(db, "albums", "genres", "TEXT");
             add_column_if_missing(db, "tracks", "genres", "TEXT");
+        }
+        if migration.version == 72 {
+            // Décalage des paroles par zone — forum #1328.
+            add_column_if_missing(
+                db,
+                "zones",
+                "lyrics_offset_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            );
+        }
+        if migration.version == 71 {
+            // Per-track cover — see migration 71 and forum #1312.
+            add_column_if_missing(db, "tracks", "cover_path", "TEXT");
         }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
@@ -1016,9 +1854,59 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 add_column_if_missing(db, table, "bio_fetched_at", "TEXT");
             }
         }
-        if migration.version == 55 {
+        if migration.version == 57 {
             // Scope playlists per profile. Existing rows default to profile 1 (Default).
+            // (Version 57 on the v0.9 line; 55 on main — see the migration entry.)
             add_column_if_missing(db, "playlists", "profile_id", "INTEGER NOT NULL DEFAULT 1");
+        }
+        if migration.version == 59 {
+            // Match subscriptions by streaming source id (Apple Podcasts id), not
+            // just feed_url — keeps the browse "S'abonner" button in sync (Fabien).
+            add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");
+        }
+        if migration.version == 60 {
+            // The album's folder on disk — see the migration's comment.
+            add_column_if_missing(db, "albums", "folder_path", "TEXT");
+            db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_albums_folder_path \
+                 ON albums(folder_path) WHERE folder_path IS NOT NULL",
+            )
+            .ok();
+        }
+        if migration.version == 61 {
+            strip_quality_suffixes_from_album_titles(db);
+        }
+        if migration.version == 62 {
+            merge_albums_split_by_quality(db);
+        }
+        if migration.version == 73 {
+            merge_scattered_compilations(db);
+        }
+        if migration.version == 64 {
+            add_column_if_missing(db, "alarms", "profile_id", "INTEGER");
+        }
+        if migration.version == 65 {
+            // Per-album numbering for streaming queue items — see the migration's
+            // comment. add_column_if_missing keeps this a no-op on a fresh DB
+            // (CORE_SCHEMA already carries the columns) and safe on partial re-runs.
+            add_column_if_missing(db, "queue_items", "track_number", "INTEGER");
+            add_column_if_missing(db, "queue_items", "disc_number", "INTEGER");
+        }
+        if migration.version == 76 {
+            // Pistes virtuelles d'une feuille CUE : `cue_media_path` porte le
+            // vrai fichier audio, `file_path` restant NUL pour ces pistes.
+            add_column_if_missing(db, "tracks", "cue_media_path", "TEXT");
+            add_column_if_missing(db, "tracks", "cue_start_ms", "INTEGER");
+            add_column_if_missing(db, "tracks", "cue_end_ms", "INTEGER");
+            // L'index vient APRES les colonnes, et ici plutot que dans `up:` —
+            // que le runner execute avant ce bloc. Il rend une identite aux
+            // pistes virtuelles : sans lui, chaque scan les recreerait, faute de
+            // pouvoir les retrouver (`file_path` etant NUL pour toutes).
+            let _ = db.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_cue_identity \
+                 ON tracks(cue_media_path, cue_start_ms) \
+                 WHERE cue_media_path IS NOT NULL;",
+            );
         }
 
         db.execute(
@@ -1029,12 +1917,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ],
         )?;
 
+        done += 1;
         info!(
             version = migration.version,
             name = migration.name,
+            ms = step_started.elapsed().as_millis() as u64,
             "migration_applied"
         );
     }
+
+    migration_status::advance("contrôles finaux", done);
 
     // Post-migration safety pass: ensure critical columns always exist regardless
     // of what migration version the DB came from. This guards against:
@@ -1064,15 +1956,54 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // no FLAC transcode). Off by default — ALAC and AAC share the audio/mp4
     // MIME, so it can't be auto-detected safely.
     add_column_if_missing(db, "zones", "alac_passthrough", "INTEGER DEFAULT 0");
+    // Opt-in : servir l'AAC tel quel au renderer qui le décode, au lieu de le
+    // transcoder en FLAC. Demandé par Marco Polo (#1424) pour un Marantz SR7009
+    // et un Denon RC12, qui l'acceptent nativement.
+    //
+    // L'AAC étant déjà compressé avec perte, le gain n'est pas la qualité — le
+    // transcodage n'ajoute pas de perte audible — mais la RÉACTIVITÉ : plus de
+    // réencodage avant le premier octet, et pas de charge processeur.
+    //
+    // Éteint par défaut, comme alac_passthrough et pour la même raison : un
+    // renderer qui ANNONCE l'AAC peut le refuser dans un conteneur ou à un
+    // débit donné. Détecté automatiquement, cela produirait un silence
+    // inexpliqué — le pire symptôme. Celui qui active sait ce que son appareil
+    // fait vraiment ; les autres ne voient aucun changement.
+    add_column_if_missing(db, "zones", "aac_passthrough", "INTEGER DEFAULT 0");
     // Opt-in: transcode lossless to WAV/LPCM (not FLAC) for this DLNA renderer.
     // Skips the slow native FLAC encoder for hi-res AND avoids renderers whose
     // ALAC decoder pops at start (Yves, LHC-56). Overrides alac_passthrough.
     add_column_if_missing(db, "zones", "dlna_lpcm", "INTEGER DEFAULT 0");
+    // Opt-in: cap this DLNA renderer's output to 16-bit. Some renderers advertise
+    // `audio/flac` (so Tune sends hi-res FLAC/ALAC direct) but only decode 16-bit
+    // internally — 24-bit direct plays SILENCE (Ruark R3, Yves forum #1137). This
+    // forces a 16-bit downconvert (kept as FLAC) instead of direct passthrough,
+    // without regressing renderers that genuinely play 24-bit.
+    add_column_if_missing(db, "zones", "dlna_cap_16bit", "INTEGER DEFAULT 0");
+    // Opt-in: serve genuine 24-bit WAV to this DLNA renderer (instead of the
+    // 16-bit LPCM fallback). Only safe on renderers that advertise `audio/L24`
+    // in their GetProtocolInfo Sink — the UI only offers the toggle when the
+    // capability probe reports `lpcm24`. The 24-bit WAV is advertised WITHOUT
+    // the 16-bit-only `DLNA.ORG_PN=LPCM` profile so a strict renderer no longer
+    // maps it back to 16-bit and reads misaligned samples (the #1137 silence
+    // class). Off by default; overrides dlna_lpcm/dlna_cap_16bit when set.
+    add_column_if_missing(db, "zones", "dlna_wav24", "INTEGER DEFAULT 0");
+    // Per-zone SetAVTransportURI→Play delay in ms (default 0 = use the config /
+    // device-name default). Lets a renderer with a cold-start under-run (first
+    // seconds hachées — Cyrille, Yamaha R-N2000A) buffer before its transport
+    // clock starts, the network analogue of the local ring-buffer prefill.
+    // Overrides `[device_delays]` / `dlna_play_delay_ms` from config.
+    add_column_if_missing(db, "zones", "dlna_play_delay_ms", "INTEGER DEFAULT 0");
     // Physical host (IP) of the renderer, used to dedup DLNA zones across
     // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
     // N12 after a restart) must reconnect to its existing zone instead of
     // spawning a duplicate (forum #942).
     add_column_if_missing(db, "zones", "host", "TEXT");
+    // MAC of the renderer (Phase B of the MAC-identity chantier): the durable
+    // cross-protocol key. A Bluesound Node discovered as BluOS + DLNA +
+    // OpenHome must end up with ONE zone even when names and UUIDs all
+    // differ and the IP changes (forum #1239, Bilou: 3 « Node » zones).
+    add_column_if_missing(db, "zones", "mac", "TEXT");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
@@ -1085,6 +2016,24 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
 
+    // Podcast subscriptions matched by streaming source id (migration v59). Safety
+    // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
+    add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");
+
+    // Instantané d'identité des favoris (migration v66) : titre/artiste/chemin
+    // figés à l'ajout, pour re-rattacher un favori quand un rescan renouvelle
+    // les rowids (racines music déplacées, library clear — bug .18). Passe de
+    // sûreté idempotente ; voir db::favorites_reconcile.
+    add_column_if_missing(db, "favorites", "item_name", "TEXT");
+    add_column_if_missing(db, "favorites", "item_artist", "TEXT");
+    add_column_if_missing(db, "favorites", "item_path", "TEXT");
+
+    // Provenance d'un embedding CLAP (#1732 phase 1) : NULL = analysé sur le
+    // fichier, 'inherited:<id>' = copié depuis une jumelle (le DSD est exclu
+    // de l'analyse ; l'héritage est sa seule voie vers les ambiances). Passe
+    // de sûreté idempotente, PG : migration 025.
+    add_column_if_missing(db, "track_audio_embedding", "source", "TEXT");
+
     // Persistent "date added" side table (survives full rescan). CREATE IF NOT
     // EXISTS here too so DBs from any prior version get it regardless of which
     // migration version they came from.
@@ -1093,13 +2042,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
-    // streaming_queue is created by migration v53, but that only runs when a DB
-    // upgrades THROUGH v53 — and on Windows a migration can fail silently (file
-    // locking) or the tracking row can be written without the CREATE taking.
-    // Re-create it unconditionally here (IF NOT EXISTS = no-op otherwise) so the
-    // Deezer/streaming connect path never hits "no such table: streaming_queue"
-    // again (forum #951: Bilou/Yan still saw it in v0.8.287+ despite the v53
-    // fix). Schema mirrors migration v53 / play_queue_repo.
+    // Ensure streaming_queue exists BEFORE the unified-queue copy reads it. It
+    // used to be created lazily on first write, so on a fresh DB the unified
+    // migration and the Deezer/streaming connect path could hit "no such table:
+    // streaming_queue" (forum #951: Bilou/Yan, still seen in v0.8.287+ on Windows
+    // where a numbered migration can fail silently). IF NOT EXISTS = no-op
+    // otherwise. Runs every startup, so it is the idempotent guarantee across the
+    // main↔release/v0.9 merge (the numbered migrations may collide/skip).
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS streaming_queue (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -1116,8 +2065,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
-    // Streaming favorites (migration v56); re-create unconditionally so DBs from
-    // any prior version get it regardless of which migration they came from.
+    // Streaming favorites (migration v58 on the v0.9 line); re-create
+    // unconditionally so DBs from any prior version get it regardless of which
+    // migration they came from.
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS streaming_favorites (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -1135,8 +2085,20 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
+    // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
+    // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
+    // on DBs that skipped the numbered unified-queue migration.
+    migrate_to_unified_queue(db);
+
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
+
+    migration_status::finish();
+    info!(
+        applied = pending,
+        ms = started.elapsed().as_millis() as u64,
+        "migrations_complete"
+    );
 
     Ok(())
 }
@@ -1222,6 +2184,91 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "smart_playlists_match_mode",
         include_str!("../../migrations/postgres/009_smart_playlists_match_mode.sql"),
     ),
+    (
+        10,
+        "numeric_column_types",
+        include_str!("../../migrations/postgres/010_numeric_column_types.sql"),
+    ),
+    (
+        11,
+        "history_numeric_column_types",
+        include_str!("../../migrations/postgres/011_history_numeric_column_types.sql"),
+    ),
+    (
+        12,
+        "integer_id_columns",
+        include_str!("../../migrations/postgres/012_integer_id_columns.sql"),
+    ),
+    (
+        13,
+        "numeric_column_types_remaining",
+        include_str!("../../migrations/postgres/013_numeric_column_types_remaining.sql"),
+    ),
+    (
+        14,
+        "album_folder_path",
+        include_str!("../../migrations/postgres/014_album_folder_path.sql"),
+    ),
+    (
+        15,
+        "track_audio_embedding",
+        include_str!("../../migrations/postgres/015_track_audio_embedding.sql"),
+    ),
+    (
+        16,
+        "alarms_profile_id",
+        include_str!("../../migrations/postgres/016_alarms_profile_id.sql"),
+    ),
+    (
+        17,
+        "favorites_identity",
+        include_str!("../../migrations/postgres/017_favorites_identity.sql"),
+    ),
+    (
+        18,
+        "fix_sans_pochette_rule",
+        include_str!("../../migrations/postgres/018_fix_sans_pochette_rule.sql"),
+    ),
+    (
+        19,
+        "album_metadata",
+        include_str!("../../migrations/postgres/019_album_metadata.sql"),
+    ),
+    (
+        20,
+        "metadata_reports",
+        include_str!("../../migrations/postgres/020_metadata_reports.sql"),
+    ),
+    (
+        21,
+        "track_cover_path",
+        include_str!("../../migrations/postgres/021_track_cover_path.sql"),
+    ),
+    (
+        22,
+        "zone_lyrics_offset",
+        include_str!("../../migrations/postgres/022_zone_lyrics_offset.sql"),
+    ),
+    (
+        23,
+        "metadata_proposals",
+        include_str!("../../migrations/postgres/023_metadata_proposals.sql"),
+    ),
+    (
+        24,
+        "dsd_replaygain_rescale",
+        include_str!("../../migrations/postgres/024_dsd_replaygain_rescale.sql"),
+    ),
+    (
+        25,
+        "embedding_source",
+        include_str!("../../migrations/postgres/025_embedding_source.sql"),
+    ),
+    (
+        26,
+        "queue_items_numbering",
+        include_str!("../../migrations/postgres/026_queue_items_numbering.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -1247,19 +2294,99 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     .await
     .map_err(|e| format!("pg create schema_version: {e}"))?;
 
+    // Heal databases whose schema_version was created by the SQLite→PG data
+    // migration with `version TEXT` (pg_migrate.rs before this fix) while this
+    // runner and the migration scripts use INTEGER. On such a database
+    // `COALESCE(MAX(version), 0)` mixes text and integer and PG aborts — the
+    // server then panics at startup (JF, v0.9.13: "COALESCE types text and
+    // integer cannot be matched"). Values are always digit strings, so the
+    // in-place cast is safe; no-op once the column is integer.
+    let version_type: Option<String> = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_name = 'schema_version' AND column_name = 'version'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("pg inspect schema_version: {e}"))?;
+    if matches!(
+        version_type.as_deref(),
+        Some("text") | Some("character varying")
+    ) {
+        sqlx::raw_sql(
+            "ALTER TABLE schema_version \
+             ALTER COLUMN version TYPE INTEGER USING version::integer",
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| format!("pg heal schema_version type: {e}"))?;
+        info!("pg_schema_version_column_healed_text_to_integer");
+    }
+
     // What has already been applied?
-    let current: i32 =
+    let mut current: i32 =
         sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
             .fetch_one(pool)
             .await
             .map_err(|e| format!("pg read schema_version: {e}"))?;
 
+    // Databases created by the SQLite→PG data migration are stamped with the
+    // sentinel version 99 ("schema as of the migration date"). 99 outranks
+    // every numbered migration, so scripts added AFTER that date (009
+    // smart_playlists match_mode, 010 numeric column types…) were skipped
+    // forever: JF's force-scan added nothing (album resolution fails with
+    // `operator does not exist: text = bigint`, the exact drift 010 repairs)
+    // and album views 500'd. All numbered scripts are idempotent (007's
+    // destructive DROP is guarded on the broken-id condition since this fix),
+    // so drop the sentinel and let the normal loop bring the database to the
+    // real latest, recording true version rows along the way.
+    if current == 99 {
+        sqlx::raw_sql("DELETE FROM schema_version WHERE version = 99")
+            .execute(pool)
+            .await
+            .map_err(|e| format!("pg drop sentinel 99: {e}"))?;
+        current =
+            sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("pg reread schema_version: {e}"))?;
+        info!(
+            resume_from = current,
+            "pg_sentinel_99_dropped_replaying_idempotent_migrations"
+        );
+    }
+
+    // Même décompte que côté SQLite : de quoi annoncer l'avancement au lieu de
+    // laisser croire à un serveur planté (#1701). Le « +1 » est l'ANALYZE final.
+    let pending = PG_MIGRATIONS
+        .iter()
+        .filter(|&&(v, _, _)| v > current)
+        .count();
+    let started = std::time::Instant::now();
+    migration_status::begin("postgres", pending + 1);
+    if pending > 0 {
+        info!(
+            from = current,
+            to = pg_latest_version(),
+            pending,
+            "pg_migration_start"
+        );
+    }
+
+    let mut done = 0usize;
     for &(version, name, sql) in PG_MIGRATIONS {
         if version <= current {
             continue;
         }
 
-        info!(version, name, "pg_migration_applying");
+        info!(
+            version,
+            name,
+            step = done + 1,
+            total = pending + 1,
+            "pg_migration_applying"
+        );
+        migration_status::advance(name, done);
+        let step_started = std::time::Instant::now();
 
         // Each migration file manages its own BEGIN/COMMIT, so we
         // execute the raw SQL directly.
@@ -1268,8 +2395,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             .await
             .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
 
-        info!(version, name, "pg_migration_applied");
+        done += 1;
+        info!(
+            version,
+            name,
+            ms = step_started.elapsed().as_millis() as u64,
+            "pg_migration_applied"
+        );
     }
+
+    migration_status::advance("contrôles finaux", done);
 
     // Run ANALYZE on key tables for the query planner.
     sqlx::raw_sql("ANALYZE artists; ANALYZE albums; ANALYZE tracks;")
@@ -1277,6 +2412,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         .await
         .ok();
     info!("pg_analyze_complete");
+
+    migration_status::finish();
+    info!(
+        applied = pending,
+        ms = started.elapsed().as_millis() as u64,
+        "pg_migrations_complete"
+    );
 
     Ok(())
 }
@@ -1316,12 +2458,311 @@ mod tests {
     }
 
     #[test]
+    fn unified_queue_exists_after_migrations() {
+        // Regression class (tester Yacine, Synology DS418j — originally on the
+        // legacy streaming_queue): startup's orphan-queue cleanup must never
+        // hit a missing table on a fresh DB. Since the v0.9 unified queue the
+        // cleanup targets queue_items — assert run_migrations creates it and
+        // that the exact startup DELETE succeeds.
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let exists: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='queue_items'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "queue_items must exist after run_migrations");
+
+        // The startup orphan cleanup DELETE must not error on a migrated DB.
+        conn.execute_batch("DELETE FROM queue_items WHERE zone_id NOT IN (SELECT id FROM zones)")
+            .expect("orphan cleanup DELETE must succeed on a migrated DB");
+    }
+
+    #[test]
     fn migrations_are_idempotent() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// Forum #1328 : décalage des paroles par zone. Vérifie la colonne ET son
+    /// défaut — un défaut non nul décalerait les paroles de tout le monde.
+    #[test]
+    fn zones_have_a_lyrics_offset_defaulting_to_zero() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(zones)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "lyrics_offset_ms"),
+            "zones.lyrics_offset_ms manquante : {cols:?}"
+        );
+        conn.execute_batch("INSERT INTO zones (name, output_type) VALUES ('z', 'local');")
+            .unwrap();
+        let off: i64 = conn
+            .query_row(
+                "SELECT lyrics_offset_ms FROM zones WHERE name = 'z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(off, 0, "une zone neuve ne doit decaler aucune parole");
+    }
+
+    /// Forum #1312: a track needs a cover of its own, so a folder the scanner
+    /// had to name itself cannot lend one file's artwork to all the others.
+    #[test]
+    fn tracks_have_their_own_cover_column() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tracks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "cover_path"),
+            "tracks.cover_path missing: {cols:?}"
+        );
+    }
+
+    /// Les pistes virtuelles CUE reposent sur trois colonnes ET un index unique
+    /// partiel. Les colonnes seules ne suffisent pas : sans l'index, rien
+    /// n'identifie une piste virtuelle et chaque scan les recréerait.
+    #[test]
+    fn cue_virtual_tracks_have_their_columns_and_identity_index() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(tracks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["cue_media_path", "cue_start_ms", "cue_end_ms"] {
+            assert!(
+                cols.iter().any(|x| x == c),
+                "tracks.{c} manquante: {cols:?}"
+            );
+        }
+
+        let idx: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tracks'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            idx.iter().any(|i| i == "idx_tracks_cue_identity"),
+            "index d'identité CUE manquant: {idx:?}"
+        );
+    }
+
+    /// Le point qui rend tout le dispositif possible : `file_path` est UNIQUE,
+    /// et plusieurs pistes d'une même feuille CUE partagent un seul fichier.
+    /// C'est légal UNIQUEMENT parce que `UNIQUE` tolère plusieurs `NULL`.
+    /// Si ce comportement changeait, le découpage CUE casserait en silence.
+    #[test]
+    fn unique_file_path_still_tolerates_several_nulls() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        for (start, title) in [(0, "Aria"), (32_000, "Variatio 1"), (125_493, "Variatio 2")] {
+            conn.execute(
+                "INSERT INTO tracks (title, file_path, cue_media_path, cue_start_ms) \
+                 VALUES (?1, NULL, '/m/gould.ape', ?2)",
+                rusqlite::params![title, start],
+            )
+            .expect("plusieurs pistes CUE doivent coexister sur un même fichier");
+        }
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE cue_media_path = '/m/gould.ape'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+
+        // Mais deux pistes au MÊME début sur le MÊME fichier restent interdites :
+        // c'est ce qui empêche un rescan de dupliquer la bibliothèque.
+        let dup = conn.execute(
+            "INSERT INTO tracks (title, file_path, cue_media_path, cue_start_ms) \
+             VALUES ('doublon', NULL, '/m/gould.ape', 0)",
+            [],
+        );
+        assert!(dup.is_err(), "l'index d'identité n'empêche pas le doublon");
+    }
+
+    /// The upgrade path relies on `add_column_if_missing`, so pin its contract:
+    /// it adds the column once and a re-run is a no-op rather than an error.
+    /// Exercised on a throwaway table — mangling `tracks` here would only fight
+    /// its FTS triggers and test nothing extra.
+    #[test]
+    fn add_column_if_missing_is_idempotent() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        add_column_if_missing(&db, "probe", "cover_path", "TEXT");
+        add_column_if_missing(&db, "probe", "cover_path", "TEXT");
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(probe)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            cols.iter().filter(|c| *c == "cover_path").count(),
+            1,
+            "cover_path should be added exactly once: {cols:?}"
+        );
+    }
+
+    /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
+    /// serves. A fresh library must not carry them, and a library that already
+    /// seeded them must lose them.
+    #[test]
+    fn dead_fip_webradios_are_gone() {
+        const DEAD: [&str; 2] = [
+            "https://icecast.radiofrance.fr/fiplatino-hifi.aac",
+            "https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac",
+        ];
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let count_dead = || {
+            let conn = db.connection().lock().unwrap();
+            DEAD.iter()
+                .map(|url| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM radio_stations WHERE url = ?1",
+                        [url],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                })
+                .sum::<i64>()
+        };
+
+        // Fresh install: never seeded.
+        assert_eq!(count_dead(), 0, "dead FIP webradios seeded on a fresh db");
+
+        // Existing install: re-insert them the way an older seed did, then let
+        // the migration run again. It must clean them out, and leave the living
+        // FIP stations alone.
+        {
+            let conn = db.connection().lock().unwrap();
+            for url in DEAD {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country) VALUES ('x', ?1, 'g', 'France')",
+                    [url],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(count_dead(), 2, "test fixture did not insert");
+
+        let live_before = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url LIKE '%fip%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        // Replaying the migration is what an upgrade does for a db still below
+        // version 70; force it here since this db is already at latest.
+        {
+            let conn = db.connection().lock().unwrap();
+
+            let m = MIGRATIONS.iter().find(|m| m.version == 70).unwrap();
+            conn.execute_batch(m.up).unwrap();
+            // Idempotent: a second pass must also be a no-op, not an error.
+            conn.execute_batch(m.up).unwrap();
+        }
+
+        assert_eq!(count_dead(), 0, "migration 70 left a dead station behind");
+        let live_after = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url LIKE '%fip%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            live_after,
+            live_before - 2,
+            "migration 70 removed more than the two dead stations"
+        );
+    }
+
+    #[test]
+    fn renumber_queue_positions_sql_unifies_position_space() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // Pre-unification layout: local rows at 0,1 and streaming rows at 0,1
+        // (overlapping) for one zone.
+        let conn = db.connection().lock().unwrap();
+        // Isolated SQL test: no real zones/tracks, so relax FK enforcement.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO queue_items (zone_id, position, track_id, source) VALUES (1, 0, 101, 'local');
+             INSERT INTO queue_items (zone_id, position, track_id, source) VALUES (1, 1, 102, 'local');
+             INSERT INTO queue_items (zone_id, position, source_id, source) VALUES (1, 0, 'q1', 'qobuz');
+             INSERT INTO queue_items (zone_id, position, source_id, source) VALUES (1, 1, 'q2', 'qobuz');",
+        )
+        .unwrap();
+        // The v53 renumber SQL: streaming rows shift to L..L+S-1.
+        conn.execute_batch(RENUMBER_QUEUE_POSITIONS_SQL).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT track_id, position FROM queue_items WHERE zone_id = 1 ORDER BY position",
+            )
+            .unwrap();
+        let rows: Vec<(Option<i64>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Local stays 0,1; streaming now 2,3 → one contiguous space, no collisions.
+        assert_eq!(
+            rows,
+            vec![(Some(101), 0), (Some(102), 1), (None, 2), (None, 3)]
+        );
     }
 
     #[test]
@@ -1371,5 +2812,261 @@ mod tests {
             )
             .unwrap();
         assert_eq!(jazz, 1, "re-seed must not duplicate an existing collection");
+    }
+
+    // The PG numeric-type heal chain (#1220): the migration list must stay
+    // contiguous and 1-based so run_pg_migrations applies every step, and the
+    // numeric-column-type heal migrations (010/011/013) must all be present — a
+    // gap or a missing heal would leave a data-migrated DB with TEXT numeric
+    // columns and re-break force-scan album resolution (`operator does not
+    // exist: text = bigint`). (012 heals integer id columns, a sibling fix.)
+    // Runs without a live PG.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_migrations_are_contiguous_and_include_numeric_heals() {
+        for (idx, &(version, _, _)) in PG_MIGRATIONS.iter().enumerate() {
+            assert_eq!(
+                version as usize,
+                idx + 1,
+                "PG_MIGRATIONS must be contiguous and 1-based"
+            );
+        }
+        // Ce nombre se met a jour A LA MAIN, et c'est voulu : il oblige a
+        // constater qu'une migration PG a ete ajoutee. Ajouter le fichier SQL
+        // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
+        // qui est le seul a executer ce test — la feature `postgres` n'est pas
+        // dans le jeu par defaut.
+        assert_eq!(pg_latest_version(), 26, "latest PG migration must be 26");
+        for wanted in [10, 11, 13] {
+            assert!(
+                PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
+                "numeric-type heal migration {wanted} must be registered"
+            );
+        }
+    }
+
+    /// #1440 — cas RÉEL : l'anthologie « OUF », douze lignes issues de douze
+    /// dossiers d'artistes, se replie en une seule.
+    #[test]
+    fn scattered_compilation_rows_are_folded_into_one() {
+        const TITLE: &str = "OUF L'anthologie Souterraine 2015-2017";
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let ids: Vec<i64> = ["Corte Real", "Alligator", "Oulane"]
+            .iter()
+            .enumerate()
+            .map(|(i, artiste)| {
+                let folder = format!("/mnt/recordings_usb/Qobuz/{artiste}/{TITLE}");
+                let conn = db.connection().lock().unwrap();
+                conn.execute(
+                    "INSERT INTO albums (title, folder_path) VALUES (?, ?)",
+                    rusqlite::params![TITLE, folder],
+                )
+                .unwrap();
+                let id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![format!("piste {i}"), id, (i as i64) + 1, format!("{folder}/0{}.flac", i + 1)],
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let restants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title = ?",
+                [TITLE],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restants, 1, "les trois éclats doivent tenir en un album");
+        let sur_le_survivant: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+                [ids[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sur_le_survivant, 3, "les pistes suivent l'album conservé");
+    }
+
+    /// #1440 + #1444 — cas RÉEL : « ALLOPOP », quatre volumes portant le MÊME
+    /// titre, éclatés en 41 dossiers sous `Qobuz/`. Seule la pochette déposée
+    /// dans chaque dossier les sépare ; sans elle, les numéros de piste se
+    /// chevauchent et la grappe entière serait abandonnée.
+    #[test]
+    fn several_volumes_sharing_a_title_are_split_by_their_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Trois artistes du volume 1 (pistes 1, 2, 3) et deux du volume 2
+        // (pistes 1, 2) : les numéros se chevauchent d'un volume à l'autre.
+        let volumes: [(u32, &[(&str, i64)]); 2] = [
+            (1, &[("Diane", 1), ("Gatien", 2), ("Loup Blaster", 3)]),
+            (2, &[("Tristan Savoie", 1), ("Ma Fraisse", 2)]),
+        ];
+        for (volume, membres) in volumes {
+            for (artiste, piste) in membres {
+                let folder = dir.path().join(artiste).join("ALLOPOP");
+                std::fs::create_dir_all(&folder).unwrap();
+                // Chaque dossier reçoit la pochette de son volume RÉ-ENCODÉE :
+                // Qobuz ne livre pas deux fois le même fichier, et c'est
+                // précisément ce qui trompait la comparaison par octets.
+                std::fs::write(
+                    folder.join("cover.jpg"),
+                    crate::scanner::compilation::pochette_de_test(
+                        volume,
+                        96,
+                        60 + (*piste as u8) * 8,
+                    ),
+                )
+                .unwrap();
+                let folder = folder.to_str().unwrap().to_string();
+                let conn = db.connection().lock().unwrap();
+                conn.execute(
+                    "INSERT INTO albums (title, folder_path) VALUES ('ALLOPOP', ?)",
+                    rusqlite::params![folder],
+                )
+                .unwrap();
+                let id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![artiste, id, piste, format!("{folder}/0{piste}.flac")],
+                )
+                .unwrap();
+            }
+        }
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let restants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title = 'ALLOPOP'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restants, 2,
+            "cinq dossiers, deux pochettes ⇒ deux albums — ni un, ni cinq"
+        );
+        let pistes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pistes, 5, "aucune piste perdue au passage");
+    }
+
+    /// LE DÉGÂT DÉJÀ FAIT par les 0.9.66/0.9.67 : quatre volumes écrasés en UN
+    /// SEUL album (#1470). La migration de rattrapage sait recoller ce qui est
+    /// éparpillé — sait-elle SÉPARER ce qui a été fusionné à tort ?
+    ///
+    /// Reproduit l'état de .18 : un album, des pistes venues de dossiers aux
+    /// pochettes différentes, et des numéros en double.
+    #[test]
+    fn an_album_wrongly_merged_is_split_back_by_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Un seul album, quatre volumes dedans, chaque numéro en double.
+        let album_id = {
+            let conn = db.connection().lock().unwrap();
+            let premier = dir.path().join("Diane").join("ALLOPOP");
+            std::fs::create_dir_all(&premier).unwrap();
+            std::fs::write(
+                premier.join("cover.jpg"),
+                crate::scanner::compilation::pochette_de_test(0, 96, 90),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO albums (title, folder_path) VALUES ('ALLOPOP', ?)",
+                rusqlite::params![premier.to_string_lossy()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        for (vol, artiste, num) in [
+            (0usize, "Diane", 1),
+            (1, "Tristan", 1),
+            (2, "Nina", 1),
+            (3, "Oscar", 1),
+        ] {
+            let d = dir.path().join(artiste).join("ALLOPOP");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("cover.jpg"),
+                crate::scanner::compilation::pochette_de_test(vol as u32, 96, 90),
+            )
+            .unwrap();
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    artiste,
+                    album_id,
+                    num,
+                    format!("{}/01.flac", d.to_string_lossy())
+                ],
+            )
+            .unwrap();
+        }
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let albums: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title='ALLOPOP'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            albums, 4,
+            "un album fusionné à tort doit être redécoupé selon les pochettes"
+        );
+    }
+
+    /// #1440 — cas RÉEL inverse : deux « Greatest Hits » d'artistes différents,
+    /// tous deux numérotés à partir de 1. La collision protège.
+    #[test]
+    fn homonymous_albums_are_never_folded() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        for (artiste, dossier) in [
+            ("Pat Benatar", "/data/music/P/Pat Benatar/Greatest Hits"),
+            ("Police", "/data/music/P/Police/Greatest Hits"),
+        ] {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "INSERT INTO albums (title, folder_path) VALUES (?, ?)",
+                rusqlite::params!["Greatest Hits", dossier],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tracks (title, album_id, track_number, file_path) VALUES (?, ?, 1, ?)",
+                rusqlite::params![artiste, id, format!("{dossier}/01.flac")],
+            )
+            .unwrap();
+        }
+
+        super::merge_scattered_compilations(&db);
+
+        let conn = db.connection().lock().unwrap();
+        let restants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM albums WHERE title = 'Greatest Hits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restants, 2, "deux disques homonymes restent deux albums");
     }
 }

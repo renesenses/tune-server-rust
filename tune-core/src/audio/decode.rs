@@ -3,7 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
@@ -13,6 +13,18 @@ use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use super::dsd_to_pcm::choose_output_rate;
+
+/// How long a decoder waits for the consumer to take a chunk before giving up.
+///
+/// Generous on purpose: a consumer can legitimately stop reading for a long
+/// while — OAAT prefetches the next track, reads its header, then leaves the
+/// body untouched until the current track ends.
+///
+/// Named rather than spelled out at each site because the value has already
+/// drifted once: the log messages announced `_10s` long after it became 300,
+/// which cost a wrong diagnosis on #1323. A name cannot go stale; a number in
+/// a message can.
+const SEND_TIMEOUT_SECS: u64 = 300;
 
 /// Resolve the actual audio bit depth from codec parameters.
 ///
@@ -63,6 +75,61 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
 
     // Ultimate fallback
     16
+}
+
+/// Rebuild the decoder after `Error::ResetRequired` from `next_packet`.
+///
+/// A chained Ogg (an icecast rip, or two files joined with `cat`) contains a
+/// mid-file `is_first_page`: symphonia's OggReader starts a new physical
+/// stream, rebuilds its track list and returns `ResetRequired`. The consumer
+/// must re-fetch the default track, build a fresh decoder and keep pulling
+/// packets. Treating it as EOF truncated playback to the first chain link —
+/// the local output then signalled a natural end a few seconds in and the
+/// poller replayed the track: the « boucle sur les 2-3 premières secondes »
+/// of #1270 (liste Bertrand 13/08).
+///
+/// Returns the new `(track_id, decoder)` when the next link is decodable and
+/// keeps the same sample rate / channel count. A mid-stream parameter change
+/// cannot be represented in the already-announced PCM stream, so those (and
+/// codec init failures) return `None`: stop decoding at the boundary, which is
+/// the pre-fix behaviour.
+fn rebuild_decoder_after_ogg_chain_reset(
+    format: &dyn FormatReader,
+    file_path: &str,
+    expect_rate: u32,
+    expect_channels: u32,
+) -> Option<(u32, Box<dyn AudioDecoder>)> {
+    let track = format.default_track(TrackType::Audio)?;
+    let params = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p.clone(),
+        _ => return None,
+    };
+    let rate = params.sample_rate.unwrap_or(44100);
+    let channels = params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u32)
+        .unwrap_or(2);
+    if rate != expect_rate || channels != expect_channels {
+        tracing::warn!(
+            file = file_path,
+            expect_rate,
+            rate,
+            expect_channels,
+            channels,
+            "ogg_chain_params_changed_stopping_at_boundary"
+        );
+        return None;
+    }
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .ok()?;
+    debug!(
+        file = file_path,
+        track_id = track.id,
+        "ogg_chain_decoder_rebuilt"
+    );
+    Some((track.id, decoder))
 }
 
 pub struct DecodedAudio {
@@ -195,6 +262,8 @@ pub fn can_decode_native(file_path: &str) -> bool {
             | "aac"
             | "alac"
             | "ogg"
+            | "oga"
+            | "opus"
             | "aiff"
             | "aif"
             | "dsf"
@@ -315,48 +384,50 @@ pub fn decode_to_pcm(
     }
 
     if ext == "ape" {
-        // Wrap in catch_unwind: the native APE decoder may panic on malformed
-        // or unsupported APE files (e.g. very old versions, Insane compression).
-        // A panic must NOT crash the server.
+        // SPIKE (#1145): real Monkey's Audio playback via the pure-Rust
+        // `ape-decoder` crate (MIT/Apache-2.0), replacing the broken in-tree
+        // stub.
+        //
+        // catch_unwind : le catch symphonia plus bas ne couvrait PAS cette
+        // branche (return anticipé) — un panic du décodeur entropique tiers
+        // sur un fichier corrompu tuait le worker au lieu de produire une
+        // erreur propre (durcissement, revue 2026-08-15).
         let fp = file_path.to_string();
-        let result = catch_unwind(AssertUnwindSafe(move || {
-            super::ape::decode_ape_to_pcm(
-                &fp,
-                target_sample_rate,
-                target_channels,
-                seek_s,
-                max_duration_s,
-            )
-        }));
-        return match result {
-            Ok(inner) => inner,
-            Err(panic_info) => {
-                let msg = panic_payload_to_string(&panic_info);
-                error!(file = file_path, panic = %msg, "ape_decoder_panic");
-                Err(format!("APE decode panic: {msg}"))
-            }
-        };
+        return catch_unwind(AssertUnwindSafe(move || {
+            decode_ape_to_pcm(&fp, seek_s, max_duration_s)
+        }))
+        .unwrap_or_else(|_| Err("ape: decoder panicked (corrupt file?)".into()));
     }
 
+    // WMA/ASF partait vers ffmpeg — un binaire externe retire du projet en
+    // v0.8.46, donc ce chemin echouait de toute facon, partout. Symphonia n'a
+    // pas de decodeur WMA : plutot qu'un echec opaque (« ffmpeg failed (is
+    // ffmpeg installed?) »), on nomme la vraie raison.
     if ext == "wma" || ext == "asf" {
-        return decode_via_ffmpeg(
-            file_path,
-            target_sample_rate,
-            target_channels,
-            seek_s,
-            max_duration_s,
-        );
+        return Err(format!(
+            "format non pris en charge : {ext} (WMA/ASF n'a plus de decodeur depuis le retrait de ffmpeg)"
+        ));
     }
 
-    // Ogg-Vorbis (.ogg / .oga) is decoded NATIVELY by symphonia (the "ogg"
-    // demuxer + "vorbis" codec features are enabled), so it must NOT be routed
-    // to the ffmpeg fallback — ffmpeg was removed from the project (v0.8.46), so
-    // that path always fails now and would break .ogg playback entirely.
-    // Only Opus and the WebM container (which symphonia can't demux/decode)
-    // still hit the fallback — that path is effectively unsupported without
-    // ffmpeg, but it's the pre-existing Opus limitation, not a regression.
-    if ext == "opus" || ext == "webm" || ext == "weba" {
-        return decode_via_ffmpeg(
+    // Ogg-Vorbis / Ogg-FLAC (.ogg / .oga) is decoded NATIVELY by symphonia (the
+    // "ogg" demuxer + "vorbis"/"flac" codec features are enabled). Il n'existe
+    // plus aucun repli externe : tout ce qui n'est pas décodé ici l'est par
+    // symphonia ou par libopus, ou ne l'est pas du tout.
+    //
+    // Opus needs libopus (symphonia has no Opus codec). We route the explicit
+    // Opus/WebM extensions here, and ALSO sniff `.ogg`/`.oga` for OpusHead —
+    // a `.ogg` file can carry Opus, and misrouting it to the Vorbis decoder
+    // would fail (silence + 2 s loop). Vorbis/FLAC-in-Ogg fall through to
+    // symphonia below.
+    if ext == "opus"
+        || ext == "webm"
+        || ext == "weba"
+        || ((ext == "ogg" || ext == "oga") && ogg_stream_is_opus(file_path))
+    {
+        // symphonia demuxes the container (mkv/ogg features) but has no Opus
+        // decoder, so the packets are fed to libopus via audiopus. This gives
+        // native Opus playback and restores YouTube→DLNA sound (forum #940).
+        return decode_opus_to_pcm(
             file_path,
             target_sample_rate,
             target_channels,
@@ -385,6 +456,189 @@ pub fn decode_to_pcm(
             Err(format!("decode panic ({ext}): {msg}"))
         }
     }
+}
+
+/// Sniff whether an Ogg stream carries Opus (`OpusHead`) rather than Vorbis.
+///
+/// A `.ogg`/`.oga` file can hold Vorbis OR Opus. Vorbis (and FLAC-in-Ogg) is
+/// decoded natively by symphonia, but Opus-in-Ogg needs libopus. We route on
+/// the actual codec, not the extension: the first Ogg page of an Opus stream
+/// begins with the `OpusHead` magic (Vorbis begins with `\x01vorbis`,
+/// FLAC-in-Ogg with `FLAC`). Reading the first 4 KiB is enough to see the id
+/// header. Returns `false` on any I/O error — the caller then falls back to
+/// symphonia, the correct behaviour for Vorbis/FLAC-in-Ogg.
+fn ogg_stream_is_opus(file_path: &str) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 4096];
+    let Ok(mut f) = File::open(file_path) else {
+        return false;
+    };
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf[..n].windows(8).any(|w| w == b"OpusHead")
+}
+
+/// Decode Opus audio (Ogg-Opus / .opus, or Opus-in-WebM from YouTube) to PCM.
+///
+/// symphonia demuxes the WebM/Ogg container (the `mkv`/`ogg` features) but has
+/// no Opus codec, so we pull the raw Opus packets and decode them with libopus
+/// (audiopus). Opus is always 48 kHz internally; we return native 48 kHz / 16
+/// bit and let the caller's encoder follow that rate. This gives native .opus /
+/// Ogg-Opus playback and restores YouTube→DLNA audio (forum #940 and the
+/// Opus/Ogg-Vorbis support request): before this, Opus streams decoded to
+/// silence — and, for local files, looped every ~2 s because the silent decode
+/// failure was mistaken for EOF.
+///
+/// ## Seek
+///
+/// Opus has no sample-accurate native seek. We seek the Ogg container coarsely
+/// (page granularity) to land near the target, then skip the residual samples
+/// using each packet's presentation timestamp (`pts`, in the track timebase,
+/// which for Opus is 1/48000 s) so the returned buffer starts exactly at
+/// `seek_s`. `max_duration_s` bounds the returned window measured *from* the
+/// seek point.
+fn decode_opus_to_pcm(
+    file_path: &str,
+    _target_sample_rate: Option<u32>,
+    _target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    use audiopus::{
+        Channels, MutSignals, SampleRate, coder::Decoder as OpusDecoder,
+        packet::Packet as OpusPacket,
+    };
+
+    let file = File::open(file_path).map_err(|e| format!("open opus: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("opus probe: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("opus: no audio track")?;
+    let track_id = track.id;
+    // Timebase to map packet.pts → sample index @ 48 kHz. Opus is always
+    // 1/48000, but honour the container's declared timebase if present.
+    let time_base = track.time_base;
+    let ch: usize = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => {
+            p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
+        }
+        _ => 2,
+    }
+    .clamp(1, 2); // libopus decoder: mono or stereo
+    let channels_enum = if ch == 1 {
+        Channels::Mono
+    } else {
+        Channels::Stereo
+    };
+
+    // Coarse container seek to land near the target page before sample-accurate
+    // skipping. Best-effort: on failure we still skip from the start via pts.
+    let skip_frames: i64 = if seek_s > 0.0 {
+        let seconds = seek_s as i64;
+        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
+        if let Some(time) = Time::try_new(seconds, nanos) {
+            let _ = format.seek(
+                SeekMode::Coarse,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(track_id),
+                },
+            );
+        }
+        (seek_s * 48000.0) as i64
+    } else {
+        0
+    };
+
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, channels_enum)
+        .map_err(|e| format!("opus decoder init: {e}"))?;
+
+    // 120 ms is the largest Opus frame @ 48 kHz (5760 samples/channel).
+    let mut out_buf = vec![0i16; 5760 * ch];
+    let mut samples_i32: Vec<i32> = Vec::new();
+    // `as usize` saturates the f64 (e.g. `f64::MAX` from the converter's
+    // "decode everything" call); the multiply must saturate too or debug
+    // builds panic on overflow.
+    let max_samples = if max_duration_s > 0.0 {
+        ((max_duration_s * 48000.0) as usize).saturating_mul(ch)
+    } else {
+        usize::MAX
+    };
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        if packet.data.is_empty() {
+            continue;
+        }
+        // Sample index (@48 kHz) of this packet's first frame.
+        let pkt_start_frame: i64 = match time_base {
+            Some(tb) => {
+                let t = tb.calc_time_saturating(packet.pts);
+                (t.as_secs_f64() * 48000.0).round() as i64
+            }
+            None => packet.pts.get(),
+        };
+        let opus_pkt = match OpusPacket::try_from(&packet.data[..]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let sig = match MutSignals::try_from(&mut out_buf[..]) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("opus output buffer: {e}")),
+        };
+        let n = match decoder.decode(Some(opus_pkt), sig, false) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Per-channel frame count decoded from this packet.
+        let n = n.min(out_buf.len() / ch);
+        // Drop leading frames until we reach the requested seek point.
+        let local_offset: usize = if skip_frames > pkt_start_frame {
+            ((skip_frames - pkt_start_frame) as usize).min(n)
+        } else {
+            0
+        };
+        if local_offset < n {
+            let start = local_offset * ch;
+            let end = n * ch;
+            samples_i32.extend(out_buf[start..end].iter().map(|&s| s as i32));
+        }
+        if samples_i32.len() >= max_samples {
+            samples_i32.truncate(max_samples);
+            break;
+        }
+    }
+
+    if samples_i32.is_empty() {
+        return Err("opus: decoded no audio".into());
+    }
+    let duration_s = (samples_i32.len() / ch) as f64 / 48000.0;
+    Ok(DecodedAudio {
+        samples_i32,
+        bit_depth: 16,
+        sample_rate: 48000,
+        channels: ch as u32,
+        duration_s,
+    })
 }
 
 /// Streaming decode: decodes a file packet-by-packet and sends PCM chunks
@@ -444,7 +698,7 @@ pub fn decode_to_pcm_streaming_with_levels(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
-    levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
 ) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         file_path,
@@ -467,7 +721,7 @@ pub fn decode_to_pcm_streaming_seeked(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
-    levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
@@ -491,7 +745,7 @@ fn decode_to_pcm_streaming_inner(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
-    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
     let ext = Path::new(file_path)
@@ -555,6 +809,76 @@ fn decode_to_pcm_streaming_inner(
         );
     }
 
+    // Opus (native .opus / Ogg-Opus, or Opus-in-WebM) has no symphonia codec —
+    // it is decoded with libopus (audiopus) via decode_to_pcm, then streamed as
+    // chunks. Before this the streaming path fed Opus to symphonia's
+    // make_audio_decoder, which failed → the stream produced no audio and (for
+    // local files) looped every ~2 s. `.ogg`/`.oga` is sniffed: OpusHead → here,
+    // Vorbis/FLAC-in-Ogg → the symphonia streaming path below.
+    if matches!(ext.as_str(), "opus" | "webm" | "weba")
+        || ((ext == "ogg" || ext == "oga") && ogg_stream_is_opus(file_path))
+    {
+        // Full decode (seek honoured) → PCM at native 48 kHz / 16-bit.
+        let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, seek_s, 0.0)?;
+        let output_bd = target_bit_depth.unwrap_or(decoded.bit_depth);
+        let pcm_bytes = if output_bd != decoded.bit_depth {
+            convert_pcm_bit_depth(&decoded.samples_i32, decoded.bit_depth, output_bd)
+        } else {
+            decoded.pcm_bytes()
+        };
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime for streaming decode")?;
+        let ch = decoded.channels as u16;
+        let sr = decoded.sample_rate; // Opus is always 48 kHz
+        source_rate = sr;
+        if target_bit_depth.is_some() {
+            let wav_hdr = super::wav::build_wav_header(ch, sr, output_bd);
+            if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
+                return Ok((output_bd, source_rate));
+            }
+            if let Some(ref n) = data_ready {
+                n.notify_one();
+            }
+            first_chunk_sent = true;
+            debug!(
+                source_rate = sr,
+                output_bd,
+                channels = ch,
+                format = ext.as_str(),
+                "streaming_decode_wav_header_sent_opus"
+            );
+        }
+        for chunk in pcm_bytes.chunks(chunk_size) {
+            match rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+                tx.send(chunk.to_vec()),
+            )) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    debug!("streaming_decode_consumer_dropped (opus)");
+                    return Ok((output_bd, source_rate));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "streaming_decode_send_timeout (opus)"
+                    );
+                    return Ok((output_bd, source_rate));
+                }
+            }
+            if !first_chunk_sent {
+                first_chunk_sent = true;
+                if let Some(ref n) = data_ready {
+                    n.notify_one();
+                }
+            }
+            if let Some(ref ltx) = levels_tx {
+                super::tap::send_windowed_pcm(ltx, chunk, output_bd, ch, sr);
+            }
+        }
+        return Ok((output_bd, source_rate));
+    }
+
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
     if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape" | "wma" | "asf") {
@@ -600,7 +924,7 @@ fn decode_to_pcm_streaming_inner(
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.to_vec()),
             )) {
                 Ok(Ok(())) => {}
@@ -609,7 +933,10 @@ fn decode_to_pcm_streaming_inner(
                     return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
-                    tracing::warn!("streaming_decode_send_timeout_10s (fallback)");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "streaming_decode_send_timeout (fallback)"
+                    );
                     return Ok((output_bd, source_rate));
                 }
             }
@@ -620,7 +947,7 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch, sr));
+                super::tap::send_windowed_pcm(ltx, chunk, output_bd, ch, sr);
             }
         }
         return Ok((output_bd, source_rate));
@@ -652,7 +979,7 @@ fn decode_to_pcm_streaming_inner(
         Some(CodecParameters::Audio(params)) => params.clone(),
         _ => return Err("track has no audio codec parameters".into()),
     };
-    let track_id = track.id;
+    let mut track_id = track.id;
     let source_channels = audio_params
         .channels
         .as_ref()
@@ -682,18 +1009,50 @@ fn decode_to_pcm_streaming_inner(
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime for streaming decode")?;
 
+    // Sample-accurate seek: how many leading frames to discard AFTER the
+    // demuxer seek so playback starts EXACTLY at the requested position.
+    // `SeekMode::Accurate` lands on the packet boundary at-or-before the
+    // target (actual_ts <= required_ts); the residual (required_ts - actual_ts)
+    // frames are trimmed in the decode loop below. `Coarse` (the old mode) did
+    // no trim and could land a full seek-index granule off — inaudible on local
+    // FLAC (dense native seektable) but seconds off on freshly transcoded Qobuz
+    // FLAC (sparse/absent seektable) and fragmented Tidal DASH, so streaming
+    // seeks appeared to overshoot the clicked position (DEvir, v0.9.50, ASIO).
+    let mut frames_to_skip: u64 = 0;
     if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        let _ = format.seek(
-            SeekMode::Coarse,
+        match format.seek(
+            SeekMode::Accurate,
             SeekTo::Time {
                 time,
                 track_id: Some(track_id),
             },
-        );
-        debug!(file = file_path, seek_s, "streaming_decode_seeked");
+        ) {
+            Ok(seeked) => {
+                // Symphonia 0.6 `Timestamp` is a newtype over i64; `.get()`
+                // yields the raw frame index. Accurate seek guarantees
+                // actual <= required, but clamp defensively.
+                let required = seeked.required_ts.get();
+                let actual = seeked.actual_ts.get();
+                frames_to_skip = (required - actual).max(0) as u64;
+                // Clear the decoder's internal state so the first post-seek
+                // packet decodes cleanly (Symphonia requires a reset after seek).
+                decoder.reset();
+                debug!(
+                    file = file_path,
+                    seek_s,
+                    required_ts = required,
+                    actual_ts = actual,
+                    frames_to_skip,
+                    "streaming_decode_seeked"
+                );
+            }
+            Err(e) => {
+                debug!(file = file_path, seek_s, error = %e, "streaming_decode_seek_failed");
+            }
+        }
     }
 
     // Send the WAV header as the first chunk using the REAL source sample
@@ -731,6 +1090,23 @@ fn decode_to_pcm_streaming_inner(
                 debug!(file = file_path, total_samples, "streaming_decode_eof");
                 break;
             }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Chained Ogg boundary — rebuild the decoder and keep going
+                // instead of truncating the track at the first link (#1270).
+                match rebuild_decoder_after_ogg_chain_reset(
+                    format.as_ref(),
+                    file_path,
+                    source_rate,
+                    source_channels,
+                ) {
+                    Some((id, dec)) => {
+                        track_id = id;
+                        decoder = dec;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             Err(e) => {
                 tracing::warn!(file = file_path, error = %e, total_samples, source_bd, "streaming_decode_packet_error");
                 break;
@@ -754,6 +1130,22 @@ fn decode_to_pcm_streaming_inner(
 
         let mut packet_samples: Vec<i32> = Vec::new();
         decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
+
+        // Trim the leading frames left over from the Accurate seek so the very
+        // first emitted sample is the requested position (see `frames_to_skip`
+        // above). `packet_samples` is interleaved (channels consecutive), so a
+        // frame == `source_channels` samples; both counts are frame-aligned.
+        if frames_to_skip > 0 {
+            let ch = source_channels.max(1) as usize;
+            let skip_samples = (frames_to_skip as usize)
+                .saturating_mul(ch)
+                .min(packet_samples.len());
+            packet_samples.drain(..skip_samples);
+            frames_to_skip -= (skip_samples / ch) as u64;
+            if packet_samples.is_empty() {
+                continue;
+            }
+        }
 
         // Normalize: right-justify samples (same as batch decode)
         if shift > 0 && shift < 32 {
@@ -815,7 +1207,7 @@ fn decode_to_pcm_streaming_inner(
             // floating-point math) and was previously called before send(),
             // introducing micro-pauses that caused Squeezebox/LMS stuttering.
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.clone()),
             )) {
                 Ok(Ok(())) => {}
@@ -824,7 +1216,10 @@ fn decode_to_pcm_streaming_inner(
                     return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
-                    tracing::warn!("streaming_decode_send_timeout_10s");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "streaming_decode_send_timeout"
+                    );
                     return Ok((output_bd, source_rate));
                 }
             }
@@ -838,12 +1233,13 @@ fn decode_to_pcm_streaming_inner(
             // The unbounded channel never blocks; the clone above is cheap
             // compared to the latency savings for network outputs.
             if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(
+                super::tap::send_windowed_pcm(
+                    ltx,
                     &chunk,
                     output_bd,
                     source_channels as u16,
                     source_rate,
-                ));
+                );
             }
         }
     }
@@ -851,7 +1247,7 @@ fn decode_to_pcm_streaming_inner(
     // Flush remaining bytes
     if !pcm_buf.is_empty() {
         match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
             tx.send(pcm_buf),
         )) {
             Ok(Ok(())) => {}
@@ -859,7 +1255,10 @@ fn decode_to_pcm_streaming_inner(
                 debug!("streaming_decode_consumer_dropped (final)");
             }
             Err(_) => {
-                tracing::warn!("streaming_decode_send_timeout_10s (final)");
+                tracing::warn!(
+                    timeout_secs = SEND_TIMEOUT_SECS,
+                    "streaming_decode_send_timeout (final)"
+                );
             }
         }
     }
@@ -902,140 +1301,350 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Decode a WMA/ASF file to PCM via FFmpeg subprocess.
+/// SPIKE (#1145): decode a Monkey's Audio (.ape) file to PCM using the
+/// pure-Rust `ape-decoder` crate. Returns right-justified i32 samples in a
+/// `DecodedAudio`, matching the symphonia path's contract.
 ///
-/// Symphonia does not support the WMA codec or ASF container, so we shell out
-/// to FFmpeg which handles all WMA variants (WMA v1/v2/Pro/Lossless).
-/// FFmpeg outputs raw signed 16-bit little-endian PCM to stdout.
-fn decode_via_ffmpeg(
+/// The crate decodes to interleaved little-endian PCM bytes at the file's
+/// native bit depth (16/24/32). We deinterleave into right-justified i32
+/// samples so `pcm_bytes()` / `convert_pcm_bit_depth()` behave exactly as for
+/// the symphonia decoders. `seek_s` uses the crate's sample-accurate
+/// `decode_from`; `max_duration_s` truncates the sample buffer afterward.
+///
+/// NOT production-hardened: no local staging tuning, decodes the whole file
+/// into memory (a large 24/96 .ape can be ~1 GB PCM — the streaming path in
+/// decode_to_pcm_streaming_inner already routes .ape through full decode + chunk).
+fn decode_ape_to_pcm(
     file_path: &str,
-    _target_sample_rate: Option<u32>,
-    _target_channels: Option<u32>,
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    use std::process::Command;
+    use std::io::BufReader;
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    let file = File::open(file_path).map_err(|e| format!("open ape: {e}"))?;
+    let mut decoder =
+        ape_decoder::ApeDecoder::new(BufReader::new(file)).map_err(|e| format!("ape open: {e}"))?;
 
-    if seek_s > 0.0 {
-        cmd.args(["-ss", &format!("{seek_s}")]);
+    // Copy out the fields we need BEFORE any &mut decode call: info() borrows
+    // the decoder immutably and decode_all/decode_from borrow it mutably.
+    let (sample_rate, channels, bit_depth, is_float, is_signed_8bit, total_samples) = {
+        let info = decoder.info();
+        (
+            info.sample_rate,
+            info.channels as u32,
+            info.bits_per_sample,
+            info.is_floating_point,
+            info.is_signed_8bit,
+            info.total_samples,
+        )
+    };
+
+    if is_float {
+        return Err("Monkey's Audio (.ape) floating-point source not supported".into());
+    }
+    if !matches!(bit_depth, 8 | 16 | 24 | 32) {
+        return Err(format!("ape: unsupported bit depth {bit_depth}"));
+    }
+    // Garde-fous d'en-tête : un fichier corrompu/forgé peut annoncer des
+    // valeurs absurdes que le décodage intégral en mémoire transformerait en
+    // allocation démesurée (un 24/96 légitime fait déjà ~1 Go de PCM).
+    if channels == 0 || channels > 8 {
+        return Err(format!("ape: implausible channel count {channels}"));
+    }
+    if sample_rate == 0 || sample_rate > 384_000 {
+        return Err(format!("ape: implausible sample rate {sample_rate}"));
+    }
+    // Plafond d'allocation calculé depuis l'en-tête, AVANT decode_all.
+    const MAX_APE_PCM_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    let bytes_per = u64::from(bit_depth / 8).max(1);
+    let expected_bytes = total_samples
+        .saturating_mul(u64::from(channels))
+        .saturating_mul(bytes_per);
+    if expected_bytes > MAX_APE_PCM_BYTES {
+        return Err(format!(
+            "ape: decoded size would exceed {} GiB (header claims {total_samples} samples)",
+            MAX_APE_PCM_BYTES / (1024 * 1024 * 1024)
+        ));
     }
 
-    cmd.args(["-i", file_path]);
-
-    if max_duration_s > 0.0 {
-        cmd.args(["-t", &format!("{max_duration_s}")]);
-    }
-
-    // Probe the file first to get sample rate and channels
-    let probe_output = Command::new("ffprobe")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=sample_rate,channels,bits_per_raw_sample",
-            "-of",
-            "csv=p=0",
-            file_path,
-        ])
-        .output()
-        .map_err(|e| format!("ffprobe failed (is ffmpeg installed?): {e}"))?;
-
-    if !probe_output.status.success() {
-        let stderr = String::from_utf8_lossy(&probe_output.stderr);
-        return Err(format!("ffprobe error: {stderr}"));
-    }
-
-    let probe_str = String::from_utf8_lossy(&probe_output.stdout);
-    let parts: Vec<&str> = probe_str.trim().split(',').collect();
-    let source_rate: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(44100);
-    let source_channels: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(2);
-    // WMA is typically 16-bit; WMA Lossless can be 24-bit
-    let source_bd: u16 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
-    let out_bd = if source_bd >= 24 { 24u16 } else { 16u16 };
-
-    let pcm_fmt = if out_bd == 24 { "s24le" } else { "s16le" };
-    cmd.args([
-        "-f",
-        pcm_fmt,
-        "-acodec",
-        &format!("pcm_{pcm_fmt}"),
-        "-ar",
-        &source_rate.to_string(),
-        "-ac",
-        &source_channels.to_string(),
-        "-",
-    ]);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("ffmpeg failed (is ffmpeg installed?): {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg decode error: {stderr}"));
-    }
-
-    let pcm_data = output.stdout;
-    let bytes_per_sample = if out_bd == 24 { 3 } else { 2 };
-    let num_samples = pcm_data.len() / bytes_per_sample;
-
-    let mut samples: Vec<i32> = Vec::with_capacity(num_samples);
-    if out_bd == 24 {
-        for i in 0..num_samples {
-            let offset = i * 3;
-            if offset + 2 >= pcm_data.len() {
-                break;
-            }
-            let lo = pcm_data[offset] as u32;
-            let mid = pcm_data[offset + 1] as u32;
-            let hi = pcm_data[offset + 2] as u32;
-            let val24 = lo | (mid << 8) | (hi << 16);
-            let val32 = if val24 & 0x80_0000 != 0 {
-                (val24 | 0xFF00_0000) as i32
-            } else {
-                val24 as i32
-            };
-            samples.push(val32);
-        }
+    // Sample-accurate seek: decode from the requested sample offset onward.
+    let start_sample = if seek_s > 0.0 {
+        (seek_s * sample_rate as f64) as u64
     } else {
-        for i in 0..num_samples {
-            let offset = i * 2;
-            if offset + 1 >= pcm_data.len() {
-                break;
+        0
+    };
+
+    let pcm: Vec<u8> = if start_sample > 0 {
+        decoder
+            .decode_from(start_sample)
+            .map_err(|e| format!("ape decode_from: {e}"))?
+    } else {
+        decoder
+            .decode_all()
+            .map_err(|e| format!("ape decode_all: {e}"))?
+    };
+
+    // Deinterleave native-depth LE PCM bytes into right-justified i32 samples.
+    let bytes_per_sample = (bit_depth / 8) as usize;
+    if bytes_per_sample == 0 || pcm.len() % bytes_per_sample != 0 {
+        return Err("ape: PCM byte length not aligned to sample size".into());
+    }
+    let mut samples: Vec<i32> = Vec::with_capacity(pcm.len() / bytes_per_sample);
+    match bit_depth {
+        8 => {
+            // APE 8-bit is unsigned by default; is_signed_8bit overrides.
+            let signed = is_signed_8bit;
+            for b in &pcm {
+                let v = if signed {
+                    *b as i8 as i32
+                } else {
+                    *b as i32 - 128
+                };
+                samples.push(v);
             }
-            let val = i16::from_le_bytes([pcm_data[offset], pcm_data[offset + 1]]);
-            samples.push(val as i32);
+        }
+        16 => {
+            for b in pcm.chunks_exact(2) {
+                samples.push(i16::from_le_bytes([b[0], b[1]]) as i32);
+            }
+        }
+        24 => {
+            for b in pcm.chunks_exact(3) {
+                let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+                // sign-extend 24-bit -> i32
+                samples.push((v << 8) >> 8);
+            }
+        }
+        32 => {
+            for b in pcm.chunks_exact(4) {
+                samples.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    // Optional truncation to max_duration_s (whole frames).
+    if max_duration_s > 0.0 {
+        let max_samples = (max_duration_s * sample_rate as f64 * channels as f64) as usize;
+        if samples.len() > max_samples {
+            samples.truncate(max_samples);
         }
     }
 
-    let total_frames = samples.len() as f64 / source_channels as f64;
-    let duration_s = total_frames / source_rate as f64;
+    // 8-bit is widened to 16-bit for the rest of the pipeline (WAV min depth).
+    let out_bd = if bit_depth == 8 { 16 } else { bit_depth };
+    if bit_depth == 8 {
+        for s in samples.iter_mut() {
+            *s <<= 8;
+        }
+    }
+
+    let total_frames = samples.len() as f64 / channels as f64;
+    let duration_s = total_frames / sample_rate as f64;
 
     debug!(
         file = file_path,
         samples = samples.len(),
-        rate = source_rate,
-        channels = source_channels,
+        rate = sample_rate,
+        channels,
         bit_depth = out_bd,
         duration_s,
-        "decoded_via_ffmpeg"
+        "decoded_ape (spike #1145)"
     );
 
     Ok(DecodedAudio {
         samples_i32: samples,
         bit_depth: out_bd,
-        sample_rate: source_rate,
-        channels: source_channels,
+        sample_rate,
+        channels,
         duration_s,
     })
+}
+
+/// Remux a Tidal HI-RES DASH FLAC-in-fMP4 file into a native `.flac` file
+/// WITHOUT decoding or re-encoding (#1146). The source is already FLAC (Tidal
+/// delivers FLAC frames inside a fragmented MP4), so the old path — decode to
+/// PCM then re-encode FLAC — wastes ~59s on a weak CPU (.18, HI-RES) for a
+/// bit-identical result. Here we reuse symphonia's mp4 demuxer to pull the raw
+/// FLAC frames (`packet.data`, unmodified) and the STREAMINFO (`extra_data`, the
+/// 34-byte block body), and write `fLaC` + metadata + frames = a valid, bit-exact
+/// `.flac` in a few hundred ms (I/O-bound copy). MD5 is preserved (frames copied
+/// verbatim → decoded audio unchanged → original checksum still valid).
+///
+/// Only valid when the renderer takes FLAC and no zone EQ is active (an EQ would
+/// mutate samples, which a remux cannot). Returns `(file_size, bit_depth,
+/// sample_rate)`, matching the decode+encode path's tuple.
+pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16, u32), String> {
+    let file = File::open(input_path).map_err(|e| format!("remux open: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(input_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("remux probe: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("remux: no default audio track")?;
+    let track_id = track.id;
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("remux: track has no audio codec parameters".into()),
+    };
+    // The mp4 `dfLa` box exposes the 34-byte METADATA_BLOCK_STREAMINFO body here.
+    let stream_info = audio_params
+        .extra_data
+        .clone()
+        .ok_or("remux: no FLAC STREAMINFO (extra_data) — not a FLAC-in-mp4 track")?;
+    if stream_info.len() != 34 {
+        return Err(format!(
+            "remux: STREAMINFO is {} bytes, expected 34 — refusing to remux",
+            stream_info.len()
+        ));
+    }
+    let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    let bit_depth = resolve_bit_depth(&audio_params);
+
+    let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
+    // "fLaC" stream marker.
+    out.extend_from_slice(b"fLaC");
+    // METADATA_BLOCK_HEADER: is_last=0, type=0 (STREAMINFO), 24-bit length = 34.
+    out.push(0x00);
+    out.extend_from_slice(&[0x00, 0x00, 0x22]);
+    out.extend_from_slice(&stream_info);
+    // Empty VORBIS_COMMENT (is_last=1, type=4, len=8): vendor_len=0 + count=0.
+    // Some DLNA renderers reject a FLAC stream without a VORBIS_COMMENT block, so
+    // append the same empty one the native encoder emits.
+    out.push(0x84);
+    out.extend_from_slice(&[0x00, 0x00, 0x08]);
+    out.extend_from_slice(&[0u8; 8]);
+
+    // Concatenate the raw FLAC frames in order — one mp4 sample = one FLAC frame.
+    let mut frame_count: u64 = 0;
+    loop {
+        match format.next_packet() {
+            Ok(Some(packet)) => {
+                if packet.track_id == track_id {
+                    out.extend_from_slice(&packet.data);
+                    frame_count += 1;
+                }
+            }
+            Ok(None) => break,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("remux next_packet: {e}")),
+        }
+    }
+    if frame_count == 0 {
+        return Err("remux: no FLAC frames extracted".into());
+    }
+
+    std::fs::write(output_path, &out).map_err(|e| format!("remux write: {e}"))?;
+    Ok((out.len() as u64, bit_depth, sample_rate))
+}
+
+/// Streaming variant of [`remux_flac_dash`] (#1146): remux a STILL-DOWNLOADING
+/// DASH fMP4 and push the FLAC bytes into an mpsc channel AS the frames arrive,
+/// so a chunked-capable renderer (Lavf/DMP-A8) starts playing almost immediately
+/// — matching Qobuz's instant start — instead of waiting for the whole file to
+/// download+remux. Reads via the growing-file source (dash_growth registry) so
+/// `next_packet` blocks at the download frontier rather than hitting EOF.
+///
+/// Runs on a blocking thread (symphonia is sync) → uses `blocking_send`. Returns
+/// when the stream is fully sent, or early (Ok) if the consumer is gone.
+pub fn remux_flac_dash_stream(input_path: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(), String> {
+    // Source: the growing fMP4 if a streaming download registered a handle, else
+    // a plain file (fully downloaded).
+    let mss = if let Some(growth) = crate::audio::dash_growth::take_for(input_path) {
+        let src = crate::audio::dash_growth::GrowingFileSource::open(input_path, growth)
+            .map_err(|e| format!("remux-stream open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(src), Default::default())
+    } else {
+        let file = File::open(input_path).map_err(|e| format!("remux-stream open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
+
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(input_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("remux-stream probe: {e}"))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("remux-stream: no default audio track")?;
+    let track_id = track.id;
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("remux-stream: track has no audio codec parameters".into()),
+    };
+    let stream_info = audio_params
+        .extra_data
+        .clone()
+        .ok_or("remux-stream: no FLAC STREAMINFO (extra_data)")?;
+    if stream_info.len() != 34 {
+        return Err(format!(
+            "remux-stream: STREAMINFO is {} bytes, expected 34",
+            stream_info.len()
+        ));
+    }
+
+    // Header: fLaC + STREAMINFO + empty VORBIS_COMMENT.
+    let mut header = Vec::with_capacity(64);
+    header.extend_from_slice(b"fLaC");
+    header.push(0x00);
+    header.extend_from_slice(&[0x00, 0x00, 0x22]);
+    header.extend_from_slice(&stream_info);
+    header.push(0x84);
+    header.extend_from_slice(&[0x00, 0x00, 0x08]);
+    header.extend_from_slice(&[0u8; 8]);
+    if tx.blocking_send(header).is_err() {
+        return Ok(()); // consumer already gone
+    }
+
+    // Frames: batch ~64 KB before sending to keep channel churn low.
+    const FLUSH: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(96 * 1024);
+    loop {
+        match format.next_packet() {
+            Ok(Some(packet)) => {
+                if packet.track_id == track_id {
+                    buf.extend_from_slice(&packet.data);
+                    if buf.len() >= FLUSH && tx.blocking_send(std::mem::take(&mut buf)).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("remux-stream next_packet: {e}")),
+        }
+    }
+    if !buf.is_empty() {
+        let _ = tx.blocking_send(buf);
+    }
+    Ok(())
 }
 
 /// Symphonia-based decoder for standard formats (FLAC, MP3, WAV, M4A, OGG, etc).
@@ -1046,8 +1655,19 @@ fn decode_symphonia(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    // Streaming DASH (#1146 Plan C step 2): if a background task is still
+    // appending this fMP4, decode it as it grows via a blocking MediaSource
+    // instead of a plain File (which would EOF-truncate at the write frontier).
+    // Registry is empty unless TUNE_DASH_STREAM_DECODE armed a download — then
+    // this is byte-identical to the File path.
+    let mss = if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        let src = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
+            .map_err(|e| format!("open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(src), Default::default())
+    } else {
+        let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
 
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
@@ -1071,7 +1691,7 @@ fn decode_symphonia(
         Some(CodecParameters::Audio(params)) => params.clone(),
         _ => return Err("track has no audio codec parameters".into()),
     };
-    let track_id = track.id;
+    let mut track_id = track.id;
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_channels = audio_params
         .channels
@@ -1083,21 +1703,44 @@ fn decode_symphonia(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    // Seek if requested
+    let source_bd = resolve_bit_depth(&audio_params);
+
+    // Seek if requested. On a non-seekable source (e.g. a FLAC over SMB with no
+    // seektable) `format.seek` fails and the reader stays at position 0. If we
+    // then kept decoding, we'd return the *first* segment again for every seek
+    // offset — the ReplayGain / trailing-silence analyzers advance `seek` by a
+    // full segment each time, never see a short final segment, and loop forever
+    // (#1277, a regression of the #1109 segmented-decode OOM fix). Honour the
+    // error by returning an EMPTY segment: the analyzers break on the resulting
+    // `is_empty()`. The first segment (seek_s == 0.0, no seek) always decodes
+    // normally, so the analysis still runs over the head of the track.
     if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        let _ = format.seek(
-            SeekMode::Coarse,
-            SeekTo::Time {
-                time,
-                track_id: Some(track_id),
-            },
-        );
+        if format
+            .seek(
+                SeekMode::Coarse,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(track_id),
+                },
+            )
+            .is_err()
+        {
+            debug!(
+                file = file_path,
+                seek_s, "decode_symphonia_seek_failed_returning_empty"
+            );
+            return Ok(DecodedAudio {
+                samples_i32: Vec::new(),
+                bit_depth: source_bd,
+                sample_rate: target_sample_rate.unwrap_or(source_rate),
+                channels: target_channels.unwrap_or(source_channels),
+                duration_s: 0.0,
+            });
+        }
     }
-
-    let source_bd = resolve_bit_depth(&audio_params);
 
     let mut all_samples: Vec<i32> = Vec::new();
     let max_samples = if max_duration_s > 0.0 {
@@ -1118,6 +1761,23 @@ fn decode_symphonia(
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
                 break;
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Chained Ogg boundary — rebuild the decoder and keep going
+                // instead of truncating the track at the first link (#1270).
+                match rebuild_decoder_after_ogg_chain_reset(
+                    format.as_ref(),
+                    file_path,
+                    source_rate,
+                    source_channels,
+                ) {
+                    Some((id, dec)) => {
+                        track_id = id;
+                        decoder = dec;
+                        continue;
+                    }
+                    None => break,
+                }
             }
             Err(_) => break,
         };
@@ -1151,8 +1811,29 @@ fn decode_symphonia(
         }
     }
 
-    let out_rate = target_sample_rate.unwrap_or(source_rate);
-    let out_channels = target_channels.unwrap_or(source_channels);
+    // On rapporte ce qu'on a REELLEMENT decode, jamais ce qui a ete demande.
+    //
+    // Ce chemin ne reechantillonne pas et ne downmixe pas : les echantillons
+    // restent entrelaces a la cadence source. Etiqueter la sortie avec les
+    // valeurs DEMANDEES transformait une intention en fait, et trois appelants
+    // s'y fiaient (JP Robbe, #1498) :
+    //
+    // - `embedding.rs` passait `d.channels` (donc 1) a `to_mono_f32`, qui
+    //   prenait alors sa branche « deja mono » et ne moyennait rien. Le modele
+    //   acoustique recevait du L/R/L/R a 44,1 kHz presente comme du mono
+    //   48 kHz — la moitie de la duree utile, et un timbre brouille. C'est le
+    //   defaut #1108, que son correctif n'a jamais pu corriger : il etait
+    //   neutralise ici, en amont.
+    // - `pipeline.rs` construisait l'encodeur avec l'etiquette tout en lui
+    //   donnant les vrais echantillons : en-tete annoncant la cadence cible,
+    //   donnees a la cadence source. Lecture a la mauvaise vitesse.
+    // - `analyzer.rs` interpretait les segments avec la mauvaise trame.
+    //
+    // Une fonction qui ment sur ce qu'elle renvoie est un piege permanent :
+    // chaque moitie a l'air juste et la relecture ne voit rien. Dire « voici du
+    // 44,1 stereo » laisse au moins l'appelant verifier et convertir.
+    let out_rate = source_rate;
+    let out_channels = source_channels;
     let total_frames = all_samples.len() as f64 / source_channels as f64;
     let duration_s = total_frames / source_rate as f64;
 
@@ -1191,7 +1872,7 @@ fn decode_dsd_streaming(
     chunk_size: usize,
     first_chunk_sent: &mut bool,
     data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
-    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
+    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     rt: &tokio::runtime::Handle,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
@@ -1229,7 +1910,7 @@ fn decode_dsd_streaming(
                 // Send PCM data first, compute levels after (same rationale
                 // as the symphonia path: avoid delaying the audio stream).
                 match rt.block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                     tx.send(chunk.clone()),
                 )) {
                     Ok(Ok(())) => {}
@@ -1238,7 +1919,10 @@ fn decode_dsd_streaming(
                         return Ok(true); // consumer gone
                     }
                     Err(_) => {
-                        tracing::warn!("dsd_streaming_send_timeout_10s");
+                        tracing::warn!(
+                            timeout_secs = SEND_TIMEOUT_SECS,
+                            "dsd_streaming_send_timeout"
+                        );
                         return Ok(true); // channel stalled
                     }
                 }
@@ -1249,12 +1933,7 @@ fn decode_dsd_streaming(
                     }
                 }
                 if let Some(ltx) = levels_tx {
-                    let _ = ltx.send(super::levels::compute_levels(
-                        &chunk,
-                        output_bd,
-                        ch,
-                        output_rate,
-                    ));
+                    super::tap::send_windowed_pcm(ltx, &chunk, output_bd, ch, output_rate);
                 }
             }
             Ok(false)
@@ -1318,7 +1997,7 @@ fn decode_dsd_streaming(
     // Send any remaining bytes (send first, levels after)
     if !pcm_buf.is_empty() {
         let send_ok = match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
             tx.send(pcm_buf.clone()),
         )) {
             Ok(Ok(())) => true,
@@ -1327,18 +2006,16 @@ fn decode_dsd_streaming(
                 false
             }
             Err(_) => {
-                tracing::warn!("dsd_streaming_send_timeout_10s (final)");
+                tracing::warn!(
+                    timeout_secs = SEND_TIMEOUT_SECS,
+                    "dsd_streaming_send_timeout (final)"
+                );
                 false
             }
         };
         if send_ok {
             if let Some(ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(
-                    &pcm_buf,
-                    output_bd,
-                    ch,
-                    output_rate,
-                ));
+                super::tap::send_windowed_pcm(ltx, &pcm_buf, output_bd, ch, output_rate);
             }
         }
     }
@@ -1389,13 +2066,16 @@ pub fn decode_dsd_to_dop_streaming(
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk),
             )) {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Ok(true),
                 Err(_) => {
-                    tracing::warn!("dop_streaming_send_timeout_10s");
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT_SECS,
+                        "dop_streaming_send_timeout"
+                    );
                     return Ok(true);
                 }
             }
@@ -1430,7 +2110,7 @@ pub fn decode_dsd_to_dop_streaming(
 
     if !pcm_buf.is_empty() {
         let _ = rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
             tx.send(pcm_buf),
         ));
     }
@@ -1481,6 +2161,32 @@ fn convert_24bit_pcm_to_depth(pcm_24: &[u8], target_bd: u16) -> Vec<u8> {
 /// Uses `DsdToPcmStreamer` to process the file in chunks, avoiding the
 /// catastrophic memory usage of the old batch approach.
 /// Memory usage: O(block_size + filter_len) ≈ 40 KB regardless of file size.
+/// Upper bound of output PCM samples needed for a `seek_s`..`seek_s+max_duration_s`
+/// window, so a bounded read (e.g. a 10 s preview or the embedding window) stops
+/// decoding early instead of converting the WHOLE DSD file. The DSD→PCM path runs
+/// a per-output-sample FIR: a full DSD64 track is billions of multiply-adds on a
+/// non-cancellable thread, which reads as a hang. Returns `usize::MAX` when no
+/// duration is requested, so the "decode everything" path is unchanged.
+fn dsd_needed_samples(
+    seek_s: f64,
+    max_duration_s: f64,
+    output_rate: u32,
+    channels: usize,
+) -> usize {
+    if max_duration_s <= 0.0 {
+        return usize::MAX;
+    }
+    let skip_frames = if seek_s > 0.0 {
+        (seek_s * output_rate as f64) as usize
+    } else {
+        0
+    };
+    let keep_frames = (max_duration_s * output_rate as f64).ceil() as usize;
+    skip_frames
+        .saturating_add(keep_frames)
+        .saturating_mul(channels.max(1))
+}
+
 fn decode_dsd_to_pcm(
     file_path: &str,
     ext: &str,
@@ -1519,10 +2225,18 @@ fn decode_dsd_to_pcm(
         all_samples.reserve((info.total_samples / decimation) as usize * channels);
         let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, true);
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            if all_samples.len() >= needed {
+                break;
+            }
         }
-        append_pcm24(&mut all_samples, &streamer.flush());
+        // Skip the filter flush once the window is satisfied (its tail would be
+        // trimmed away anyway); only a full-file read needs it.
+        if all_samples.len() < needed {
+            append_pcm24(&mut all_samples, &streamer.flush());
+        }
         (dsd_rate, output_rate, channels)
     } else {
         let info = super::dff::parse_dff(file_path)?;
@@ -1536,10 +2250,16 @@ fn decode_dsd_to_pcm(
         let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            if all_samples.len() >= needed {
+                break;
+            }
         }
-        append_pcm24(&mut all_samples, &streamer.flush());
+        if all_samples.len() < needed {
+            append_pcm24(&mut all_samples, &streamer.flush());
+        }
         (dsd_rate, output_rate, channels)
     };
 
@@ -1689,12 +2409,50 @@ mod decode_integration_tests {
     }
 
     #[test]
+    fn dsd_needed_samples_bounds() {
+        // No duration requested → decode the whole file (unchanged path).
+        assert_eq!(dsd_needed_samples(0.0, 0.0, 48_000, 2), usize::MAX);
+        // 10 s @ 48 kHz stereo = 480_000 frames × 2 channels.
+        assert_eq!(dsd_needed_samples(0.0, 10.0, 48_000, 2), 480_000 * 2);
+        // Seek adds its frames to the window; mono keeps the frame count.
+        assert_eq!(dsd_needed_samples(1.0, 10.0, 48_000, 1), 48_000 + 480_000);
+    }
+
+    // A bounded read must stop decoding early — decode less than the full file
+    // instead of converting all of it and trimming (the DSD hang, Sandro's DSF).
+    #[test]
+    fn decode_dsf_bounded_stops_early() {
+        let path = std::env::temp_dir().join("tune_test_dsf_bounded.dsf");
+        let p = path.to_str().unwrap();
+        write_test_dsf(p, 0x55);
+        let full = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
+        let bounded = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.005).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!bounded.samples_i32.is_empty());
+        assert!(
+            bounded.samples_i32.len() < full.samples_i32.len(),
+            "bounded decode must be shorter than full: {} vs {}",
+            bounded.samples_i32.len(),
+            full.samples_i32.len(),
+        );
+        let frames = bounded.samples_i32.len() / bounded.channels.max(1) as usize;
+        assert!(
+            frames as f64 / 176_400.0 <= 0.006,
+            "bounded window should be ~0.005 s, got {} frames",
+            frames,
+        );
+    }
+
+    #[test]
     fn can_decode_native_formats() {
         assert!(can_decode_native("song.flac"));
         assert!(can_decode_native("song.mp3"));
         assert!(can_decode_native("song.wav"));
         assert!(can_decode_native("song.m4a"));
         assert!(can_decode_native("song.ogg"));
+        assert!(can_decode_native("song.oga"));
+        assert!(can_decode_native("song.opus"));
         assert!(can_decode_native("song.aiff"));
         assert!(can_decode_native("song.aif"));
         assert!(can_decode_native("song.dsf"));
@@ -1714,6 +2472,48 @@ mod decode_integration_tests {
         assert!(
             result.duration_s > 0.9 && result.duration_s < 1.1,
             "duration should be ~1s, got {}",
+            result.duration_s
+        );
+    }
+
+    /// #1498 (JP Robbe) — la sortie doit decrire ce qui a ete DECODE, jamais ce
+    /// qui a ete demande.
+    ///
+    /// Ce chemin ne reechantillonne pas et ne downmixe pas. Etiqueter la sortie
+    /// avec les valeurs demandees transformait une intention en fait, et les
+    /// appelants qui lisent l'etiquette y perdaient :
+    ///
+    /// - la passe acoustique passait `channels` (donc 1) a `to_mono_f32`, qui
+    ///   prenait sa branche « deja mono » et ne moyennait rien : le modele
+    ///   recevait du L/R/L/R pris pour du mono (#1108, jamais corrige parce que
+    ///   son correctif etait neutralise ici) ;
+    /// - `pipeline.rs` construisait son encodeur avec l'etiquette tout en lui
+    ///   donnant les vrais echantillons : en-tete a la cadence cible, donnees a
+    ///   la cadence source.
+    ///
+    /// Le test existant `decode_wav` ne pouvait pas l'attraper : il demande
+    /// `None, None`, donc demande et realite coincident toujours.
+    #[test]
+    fn decode_reports_what_it_decoded_not_what_was_asked() {
+        let path = fixture_path("test.wav"); // 44,1 kHz stereo
+        let result = decode_to_pcm(&path, Some(48_000), Some(1), 0.0, 0.0).unwrap();
+
+        assert_eq!(
+            result.sample_rate, 44100,
+            "la cadence rapportee doit etre celle de la source, pas celle demandee"
+        );
+        assert_eq!(
+            result.channels, 2,
+            "le nombre de canaux rapporte doit etre celui de la source, pas celui demande"
+        );
+
+        // Et la coherence qui compte pour l'appelant : le compte d'echantillons
+        // doit correspondre a l'etiquette. C'est cette equation qui etait fausse.
+        let frames = result.samples_i32.len() as f64 / result.channels as f64;
+        let duration = frames / result.sample_rate as f64;
+        assert!(
+            (duration - result.duration_s).abs() < 0.01,
+            "duree deduite de l'etiquette ({duration:.3} s) et duree rapportee ({:.3} s) doivent concorder",
             result.duration_s
         );
     }
@@ -1742,10 +2542,166 @@ mod decode_integration_tests {
 
     #[test]
     fn decode_ogg() {
+        // test.ogg is Ogg-FLAC — decoded natively by symphonia, NOT routed to
+        // the Opus path. Assert a real ~2 s duration so a silent/empty decode
+        // (the failure mode we guard against) fails the test loudly.
         let path = fixture_path("test.ogg");
+        assert!(
+            !ogg_stream_is_opus(&path),
+            "test.ogg must not be sniffed as Opus"
+        );
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
         assert!(!result.samples_i32.is_empty(), "OGG should produce samples");
         assert_eq!(result.sample_rate, 44100);
+        assert!(
+            result.duration_s > 0.5,
+            "ogg duration should be non-trivial, got {}",
+            result.duration_s
+        );
+    }
+
+    #[test]
+    fn decode_ogg_vorbis() {
+        // A genuine Ogg-Vorbis stream: must go through symphonia (Vorbis), not
+        // the Opus decoder, and yield ~2 s of real audio.
+        let path = fixture_path("test_vorbis.ogg");
+        assert!(
+            !ogg_stream_is_opus(&path),
+            "Ogg-Vorbis must not be sniffed as Opus"
+        );
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(
+            !result.samples_i32.is_empty(),
+            "Ogg-Vorbis should produce samples"
+        );
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
+        assert!(
+            result.duration_s > 1.8 && result.duration_s < 2.2,
+            "Ogg-Vorbis duration should be ~2 s, got {}",
+            result.duration_s
+        );
+        assert!(
+            result.samples_i32.iter().any(|s| *s != 0),
+            "Ogg-Vorbis PCM must not be all silence"
+        );
+    }
+
+    #[test]
+    fn decode_chained_ogg_vorbis_decodes_past_first_link() {
+        // Two Ogg-Vorbis physical streams back-to-back (an icecast rip, or
+        // `cat a.ogg b.ogg`). Symphonia signals the mid-file boundary with
+        // `Error::ResetRequired`; treating it as EOF truncated playback to the
+        // first link, the local output signalled a natural end a few seconds
+        // in and the poller replayed the head of the track over and over —
+        // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
+        let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("tune_chained_vorbis_{}.ogg", std::process::id()));
+        let mut chained = single.clone();
+        chained.extend_from_slice(&single);
+        std::fs::write(&path, &chained).unwrap();
+
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
+        let _ = std::fs::remove_file(&path);
+        let result = result.unwrap();
+
+        // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
+        // stop at the first boundary (~2 s).
+        assert!(
+            result.duration_s > 3.0,
+            "chained Ogg-Vorbis must decode past the first chain boundary, got {} s",
+            result.duration_s
+        );
+        assert!(
+            result.samples_i32.iter().any(|s| *s != 0),
+            "chained Ogg-Vorbis PCM must not be all silence"
+        );
+    }
+
+    #[test]
+    fn ogg_opus_is_sniffed_as_opus() {
+        // A .ogg carrying Opus must be detected so it routes to libopus, not
+        // the Vorbis decoder (which would fail → silence + 2 s loop).
+        assert!(ogg_stream_is_opus(&fixture_path("test_opus_in.ogg")));
+        assert!(ogg_stream_is_opus(&fixture_path("test.opus")));
+    }
+
+    #[test]
+    fn decode_opus() {
+        // Native .opus (Ogg-Opus): decoded by libopus at 48 kHz / 16-bit.
+        let path = fixture_path("test.opus");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(
+            !result.samples_i32.is_empty(),
+            "Opus should produce samples"
+        );
+        assert_eq!(result.sample_rate, 48000, "Opus decodes at native 48 kHz");
+        assert_eq!(result.bit_depth, 16);
+        assert_eq!(result.channels, 2);
+        assert!(
+            result.duration_s > 1.8 && result.duration_s < 2.2,
+            "Opus duration should be ~2 s, got {}",
+            result.duration_s
+        );
+        assert!(
+            result.samples_i32.iter().any(|s| *s != 0),
+            "decoded Opus PCM must not be all silence (the pre-fix failure mode)"
+        );
+    }
+
+    #[test]
+    fn decode_opus_in_ogg_container() {
+        // Opus muxed in a generic .ogg — the sniffer routes it to libopus.
+        let path = fixture_path("test_opus_in.ogg");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert_eq!(result.sample_rate, 48000);
+        assert_eq!(result.channels, 2);
+        assert!(
+            result.duration_s > 1.8 && result.duration_s < 2.2,
+            "Opus-in-ogg duration should be ~2 s, got {}",
+            result.duration_s
+        );
+    }
+
+    #[test]
+    fn decode_opus_with_duration_limit() {
+        let path = fixture_path("test.opus");
+        let full = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        let bounded = decode_to_pcm(&path, None, None, 0.0, 0.5).unwrap();
+        assert!(
+            bounded.samples_i32.len() < full.samples_i32.len(),
+            "bounded Opus decode must be shorter: {} vs {}",
+            bounded.samples_i32.len(),
+            full.samples_i32.len()
+        );
+        assert!(!bounded.samples_i32.is_empty());
+        assert!(
+            bounded.duration_s <= 0.55,
+            "bounded window should be ~0.5 s, got {}",
+            bounded.duration_s
+        );
+    }
+
+    #[test]
+    fn decode_opus_with_seek() {
+        // Seek must drop the leading portion: a 0.5 s seek into a ~2 s file
+        // yields ~1.5 s, and roughly `seek` seconds fewer frames than the full
+        // decode (sample-accurate via packet pts).
+        let path = fixture_path("test.opus");
+        let full = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        let seeked = decode_to_pcm(&path, None, None, 0.5, 0.0).unwrap();
+        assert!(
+            seeked.samples_i32.len() < full.samples_i32.len(),
+            "seeked Opus decode should have fewer samples"
+        );
+        let dropped_frames =
+            (full.samples_i32.len() - seeked.samples_i32.len()) / full.channels.max(1) as usize;
+        let dropped_s = dropped_frames as f64 / 48000.0;
+        assert!(
+            (dropped_s - 0.5).abs() < 0.1,
+            "seek should drop ~0.5 s of audio, dropped {dropped_s} s"
+        );
     }
 
     #[test]
@@ -1827,6 +2783,19 @@ mod decode_integration_tests {
     }
 
     #[test]
+    fn convert_pcm_bytes_24_to_16_for_dlna_lpcm() {
+        // #1137: a 24-bit source served to a DLNA renderer over the LPCM
+        // fallback must be reduced to genuine 16-bit PCM, not relabelled.
+        // 24-bit LE sample 0x123456 -> keep the top 16 bits -> 0x1234 (LE 34 12).
+        // A negative sample 0x800000 (-8388608) -> 0x8000 (i16::MIN, LE 00 80).
+        let src = [0x56, 0x34, 0x12, /* next */ 0x00, 0x00, 0x80];
+        let out = convert_pcm_bytes(&src, 24, 16);
+        assert_eq!(out, vec![0x34, 0x12, 0x00, 0x80]);
+        // Output is exactly 2 bytes per sample (16-bit).
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
     fn resolve_bit_depth_from_bits_per_sample() {
         let mut params = AudioCodecParameters::new();
         params.bits_per_sample = Some(24);
@@ -1890,5 +2859,41 @@ mod decode_integration_tests {
         params.bits_per_sample = Some(16);
         params.extra_data = Some(cookie.into_boxed_slice());
         assert_eq!(resolve_bit_depth(&params), 16);
+    }
+
+    /// SPIKE (#1145): decode a REAL .ape fixture (Monkey's Audio, High/c3000
+    /// compression, 16-bit stereo) and verify the PCM byte-for-byte matches the
+    /// reference WAV that the C++ Monkey's Audio decoder produced. This is the
+    /// correctness proof: it fails loudly if `ape-decoder` regresses, exactly
+    /// what the old in-tree stub lacked.
+    #[test]
+    fn ape_decodes_real_fixture_matches_reference_wav() {
+        let ape = fixture_path("ape/sine_16s_c3000.ape");
+        let decoded = decode_ape_to_pcm(&ape, 0.0, 0.0).expect("ape decode");
+
+        // Basic sanity: 44.1kHz stereo 16-bit, ~non-trivial duration, non-silent.
+        assert_eq!(decoded.channels, 2, "stereo");
+        assert_eq!(decoded.bit_depth, 16);
+        assert!(decoded.sample_rate >= 8000, "plausible sample rate");
+        assert!(decoded.duration_s > 0.1, "non-trivial duration");
+        assert!(
+            decoded.samples_i32.iter().any(|s| *s != 0),
+            "decoded PCM must not be all-silence (the stub's failure mode)"
+        );
+
+        // Byte-for-byte compare against the C++ reference decoder output.
+        let ref_wav =
+            std::fs::read(fixture_path("ape/sine_16s_c3000.wav")).expect("read reference wav");
+        let ref_pcm = &ref_wav[44..]; // strip 44-byte canonical WAV header
+        let our_pcm = decoded.pcm_bytes();
+        assert_eq!(
+            our_pcm.len(),
+            ref_pcm.len(),
+            "PCM length must equal the reference decoder's output"
+        );
+        assert_eq!(
+            our_pcm, ref_pcm,
+            "decoded PCM must be byte-for-byte identical to the C++ reference decoder"
+        );
     }
 }

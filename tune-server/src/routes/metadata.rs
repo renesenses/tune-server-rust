@@ -17,10 +17,14 @@ use tune_core::metadata::{MetadataUpdate, write_metadata};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
-struct TrackEdit {
+pub(crate) struct TrackEdit {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    /// Reattach the track to an existing album by id. The web Metadata
+    /// Manager has always sent this (grouping loose tracks under a new
+    /// album) but it was not deserialized, so the move silently did nothing.
+    album_id: Option<i64>,
     album_artist: Option<String>,
     genre: Option<String>,
     track_number: Option<u32>,
@@ -58,8 +62,15 @@ struct PaginationParams {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tracks/{id}/edit", post(edit_track))
+        // The web TrackTagsDrawer saves via PATCH /metadata/tracks/{id}, which
+        // never existed on the Rust port and 404'd. Same handler as /edit.
+        .route("/tracks/{id}", axum::routing::patch(edit_track))
         .route("/albums/{id}/edit", post(edit_album))
         .route("/artists/{id}/edit", post(edit_artist))
+        // Legacy Python-server endpoint still called by the web Metadata
+        // Manager ("Graver les tags") — 404'd on the Rust port. Delegates to
+        // the /library/write-tags job (fill-missing-only, whole library).
+        .route("/write-all-tags", post(write_all_tags_compat))
         .route("/doubtful", get(list_doubtful_metadata))
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
@@ -216,7 +227,7 @@ async fn fix_years_from_path(State(state): State<AppState>) -> impl IntoResponse
         .into_response()
 }
 
-async fn edit_track(
+pub(crate) async fn edit_track(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<TrackEdit>,
@@ -259,6 +270,12 @@ async fn edit_track(
     if let Some(ref v) = body.album {
         track.album_title = Some(v.clone());
     }
+    if let Some(aid) = body.album_id {
+        track.album_id = Some(aid);
+        if let Ok(Some(album)) = AlbumRepo::with_backend(state.backend.clone()).get(aid) {
+            track.album_title = Some(album.title);
+        }
+    }
     if let Some(ref v) = body.genre {
         track.genre = Some(v.clone());
     }
@@ -281,6 +298,19 @@ async fn edit_track(
     repo.update(&track).ok();
 
     Json(json!({ "status": "ok", "track_id": id })).into_response()
+}
+
+async fn write_all_tags_compat(state: State<AppState>) -> impl IntoResponse {
+    use crate::routes::library::write_tags::{WriteTagsRequest, write_tags_to_files};
+    write_tags_to_files(
+        state,
+        Json(WriteTagsRequest {
+            only_missing: true,
+            track_ids: None,
+            album_id: None,
+        }),
+    )
+    .await
 }
 
 async fn edit_album(
@@ -650,7 +680,9 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
         return Json(json!({"error": "no lastfm api key configured"})).into_response();
     }
 
-    let client = reqwest::Client::new();
+    // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
+    // d'attente, qu'un client reqwest construit à la main n'a pas du tout.
+    let client = tune_core::http::client::shared();
     let resp = client
         .get("http://ws.audioscrobbler.com/2.0/")
         .query(&[
@@ -816,16 +848,23 @@ async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> 
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Voir auto_dj::similar_artist_names : pas de repli codé en dur, le client
+    // porte l'adresse de référence (#1730).
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let api_base = settings
-        .get("artist_enrichment_api")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
+    let api_base = settings.get("artist_enrichment_api").ok().flatten();
 
-    let mut client =
-        tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
-    let data = client.get_similar(&artist.name).await;
+    let mut client = tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(
+        api_base.as_deref(),
+        10,
+    );
+    // Même correction qu'en auto_dj : l'API est indexée par MBID, la route
+    // lui passait le nom de l'artiste (#1730). Un artiste inconnu du cloud
+    // rend une liste vide, pas une erreur — la vue « artistes similaires »
+    // reste affichable.
+    let data = match client.resolve_mbid(&artist.name).await {
+        Some(mbid) => client.get_similar(&mbid).await,
+        None => Vec::new(),
+    };
     Json(json!(data)).into_response()
 }
 
@@ -985,42 +1024,6 @@ fn normalize_genre(
         }
     }
     None
-}
-
-/// Strip hi-res suffixes like "(96kHz/24bit)" from album titles for API lookups.
-fn clean_album_title(title: &str) -> String {
-    // Remove patterns like (44.1kHz), (96kHz/24bit), (192kHz 24bit) etc.
-    let mut result = String::with_capacity(title.len());
-    let mut depth = 0i32;
-    let mut paren_start = 0;
-    for (i, c) in title.char_indices() {
-        if c == '(' {
-            if depth == 0 {
-                paren_start = i;
-            }
-            depth += 1;
-        } else if c == ')' {
-            depth -= 1;
-            if depth <= 0 {
-                depth = 0;
-                // Check if the parenthesized content looks like a hi-res suffix.
-                let inner = &title[paren_start + 1..i];
-                let lower = inner.to_lowercase();
-                if lower.contains("khz") || lower.contains("hz") {
-                    // Skip this parenthesized part (and leading whitespace).
-                    while result.ends_with(' ') {
-                        result.pop();
-                    }
-                } else {
-                    // Keep it.
-                    result.push_str(&title[paren_start..=i]);
-                }
-            }
-        } else if depth == 0 {
-            result.push(c);
-        }
-    }
-    result.trim().to_string()
 }
 
 /// Regex-free artist normalization for fuzzy grouping.
@@ -1716,7 +1719,7 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
             continue;
         }
 
-        let clean_title = clean_album_title(album_title);
+        let clean_title = tune_core::scanner::quality::strip_quality_suffix(album_title);
         let mut genre: Option<String> = None;
 
         // 1) Last.fm

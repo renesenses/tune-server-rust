@@ -73,6 +73,12 @@ pub struct PrefetchedTrack {
     pub album: Option<String>,
     pub cover_url: Option<String>,
     pub mime_type: String,
+    /// The service's own URL the buffer was decoded from — carried through to
+    /// `PlayMedia::origin_url` when this track is served from the buffer, so an
+    /// output that wants the bytes as the service published them still has a way
+    /// to reach them. Everything served from here is a local PCM session, so it
+    /// is never the URL the output receives.
+    pub upstream_url: Option<String>,
 }
 
 /// Thread-safe prefetch engine shared across async tasks.
@@ -319,6 +325,12 @@ impl PrefetchEngine {
             };
 
         let upstream_url = stream_data.url.clone();
+        // Kept aside for `PrefetchedTrack::upstream_url`: `upstream_url` itself
+        // is moved into the decode task below. A `file://` DASH assembly is one
+        // of our own temporary files, not bytes as the service published them,
+        // so it does not qualify as an origin.
+        let upstream_url_for_origin =
+            (!upstream_url.starts_with("file://")).then(|| upstream_url.clone());
         let sr = stream_data.quality.sample_rate;
         let bd = stream_data.quality.bit_depth;
         let codec = stream_data.quality.codec.to_lowercase();
@@ -459,6 +471,7 @@ impl PrefetchEngine {
                     album: track_album,
                     cover_url: track_cover,
                     mime_type: "audio/wav".into(),
+                    upstream_url: upstream_url_for_origin,
                 };
 
                 *self.buffer.lock().await = Some(prefetched);
@@ -648,6 +661,7 @@ mod tests {
             album: Some("Test Album".into()),
             cover_url: None,
             mime_type: "audio/wav".into(),
+            upstream_url: None,
         };
         *engine.buffer.lock().await = Some(track);
 
@@ -693,6 +707,7 @@ mod tests {
             album: None,
             cover_url: None,
             mime_type: "audio/wav".into(),
+            upstream_url: None,
         });
 
         let status = engine.status().await;
@@ -723,6 +738,7 @@ mod tests {
             album: None,
             cover_url: None,
             mime_type: "audio/wav".into(),
+            upstream_url: None,
         });
         *engine.prefetched_position.lock().await = Some(5);
 
@@ -755,6 +771,7 @@ mod tests {
             album: None,
             cover_url: None,
             mime_type: "audio/wav".into(),
+            upstream_url: None,
         });
         *engine.prefetched_position.lock().await = Some(3);
 

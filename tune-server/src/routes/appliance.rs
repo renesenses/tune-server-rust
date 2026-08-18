@@ -1,0 +1,307 @@
+//! Appliance mode: host network configuration (WiFi via nmcli).
+//!
+//! Only active when the host is a Tune appliance image: marker file
+//! `/etc/tune-appliance` present, or `TUNE_APPLIANCE=1` (dev/test).
+//! On regular desktop installs every endpoint returns 404 so the surface
+//! is not exposed. SMB mounts are handled by the existing `/network` routes.
+
+use axum::http::HeaderMap;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio::process::Command;
+
+use crate::error::AppError;
+use crate::state::AppState;
+
+const APPLIANCE_MARKER: &str = "/etc/tune-appliance";
+const SCAN_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Deserialize)]
+struct WifiConnect {
+    ssid: String,
+    password: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WifiForget {
+    ssid: String,
+}
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/status", get(status))
+        .route("/wifi/scan", get(wifi_scan))
+        .route("/wifi/connect", post(wifi_connect))
+        .route("/wifi/forget", post(wifi_forget))
+}
+
+/// True when running on a Tune appliance image (or forced via env for dev).
+pub fn is_appliance() -> bool {
+    if let Ok(v) = std::env::var("TUNE_APPLIANCE") {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    std::path::Path::new(APPLIANCE_MARKER).exists()
+}
+
+fn require_appliance() -> Result<(), AppError> {
+    if is_appliance() {
+        Ok(())
+    } else {
+        Err(AppError::not_found("appliance mode not active"))
+    }
+}
+
+fn nmcli_bin() -> String {
+    std::env::var("TUNE_NMCLI_BIN").unwrap_or_else(|_| "nmcli".into())
+}
+
+async fn nmcli(args: &[&str], timeout: Duration, lang: &str) -> Result<String, AppError> {
+    match tokio::time::timeout(timeout, Command::new(nmcli_bin()).args(args).output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(AppError::bad_request(
+                crate::i18n::t(lang, "net.wifiCommandFailed").replace("{error}", &stderr),
+            ))
+        }
+        Ok(Err(e)) => Err(AppError::internal(
+            crate::i18n::t(lang, "net.wifiUnavailable").replace("{error}", &e.to_string()),
+        )),
+        Err(_) => Err(AppError {
+            status: axum::http::StatusCode::GATEWAY_TIMEOUT,
+            message: crate::i18n::t(lang, "net.wifiTimeout"),
+            code: Some("timeout".into()),
+        }),
+    }
+}
+
+/// Split one line of `nmcli -t` (terse) output on unescaped `:`.
+/// nmcli escapes `:` as `\:` and `\` as `\\` inside field values.
+fn split_terse(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            ':' => fields.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
+fn parse_wifi_list(raw: &str) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    raw.lines()
+        .filter_map(|line| {
+            // IN-USE:SSID:SIGNAL:SECURITY
+            let f = split_terse(line);
+            if f.len() < 4 || f[1].is_empty() {
+                return None;
+            }
+            let in_use = f[0] == "*";
+            // nmcli lists one row per BSSID; keep the strongest per SSID,
+            // rows arrive sorted by signal so first wins (unless in use).
+            if !seen.insert(f[1].clone()) && !in_use {
+                return None;
+            }
+            Some(json!({
+                "ssid": f[1],
+                "signal": f[2].parse::<i64>().unwrap_or(0),
+                "security": f[3],
+                "in_use": in_use,
+            }))
+        })
+        .collect()
+}
+
+fn parse_device_status(raw: &str) -> (Vec<Value>, bool, bool) {
+    let mut devices = Vec::new();
+    let mut ethernet_connected = false;
+    let mut wifi_connected = false;
+    for line in raw.lines() {
+        // DEVICE:TYPE:STATE:CONNECTION
+        let f = split_terse(line);
+        if f.len() < 4 || !matches!(f[1].as_str(), "ethernet" | "wifi") {
+            continue;
+        }
+        let connected = f[2] == "connected";
+        match f[1].as_str() {
+            "ethernet" if connected => ethernet_connected = true,
+            "wifi" if connected => wifi_connected = true,
+            _ => {}
+        }
+        devices.push(json!({
+            "device": f[0],
+            "type": f[1],
+            "state": f[2],
+            "connection": if f[3].is_empty() { Value::Null } else { json!(f[3]) },
+        }));
+    }
+    (devices, ethernet_connected, wifi_connected)
+}
+
+fn validate_ssid(ssid: &str) -> Result<(), AppError> {
+    if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(|c| c.is_control()) {
+        return Err(AppError::bad_request("invalid ssid"));
+    }
+    Ok(())
+}
+
+async fn status(headers: HeaderMap) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    let lang = crate::i18n::lang_from_header(&headers);
+    let raw = nmcli(
+        &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"],
+        SCAN_TIMEOUT,
+        &lang,
+    )
+    .await?;
+    let (devices, ethernet_connected, wifi_connected) = parse_device_status(&raw);
+    // Current WiFi SSID + signal (only meaningful when wifi_connected)
+    let mut wifi_ssid = Value::Null;
+    let mut wifi_signal = Value::Null;
+    if wifi_connected {
+        if let Ok(list) = nmcli(
+            &["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi"],
+            SCAN_TIMEOUT,
+            &lang,
+        )
+        .await
+        {
+            if let Some(active) = parse_wifi_list(&list)
+                .into_iter()
+                .find(|n| n["in_use"] == json!(true))
+            {
+                wifi_ssid = active["ssid"].clone();
+                wifi_signal = active["signal"].clone();
+            }
+        }
+    }
+    Ok(Json(json!({
+        "appliance": true,
+        "devices": devices,
+        "ethernet_connected": ethernet_connected,
+        "wifi_connected": wifi_connected,
+        "wifi_ssid": wifi_ssid,
+        "wifi_signal": wifi_signal,
+    })))
+}
+
+async fn wifi_scan(headers: HeaderMap) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    let lang = crate::i18n::lang_from_header(&headers);
+    let raw = nmcli(
+        &[
+            "-t",
+            "-f",
+            "IN-USE,SSID,SIGNAL,SECURITY",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+        ],
+        SCAN_TIMEOUT,
+        &lang,
+    )
+    .await?;
+    Ok(Json(json!({ "networks": parse_wifi_list(&raw) })))
+}
+
+async fn wifi_connect(
+    headers: HeaderMap,
+    Json(body): Json<WifiConnect>,
+) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    validate_ssid(&body.ssid)?;
+    let lang = crate::i18n::lang_from_header(&headers);
+    let mut args = vec!["device", "wifi", "connect", body.ssid.as_str()];
+    if let Some(pw) = body.password.as_deref().filter(|p| !p.is_empty()) {
+        args.extend(["password", pw]);
+    }
+    let out = nmcli(&args, CONNECT_TIMEOUT, &lang).await.map_err(|e| {
+        // nmcli reports wrong passphrase on stderr with exit code != 0
+        if e.message.contains("Secrets were required")
+            || e.message.contains("802-11-wireless-security")
+        {
+            AppError::bad_request(crate::i18n::t(&lang, "net.wifiBadPassword"))
+        } else {
+            e
+        }
+    })?;
+    tracing::info!(ssid = %body.ssid, "appliance wifi connected");
+    Ok(Json(json!({ "connected": true, "message": out.trim() })))
+}
+
+async fn wifi_forget(
+    headers: HeaderMap,
+    Json(body): Json<WifiForget>,
+) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    validate_ssid(&body.ssid)?;
+    let lang = crate::i18n::lang_from_header(&headers);
+    nmcli(
+        &["connection", "delete", "id", body.ssid.as_str()],
+        SCAN_TIMEOUT,
+        &lang,
+    )
+    .await?;
+    Ok(Json(json!({ "forgotten": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_terse_handles_escaped_colons() {
+        assert_eq!(split_terse("a:b:c"), vec!["a", "b", "c"]);
+        assert_eq!(
+            split_terse(r"*:My\:SSID:82:WPA2"),
+            vec!["*", "My:SSID", "82", "WPA2"]
+        );
+        assert_eq!(split_terse(r"x\\y:z"), vec![r"x\y", "z"]);
+        assert_eq!(split_terse(""), vec![""]);
+    }
+
+    #[test]
+    fn parse_wifi_list_dedupes_and_flags_in_use() {
+        let raw = " :Livebox-1234:78:WPA2\n*:Atelier:64:WPA2\n :Livebox-1234:40:WPA2\n :\n";
+        let nets = parse_wifi_list(raw);
+        assert_eq!(nets.len(), 2);
+        assert_eq!(nets[0]["ssid"], "Livebox-1234");
+        assert_eq!(nets[0]["signal"], 78);
+        assert_eq!(nets[0]["in_use"], false);
+        assert_eq!(nets[1]["ssid"], "Atelier");
+        assert_eq!(nets[1]["in_use"], true);
+    }
+
+    #[test]
+    fn parse_device_status_reports_links() {
+        let raw = "enp1s0:ethernet:connected:Wired connection 1\nwlan0:wifi:disconnected:\nlo:loopback:unmanaged:\n";
+        let (devices, eth, wifi) = parse_device_status(raw);
+        assert_eq!(devices.len(), 2);
+        assert!(eth);
+        assert!(!wifi);
+        assert_eq!(devices[1]["connection"], Value::Null);
+    }
+
+    #[test]
+    fn validate_ssid_rejects_bad_input() {
+        assert!(validate_ssid("Livebox-1234").is_ok());
+        assert!(validate_ssid("").is_err());
+        assert!(validate_ssid("a\nb").is_err());
+        assert!(validate_ssid(&"x".repeat(33)).is_err());
+    }
+}

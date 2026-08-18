@@ -106,6 +106,25 @@ fn assert_not_html(bytes: &[u8], endpoint: &str) {
     );
 }
 
+async fn patch_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::patch(path)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, json)
+}
+
 async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -593,16 +612,48 @@ async fn api_stats_endpoint() {
     assert!(body["slowest_endpoints"].is_array());
 }
 
+/// `/system/changelog` répond, et ce qu'il rend est bien formé.
+///
+/// Ce test a bloqué TOUTES les fusions du dépôt pendant une panne GitHub du
+/// 2026-08-17 — y compris une PR qui ne touchait pas au changelog. La raison :
+/// il exigeait au moins 5 versions d'un point d'entrée qui va les chercher sur
+/// le réseau (`fetch_github_changelog` : proxy `mozaiklabs.fr` d'abord, puis
+/// `api.github.com`). Les deux sources sont tombées ensemble — le proxy parce
+/// que son amont EST GitHub — et le test a échoué sur `release/v0.9` comme sur
+/// chaque branche.
+///
+/// Un test d'intégration ne doit pas transformer l'indisponibilité d'un tiers
+/// en échec de compilation. Ce qui est vérifié ici reste donc :
+///
+/// - la route répond 200 et porte une `version` ;
+/// - `entries` est un tableau ;
+/// - **quand des données arrivent**, leur forme est vérifiée entièrement — au
+///   moins 5 versions, la plus récente non vide.
+///
+/// La seule chose relâchée est l'exigence que le réseau réponde. Un changelog
+/// vide n'est plus un échec ; un changelog mal formé en reste un.
 #[tokio::test]
 async fn changelog_has_entries() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/system/changelog").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["version"].is_string());
-    let entries = body["entries"].as_array().unwrap();
+    let entries = body["entries"]
+        .as_array()
+        .expect("entries doit toujours être un tableau, même vide");
+
+    if entries.is_empty() {
+        // Source injoignable : c'est un fait sur le réseau, pas un défaut du
+        // serveur. On le dit dans la sortie du test plutôt que de faire
+        // échouer la CI de tout le dépôt.
+        eprintln!("changelog vide — source distante injoignable, contrat de forme non vérifiable");
+        return;
+    }
+
     assert!(
         entries.len() >= 5,
-        "changelog should have at least 5 versions"
+        "changelog reçu mais tronqué : {} version(s), 5 attendues",
+        entries.len()
     );
     // The newest entry's version is not hardcoded (it moves with each
     // release); just assert it's a present, non-empty string.
@@ -688,7 +739,7 @@ async fn playback_manager_state_transitions() {
     let (_app, state) = make_app_with_state();
 
     // Create a zone in DB
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_id = zone_repo
         .create("Test", Some("mock"), Some("mock-1"))
         .unwrap();
@@ -879,6 +930,525 @@ async fn api_trailing_slash_does_not_serve_html() {
         assert!(
             status.is_redirection(),
             "/api/v1/nonexistent/ should redirect or 404, got {status}"
+        );
+    }
+}
+
+// ── Queue endpoint characterization tests ───────────────────────────
+//
+// These lock the CURRENT intentional behaviour of the unified queue
+// (v0.9 rc.2: local + streaming share the `queue_items` table but keep
+// independent position spaces — "one active queue type per zone"). A
+// future interleaved-queue feature must update these on purpose, not by
+// accident.
+
+async fn make_zone(app: &axum::Router, name: &str) -> i64 {
+    let (status, body) = post_json(app, "/api/v1/zones", json!({ "name": name })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    body["id"].as_i64().expect("zone id")
+}
+
+// queue_items.track_id has a FK to tracks(id) (enforced — foreign_keys=ON),
+// so local queue rows require real tracks. Insert them via the repo first.
+fn insert_track(state: &tune_server::state::AppState, title: &str) -> i64 {
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+    repo.create(&tune_core::db::models::Track::new(title.into()))
+        .expect("insert track")
+}
+
+#[tokio::test]
+async fn queue_add_local_and_get() {
+    let (app, state) = make_app_with_state();
+    let t1 = insert_track(&state, "A");
+    let t2 = insert_track(&state, "B");
+    let zid = make_zone(&app, "Q-local").await;
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [t1, t2] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tracks = body["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0]["track_id"], t1);
+    assert_eq!(tracks[1]["track_id"], t2);
+    assert_eq!(body["length"], 2);
+}
+
+#[tokio::test]
+async fn queue_add_streaming_and_get() {
+    let app = make_app();
+    let zid = make_zone(&app, "Q-streaming").await;
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({
+            "source": "qobuz",
+            "source_id": "s1",
+            "title": "Stream Song",
+            "artist_name": "Stream Artist",
+            "duration_ms": 200000
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tracks = body["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0]["source_id"], "s1");
+    assert_eq!(tracks[0]["title"], "Stream Song");
+    assert_eq!(tracks[0]["source"], "qobuz");
+}
+
+#[tokio::test]
+async fn queue_returns_combined_in_insertion_order() {
+    // Documented behaviour (v0.9 unified queue): local and streaming rows live
+    // in ONE `queue_items` table sharing a single position space, so GET /queue
+    // returns them in INSERTION order (ORDER BY position) — the exact order the
+    // poller/orchestrator advance through. Both subsets are always returned
+    // together (the old either/or logic hid streaming rows when a local queue
+    // was present, so an added Qobuz track was invisible and never played —
+    // Progman). Here the streaming track is added first, so it comes first.
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "LocalSecond");
+    let zid = make_zone(&app, "Q-mixed").await;
+
+    // Add a streaming track first…
+    let (s1, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "source": "tidal", "source_id": "t1", "title": "Streamed" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+    // …then a local track.
+    let (s2, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [tid] }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::CREATED);
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tracks = body["tracks"].as_array().unwrap();
+    // Both are returned, in the order they were added: streaming (position 0)
+    // then local (position 1).
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0]["source_id"], "t1");
+    assert_eq!(tracks[1]["track_id"], tid);
+    assert!(tracks[1].get("source_id").is_none() || tracks[1]["source_id"].is_null());
+}
+
+#[tokio::test]
+async fn queue_clear_empties_both_subsets() {
+    let app = make_app();
+    let zid = make_zone(&app, "Q-clear").await;
+
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [1, 2] }),
+    )
+    .await;
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "source": "qobuz", "source_id": "s9", "title": "X" }),
+    )
+    .await;
+
+    let (status, _) = post_json(&app, &format!("/api/v1/zones/{zid}/queue/clear"), json!({})).await;
+    assert!(status.is_success());
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["tracks"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn queue_add_empty_body_is_rejected() {
+    let app = make_app();
+    let zid = make_zone(&app, "Q-empty").await;
+
+    let (status, _) = post_json(&app, &format!("/api/v1/zones/{zid}/queue/add"), json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ── Orphan zone guard (Yacine, 24/07) ───────────────────────────────
+//
+// A zone row without output_device_id (leftover from manual creation or
+// old delete/re-create cycles) can never produce sound: send_to_output is
+// skipped and play() used to "succeed" with output_sent=false, so the
+// client showed the track playing while nothing came out. play/next/
+// previous must now return a clean 409 and GET /zones must report the
+// zone offline so clients grey it out. The zone row itself is preserved
+// (no automatic destruction of user data).
+
+#[tokio::test]
+async fn orphan_zone_play_returns_409() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Orphan Track");
+    // make_zone POSTs only a name: no output_device_id → orphan zone.
+    let zid = make_zone(&app, "Orphan Zone").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({ "track_id": tid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "play must 409, got {body}");
+    assert_eq!(body["error"], "zone_no_output_device");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Orphan Zone"),
+        "message should name the zone: {body}"
+    );
+
+    // The zone row must still exist (no automatic deletion).
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(zone["name"], "Orphan Zone");
+    // …and be reported offline so clients grey it out.
+    assert_eq!(zone["online"], false, "orphan zone must be offline: {zone}");
+}
+
+#[tokio::test]
+async fn orphan_zone_next_and_previous_return_409() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Orphan Next");
+    let zid = make_zone(&app, "Orphan Nav").await;
+    // Give the zone a queue so next/previous have something to skip to.
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [tid] }),
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &format!("/api/v1/zones/{zid}/next"), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "next must 409, got {body}");
+    assert_eq!(body["error"], "zone_no_output_device");
+
+    let (status, body) = post_json(&app, &format!("/api/v1/zones/{zid}/previous"), json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "previous must 409, got {body}"
+    );
+    assert_eq!(body["error"], "zone_no_output_device");
+}
+
+#[tokio::test]
+async fn orphan_zone_listed_offline_in_zones() {
+    let app = make_app();
+    let zid = make_zone(&app, "Orphan Listed").await;
+
+    let (status, body) = get(&app, "/api/v1/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zones = body.as_array().expect("zones array");
+    let zone = zones
+        .iter()
+        .find(|z| z["id"] == zid)
+        .expect("orphan zone present in listing");
+    assert_eq!(
+        zone["online"], false,
+        "orphan zone must be listed offline: {zone}"
+    );
+}
+
+#[tokio::test]
+async fn browser_zone_without_device_is_not_rejected_as_orphan() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Browser Track");
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/zones",
+        json!({ "name": "Browser Zone", "output_type": "browser" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create browser zone: {body}");
+    let zid = body["id"].as_i64().expect("zone id");
+
+    // Browser zones legitimately have no output device (the web client pulls
+    // stream_url itself): the orphan guard must NOT fire. The play may fail
+    // for other reasons (test track has no real file) but never with 409
+    // zone_no_output_device.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({ "track_id": tid }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "browser zone must not be rejected as orphan: {body}"
+    );
+
+    // And it stays online in the listing.
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(zone["online"], true, "browser zone must be online: {zone}");
+}
+
+// ───────────────────────── Lyrics endpoint (mode « Grand écran ») ─────────
+//
+// Contract with the web client:
+//   200 {"synced": bool, "source": "lrc"|"tag"|"lrclib",
+//        "lines": [{"t_ms": u64|null, "text": "..."}]}
+//   404 {"error": "no_lyrics"}
+// Cascade: sidecar .lrc → embedded tag → LRCLIB (opt-in). These tests cover
+// the local sources and the clean-404 paths (no network involved: the
+// lyrics_lrclib_enabled setting stays unset → LRCLIB is skipped).
+
+fn insert_track_with_file(state: &tune_server::state::AppState, title: &str, path: &str) -> i64 {
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+    let mut t = tune_core::db::models::Track::new(title.into());
+    t.file_path = Some(path.into());
+    repo.create(&t).expect("insert track")
+}
+
+#[tokio::test]
+async fn lyrics_unknown_track_is_404_no_lyrics() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/library/tracks/424242/lyrics").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "no_lyrics");
+}
+
+#[tokio::test]
+async fn lyrics_track_without_any_source_is_404_no_lyrics() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Muette");
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "no_lyrics");
+}
+
+#[tokio::test]
+async fn lyrics_sidecar_lrc_is_synced() {
+    let dir = std::env::temp_dir().join(format!("tune_lyrics_it_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let audio = dir.join("Ma Chanson.flac");
+    // Multi-timestamps on one line + metadata tags to ignore.
+    std::fs::write(
+        dir.join("Ma Chanson.lrc"),
+        "[ar:Artiste]\n[ti:Ma Chanson]\n[00:12.00][01:15.00]Refrain\n[00:30.500] Couplet\n",
+    )
+    .unwrap();
+
+    let (app, state) = make_app_with_state();
+    let tid = insert_track_with_file(&state, "Ma Chanson", audio.to_str().unwrap());
+
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["synced"], true);
+    assert_eq!(body["source"], "lrc");
+    let lines = body["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 3);
+    // Sorted by t_ms; the multi-timestamp line appears twice.
+    assert_eq!(lines[0]["t_ms"], 12_000);
+    assert_eq!(lines[0]["text"], "Refrain");
+    assert_eq!(lines[1]["t_ms"], 30_500);
+    assert_eq!(lines[1]["text"], "Couplet");
+    assert_eq!(lines[2]["t_ms"], 75_000);
+    assert_eq!(lines[2]["text"], "Refrain");
+}
+
+#[tokio::test]
+async fn lyrics_embedded_tag_plain_is_unsynced() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Taggée");
+    // The scanner persists embedded USLT/LYRICS content under this key.
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    meta.set(tid, "lyrics", "Première ligne\n\nDeuxième ligne")
+        .unwrap();
+
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["synced"], false);
+    assert_eq!(body["source"], "tag");
+    let lines = body["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["t_ms"], Value::Null);
+    assert_eq!(lines[0]["text"], "Première ligne");
+    assert_eq!(lines[1]["text"], "Deuxième ligne");
+}
+
+#[tokio::test]
+async fn lyrics_embedded_tag_with_lrc_timestamps_is_synced() {
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "Taggée LRC");
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    meta.set(tid, "lyrics", "[00:01.00] Un\n[00:02.00] Deux")
+        .unwrap();
+
+    let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["synced"], true);
+    assert_eq!(body["source"], "tag");
+    let lines = body["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["t_ms"], 1_000);
+    assert_eq!(lines[1]["t_ms"], 2_000);
+}
+
+// ── AutoPlay : le reglage persiste, l'API le niait (Sandro, 0.9.70) ────────
+//
+// `autoplay_enabled` est VOLONTAIREMENT absent de la requete SQL de ZoneRepo
+// (migration v36 pouvant echouer en silence sous Windows), donc `row_to_zone`
+// le met a `false` sans exception. La serialisation de la zone propageait ce
+// faux jusqu'au client : le bouton retombait a chaque resynchronisation alors
+// que le poller, lui, lisait la bonne valeur en fin de file.
+
+#[tokio::test]
+async fn autoplay_active_est_rapporte_par_la_liste_des_zones() {
+    let app = make_app();
+    let zid = make_zone(&app, "AutoPlay Liste").await;
+
+    let (status, _) = patch_json(
+        &app,
+        &format!("/api/v1/zones/{zid}"),
+        json!({ "autoplay_enabled": true }),
+    )
+    .await;
+    assert!(status.is_success(), "activation refusee : {status}");
+
+    let (status, body) = get(&app, "/api/v1/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zone = body
+        .as_array()
+        .expect("zones array")
+        .iter()
+        .find(|z| z["id"] == zid)
+        .expect("zone presente");
+    assert_eq!(
+        zone["autoplay_enabled"], true,
+        "la liste doit rapporter le reglage persiste : {zone}"
+    );
+}
+
+#[tokio::test]
+async fn autoplay_active_est_rapporte_par_le_detail_de_la_zone() {
+    let app = make_app();
+    let zid = make_zone(&app, "AutoPlay Detail").await;
+
+    patch_json(
+        &app,
+        &format!("/api/v1/zones/{zid}"),
+        json!({ "autoplay_enabled": true }),
+    )
+    .await;
+
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        zone["autoplay_enabled"], true,
+        "le detail doit rapporter le reglage persiste : {zone}"
+    );
+}
+
+#[tokio::test]
+async fn autoplay_inactif_reste_inactif() {
+    // Le defaut ne doit pas basculer dans l'autre sens en corrigeant le bug.
+    let app = make_app();
+    let zid = make_zone(&app, "AutoPlay Defaut").await;
+
+    let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(zone["autoplay_enabled"], false, "defaut attendu : {zone}");
+}
+
+/// Une playlist bâtie depuis les favoris radio doit dire ce qui n'a PAS marché.
+///
+/// L'ancien chemin local ne rendait que `matched_tracks` : « 0 sur 2 » sans
+/// indiquer lesquels, ni si la recherche avait échoué, ni si un candidat avait
+/// été trouvé puis refusé au seuil. C'est exactement l'aveuglement qui a rendu
+/// #1235 indiagnosticable pendant des semaines côté streaming — corrigé là-bas
+/// par #1079, jamais ici.
+///
+/// Le test vise le rapport, pas la qualité du rapprochement : la bibliothèque
+/// est vide, donc aucun favori ne peut correspondre. Ce qui doit être vrai,
+/// c'est que chaque favori figure dans le compte rendu avec une raison.
+#[tokio::test]
+async fn playlist_depuis_favoris_radio_rend_compte_de_chaque_favori() {
+    let app = make_app();
+
+    for (title, artist) in [
+        ("Nightswimming", "R.E.M."),
+        ("Under the Strikes", "Sofiane Pamart"),
+    ] {
+        let (st, _) = post_json(
+            &app,
+            "/api/v1/radio-favorites",
+            serde_json::json!({
+                "title": title,
+                "artist": artist,
+                "station_name": "FIP",
+            }),
+        )
+        .await;
+        assert!(
+            st.is_success(),
+            "le favori « {title} » doit pouvoir être enregistré (statut {st})"
+        );
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        serde_json::json!({ "playlist_name": "Depuis FIP" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "réponse : {body}");
+    assert_eq!(body["favorites_count"], 2);
+
+    let results = body["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("le rapport par favori doit être présent : {body}"));
+    assert_eq!(
+        results.len(),
+        2,
+        "chaque favori doit apparaître dans le compte rendu, y compris ceux qui \
+         n'ont rien donné — sinon l'utilisateur ne peut ni corriger un tag ni \
+         signaler utilement : {body}"
+    );
+
+    for r in results {
+        let s = r["status"].as_str().unwrap_or("");
+        assert!(
+            [
+                "matched",
+                "not_found",
+                "rejected",
+                "search_failed",
+                "duplicate",
+                "add_failed"
+            ]
+            .contains(&s),
+            "statut inattendu « {s} » dans {r}"
+        );
+        assert!(
+            r["title"].as_str().is_some_and(|t| !t.is_empty()),
+            "chaque ligne doit nommer le favori concerné : {r}"
         );
     }
 }

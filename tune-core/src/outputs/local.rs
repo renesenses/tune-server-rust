@@ -12,6 +12,99 @@ use tracing::{debug, info, warn};
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 use crate::poller::TRACK_END_NOTIFY;
 
+/// Why a device refused to open, as far as the backend string lets us tell.
+///
+/// Two audiences need this, and they need different words: the log is read by
+/// us, in English, alongside the raw backend error; the toast is read by
+/// someone whose music just didn't start, in their language, and must say what
+/// to *do*. Classifying once and rendering twice keeps the two from drifting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenFailure {
+    /// The sound server is not reachable, or the account may not open the
+    /// device at all.
+    ServerUnreachable,
+    /// The device disappeared between selection and playback.
+    DeviceGone,
+    /// Another application holds the device exclusively.
+    Busy,
+    /// Nothing matched — say so plainly rather than guess.
+    Unknown,
+}
+
+/// Classify a device-open error.
+///
+/// The backend strings are written for driver authors, not for the person whose
+/// music stopped: ALSA reports an unreachable PipeWire daemon as
+/// `Host is down (112)`, which reads like a network fault and sends everyone
+/// looking at the wrong layer. It cost a full morning with Yacine on 8 Aug
+/// 2026 — and the real cause turned out to be a third thing again, an account
+/// missing from the `audio` group on a machine driven over SSH, where logind
+/// grants no device ACL because there is no local seat. Both faults surface as
+/// the same string, hence the deliberately broad wording of that arm.
+///
+/// Matching is loose on purpose: cpal wraps the backend message and the wording
+/// varies by platform, so anything unrecognised falls through to `Unknown`
+/// rather than to a confident wrong answer.
+fn classify_open_failure(err: &str) -> OpenFailure {
+    let e = err.to_ascii_lowercase();
+    if e.contains("host is down")
+        || e.contains("connection refused")
+        || e.contains("permission denied")
+        || e.contains("access denied")
+    {
+        OpenFailure::ServerUnreachable
+    } else if e.contains("no such device") || e.contains("no such file") {
+        OpenFailure::DeviceGone
+    } else if e.contains("busy") || e.contains("in use") {
+        OpenFailure::Busy
+    } else {
+        OpenFailure::Unknown
+    }
+}
+
+impl OpenFailure {
+    /// English, for the log, next to the raw backend error.
+    fn log_hint(self) -> &'static str {
+        match self {
+            Self::ServerUnreachable => {
+                "the sound server (PipeWire/PulseAudio) is unreachable, or this account \
+                 cannot open the device — check that Tune runs in the owning user session \
+                 and that the account is in the `audio` group"
+            }
+            Self::DeviceGone => {
+                "the device is gone — a USB DAC unplugged or powered off since it was selected"
+            }
+            Self::Busy => "the device is held exclusively by another application",
+            Self::Unknown => {
+                "the device refused every format offered — it may be unavailable or misconfigured"
+            }
+        }
+    }
+
+    /// French, for the toast. Says what to do, not what failed internally.
+    fn user_message(self) -> &'static str {
+        match self {
+            Self::ServerUnreachable => {
+                "le service audio ne répond pas, ou Tune n'a pas le droit d'ouvrir ce \
+                 périphérique. Vérifiez que le serveur audio est démarré et que le compte \
+                 qui exécute Tune appartient au groupe « audio »"
+            }
+            Self::DeviceGone => {
+                "le périphérique n'est plus là. Vérifiez qu'il est allumé et connecté, \
+                 puis choisissez-le à nouveau dans les réglages de la zone"
+            }
+            Self::Busy => {
+                "un autre programme utilise déjà ce périphérique en exclusivité. \
+                 Fermez-le, puis relancez la lecture"
+            }
+            Self::Unknown => {
+                "le périphérique a refusé tous les formats proposés. Choisissez une autre \
+                 sortie dans les réglages de la zone"
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Audio host selection (WASAPI vs ASIO on Windows)
 // ---------------------------------------------------------------------------
@@ -40,11 +133,13 @@ pub fn select_host(backend: &str) -> cpal::Host {
                             devices = device_count,
                             "local_audio_host_selected"
                         );
+                        note_observed_backend("ASIO");
                         return host;
                     }
                     warn!(
                         "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
                     );
+                    note_observed_backend("WASAPI");
                     return cpal::default_host();
                 }
                 Err(e) => {
@@ -53,6 +148,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
                         "local_audio_asio_host_unavailable — check ASIO driver installation"
                     );
                     info!(backend = "wasapi", "local_audio_host_fallback");
+                    note_observed_backend("WASAPI");
                     return cpal::default_host();
                 }
             },
@@ -61,10 +157,12 @@ pub fn select_host(backend: &str) -> cpal::Host {
                 // abort() when probed, crashing the process silently.
                 // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
+                note_observed_backend("WASAPI");
                 return cpal::default_host();
             }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
+                note_observed_backend("WASAPI");
                 return cpal::default_host();
             }
         }
@@ -83,8 +181,45 @@ pub fn select_host(backend: &str) -> cpal::Host {
     }
 }
 
-/// Returns the name of the audio backend for the given preference.
+/// Backend réellement retenu par le dernier `select_host`, quand il diffère de
+/// ce qui était demandé.
+///
+/// `select_host` peut retomber sur WASAPI en silence : pilote ASIO absent, ou
+/// installé mais sans périphérique de sortie parce qu'une autre application le
+/// tient déjà — un pilote ASIO ne s'ouvre que dans un seul processus. Jusqu'ici
+/// rien ne remontait cette bascule : l'interface continuait d'annoncer le
+/// backend *demandé*, si bien qu'un utilisateur ayant choisi ASIO se voyait
+/// confirmer « ASIO » alors que le son sortait en WASAPI (signalement Bilou).
+static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+
+/// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+///
+/// Ses seuls appelants vivent dans la branche `windows + feature asio` de
+/// `select_host` : ailleurs, il n'y a aucun choix de backend à observer, donc
+/// aucun appel — d'où un `dead_code` sur toutes les autres cibles. On l'autorise
+/// explicitement plutôt que de placer la fonction sous le même `cfg`, pour
+/// qu'un futur appel depuis une autre plateforme n'ait pas à la ressusciter.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn note_observed_backend(name: &'static str) {
+    if let Ok(mut slot) = OBSERVED_BACKEND.write() {
+        *slot = Some(name);
+    }
+}
+
+/// Nom du backend audio à afficher.
+///
+/// Ce qui a été *observé* prime sur ce qui a été *demandé* : c'est la seule
+/// réponse qui corresponde à ce que l'utilisateur entend réellement.
 pub fn active_backend_name(backend: &str) -> &'static str {
+    backend_display_name(OBSERVED_BACKEND.read().ok().and_then(|g| *g), backend)
+}
+
+/// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
+/// toucher à l'état global ni ouvrir un périphérique.
+fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'static str {
+    if let Some(observed) = observed {
+        return observed;
+    }
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
         match backend.to_lowercase().as_str() {
@@ -611,7 +746,16 @@ pub struct LocalOutput {
     device_id: String,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    /// What the playback callbacks actually multiply by: the user volume
+    /// scaled by the ReplayGain factor. Composing here means the dozen places
+    /// that read a volume in the render loops need no knowledge of ReplayGain.
     volume: Arc<AtomicU32>,
+    /// The volume the user asked for, in milli-units — what the UI shows and
+    /// what mute restores. Kept apart from `volume` so a ReplayGain
+    /// attenuation never looks like the slider moved on its own.
+    user_volume: Arc<AtomicU32>,
+    /// ReplayGain factor for the current track, in milli-units (1000 = 1.0).
+    rg_factor: Arc<AtomicU32>,
     /// Volume stored before mute, so unmute can restore it
     pre_mute_volume: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
@@ -672,12 +816,96 @@ pub struct LocalOutput {
     /// Pending next track for gapless playback.  Set by `set_next_media()`,
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    /// Zone equalizer for the zone currently playing on this output, applied
+    /// BEFORE the room-correction convolver — the same order as the transcoded
+    /// path (`transcode_source_to_file`: ReplayGain → EQ → convolver).
+    ///
+    /// A local (cpal/ASIO/WASAPI) zone never takes the temp-file transcode
+    /// path — `use_file_transcode_for` requires a network output — and the
+    /// streaming pipe it does take never ran the `EqProcessor`. The equalizer
+    /// was therefore applied NOWHERE on a local output: profile saved, curve
+    /// drawn, zero effect on the DAC (Jean Marie, forum #1416, deux zones
+    /// `local:` dans ses journaux ; même famille que #1216 / #1168 / Diretta).
+    /// Set per-play by the orchestrator, exactly like `crossfeed`.
+    eq: Arc<std::sync::Mutex<Option<super::super::audio::eq::EqProcessor>>>,
+    /// Format effectivement résolu pour le flux en cours : (taux, canaux),
+    /// empaquetés dans un seul u32 (taux sur 24 bits, canaux sur 8).
+    ///
+    /// Un `EqProcessor` se construit POUR un couple (taux, canaux) — d'où sa
+    /// reconstruction à chaque lecture. Sans mémoire de ce couple, personne ne
+    /// pouvait en rebâtir un pendant la lecture : bouger un curseur écrivait le
+    /// profil, le serveur répondait 200, et le son ne changeait pas avant la
+    /// piste suivante (#1725). Or c'est exactement ainsi qu'on règle un
+    /// égaliseur — musique en cours, à l'oreille.
+    ///
+    /// 0 = aucun flux en cours ; `current_format()` renvoie alors `None`.
+    current_format: Arc<AtomicU32>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
+    /// PURE (audiophile) bypass for the zone currently playing on this output.
+    /// When set, the playback loop skips the room-correction convolver so the
+    /// signal path stays bit-perfect. Set per-play by the orchestrator.
+    pure_bypass: Arc<AtomicBool>,
+    /// Optional headphone crossfeed effect, applied AFTER the convolver on the
+    /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
+    /// PURE) and only when the stream is stereo. Set per-play by the
+    /// orchestrator via `set_crossfeed`.
+    crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// True while the PCM currently flowing through this output is a **DoP**
+    /// (DSD over PCM) payload, as detected on the bytes themselves by
+    /// [`is_dop_pcm`].
+    ///
+    /// DoP is not audio: it is a DSD bitstream smuggled inside 24-bit PCM
+    /// frames, recognised by the receiving DAC through a marker byte. Any
+    /// arithmetic on those samples — an equalizer biquad, the convolver, the
+    /// crossfeed — rewrites the marker, the DAC stops seeing DoP, and it
+    /// **mutes**. That is the whole point of the marker: a DAC must fall silent
+    /// rather than blast a DSD bitstream at the speakers as if it were PCM.
+    ///
+    /// Held on the output rather than kept local to the feed loop so the
+    /// transition can be logged exactly once (a support log then says whether a
+    /// track played as DoP), and so the remaining half of the problem has a
+    /// place to hang: the **volume multiply** in the render callbacks destroys
+    /// the marker in the same way, which is why DoP only ever survives at 100 %
+    /// with ReplayGain off. That one is older and independent of the DSP chain,
+    /// and it changes what the volume slider does on a DSD track — it is
+    /// tracked separately rather than smuggled in here.
+    dop_active: Arc<AtomicBool>,
+    /// Set by the playback thread when the audio device refuses to open, so
+    /// the poller can stop the zone and tell the user on the very next tick
+    /// instead of waiting out the stall heuristics. Cleared on every
+    /// `play_url()` — a failure belongs to the track that provoked it, and
+    /// must never travel to the next one.
+    open_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl LocalOutput {
     pub fn new(device_name: String) -> Self {
         Self::with_options(device_name, false, "auto")
+    }
+
+    /// Recompute what the render callbacks multiply by: user volume ×
+    /// ReplayGain factor.
+    ///
+    /// The product is clamped to unity. Going above it would push a track
+    /// whose ReplayGain asks for a boost past full scale on peaks — and the
+    /// user, who never touched the slider, would hear distortion appear out of
+    /// nowhere. `gain_factor` already refuses to clip against the tagged peak;
+    /// this is the second, unconditional guard for a track with no peak tag.
+    /// Set the ReplayGain factor for the track about to play (1.0 = untouched).
+    /// Inherent twin of the trait method so the orchestrator can call it on a
+    /// downcast `LocalOutput` without importing `OutputTarget`.
+    pub fn set_replaygain_factor(&self, factor: f64) {
+        let f = (factor.clamp(0.0, 4.0) * 1000.0).round() as u32;
+        self.rg_factor.store(f, Ordering::SeqCst);
+        self.recompute_effective_volume();
+    }
+
+    fn recompute_effective_volume(&self) {
+        let user = self.user_volume.load(Ordering::SeqCst) as f64 / 1000.0;
+        let rg = self.rg_factor.load(Ordering::SeqCst) as f64 / 1000.0;
+        let effective = (user * rg).clamp(0.0, 1.0);
+        self.volume
+            .store((effective * 1000.0).round() as u32, Ordering::SeqCst);
     }
 
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
@@ -695,6 +923,8 @@ impl LocalOutput {
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
+            user_volume: Arc::new(AtomicU32::new(1000)),
+            rg_factor: Arc::new(AtomicU32::new(1000)),
             pre_mute_volume: Arc::new(AtomicU32::new(1000)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
@@ -714,8 +944,83 @@ impl LocalOutput {
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
+            eq: Arc::new(std::sync::Mutex::new(None)),
+            current_format: Arc::new(AtomicU32::new(0)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            pure_bypass: Arc::new(AtomicBool::new(false)),
+            crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            dop_active: Arc::new(AtomicBool::new(false)),
+            open_failure: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Install (or clear with `None`) the zone equalizer for the zone about to
+    /// play on this output. Set per-play by the orchestrator, mirroring
+    /// `set_crossfeed`: the orchestrator passes `None` when the zone has no
+    /// enabled EQ profile, when the profile is inaudible, or when the zone is
+    /// in PURE mode (`load_eq_processor` already returns `None` in all three
+    /// cases, so PURE stays bit-perfect without a second guard here).
+    ///
+    /// Rebuilt at each play so the biquad coefficients match the resolved
+    /// stream's sample rate and channel count, and so a profile edited between
+    /// two tracks takes effect on the next one.
+    pub fn set_eq(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+        *self.eq.lock().unwrap() = eq;
+    }
+
+    /// Remplacer l'égaliseur **pendant** la lecture, en emportant l'historique
+    /// des filtres pour que le changement s'entende sans claquer.
+    ///
+    /// La boucle de lecture relit ce mutex à chaque paquet : en remplacer le
+    /// contenu suffit à changer le son en vol. Ce qu'il ne faut pas faire, en
+    /// revanche, c'est jeter l'historique des biquads — un filtre dont l'état
+    /// retombe brutalement à zéro produit une discontinuité, donc un clic, et
+    /// un curseur qu'on fait glisser en produirait un par cran. Voir
+    /// `EqProcessor::inherit_state_from`.
+    ///
+    /// Distinct de [`Self::set_eq`] à dessein : au début d'une piste il n'y a
+    /// pas d'historique à conserver, et celui de la piste précédente serait
+    /// faux.
+    pub fn replace_eq_live(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+        let mut emplacement = self.eq.lock().unwrap();
+        match (eq, emplacement.as_ref()) {
+            (Some(mut neuf), Some(precedent)) => {
+                neuf.inherit_state_from(precedent);
+                *emplacement = Some(neuf);
+            }
+            (suivant, _) => *emplacement = suivant,
+        }
+    }
+
+    pub fn has_eq(&self) -> bool {
+        self.eq.lock().unwrap().is_some()
+    }
+
+    /// Format du flux en cours, `(taux, canaux)`, ou `None` si rien ne joue.
+    ///
+    /// Sert à rebâtir un `EqProcessor` aux bons coefficients SANS attendre la
+    /// piste suivante (#1725).
+    pub fn current_format(&self) -> Option<(u32, u16)> {
+        let empaquete = self.current_format.load(Ordering::Relaxed);
+        if empaquete == 0 {
+            return None;
+        }
+        let taux = empaquete >> 8;
+        let canaux = (empaquete & 0xFF) as u16;
+        if taux == 0 || canaux == 0 {
+            return None;
+        }
+        Some((taux, canaux))
+    }
+
+    /// Empaquette `(taux, canaux)` pour [`Self::current_format`]. Un taux
+    /// au-delà de 16,7 MHz déborderait les 24 bits — il n'en existe pas, mais
+    /// on préfère annoncer « pas de flux » qu'un taux tronqué.
+    pub(crate) fn pack_format(taux: u32, canaux: u16) -> u32 {
+        if taux == 0 || taux > 0x00FF_FFFF || canaux == 0 || canaux > 255 {
+            return 0;
+        }
+        (taux << 8) | (canaux as u32)
     }
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
@@ -728,6 +1033,53 @@ impl LocalOutput {
     pub fn clear_convolver(&self) {
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
+    /// for the zone currently playing on this output. Set per-play by the
+    /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
+    /// zones on the same output keep it.
+    pub fn set_pure_bypass(&self, bypass: bool) {
+        self.pure_bypass.store(bypass, Ordering::Relaxed);
+    }
+
+    /// Install (or clear with `None`) the headphone crossfeed processor for the
+    /// zone about to play on this output. Set per-play by the orchestrator,
+    /// mirroring `set_pure_bypass`: the orchestrator passes `None` when the zone
+    /// has crossfeed disabled or is in PURE mode. Applied in the playback loop
+    /// after the convolver, only for stereo streams.
+    pub fn set_crossfeed(&self, cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>) {
+        *self.crossfeed.lock().unwrap() = cf;
+    }
+
+    /// Remplacer le crossfeed **pendant** la lecture, en emportant les lignes à
+    /// retard pour que le changement s'entende sans claquer.
+    ///
+    /// Jumeau de [`Self::replace_eq_live`], et pour la même raison : la boucle
+    /// de lecture relit ce mutex à chaque paquet, donc en remplacer le contenu
+    /// suffit à changer le son en vol — mais une ligne à retard qui repart à
+    /// zéro fait chuter le terme croisé au silence, ce qui s'entend comme un
+    /// clic. Voir `CrossfeedProcessor::inherit_state_from`.
+    ///
+    /// Distinct de [`Self::set_crossfeed`] à dessein : au début d'une piste il
+    /// n'y a pas d'historique à conserver, et celui de la piste précédente
+    /// serait faux.
+    pub fn replace_crossfeed_live(
+        &self,
+        cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>,
+    ) {
+        let mut emplacement = self.crossfeed.lock().unwrap();
+        match (cf, emplacement.as_ref()) {
+            (Some(mut neuf), Some(precedent)) => {
+                neuf.inherit_state_from(precedent);
+                *emplacement = Some(neuf);
+            }
+            (suivant, _) => *emplacement = suivant,
+        }
+    }
+
+    pub fn has_crossfeed(&self) -> bool {
+        self.crossfeed.lock().unwrap().is_some()
     }
 
     pub fn has_convolver(&self) -> bool {
@@ -744,12 +1096,19 @@ impl LocalOutput {
             .store(position_ms, Ordering::SeqCst);
     }
 
-    /// Signal that the producer actually emitted a pre-seeked stream.
-    /// Only call this when the decoder used seek_s (local files).
-    /// Do NOT call for streaming sources (TIDAL/Qobuz) where the
-    /// producer always starts from 0s.
+    /// Signal that the producer actually emitted a pre-seeked stream: the
+    /// consumer must NOT byte-skip seek_offset_ms again (double seek, #1518).
+    /// Since b3a4a79f BOTH transcode arms (local file and Qobuz/Tidal
+    /// streaming) feed seek_s to the decoder, so the orchestrator always
+    /// passes `true` here. `false` remains meaningful only for a producer
+    /// that genuinely starts at 0s.
     pub fn set_producer_seeked(&self, seeked: bool) {
         self.stream_pre_seeked.store(seeked, Ordering::SeqCst);
+    }
+
+    /// Consumer-side view of the pre-seeked flag (regression test for #1518).
+    pub fn producer_seeked(&self) -> bool {
+        self.stream_pre_seeked.load(Ordering::SeqCst)
     }
 }
 
@@ -934,6 +1293,20 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 ///   - PCM integer: `wBitsPerSample` (or `wValidBitsPerSample` for EXTENSIBLE)
 ///   - IEEE Float 32-bit: returns 0 as a sentinel so `pcm_bytes_to_f32`
 ///     uses the float path.
+/// Whether a failed header read should be retried rather than treated as a hard
+/// failure. When a gapless/next track's transcode session has just started, its
+/// WAV header isn't emitted yet, so the first reads return `TimedOut`/
+/// `WouldBlock`. The pre-#522 code `break`-ed on any error, abandoning the chain
+/// and skipping track 2 in a gapless album (Alain #981). Retrying on these
+/// transient kinds — while a real error (broken pipe, etc.) still fails fast —
+/// is what aligns the gapless path with the direct `play_url` path.
+fn header_read_should_retry(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     if header.len() < 44 {
         return None;
@@ -1051,6 +1424,122 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     }
 
     data_offset.map(|d| (channels, sample_rate, bit_depth, d))
+}
+
+/// Frames that must carry a valid, alternating DoP marker before a buffer is
+/// treated as DoP.
+///
+/// The marker is one byte out of three, so a single frame would match ordinary
+/// PCM once every ~256 samples. Requiring 32 consecutive frames — with the
+/// marker *alternating* and identical across channels — puts a false positive
+/// past 1 in 2^250 while still fitting in the smallest chunk the feed loops
+/// ever assemble.
+const DOP_DETECT_FRAMES: usize = 32;
+
+/// True when `bytes` — interleaved 24-bit little-endian PCM — actually carries
+/// a **DoP** (DSD over PCM) payload.
+///
+/// DoP packs 16 DSD bits into the low two bytes of each 24-bit sample and
+/// stamps the top byte with a marker that alternates `0x05` / `0xFA` from one
+/// frame to the next, identically on every channel (see
+/// `audio::dsd_to_dop::DsdToDoP::feed`). That marker is the *only* thing that
+/// tells a DAC it is being handed DSD and not audio — and it is exactly what
+/// any sample-domain processing destroys.
+///
+/// Sniffing the bytes is how DoP is meant to be recognised: the DAC at the far
+/// end of the cable does precisely this, and it is why the detection lives here
+/// rather than being threaded down from the resolver. Any path that produces
+/// DoP is covered, now and later, with nothing to keep in sync.
+///
+/// Only ever true for 24-bit streams — DoP has no other carrier.
+pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
+    if bit_depth != 24 || channels == 0 {
+        return false;
+    }
+    let ch = channels as usize;
+    let frame_bytes = 3 * ch;
+    if bytes.len() < frame_bytes * DOP_DETECT_FRAMES {
+        return false;
+    }
+    let mut prev: Option<u8> = None;
+    for f in 0..DOP_DETECT_FRAMES {
+        let base = f * frame_bytes;
+        // The marker is the top byte of the 24-bit little-endian sample, and it
+        // is the SAME on every channel of a frame. A stereo PCM signal that
+        // happened to hit 0x05 on the left would have to hit it on the right in
+        // the same frame too.
+        let marker = bytes[base + 2];
+        if marker != 0x05 && marker != 0xFA {
+            return false;
+        }
+        for c in 1..ch {
+            if bytes[base + 3 * c + 2] != marker {
+                return false;
+            }
+        }
+        // Strict alternation. Which of the two values a buffer starts on
+        // depends on where the chunk boundary fell, so only the alternation is
+        // asserted, never the starting value.
+        if prev.is_some_and(|p| p == marker) {
+            return false;
+        }
+        prev = Some(marker);
+    }
+    true
+}
+
+/// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
+/// in place, at the three playback-loop feed sites.
+///
+/// Order matches the signal flow: zone **equalizer** first, then the
+/// room-correction **convolver**, then the headphone **crossfeed**. All three
+/// are skipped when `pure_bypass` is set (PURE / audiophile zone →
+/// bit-perfect). Crossfeed additionally requires a stereo stream
+/// (`channels == 2`); on non-stereo it is left untouched. Uses the same
+/// try-lock pattern as the convolver so a contended lock never blocks audio.
+///
+/// They are skipped just as hard when `dop` is set: the buffer is then a DSD
+/// bitstream wearing PCM's clothes, and filtering it would strip the marker
+/// that makes the DAC play it at all — the user hears nothing (Tades, forum
+/// #1408 : « pas de son quand j'active égaliseur ou crossfeed », hors mode
+/// PURE). PURE zones never hit this because they bypass everything anyway;
+/// the silence was reserved for people who had asked for processing.
+///
+/// EQ-before-convolver is the order the transcoded path already uses
+/// (`transcode_source_to_file`), so a zone hears the same chain whether it
+/// plays on the DAC or through a network renderer.
+#[inline]
+fn apply_local_dsp(
+    samples: &mut [f32],
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    channels: u16,
+    dop: bool,
+) {
+    if dop || pure_bypass.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut e) = eq.lock() {
+        if let Some(ref mut p) = *e {
+            p.process_interleaved(samples);
+        }
+    }
+    if let Ok(mut conv) = convolver.lock() {
+        if let Some(ref mut c) = *conv {
+            c.process_interleaved(samples);
+        }
+    }
+    // Crossfeed is a headphone (local DAC) effect and only makes sense on a
+    // stereo stream — the difference-based algorithm needs L/R pairs.
+    if channels == 2 {
+        if let Ok(mut cf) = crossfeed.lock() {
+            if let Some(ref mut c) = *cf {
+                c.process_interleaved(samples);
+            }
+        }
+    }
 }
 
 /// Convert raw PCM bytes to f32 samples.
@@ -1188,9 +1677,9 @@ impl OutputTarget for LocalOutput {
             .store(start_position_ms, Ordering::SeqCst);
         self.position_ms.store(start_position_ms, Ordering::SeqCst);
         // stream_pre_seeked is set explicitly by set_producer_seeked()
-        // from the orchestrator — only when the decoder actually applied
-        // the seek (local files). For streaming sources (TIDAL/Qobuz),
-        // the producer starts from 0s and needs consumer-side skip.
+        // from the orchestrator. Both transcode arms (local file AND
+        // Qobuz/Tidal streaming) pre-seek the decoder, so the consumer
+        // must not byte-skip the offset again (#1518).
 
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
@@ -1230,6 +1719,13 @@ impl OutputTarget for LocalOutput {
         // Clear the natural-end flag and generation for the new track.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        // A device-open failure belongs to the track that provoked it. Clearing
+        // it here means a user who fixes the device and presses play again is
+        // never stopped by the previous attempt's error.
+        if let Ok(mut slot) = self.open_failure.lock() {
+            *slot = None;
+        }
+        let open_failure = self.open_failure.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
         let track_ended_generation = self.track_ended_generation.clone();
 
@@ -1246,7 +1742,12 @@ impl OutputTarget for LocalOutput {
         let duration_ms_arc = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
+        let eq = self.eq.clone();
+        let current_format = self.current_format.clone();
         let convolver = self.convolver.clone();
+        let pure_bypass = self.pure_bypass.clone();
+        let crossfeed = self.crossfeed.clone();
+        let dop_active = self.dop_active.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -1303,10 +1804,7 @@ impl OutputTarget for LocalOutput {
                 }
                 match reader.read(&mut header_buf) {
                     Ok(n) => break n,
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
+                    Err(ref e) if header_read_should_retry(e.kind()) => {
                         // Retry header read (stream not ready yet)
                         continue;
                     }
@@ -1324,6 +1822,12 @@ impl OutputTarget for LocalOutput {
                 "local_audio_first_read"
             );
             header_buf.truncate(header_read);
+
+            // Set by the cpal stream error callback when the output device
+            // vanishes mid-playback (USB DAC hot-unplugged, #1626). Checked by
+            // the feed and drain loops below so the thread tears down cleanly
+            // instead of waiting forever on a ring buffer nobody drains.
+            let device_gone = Arc::new(AtomicBool::new(false));
 
             let (mut channels, mut sample_rate, mut bit_depth, data_offset) = if let Some(parsed) =
                 parse_wav_header(&header_buf)
@@ -1471,7 +1975,7 @@ impl OutputTarget for LocalOutput {
                             data[read..].fill(0.0);
                         }
                     },
-                    |e| warn!(error = %e, "audio_stream_error"),
+                    make_stream_error_cb(device_gone.clone()),
                     None,
                 ) {
                     Ok(s) => s,
@@ -1492,9 +1996,44 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing"
                 );
 
+                // Chaine DSP de la zone : egaliseur, correction de piece,
+                // crossfeed.
+                //
+                // Ce chemin — flux compresse decode en bloc — ne l'appelait
+                // PAS. Les trois sites d'`apply_local_dsp` etaient tous sur le
+                // chemin PCM : sur un flux non-WAV, l'egaliseur, le convolveur
+                // et le crossfeed n'agissaient nulle part (#1725, quatrieme
+                // trou de la meme famille que #1216, #1168 et Diretta).
+                //
+                // AVANT l'adaptation de canaux et le reechantillonnage, et
+                // c'est deliberé : l'orchestrateur construit l'`EqProcessor`
+                // pour le couple (`media.sample_rate`, `media.channels`) —
+                // c'est-a-dire (`dec_sr`, `dec_ch`). Appliquer apres coup des
+                // biquads calcules pour 44,1 kHz a un flux ramene a 48 kHz
+                // deplacerait toutes les frequences de coupure.
+                let mut samples = decoded_samples;
+                //
+                // `dop = false` : le DoP voyage dans un conteneur PCM, donc un
+                // flux DoP arrive en WAV et prend l'autre chemin. Ici les
+                // echantillons sortent d'un decodeur (FLAC, MP3, AAC) sous
+                // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
+                // bruts, n'a rien a y examiner.
+                apply_local_dsp(
+                    &mut samples,
+                    &eq,
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    dec_ch,
+                    false,
+                );
+
+                // Memoriser le format pour un rebatissage d'EQ a chaud
+                // (#1725) : c'est le couple que la chaine DSP vient de voir.
+                current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
+
                 // Adapt channels and resample if needed (using rubato
                 // sinc resampler for high-quality rate conversion)
-                let mut samples = decoded_samples;
                 if dec_ch != output_ch {
                     samples = adapt_channels(&samples, dec_ch, output_ch);
                 }
@@ -1539,7 +2078,22 @@ impl OutputTarget for LocalOutput {
                         {
                             std::thread::sleep(std::time::Duration::from_millis(50));
                         }
-                        feed_ring_abortable(&ring, chunk, &stop_rx, &paused, Some(&force_silent));
+                        let fed = feed_ring_abortable(
+                            &ring,
+                            chunk,
+                            &stop_rx,
+                            &paused,
+                            Some(&force_silent),
+                        );
+                        if !fed || device_gone.load(Ordering::Relaxed) {
+                            // Consumer dead (USB DAC unplugged, #1626): stop
+                            // feeding instead of stalling 5s on every chunk.
+                            warn!(
+                                device = %device_name,
+                                "local_audio_compressed_feed_aborted_device_lost"
+                            );
+                            break;
+                        }
                         fed_samples += chunk.len() as u64;
                         let fed_frames = fed_samples / output_ch as u64;
                         let pos =
@@ -1560,7 +2114,17 @@ impl OutputTarget for LocalOutput {
                 track_ended_generation.store(my_generation, Ordering::SeqCst);
                 TRACK_END_NOTIFY.notify_one();
 
-                // Wait for ring buffer to drain
+                // Wait for ring buffer to drain — but NEVER block forever: if
+                // the render callback is dead (USB DAC unplugged, #1626) the
+                // ring stays full and this loop used to spin until restart.
+                // Deadline = queued audio duration + 5s margin, mirroring the
+                // asio_drain_timeout guard of the exclusive path.
+                let drain_deadline = std::time::Duration::from_millis(
+                    (ring.available() as u64 * 1000)
+                        / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
+                        + 5000,
+                );
+                let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1569,6 +2133,17 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        break;
+                    }
+                    if device_gone.load(Ordering::Relaxed)
+                        || drain_started.elapsed() >= drain_deadline
+                    {
+                        warn!(
+                            device = %device_name,
+                            remaining_samples = ring.available(),
+                            device_gone = device_gone.load(Ordering::Relaxed),
+                            "local_audio_compressed_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1581,6 +2156,17 @@ impl OutputTarget for LocalOutput {
                 info!(device = %device_name, "local_audio_compressed_stopped");
                 return;
             };
+
+            // Format definitif du flux PCM : c'est CE couple que voit
+            // `apply_local_dsp`, donc celui auquel un EqProcessor doit etre
+            // bati. Memorise ici pour qu'un profil modifie EN COURS de lecture
+            // puisse etre applique tout de suite, au lieu d'attendre la piste
+            // suivante (#1725). La branche compressee est sortie en `return`
+            // juste au-dessus : elle ne passe pas par le DSP.
+            current_format.store(
+                LocalOutput::pack_format(sample_rate, channels),
+                Ordering::Relaxed,
+            );
 
             // bit_depth == 0 is the sentinel for IEEE float 32-bit (4 bytes)
             let bytes_per_sample = if bit_depth == 0 {
@@ -1701,15 +2287,26 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
+                    // Detected on the raw bytes, BEFORE they become f32 and
+                    // before `leftover` is truncated: the marker only exists in
+                    // the 24-bit packing.
+                    let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
+                    if dop_active.swap(dop, Ordering::Relaxed) != dop {
+                        info!(dop, "local_audio_dop_stream_state_changed");
+                    }
                     let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
-                        }
-                    }
+                    apply_local_dsp(
+                        &mut samples,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &pure_bypass,
+                        channels,
+                        dop,
+                    );
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -1815,7 +2412,6 @@ impl OutputTarget for LocalOutput {
                 let mut skipped_bytes_asio: u64 = 0;
 
                 // Read and feed the rest of the stream
-                let mut read_buf = vec![0u8; 65536];
                 let mut leftover: Vec<u8> = Vec::new();
 
                 // Process leftover from header read
@@ -1864,6 +2460,68 @@ impl OutputTarget for LocalOutput {
 
                 let mut http_eof_asio = false;
                 let mut last_data_at = std::time::Instant::now();
+                // Pump thread: it owns the blocking HTTP read so the thread
+                // that HOLDS THE ASIO DEVICE never blocks on the network.
+                // Before this, stop() set force_silent but the device thread
+                // sat in reader.read() until the HTTP session died as a side
+                // effect of the NEXT play — it then released the ASIO lock
+                // ~2.5s INTO the new play. Two repeats survived by timing;
+                // the 3rd hit the wrong interleaving: silent output and the
+                // poller oscillating at EOF (DEvir, Fireface ASIO, repeat-all,
+                // v0.9.0). With the pump, the device thread polls a channel
+                // (500ms) and honours stop within one tick; the pump thread
+                // may linger in a blocked read but only owns the socket, and
+                // exits when the receiver drops or the session closes.
+                // Approximate depth of the pump→device channel. Incremented by
+                // the pump before each send, decremented by the device loop on
+                // each successful recv. A high steady depth means the device
+                // thread is NOT draining (ring full / callback dead); a depth of
+                // ~0 means the device is starved (EOF never latches). Surfaced in
+                // the periodic `asio_exclusive_feed_stats` log (DEvir bug-22).
+                let pump_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let (pump_tx, pump_rx) =
+                    std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(64);
+                {
+                    let pump_depth = pump_depth.clone();
+                    std::thread::spawn(move || {
+                        let mut reader = reader;
+                        let mut buf = vec![0u8; 65536];
+                        loop {
+                            match reader.read(&mut buf) {
+                                Ok(0) => {
+                                    pump_depth.fetch_add(1, Ordering::Relaxed);
+                                    if pump_tx.send(Ok(Vec::new())).is_err() {
+                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                                    }
+                                    break;
+                                }
+                                Ok(n) => {
+                                    pump_depth.fetch_add(1, Ordering::Relaxed);
+                                    if pump_tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                                        break; // receiver gone — playback stopped
+                                    }
+                                }
+                                Err(e) => {
+                                    let transient = matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::TimedOut
+                                            | std::io::ErrorKind::WouldBlock
+                                    );
+                                    pump_depth.fetch_add(1, Ordering::Relaxed);
+                                    if pump_tx.send(Err(e)).is_err() {
+                                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    if !transient {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                let mut last_stats_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1873,16 +2531,36 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
 
-                    let n = match reader.read(&mut read_buf) {
-                        Ok(0) => {
+                    // Periodic health snapshot (~500ms) so a wedge is diagnosable
+                    // from DEvir's next log: ring full + high pump_depth => the
+                    // callback stopped draining; ring/pump ~empty => starved / EOF
+                    // never latched (bug-22 / #789).
+                    if last_stats_at.elapsed() >= std::time::Duration::from_millis(500) {
+                        debug!(
+                            ring_available = ring.available(),
+                            ring_capacity = ring.capacity(),
+                            total_frames_fed,
+                            pump_depth = pump_depth.load(Ordering::Relaxed),
+                            leftover_bytes = leftover.len(),
+                            "asio_exclusive_feed_stats"
+                        );
+                        last_stats_at = std::time::Instant::now();
+                    }
+
+                    let recv = pump_rx.recv_timeout(std::time::Duration::from_millis(500));
+                    if recv.is_ok() {
+                        pump_depth.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    let chunk = match recv {
+                        Ok(Ok(data)) if data.is_empty() => {
                             http_eof_asio = true;
                             break;
                         }
-                        Ok(n) => {
+                        Ok(Ok(data)) => {
                             last_data_at = std::time::Instant::now();
-                            n
+                            data
                         }
-                        Err(ref e)
+                        Ok(Err(ref e))
                             if e.kind() == std::io::ErrorKind::TimedOut
                                 || e.kind() == std::io::ErrorKind::WouldBlock =>
                         {
@@ -1907,12 +2585,31 @@ impl OutputTarget for LocalOutput {
                             }
                             continue;
                         }
-                        Err(e) => {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Same sustained-idle EOF heuristic as the
+                            // transient-read-error arm above.
+                            if total_frames_fed > 0
+                                && leftover.is_empty()
+                                && ring.available() == 0
+                                && last_data_at.elapsed() > std::time::Duration::from_secs(5)
+                            {
+                                info!("local_audio_asio_exclusive_stream_idle_eof");
+                                http_eof_asio = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        Ok(Err(e)) => {
                             warn!(error = %e, "local_audio_asio_exclusive_read_error");
                             http_eof_asio = true;
                             break;
                         }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            http_eof_asio = true;
+                            break;
+                        }
                     };
+                    let n = chunk.len();
 
                     if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
                         let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
@@ -1921,9 +2618,9 @@ impl OutputTarget for LocalOutput {
                             continue;
                         }
                         skipped_bytes_asio = skip_bytes_asio;
-                        leftover.extend_from_slice(&read_buf[remaining..n]);
+                        leftover.extend_from_slice(&chunk[remaining..]);
                     } else {
-                        leftover.extend_from_slice(&read_buf[..n]);
+                        leftover.extend_from_slice(&chunk);
                     }
 
                     let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
@@ -1931,15 +2628,26 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
+                    // Detected on the raw bytes, BEFORE they become f32 and
+                    // before `leftover` is truncated: the marker only exists in
+                    // the 24-bit packing.
+                    let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
+                    if dop_active.swap(dop, Ordering::Relaxed) != dop {
+                        info!(dop, "local_audio_dop_stream_state_changed");
+                    }
                     let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    if let Ok(mut conv) = convolver.lock() {
-                        if let Some(ref mut c) = *conv {
-                            c.process_interleaved(&mut samples);
-                        }
-                    }
+                    apply_local_dsp(
+                        &mut samples,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &pure_bypass,
+                        channels,
+                        dop,
+                    );
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -1959,7 +2667,25 @@ impl OutputTarget for LocalOutput {
                     TRACK_END_NOTIFY.notify_one();
                 }
 
-                // Wait for ring buffer to drain
+                // Wait for the ring to drain — but NEVER block forever. If the
+                // ASIO render callback stops consuming (RME driver wedged after a
+                // stop→start reopen at a Repeat loop point — DEvir bug-22, the
+                // #789 regression), `ring.available()` never reaches 0 and this
+                // loop used to spin indefinitely, stranding this thread AND the
+                // process-wide ASIO_DEVICE_LOCK (held until `exclusive` is dropped
+                // just below). Bound it two ways: a hard wall-clock deadline of
+                // ~2× the ring's time-capacity, and a stall detector that bails if
+                // `available()` has not decreased for ~1.5s.
+                let ring_capacity_ms = if sample_rate > 0 && channels > 0 {
+                    (ring.capacity() as u64 * 1000) / (sample_rate as u64 * channels as u64)
+                } else {
+                    0
+                };
+                let drain_deadline =
+                    std::time::Duration::from_millis((ring_capacity_ms * 2).max(1000));
+                let drain_started = std::time::Instant::now();
+                let mut last_avail = ring.available();
+                let mut last_progress_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1967,13 +2693,38 @@ impl OutputTarget for LocalOutput {
                     if force_silent.load(Ordering::Relaxed) {
                         break;
                     }
-                    if ring.available() == 0 {
+                    let avail = ring.available();
+                    if avail == 0 {
+                        break;
+                    }
+                    if avail < last_avail {
+                        last_avail = avail;
+                        last_progress_at = std::time::Instant::now();
+                    } else if last_progress_at.elapsed() >= std::time::Duration::from_millis(1500) {
+                        warn!(
+                            device = %device_name,
+                            ring_available = avail,
+                            total_frames_fed,
+                            "asio_drain_timeout"
+                        );
+                        break;
+                    }
+                    if drain_started.elapsed() >= drain_deadline {
+                        warn!(
+                            device = %device_name,
+                            ring_available = avail,
+                            elapsed_ms = drain_started.elapsed().as_millis() as u64,
+                            "asio_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
-                // AsioExclusiveOutput::drop() releases the ASIO device
+                // AsioExclusiveOutput::drop() releases the ASIO device and, with
+                // it, the process-wide ASIO_DEVICE_LOCK. Both loops above are now
+                // bounded and any panic unwinds through this owned local, so this
+                // drop runs on EVERY exit path — the lock can never be stranded.
                 drop(exclusive);
                 if play_generation.load(Ordering::SeqCst) == my_generation {
                     playing.store(false, Ordering::SeqCst);
@@ -2311,10 +3062,67 @@ impl OutputTarget for LocalOutput {
                             data[read..].fill(0.0);
                         }
                     },
-                    |e| warn!(error = %e, "audio_stream_error"),
+                    make_stream_error_cb(device_gone.clone()),
                     None,
                 )
             };
+
+            // Bit-perfect USB DACs (XMOS/Totaldac, Nagra, …) frequently reject
+            // float and only accept integer PCM: cpal's f32 build_output_stream
+            // then fails with "Sample format 'f32' is not supported by hardware".
+            // This builds the same stream in an integer format instead, converting
+            // the f32 ring-buffer samples on the fly (reuses symphonia's IntoSample,
+            // as orchestrator.rs already does). Only used as a fallback after both
+            // f32 attempts fail, so the f32 happy path is untouched (Pascal, XMOS
+            // USB Audio 2.0 → Totaldac).
+            fn build_int_stream<T>(
+                device: &cpal::Device,
+                cfg: &cpal::StreamConfig,
+                ring_cb: Arc<RingBuf>,
+                vol_cb: Arc<AtomicU32>,
+                paused_cb: Arc<AtomicBool>,
+                silent_cb: Arc<AtomicBool>,
+                ds_cb: Arc<AtomicBool>,
+                min_buf: usize,
+                device_gone: Arc<AtomicBool>,
+            ) -> Result<cpal::Stream, cpal::BuildStreamError>
+            where
+                T: cpal::SizedSample + Send + 'static,
+                f32: symphonia::core::audio::conv::IntoSample<T>,
+            {
+                use symphonia::core::audio::conv::IntoSample;
+                let zero: T = 0.0f32.into_sample();
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_output_stream(
+                    cfg,
+                    move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                        let n = data.len();
+                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                            data.fill(zero);
+                            return;
+                        }
+                        if !ds_cb.load(Ordering::Acquire) {
+                            if ring_cb.available() < min_buf {
+                                data.fill(zero);
+                                return;
+                            }
+                            ds_cb.store(true, Ordering::Release);
+                        }
+                        if scratch.len() < n {
+                            scratch.resize(n, 0.0);
+                        }
+                        let buf = &mut scratch[..n];
+                        let read = ring_cb.pop(buf);
+                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
+                            *o = (*s * v).into_sample();
+                        }
+                        data[read..].fill(zero);
+                    },
+                    make_stream_error_cb(device_gone),
+                    None,
+                )
+            }
 
             let finished_flag = Arc::new(AtomicBool::new(false));
 
@@ -2372,13 +3180,102 @@ impl OutputTarget for LocalOutput {
                             (s, source_cfg, ring_fb)
                         }
                         Err(second_err) => {
-                            warn!(
-                                first_error = %first_err,
-                                second_error = %second_err,
-                                "audio_stream_build_failed_both_configs"
-                            );
-                            playing.store(false, Ordering::SeqCst);
-                            return;
+                            // Both f32 attempts failed. The hardware likely rejects
+                            // float (bit-perfect integer-only DAC). Cascade integer
+                            // formats — i32 then i16 — at the chosen rate, then the
+                            // source rate. First one the device accepts wins.
+                            let mut candidates: Vec<cpal::StreamConfig> =
+                                vec![output_config.clone()];
+                            if source_cfg.sample_rate != output_config.sample_rate
+                                || source_cfg.channels != output_config.channels
+                            {
+                                candidates.push(source_cfg.clone());
+                            }
+                            let mut built: Option<(
+                                cpal::Stream,
+                                cpal::StreamConfig,
+                                Arc<RingBuf>,
+                            )> = None;
+                            'int_cascade: for cand in &candidates {
+                                let cap =
+                                    (cand.sample_rate as usize) * (cand.channels as usize) * 2;
+                                let min_buf =
+                                    (cand.sample_rate as usize) * (cand.channels as usize) / 5;
+                                for is_i32 in [true, false] {
+                                    let r = Arc::new(RingBuf::new(cap));
+                                    r.clear();
+                                    data_started_shared.store(false, Ordering::SeqCst);
+                                    let res = if is_i32 {
+                                        build_int_stream::<i32>(
+                                            &device,
+                                            cand,
+                                            r.clone(),
+                                            volume.clone(),
+                                            paused.clone(),
+                                            silent_cb_outer.clone(),
+                                            data_started_shared.clone(),
+                                            min_buf,
+                                            device_gone.clone(),
+                                        )
+                                    } else {
+                                        build_int_stream::<i16>(
+                                            &device,
+                                            cand,
+                                            r.clone(),
+                                            volume.clone(),
+                                            paused.clone(),
+                                            silent_cb_outer.clone(),
+                                            data_started_shared.clone(),
+                                            min_buf,
+                                            device_gone.clone(),
+                                        )
+                                    };
+                                    if let Ok(s) = res {
+                                        info!(
+                                            format = if is_i32 { "i32" } else { "i16" },
+                                            sample_rate = cand.sample_rate,
+                                            "local_audio_fallback_to_integer_format"
+                                        );
+                                        built = Some((s, cand.clone(), r));
+                                        break 'int_cascade;
+                                    }
+                                }
+                            }
+                            match built {
+                                Some(t) => t,
+                                None => {
+                                    // Every format was refused, so the fault is
+                                    // the device itself, not the encoding. Name
+                                    // the likely cause: the raw ALSA string
+                                    // ("Host is down (112)" — Yacine) reads as a
+                                    // network error and sends people hunting in
+                                    // the wrong place, when it is what the
+                                    // PipeWire ALSA plugin returns if it cannot
+                                    // reach the daemon — typically a server
+                                    // started outside the user session, or a
+                                    // USB DAC that went away.
+                                    let cause = classify_open_failure(&first_err.to_string());
+                                    warn!(
+                                        device = %device_name,
+                                        first_error = %first_err,
+                                        second_error = %second_err,
+                                        hint = %cause.log_hint(),
+                                        "audio_stream_build_failed_all_formats"
+                                    );
+                                    // Hand the poller something to say. Without
+                                    // this the zone plays on in silence until the
+                                    // stall heuristics fire ~73 s later, with no
+                                    // message anywhere the user can see.
+                                    if let Ok(mut slot) = open_failure.lock() {
+                                        *slot = Some(format!(
+                                            "Sortie « {device_name} » : {}.",
+                                            cause.user_message()
+                                        ));
+                                    }
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -2587,6 +3484,18 @@ impl OutputTarget for LocalOutput {
                     );
                     break;
                 }
+                // Device vanished mid-track (USB DAC unplugged, #1626): stop
+                // reading — nobody will ever play these samples. http_eof stays
+                // false so no natural track end is signalled (we must not chain
+                // the queue onto a dead device).
+                if device_gone.load(Ordering::Relaxed) {
+                    warn!(
+                        device = %device_name,
+                        total_bytes_read,
+                        "local_audio_stopped_device_lost"
+                    );
+                    break;
+                }
 
                 let read_start = std::time::Instant::now();
                 let n = match reader.read(&mut read_buf) {
@@ -2655,6 +3564,10 @@ impl OutputTarget for LocalOutput {
                     continue;
                 }
 
+                let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
+                if dop_active.swap(dop, Ordering::Relaxed) != dop {
+                    info!(dop, "local_audio_dop_stream_state_changed");
+                }
                 let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                 let remainder = leftover[aligned_len..].to_vec();
                 leftover = remainder;
@@ -2670,11 +3583,15 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                if let Ok(mut conv) = convolver.lock() {
-                    if let Some(ref mut c) = *conv {
-                        c.process_interleaved(&mut samples);
-                    }
-                }
+                apply_local_dsp(
+                    &mut samples,
+                    &eq,
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    channels,
+                    dop,
+                );
 
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
@@ -2689,7 +3606,20 @@ impl OutputTarget for LocalOutput {
                     );
                 }
 
-                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                let fed =
+                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                if !fed {
+                    // Wedge: the render callback stopped draining the ring
+                    // (dead stream after a USB DAC unplug on macOS, where no
+                    // error callback fires, #1626). Without this check the loop
+                    // stalled 5s on EVERY chunk while the position stood still.
+                    warn!(
+                        device = %device_name,
+                        total_bytes_read,
+                        "local_audio_stopped_feed_stall"
+                    );
+                    break;
+                }
 
                 total_frames_fed += (aligned_len / frame_bytes) as u64;
 
@@ -2721,6 +3651,22 @@ impl OutputTarget for LocalOutput {
             // If the stream was never started (very short track or error),
             // start it now with whatever data we have.
             if !stream_started {
+                // Empty stream: the source delivered zero audio bytes (a
+                // superseded/aborted start — e.g. a rapid re-trigger of the same
+                // track, seen in Philippe Vella's log as two orchestrator_play
+                // ~330 ms apart). Starting the cpal stream on an empty ring
+                // played audible silence while the transport kept advancing the
+                // progress bar ("le son coupe, la barre continue"). Bail instead
+                // so the orchestrator sees the track did not actually play,
+                // rather than a phantom "playing" state on a silent output.
+                if total_bytes_read == 0 {
+                    warn!(
+                        device = %device_name,
+                        "local_audio_empty_stream_no_playback"
+                    );
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
                 if let Err(e) = stream.play() {
                     warn!(error = %e, "audio_stream_play_failed_final");
                     playing.store(false, Ordering::SeqCst);
@@ -2739,7 +3685,10 @@ impl OutputTarget for LocalOutput {
             // chain into the next track without closing the cpal stream.
             // The audio device stays open — zero gap between tracks.
             // ---------------------------------------------------------------
-            while http_eof && !force_silent.load(Ordering::Relaxed) {
+            while http_eof
+                && !force_silent.load(Ordering::Relaxed)
+                && !device_gone.load(Ordering::Relaxed)
+            {
                 let pending = next_media_ref.lock().unwrap().take();
                 let Some(next) = pending else { break };
 
@@ -2976,6 +3925,17 @@ impl OutputTarget for LocalOutput {
                     if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
                         break;
                     }
+                    // Device lost mid-chain (#1626): abort without signalling
+                    // a natural end, like the main read loop above.
+                    if device_gone.load(Ordering::Relaxed) {
+                        warn!(
+                            device = %device_name,
+                            total_bytes_read,
+                            "local_audio_gapless_stopped_device_lost"
+                        );
+                        http_eof = false;
+                        break;
+                    }
                     match next_reader.read(&mut gapless_read_buf) {
                         Ok(0) => {
                             debug!(
@@ -3007,13 +3967,23 @@ impl OutputTarget for LocalOutput {
                                     &mut resample_leftover,
                                 );
                             }
-                            feed_ring_abortable(
+                            let fed = feed_ring_abortable(
                                 &ring,
                                 &smp,
                                 &stop_rx,
                                 &paused,
                                 Some(&force_silent),
                             );
+                            if !fed {
+                                // Dead consumer (see main loop, #1626).
+                                warn!(
+                                    device = %device_name,
+                                    total_bytes_read,
+                                    "local_audio_gapless_stopped_feed_stall"
+                                );
+                                http_eof = false;
+                                break;
+                            }
                             total_frames_fed += (aligned / frame_bytes) as u64;
                             let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0)
                                 as u64
@@ -3028,6 +3998,7 @@ impl OutputTarget for LocalOutput {
                         }
                         Err(e) => {
                             warn!(error = %e, "local_audio_gapless_read_error");
+                            http_eof = true;
                             break;
                         }
                     }
@@ -3062,29 +4033,37 @@ impl OutputTarget for LocalOutput {
             // Signal that HTTP reading is done
             finished_flag.store(true, Ordering::SeqCst);
 
-            // Signal natural track end BEFORE draining when the HTTP stream
-            // reached EOF.  This is critical when resampling causes slow
-            // ring-buffer consumption (e.g. 44.1→192 kHz, ×4.35 expansion):
-            // the HTTP stream finishes sending all data, but the ring drains
-            // slowly.  If a new play command (next track or poller timeout)
-            // sets force_silent during the drain, the old code would exit
-            // without setting track_ended_naturally, causing the poller to
-            // never detect end-of-track and never advance the queue.
-            // Setting the flag here ensures the orchestrator sees it
-            // immediately.  play_url() clears the flag for the next track.
-            if http_eof {
-                track_ended_naturally.store(true, Ordering::SeqCst);
-                track_ended_generation.store(my_generation, Ordering::SeqCst);
-                TRACK_END_NOTIFY.notify_one();
-                debug!(
-                    ring_available = ring.available(),
-                    total_bytes_read,
-                    total_frames_fed,
-                    "local_audio_track_ended_naturally_pre_drain"
-                );
-            }
-
-            // Wait for ring buffer to drain or stop signal
+            // Wait for the ring buffer to drain (real playback) before signalling
+            // the natural track end. The HTTP thread finishes FEEDING all samples
+            // well before the DAC has PLAYED them — up to ~2s at the output rate
+            // (more when resampling 44.1→192). The old code signalled end + left
+            // the reported position at the fed/decoded end BEFORE draining, so the
+            // poller saw position past (DB) duration + margin while up to ~2s was
+            // still queued in the ring, and advanced the queue early — cutting the
+            // end of every track (JP Borderies, WASAPI/ASIO exclusive, VX248: log
+            // showed ring_available ~1.4M f32 samples still queued at advance time).
+            //
+            // Fix: during the drain, report the PLAYED position (fed − what is
+            // still queued in the ring) so the poller's position-past-end check
+            // tracks real playback; only signal track_ended_naturally once the ring
+            // is actually empty. If a new play/stop interrupts the drain
+            // (force_silent/stop_rx), the queue already moved on (force_silent is
+            // only set by a fresh play_url) — so we must NOT emit a natural end for
+            // this superseded track.
+            let fed_position_ms = position_ms.load(Ordering::Relaxed);
+            let mut drained_naturally = false;
+            // NEVER drain forever: with a dead render callback (USB DAC hot-
+            // unplugged, #1626 — on macOS no error callback ever fires) the
+            // ring stays full and this loop used to spin until restart, keeping
+            // the zone "Playing" and freezing the hotplug rescan. Deadline =
+            // queued audio duration + 5s margin (same guard as the ASIO
+            // exclusive path's asio_drain_timeout).
+            let drain_deadline = std::time::Duration::from_millis(
+                (ring.available() as u64 * 1000)
+                    / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
+                    + 5000,
+            );
+            let drain_started = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -3092,10 +4071,55 @@ impl OutputTarget for LocalOutput {
                 if force_silent.load(Ordering::Relaxed) {
                     break;
                 }
-                if ring.available() == 0 {
+                let remaining = ring.available();
+                if remaining == 0 {
+                    drained_naturally = true;
                     break;
                 }
+                if device_gone.load(Ordering::Relaxed) || drain_started.elapsed() >= drain_deadline
+                {
+                    // No natural end: the tail was never actually played, and
+                    // advancing the queue would immediately hit the same dead
+                    // device.
+                    warn!(
+                        device = %device_name,
+                        remaining_samples = remaining,
+                        device_gone = device_gone.load(Ordering::Relaxed),
+                        "local_audio_drain_timeout"
+                    );
+                    break;
+                }
+                // Report real playback: subtract the still-queued ring content
+                // (interleaved f32 samples at the output rate/channels).
+                if output_sr > 0 && output_ch > 0 {
+                    let ring_ms =
+                        (remaining as f64 / output_ch as f64 / output_sr as f64 * 1000.0) as u64;
+                    position_ms.store(fed_position_ms.saturating_sub(ring_ms), Ordering::Relaxed);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            if http_eof && drained_naturally {
+                position_ms.store(fed_position_ms, Ordering::Relaxed);
+                track_ended_naturally.store(true, Ordering::SeqCst);
+                track_ended_generation.store(my_generation, Ordering::SeqCst);
+                TRACK_END_NOTIFY.notify_one();
+                debug!(
+                    total_bytes_read,
+                    total_frames_fed, "local_audio_track_ended_naturally_post_drain"
+                );
+            }
+
+            // Hand the poller something to say when the device disappeared
+            // mid-playback (#1626) — same channel as the open-failure path, so
+            // the zone shows a clear message instead of silently stopping.
+            if device_gone.load(Ordering::Relaxed) {
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(format!(
+                        "Sortie « {device_name} » : {}.",
+                        OpenFailure::DeviceGone.user_message()
+                    ));
+                }
             }
 
             drop(stream);
@@ -3129,6 +4153,10 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        // Plus de flux, donc plus de format : sans cet oubli explicite,
+        // `current_format()` decrirait encore la piste precedente et on
+        // rebatirait un EqProcessor pour un flux mort (#1725).
+        self.current_format.store(0, Ordering::Relaxed);
         // Immediately silence the cpal callback so no audio leaks while
         // we wait for the playback thread to exit.  This flag is also
         // checked by the I/O read loop and feed_ring, causing the thread
@@ -3199,27 +4227,33 @@ impl OutputTarget for LocalOutput {
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         let v = (volume.clamp(0.0, 1.0) * 1000.0) as u32;
-        self.volume.store(v, Ordering::SeqCst);
+        self.user_volume.store(v, Ordering::SeqCst);
+        self.recompute_effective_volume();
         if v > 0 {
             self.muted.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
 
+    fn set_replaygain_factor(&self, factor: f64) {
+        LocalOutput::set_replaygain_factor(self, factor);
+    }
+
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
         if muted {
-            let current = self.volume.load(Ordering::SeqCst);
+            let current = self.user_volume.load(Ordering::SeqCst);
             if current > 0 {
                 self.pre_mute_volume.store(current, Ordering::SeqCst);
             }
-            self.volume.store(0, Ordering::SeqCst);
+            self.user_volume.store(0, Ordering::SeqCst);
             self.muted.store(true, Ordering::SeqCst);
         } else {
             let restored = self.pre_mute_volume.load(Ordering::SeqCst);
-            self.volume
+            self.user_volume
                 .store(if restored > 0 { restored } else { 1000 }, Ordering::SeqCst);
             self.muted.store(false, Ordering::SeqCst);
         }
+        self.recompute_effective_volume();
         Ok(())
     }
 
@@ -3251,12 +4285,14 @@ impl OutputTarget for LocalOutput {
                 state: TransportState::Playing,
                 position_ms: duration_ms.saturating_add(5000),
                 duration_ms,
-                volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
+                volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
                 muted: self.muted.load(Ordering::Relaxed),
                 current_uri: self.current_uri.lock().unwrap().clone(),
                 track_title: self.track_title.lock().unwrap().clone(),
                 track_artist: self.track_artist.lock().unwrap().clone(),
                 ended_naturally: true,
+                // A renderer plays at 1x: keep the poller's wall-clock guards.
+                realtime: true,
             });
         }
 
@@ -3274,13 +4310,19 @@ impl OutputTarget for LocalOutput {
             state,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms,
-            volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
+            volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().unwrap().clone(),
             track_title: self.track_title.lock().unwrap().clone(),
             track_artist: self.track_artist.lock().unwrap().clone(),
             ended_naturally: self.track_ended_naturally.load(Ordering::Relaxed),
+            // A renderer plays at 1x: keep the poller's wall-clock guards.
+            realtime: true,
         })
+    }
+
+    fn take_output_failure(&self) -> Option<String> {
+        self.open_failure.lock().ok().and_then(|mut s| s.take())
     }
 
     async fn is_available(&self) -> bool {
@@ -3314,41 +4356,101 @@ impl OutputTarget for LocalOutput {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Build the error callback for a shared-mode cpal stream.
+///
+/// A hot-unplugged USB DAC surfaces here — and used to be merely logged, which
+/// left the feeding thread waiting forever on a ring buffer nobody drains
+/// (issue #1626). Instead:
+///
+/// - `DeviceNotAvailable` (WASAPI raises it when the endpoint is invalidated)
+///   flags `device_gone` so the feeding thread tears down, and is logged once.
+/// - Any other error still flags nothing but is rate-limited to one log line
+///   per second: cpal 0.17's ALSA `output_stream_worker` loops on error
+///   (`error_callback(...); continue`), and with a dead fd `poll()` returns
+///   immediately — unbounded logging floods the log at poll speed until the
+///   stream is dropped.
+///
+/// On macOS CoreAudio the callback typically never fires on unplug (the
+/// AudioUnit just stops rendering); the feed-stall and drain deadlines in the
+/// playback thread cover that case.
+fn make_stream_error_cb(
+    device_gone: Arc<AtomicBool>,
+) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    let mut last_warn: Option<std::time::Instant> = None;
+    move |e: cpal::StreamError| {
+        if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+            if !device_gone.swap(true, Ordering::SeqCst) {
+                warn!(error = %e, "audio_stream_device_lost");
+            }
+            return;
+        }
+        if last_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+            warn!(error = %e, "audio_stream_error");
+            last_warn = Some(std::time::Instant::now());
+        }
+    }
+}
+
 /// Feed samples into the ring buffer, blocking (with sleep) when full.
 /// Checks the stop signal, abort flag, and pause state periodically.
 /// Returns immediately when abort is signaled or stop is received.
+///
+/// Returns `false` ONLY when the wedge detector tripped (the consumer stopped
+/// draining the ring for ≥5s — dead render callback, e.g. unplugged USB DAC);
+/// `true` otherwise, including stop/abort exits which the callers already
+/// detect through their own checks.
 fn feed_ring_abortable(
     ring: &RingBuf,
     samples: &[f32],
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
     abort: Option<&AtomicBool>,
-) {
+) -> bool {
     let mut offset = 0;
+    // Wedge detector: if the render callback stops consuming, the ring stays
+    // full and `ring.push` returns 0 forever. Bail after a sustained stall so
+    // the device-owning thread can tear down (and release the ASIO device lock)
+    // instead of blocking permanently (DEvir bug-22 / #789: the callback
+    // quiesced at a Repeat loop point). The 5s threshold is far longer than any
+    // normal back-pressure wait (the callback drains a full ring within a few
+    // buffer periods), so this never trips during healthy playback.
+    let mut last_progress_at = std::time::Instant::now();
     while offset < samples.len() {
         if stop_rx.try_recv().is_ok() {
-            return;
+            return true;
         }
         if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
-            return;
+            return true;
         }
         // If paused, wait without feeding
         while paused.load(Ordering::Relaxed) {
             if stop_rx.try_recv().is_ok() {
-                return;
+                return true;
             }
             if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
-                return;
+                return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+            // A deliberate pause is not a stall.
+            last_progress_at = std::time::Instant::now();
         }
         let written = ring.push(&samples[offset..]);
         offset += written;
         if written == 0 {
+            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
+                warn!(
+                    remaining_samples = samples.len() - offset,
+                    "asio_feed_ring_stall_timeout"
+                );
+                return false;
+            }
             // Ring buffer full — wait a bit
             std::thread::sleep(std::time::Duration::from_millis(5));
+        } else {
+            last_progress_at = std::time::Instant::now();
         }
     }
+    true
 }
 
 /// Find an audio output device by name, falling back to the default device if
@@ -3586,273 +4688,340 @@ fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
 
 /// Simple linear-interpolation resampler for rate conversion.
 /// Kept as a fallback — the main path now uses rubato sinc resampling.
-#[allow(dead_code)]
-fn simple_resample(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> Vec<f32> {
-    if from_sr == to_sr {
-        return samples.to_vec();
-    }
-    let ch = channels as usize;
-    let in_frames = samples.len() / ch;
-    if in_frames == 0 {
-        return Vec::new();
-    }
-    let ratio = to_sr as f64 / from_sr as f64;
-    let out_frames = (in_frames as f64 * ratio) as usize;
-    let mut out = Vec::with_capacity(out_frames * ch);
+/// Implementation lives in `crate::audio`; only this file's tests still
+/// reference it directly.
+#[cfg(test)]
+use crate::audio::simple_resample;
 
-    for i in 0..out_frames {
-        let src_pos = i as f64 / ratio;
-        let idx = src_pos as usize;
-        let frac = (src_pos - idx as f64) as f32;
-        let idx0 = idx.min(in_frames - 1);
-        let idx1 = (idx + 1).min(in_frames - 1);
-        for c in 0..ch {
-            let s0 = samples[idx0 * ch + c];
-            let s1 = samples[idx1 * ch + c];
-            out.push(s0 + (s1 - s0) * frac);
-        }
-    }
-    out
-}
-
-/// Resample a complete buffer of interleaved f32 samples using rubato sinc.
-///
-/// Used for compressed streams where all decoded data is available at once.
-/// Creates and consumes a temporary resampler internally.
-fn rubato_resample_batch(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> Vec<f32> {
-    if from_sr == to_sr || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ch = channels as usize;
-    if ch == 0 {
-        return Vec::new();
-    }
-
-    let ratio = to_sr as f64 / from_sr as f64;
-    // Adaptive resampler params based on conversion ratio:
-    //   ratio ≤ 2.0 (e.g. 96kHz→48kHz): quality params, plenty of CPU budget
-    //   ratio > 2.0 (e.g. 176.4kHz→48kHz, 192kHz→48kHz): lighter params
-    //     to avoid real-time stuttering on Windows (still ~90dB SNR)
-    let inv_ratio = 1.0 / ratio; // > 1.0 when downsampling
-    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
-        (32_usize, 64_usize) // lighter: 176.4/192kHz → 48kHz
-    } else {
-        (64_usize, 128_usize) // standard: 96kHz → 48kHz
-    };
-    let window = WindowFunction::BlackmanHarris2;
-    let f_cutoff = calculate_cutoff(sinc_len, window);
-    let params = SincInterpolationParameters {
-        sinc_len,
-        f_cutoff,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor,
-        window,
-    };
-    let mut resampler =
-        match Async::<f32>::new_sinc(ratio, 1.1, &params, 1024, ch, FixedAsync::Input) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warn!(error = %e, "rubato_batch_resampler_creation_failed_using_linear");
-                return simple_resample(samples, from_sr, to_sr, channels);
-            }
-        };
-
-    // Resample using the chunk helper, then flush
-    let mut batch_leftover: Vec<f32> = Vec::new();
-    let mut out = rubato_resample_chunk(
-        &mut resampler,
-        samples,
-        channels,
-        false,
-        &mut batch_leftover,
-    );
-    let flushed = rubato_resample_chunk(&mut resampler, &[], channels, true, &mut batch_leftover);
-    out.extend_from_slice(&flushed);
-
-    info!(
-        from_sr,
-        to_sr,
-        in_samples = samples.len(),
-        out_samples = out.len(),
-        "rubato_batch_resample_complete"
-    );
-
-    out
-}
-
-/// Resample a chunk of interleaved f32 samples using rubato's sinc resampler.
-///
-/// The resampler is created once per track and reused across chunks.
-/// `samples` is interleaved f32, `channels` is the channel count *after*
-/// any channel adaptation (i.e. the output channel count).
-///
-/// When `flush` is true, feeds silence into the resampler to drain its
-/// internal buffers at end-of-stream. `samples` should be empty in that case.
-fn rubato_resample_chunk(
-    resampler: &mut Option<Async<f32>>,
-    samples: &[f32],
-    channels: u16,
-    flush: bool,
-    resample_leftover: &mut Vec<f32>,
-) -> Vec<f32> {
-    use rubato::audioadapter_buffers::direct::InterleavedSlice;
-    use rubato::audioadapter_buffers::owned::InterleavedOwned;
-
-    let Some(resampler) = resampler.as_mut() else {
-        // No resampler available — pass through unchanged
-        return samples.to_vec();
-    };
-
-    let ch = channels as usize;
-    if ch == 0 {
-        return Vec::new();
-    }
-
-    // Combine leftover from previous call with new samples.
-    // This avoids using rubato's partial_len during continuous streaming,
-    // which pads the remainder with silence and corrupts subsequent output
-    // (perceived as white noise on 24-bit audio where frame counts rarely
-    // align to the resampler's block size).
-    let combined: Vec<f32>;
-    let input_ref: &[f32] = if flush {
-        // When flushing, drain leftover first, then feed silence
-        if !resample_leftover.is_empty() {
-            combined = resample_leftover.drain(..).collect();
-            &combined
-        } else {
-            &[]
-        }
-    } else {
-        if resample_leftover.is_empty() {
-            // Fast path: no leftover, use new samples directly
-            let usable = (samples.len() / ch) * ch;
-            &samples[..usable]
-        } else {
-            // Prepend leftover from previous call
-            combined = resample_leftover
-                .drain(..)
-                .chain(samples.iter().copied())
-                .collect();
-            let usable = (combined.len() / ch) * ch;
-            // Any sub-frame remainder goes back to leftover (shouldn't happen
-            // since both leftover and samples are frame-aligned, but be safe)
-            if usable < combined.len() {
-                resample_leftover.extend_from_slice(&combined[usable..]);
-            }
-            &combined[..usable]
-        }
-    };
-
-    let actual_in_frames = input_ref.len() / ch;
-
-    // Process only complete resampler blocks (input_frames_next() frames each).
-    // Carry over any remaining frames to the next call instead of using
-    // partial_len, which pads with silence and introduces artifacts.
-    let mut all_output = Vec::new();
-    let mut offset = 0;
-
-    while offset < actual_in_frames {
-        let chunk_needed = resampler.input_frames_next();
-        let chunk_available = actual_in_frames - offset;
-
-        if chunk_available < chunk_needed {
-            if flush {
-                // End of track: process remaining frames with silence padding
-                let chunk_slice = &input_ref[offset * ch..actual_in_frames * ch];
-                let input_adapter = match InterleavedSlice::new(chunk_slice, ch, chunk_available) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!(error = %e, "rubato_input_adapter_error_flush");
-                        break;
-                    }
-                };
-                let out_frames = resampler.output_frames_next();
-                let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
-                let indexing = rubato::Indexing {
-                    input_offset: 0,
-                    output_offset: 0,
-                    partial_len: Some(chunk_available),
-                    active_channels_mask: None,
-                };
-                match resampler.process_into_buffer(
-                    &input_adapter,
-                    &mut output_buf,
-                    Some(&indexing),
-                ) {
-                    Ok((_nbr_in, nbr_out)) => {
-                        let out_data = output_buf.take_data();
-                        all_output.extend_from_slice(&out_data[..nbr_out * ch]);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "rubato_process_error_flush");
-                    }
-                }
-                offset = actual_in_frames;
-            } else {
-                // Continuous streaming: save remainder for next call
-                resample_leftover.extend_from_slice(&input_ref[offset * ch..actual_in_frames * ch]);
-                break;
-            }
-        } else {
-            // Full block available — process without partial_len
-            let chunk_slice = &input_ref[offset * ch..(offset + chunk_needed) * ch];
-            let input_adapter = match InterleavedSlice::new(chunk_slice, ch, chunk_needed) {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!(error = %e, "rubato_input_adapter_error");
-                    break;
-                }
-            };
-
-            let out_frames = resampler.output_frames_next();
-            let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
-
-            match resampler.process_into_buffer(&input_adapter, &mut output_buf, None) {
-                Ok((_nbr_in, nbr_out)) => {
-                    let out_data = output_buf.take_data();
-                    all_output.extend_from_slice(&out_data[..nbr_out * ch]);
-                }
-                Err(e) => {
-                    warn!(error = %e, "rubato_process_error");
-                    break;
-                }
-            }
-
-            offset += chunk_needed;
-        }
-    }
-
-    // If flushing and we processed all leftover above, now feed a block of
-    // pure silence to drain the resampler's internal delay line.
-    if flush && offset >= actual_in_frames {
-        let silence_frames = resampler.input_frames_next();
-        let silence = vec![0.0f32; silence_frames * ch];
-        let input_adapter = match InterleavedSlice::new(&silence, ch, silence_frames) {
-            Ok(a) => a,
-            Err(_) => return all_output,
-        };
-        let out_frames = resampler.output_frames_next();
-        let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
-        let indexing = rubato::Indexing {
-            input_offset: 0,
-            output_offset: 0,
-            partial_len: Some(0),
-            active_channels_mask: None,
-        };
-        if let Ok((_nbr_in, nbr_out)) =
-            resampler.process_into_buffer(&input_adapter, &mut output_buf, Some(&indexing))
-        {
-            let out_data = output_buf.take_data();
-            all_output.extend_from_slice(&out_data[..nbr_out * ch]);
-        }
-    }
-
-    all_output
-}
+/// Rubato sinc resampling helpers. Implementation moved to
+/// `crate::audio::resample` (#1525) so the file converter can share it
+/// without the `local-audio` feature; re-exported for this pipeline's
+/// existing call sites and tests.
+pub(crate) use crate::audio::resample::{rubato_resample_batch, rubato_resample_chunk};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Égaliseur de zone sur la sortie locale (#1416, Jean Marie)
+    //
+    // L'`EqProcessor` n'était appliqué que dans `transcode_source_to_file`,
+    // chemin qu'une zone locale ne prend JAMAIS (`use_file_transcode_for`
+    // exige une sortie réseau). L'égaliseur n'agissait donc nulle part sur un
+    // DAC local. Ces tests verrouillent le branchement dans la chaîne DSP.
+    // -----------------------------------------------------------------------
+
+    /// EQ de test : -12 dB de plateau aigu, audible sur un sinus 8 kHz.
+    fn test_eq() -> crate::audio::eq::EqProcessor {
+        let profile = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 2000.0,
+                gain: -12.0,
+                q: 0.71,
+                band_type: "high_shelf".into(),
+            }],
+            ..Default::default()
+        };
+        crate::audio::eq::EqProcessor::new(&profile, 44100, 2)
+    }
+
+    fn stereo_sine_8k(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|i| {
+                let v =
+                    ((2.0 * std::f64::consts::PI * 8000.0 * i as f64 / 44100.0).sin() * 0.5) as f32;
+                [v, v]
+            })
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn local_dsp_applies_the_zone_eq() {
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(4096);
+        let before = rms(&samples);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        // On saute les 512 premières trames (établissement du filtre).
+        let after = rms(&samples[1024..]);
+
+        let delta_db = 20.0 * (after / before).log10();
+        assert!(
+            delta_db < -8.0,
+            "un plateau -12 dB doit atténuer un 8 kHz ; mesuré {delta_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn local_dsp_skips_the_eq_in_pure_mode() {
+        // PURE promet un chemin bit-perfect : même avec un EQ installé, le
+        // signal doit ressortir strictement identique.
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(true);
+
+        let mut samples = stereo_sine_8k(1024);
+        let before = samples.clone();
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        assert_eq!(samples, before);
+    }
+
+    #[test]
+    fn local_dsp_without_eq_is_identity() {
+        // Aucune zone sans EQ ne doit changer de son : garde-fou de
+        // non-régression pour tous les utilisateurs qui n'ont rien activé.
+        let eq = std::sync::Mutex::new(None);
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(1024);
+        let before = samples.clone();
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        assert_eq!(samples, before);
+    }
+
+    #[test]
+    fn local_dsp_eq_runs_on_mono_and_multichannel_too() {
+        // Le crossfeed est réservé au stéréo ; l'égaliseur, lui, doit agir
+        // quel que soit le nombre de canaux (un DAC mono ou 5.1 a droit à sa
+        // correction).
+        let profile = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 2000.0,
+                gain: -12.0,
+                q: 0.71,
+                band_type: "high_shelf".into(),
+            }],
+            ..Default::default()
+        };
+        let eq =
+            std::sync::Mutex::new(Some(crate::audio::eq::EqProcessor::new(&profile, 44100, 1)));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples: Vec<f32> = (0..4096)
+            .map(|i| {
+                ((2.0 * std::f64::consts::PI * 8000.0 * i as f64 / 44100.0).sin() * 0.5) as f32
+            })
+            .collect();
+        let before = rms(&samples);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1, false);
+        let after = rms(&samples[1024..]);
+        assert!(20.0 * (after / before).log10() < -8.0);
+    }
+
+    /// Génère du DoP réel avec l'encodeur du serveur, pour ne pas tester une
+    /// idée qu'on se fait du format.
+    fn real_dop_bytes(frames: usize, channels: usize) -> Vec<u8> {
+        let mut enc = crate::audio::dsd_to_dop::DsdToDoP::new(channels, false);
+        // 2 octets DSD par canal et par trame DoP.
+        let dsd: Vec<u8> = (0..frames * 2 * channels).map(|i| (i * 37) as u8).collect();
+        enc.feed(&dsd)
+    }
+
+    #[test]
+    fn dop_is_recognised_on_real_encoder_output() {
+        for ch in [2usize, 1, 6] {
+            let bytes = real_dop_bytes(256, ch);
+            assert!(
+                is_dop_pcm(&bytes, 24, ch as u16),
+                "DoP {ch} canaux non reconnu"
+            );
+        }
+    }
+
+    #[test]
+    fn dop_detection_survives_a_chunk_boundary() {
+        // Les boucles de lecture découpent le flux à l'octet près : la
+        // détection ne doit pas dépendre de la parité du marqueur au début du
+        // tampon, sinon une trame DoP sur deux serait filtrée — et le DAC se
+        // tairait par intermittence.
+        let bytes = real_dop_bytes(256, 2);
+        let offset = 6; // une trame stéréo complète
+        assert!(is_dop_pcm(&bytes[offset..], 24, 2));
+    }
+
+    #[test]
+    fn ordinary_pcm_is_never_taken_for_dop() {
+        // Le faux positif est le risque de cette détection : il désactiverait
+        // l'égaliseur en silence. Un sinus 24 bits ne doit jamais passer.
+        let mut pcm = Vec::new();
+        for i in 0..2048 {
+            let v = ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44100.0).sin() * 8_000_000.0)
+                as i32;
+            for _ in 0..2 {
+                pcm.extend_from_slice(&v.to_le_bytes()[..3]);
+            }
+        }
+        assert!(!is_dop_pcm(&pcm, 24, 2));
+        // Le silence non plus (octet de poids fort à 0 partout).
+        assert!(!is_dop_pcm(&vec![0u8; 4096], 24, 2));
+        // Ni un tampon dont le marqueur est constant au lieu d'alterner.
+        let stuck: Vec<u8> = (0..4096)
+            .map(|i| if i % 3 == 2 { 0x05 } else { 0x11 })
+            .collect();
+        assert!(!is_dop_pcm(&stuck, 24, 2));
+    }
+
+    #[test]
+    fn dop_is_only_ever_detected_on_24_bit() {
+        // DoP n'a pas d'autre porteur : chercher le marqueur dans du 16 ou du
+        // 32 bits lirait des octets qui ne sont pas des marqueurs.
+        let bytes = real_dop_bytes(256, 2);
+        assert!(!is_dop_pcm(&bytes, 16, 2));
+        assert!(!is_dop_pcm(&bytes, 32, 2));
+        assert!(!is_dop_pcm(&bytes, 24, 0));
+    }
+
+    #[test]
+    fn dop_detection_needs_enough_frames() {
+        // Un tampon trop court ne prouve rien : mieux vaut traiter le son
+        // (comportement d'avant) que couper l'égaliseur sur une coïncidence.
+        let bytes = real_dop_bytes(DOP_DETECT_FRAMES - 1, 2);
+        assert!(!is_dop_pcm(&bytes, 24, 2));
+        assert!(is_dop_pcm(&real_dop_bytes(DOP_DETECT_FRAMES, 2), 24, 2));
+    }
+
+    #[test]
+    fn local_dsp_leaves_a_dop_stream_strictly_untouched() {
+        // Le cœur du défaut : avec un EQ ET un crossfeed installés, un flux DoP
+        // doit ressortir bit pour bit identique. Un seul échantillon modifié
+        // efface le marqueur, le DAC quitte le mode DSD et se tait (Tades,
+        // forum #1408).
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(Some(
+            crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
+        ));
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(1024);
+        let before = samples.clone();
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, true);
+        assert_eq!(samples, before);
+    }
+
+    #[test]
+    fn dop_bypass_does_not_disable_the_eq_on_ordinary_pcm() {
+        // Non-régression de #1708 : la garde DoP ne doit rien coûter à ceux qui
+        // écoutent du PCM, c'est-à-dire presque tout le monde.
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let mut samples = stereo_sine_8k(4096);
+        let before = rms(&samples);
+        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        assert!(20.0 * (rms(&samples[1024..]) / before).log10() < -8.0);
+    }
+
+    #[test]
+    fn header_read_retries_only_transient_kinds() {
+        use std::io::ErrorKind;
+        // #522: the next track's transcode hasn't emitted its WAV header yet →
+        // retry instead of abandoning the gapless chain (would skip track 2).
+        assert!(header_read_should_retry(ErrorKind::TimedOut));
+        assert!(header_read_should_retry(ErrorKind::WouldBlock));
+        // Real errors still fail fast (no infinite retry on a dead stream).
+        assert!(!header_read_should_retry(ErrorKind::BrokenPipe));
+        assert!(!header_read_should_retry(ErrorKind::UnexpectedEof));
+        assert!(!header_read_should_retry(ErrorKind::NotFound));
+    }
+
+    // -----------------------------------------------------------------------
+    // USB DAC hot-unplug teardown (#1626)
+    // -----------------------------------------------------------------------
+
+    /// A `DeviceNotAvailable` stream error must flag `device_gone` so the
+    /// feeding thread tears down instead of waiting on a ring nobody drains.
+    #[test]
+    fn device_not_available_flags_device_gone() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let mut cb = make_stream_error_cb(gone.clone());
+        cb(cpal::StreamError::DeviceNotAvailable);
+        assert!(gone.load(Ordering::SeqCst));
+        // Repeated invocations (WASAPI fires once, but belt-and-suspenders)
+        // keep the flag set and must not panic.
+        cb(cpal::StreamError::DeviceNotAvailable);
+        assert!(gone.load(Ordering::SeqCst));
+    }
+
+    /// Other stream errors (ALSA underruns are routine) must NOT tear down
+    /// playback.
+    #[test]
+    fn generic_stream_error_does_not_flag_device_gone() {
+        let gone = Arc::new(AtomicBool::new(false));
+        let mut cb = make_stream_error_cb(gone.clone());
+        cb(cpal::StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "underrun".into(),
+            },
+        });
+        assert!(!gone.load(Ordering::SeqCst));
+    }
+
+    /// Happy path: everything fits, the feeder reports success.
+    #[test]
+    fn feed_ring_reports_success_when_fully_fed() {
+        let ring = RingBuf::new(16);
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        assert!(feed_ring_abortable(&ring, &[0.5f32; 8], &rx, &paused, None));
+        assert_eq!(ring.available(), 8);
+    }
+
+    /// An abort (stop/new play) is a clean exit, not a stall: the caller's own
+    /// stop checks handle it, so the feeder must not report a dead consumer.
+    #[test]
+    fn feed_ring_abort_is_not_a_stall() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // full — feeding would block
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let abort = AtomicBool::new(true);
+        assert!(feed_ring_abortable(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            Some(&abort)
+        ));
+    }
+
+    /// Dead consumer (unplugged DAC: the cpal callback stops popping): the
+    /// wedge detector must report the stall so the playback thread stops
+    /// feeding instead of stalling 5s on every chunk forever. Slow test (~5s,
+    /// the real wedge threshold) — the price of exercising the actual guard.
+    #[test]
+    fn feed_ring_reports_stall_when_consumer_dead() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // full, and nobody will ever pop
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert!(!feed_ring_abortable(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            None
+        ));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn test_parse_wav_header() {
@@ -4197,5 +5366,249 @@ mod tests {
         let devices = list_audio_devices();
         // On CI there may be no devices, but on dev machines there should be at least one
         let _ = devices.len();
+    }
+}
+
+#[cfg(test)]
+mod open_failure_tests {
+    use super::{OpenFailure, classify_open_failure};
+
+    /// The exact string Yacine's log carried, six times, with no other clue.
+    #[test]
+    fn pipewire_unreachable_is_classified_as_server_or_permission() {
+        assert_eq!(
+            classify_open_failure(
+                "A backend-specific error has occurred: ALSA function 'snd_pcm_open' \
+                 failed with error 'Host is down (112)'"
+            ),
+            OpenFailure::ServerUnreachable
+        );
+    }
+
+    /// The real cause on 8 Aug 2026: an account outside the `audio` group, on a
+    /// machine driven over SSH. It can surface as a plain permission error, so
+    /// that wording must land in the same arm.
+    #[test]
+    fn a_permission_error_lands_in_the_same_arm() {
+        assert_eq!(
+            classify_open_failure("snd_pcm_open failed with error 'Permission denied'"),
+            OpenFailure::ServerUnreachable
+        );
+    }
+
+    #[test]
+    fn a_vanished_device_is_classified_as_gone() {
+        assert_eq!(
+            classify_open_failure(
+                "ALSA function 'snd_pcm_open' failed with error 'No such device'"
+            ),
+            OpenFailure::DeviceGone
+        );
+    }
+
+    #[test]
+    fn an_exclusively_held_device_is_classified_as_busy() {
+        assert_eq!(
+            classify_open_failure("Device or resource busy"),
+            OpenFailure::Busy
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_error_does_not_guess() {
+        assert_eq!(
+            classify_open_failure("something nobody has seen before"),
+            OpenFailure::Unknown
+        );
+    }
+
+    /// Both renderings must exist for every arm, and stay in their own
+    /// language: the log is ours, the toast is the listener's.
+    #[test]
+    fn every_cause_renders_for_both_audiences() {
+        for c in [
+            OpenFailure::ServerUnreachable,
+            OpenFailure::DeviceGone,
+            OpenFailure::Busy,
+            OpenFailure::Unknown,
+        ] {
+            assert!(!c.log_hint().is_empty(), "{c:?} has no log hint");
+            assert!(!c.user_message().is_empty(), "{c:?} has no user message");
+            // The toast must say what to do, not merely restate the failure.
+            let m = c.user_message();
+            assert!(
+                m.contains("Vérifiez")
+                    || m.contains("Choisissez")
+                    || m.contains("Fermez")
+                    || m.contains("choisissez"),
+                "{c:?} user message gives no action: {m}"
+            );
+        }
+    }
+
+    /// The contract the poller relies on: a failure is delivered once. If it
+    /// stuck around, the very next track would be stopped by the previous
+    /// track's error — a far worse bug than the silence this fixes.
+    #[test]
+    fn a_failure_is_delivered_once_then_cleared() {
+        use super::super::traits::OutputTarget;
+        let out = super::LocalOutput::new("test-device".into());
+        assert!(
+            out.take_output_failure().is_none(),
+            "clean output must report nothing"
+        );
+
+        *out.open_failure.lock().unwrap() = Some("boum".into());
+        assert_eq!(out.take_output_failure().as_deref(), Some("boum"));
+        assert!(
+            out.take_output_failure().is_none(),
+            "a failure must never be reported twice"
+        );
+    }
+
+    /// The `audio` group is the lesson of 8 Aug 2026 — if this hint ever loses
+    /// it, the next person driving Tune over SSH starts the hunt from scratch.
+    #[test]
+    fn the_unreachable_hint_names_the_audio_group() {
+        let h = OpenFailure::ServerUnreachable.log_hint();
+        assert!(h.contains("audio"), "got: {h}");
+        let m = OpenFailure::ServerUnreachable.user_message();
+        assert!(m.contains("audio"), "got: {m}");
+    }
+}
+
+#[cfg(test)]
+mod backend_display_tests {
+    use super::backend_display_name;
+
+    // Le cas Bilou : l'utilisateur demande ASIO, le pilote n'est pas ouvrable
+    // (absent, ou déjà tenu par une autre application — un pilote ASIO ne
+    // s'ouvre que dans un seul processus), la lecture retombe sur WASAPI.
+    // L'interface annonçait quand même « ASIO ».
+    #[test]
+    fn observed_wins_over_requested() {
+        assert_eq!(backend_display_name(Some("WASAPI"), "asio"), "WASAPI");
+    }
+
+    // Et l'inverse doit tenir aussi : une bascule vers WASAPI observée une fois
+    // ne doit pas figer l'affichage si ASIO s'ouvre ensuite.
+    #[test]
+    fn observed_asio_is_reported_even_when_setting_says_otherwise() {
+        assert_eq!(backend_display_name(Some("ASIO"), "wasapi"), "ASIO");
+    }
+
+    // Sans observation — aucun périphérique encore ouvert — on retombe sur la
+    // déduction d'avant, inchangée.
+    #[test]
+    fn without_observation_falls_back_to_the_setting() {
+        let name = backend_display_name(None, "asio");
+        assert!(
+            matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
+            "nom inattendu: {name}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod format_courant_tests {
+    use super::LocalOutput;
+
+    // -----------------------------------------------------------------------
+    // #1725 — un curseur bouge pendant la lecture, le son doit suivre.
+    //
+    // `set_eq` n'etait appele qu'au demarrage d'une piste, faute de connaitre
+    // le couple (taux, canaux) auquel batir les biquads. `current_format` le
+    // memorise ; ces tests verrouillent l'empaquetage, dont depend la
+    // reconstruction a chaud.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empaquetage_aller_retour_sur_les_formats_courants() {
+        for (taux, canaux) in [
+            (44_100u32, 2u16),
+            (48_000, 2),
+            (96_000, 2),
+            (192_000, 2),
+            (352_800, 2),
+            (768_000, 2),
+            (44_100, 1),
+            (48_000, 8),
+        ] {
+            let empaquete = LocalOutput::pack_format(taux, canaux);
+            assert_ne!(empaquete, 0, "{taux}/{canaux} doit s'empaqueter");
+            assert_eq!(empaquete >> 8, taux, "taux perdu pour {taux}/{canaux}");
+            assert_eq!(
+                (empaquete & 0xFF) as u16,
+                canaux,
+                "canaux perdus pour {taux}/{canaux}"
+            );
+        }
+    }
+
+    /// Zero = « aucun flux ». Batir un EqProcessor pour un format inconnu
+    /// donnerait des coefficients faux, donc mieux vaut ne rien pousser.
+    #[test]
+    fn un_format_absent_ou_aberrant_ne_s_empaquette_pas() {
+        assert_eq!(LocalOutput::pack_format(0, 2), 0, "taux nul");
+        assert_eq!(LocalOutput::pack_format(44_100, 0), 0, "zero canal");
+        assert_eq!(
+            LocalOutput::pack_format(0x0100_0000, 2),
+            0,
+            "un taux qui deborde les 24 bits doit dire « pas de flux » plutot \
+             que de rendre un taux tronque"
+        );
+        assert_eq!(LocalOutput::pack_format(44_100, 256), 0, "trop de canaux");
+    }
+
+    /// Une sortie neuve n'a pas de flux : rien a rebatir.
+    #[test]
+    fn une_sortie_neuve_n_annonce_aucun_format() {
+        let sortie = LocalOutput::new("format-test".to_string());
+        assert_eq!(sortie.current_format(), None);
+    }
+}
+
+#[cfg(test)]
+mod chemin_compresse_dsp_tests {
+    /// #1725 — le chemin compresse ne passait par AUCUN DSP.
+    ///
+    /// Les trois appels d'`apply_local_dsp` vivaient tous sur le chemin PCM.
+    /// Un flux non-WAV — FLAC, MP3, AAC decode en bloc — alimentait le tampon
+    /// sans egaliseur, sans correction de piece et sans crossfeed. Quatrieme
+    /// trou de la meme famille que #1216 (passthrough reseau), #1168
+    /// (navigateur) et Diretta (sortie pull) : un DSP annonce comme applique,
+    /// absent d'un chemin donne.
+    ///
+    /// Ce test lit le CONTENU du fichier : il verifie que la branche
+    /// compressee applique la chaine AVANT de reechantillonner. C'est un
+    /// controle grossier, mais il attrape la seule regression qui compte —
+    /// quelqu'un qui deplace ou supprime cet appel.
+    #[test]
+    fn la_branche_compressee_applique_le_dsp_avant_le_reechantillonnage() {
+        let source = include_str!("local.rs");
+        let branche = source
+            .split("local_audio_compressed_playing")
+            .nth(1)
+            .expect("branche compressee introuvable");
+        // On ne regarde que jusqu'au pre-remplissage du tampon.
+        let avant_tampon = branche
+            .split("Pre-fill the ring buffer")
+            .next()
+            .expect("pre-remplissage introuvable");
+
+        let pos_dsp = avant_tampon
+            .find("apply_local_dsp(")
+            .expect("le chemin compresse n'applique AUCUN DSP (#1725)");
+        let pos_resample = avant_tampon.find("rubato_resample_batch");
+
+        if let Some(pos_resample) = pos_resample {
+            assert!(
+                pos_dsp < pos_resample,
+                "le DSP doit s'appliquer AVANT le reechantillonnage : \
+                 l'EqProcessor est bati pour (media.sample_rate, media.channels), \
+                 donc pour dec_sr/dec_ch. L'appliquer apres deplacerait toutes \
+                 les frequences de coupure."
+            );
+        }
     }
 }

@@ -41,33 +41,63 @@ pub async fn report_artist_image(
     Ok(())
 }
 
-/// Submit a genre correction for an album.
-pub async fn submit_genre_correction(
-    album_id: &str,
-    genre: &str,
-    base_url: Option<&str>,
+/// A metadata report to submit to the community backend.
+#[derive(Debug, Clone, Default)]
+pub struct ReportSubmission<'a> {
+    pub entity: &'a str,
+    pub mbid: Option<&'a str>,
+    pub field: Option<&'a str>,
+    pub value: Option<&'a str>,
+    pub reason: &'a str,
+    pub comment: Option<&'a str>,
+}
+
+/// Submit a metadata report (wrong cover, wrong credit, bogus bio…).
+/// Values reported by enough distinct instances get unpublished server-side.
+pub async fn submit_report(
+    base_url: &str,
+    instance_id: &str,
+    report: &ReportSubmission<'_>,
 ) -> Result<(), String> {
-    let base = base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/');
-    let url = format!("{base}/api/v1/community/genres");
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/api/v1/community/reports");
     let client = crate::http::client::shared();
+
+    let mut body = serde_json::json!({
+        "instance_id": instance_id,
+        "entity": report.entity,
+        "reason": report.reason,
+    });
+    for (key, val) in [
+        ("mbid", report.mbid),
+        ("field", report.field),
+        ("value", report.value),
+        ("comment", report.comment),
+    ] {
+        if let Some(v) = val {
+            body[key] = serde_json::json!(v);
+        }
+    }
 
     let resp = client
         .post(&url)
-        .json(&serde_json::json!({
-            "album_id": album_id,
-            "genre": genre,
-        }))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .map_err(|e| format!("genre correction submit failed: {e}"))?;
+        .map_err(|e| format!("submit report failed: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        debug!(album_id, status = %status, "genre_correction_rejected");
-        return Err(format!("genre correction failed: {status}"));
+        debug!(entity = report.entity, status = %status, "metadata_report_rejected");
+        return Err(format!("metadata report failed: {status}"));
     }
 
-    info!(album_id, genre, "genre_correction_submitted");
+    info!(
+        entity = report.entity,
+        reason = report.reason,
+        "metadata_report_submitted"
+    );
     Ok(())
 }
 

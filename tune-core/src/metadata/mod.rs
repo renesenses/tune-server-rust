@@ -179,6 +179,19 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Canonical grouping key for a genre label, insensitive to case AND to the
+/// space-vs-hyphen separator, so "Trip Hop" and "Trip-Hop" (or "trip hop")
+/// collapse to a single key ("trip hop"). Used to dedup the library genre
+/// views, which otherwise show one card per spelling variant (#1161).
+pub fn genre_key(genre: &str) -> String {
+    genre
+        .to_lowercase()
+        .replace('-', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Normalize a lofty `FileType` debug string into a user-friendly format name.
 ///
 /// lofty's `FileType` Debug representation doesn't always match what users expect:
@@ -204,35 +217,6 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
         // lofty may report "alac" directly for some M4A files
         "alac" => "alac".to_string(),
         other => other.to_string(),
-    }
-}
-
-/// Detect ALAC vs AAC for M4A files by probing with symphonia.
-/// Returns "alac" if the codec is ALAC, "aac" otherwise.
-pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::formats::probe::Hint;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-
-    let file = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension("m4a");
-    let format_reader = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .ok()?;
-    let track = format_reader.default_track(symphonia::core::formats::TrackType::Audio)?;
-    let codec_name = format!("{:?}", track.codec_params);
-    if codec_name.contains("Alac") || codec_name.contains("alac") || codec_name.contains("ALAC") {
-        Some("alac".to_string())
-    } else {
-        Some("aac".to_string())
     }
 }
 
@@ -591,7 +575,8 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     // frames can be parsed. Old taggers commonly set this on DSD/DSF files
     // (Benjithom, #959) — without reversing it the frame sizes desync (notably
     // when a PIC image precedes the title) and the title is lost, so Tune fell
-    // back to the filename. (v2.4 uses per-frame unsync, not handled here.)
+    // back to the filename. v2.4 is handled per frame below (its synchsafe frame
+    // sizes count the *stored* length, so a whole-tag deunsync would desync them).
     let unsync = flags & 0x80 != 0;
     let raw_frames = &data[pos.min(tag_end)..tag_end];
     let deunsynced;
@@ -635,6 +620,13 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
             }
         };
 
+        // v2.4 unsynchronisation is per frame: either the whole-tag flag (0x80)
+        // or the frame's own format flag (0x02, second flag byte). Its synchsafe
+        // frame size counts the *stored* (still-stuffed) bytes, so we slice with
+        // frame_size first, then reverse the 0xFF 0x00 stuffing on the slice.
+        let frame_unsync =
+            major_version == 4 && (unsync || (header_len == 10 && frames[fpos + 9] & 0x02 != 0));
+
         fpos += header_len; // skip frame header
 
         // Normalize v2.2 3-char ids to their v2.3/v2.4 equivalents.
@@ -652,6 +644,15 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
 
         let frame_data = &frames[fpos..fpos + frame_size];
         fpos += frame_size;
+
+        // Reverse per-frame unsynchronisation before reading the payload.
+        let deunsynced_frame;
+        let frame_data: &[u8] = if frame_unsync {
+            deunsynced_frame = deunsynchronise(frame_data);
+            &deunsynced_frame
+        } else {
+            frame_data
+        };
 
         // Check for picture frames (APIC in v2.3/2.4, PIC in v2.2).
         if frame_id == "APIC" {
@@ -698,6 +699,55 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     }
 
     Some(tags)
+}
+
+/// Return the genre from the FIRST prepended ID3v2 tag of an MP3 — but only when
+/// a SECOND ID3v2 tag immediately follows it.
+///
+/// iTunes M4A→MP3 conversions leave a stale ID3v2.4 tag, and a later re-tag in
+/// Mp3Tag prepends a fresh ID3v2.3 tag in front of it, so the file carries two
+/// consecutive tags. lofty merges both into one tag with last-wins frame
+/// semantics, so the stale second tag's `TCON` ("Singer/Songwriter") overrides
+/// the user's genre ("Alternatif & Indé"). Every standard tool (Mp3Tag, ffprobe)
+/// reads only the first tag — so do we. The single-tag guard keeps this a no-op
+/// for normal files, so lofty's (encoding/numeric-genre-aware) value is untouched
+/// except in exactly this dual-tag case. Forum #1184.
+fn mp3_first_tag_genre_if_dual(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 10];
+    f.read_exact(&mut header).ok()?;
+    if &header[0..3] != b"ID3" {
+        return None;
+    }
+    let major_version = header[3];
+    let flags = header[5];
+    let tag_size = syncsafe_to_u32(&header[6..10]) as usize;
+    // v2.4 may append a 10-byte footer (flag 0x10) after the frames; the next
+    // tag then starts past it.
+    let has_footer = major_version == 4 && (flags & 0x10 != 0);
+    let first_tag_end = 10 + tag_size + if has_footer { 10 } else { 0 };
+
+    // Cap to avoid reading a pathological/corrupt size into memory.
+    if first_tag_end > 4_194_304 {
+        return None;
+    }
+
+    // Is there a SECOND ID3v2 tag right after the first? If not, leave lofty's
+    // genre alone — a single well-formed tag needs no correction.
+    f.seek(SeekFrom::Start(first_tag_end as u64)).ok()?;
+    let mut peek = [0u8; 3];
+    if f.read_exact(&mut peek).is_err() || &peek != b"ID3" {
+        return None;
+    }
+
+    // Re-read and parse just the first tag; its TCON is the user's genre.
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = vec![0u8; first_tag_end];
+    f.read_exact(&mut buf).ok()?;
+    let tags = parse_id3v2_tag(&buf)?;
+    tags.genre().map(|s| s.to_string())
 }
 
 /// Decode an ID3v2 text string given its encoding byte.
@@ -927,7 +977,22 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
             Err(_) => (None, None, None, None),
         }
     } else {
-        (None, None, None, None)
+        // DFF (DSDIFF) has no fmt/ID3 chunk like DSF. Previously this arm
+        // returned all-None, so every DFF that reached this fallback (lofty
+        // couldn't decode it, or it had no/empty tag) landed with
+        // duration_ms = 0 — which downstream disables gapless, the wall-clock
+        // advance nets, prefetch and crossfade (poller), cutting the album on
+        // those tracks (DSD testers: Benjithom RS130, LANDES). Read the DSDIFF
+        // header for the real sample rate, channels and duration.
+        match path.to_str().map(crate::audio::dff::parse_dff) {
+            Some(Ok(info)) => (
+                Some(info.sample_rate),
+                Some(info.channels as u16),
+                info.duration_ms(),
+                None,
+            ),
+            _ => (None, None, None, None),
+        }
     };
 
     // Try to read ID3v2 tags from the DSF metadata chunk
@@ -1419,6 +1484,103 @@ fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
     }
 }
 
+/// Read a raw Vorbis comment value using its exact 4-byte length prefix.
+///
+/// Every Vorbis comment is stored as `[len: u32 LE]["KEY=value"]`. Unlike
+/// [`raw_vorbis_field`] — which scans for a control-char delimiter and can
+/// over-read (then fail UTF-8) on a value sitting at the very end of the comment
+/// block, right before the audio frames — this recovers the exact value
+/// regardless of what follows. Used for keys lofty has no `ItemKey` for (e.g.
+/// `SOURCE`), which are dropped during the VorbisComments → generic-tag split.
+fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
+    let data = read_vorbis_header(path)?;
+    find_vorbis_comment(&data, field_name)
+}
+
+/// The bounded header read behind [`raw_vorbis_comment`], split out so a caller
+/// after several fields pays for **one** read instead of one per field.
+///
+/// This matters at scan time: looking for four Dynamic Range spellings with four
+/// separate calls costs four 1 MB reads on *every* file, and the files that have
+/// none — the vast majority — pay the full price every time.
+fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+        return None;
+    }
+    // Vorbis comments live in the file header; a bounded prefix read finds them
+    // without slurping a multi-GB hi-res FLAC into RAM.
+    const HEADER_BYTES: u64 = 1024 * 1024;
+    let mut data = Vec::new();
+    {
+        use std::io::Read;
+        std::fs::File::open(path)
+            .ok()?
+            .take(HEADER_BYTES)
+            .read_to_end(&mut data)
+            .ok()?;
+    }
+    Some(data)
+}
+
+/// Find one field in an already-read Vorbis header.
+fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
+    let needle = format!("{}=", field_name.to_ascii_uppercase());
+    let nlen = needle.len();
+    if data.len() <= nlen {
+        return None;
+    }
+    for i in 4..=data.len() - nlen {
+        if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
+            continue;
+        }
+        // The 4-byte LE length prefix precedes the "KEY=value" string and covers
+        // its whole length, so the value ends at `i + len`.
+        let len = u32::from_le_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
+        if len < nlen || i + len > data.len() {
+            continue;
+        }
+        if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len]) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Reduce a Dynamic Range tag to its bare digits.
+///
+/// Tools disagree on the form: DROffline MK2 and foobar2000 write `12`, `DR12`
+/// or `DR 12` depending on version and template. Storing the raw form would
+/// sink the sort this feature exists for — values are TEXT in `track_metadata`,
+/// so `"DR9"` and `"9"` never line up, and `"10" < "9"` lexically.
+///
+/// An optional `DR` prefix and surrounding spaces are dropped, but the result is
+/// kept ONLY when what remains is an integer. Anything unexpected is returned
+/// untouched rather than mangled: showing a value we failed to parse beats
+/// losing it.
+fn normalise_dr(raw: &str) -> String {
+    let t = raw.trim();
+    let body = t
+        .strip_prefix("DR")
+        .or_else(|| t.strip_prefix("dr"))
+        .or_else(|| t.strip_prefix("Dr"))
+        .unwrap_or(t)
+        .trim();
+    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit()) {
+        return t.to_string();
+    }
+    // "08" → "8", but a lone "0" stays "0" (a crushed master really can measure
+    // DR0, and dropping it would read as "no value").
+    let stripped = body.trim_start_matches('0');
+    if stripped.is_empty() {
+        "0".to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
@@ -1430,7 +1592,9 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     // into RAM (twice: the old code also built a full from_utf8_lossy copy that
     // was never read) just to recover one tag. On the rare file whose comment
     // block sits past the window this returns None, exactly as before when lofty
-    // already missed the field.
+    // already missed the field. (Port from main: unbounded fs::read here spiked
+    // the scanner to ~14 GB RSS across 32 workers on .15's hi-res library → OOM
+    // crash-loop — the real cause behind the RC3 scan OOM.)
     const HEADER_BYTES: u64 = 1024 * 1024;
     let mut data = Vec::new();
     {
@@ -1576,7 +1740,20 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
 
     let credits = parse_credits(tag);
 
-    let raw_genre = tag.genre().map(|s| s.to_string());
+    let mut raw_genre = tag.genre().map(|s| s.to_string());
+    // MP3s carrying two prepended ID3v2 tags (iTunes M4A→MP3 leftover + Mp3Tag
+    // re-tag) make lofty merge last-wins, so a stale genre overrides the user's.
+    // Read the first tag like every standard player does — no-op unless a second
+    // tag actually follows. Forum #1184.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
+    {
+        if let Some(g) = mp3_first_tag_genre_if_dual(path) {
+            raw_genre = Some(g);
+        }
+    }
     let genres = raw_genre
         .as_deref()
         .map(split_genre_tag)
@@ -1630,17 +1807,43 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         }
     }
 
+    // Partial-tag fallback: a file can carry SOME tags (artist, a title…) yet be
+    // missing others. lofty leaves those empty, and because the file *is* tagged
+    // the whole-file filename fallback (tagless_fallback) never runs — so a FLAC
+    // with no TRACKNUMBER shows track 0 and one with no ALBUM shows "Album
+    // inconnu", even though the filename ("09.Stuffy") and folder carry the
+    // answer (JP Robbe; confirmed on real libraries: Jazz at the Pawnshop /
+    // Montreux Alexander FLACs have TITLE+ALBUM but no TRACKNUMBER). Fill each
+    // MISSING field individually — never override a value the tag already has.
+    let (fname_track, fname_title) = extract_title_from_filename(path);
+    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
+        title = fname_title;
+    }
+    if album.as_deref().map_or(true, |a| a.trim().is_empty()) {
+        album = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+    }
+    let track_number = tag.track().or(fname_track);
+
     Ok(TrackMetadata {
         title,
         artist,
         album,
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
-        track_number: tag.track(),
+        track_number,
         disc_number: tag.disk(),
         total_tracks,
         total_discs,
-        disc_subtitle: get(ItemKey::SetSubtitle),
+        // lofty's SetSubtitle maps Vorbis DISCSUBTITLE / ID3 TSST only — it has
+        // NO mapping for the Vorbis `SETSUBTITLE` alias, which is the canonical
+        // key in D. Pamingle's Vademecum. Read it raw as a fallback so those
+        // files show per-disc subtitles too (Dominique, v0.9.9).
+        disc_subtitle: get(ItemKey::SetSubtitle)
+            .or_else(|| raw_vorbis_comment(path, "SETSUBTITLE")),
         year: tag
             .date()
             .map(|d| d.year as u32)
@@ -1738,7 +1941,17 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         p.options(
             ParseOptions::new()
                 .parsing_mode(ParsingMode::Relaxed)
-                .max_junk_bytes(1024 * 1024),
+                .max_junk_bytes(1024 * 1024)
+                // Don't load embedded cover art: this pass only reads text tags
+                // (sort orders, credits, ISRC, lyrics…) via get_string and never
+                // touches the picture. Without this, lofty reads the whole PICTURE
+                // block into memory for EVERY file the scanner processes (called
+                // per file in auto_scan's batch callback), and a huge/malformed
+                // embedded image spikes RSS past the OOM killer — the same failure
+                // try_read_metadata was hardened against (#JeromeQ), which this
+                // second read path was missing (.15: 31 115 new files → ~14 GB RSS
+                // → OOM crash-loop). Cover extraction stays in artwork::get_or_extract.
+                .read_cover_art(false),
         )
         .guess_file_type()?
         .read()
@@ -1821,6 +2034,10 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::OriginalMediaType) {
         meta.insert("media_type".into(), v);
     }
+    // RELEASECOUNTRY (Vorbis) — country of the specific release, ISO 3166-1.
+    if let Some(v) = get(ItemKey::ReleaseCountry) {
+        meta.insert("release_country".into(), v);
+    }
 
     // Dates
     if let Some(v) = get(ItemKey::ReleaseDate) {
@@ -1833,6 +2050,51 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // Technical
     if let Some(v) = get(ItemKey::EncodedBy) {
         meta.insert("encoder".into(), v);
+    }
+    // ENCODER (Vorbis) — encoding software that produced the file. Distinct from
+    // `encoder` (ENCODEDBY / who encoded). lofty falls back to the FLAC vendor
+    // string when no explicit ENCODER field is present.
+    if let Some(v) = get(ItemKey::EncoderSoftware) {
+        meta.insert("encoder_software".into(), v);
+    }
+    // Support / medium (CD, SACD, Vinyl…). Aligned on the MusicBrainz standard
+    // MEDIA (Vorbis) / TMED (ID3v2) via ItemKey::OriginalMediaType, with the
+    // legacy Vorbis `SOURCE` tag as a fallback for files tagged before the
+    // switch (D. Pamingle : « nommer MEDIA, ID3v2 TMED, aligné sur MusicBrainz »).
+    if let Some(v) = get(ItemKey::OriginalMediaType).or_else(|| raw_vorbis_comment(path, "SOURCE"))
+    {
+        meta.insert("source_media".into(), v);
+    }
+    // Dynamic Range — the mastering's measured dynamics, asked for twice on the
+    // forum (Babacar #303, Patatorz #1418). No standard exists: lofty has no
+    // `ItemKey` for it, so like `SOURCE` these fields are dropped during the
+    // VorbisComments → generic-tag split and need the raw header read.
+    //
+    // Patatorz described the real chain (2026-08-15): measured with DROffline
+    // MK2, written as `ALBUM DYNAMIC RANGE` through Mp3tag. He does NOT tag
+    // individual tracks ("trop de travail"), which is why the album field leads
+    // here; `DYNAMIC RANGE` is read anyway since foobar2000 writes it.
+    //
+    // NOT covered: MP3. There these values live in TXXX frames, which lofty does
+    // not surface either, and no raw reader serves that format (the `Id3v2Tags`
+    // one is DSF-specific). Separate piece of work.
+    //
+    // `ALBUM DR` / `DR` are accepted as secondary spellings. The header is read
+    // ONCE for all four: a file without any of them — the common case — would
+    // otherwise pay four separate 1 MB reads per scan.
+    if let Some(header) = read_vorbis_header(path) {
+        if let Some(v) = find_vorbis_comment(&header, "ALBUM DYNAMIC RANGE")
+            .or_else(|| find_vorbis_comment(&header, "ALBUM DR"))
+        {
+            meta.insert("dr_album".into(), normalise_dr(&v));
+        }
+        // "DR" is checked last and only as a fallback: it is short enough to
+        // collide with an unrelated field, so a specific spelling always wins.
+        if let Some(v) = find_vorbis_comment(&header, "DYNAMIC RANGE")
+            .or_else(|| find_vorbis_comment(&header, "DR"))
+        {
+            meta.insert("dr_track".into(), normalise_dr(&v));
+        }
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
         meta.insert("copyright".into(), v);
@@ -1858,6 +2120,11 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // MusicBrainz IDs
     if let Some(v) = get(ItemKey::MusicBrainzRecordingId) {
         meta.insert("mb_track_id".into(), v);
+    }
+    // MUSICBRAINZ_RELEASETRACKID — per-release track MBID, distinct from the
+    // recording id above (which is MUSICBRAINZ_TRACKID in Vorbis terms).
+    if let Some(v) = get(ItemKey::MusicBrainzTrackId) {
+        meta.insert("mb_release_track_id".into(), v);
     }
     if let Some(v) = get(ItemKey::MusicBrainzReleaseId) {
         meta.insert("mb_release_id".into(), v);
@@ -2065,6 +2332,78 @@ fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+mod dynamic_range_tests {
+    use super::{find_vorbis_comment, normalise_dr};
+
+    /// Build a Vorbis comment block the way the format stores it:
+    /// `[len: u32 LE]["KEY=value"]`, which is what the reader relies on.
+    fn comment_block(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = vec![0u8; 4]; // reader starts at index 4
+        for (k, v) in pairs {
+            let entry = format!("{k}={v}");
+            out.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            out.extend_from_slice(entry.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn reads_the_album_field_written_by_mp3tag() {
+        // Patatorz's real chain: DROffline MK2 measures, Mp3tag writes this key.
+        let data = comment_block(&[("ARTIST", "Autechre"), ("ALBUM DYNAMIC RANGE", "12")]);
+        assert_eq!(
+            find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").as_deref(),
+            Some("12")
+        );
+    }
+
+    #[test]
+    fn field_lookup_ignores_case() {
+        let data = comment_block(&[("album dynamic range", "9")]);
+        assert_eq!(
+            find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").as_deref(),
+            Some("9")
+        );
+    }
+
+    #[test]
+    fn absent_field_is_none_not_a_wrong_match() {
+        // A library with no DR tags is the common case; it must not pick up a
+        // neighbouring field just because the block contains the word.
+        let data = comment_block(&[("COMMENT", "dynamic range is great")]);
+        assert!(find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").is_none());
+    }
+
+    /// The forms seen in the wild, and what the future numeric sort needs.
+    #[test]
+    fn normalises_every_known_spelling_to_bare_digits() {
+        assert_eq!(normalise_dr("12"), "12");
+        assert_eq!(normalise_dr("DR12"), "12");
+        assert_eq!(normalise_dr("DR 12"), "12");
+        assert_eq!(normalise_dr(" dr8 "), "8");
+        assert_eq!(normalise_dr("Dr8"), "8");
+        // Zero-padded values must collapse, or "08" and "8" sort apart.
+        assert_eq!(normalise_dr("08"), "8");
+    }
+
+    #[test]
+    fn keeps_dr_zero_rather_than_emptying_it() {
+        // A crushed master really can measure DR0; an empty string would read
+        // as "no value" and hide it.
+        assert_eq!(normalise_dr("DR0"), "0");
+        assert_eq!(normalise_dr("0"), "0");
+    }
+
+    #[test]
+    fn unparseable_values_survive_untouched() {
+        // Better to show something we could not interpret than to lose it.
+        assert_eq!(normalise_dr("n/a"), "n/a");
+        assert_eq!(normalise_dr("12.5"), "12.5");
+        assert_eq!(normalise_dr(""), "");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2222,6 +2561,96 @@ mod tests {
         let parsed = parse_id3v2_tag(&tag).expect("tag parses");
         assert_eq!(parsed.title(), Some("Hi"));
         assert!(parsed.has_picture);
+    }
+
+    #[test]
+    fn parse_id3v24_unsynchronised_frames() {
+        // Pierre Mack's DSF (Mp3tag-written): ID3v2.4 with the whole-tag unsync
+        // flag (0x80). Unlike v2.3, a v2.4 frame's synchsafe size counts the
+        // *stored* (still-0x00-stuffed) bytes, so the tag body must NOT be
+        // deunsynchronised as a whole — each frame is unstuffed individually
+        // after slicing by its stored size. A large APIC full of 0xFF stuffing
+        // precedes the title; whole-tag deunsync would desync every later frame.
+        fn frame_v24(id: &str, data: &[u8]) -> Vec<u8> {
+            // Unsynchronise the payload; the stored size is the stuffed length.
+            let mut stuffed = Vec::new();
+            for &b in data {
+                stuffed.push(b);
+                if b == 0xFF {
+                    stuffed.push(0x00);
+                }
+            }
+            let n = stuffed.len() as u32;
+            let mut f = id.as_bytes().to_vec();
+            f.push(((n >> 21) & 0x7F) as u8);
+            f.push(((n >> 14) & 0x7F) as u8);
+            f.push(((n >> 7) & 0x7F) as u8);
+            f.push((n & 0x7F) as u8);
+            f.extend_from_slice(&[0, 0]); // frame flags
+            f.extend_from_slice(&stuffed);
+            f
+        }
+
+        // APIC body with 0xFF bytes (front cover JPEG-ish), then the title.
+        let mut apic_body = vec![0u8]; // Latin-1
+        apic_body.extend_from_slice(b"image/jpeg");
+        apic_body.push(0);
+        apic_body.push(3); // front cover
+        apic_body.push(0); // empty description
+        apic_body.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 0xFF, 0xFF]);
+        let apic = frame_v24("APIC", &apic_body);
+        let tit2 = frame_v24("TIT2", &[0x00, b'H', b'i']); // Latin-1 "Hi"
+
+        let mut body = apic;
+        body.extend_from_slice(&tit2);
+
+        let size = body.len();
+        let mut tag = vec![b'I', b'D', b'3', 0x04, 0x00, 0x80]; // v2.4, whole-tag unsync
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&body);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("Hi"));
+        assert!(parsed.has_picture);
+        let (mime, data) = parsed.picture.expect("picture present");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn parse_id3v24_per_frame_unsync_flag() {
+        // v2.4 also allows a single frame to opt into unsync via its format flag
+        // (0x02, second flag byte) while the tag header does not set 0x80.
+        let title = [0x00u8, b'F', 0xFF, b'x']; // Latin-1 with a raw 0xFF
+        let mut stuffed = Vec::new();
+        for &b in &title {
+            stuffed.push(b);
+            if b == 0xFF {
+                stuffed.push(0x00);
+            }
+        }
+        let n = stuffed.len() as u32;
+        let mut frame = b"TIT2".to_vec();
+        frame.push(((n >> 21) & 0x7F) as u8);
+        frame.push(((n >> 14) & 0x7F) as u8);
+        frame.push(((n >> 7) & 0x7F) as u8);
+        frame.push((n & 0x7F) as u8);
+        frame.extend_from_slice(&[0x00, 0x02]); // per-frame unsync flag
+        frame.extend_from_slice(&stuffed); // stored (still-stuffed) payload
+
+        let size = frame.len();
+        let mut tag = vec![b'I', b'D', b'3', 0x04, 0x00, 0x00]; // v2.4, no tag flag
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&frame);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("F\u{FF}x"));
     }
 
     #[test]
@@ -2578,6 +3007,61 @@ mod tests {
     }
 
     #[test]
+    fn try_read_metadata_untagged_wav_falls_back_to_path() {
+        // Regression (Jean-Luc Cassé, Windows): ~16% of his WAV-ripped albums never
+        // appeared in the library because an untagged WAV made lofty return no tag
+        // (or fail to parse), read_metadata returned None, and the scanner dropped
+        // the file as `skipped_no_metadata`. A supported, on-disk audio file must
+        // NEVER be dropped just because its tags are unreadable — it must index with
+        // metadata derived from the path.
+        use std::io::Write;
+
+        // Minimal canonical PCM WAV (stereo/16-bit/44100), no INFO/id3 tags.
+        let mut wav: Vec<u8> = Vec::new();
+        let data: [u8; 8] = [0; 8];
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&2u16.to_le_bytes()); // channels
+        wav.extend_from_slice(&44_100u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&176_400u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&4u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+
+        // Directory convention: .../Artist/Album/NN - Title.wav
+        let dir = std::env::temp_dir()
+            .join("tune_test_untagged_wav")
+            .join("Jean-Luc")
+            .join("Best Of");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("07 - Untagged Song.wav");
+        std::fs::File::create(&file)
+            .unwrap()
+            .write_all(&wav)
+            .unwrap();
+
+        let result = try_read_metadata(&file);
+        assert!(result.is_ok(), "untagged WAV must not error: {result:?}");
+        let meta = result.unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Untagged Song"));
+        assert_eq!(meta.album.as_deref(), Some("Best Of"));
+        assert_eq!(meta.artist.as_deref(), Some("Jean-Luc"));
+        assert_eq!(meta.album_artist.as_deref(), Some("Jean-Luc"));
+        assert_eq!(meta.track_number, Some(7));
+        // Holds through both fallback paths: tagless_fallback (lofty parsed props)
+        // and tagless_fallback_no_props (lofty failed) both normalise to "wav".
+        assert_eq!(meta.format.as_deref(), Some("wav"));
+
+        std::fs::remove_dir_all(std::env::temp_dir().join("tune_test_untagged_wav")).ok();
+    }
+
+    #[test]
     fn try_read_metadata_dsf_title_not_filename() {
         // Regression (LANDES Philippe / Benjithom): a tagged DSF must surface its
         // real ID3v2 title through the full try_read_metadata path, never fall
@@ -2599,6 +3083,63 @@ mod tests {
         assert_eq!(meta.artist.as_deref(), Some("Yes"));
         assert_eq!(meta.album.as_deref(), Some("Fragile"));
         assert_eq!(meta.format.as_deref(), Some("dsd"));
+    }
+
+    #[test]
+    fn mp3_dual_id3v2_prefers_first_tag_genre() {
+        // Forum #1184: an MP3 with two prepended ID3v2 tags (iTunes M4A→MP3
+        // leftover + Mp3Tag re-tag) must report the FIRST tag's genre, like every
+        // standard player — not lofty's last-wins merge of the stale second tag.
+        use std::io::Write;
+        let first = build_id3v2_tag(&[("TIT2", "Song"), ("TCON", "Alternatif")]);
+        let second = build_id3v2_tag(&[("TCON", "Singer/Songwriter")]);
+        let mut buf = first.clone();
+        buf.extend_from_slice(&second);
+        let tmp = std::env::temp_dir().join("tune_test_dual_id3v2.mp3");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let g = mp3_first_tag_genre_if_dual(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(g.as_deref(), Some("Alternatif"));
+    }
+
+    #[test]
+    fn mp3_single_id3v2_leaves_genre_to_lofty() {
+        // Guard: a normal single-tag MP3 must NOT trigger the override (returns
+        // None), so lofty's encoding/numeric-genre-aware value is kept.
+        use std::io::Write;
+        let only = build_id3v2_tag(&[("TIT2", "Song"), ("TCON", "Jazz")]);
+        let tmp = std::env::temp_dir().join("tune_test_single_id3v2.mp3");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&only)
+            .unwrap();
+        let g = mp3_first_tag_genre_if_dual(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(g, None);
+    }
+
+    #[test]
+    fn filename_track_and_title_extraction() {
+        // Powers the partial-tag fallback (JP Robbe / Jazz at the Pawnshop): a
+        // FLAC missing TRACKNUMBER still gets its number + title from the filename.
+        let cases = [
+            ("09.Stuffy.flac", Some(9), "Stuffy"),
+            ("01 Expresso love.flac", Some(1), "Expresso love"),
+            (
+                "13 Going home (with Hank Marvin).flac",
+                Some(13),
+                "Going home (with Hank Marvin)",
+            ),
+            ("Sultans of Swing.flac", None, "Sultans of Swing"), // no leading number
+        ];
+        for (name, want_num, want_title) in cases {
+            let (num, title) = extract_title_from_filename(Path::new(name));
+            assert_eq!(num, want_num, "track number for {name}");
+            assert_eq!(title.as_deref(), Some(want_title), "title for {name}");
+        }
     }
 
     #[test]

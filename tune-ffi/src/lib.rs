@@ -10,6 +10,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,7 +19,10 @@ use tracing::info;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(false);
-static SHUTDOWN_TX: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
+// A `Mutex<Option<_>>` (not a `OnceLock`) so each start publishes a fresh
+// sender and each stop clears it — otherwise a second start/stop cycle could
+// never replace the sender and restart would be broken.
+static SHUTDOWN_TX: Mutex<Option<tokio::sync::watch::Sender<bool>>> = Mutex::new(None);
 
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
@@ -47,7 +51,19 @@ pub extern "C" fn tune_server_start(
     music_dirs_json: *const c_char,
     web_dir: *const c_char,
 ) -> i32 {
-    if RUNNING.load(Ordering::SeqCst) {
+    // Validate raw pointers before dereferencing: a null `db_path` would be UB
+    // if passed to `CStr::from_ptr`, so reject it with the error code instead.
+    if db_path.is_null() {
+        return -2; // null db_path
+    }
+
+    // Claim the running slot atomically *before* spawning so two concurrent
+    // starts can't both proceed. The server task clears the flag on exit, so a
+    // later start (restart) can claim it again.
+    if RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return -1; // already running
     }
 
@@ -89,12 +105,16 @@ pub extern "C" fn tune_server_start(
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let _ = SHUTDOWN_TX.set(shutdown_tx);
+    // Publish a fresh sender for this run (replacing any stale one from a
+    // previous start/stop cycle), so `tune_server_stop` can signal shutdown.
+    if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+        *guard = Some(shutdown_tx);
+    }
 
     let rt = get_runtime();
 
     rt.spawn(async move {
-        RUNNING.store(true, Ordering::SeqCst);
+        // RUNNING was already claimed synchronously above.
         info!(port, db = %db_path, "tune_ffi_server_starting");
 
         match run_server(port, db_path, music_dirs, web_dir, shutdown_rx).await {
@@ -115,8 +135,11 @@ pub extern "C" fn tune_server_stop() -> i32 {
     if !RUNNING.load(Ordering::SeqCst) {
         return -1;
     }
-    if let Some(tx) = SHUTDOWN_TX.get() {
-        let _ = tx.send(true);
+    // Take the sender so it is cleared for the next start/stop cycle.
+    if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(true);
+        }
     }
     0
 }
@@ -210,4 +233,56 @@ async fn run_server(
         .map_err(|e| format!("serve: {e}"))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The FFI entry points touch process-global state (`RUNNING`), so the tests
+    // that manipulate it are serialized to stay deterministic under the default
+    // parallel test runner.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn null_db_path_is_rejected_without_panicking() {
+        let _g = test_lock();
+        // A null `db_path` must return the error code, not dereference the
+        // pointer, and must not claim the running slot.
+        let rc = tune_server_start(0, std::ptr::null(), std::ptr::null(), std::ptr::null());
+        assert_eq!(rc, -2, "null db_path should return -2");
+        assert!(
+            !RUNNING.load(Ordering::SeqCst),
+            "a rejected start must not mark the server running"
+        );
+    }
+
+    #[test]
+    fn double_start_is_rejected() {
+        let _g = test_lock();
+        // Simulate a server already running by claiming the slot, then a second
+        // start must be rejected (-1) without spawning or binding anything.
+        RUNNING.store(true, Ordering::SeqCst);
+        let db = CString::new(":memory:").unwrap();
+        let rc = tune_server_start(0, db.as_ptr(), std::ptr::null(), std::ptr::null());
+        assert_eq!(rc, -1, "a second start should return -1 while running");
+        // Restore global state for other tests.
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn stop_when_not_running_is_rejected() {
+        let _g = test_lock();
+        // Stopping a server that never started must return -1, not panic.
+        RUNNING.store(false, Ordering::SeqCst);
+        assert_eq!(tune_server_stop(), -1);
+    }
 }

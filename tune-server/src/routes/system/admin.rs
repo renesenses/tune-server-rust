@@ -3,6 +3,8 @@ use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tracing::{info, warn};
+
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
@@ -113,7 +115,7 @@ pub(super) async fn admin_connections(State(state): State<AppState>) -> Json<Val
 }
 
 pub(super) async fn admin_discovery(State(state): State<AppState>) -> Json<Value> {
-    let scanner = state.scanner.lock().await;
+    let scanner = &state.scanner;
     let devices = scanner.devices().await;
 
     Json(json!({
@@ -203,12 +205,186 @@ pub(super) async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
     Json(json!(result))
 }
 
-pub(super) async fn system_peers() -> Json<Value> {
-    Json(json!([]))
+// ---------------------------------------------------------------------------
+// Other Tune servers on the network ("Serveurs Tune sur le réseau")
+// ---------------------------------------------------------------------------
+//
+// Peers are added manually by IP:port and persisted. This is the robust path
+// for the environments where the reporter hit an empty list (Docker macvlan +
+// Windows), because those block the multicast that any auto-discovery relies on.
+// mDNS auto-discovery (`_tune-server._tcp`, already advertised via
+// `register_self`) can layer on top later without changing this contract.
+
+/// Settings key: JSON array of manually-added `{host, port}` peers.
+const TUNE_PEERS_KEY: &str = "tune_peers";
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+struct PeerAddr {
+    host: String,
+    port: u16,
 }
 
-pub(super) async fn discover_servers() -> Json<Value> {
-    Json(json!({ "servers": [], "message": "peer discovery not yet implemented" }))
+fn load_peers(state: &AppState) -> Vec<PeerAddr> {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get(TUNE_PEERS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_peers(state: &AppState, peers: &[PeerAddr]) {
+    if let Ok(json) = serde_json::to_string(peers) {
+        if let Err(e) = SettingsRepo::with_backend(state.backend.clone()).set(TUNE_PEERS_KEY, &json)
+        {
+            warn!(error = %e, "tune_peers_persist_failed");
+        }
+    }
+}
+
+fn local_hostname() -> String {
+    // Real OS hostname (shared helper) — the old env-only derivation collapsed
+    // to "tune-server" under systemd, so every peer advertised the same name and
+    // the "Tune servers on the network" list looked empty/duplicated (#1127).
+    tune_core::discovery::system_hostname()
+}
+
+fn zone_count(state: &AppState) -> i64 {
+    state
+        .backend
+        .query_one("SELECT COUNT(*) FROM zones", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// This server's own summary, read by OTHER Tune servers to populate their
+/// "servers on the network" list in one round-trip.
+pub(super) async fn peer_info(State(state): State<AppState>) -> Json<Value> {
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    Json(json!({
+        "name": format!("Tune ({})", local_hostname()),
+        "version": tune_core::version(),
+        "tracks": tracks,
+        "zones": zone_count(&state),
+    }))
+}
+
+/// Query a peer's `/system/peer-info` with a short timeout. `None` = unreachable.
+async fn fetch_peer_info(host: &str, port: u16) -> Option<Value> {
+    let url = format!("http://{host}:{port}/api/v1/system/peer-info");
+    let client = tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
+}
+
+fn peer_json(host: &str, port: u16, info: Option<&Value>) -> Value {
+    match info {
+        Some(i) => json!({
+            "name": i.get("name").and_then(|v| v.as_str()).unwrap_or("Tune"),
+            "host": host, "port": port,
+            "version": i.get("version").and_then(|v| v.as_str()).unwrap_or(""),
+            "tracks": i.get("tracks").and_then(|v| v.as_i64()).unwrap_or(0),
+            "zones": i.get("zones").and_then(|v| v.as_i64()).unwrap_or(0),
+            "online": true,
+        }),
+        None => json!({
+            "name": format!("{host}:{port}"),
+            "host": host, "port": port,
+            "version": "", "tracks": 0, "zones": 0, "online": false,
+        }),
+    }
+}
+
+pub(super) async fn system_peers(State(state): State<AppState>) -> Json<Value> {
+    let self_ip = tune_core::discovery::ssdp::get_local_ip().map(|ip| ip.to_string());
+    let mut out = Vec::new();
+    for p in load_peers(&state) {
+        if self_ip.as_deref() == Some(p.host.as_str()) {
+            continue; // never list ourselves
+        }
+        let info = fetch_peer_info(&p.host, p.port).await;
+        out.push(peer_json(&p.host, p.port, info.as_ref()));
+    }
+    Json(json!(out))
+}
+
+#[derive(Deserialize)]
+pub(super) struct PeerBody {
+    host: String,
+    port: Option<u16>,
+}
+
+pub(super) async fn add_peer(
+    State(state): State<AppState>,
+    Json(body): Json<PeerBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = body.host.trim().to_string();
+    let port = body.port.unwrap_or(8888);
+    if host.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "host_required" })),
+        )
+            .into_response();
+    }
+    // Validate: a Tune server must actually answer at this address.
+    let Some(info) = fetch_peer_info(&host, port).await else {
+        return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "peer_unreachable",
+                "message": "No Tune server responded at this address. Check the IP, port, and that the other server is running and reachable.",
+            })),
+        )
+            .into_response();
+    };
+    let mut peers = load_peers(&state);
+    if !peers.iter().any(|p| p.host == host && p.port == port) {
+        peers.push(PeerAddr {
+            host: host.clone(),
+            port,
+        });
+        save_peers(&state, &peers);
+        info!(host = %host, port, "tune_peer_added");
+    }
+    Json(peer_json(&host, port, Some(&info))).into_response()
+}
+
+pub(super) async fn remove_peer(
+    State(state): State<AppState>,
+    Json(body): Json<PeerBody>,
+) -> Json<Value> {
+    let host = body.host.trim().to_string();
+    let port = body.port.unwrap_or(8888);
+    let mut peers = load_peers(&state);
+    let before = peers.len();
+    peers.retain(|p| !(p.host == host && p.port == port));
+    if peers.len() != before {
+        save_peers(&state, &peers);
+        info!(host = %host, port, "tune_peer_removed");
+    }
+    Json(json!({ "ok": true }))
+}
+
+/// Auto-discovered peer Tune servers (mDNS `_tune-server._tcp`, #1273).
+///
+/// Complements `/system/peers` (manually-added, persisted peers): this is the
+/// zero-config path, empty on networks that block multicast (Docker macvlan,
+/// Windows firewall) where the manual list is the fallback.
+pub(super) async fn discover_servers(State(state): State<AppState>) -> Json<Value> {
+    let servers = state.discovered_tune_peers().await;
+    Json(json!({ "total": servers.len(), "servers": servers }))
 }
 
 pub(super) async fn listening_stats(State(state): State<AppState>) -> Json<Value> {

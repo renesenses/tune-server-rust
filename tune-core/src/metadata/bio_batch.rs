@@ -486,11 +486,6 @@ pub async fn batch_enrich_artist_bios(
         .unwrap_or_default();
 
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
-    let instance_id = settings
-        .get("instance_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
 
     let mut enriched = 0u32;
     let mut failed = 0u32;
@@ -528,25 +523,9 @@ pub async fn batch_enrich_artist_bios(
                     source = %bio.source,
                     "batch_artist_bio_enriched"
                 );
-
-                // Submit to mozaiklabs.fr community
-                if !instance_id.is_empty() {
-                    let mbid = mbid.clone();
-                    let name = name.clone();
-                    let instance_id = instance_id.clone();
-                    let bio = bio.text.clone();
-                    tokio::spawn(async move {
-                        submit_artist_bio(
-                            "https://mozaiklabs.fr",
-                            &mbid,
-                            &name,
-                            &instance_id,
-                            &bio,
-                        )
-                        .await
-                        .ok();
-                    });
-                }
+                // Community contribution of this bio now goes through the single
+                // bio_sync upload path (POST /community/bios); the redundant direct
+                // push to /community/artist-bios was removed.
             }
             None => {
                 failed += 1;
@@ -663,40 +642,4 @@ pub async fn batch_enrich_album_bios(
             .to_string(),
         )
         .ok();
-}
-
-/// Submit an artist bio to mozaiklabs.fr community.
-async fn submit_artist_bio(
-    base_url: &str,
-    mbid: &str,
-    artist_name: &str,
-    instance_id: &str,
-    bio: &str,
-) -> Result<(), String> {
-    let url = format!(
-        "{}/api/v1/community/artist-bios",
-        base_url.trim_end_matches('/')
-    );
-    let client = crate::http::client::shared();
-
-    let resp = client
-        .post(&url)
-        .header("Accept", "application/json")
-        .json(&serde_json::json!({
-            "mbid": mbid,
-            "artist_name": artist_name,
-            "instance_id": instance_id,
-            "bio": bio,
-        }))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("submit artist bio failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("submit bio failed: {}", resp.status()));
-    }
-
-    debug!(mbid, artist_name, "community_artist_bio_submitted");
-    Ok(())
 }

@@ -147,10 +147,11 @@ impl MdnsScanner {
     /// Announce this Tune server instance via mDNS so HomeAssistant
     /// and other clients can auto-discover it.
     pub fn register_self(&self, port: u16, version: &str) -> Result<(), String> {
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "tune-server".into());
-        let service_name = format!("Tune ({})", hostname);
+        // Real OS hostname (not the env-only derivation that collapsed to
+        // "tune-server" under systemd, colliding every instance — #1112).
+        let hostname = crate::discovery::system_hostname();
+        let service_name = format!("Tune ({hostname})");
+        let host_label = crate::discovery::mdns_host_label(&hostname);
 
         let local_ip = crate::discovery::ssdp::get_local_ip()
             .map(|ip| ip.to_string())
@@ -161,7 +162,7 @@ impl MdnsScanner {
         let svc = ServiceInfo::new(
             TUNE_SERVICE,
             &service_name,
-            &format!("{hostname}.local."),
+            &format!("{host_label}.local."),
             &local_ip,
             port,
             &properties[..],
@@ -396,9 +397,18 @@ fn service_to_device(
     let port = info.get_port();
     let port = if port > 0 { port } else { default_port };
 
-    let dev_id = format!("{}-{}-{}", output_type, host, port);
+    // L'identifiant que l'appareil annonce lui-meme, lu AVANT tout
+    // enrichissement et jamais reecrit ensuite (cf. `stable_id`).
+    let stable_id = info
+        .get_property_val_str("deviceid")
+        .or_else(|| info.get_property_val_str("id"))
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+
+    let dev_id = device_id_for(output_type, stable_id.as_deref(), &host, port);
 
     let mut device = DiscoveredDevice::new(dev_id, friendly_name, output_type, host, port);
+    device.stable_id = stable_id;
 
     // Extract capabilities from TXT records
     let mut caps = HashMap::new();
@@ -520,46 +530,91 @@ fn service_to_device(
     }
 
     device.capabilities = caps;
+    // Normalise whatever landed in mac_address (AirPlay deviceid, opaque
+    // Chromecast id → ARP fallback) and derive the brand from the OUI when
+    // the TXT record carried no manufacturer.
+    super::mac::enrich_identity(&mut device);
     device
 }
 
-fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
-    let local_prefix = detect_local_subnet();
-    let mut ipv4_same_subnet: Option<String> = None;
-    let mut ipv4_private: Option<String> = None;
-    let mut ipv4_any: Option<String> = None;
-
-    for addr in addrs {
-        let ip = addr.to_ip_addr();
-        if let std::net::IpAddr::V4(v4) = ip {
-            let s = v4.to_string();
-            if ipv4_any.is_none() {
-                ipv4_any = Some(s.clone());
-            }
-            let octets = v4.octets();
-            let is_private = octets[0] == 192
-                || octets[0] == 10
-                || (octets[0] == 172 && (16..=31).contains(&octets[1]));
-            if is_private && ipv4_private.is_none() {
-                ipv4_private = Some(s.clone());
-            }
-            if let Some(ref prefix) = local_prefix {
-                if s.starts_with(prefix) && ipv4_same_subnet.is_none() {
-                    ipv4_same_subnet = Some(s);
-                }
-            }
-        }
+/// L'identifiant durable d'un appareil.
+///
+/// Prefere ce que l'appareil annonce lui-meme ; ne retombe sur l'adresse que
+/// lorsqu'il n'annonce rien. C'est tout l'objet de #1528 : un bail DHCP
+/// renouvele changeait l'identite de l'appareil, donc dedoublait sa zone et
+/// faisait revenir les zones supprimees, puisque tout le cycle de vie d'une
+/// zone repose sur cette chaine.
+pub fn device_id_for(
+    output_type: OutputType,
+    stable_id: Option<&str>,
+    host: &str,
+    port: u16,
+) -> String {
+    match stable_id {
+        Some(id) => format!("{output_type}-{id}"),
+        None => legacy_device_id(output_type, host, port),
     }
+}
 
-    ipv4_same_subnet
-        .or(ipv4_private)
-        .or(ipv4_any)
+/// L'ancienne forme, derivee de l'adresse.
+///
+/// Toujours produite pour les appareils qui n'annoncent aucun identifiant, et
+/// surtout : c'est sous cette forme que sont enregistrees les zones creees
+/// AVANT #1528. La decouverte s'en sert pour les retrouver et les re-ancrer
+/// (`discovery_setup`), ce qui evite la migration SQL qui aurait fait perdre
+/// toutes les zones d'un coup.
+pub fn legacy_device_id(output_type: OutputType, host: &str, port: u16) -> String {
+    format!("{output_type}-{host}-{port}")
+}
+
+fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
+    let ips: Vec<std::net::IpAddr> = addrs.iter().map(|a| a.to_ip_addr()).collect();
+    choose_address(&ips, detect_local_subnet().as_deref())
+}
+
+/// Choisit l'adresse qui servira d'identité à l'appareil.
+///
+/// Cette fonction **doit rendre le même résultat pour un même jeu d'adresses**,
+/// quel que soit l'ordre dans lequel elles arrivent. `device_id` en est dérivé
+/// (`{type}-{host}-{port}`) et tout le cycle de vie d'une zone repose dessus :
+/// une identité qui change d'un démarrage à l'autre dédouble la zone, et fait
+/// revenir celles que l'utilisateur avait supprimées — le garde-fou
+/// `is_device_hidden` porte sur l'ancien identifiant et ne reconnaît plus le
+/// nouveau (#1528).
+///
+/// Or l'appelant itère un `HashSet`, dont l'ordre n'est pas déterministe. Un
+/// appareil à deux pattes sur le même sous-réseau (Wi-Fi et Ethernet) tombait
+/// donc tantôt sur l'une, tantôt sur l'autre, **sans que rien n'ait bougé sur
+/// le réseau**. D'où le tri, qui ne coûte rien sur trois adresses.
+fn choose_address(addrs: &[std::net::IpAddr], local_prefix: Option<&str>) -> String {
+    let mut v4: Vec<std::net::Ipv4Addr> = addrs
+        .iter()
+        .filter_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => Some(*v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect();
+    v4.sort_unstable();
+
+    let is_private = |v4: &std::net::Ipv4Addr| {
+        let o = v4.octets();
+        o[0] == 192 || o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1]))
+    };
+
+    let same_subnet = local_prefix.and_then(|prefix| {
+        v4.iter()
+            .find(|v| v.to_string().starts_with(prefix))
+            .map(|v| v.to_string())
+    });
+
+    same_subnet
+        .or_else(|| v4.iter().find(|v| is_private(v)).map(|v| v.to_string()))
+        .or_else(|| v4.first().map(|v| v.to_string()))
         .unwrap_or_else(|| {
-            addrs
-                .iter()
-                .next()
-                .map(|a| a.to_ip_addr().to_string())
-                .unwrap_or_default()
+            // Que de l'IPv6 : on trie là aussi plutôt que de prendre au hasard.
+            let mut rest: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            rest.sort();
+            rest.into_iter().next().unwrap_or_default()
         })
 }
 
@@ -717,5 +772,96 @@ mod tests {
             raw.to_string()
         };
         assert_eq!(name, "Mac Studio");
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn choose_address_is_the_same_whatever_the_order() {
+        // Le coeur de #1528 : deux adresses egalement recevables sur le meme
+        // sous-reseau. L'appelant itere un HashSet, donc l'ordre varie d'un
+        // demarrage a l'autre — l'identite de l'appareil, elle, ne doit pas.
+        let a = [ip("192.168.1.42"), ip("192.168.1.77")];
+        let b = [ip("192.168.1.77"), ip("192.168.1.42")];
+        assert_eq!(
+            choose_address(&a, Some("192.168.1.")),
+            choose_address(&b, Some("192.168.1.")),
+        );
+    }
+
+    #[test]
+    fn choose_address_prefers_the_local_subnet_then_private_then_the_rest() {
+        let addrs = [ip("8.8.8.8"), ip("10.0.0.5"), ip("192.168.1.42")];
+        assert_eq!(choose_address(&addrs, Some("192.168.1.")), "192.168.1.42");
+        // Hors sous-reseau connu, une privee vaut mieux qu'une publique.
+        assert_eq!(choose_address(&addrs, Some("172.20.")), "10.0.0.5");
+        // Aucune privee : il reste la publique, plutot que rien.
+        assert_eq!(choose_address(&[ip("8.8.8.8")], None), "8.8.8.8");
+    }
+
+    #[test]
+    fn choose_address_falls_back_to_ipv6_without_drawing_lots() {
+        let a = [ip("fe80::2"), ip("fe80::1")];
+        let b = [ip("fe80::1"), ip("fe80::2")];
+        assert_eq!(choose_address(&a, None), choose_address(&b, None));
+        assert!(!choose_address(&a, None).is_empty());
+    }
+
+    #[test]
+    fn choose_address_without_any_address_is_empty_not_a_panic() {
+        assert_eq!(choose_address(&[], Some("192.168.1.")), "");
+    }
+
+    #[test]
+    fn device_id_prefers_what_the_device_announces() {
+        // Le coeur de #1528 : deux adresses differentes, meme appareil, meme
+        // identifiant. C'est ce qui empeche un bail DHCP renouvele de dedoubler
+        // la zone et de faire revenir celles qu'on a supprimees.
+        let a = device_id_for(
+            OutputType::Chromecast,
+            Some("uuid-abc"),
+            "192.168.1.42",
+            8009,
+        );
+        let b = device_id_for(
+            OutputType::Chromecast,
+            Some("uuid-abc"),
+            "192.168.1.77",
+            8009,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn device_id_falls_back_to_the_address_when_nothing_is_announced() {
+        // Tous les appareils n'annoncent pas d'identifiant : on ne peut pas
+        // faire mieux que l'adresse, et c'est la forme historique.
+        assert_eq!(
+            device_id_for(OutputType::Dlna, None, "192.168.1.9", 8080),
+            legacy_device_id(OutputType::Dlna, "192.168.1.9", 8080),
+        );
+    }
+
+    #[test]
+    fn two_devices_announcing_different_ids_never_collide() {
+        // L'autre bord : meme adresse et meme port (un hote qui expose deux
+        // services), identifiants distincts.
+        assert_ne!(
+            device_id_for(OutputType::Airplay, Some("aa:bb"), "192.168.1.5", 7000),
+            device_id_for(OutputType::Airplay, Some("cc:dd"), "192.168.1.5", 7000),
+        );
+    }
+
+    #[test]
+    fn the_legacy_form_is_unchanged() {
+        // Les zones creees avant #1528 sont enregistrees sous cette forme
+        // exacte : la decouverte s'en sert pour les retrouver et les
+        // re-ancrer. La changer perdrait toutes les zones existantes.
+        assert_eq!(
+            legacy_device_id(OutputType::Bluos, "192.168.1.23", 11000),
+            format!("{}-192.168.1.23-11000", OutputType::Bluos),
+        );
     }
 }

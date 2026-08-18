@@ -226,6 +226,31 @@ impl SqliteDb {
             .map_err(|e| format!("execute: {e}"))
     }
 
+    /// Replier le WAL dans la base et le tronquer.
+    ///
+    /// À appeler **avant** que le processus ne soit remplacé ou ne meure : une
+    /// mise à jour se termine par un `exec()` qui écrase l'image sans dérouler
+    /// aucun destructeur, et l'arrêt peut se solder par un SEGV quand
+    /// onnxruntime est chargé (#1462). Dans les deux cas le WAL reste sur le
+    /// disque, et la cohérence dépend alors d'une reprise correcte et d'un
+    /// passage de verrous qu'on ne contrôle pas.
+    ///
+    /// Un checkpoint TRUNCATE ramène le cas au plus simple : plus rien à
+    /// rejouer. Ça ne prouve pas la cause de la corruption du 10 août — elle
+    /// reste inexpliquée — mais ça retire la fenêtre où elle pouvait se
+    /// produire, ce qui vaut mieux qu'une explication.
+    ///
+    /// Silencieux en cas d'échec : c'est une précaution de fin de vie, jamais
+    /// une raison d'empêcher un arrêt ou une mise à jour d'aboutir.
+    pub fn checkpoint(&self) {
+        if let Ok(conn) = self.conn.lock() {
+            match conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                Ok(()) => tracing::info!("sqlite_checkpoint_before_exit"),
+                Err(e) => tracing::warn!(error = %e, "sqlite_checkpoint_failed"),
+            }
+        }
+    }
+
     pub fn execute_batch(&self, sql: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(sql).map_err(|e| format!("batch: {e}"))
@@ -337,8 +362,17 @@ CREATE TABLE IF NOT EXISTS albums (
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,
-    original_date TEXT
+    original_date TEXT,
+    -- The folder on disk holding this release. What identifies an album: see
+    -- `scanner::album_folder`.
+    folder_path TEXT
 );
+
+-- No index on folder_path here: this batch runs against EXISTING databases too,
+-- where `CREATE TABLE IF NOT EXISTS albums` is a no-op and the column does not
+-- exist yet, so indexing it would abort the whole batch and the server with it.
+-- Migration 60 adds column and index together, and it runs on fresh databases
+-- as well (see `run_migrations`), so both cases end up indexed.
 
 CREATE TABLE IF NOT EXISTS tracks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -368,7 +402,18 @@ CREATE TABLE IF NOT EXISTS tracks (
     bpm REAL,
     label TEXT,
     musicbrainz_recording_id TEXT,
-    comments TEXT
+    comments TEXT,
+    -- Cover embedded in THIS file. The album cover stays the norm; this is the
+    -- override for a track whose album is a folder of unrelated files, where
+    -- one track's artwork must not stand for all the others (forum #1312).
+    cover_path TEXT,
+    -- Piste virtuelle issue d'une feuille CUE (#1763). `file_path` reste NUL
+    -- pour ces pistes — plusieurs partagent le meme fichier, ce que la
+    -- contrainte UNIQUE interdirait, mais elle tolere plusieurs NULL. Le vrai
+    -- chemin vit ici, avec les bornes de la piste dans le fichier.
+    cue_media_path TEXT,
+    cue_start_ms INTEGER,
+    cue_end_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -432,21 +477,41 @@ CREATE TABLE IF NOT EXISTS zones (
     last_play_state TEXT DEFAULT 'stopped',
     dsd_mode TEXT DEFAULT 'auto',
     dlna_native_flac INTEGER DEFAULT 0,
-    host TEXT
+    -- Servir l'AAC tel quel au renderer qui le decode (#1424). Eteint par
+    -- defaut : un renderer qui l'annonce peut le refuser en pratique.
+    aac_passthrough INTEGER DEFAULT 0,
+    host TEXT,
+    mac TEXT,
+    -- Décalage des paroles synchronisées, en ms (positif = retardées).
+    -- Compense la latence serveur → oreille, propre à chaque appareil (#1328).
+    lyrics_offset_ms INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS play_queue (
+-- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both
+-- local tracks (track_id set, source='local') and streaming tracks (source_id
+-- + inline metadata). Replaces the play_queue / streaming_queue split. Local
+-- display fields (title/artist/...) stay NULL and are joined from tracks.
+CREATE TABLE IF NOT EXISTS queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     position INTEGER NOT NULL DEFAULT 0,
-    is_current INTEGER DEFAULT 0
+    is_current INTEGER DEFAULT 0,
+    track_id INTEGER REFERENCES tracks(id) ON DELETE CASCADE,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    duration_ms INTEGER DEFAULT 0,
+    track_number INTEGER,
+    disc_number INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_id);
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
-CREATE INDEX IF NOT EXISTS idx_play_queue_zone_id ON play_queue(zone_id);
+CREATE INDEX IF NOT EXISTS idx_queue_items_zone_id ON queue_items(zone_id);
 
 -- FTS5 virtual tables for full-text search (accent-insensitive, multi-column)
 CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(

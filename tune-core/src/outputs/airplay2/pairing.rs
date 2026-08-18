@@ -1,33 +1,54 @@
-//! AirPlay 2 / HomeKit-style PIN pairing — pure, device-independent building
-//! blocks (phase 1).
+//! AirPlay 2 / HomeKit-style PIN pairing — protocole complet, **dormant**.
 //!
-//! AirPlay 2 receivers (Apple TV, Samsung/LG TVs, HomePod, many AVRs) require a
-//! HomeKit-flavoured pairing handshake before they will accept an RTSP session:
+//! Les récepteurs AirPlay 2 (Apple TV, téléviseurs Samsung/LG, HomePod, nombre
+//! d'amplis) exigent une poignée de main façon HomeKit avant d'accepter une
+//! session RTSP :
 //!
-//!   1. **pair-setup**  — SRP-6a using the PIN the accessory displays on screen.
-//!      Six TLV8 messages (M1..M6) over `POST /pair-setup` on TCP port 7000.
-//!      Establishes a shared secret and exchanges long-term Ed25519 identities.
-//!   2. **pair-verify** — Curve25519 (X25519) ECDH → HKDF → a ChaCha20-Poly1305
-//!      session key, authenticated with the Ed25519 identities from pair-setup.
-//!      Four TLV8 messages (M1..M4) over `POST /pair-verify`.
+//!   1. **pair-setup**  — SRP-6a avec le code que l'accessoire affiche à
+//!      l'écran. Six messages TLV8 (M1..M6) en `POST /pair-setup`, port 7000.
+//!      Établit un secret partagé et échange les identités Ed25519 durables.
+//!   2. **pair-verify** — ECDH Curve25519 (X25519) → HKDF → une clé de session
+//!      ChaCha20-Poly1305, authentifiée par les identités issues de
+//!      pair-setup. Quatre messages TLV8 (M1..M4) en `POST /pair-verify`.
 //!
-//! After pair-verify the RTSP control/stream is encrypted with the derived
-//! session key. That encrypted-RTSP transport, plus the *live* completion of
-//! both handshakes, is deliberately out of scope for this increment — see the
-//! `TODO(phase2)` markers. What lives here now is:
+//! # État réel de ce module
 //!
-//!   * A complete, unit-tested **TLV8 codec** (HomeKit fragmentation rule).
-//!   * The **kTLVType_*** / **State** / **Method** / **Error** constants.
-//!   * Thin, unit-tested wrappers over the pure crypto primitives every step
-//!     needs: SRP-6a client (`srp`), HKDF-SHA512, Ed25519 sign/verify, X25519
-//!     ECDH, and ChaCha20-Poly1305 AEAD.
-//!   * Typed function signatures for the two handshakes with the live network
-//!     turns stubbed (`TODO(phase2)`).
+//! Ce qui est **écrit et couvert hors ligne** (25 tests, contre un accessoire
+//! simulé en mémoire) :
 //!
-//! None of this drives a real device yet; nothing here should be described as
-//! "playable".
+//!   * le **codec TLV8** complet, règle de fragmentation HAP comprise ;
+//!   * les constantes **kTLVType_* / State / Method / Error** ;
+//!   * les primitives : client SRP-6a (`srp`), HKDF-SHA512, signature et
+//!     vérification Ed25519, ECDH X25519, AEAD ChaCha20-Poly1305 ;
+//!   * les deux poignées de main de bout en bout — [`run_pair_setup`] et
+//!     [`run_pair_verify`] — pilotées par le trait [`PairTransport`].
+//!
+//! Ce qui est écrit mais **jamais confronté à un appareil** :
+//!
+//!   * [`RtspPairTransport`], le transport RTSP réel. Sa correction face à un
+//!     vrai récepteur est **non validée** : les quirks des Samsung/LG/Apple ne
+//!     se devinent pas, ils se capturent.
+//!
+//! Ce qui **n'existe pas** :
+//!
+//!   * le RTSP **chiffré** qui doit suivre pair-verify, et donc toute lecture
+//!     audio. Les clés de session sont dérivées et s'arrêtent là.
+//!
+//! # Rien n'appelle ce module
+//!
+//! Aucun chemin de découverte, de sortie ou de route ne l'atteint : il est
+//! compilé et testé, pas branché. C'est délibéré — le brancher demande une
+//! revue crypto ciblée (conformité HAP du groupe SRP, des sels HKDF et des
+//! nonces), une décision sur le stockage de la graine Ed25519 durable, et un
+//! parcours de saisie du code. Aucun de ces trois points n'est tranché.
+//!
+//! **Ne pas décrire AirPlay 2 comme fonctionnel sur la foi de ce fichier.**
 
-#![allow(dead_code)] // phase-1 scaffold: several items are wired up in phase 2.
+// Le module est volontairement dormant : ses éléments publics n'ont pas encore
+// d'appelant hors des tests. L'autorisation saute lot par lot à mesure que le
+// branchement avance — la retirer aujourd'hui noierait la compilation sous des
+// avertissements sans rien révéler.
+#![allow(dead_code)]
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};

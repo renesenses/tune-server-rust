@@ -2,16 +2,37 @@
 
 **Statut** : Draft (2026-07-01)
 **Auteur** : cadrage architecte
-**Cible** : branche `release/v0.9` (trigger v0.8.50)
-**Contrainte maîtresse** : **régression minimale**, ouverture aux évolutions futures.
+**Cible** : branche `release/v0.9`, livrée sur le cycle **v0.9.0-rc.1 → rc.4 → GA (31/07/2026)**.
+**Contrainte maîtresse** : **régression minimale** (fenêtre RC), ouverture aux évolutions futures.
 
-> Ce document est le **pendant technique** de [`ROADMAP-v0.9.md`](ROADMAP-v0.9.md).
-> La roadmap décrit *quelles features* on livre (Plugin SDK, multi-user, AI, perf 500K, Mozaiklabs, PostgreSQL).
-> Ce document décrit *comment on rend le code prêt à les recevoir* sans casser l'existant.
-> Il traite les **6 points d'attention** identifiés dans `docs/architecture-tune-server-rust.pdf`.
+> ## Périmètre & articulation avec le gel RC — à lire avant tout
 >
-> Ne dupliquent pas ce doc : [`POSTGRES-PLAN.md`](POSTGRES-PLAN.md) (axe DB détaillé) et la RFC plugin
-> (mémoire `project_tune_plugin_rfc`). On y renvoie.
+> Cette refonte fait partie de l'**axe 3 « Refacto »** de la roadmap v0.9.0
+> (`Tune_Roadmap_v0.9.0.pdf`) : *erreurs typées, tests unitaires orchestrator/poller/queue,
+> consolidation queue locale/streaming*. Elle est livrée **sur `release/v0.9`**, pas sur `main`
+> (`main` = v0.8.x stable, bugfix critiques uniquement).
+>
+> **Le défi** : concilier une refonte structurelle avec un **feature freeze / cycle RC hebdomadaire**.
+> La réponse est le principe directeur ci-dessous — *filet d'abord, chaque pièce derrière un flag,
+> bascule par zone, shadow-compare* — décliné rc par rc pour que **chaque RC reste verte** :
+>
+> | RC | Contenu refonte (freeze-safe) |
+> |----|-------------------------------|
+> | **rc.1** | Phase 0 — **filet de tests** (orchestrator/poller/queue) + **erreurs typées** `TuneError`. Zéro changement de comportement. |
+> | **rc.2** | Phase 1 — **Poller FSM** derrière flag `poller_fsm`, shadow-compare vs legacy, bascule par zone. + **consolidation queue** locale/streaming. |
+> | **rc.3** | Phase 2 — **resolvers + `plan_playback`** ; Phase 3 — **`OutputCaps`** + harnais conformité. |
+> | **rc.4** | Nettoyage flags stabilisés, doc, validation finale. Bus FFI + SDK plugin = **différés** si la fenêtre est trop courte (candidats v0.9.1/v1.0). |
+>
+> Règle d'or : **si une pièce n'est pas prête à être flippée sans risque avant une RC, elle glisse à la
+> RC suivante — jamais on ne merge un demi-chemin sur `release/v0.9`.**
+>
+> ---
+>
+> Ce document traite les **6 points d'attention** de `docs/architecture-tune-server-rust.pdf`.
+> Il **remplace** en pertinence l'ancien [`ROADMAP-v0.9.md`](ROADMAP-v0.9.md) (2026-06-02, orienté
+> features Plugin SDK/multi-user/AI) : les roadmaps v0.9.0/v1.0.0 ont requalifié v0.9 en **stabilisation**.
+> Ne dupliquent pas ce doc : [`POSTGRES-PLAN.md`](POSTGRES-PLAN.md) et la RFC plugin
+> (mémoire `project_tune_plugin_rfc`).
 
 ---
 
@@ -43,7 +64,7 @@ Invariants non négociables sur toute la durée du chantier :
 | 4 | Outputs | `tune-core/src/outputs/*` (15 impls) | 11749 | Capacités implicites (`play_media` défaut = `"not implemented"`), couverture inégale | `OutputCaps` explicites + harnais de conformité |
 | 5 | Plugins | `tune-core/src/plugin_sdk.rs` | — | Compilé en dur via features ; PDF « dynamique/marketplace » = aspirationnel | Contrat `tune-plugin-sdk` semver (voir RFC) |
 | 6 | FFI | `tune-ffi/src/lib.rs` | 213 | 4 fonctions C ; Swift/Flutter réimplémentent la logique | Bus de commandes JSON + flux d'événements |
-| — | Legacy | `tune-pyo3/` | — | **Hors `workspace.members`**, orphelin (serveur Python abandonné) | Sortir du repo |
+| — | Legacy | `tune-pyo3/` | — | ~~Orphelin (serveur Python abandonné)~~ | **Fait** — supprimé du repo (août 2026) |
 | — | Erreurs | transverse | — | `Result<_, String>` aux frontières → intestable | Erreurs typées `thiserror` |
 
 ### Vue d'ensemble cible
@@ -472,13 +493,18 @@ JSON couvre 95 % du besoin à coût quasi nul et sans casser l'ABI existante.
 - **`thiserror`** (déjà en dep) aux frontières de module : `PlayError`, `ResolveError`, `OutputError`,
   `DbError`. Remplace `Result<_, String>` — prérequis de testabilité des axes 1/2/4. Migration
   incrémentale, module par module, `impl From<_> for _` pour ne rien casser côté appelants.
-- **Sortir `tune-pyo3`** du repo (serveur Python abandonné, déjà hors `workspace.members`). Ramène le
-  projet à **5 modules réels** (`tune-core`, `tune-server`, `tune-cli`, `tune-ffi`, `tune-bridge`) —
-  et corrige le PDF qui en annonce 6.
+- ~~**Sortir `tune-pyo3`** du repo~~ — **fait en août 2026** (passe de sécurité, item 10). Le crate
+  ne compilait plus contre `tune-core` courant et son `pyo3` 0.24 épinglé restait dans la plage
+  vulnérable RUSTSEC-2026-0176/0177. Le projet est ramené à **5 modules réels** (`tune-core`,
+  `tune-server`, `tune-cli`, `tune-ffi`, `tune-bridge`) — reste à corriger le PDF qui en annonce 6.
 
 ---
 
-## Séquencement (branche `release/v0.9`, features gelées à v0.8.50)
+## Séquencement (branche `release/v0.9`, mappé sur le cycle RC)
+
+> Rappel cadence (voir bandeau en tête) : **rc.1** = Phase 0 + erreurs typées ; **rc.2** = Phase 1 (FSM,
+> flag) + consolidation queue ; **rc.3** = Phases 2-3 ; **rc.4** = nettoyage. Phase 4 (SDK/FFI) différée
+> si la fenêtre 31/07 est trop serrée.
 
 ```mermaid
 flowchart LR
@@ -525,7 +551,7 @@ ils héritent d'un socle testé plutôt que de l'aggraver.
 - Harnais `assert_output_contract` passé par les 15 impls.
 - `tune-plugin-sdk` publié, un plugin tiers buildable hors-arbre en < 2h (repris roadmap axe 1).
 - `tune_command` : au moins une feature portée iPad+Flutter sans ajout de fonction C.
-- `tune-pyo3` supprimé ; PDF corrigé (5 modules).
+- ~~`tune-pyo3` supprimé~~ **fait** ; PDF à corriger (5 modules).
 - **Zéro régression** mesurée sur le cahier de recette v0.8.x.
 
 ---
