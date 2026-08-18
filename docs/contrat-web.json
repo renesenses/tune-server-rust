@@ -2,6 +2,7 @@
   "routes": [
     {
       "route": "/cloud/license/activate",
+      "methode": "POST",
       "type": "LicenseActivateResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -12,6 +13,7 @@
     },
     {
       "route": "/cloud/license/deactivate",
+      "methode": "POST",
       "type": "LicenseActivateResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -22,6 +24,7 @@
     },
     {
       "route": "/cloud/license/status",
+      "methode": "GET",
       "type": "LicenseStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -38,6 +41,7 @@
     },
     {
       "route": "/cloud/license/validate",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -47,6 +51,7 @@
     },
     {
       "route": "/cloud/sso/disconnect",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [],
@@ -56,6 +61,7 @@
     },
     {
       "route": "/devices",
+      "methode": "GET",
       "type": "DiscoveredDevice",
       "liste": true,
       "champs_obligatoires": [
@@ -75,6 +81,7 @@
     },
     {
       "route": "/devices/catalog",
+      "methode": "GET",
       "type": "DeviceCatalog",
       "liste": false,
       "champs_obligatoires": [
@@ -85,6 +92,7 @@
     },
     {
       "route": "/devices/clear",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -94,6 +102,7 @@
     },
     {
       "route": "/devices/{}",
+      "methode": "GET",
       "type": "DiscoveredDevice",
       "liste": false,
       "champs_obligatoires": [
@@ -113,6 +122,7 @@
     },
     {
       "route": "/devices/{}/pair",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -125,6 +135,7 @@
     },
     {
       "route": "/devices/{}/pair/pin",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -137,6 +148,7 @@
     },
     {
       "route": "/dj/waveform/{}",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -148,6 +160,17 @@
     },
     {
       "route": "/eq/expert-settings",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "expert_bands"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/eq/expert-settings",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -157,6 +180,7 @@
     },
     {
       "route": "/eq/presets",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -166,6 +190,7 @@
     },
     {
       "route": "/eq/presets",
+      "methode": "POST",
       "type": "EqProPreset",
       "liste": false,
       "champs_obligatoires": [
@@ -181,6 +206,7 @@
     },
     {
       "route": "/ext/bandcamp/album",
+      "methode": "GET",
       "type": "BandcampAlbumDetail",
       "liste": false,
       "champs_obligatoires": [
@@ -199,6 +225,7 @@
     },
     {
       "route": "/ext/bandcamp/collection",
+      "methode": "GET",
       "type": "BandcampCollectionPage",
       "liste": false,
       "champs_obligatoires": [
@@ -212,6 +239,7 @@
     },
     {
       "route": "/ext/bandcamp/collection/link",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -223,6 +251,7 @@
     },
     {
       "route": "/ext/bandcamp/discover",
+      "methode": "GET",
       "type": "BandcampDecouverte",
       "liste": false,
       "champs_obligatoires": [
@@ -237,6 +266,7 @@
     },
     {
       "route": "/ext/bandcamp/search",
+      "methode": "GET",
       "type": "BandcampRecherche",
       "liste": false,
       "champs_obligatoires": [
@@ -249,6 +279,7 @@
     },
     {
       "route": "/ext/bandcamp/tags",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -258,6 +289,7 @@
     },
     {
       "route": "/home",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -267,6 +299,7 @@
     },
     {
       "route": "/library/albums",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -298,6 +331,7 @@
     },
     {
       "route": "/library/albums-detailed",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -308,6 +342,7 @@
     },
     {
       "route": "/library/albums/batch-update",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -318,6 +353,7 @@
     },
     {
       "route": "/library/albums/recent",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -349,6 +385,39 @@
     },
     {
       "route": "/library/albums/{}",
+      "methode": "GET",
+      "type": "Album",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "added_at",
+        "artist_id",
+        "artist_name",
+        "year",
+        "original_year",
+        "release_date",
+        "original_date",
+        "genre",
+        "disc_count",
+        "track_count",
+        "cover_path",
+        "source",
+        "source_id",
+        "sample_rate",
+        "bit_depth",
+        "format",
+        "quality",
+        "label",
+        "catalog_number",
+        "dynamic_range"
+      ]
+    },
+    {
+      "route": "/library/albums/{}",
+      "methode": "PUT",
       "type": "Album",
       "liste": false,
       "champs_obligatoires": [
@@ -380,6 +449,7 @@
     },
     {
       "route": "/library/albums/{}/artwork/rescan",
+      "methode": "POST",
       "type": "ArtworkRescanResult",
       "liste": false,
       "champs_obligatoires": [
@@ -390,6 +460,7 @@
     },
     {
       "route": "/library/albums/{}/bio",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -402,6 +473,7 @@
     },
     {
       "route": "/library/albums/{}/similar",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -433,6 +505,7 @@
     },
     {
       "route": "/library/ambiances",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -442,6 +515,7 @@
     },
     {
       "route": "/library/artists",
+      "methode": "POST",
       "type": "Artist",
       "liste": false,
       "champs_obligatoires": [
@@ -460,6 +534,26 @@
     },
     {
       "route": "/library/artists/{}",
+      "methode": "GET",
+      "type": "Artist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "sort_name",
+        "musicbrainz_id",
+        "discogs_id",
+        "bio",
+        "image_path",
+        "image_source",
+        "source_id"
+      ]
+    },
+    {
+      "route": "/library/artists/{}",
+      "methode": "PUT",
       "type": "Artist",
       "liste": false,
       "champs_obligatoires": [
@@ -478,6 +572,7 @@
     },
     {
       "route": "/library/artists/{}/albums",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -509,6 +604,7 @@
     },
     {
       "route": "/library/artists/{}/bio",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -520,6 +616,7 @@
     },
     {
       "route": "/library/artists/{}/credits",
+      "methode": "GET",
       "type": "TrackCredit",
       "liste": true,
       "champs_obligatoires": [
@@ -535,6 +632,7 @@
     },
     {
       "route": "/library/artists/{}/metadata",
+      "methode": "GET",
       "type": "ArtistMetadata",
       "liste": false,
       "champs_obligatoires": [],
@@ -552,6 +650,7 @@
     },
     {
       "route": "/library/artists/{}/tracks",
+      "methode": "GET",
       "type": "Track",
       "liste": true,
       "champs_obligatoires": [
@@ -589,6 +688,7 @@
     },
     {
       "route": "/library/artwork/enrich-artists",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -600,6 +700,7 @@
     },
     {
       "route": "/library/artwork/enrich-artists/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -610,6 +711,7 @@
     },
     {
       "route": "/library/artwork/rescan",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -619,6 +721,7 @@
     },
     {
       "route": "/library/browse",
+      "methode": "GET",
       "type": "BrowseRootsResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -628,6 +731,7 @@
     },
     {
       "route": "/library/browse/dir",
+      "methode": "GET",
       "type": "BrowseResult",
       "liste": false,
       "champs_obligatoires": [
@@ -644,6 +748,7 @@
     },
     {
       "route": "/library/enrich-all",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -653,6 +758,7 @@
     },
     {
       "route": "/library/enrich-all/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -666,6 +772,7 @@
     },
     {
       "route": "/library/history",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -676,6 +783,7 @@
     },
     {
       "route": "/library/history/at",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -688,6 +796,7 @@
     },
     {
       "route": "/library/history/dashboard",
+      "methode": "GET",
       "type": "DashboardData",
       "liste": false,
       "champs_obligatoires": [
@@ -713,6 +822,7 @@
     },
     {
       "route": "/library/history/top-artists",
+      "methode": "GET",
       "type": "TopArtist",
       "liste": true,
       "champs_obligatoires": [
@@ -728,6 +838,7 @@
     },
     {
       "route": "/library/history/top-tracks",
+      "methode": "GET",
       "type": "TopTrack",
       "liste": true,
       "champs_obligatoires": [
@@ -743,6 +854,7 @@
     },
     {
       "route": "/library/history/tracks/{}/plays",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -753,6 +865,7 @@
     },
     {
       "route": "/library/reports",
+      "methode": "POST",
       "type": "MetadataReportResult",
       "liste": false,
       "champs_obligatoires": [
@@ -765,6 +878,7 @@
     },
     {
       "route": "/library/search",
+      "methode": "GET",
       "type": "SearchResult",
       "liste": false,
       "champs_obligatoires": [
@@ -778,6 +892,7 @@
     },
     {
       "route": "/library/search/acoustic/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -789,6 +904,7 @@
     },
     {
       "route": "/library/smart-collections",
+      "methode": "GET",
       "type": "SmartCollection",
       "liste": true,
       "champs_obligatoires": [
@@ -811,7 +927,32 @@
       ]
     },
     {
+      "route": "/library/smart-collections",
+      "methode": "POST",
+      "type": "SmartCollection",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "description",
+        "icon",
+        "color",
+        "rules",
+        "match_mode",
+        "sort_by",
+        "sort_order",
+        "max_albums",
+        "auto_refresh",
+        "created_at",
+        "updated_at"
+      ],
+      "champs_optionnels": [
+        "album_count"
+      ]
+    },
+    {
       "route": "/library/smart-collections/preview",
+      "methode": "POST",
       "type": "SmartCollectionPreview",
       "liste": false,
       "champs_obligatoires": [
@@ -822,6 +963,31 @@
     },
     {
       "route": "/library/smart-collections/{}",
+      "methode": "GET",
+      "type": "SmartCollection",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "description",
+        "icon",
+        "color",
+        "rules",
+        "match_mode",
+        "sort_by",
+        "sort_order",
+        "max_albums",
+        "auto_refresh",
+        "created_at",
+        "updated_at"
+      ],
+      "champs_optionnels": [
+        "album_count"
+      ]
+    },
+    {
+      "route": "/library/smart-collections/{}",
+      "methode": "PUT",
       "type": "SmartCollection",
       "liste": false,
       "champs_obligatoires": [
@@ -845,6 +1011,7 @@
     },
     {
       "route": "/library/smart-playlists",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -854,6 +1021,7 @@
     },
     {
       "route": "/library/smart-playlists/{}",
+      "methode": "DELETE",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -863,6 +1031,7 @@
     },
     {
       "route": "/library/stats",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -874,6 +1043,7 @@
     },
     {
       "route": "/library/stats/completeness",
+      "methode": "GET",
       "type": "CompletenessStats",
       "liste": false,
       "champs_obligatoires": [
@@ -893,6 +1063,45 @@
     },
     {
       "route": "/library/tracks/{}",
+      "methode": "GET",
+      "type": "Track",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/library/tracks/{}",
+      "methode": "PUT",
       "type": "Track",
       "liste": false,
       "champs_obligatoires": [
@@ -930,6 +1139,7 @@
     },
     {
       "route": "/library/tracks/{}/credits",
+      "methode": "GET",
       "type": "TrackCredit",
       "liste": true,
       "champs_obligatoires": [
@@ -945,6 +1155,7 @@
     },
     {
       "route": "/library/tracks/{}/lyrics",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -956,6 +1167,7 @@
     },
     {
       "route": "/library/tracks/{}/similar",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -967,6 +1179,7 @@
     },
     {
       "route": "/metadata/artists/{}/enrich",
+      "methode": "GET",
       "type": "ArtistMetadata",
       "liste": false,
       "champs_obligatoires": [],
@@ -984,6 +1197,7 @@
     },
     {
       "route": "/metadata/doubtful",
+      "methode": "GET",
       "type": "DoubtfulAlbum",
       "liste": true,
       "champs_obligatoires": [
@@ -1001,6 +1215,7 @@
     },
     {
       "route": "/network/media-servers/{}/browse",
+      "methode": "GET",
       "type": "MediaServerBrowseResult",
       "liste": false,
       "champs_obligatoires": [
@@ -1014,6 +1229,7 @@
     },
     {
       "route": "/network/media-servers/{}/item/{}/play/{}",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -1063,6 +1279,7 @@
     },
     {
       "route": "/network/media-servers/{}/item/{}/stream-url",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1072,6 +1289,7 @@
     },
     {
       "route": "/network/smb/mount",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1084,6 +1302,7 @@
     },
     {
       "route": "/network/smb/mount",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1094,6 +1313,7 @@
     },
     {
       "route": "/offline/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1105,6 +1325,7 @@
     },
     {
       "route": "/onboarding/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1115,6 +1336,7 @@
     },
     {
       "route": "/outputs/{}/airplay/pair-pin",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1124,6 +1346,7 @@
     },
     {
       "route": "/outputs/{}/airplay/pair-start",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1134,6 +1357,7 @@
     },
     {
       "route": "/outputs/{}/airplay/pair-status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1143,6 +1367,7 @@
     },
     {
       "route": "/playback/shuffle-all",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1153,6 +1378,7 @@
     },
     {
       "route": "/playlist-manager/backups/{}",
+      "methode": "DELETE",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1163,6 +1389,7 @@
     },
     {
       "route": "/playlist-manager/backups/{}/restore",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1176,6 +1403,7 @@
     },
     {
       "route": "/playlists",
+      "methode": "GET",
       "type": "Playlist",
       "liste": true,
       "champs_obligatoires": [
@@ -1188,7 +1416,22 @@
       ]
     },
     {
+      "route": "/playlists",
+      "methode": "POST",
+      "type": "Playlist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "description",
+        "track_count"
+      ]
+    },
+    {
       "route": "/playlists/all",
+      "methode": "GET",
       "type": "UnifiedPlaylistsResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -1199,6 +1442,7 @@
     },
     {
       "route": "/playlists/diff",
+      "methode": "POST",
       "type": "PlaylistDiffResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -1212,6 +1456,7 @@
     },
     {
       "route": "/playlists/import",
+      "methode": "POST",
       "type": "PlaylistImportResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -1223,6 +1468,7 @@
     },
     {
       "route": "/playlists/transfer",
+      "methode": "POST",
       "type": "PlaylistTransferResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -1241,6 +1487,21 @@
     },
     {
       "route": "/playlists/{}",
+      "methode": "GET",
+      "type": "Playlist",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "description",
+        "track_count"
+      ]
+    },
+    {
+      "route": "/playlists/{}",
+      "methode": "PUT",
       "type": "Playlist",
       "liste": false,
       "champs_obligatoires": [
@@ -1254,6 +1515,7 @@
     },
     {
       "route": "/playlists/{}/recover",
+      "methode": "POST",
       "type": "PlaylistRecoverResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -1268,6 +1530,7 @@
     },
     {
       "route": "/playlists/{}/recover/apply",
+      "methode": "POST",
       "type": "RecoverApplyResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -1278,6 +1541,7 @@
     },
     {
       "route": "/playlists/{}/tracks",
+      "methode": "GET",
       "type": "Track",
       "liste": true,
       "champs_obligatoires": [
@@ -1315,6 +1579,7 @@
     },
     {
       "route": "/playlists/{}/tracks",
+      "methode": "POST",
       "type": "Playlist",
       "liste": false,
       "champs_obligatoires": [
@@ -1328,6 +1593,7 @@
     },
     {
       "route": "/plugins",
+      "methode": "GET",
       "type": "InstalledPlugin",
       "liste": true,
       "champs_obligatoires": [
@@ -1342,6 +1608,7 @@
     },
     {
       "route": "/plugins",
+      "methode": "GET",
       "type": "MergedPlugin",
       "liste": true,
       "champs_obligatoires": [
@@ -1373,6 +1640,7 @@
     },
     {
       "route": "/plugins/{}",
+      "methode": "GET",
       "type": "MergedPlugin",
       "liste": false,
       "champs_obligatoires": [
@@ -1404,6 +1672,7 @@
     },
     {
       "route": "/plugins/{}/disable",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1413,6 +1682,7 @@
     },
     {
       "route": "/plugins/{}/enable",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1422,6 +1692,7 @@
     },
     {
       "route": "/profiles/{}/favorites/streaming{}",
+      "methode": "GET",
       "type": "StreamingFavorite",
       "liste": true,
       "champs_obligatoires": [
@@ -1440,6 +1711,7 @@
     },
     {
       "route": "/radios",
+      "methode": "POST",
       "type": "RadioStation",
       "liste": false,
       "champs_obligatoires": [
@@ -1459,6 +1731,27 @@
     },
     {
       "route": "/radios/{}",
+      "methode": "GET",
+      "type": "RadioStation",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "stream_url",
+        "favorite"
+      ],
+      "champs_optionnels": [
+        "logo_url",
+        "genre",
+        "tags",
+        "codec",
+        "country",
+        "homepage_url"
+      ]
+    },
+    {
+      "route": "/radios/{}",
+      "methode": "PUT",
       "type": "RadioStation",
       "liste": false,
       "champs_obligatoires": [
@@ -1478,6 +1771,7 @@
     },
     {
       "route": "/radios/{}/play/{}",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -1527,6 +1821,7 @@
     },
     {
       "route": "/radios{}",
+      "methode": "GET",
       "type": "RadioStation",
       "liste": true,
       "champs_obligatoires": [
@@ -1546,6 +1841,7 @@
     },
     {
       "route": "/smart-ai/discovery",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1557,6 +1853,7 @@
     },
     {
       "route": "/smart-ai/generate",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1568,6 +1865,7 @@
     },
     {
       "route": "/smart-ai/history-based",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1579,6 +1877,7 @@
     },
     {
       "route": "/smart-ai/mood",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1590,6 +1889,7 @@
     },
     {
       "route": "/smart-ai/tempo-match",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1601,6 +1901,7 @@
     },
     {
       "route": "/snapcast/clients",
+      "methode": "GET",
       "type": "SnapcastClient",
       "liste": true,
       "champs_obligatoires": [
@@ -1615,6 +1916,7 @@
     },
     {
       "route": "/snapcast/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1628,6 +1930,7 @@
     },
     {
       "route": "/sonos/discover",
+      "methode": "POST",
       "type": "SonosSpeaker",
       "liste": true,
       "champs_obligatoires": [
@@ -1641,6 +1944,7 @@
     },
     {
       "route": "/sonos/speakers",
+      "methode": "GET",
       "type": "SonosSpeaker",
       "liste": true,
       "champs_obligatoires": [
@@ -1654,6 +1958,7 @@
     },
     {
       "route": "/spotify-connect/disable",
+      "methode": "POST",
       "type": "SpotifyConnectStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -1671,6 +1976,7 @@
     },
     {
       "route": "/spotify-connect/enable",
+      "methode": "POST",
       "type": "SpotifyConnectStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -1688,6 +1994,7 @@
     },
     {
       "route": "/spotify-connect/status",
+      "methode": "GET",
       "type": "SpotifyConnectStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -1705,6 +2012,7 @@
     },
     {
       "route": "/squeezebox/discover",
+      "methode": "POST",
       "type": "SqueezeboxStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -1717,6 +2025,7 @@
     },
     {
       "route": "/squeezebox/players/{}/create-zone",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -1766,6 +2075,7 @@
     },
     {
       "route": "/squeezebox/status",
+      "methode": "GET",
       "type": "SqueezeboxStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -1778,6 +2088,7 @@
     },
     {
       "route": "/streaming/youtube/auth/device-code",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1790,6 +2101,7 @@
     },
     {
       "route": "/streaming/youtube/auth/poll",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [],
@@ -1801,6 +2113,7 @@
     },
     {
       "route": "/streaming/youtube/auth/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1811,6 +2124,7 @@
     },
     {
       "route": "/streaming/youtube/home",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -1821,6 +2135,7 @@
     },
     {
       "route": "/streaming/youtube/library",
+      "methode": "GET",
       "type": "Track",
       "liste": true,
       "champs_obligatoires": [
@@ -1858,6 +2173,7 @@
     },
     {
       "route": "/streaming/youtube/moods",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": true,
       "champs_obligatoires": [
@@ -1868,6 +2184,7 @@
     },
     {
       "route": "/streaming/youtube/moods/{}",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": true,
       "champs_obligatoires": [
@@ -1880,6 +2197,7 @@
     },
     {
       "route": "/streaming/{}/albums/{}",
+      "methode": "GET",
       "type": "Album",
       "liste": false,
       "champs_obligatoires": [
@@ -1911,6 +2229,7 @@
     },
     {
       "route": "/streaming/{}/albums/{}/tracks",
+      "methode": "GET",
       "type": "Track",
       "liste": true,
       "champs_obligatoires": [
@@ -1948,6 +2267,7 @@
     },
     {
       "route": "/streaming/{}/artists/{}",
+      "methode": "GET",
       "type": "Artist",
       "liste": false,
       "champs_obligatoires": [
@@ -1966,6 +2286,7 @@
     },
     {
       "route": "/streaming/{}/artists/{}/albums",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -1997,6 +2318,7 @@
     },
     {
       "route": "/streaming/{}/auth",
+      "methode": "POST",
       "type": "StreamingAuthResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -2009,6 +2331,7 @@
     },
     {
       "route": "/streaming/{}/disable",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2018,6 +2341,7 @@
     },
     {
       "route": "/streaming/{}/disconnect",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2027,6 +2351,7 @@
     },
     {
       "route": "/streaming/{}/enable",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2036,6 +2361,17 @@
     },
     {
       "route": "/streaming/{}/favorites/{}/{}",
+      "methode": "DELETE",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/{}/favorites/{}/{}",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2045,6 +2381,7 @@
     },
     {
       "route": "/streaming/{}/featured",
+      "methode": "GET",
       "type": "StreamingPlaylist",
       "liste": true,
       "champs_obligatoires": [
@@ -2061,6 +2398,7 @@
     },
     {
       "route": "/streaming/{}/featured-playlists/by-tag{}",
+      "methode": "GET",
       "type": "PlaylistTagGroup",
       "liste": true,
       "champs_obligatoires": [
@@ -2072,6 +2410,7 @@
     },
     {
       "route": "/streaming/{}/featured/sections",
+      "methode": "GET",
       "type": "FeaturedSection",
       "liste": true,
       "champs_obligatoires": [
@@ -2082,6 +2421,7 @@
     },
     {
       "route": "/streaming/{}/featured/{}",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -2113,6 +2453,7 @@
     },
     {
       "route": "/streaming/{}/genres/{}/albums",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -2144,6 +2485,7 @@
     },
     {
       "route": "/streaming/{}/genres{}",
+      "methode": "GET",
       "type": "StreamingGenre",
       "liste": true,
       "champs_obligatoires": [
@@ -2157,6 +2499,7 @@
     },
     {
       "route": "/streaming/{}/new-releases",
+      "methode": "GET",
       "type": "Album",
       "liste": true,
       "champs_obligatoires": [
@@ -2188,6 +2531,7 @@
     },
     {
       "route": "/streaming/{}/playlists",
+      "methode": "GET",
       "type": "StreamingPlaylist",
       "liste": true,
       "champs_obligatoires": [
@@ -2204,6 +2548,7 @@
     },
     {
       "route": "/streaming/{}/playlists/{}/tracks",
+      "methode": "GET",
       "type": "Track",
       "liste": true,
       "champs_obligatoires": [
@@ -2241,6 +2586,7 @@
     },
     {
       "route": "/streaming/{}/search",
+      "methode": "GET",
       "type": "SearchResult",
       "liste": false,
       "champs_obligatoires": [
@@ -2254,6 +2600,7 @@
     },
     {
       "route": "/streaming/{}/status",
+      "methode": "GET",
       "type": "StreamingServiceStatus",
       "liste": false,
       "champs_obligatoires": [
@@ -2267,6 +2614,7 @@
     },
     {
       "route": "/system/admin/connections",
+      "methode": "GET",
       "type": "AdminConnections",
       "liste": false,
       "champs_obligatoires": [
@@ -2277,6 +2625,7 @@
     },
     {
       "route": "/system/admin/discovery",
+      "methode": "GET",
       "type": "AdminDiscovery",
       "liste": false,
       "champs_obligatoires": [
@@ -2288,6 +2637,7 @@
     },
     {
       "route": "/system/admin/errors",
+      "methode": "GET",
       "type": "AdminError",
       "liste": true,
       "champs_obligatoires": [
@@ -2299,6 +2649,7 @@
     },
     {
       "route": "/system/admin/health",
+      "methode": "GET",
       "type": "AdminHealth",
       "liste": false,
       "champs_obligatoires": [
@@ -2317,6 +2668,7 @@
     },
     {
       "route": "/system/admin/zones",
+      "methode": "GET",
       "type": "AdminZone",
       "liste": true,
       "champs_obligatoires": [
@@ -2336,6 +2688,7 @@
     },
     {
       "route": "/system/audio-check",
+      "methode": "GET",
       "type": "AudioCheckResult",
       "liste": false,
       "champs_obligatoires": [
@@ -2350,6 +2703,7 @@
     },
     {
       "route": "/system/backups",
+      "methode": "GET",
       "type": "BackupInfo",
       "liste": true,
       "champs_obligatoires": [
@@ -2360,7 +2714,20 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/backups",
+      "methode": "POST",
+      "type": "BackupInfo",
+      "liste": false,
+      "champs_obligatoires": [
+        "filename",
+        "size",
+        "created_at"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/system/backups/{}/restore",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2370,6 +2737,7 @@
     },
     {
       "route": "/system/config/import",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2379,6 +2747,7 @@
     },
     {
       "route": "/system/database/rebuild-fts",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2390,6 +2759,7 @@
     },
     {
       "route": "/system/diagnostics",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2407,6 +2777,7 @@
     },
     {
       "route": "/system/diagnostics/network",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2420,6 +2791,7 @@
     },
     {
       "route": "/system/enrich",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2429,6 +2801,7 @@
     },
     {
       "route": "/system/health/alerts",
+      "methode": "GET",
       "type": "HealthAlert",
       "liste": true,
       "champs_obligatoires": [
@@ -2441,6 +2814,7 @@
     },
     {
       "route": "/system/health/monitor",
+      "methode": "GET",
       "type": "HealthMonitorResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -2453,6 +2827,7 @@
     },
     {
       "route": "/system/music-dirs",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2462,6 +2837,7 @@
     },
     {
       "route": "/system/music-dirs/remove",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2471,6 +2847,17 @@
     },
     {
       "route": "/system/peers",
+      "methode": "DELETE",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ok"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/peers",
+      "methode": "GET",
       "type": "TunePeer",
       "liste": true,
       "champs_obligatoires": [
@@ -2488,15 +2875,25 @@
     },
     {
       "route": "/system/peers",
-      "type": "(en ligne)",
+      "methode": "POST",
+      "type": "TunePeer",
       "liste": false,
       "champs_obligatoires": [
-        "ok"
+        "name",
+        "host",
+        "port",
+        "version",
+        "tracks",
+        "zones"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "server_id",
+        "online"
+      ]
     },
     {
       "route": "/system/restart",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2509,6 +2906,7 @@
     },
     {
       "route": "/system/scan/report",
+      "methode": "POST",
       "type": "ScanReport",
       "liste": false,
       "champs_obligatoires": [],
@@ -2531,6 +2929,18 @@
     },
     {
       "route": "/system/scan/schedule",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "time"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/scan/schedule",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2541,6 +2951,7 @@
     },
     {
       "route": "/system/scan/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2550,6 +2961,7 @@
     },
     {
       "route": "/system/stats",
+      "methode": "GET",
       "type": "SystemStats",
       "liste": false,
       "champs_obligatoires": [
@@ -2563,6 +2975,7 @@
     },
     {
       "route": "/system/youtube/enable",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2573,6 +2986,7 @@
     },
     {
       "route": "/system/youtube/status",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2584,6 +2998,7 @@
     },
     {
       "route": "/tags",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2593,6 +3008,7 @@
     },
     {
       "route": "/tags/for/{}/{}",
+      "methode": "GET",
       "type": "UserTag",
       "liste": true,
       "champs_obligatoires": [
@@ -2606,6 +3022,7 @@
     },
     {
       "route": "/tags/search",
+      "methode": "GET",
       "type": "UserTag",
       "liste": true,
       "champs_obligatoires": [
@@ -2619,6 +3036,7 @@
     },
     {
       "route": "/tags/{}",
+      "methode": "GET",
       "type": "UserTag",
       "liste": true,
       "champs_obligatoires": [
@@ -2632,6 +3050,7 @@
     },
     {
       "route": "/tags/{}/albums",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2642,6 +3061,7 @@
     },
     {
       "route": "/tags/{}/items/batch",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2651,6 +3071,7 @@
     },
     {
       "route": "/zones",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -2700,6 +3121,7 @@
     },
     {
       "route": "/zones/group",
+      "methode": "POST",
       "type": "ZoneGroupResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -2713,6 +3135,7 @@
     },
     {
       "route": "/zones/group-delays",
+      "methode": "GET",
       "type": "GroupDelay",
       "liste": true,
       "champs_obligatoires": [
@@ -2726,6 +3149,7 @@
     },
     {
       "route": "/zones/groups/list",
+      "methode": "GET",
       "type": "ZoneGroupResponse",
       "liste": true,
       "champs_obligatoires": [
@@ -2739,6 +3163,7 @@
     },
     {
       "route": "/zones/stereo-pair",
+      "methode": "POST",
       "type": "StereoPairResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -2750,6 +3175,7 @@
     },
     {
       "route": "/zones/stereo-pairs",
+      "methode": "GET",
       "type": "StereoPairInfo",
       "liste": true,
       "champs_obligatoires": [
@@ -2761,6 +3187,57 @@
     },
     {
       "route": "/zones/{}",
+      "methode": "GET",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones/{}",
+      "methode": "PATCH",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -2810,6 +3287,17 @@
     },
     {
       "route": "/zones/{}/audiophile",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/audiophile",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2819,6 +3307,7 @@
     },
     {
       "route": "/zones/{}/crossfade",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2829,6 +3318,7 @@
     },
     {
       "route": "/zones/{}/device-presets",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2838,6 +3328,18 @@
     },
     {
       "route": "/zones/{}/dsp",
+      "methode": "GET",
+      "type": "DspSettings",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "eq_profile",
+        "crossfeed"
+      ]
+    },
+    {
+      "route": "/zones/{}/dsp",
+      "methode": "PUT",
       "type": "DspSettings",
       "liste": false,
       "champs_obligatoires": [],
@@ -2848,6 +3350,7 @@
     },
     {
       "route": "/zones/{}/eq",
+      "methode": "GET",
       "type": "EqSettings",
       "liste": false,
       "champs_obligatoires": [
@@ -2858,6 +3361,7 @@
     },
     {
       "route": "/zones/{}/next",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2869,6 +3373,7 @@
     },
     {
       "route": "/zones/{}/pause",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -2918,6 +3423,7 @@
     },
     {
       "route": "/zones/{}/pins",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2929,6 +3435,7 @@
     },
     {
       "route": "/zones/{}/play",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -2978,6 +3485,7 @@
     },
     {
       "route": "/zones/{}/previous",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2989,6 +3497,17 @@
     },
     {
       "route": "/zones/{}/quality",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "quality"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/quality",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -2998,6 +3517,7 @@
     },
     {
       "route": "/zones/{}/queue",
+      "methode": "GET",
       "type": "QueueStateResponse",
       "liste": false,
       "champs_obligatoires": [
@@ -3009,6 +3529,7 @@
     },
     {
       "route": "/zones/{}/queue/add",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3018,6 +3539,7 @@
     },
     {
       "route": "/zones/{}/queue/jump",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -3067,6 +3589,7 @@
     },
     {
       "route": "/zones/{}/queue/move",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3076,6 +3599,7 @@
     },
     {
       "route": "/zones/{}/queue/{}",
+      "methode": "DELETE",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3085,6 +3609,7 @@
     },
     {
       "route": "/zones/{}/renderer-capabilities",
+      "methode": "POST",
       "type": "RendererCapabilities",
       "liste": false,
       "champs_obligatoires": [
@@ -3106,6 +3631,7 @@
     },
     {
       "route": "/zones/{}/repeat",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3115,6 +3641,7 @@
     },
     {
       "route": "/zones/{}/resume",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -3164,6 +3691,7 @@
     },
     {
       "route": "/zones/{}/seek",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -3213,6 +3741,7 @@
     },
     {
       "route": "/zones/{}/share",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3226,6 +3755,7 @@
     },
     {
       "route": "/zones/{}/shuffle",
+      "methode": "POST",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3235,6 +3765,7 @@
     },
     {
       "route": "/zones/{}/sleep",
+      "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
@@ -3247,6 +3778,7 @@
     },
     {
       "route": "/zones/{}/stop",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -3296,6 +3828,7 @@
     },
     {
       "route": "/zones/{}/transfer/{}",
+      "methode": "POST",
       "type": "Zone",
       "liste": false,
       "champs_obligatoires": [
@@ -4047,7 +4580,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 206,
+    "routes_cartographiees": 223,
     "appels_non_resolus": 140
   }
 }

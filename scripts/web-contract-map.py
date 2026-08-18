@@ -153,6 +153,18 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
 
     for m in MOTIF_APPEL.finditer(api_ts):
         brut = m.group("type").strip()
+        # La méthode HTTP vit dans les options de l'appel, juste après l'URL :
+        # `fetchJSON<T>(`${BASE}/x`, { method: 'POST', … })`. Sans elle, un GET
+        # et un POST sur la même route sont confondus — et le banc d'essai
+        # reproche à la réponse du GET les champs que le POST renvoie.
+        # Fenêtre bornée, arrêtée au prochain appel pour ne pas lui voler sa
+        # méthode.
+        suite = api_ts[m.end(): m.end() + 400]
+        coupe = suite.find("fetchJSON")
+        if coupe != -1:
+            suite = suite[:coupe]
+        m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
+        methode = m_meth.group(1).upper() if m_meth else "GET"
         route = normaliser_route(m.group("route"))
         if not route:
             non_resolus.append({
@@ -175,7 +187,8 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
                 continue
             obligatoires, optionnels = champs_du_bloc(corps)
             entrees.append({
-                "route": route, "type": "(en ligne)", "liste": brut.endswith("[]"),
+                "route": route, "methode": methode, "type": "(en ligne)",
+                "liste": brut.endswith("[]"),
                 "champs_obligatoires": obligatoires, "champs_optionnels": optionnels,
             })
             continue
@@ -191,7 +204,8 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
             continue
 
         entrees.append({
-            "route": route, "type": nu, "liste": brut.endswith("[]"),
+            "route": route, "methode": methode, "type": nu,
+            "liste": brut.endswith("[]"),
             "champs_obligatoires": connu["obligatoires"],
             "champs_optionnels": connu["optionnels"],
         })
@@ -199,12 +213,12 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
     # Dédoublonner : la même route peut être appelée plusieurs fois.
     vues, uniques = set(), []
     for e in entrees:
-        cle = (e["route"], e["type"], tuple(e["champs_obligatoires"]))
+        cle = (e["route"], e["methode"], e["type"], tuple(e["champs_obligatoires"]))
         if cle in vues:
             continue
         vues.add(cle)
         uniques.append(e)
-    return sorted(uniques, key=lambda e: e["route"]), non_resolus
+    return sorted(uniques, key=lambda e: (e["route"], e["methode"])), non_resolus
 
 
 def self_test() -> int:
@@ -227,6 +241,8 @@ def self_test() -> int:
       export const inconnu = () => fetchJSON<PasDefini>(`${BASE}/x/y-z`);
       export const imp = () => fetchJSON<import('./types').Zone[]>(`${BASE}/zones-bis`);
       export const dev = (id) => fetchJSON<Zone>(`${BASE}/devices/${encodeURIComponent(id)}?x=1`);
+      export const listP = () => fetchJSON<{ presets: Zone[] }>(`${BASE}/eq/presets`);
+      export const newP = (b) => fetchJSON<Zone>(`${BASE}/eq/presets`, { method: 'POST', body: b });
     """
     entrees, non_resolus = carte(types_src, api)
     par_route = {e["route"]: e for e in entrees}
@@ -257,6 +273,12 @@ def self_test() -> int:
     if "/devices/{}" not in par_route:
         echecs.append(f"encodeURIComponent tronque la route : {sorted(par_route)}")
 
+    eq = {e["methode"]: e for e in entrees if e["route"] == "/eq/presets"}
+    if set(eq) != {"GET", "POST"}:
+        echecs.append(f"GET et POST sur la même route ne sont pas distingués : {sorted(eq)}")
+    elif eq["GET"]["champs_obligatoires"] != ["presets"]:
+        echecs.append("le GET hérite des champs du POST")
+
     raisons = {n["route"]: n["raison"] for n in non_resolus}
     if "/system/ping" not in raisons:
         echecs.append("un type non structurel (void) n'est pas signalé")
@@ -268,8 +290,8 @@ def self_test() -> int:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 10 garanties (type nommé, optionnels, liste, paramètre "
-          "d'URL, type en ligne, import en ligne, route à parenthèses, et les deux non-résolutions)")
+    print("SELF-TEST: ok — 11 garanties (type nommé, optionnels, liste, paramètre "
+          "d'URL, type en ligne, import en ligne, route à parenthèses, méthode HTTP, et les deux non-résolutions)")
     return 0
 
 
