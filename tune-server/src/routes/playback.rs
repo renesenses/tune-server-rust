@@ -1971,7 +1971,7 @@ async fn set_eq(
     // (#1725). On regle un egaliseur musique en cours, a l'oreille — et trois
     // utilisateurs ont rapporte « l'egaliseur ne fonctionne pas » avant ca.
     // Sans effet quand rien ne joue, hors zone locale, ou en mode PURE.
-    let applique_a_chaud = state.orchestrator.refresh_zone_eq(zone_id).await;
+    let applique_a_chaud = state.orchestrator.apply_eq_change(zone_id).await;
 
     let bands = eq_bands_json(&profile);
     Json(json!({
