@@ -1301,3 +1301,136 @@ mod tests {
         assert_eq!(parse_range_start("chunks=0-"), None);
     }
 }
+
+/// Origine publique du relais Tune Bridge. Doit rester accordee au defaut code
+/// en dur du client (`wss://bridge.mozaiklabs.fr/ws/server`,
+/// tune-core/src/cloud/relay.rs) et a la base utilisee par les applications.
+pub const RELAIS_ORIGINE: &str = "https://bridge.mozaiklabs.fr";
+
+/// URL de flux joignable depuis l'exterieur, ou `None`.
+///
+/// `stream_url` est fabrique en adresse LAN absolue —
+/// `http://192.168.1.18:8888/stream/<id>.flac`. Correct chez soi, inutilisable
+/// ailleurs : depuis un telephone en 4G, cette adresse ne mene nulle part. La
+/// navigation fonctionnait a travers le relais, mais le lecteur restait muet,
+/// ce qui rend la panne d'autant plus deroutante.
+///
+/// Plutot que de faire dependre `stream_url` de la provenance de la requete —
+/// ce qui obligerait a promener la `HeaderMap` a travers une dizaine
+/// d'appelants, dont des chemins chauds — le serveur annonce les DEUX adresses
+/// et laisse le client prendre celle qui le concerne. Il n'a pas a savoir par
+/// ou on l'atteint ; il sait ou il est joignable.
+///
+/// `None` quand le pont est desactive : annoncer une adresse de relais pour un
+/// serveur qui ne s'y enregistre pas serait un mensonge de plus.
+pub fn stream_url_distant(
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    stream_id: &str,
+    ext: &str,
+) -> Option<String> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend);
+    let actif = settings
+        .get("bridge_enabled")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true" || v == "1");
+    if !actif {
+        return None;
+    }
+    let server_id = settings.get("server_id").ok().flatten()?;
+    if server_id.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{RELAIS_ORIGINE}/stream/relay/{server_id}/{stream_id}.{ext}"
+    ))
+}
+
+#[cfg(test)]
+mod stream_url_distant_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::sqlite::SqliteDb;
+
+    fn base() -> Arc<dyn tune_core::db::backend::DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // CORE_SCHEMA ne cree PAS la table `settings` : elle arrive par
+        // migration. Sans cet appel, chaque `set` echoue en « no such table »
+        // et le test mesure une base incomplete en croyant mesurer le helper.
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Le pont desactive : annoncer une adresse de relais pour un serveur qui
+    /// ne s'y enregistre pas serait un mensonge de plus — la famille de
+    /// defauts que ce depot passe sa semaine a corriger.
+    #[test]
+    fn pont_desactive_aucune_adresse_distante() {
+        let b = base();
+        SettingsRepo::with_backend(b.clone())
+            .set("server_id", "abc-123")
+            .unwrap();
+        assert_eq!(stream_url_distant(b, "s1", "flac"), None);
+    }
+
+    /// Pont actif mais identifiant absent : on ne fabrique pas une URL avec un
+    /// trou dedans.
+    #[test]
+    fn sans_identifiant_aucune_adresse_distante() {
+        let b = base();
+        SettingsRepo::with_backend(b.clone())
+            .set("bridge_enabled", "true")
+            .unwrap();
+        assert_eq!(stream_url_distant(b, "s1", "flac"), None);
+    }
+
+    #[test]
+    fn un_identifiant_vide_vaut_absence() {
+        let b = base();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("bridge_enabled", "true").unwrap();
+        s.set("server_id", "").unwrap();
+        assert_eq!(stream_url_distant(b, "s1", "flac"), None);
+    }
+
+    /// Le cas utile : le chemin doit correspondre EXACTEMENT a la route du
+    /// relais, `/stream/relay/{server_id}/{*stream_path}` — sinon le proxy
+    /// repond 404 et la lecture reste muette sans rien expliquer.
+    #[test]
+    fn pont_actif_adresse_conforme_a_la_route_du_relais() {
+        let b = base();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("bridge_enabled", "true").unwrap();
+        s.set("server_id", "75f24b9e-fb8a-4de2-8007-99edd3454263")
+            .unwrap();
+        assert_eq!(
+            stream_url_distant(b, "abcd", "flac"),
+            Some(
+                "https://bridge.mozaiklabs.fr/stream/relay/\
+                 75f24b9e-fb8a-4de2-8007-99edd3454263/abcd.flac"
+                    .to_string()
+            )
+        );
+    }
+
+    /// « 1 » vaut « true » : les reglages sont ecrits par plusieurs chemins et
+    /// n'ont jamais eu de type booleen.
+    #[test]
+    fn le_pont_accepte_1_comme_true() {
+        let b = base();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("bridge_enabled", "1").unwrap();
+        s.set("server_id", "x").unwrap();
+        assert!(stream_url_distant(b, "s", "flac").is_some());
+    }
+
+    /// L'origine doit rester accordee au defaut code en dur cote client
+    /// (tune-core/src/cloud/relay.rs). Si l'une change sans l'autre, le
+    /// serveur s'enregistre quelque part et les clients demandent ailleurs.
+    #[test]
+    fn origine_accordee_au_client_de_relais() {
+        assert_eq!(RELAIS_ORIGINE, "https://bridge.mozaiklabs.fr");
+    }
+}
