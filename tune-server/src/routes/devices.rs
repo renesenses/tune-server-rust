@@ -584,7 +584,25 @@ async fn register_discovered_dlna(
     let desc = fetch_device_description(&dev.location)
         .await
         .map_err(|e| format!("cannot fetch DLNA description from {}: {e}", dev.location))?;
-    if !desc.is_media_renderer() {
+    // La DÉCOUVERTE accepte un appareil dont le `deviceType` n'est pas
+    // MediaRenderer dès lors qu'il expose AVTransport (`ssdp.rs`,
+    // « ssdp_non_standard_renderer_accepted ») — WiiM, foobar2000, et les
+    // enveloppes HEOS. Cette re-vérification, elle, exigeait le type standard.
+    //
+    // Les deux se contredisaient, et le résultat était pire qu'un simple
+    // refus : l'appareil était découvert, enregistré, PUIS oublié quelques
+    // minutes plus tard par le re-sondage. Chez Jean Valjean (#1879), le
+    // Marantz ND8006 disparaissait ainsi à chaque démarrage depuis la 0.9.81 —
+    // son enveloppe AiOS se déclare `MediaServer:1` alors qu'elle porte bien
+    // AVTransport, et l'unification par LOCATION (#1791) a fait de cette
+    // description racine la seule retenue.
+    //
+    // On aligne donc la tolérance sur celle de la découverte. La sévérité
+    // utile n'est pas perdue : le contrôle ci-dessous exige AVTransport ET
+    // RenderingControl, donc un appareil qui n'est réellement pas un lecteur
+    // est toujours écarté — et le reste des frères HEOS, qui n'exposent aucun
+    // de ces services, continue d'être oublié comme le voulait #1528.
+    if !desc.is_media_renderer() && !desc.has_av_transport() {
         return Err(format!(
             "{} is no longer a DLNA Media Renderer",
             dev.location
@@ -811,6 +829,27 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         } else {
             tune_core::outputs::local::list_audio_devices_with_backend(backend)
         };
+        // Publier l'identifiant de registre à côté du nom.
+        //
+        // Cette charge utile n'en portait aucun, et un client qui veut créer
+        // une zone n'a pas d'autre choix que de deviner. Le panneau latéral du
+        // client web devinait « le nom », d'où des zones sans le préfixe
+        // `local:` — invisibles au dédoublonnage, et traitées par
+        // l'orchestrateur comme des renderers réseau, ce qui bloquait la
+        // lecture plus d'une minute avant de ne rien jouer (DEvir, #1823).
+        //
+        // La clé est celle que posent les quatre points d'enregistrement
+        // (`local.rs`, `background.rs`, `startup.rs`) : `local:{name}`.
+        let devices: Vec<Value> = devices
+            .into_iter()
+            .map(|d| {
+                let mut v = serde_json::to_value(&d).unwrap_or_else(|_| json!({}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("id".into(), json!(format!("local:{}", d.name)));
+                }
+                v
+            })
+            .collect();
         Json(json!({
             "devices": devices,
             "backend": tune_core::outputs::local::active_backend_name(backend),
@@ -1236,6 +1275,66 @@ mod dlna_reprobe_tests {
         assert!(is_definitive_rejection(
             "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml is no longer a DLNA Media Renderer"
         ));
+    }
+
+    /// Les deux chemins doivent appliquer la MÊME tolérance.
+    ///
+    /// La découverte accepte un appareil au `deviceType` non standard s'il
+    /// expose AVTransport ; la re-vérification l'exigeait strictement
+    /// MediaRenderer. L'appareil était donc découvert, enregistré, puis oublié
+    /// quelques minutes plus tard — le Marantz ND8006 de Jean Valjean, dont
+    /// l'enveloppe AiOS se déclare `MediaServer:1` (#1879).
+    ///
+    /// Ce test compare les deux prédicats sur les trois descriptions qui
+    /// comptent : un lecteur standard, une enveloppe non standard qui porte
+    /// AVTransport, et un vrai non-lecteur.
+    #[test]
+    fn la_reverification_tolere_ce_que_la_decouverte_accepte() {
+        use tune_core::discovery::xml_parser::{DeviceDescription, ServiceDescription};
+
+        let svc = |t: &str| ServiceDescription {
+            service_type: t.to_string(),
+            control_url: "/ctrl".to_string(),
+            ..Default::default()
+        };
+        let desc = |device_type: &str, services: Vec<ServiceDescription>| DeviceDescription {
+            device_type: device_type.to_string(),
+            friendly_name: "x".to_string(),
+            udn: "uuid:1".to_string(),
+            services,
+            ..Default::default()
+        };
+
+        // Un lecteur standard : accepté des deux côtés, hier comme aujourd'hui.
+        let standard = desc(
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+            vec![svc("urn:schemas-upnp-org:service:AVTransport:1")],
+        );
+        assert!(standard.is_media_renderer());
+
+        // L'enveloppe AiOS du Marantz : type MediaServer, mais AVTransport
+        // présent. La découverte l'accepte — la re-vérification doit suivre.
+        let aios = desc(
+            "urn:schemas-upnp-org:device:MediaServer:1",
+            vec![svc("urn:schemas-upnp-org:service:AVTransport:1")],
+        );
+        assert!(!aios.is_media_renderer(), "le type reste non standard");
+        assert!(
+            aios.has_av_transport(),
+            "c'est ce service qui le rend jouable, et que la découverte regarde"
+        );
+
+        // Un frère HEOS sans AVTransport : refusé des deux côtés. C'est ce qui
+        // empêche les cinq entrées de #1528 de revenir.
+        let frere = desc(
+            "urn:schemas-upnp-org:device:MediaServer:1",
+            vec![svc("urn:schemas-upnp-org:service:ContentDirectory:1")],
+        );
+        assert!(!frere.is_media_renderer());
+        assert!(
+            !frere.has_av_transport(),
+            "sans AVTransport, l'entrée doit continuer d'être oubliée"
+        );
     }
 
     #[test]

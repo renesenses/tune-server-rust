@@ -109,6 +109,36 @@ fn per_file_pause_ms(settings: &crate::db::settings_repo::SettingsRepo) -> u64 {
 /// it and the track is re-swept (see the candidate query below).
 const SENTINEL: &str = "audio_embed_analyzed";
 
+/// Pourquoi le décodage n'a pas rendu d'échantillons.
+///
+/// Le témoin étant posé quoi qu'il arrive, une piste en échec sort du balayage
+/// pour de bon : si la raison n'est pas dite au moment où elle est connue, elle
+/// est perdue définitivement. Les trois cas sont distingués parce qu'ils
+/// n'appellent pas le même remède — un fichier illisible se remplace, un fil
+/// interrompu est un défaut de chez nous, un délai dépassé désigne un décodeur
+/// qui tourne en rond.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecodeFailure {
+    /// Le décodage a dépassé `DECODE_TIMEOUT_SECS`.
+    Timeout,
+    /// Le fil bloquant s'est interrompu (panique, annulation).
+    Interrupted(String),
+    /// Le décodeur a répondu, mais par une erreur.
+    Decode(String),
+}
+
+impl DecodeFailure {
+    /// Phrase journalisée. Jamais vide : c'est l'invariant que teste
+    /// `aucun_echec_n_est_muet`.
+    pub(crate) fn raison(&self) -> String {
+        match self {
+            Self::Timeout => format!("délai de décodage dépassé ({DECODE_TIMEOUT_SECS} s)"),
+            Self::Interrupted(e) => format!("fil de décodage interrompu : {e}"),
+            Self::Decode(e) => format!("décodage impossible : {e}"),
+        }
+    }
+}
+
 /// Samples fed to the model: 10 s @ 48 kHz mono, matching CLAP's fixed window.
 const WINDOW_SAMPLES: usize = 480_000;
 
@@ -411,8 +441,11 @@ pub async fn analyze_embedding_batch(
         // Playback can start mid-batch; yield at once so neither the decode
         // nor the inference competes with the audio pipeline (#1515) — the
         // same mid-batch bail as the ReplayGain pass (#1310).
-        if crate::audio::replaygain::any_zone_playing(backend) {
-            info!("audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch");
+        if let Some(zone) = crate::audio::replaygain::playing_zone_name(backend) {
+            info!(
+                zone = %zone,
+                "audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch"
+            );
             break;
         }
         let track_id = match r.first().and_then(|v| v.as_i64()) {
@@ -438,11 +471,35 @@ pub async fn analyze_embedding_batch(
             }),
         )
         .await;
-        if decoded.is_err() {
-            warn!(track_id, path = %path, "audio_embed_decode_timeout");
-        }
+        // Aucun échec ne doit rester muet (#1837).
+        //
+        // Ce `if let Ok(Ok(Ok(d)))` jetait DEUX erreurs sans un mot : le
+        // décodage impossible et l'interruption du fil bloquant. Seul le délai
+        // dépassé était journalisé. Sur la machine .18, 51 pistes portaient le
+        // témoin sans empreinte, et les 11 Mo de journaux conservés ne
+        // contenaient ni `audio_embed_infer_failed` ni `audio_embed_decode_timeout` :
+        // les échecs avaient donc tous emprunté un chemin silencieux, et leur
+        // cause — que `decode_to_pcm` détenait pourtant — était perdue.
+        let decoded = match decoded {
+            Err(_) => Err(DecodeFailure::Timeout),
+            Ok(Err(e)) => Err(DecodeFailure::Interrupted(e.to_string())),
+            Ok(Ok(Err(e))) => Err(DecodeFailure::Decode(e.to_string())),
+            Ok(Ok(Ok(d))) => Ok(d),
+        };
+        let decoded = match decoded {
+            Ok(d) => Some(d),
+            Err(échec) => {
+                warn!(
+                    track_id,
+                    path = %path,
+                    raison = %échec.raison(),
+                    "audio_embed_decode_failed"
+                );
+                None
+            }
+        };
 
-        if let Ok(Ok(Ok(d))) = decoded {
+        if let Some(d) = decoded {
             let wav = prepare_clap_window(&d.samples_i32, d.channels, d.bit_depth, d.sample_rate);
             match embedder.embed(&wav) {
                 Ok(emb) => {
@@ -1128,17 +1185,53 @@ mod tests {
     }
 
     #[test]
-    fn default_leaves_half_the_machine_free() {
-        // Ni réglage écrit, ni valeur reconnue : la moitié des cœurs. C'est ce
-        // qui laisse de quoi décoder et servir un flux pendant l'analyse.
-        let expected = (cores() / 2).max(1);
-        assert_eq!(
-            super::intra_threads_for(&settings_with_throttle(None)),
-            expected
-        );
+    fn sans_reglage_le_defaut_depend_de_la_taille_de_la_machine() {
+        // Ce test affirmait « la moitié des cœurs » dans tous les cas. C'était
+        // vrai avant #1576, qui a rendu le défaut dépendant de la machine :
+        // `eco` (un seul fil) jusqu'à huit cœurs, `equilibre` (la moitié)
+        // au-delà. Le matériel typique d'un serveur audio — Pi, NAS, mini-PC —
+        // est précisément sous la barre, et c'est là que la passe avait éteint
+        // des machines.
+        //
+        // L'ancienne version passait sur toute machine de plus de huit cœurs et
+        // échouait en dessous. Elle n'a jamais été exécutée par la CI (aucune
+        // tâche ne lançait les tests de `tune-core` derrière `audio-embedding`),
+        // donc elle n'a été vue que sur des postes de développement — tous
+        // au-dessus de la barre. Le runner GitHub en a quatre.
+        let obtenu = super::intra_threads_for(&settings_with_throttle(None));
+        if cores() <= 8 {
+            assert_eq!(
+                obtenu,
+                1,
+                "sous huit cœurs le défaut doit être `eco` — un seul fil, la \
+                 machine reste utilisable pendant l'analyse ({} cœurs ici)",
+                cores()
+            );
+        } else {
+            assert_eq!(
+                obtenu,
+                (cores() / 2).max(1),
+                "au-delà de huit cœurs le défaut doit être `equilibre` — la \
+                 moitié de la machine ({} cœurs ici)",
+                cores()
+            );
+        }
+    }
+
+    #[test]
+    fn une_valeur_inconnue_retombe_toujours_sur_l_equilibre() {
+        // Contrat distinct du précédent, et c'est là que l'ancien test se
+        // trompait en les traitant ensemble : `intra_threads_for` n'applique
+        // `default_throttle()` que faute de réglage écrit. Un réglage PRÉSENT
+        // mais illisible — faute de frappe, valeur d'une version future,
+        // migration ratée — tombe dans la branche `_`, donc l'équilibre, quelle
+        // que soit la taille de la machine.
+        //
+        // C'est voulu : un réglage mal écrit ne doit ni mettre la machine à
+        // genoux, ni brider quelqu'un qui a demandé autre chose.
         assert_eq!(
             super::intra_threads_for(&settings_with_throttle(Some("n'importe quoi"))),
-            expected
+            (cores() / 2).max(1)
         );
     }
 
@@ -1250,5 +1343,42 @@ mod tests {
         let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "embedding not unit-norm: {norm}");
         assert!(emb.iter().all(|x| x.is_finite()));
+    }
+
+    /// #1837 — l'invariant qui manquait : **aucun chemin d'échec ne doit être
+    /// muet**. Sur .18, 51 pistes portaient le témoin sans empreinte et les
+    /// 11 Mo de journaux conservés ne contenaient aucune trace d'échec : les
+    /// deux cas ci-dessous étaient jetés par un `if let Ok(Ok(Ok(_)))`.
+    #[test]
+    fn aucun_echec_n_est_muet() {
+        let cas = [
+            DecodeFailure::Timeout,
+            DecodeFailure::Interrupted("task panicked".into()),
+            DecodeFailure::Decode("unsupported codec".into()),
+        ];
+        for échec in &cas {
+            let raison = échec.raison();
+            assert!(!raison.trim().is_empty(), "{échec:?} ne dit rien");
+        }
+    }
+
+    /// Les trois causes n'appellent pas le même remède : elles doivent rester
+    /// distinguables dans le journal, pas se fondre en un « échec » générique.
+    #[test]
+    fn les_trois_causes_restent_distinctes() {
+        let t = DecodeFailure::Timeout.raison();
+        let i = DecodeFailure::Interrupted("boum".into()).raison();
+        let d = DecodeFailure::Decode("codec inconnu".into()).raison();
+        assert_ne!(t, i);
+        assert_ne!(i, d);
+        assert_ne!(t, d);
+    }
+
+    /// L'erreur du décodeur doit être reportée telle quelle : c'est elle qu'on
+    /// lira pour comprendre pourquoi un FLAC ordinaire échoue.
+    #[test]
+    fn la_raison_porte_le_message_du_decodeur() {
+        let r = DecodeFailure::Decode("unsupported codec: mpc".into()).raison();
+        assert!(r.contains("unsupported codec: mpc"), "message perdu : {r}");
     }
 }

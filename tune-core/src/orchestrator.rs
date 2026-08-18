@@ -900,6 +900,21 @@ pub(crate) fn cap_output_bit_depth(bit_depth: u16) -> u16 {
     bit_depth.clamp(16, 24)
 }
 
+/// Faut-il emballer ce DSD en DoP (trames PCM 24 bits au seizième du débit) ?
+///
+/// - **Sortie locale** : « natif » et « dop » y mènent tous deux, une carte son
+///   ne recevant pas de DSD autrement.
+/// - **Renderer réseau** : uniquement sur choix EXPLICITE « dop ». En « auto »
+///   ou « natif », c'est `should_dsd_passthrough` qui tranche entre l'envoi du
+///   fichier tel quel et le transcodage.
+///
+/// Règle extraite en fonction libre parce que son absence côté réseau était
+/// invisible : `"dop"` n'était comparé qu'à un seul endroit du dépôt, sous un
+/// garde `is_local_output` (#1772).
+pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
+    (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -1967,6 +1982,14 @@ impl PlaybackOrchestrator {
         match dsd_mode.as_str() {
             "pcm" => false,
             "native" => true,
+            // « dop » n'est PAS du passthrough natif : le renderer doit recevoir
+            // le DSD emballé en trames PCM, pas le .dsf brut. Ce mode tombait
+            // dans le fourre-tout « auto » ci-dessous, qui sondait l'appareil et
+            // concluait au transcodage PCM — la moitié invisible de #1772. Le
+            // flux DoP est produit dans `resolve_local_track` ; ici on garantit
+            // seulement qu'un choix explicite ne se transforme jamais en envoi
+            // natif, y compris sur un renderer qui sait lire le DSF.
+            "dop" => false,
             _ => {
                 // Auto mode: probe renderer.
                 //
@@ -2593,10 +2616,50 @@ impl PlaybackOrchestrator {
             .is_some_and(|id| id.starts_with("local:"));
         let local_needs_wav = is_local_output && source_format.is_some();
 
-        // DSD DoP (DSD over PCM) for local output when dsd_mode is "native"
-        if is_local_output && source_format == Some(AudioFormat::Dsd) {
-            let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id);
-            if dsd_mode == "native" || dsd_mode == "dop" {
+        // Calculé ici, et non plus après la branche DoP : celle-ci en a besoin
+        // pour servir du DoP à un renderer réseau (#1772). Ne dépend que de
+        // `zone_output_type`, connu bien plus haut.
+        let is_network_output = matches!(
+            zone_output_type.as_deref(),
+            Some("dlna")
+                | Some("openhome")
+                | Some("chromecast")
+                | Some("bluos")
+                | Some("squeezebox")
+                | Some("slimproto")
+        );
+
+        // DSD en DoP (DSD over PCM), c'est-à-dire du DSD transporté dans des
+        // trames PCM 24 bits au seizième du débit.
+        //
+        // Deux cas, et le second manquait (#1772, Marco Polo, Wiim Pro → DAC
+        // Denafrips) :
+        //
+        //  - sortie locale : « natif » comme « dop » passent par ici, la carte
+        //    son ne sachant pas recevoir de DSD autrement ;
+        //  - renderer réseau : uniquement sur choix EXPLICITE « dop ». Le
+        //    lecteur réseau qui ne sait pas lire un .dsf sait souvent lire le
+        //    DoP — c'est ce que fait MinimServer, que le testeur a comparé.
+        //
+        // Avant ce correctif, `"dop"` n'était comparé qu'ici, sous le garde
+        // `is_local_output` : sur un renderer, le réglage tombait dans le
+        // fourre-tout de `should_dsd_passthrough`, était traité comme « auto »,
+        // et le Wiim n'annonçant pas le DSF, le serveur transcodait en PCM. Le
+        // DAC recevait donc du WAV 176,4 kHz — le débit DoP du DSD64, ce qui
+        // rendait le symptôme parfaitement trompeur.
+        //
+        // Le DoP réseau est plus sûr que le local : les octets partent par HTTP
+        // sans passer par le rappel cpal, donc ni le volume ni le ReplayGain ne
+        // peuvent détruire les marqueurs (cf. le grésillement de Cyrille).
+        let dsd_mode = if source_format == Some(AudioFormat::Dsd) {
+            ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id)
+        } else {
+            String::new()
+        };
+        let dop_requested = dop_requested(is_local_output, is_network_output, &dsd_mode);
+
+        if source_format == Some(AudioFormat::Dsd) {
+            if dop_requested {
                 let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
                 let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
                 // Réutilise le plafond déjà combiné avec le quirk catalogue.
@@ -2632,7 +2695,8 @@ impl PlaybackOrchestrator {
                         dsd_rate,
                         dop_rate,
                         channels = dop_channels,
-                        "dsd_dop_streaming_for_local_output"
+                        sortie = if is_local_output { "locale" } else { "réseau" },
+                        "dsd_dop_streaming"
                     );
 
                     let fp = file_path.clone();
@@ -2683,15 +2747,7 @@ impl PlaybackOrchestrator {
 
         // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC, WMA) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
-        let is_network_output = matches!(
-            zone_output_type.as_deref(),
-            Some("dlna")
-                | Some("openhome")
-                | Some("chromecast")
-                | Some("bluos")
-                | Some("squeezebox")
-                | Some("slimproto")
-        );
+        // (`is_network_output` est calculé plus haut, la branche DoP en a besoin.)
 
         // Browser (Web Audio) zones pull the file themselves via <audio> and can
         // only decode the mainstream web codecs (FLAC/MP3/AAC/WAV/Ogg/Opus). An
@@ -2786,6 +2842,19 @@ impl PlaybackOrchestrator {
             && !dlna_force_wav
             && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
+        // Même mécanique pour l'AAC (Marco Polo, #1424) : un Marantz SR7009 ou
+        // un Denon RC12 le décodent nativement, et le transcoder en FLAC ne fait
+        // que retarder le premier son et consommer du processeur — l'AAC étant
+        // déjà compressé avec perte, le transcodage n'apporte aucune qualité.
+        //
+        // Pas de garde `dlna_cap_16bit` ici, contrairement à l'ALAC : ce plafond
+        // vise les sources plus profondes que 16 bits, ce qu'un AAC n'est jamais.
+        // `dlna_force_wav` reste respecté — un renderer qui exige du LPCM le
+        // dit, et son exigence prime sur une préférence.
+        let aac_passthrough = source_format == Some(AudioFormat::Aac)
+            && is_network_output
+            && !dlna_force_wav
+            && ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id);
 
         // Chromecast's Default Media Receiver decodes a narrower set than most
         // DLNA renderers — notably it cannot play AIFF (which DLNA plays
@@ -2797,6 +2866,7 @@ impl PlaybackOrchestrator {
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
             && !alac_passthrough
+            && !aac_passthrough
             && source_format.as_ref().is_some_and(|f| {
                 if is_chromecast {
                     f.needs_transcode_for_chromecast()
@@ -10165,5 +10235,56 @@ mod bit_depth_cap_tests {
         // Une metadonnee fantaisiste ne doit pas produire un flux injouable.
         assert_eq!(cap_output_bit_depth(64), 24);
         assert_eq!(cap_output_bit_depth(u16::MAX), 24);
+    }
+}
+
+#[cfg(test)]
+mod dop_routing_tests {
+    use super::dop_requested;
+
+    /// #1772 — le cas RÉEL de Marco Polo : Wiim Pro (renderer DLNA) relié en
+    /// optique à un DAC Denafrips, zone réglée sur « dop ». Avant le correctif,
+    /// ce choix n'était comparé nulle part pour une sortie réseau : le DAC
+    /// recevait du PCM 176,4 kHz, soit très exactement le débit DoP du DSD64 —
+    /// d'où un symptôme qui ressemblait à s'y méprendre à du DoP qui marche.
+    #[test]
+    fn un_renderer_reseau_regle_sur_dop_recoit_du_dop() {
+        assert!(
+            dop_requested(false, true, "dop"),
+            "le choix explicite « dop » doit être honoré sur un renderer réseau"
+        );
+    }
+
+    /// La sortie locale ne régresse pas : ses deux modes historiques passent
+    /// toujours par le DoP, faute pour une carte son de recevoir du DSD.
+    #[test]
+    fn la_sortie_locale_gardes_ses_deux_modes() {
+        assert!(dop_requested(true, false, "native"));
+        assert!(dop_requested(true, false, "dop"));
+    }
+
+    /// Le renderer réseau en « natif » ou « auto » ne doit PAS être détourné
+    /// vers le DoP : c'est `should_dsd_passthrough` qui arbitre, et lui seul
+    /// sait si l'appareil annonce le DSF/DFF.
+    #[test]
+    fn un_renderer_en_natif_ou_auto_n_est_pas_detourne() {
+        assert!(!dop_requested(false, true, "native"));
+        assert!(!dop_requested(false, true, "auto"));
+        assert!(!dop_requested(false, true, ""));
+    }
+
+    /// « pcm » est un refus explicite : il ne produit jamais de DoP, nulle part.
+    #[test]
+    fn le_mode_pcm_ne_produit_jamais_de_dop() {
+        assert!(!dop_requested(true, false, "pcm"));
+        assert!(!dop_requested(false, true, "pcm"));
+    }
+
+    /// Une zone qui n'est ni locale ni réseau (navigateur, OAAT) ne reçoit pas
+    /// de DoP : ces chemins ont leur propre traitement du DSD.
+    #[test]
+    fn ni_locale_ni_reseau_ne_recoit_rien() {
+        assert!(!dop_requested(false, false, "dop"));
+        assert!(!dop_requested(false, false, "native"));
     }
 }

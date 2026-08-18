@@ -163,13 +163,31 @@ pub(crate) static ANALYSIS_SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 /// sweep (#1515), which must yield for the same reason and then some: its
 /// batches also run multi-threaded ONNX inference on top of the decode.
 pub(crate) fn any_zone_playing(backend: &Arc<dyn DbBackend>) -> bool {
-    matches!(
-        backend.query_one(
-            "SELECT 1 FROM zones WHERE last_play_state = 'playing' LIMIT 1",
+    playing_zone_name(backend).is_some()
+}
+
+/// Le NOM de la zone qui joue, pour que le report des passes d'analyse soit
+/// diagnosticable.
+///
+/// `any_zone_playing` ne disait que « oui » ou « non », et les journaux se
+/// bornaient à « pausing sweep ». Face à une analyse figée alors qu'il ne jouait
+/// rien, l'utilisateur ne pouvait pas savoir QUELLE zone la retenait — trois
+/// signalements ont buté là-dessus (#1464, #1456, #1457), la cause étant une
+/// zone restée à `playing` après un arrêt brutal. Nommer la zone rend la cause
+/// lisible dans le journal, sans lire le code.
+pub(crate) fn playing_zone_name(backend: &Arc<dyn DbBackend>) -> Option<String> {
+    backend
+        .query_one(
+            "SELECT name FROM zones WHERE last_play_state = 'playing' LIMIT 1",
             &[],
-        ),
-        Ok(Some(_))
-    )
+        )
+        .ok()
+        .flatten()
+        .map(|cols| {
+            cols.first()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "?".to_string())
+        })
 }
 
 /// Spawn the background ReplayGain analysis loop. Drains tracks that lack
@@ -651,8 +669,9 @@ mod tests {
         assert!(!any_zone_playing(&backend));
 
         db.execute_batch(
-            "CREATE TABLE zones (id INTEGER PRIMARY KEY, last_play_state TEXT);
-             INSERT INTO zones (id, last_play_state) VALUES (1, 'stopped'), (2, 'paused');",
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state)
+                 VALUES (1, 'Salon', 'stopped'), (2, 'Bureau', 'paused');",
         )
         .unwrap();
         assert!(!any_zone_playing(&backend));
@@ -660,6 +679,15 @@ mod tests {
         db.execute_batch("UPDATE zones SET last_play_state = 'playing' WHERE id = 2;")
             .unwrap();
         assert!(any_zone_playing(&backend));
+
+        // La garde doit NOMMER la zone qui bloque : sans ce nom, une analyse
+        // figée par une zone restée à `playing` après un arrêt brutal est
+        // indiagnosticable depuis les journaux (#1464, #1456, #1457).
+        assert_eq!(playing_zone_name(&backend).as_deref(), Some("Bureau"));
+
+        db.execute_batch("UPDATE zones SET last_play_state = 'stopped';")
+            .unwrap();
+        assert_eq!(playing_zone_name(&backend), None);
     }
 
     /// #1330 : la cadence DSD brute etait prise pour une cadence PCM, ce qui

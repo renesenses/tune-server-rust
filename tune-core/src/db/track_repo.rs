@@ -675,6 +675,16 @@ impl TrackRepo {
         rating: Option<i32>,
         collection_ids: Option<&[i64]>,
         collection_track_ids: Option<&[i64]>,
+        // Facettes Oxygen « lot 1 ». Les prédicats SQL ci-dessous sont les
+        // JUMEAUX de ceux de `routes::library::facets::build_conditions` (autre
+        // crate) : une facette qui compterait autrement que la liste qu'elle
+        // filtre serait pire qu'une facette absente.
+        favorite: Option<&str>,
+        playlist: Option<&str>,
+        untagged: Option<&str>,
+        // Année d'ENREGISTREMENT (`albums.original_year`) — distincte de
+        // `year`, qui est celle de l'édition.
+        original_year: Option<i32>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
@@ -824,6 +834,65 @@ impl TrackRepo {
                     .collect::<Vec<_>>()
                     .join(",");
                 conditions.push(format!("t.id IN ({list})"));
+            }
+        }
+
+        // L'année d'enregistrement vit sur l'ALBUM : jointure par EXISTS.
+        if let Some(y) = original_year {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND alo.original_year = {})",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Int(y as i64));
+            idx += 1;
+        }
+
+        // Favoris du profil 1 : la piste elle-même, ou son album.
+        if let Some(kind) = favorite.filter(|s| !s.is_empty()) {
+            match kind {
+                "album" => conditions.push(
+                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                     AND f.item_type = 'album' AND f.item_id = t.album_id)"
+                        .to_string(),
+                ),
+                "track" => conditions.push(
+                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
+                     AND f.item_type = 'track' AND f.item_id = t.id)"
+                        .to_string(),
+                ),
+                // Valeur inconnue : ne rien filtrer plutôt que tout exclure.
+                _ => {}
+            }
+        }
+
+        if let Some(name) = playlist.filter(|s| !s.is_empty()) {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
+                 WHERE pt.track_id = t.id AND LOWER(pl.name) = LOWER({}))",
+                make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Text(name.to_string()));
+            idx += 1;
+        }
+
+        // Étiquette manquante : liste FERMÉE, le SQL ne dépend jamais de
+        // l'entrée brute. « Manquant » = NULL ou chaîne vide (un tag effacé
+        // laisse souvent une chaîne vide, et l'utilisateur ne fait pas la
+        // différence).
+        if let Some(field) = untagged.filter(|s| !s.is_empty()) {
+            let missing = match field {
+                "genre" => Some("(t.genre IS NULL OR t.genre = '')"),
+                "year" => Some("(t.year IS NULL OR t.year = 0)"),
+                "artist" => Some("t.artist_id IS NULL"),
+                "album" => Some("t.album_id IS NULL"),
+                "cover" => Some(
+                    "(t.album_id IS NULL OR EXISTS (SELECT 1 FROM albums al \
+                      WHERE al.id = t.album_id AND (al.cover_path IS NULL OR al.cover_path = '')))",
+                ),
+                _ => None,
+            };
+            if let Some(cond) = missing {
+                conditions.push(cond.to_string());
             }
         }
 

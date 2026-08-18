@@ -116,14 +116,18 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
-    // Bandcamp (#1768) : recherche et découverte, sorties du cœur
-    // toujours-compilé. Aucun `HostServices` — ce plugin ne touche ni la base,
-    // ni la lecture, ni les réglages : il parle HTTP à un tiers, via le client
-    // partagé de tune-core. Lui inventer des services vides serait de la
-    // cérémonie.
+    // Bandcamp (#1768) : recherche, découverte et lecture, sorties du cœur
+    // toujours-compilé. Le lot 1 n'avait besoin d'AUCUN service — il ne parlait
+    // qu'HTTP à un tiers. Le lot 2 mémorise le pseudo et le `fan_id` résolu de
+    // l'acheteur : il lui faut la base, passée explicitement ici comme pour les
+    // deux autres plugins.
     #[cfg(feature = "bandcamp")]
     loader
-        .register(Box::new(tune_bandcamp::BandcampPlugin::new()))
+        .register(Box::new(tune_bandcamp::BandcampPlugin::new(
+            tune_bandcamp::HostServices {
+                backend: state.backend.clone(),
+            },
+        )))
         .await;
 }
 

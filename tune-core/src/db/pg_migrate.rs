@@ -266,7 +266,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     acoustid_confidence TEXT,
     trailing_silence_ms TEXT,
     synced_lyrics TEXT,
-    cover_path TEXT
+    cover_path TEXT,
+    -- Pistes virtuelles CUE (#1763) : cf le commentaire de CORE_SCHEMA.
+    cue_media_path TEXT,
+    cue_start_ms BIGINT,
+    cue_end_ms BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -347,6 +351,7 @@ CREATE TABLE IF NOT EXISTS zones (
     dlna_native_flac TEXT DEFAULT 0,
     host TEXT,
     alac_passthrough TEXT DEFAULT 0,
+    aac_passthrough TEXT DEFAULT 0,
     dlna_lpcm TEXT DEFAULT 0,
     dlna_cap_16bit TEXT DEFAULT 0,
     lyrics_offset_ms TEXT DEFAULT 0
@@ -754,6 +759,7 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_native_flac TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS aac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 
