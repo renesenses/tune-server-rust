@@ -11,6 +11,14 @@ services:
       # repertoire est vide — le relais NE MONTE PAS ces routes et se comporte
       # comme avant : un deploiement qui oublie le volume ne casse rien.
       - TUNE_BRIDGE_WEB_DIR=/srv/web
+      # Verification d'eligibilite premium. SANS ce jeton, le relais accepte
+      # tout serveur qui se presente et le DIT au demarrage
+      # (bridge_eligibilite_non_appliquee). On ne refuse pas tout le monde en
+      # son absence : un deploiement qui l'oublie mettrait dehors tous les
+      # utilisateurs premium, et le symptome ne pointerait pas vers la cause.
+      - TUNE_CLOUD_SERVICE_TOKEN=${TUNE_CLOUD_SERVICE_TOKEN:-}
+      # Surchargeable pour une recette ; par defaut https://mozaiklabs.fr
+      - TUNE_CLOUD_BASE_URL=${TUNE_CLOUD_BASE_URL:-}
     ports:
       - "9090:9090"
     volumes:

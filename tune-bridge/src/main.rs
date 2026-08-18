@@ -1,4 +1,5 @@
 mod api_proxy;
+mod licence;
 mod protocol;
 mod state;
 mod stream_proxy;
