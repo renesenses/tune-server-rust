@@ -45,6 +45,24 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
         "server registering"
     );
 
+    // Le Cloud Relay est PREMIUM. Le controle vivait cote serveur, sur
+    // `POST /cloud/bridge/enable` — la porte que l'utilisateur tient. Ici, on
+    // demande au cloud ce qu'il en est avant d'ouvrir la notre.
+    if let crate::licence::Verdict::Refuse(motif) =
+        state.licences.verifier(&register.server_id).await
+    {
+        warn!(server_id = %register.server_id, motif, "register refuse — licence");
+        // Le motif voyage jusqu'au serveur : il pourra le dire a son
+        // utilisateur au lieu de se reconnecter en boucle sans comprendre.
+        let reject = serde_json::json!({
+            "type": "relay.registered",
+            "ok": false,
+            "error": motif,
+        });
+        let _ = ws_tx.send(Message::Text(reject.to_string().into())).await;
+        return;
+    }
+
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(256);
 
     if let Err(reason) = state.register_server(

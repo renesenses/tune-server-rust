@@ -5244,6 +5244,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "time",
