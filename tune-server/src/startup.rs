@@ -1040,7 +1040,7 @@ pub async fn register_local_outputs(state: &AppState) {
 /// Tune de servir ce qui est local.
 pub async fn remount_network_shares(state: &AppState) {
     let rows = match state.backend.query_many(
-        "SELECT server, share, mount_path, username, password \
+        "SELECT server, share, mount_path, username, password, id, smb_version \
          FROM network_mounts WHERE mount_type = 'smb' AND COALESCE(active, 1) = 1",
         &[],
     ) {
@@ -1061,25 +1061,33 @@ pub async fn remount_network_shares(state: &AppState) {
         if host.is_empty() || share.is_empty() || path.is_empty() {
             continue;
         }
+        let id = r.get(5).and_then(|v| v.as_i64());
         // Deja monte (redemarrage du seul service, systeme reste debout) :
         // ne pas empiler un second montage sur le meme point.
-        if std::path::Path::new(&path)
-            .read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false)
-        {
-            tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_populated_skipping");
+        //
+        // Le test etait « le repertoire contient-il quelque chose ? ». Un point
+        // de montage non monte mais portant des residus — un scan a ecrit
+        // dedans pendant que le NAS etait tombe — faisait donc sauter le
+        // remontage SANS UN MOT, et l'utilisateur se retrouvait avec une
+        // bibliotheque a moitie lisible que rien n'expliquait. On demande
+        // desormais s'il s'agit reellement d'un point de montage (#1916).
+        if crate::smb::est_un_point_de_montage(std::path::Path::new(&path)) {
+            tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_mounted_skipping");
+            noter_montage(state, id, "mounted", None, None).await;
             continue;
         }
         let user = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
         let pass = r.get(4).and_then(|v| v.as_string()).unwrap_or_default();
+        let connu = r.get(6).and_then(|v| v.as_string()).unwrap_or_default();
 
-        // Meme commande que la route de montage — volontairement recopiee
-        // plutot que factorisee : la route rend des erreurs HTTP detaillees a
-        // un humain qui attend, celle-ci journalise et passe au suivant. Les
-        // fusionner obligerait a inventer une abstraction pour deux appelants
-        // aux contrats opposes.
-        let result = if cfg!(target_os = "macos") {
+        // La RESTITUTION reste propre a chaque appelant — la route rend des
+        // erreurs HTTP a un humain qui attend, celle-ci journalise et passe au
+        // suivant. La STRATEGIE de montage, elle, est commune (`crate::smb`) :
+        // recopiee, elle avait diverge, et ce code imposait encore `vers=3.0`
+        // quand la route avait appris a negocier. Le partage SMB 1.0 de
+        // Philippe Landes montait donc depuis l'assistant, et le premier
+        // redemarrage le lui reprenait (#1834).
+        let (result, dialecte_retenu) = if cfg!(target_os = "macos") {
             let creds = if user.is_empty() {
                 "guest@".to_string()
             } else if pass.is_empty() {
@@ -1088,40 +1096,154 @@ pub async fn remount_network_shares(state: &AppState) {
                 format!("{user}:{pass}@")
             };
             let unc = format!("//{creds}{host}/{share}");
-            tokio::time::timeout(
+            let res = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 tokio::process::Command::new("mount_smbfs")
                     .args([&unc, &path])
                     .output(),
             )
-            .await
+            .await;
+            (res, None)
         } else {
             let u = if user.is_empty() { "guest" } else { &user };
             let unc = format!("//{host}/{share}");
-            let opts = format!("username={u},password={pass},vers=3.0");
-            tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                tokio::process::Command::new("mount.cifs")
-                    .args([&unc, &path, "-o", &opts])
-                    .output(),
-            )
-            .await
+            // Le dialecte deja retenu passe en premier : sans cela, un partage
+            // SMB 1.0 rejouerait deux essais voues a l'echec a CHAQUE
+            // demarrage, soit vingt secondes avant que sa musique ne soit
+            // lisible. Le reste de l'echelle suit quand meme — un NAS mis a
+            // jour ne doit pas rester prisonnier de ce qu'il repondait avant.
+            let echelle = crate::smb::echelle(if connu.is_empty() {
+                None
+            } else {
+                Some(connu.as_str())
+            });
+            let mut dernier = None;
+            let mut gagnant = None;
+            for dialecte in echelle {
+                let mut opts = format!("username={u},password={pass}");
+                if let Some(v) = dialecte {
+                    opts.push_str(&format!(",vers={v}"));
+                }
+                // JAMAIS `opts` dans une trace : il porte le mot de passe.
+                let res = tokio::time::timeout(
+                    crate::smb::ESSAI_TIMEOUT,
+                    tokio::process::Command::new("mount.cifs")
+                        .args([&unc, &path, "-o", &opts])
+                        .output(),
+                )
+                .await;
+                let arreter = match &res {
+                    Ok(Ok(out)) if out.status.success() => {
+                        gagnant = Some(crate::smb::etiquette(dialecte).to_string());
+                        true
+                    }
+                    Ok(Ok(out)) => crate::smb::est_refus_d_authentification(
+                        &String::from_utf8_lossy(&out.stderr),
+                    ),
+                    // mount.cifs absent ou non executable : changer de dialecte
+                    // n'y fera rien.
+                    Ok(Err(_)) => true,
+                    Err(_) => false,
+                };
+                dernier = Some(res);
+                if arreter {
+                    break;
+                }
+            }
+            (dernier.expect("l'echelle n'est jamais vide"), gagnant)
         };
 
+        // Chaque issue est desormais ECRITE, pas seulement journalisee. C'est
+        // tout l'objet de #1916 : le remontage echouait, seul le journal le
+        // savait, l'interface continuait d'afficher le partage comme monte, et
+        // la lecture rendait une erreur reseau qui ne nommait jamais la cause.
+        // Eric (`ricouxxx`) a du trouver le contournement seul, sur un forum.
         match result {
             Ok(Ok(out)) if out.status.success() => {
-                info!(host = %host, share = %share, path = %path, "network_share_remounted")
+                info!(
+                    host = %host, share = %share, path = %path,
+                    dialect = dialecte_retenu.as_deref().unwrap_or("negocie"),
+                    "network_share_remounted"
+                );
+                noter_montage(state, id, "mounted", None, dialecte_retenu.as_deref()).await;
             }
-            Ok(Ok(out)) => warn!(
-                host = %host, share = %share,
-                error = %String::from_utf8_lossy(&out.stderr).trim(),
-                "network_share_remount_failed"
-            ),
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                warn!(
+                    host = %host, share = %share, error = %stderr,
+                    "network_share_remount_failed"
+                );
+                noter_montage(state, id, "failed", Some(&stderr), None).await;
+            }
             Ok(Err(e)) => {
-                warn!(host = %host, share = %share, error = %e, "network_share_remount_failed")
+                warn!(host = %host, share = %share, error = %e, "network_share_remount_failed");
+                noter_montage(state, id, "failed", Some(&e.to_string()), None).await;
             }
-            Err(_) => warn!(host = %host, share = %share, "network_share_remount_timeout"),
+            Err(_) => {
+                warn!(host = %host, share = %share, "network_share_remount_timeout");
+                noter_montage(
+                    state,
+                    id,
+                    "failed",
+                    Some("délai dépassé au montage"),
+                    None,
+                )
+                .await;
+            }
         }
+    }
+}
+
+/// Ecrit le constat du dernier montage sur la ligne du partage.
+///
+/// `active` dit ce que l'utilisateur VEUT ; ces colonnes disent ce qui s'est
+/// PASSE. Sans elles, un remontage en echec etait indiscernable d'un partage
+/// sain — c'est exactement ce qui a coute a Eric (`ricouxxx`) un aller-retour
+/// sur un forum public pour apprendre qu'il lui suffisait de re-saisir son
+/// partage (#1916).
+///
+/// `dialecte` n'est ecrit que lorsqu'il vient d'etre etabli : passer `None` sur
+/// un succes macOS, ou apres un echec, ne doit pas effacer ce qu'on savait.
+///
+/// Une ecriture ratee n'interrompt rien : le remontage suivant compte plus que
+/// la tenue du journal de bord.
+async fn noter_montage(
+    state: &AppState,
+    id: Option<i64>,
+    etat: &str,
+    erreur: Option<&str>,
+    dialecte: Option<&str>,
+) {
+    use tune_core::db::backend::ToSqlValue;
+    let Some(id) = id else { return };
+    let pg = state.backend.engine() == tune_core::db::engine::Engine::Postgres;
+    let p = |n: usize| {
+        if pg {
+            format!("${n}")
+        } else {
+            "?".to_string()
+        }
+    };
+    let erreur = erreur.map(|e| e.to_string());
+    // `network_mounts.id` est INTEGER sous SQLite et TEXT sous PostgreSQL. Lier
+    // un entier ferait echouer PostgreSQL en « operator does not exist: text =
+    // bigint » ; lier une chaine marche des deux cotes, SQLite appliquant
+    // l'affinite numerique de la colonne a l'operande texte.
+    let id_texte = id.to_string();
+    let mut sql = format!(
+        "UPDATE network_mounts SET mount_state = {}, last_mount_error = {}",
+        p(1),
+        p(2)
+    );
+    let mut args: Vec<&dyn ToSqlValue> = vec![&etat, &erreur];
+    if let Some(d) = dialecte.as_ref() {
+        sql.push_str(&format!(", smb_version = {}", p(3)));
+        args.push(d);
+    }
+    sql.push_str(&format!(" WHERE id = {}", p(args.len() + 1)));
+    args.push(&id_texte);
+    if let Err(e) = state.backend.execute(&sql, &args) {
+        warn!(error = %e, id, "network_share_state_write_failed");
     }
 }
 

@@ -184,6 +184,15 @@ CREATE TABLE IF NOT EXISTS network_mounts (
     username TEXT,
     password TEXT,
     active INTEGER DEFAULT 1,
+    -- `active` dit l'INTENTION de l'utilisateur (« ce partage doit etre
+    -- monte »). Les trois colonnes ci-dessous disent le CONSTAT — ce qui s'est
+    -- reellement passe au dernier essai. Rien ne les portait, et c'est ce qui
+    -- rendait #1916 invisible : le partage restait affiche comme monte alors
+    -- que le remontage au demarrage avait echoue, et la lecture rendait une
+    -- erreur reseau qui ne nommait jamais la cause.
+    smb_version TEXT,        -- dialecte retenu : 'negocie' | '2.0' | '1.0' (#1834)
+    mount_state TEXT,        -- 'mounted' | 'failed' — NUL = jamais tente
+    last_mount_error TEXT,   -- stderr de mount.cifs, jamais le mot de passe
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
@@ -1005,6 +1014,15 @@ WHERE key IN ('rg_album_gain','rg_album_peak')
         // sur des colonnes pas encore ajoutees, echouerait, et un echec de
         // migration casse tout le runner (vecu chez JF, sentinelle 99).
         // Colonnes ET index sont donc poses ensemble, dans le bloc de version.
+        up: "",
+    },
+    Migration {
+        version: 77,
+        name: "network_mounts_mount_state",
+        // Colonnes posees par add_column_if_missing dans le bloc de version :
+        // sur une base neuve elles viennent deja du CREATE TABLE de la
+        // migration 7, et un ALTER TABLE ici planterait tout le runner en
+        // « duplicate column name ».
         up: "",
     },
 ];
@@ -1908,6 +1926,17 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                  WHERE cue_media_path IS NOT NULL;",
             );
         }
+        if migration.version == 77 {
+            // Le dialecte qui a REELLEMENT monte le partage, et l'issue du
+            // dernier essai. Sans `smb_version`, le remontage au demarrage
+            // repartait de zero avec `vers=3.0` en dur : le partage SMB 1.0 de
+            // Philippe Landes montait depuis l'assistant puis se perdait au
+            // premier redemarrage (#1834). Sans `mount_state`, cet echec ne se
+            // voyait nulle part (#1916).
+            add_column_if_missing(db, "network_mounts", "smb_version", "TEXT");
+            add_column_if_missing(db, "network_mounts", "mount_state", "TEXT");
+            add_column_if_missing(db, "network_mounts", "last_mount_error", "TEXT");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -2015,6 +2044,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
+
+    // Constat du dernier montage SMB (migration v77). Passe de surete : le
+    // remontage au demarrage SELECTionne `smb_version`, donc une base qui
+    // arriverait ici sans la colonne ferait echouer la requete — et plus AUCUN
+    // partage ne serait remonte, pour tout le monde.
+    add_column_if_missing(db, "network_mounts", "smb_version", "TEXT");
+    add_column_if_missing(db, "network_mounts", "mount_state", "TEXT");
+    add_column_if_missing(db, "network_mounts", "last_mount_error", "TEXT");
 
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
@@ -2268,6 +2305,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         26,
         "queue_items_numbering",
         include_str!("../../migrations/postgres/026_queue_items_numbering.sql"),
+    ),
+    (
+        27,
+        "network_mounts_mount_state",
+        include_str!("../../migrations/postgres/027_network_mounts_mount_state.sql"),
     ),
 ];
 
@@ -2645,6 +2687,67 @@ mod tests {
         );
     }
 
+    /// Le remontage au démarrage `SELECT`e `smb_version` sur `network_mounts`.
+    /// Si la colonne manque, la requête échoue et **plus aucun partage n'est
+    /// remonté, pour tout le monde** — une base d'avant la v77 casserait donc
+    /// le remontage qu'elle est censée réparer.
+    ///
+    /// Ce test part d'une base portant la table dans sa forme d'origine (celle
+    /// de la migration 7), rejoue les migrations, et exige les trois colonnes.
+    /// Il ÉCHOUE contre le code d'avant (#1834, #1916).
+    #[test]
+    fn une_base_ancienne_gagne_les_colonnes_de_constat_du_montage() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant : ni dialecte retenu, ni constat.
+        db.execute_batch(
+            "CREATE TABLE network_mounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mount_type TEXT NOT NULL DEFAULT 'smb',
+                server TEXT NOT NULL,
+                share TEXT NOT NULL,
+                mount_path TEXT NOT NULL,
+                username TEXT,
+                password TEXT,
+                active INTEGER DEFAULT 1
+            );
+            INSERT INTO network_mounts (server, share, mount_path) \
+             VALUES ('192.168.1.159', 'ROSEDISK', '/mnt/rose');",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(network_mounts)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for attendue in ["smb_version", "mount_state", "last_mount_error"] {
+            assert!(
+                cols.iter().any(|c| c == attendue),
+                "`{attendue}` manque après migration : {cols:?}"
+            );
+        }
+
+        // Et la ligne existante survit : une migration qui reconstruirait la
+        // table ferait perdre son partage à l'utilisateur, ce qui est
+        // exactement le symptôme qu'on corrige.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_mounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "le partage enregistré a disparu à la migration");
+
+        // Colonnes vides tant qu'aucun montage n'a été tenté : NUL se lit
+        // « jamais tenté », et se distingue de 'failed'.
+        let etat: Option<String> = conn
+            .query_row("SELECT mount_state FROM network_mounts", [], |r| r.get(0))
+            .unwrap();
+        assert!(etat.is_none(), "mount_state devrait être NUL, vaut {etat:?}");
+    }
+
     /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
     /// serves. A fresh library must not carry them, and a library that already
     /// seeded them must lose them.
@@ -2836,7 +2939,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 26, "latest PG migration must be 26");
+        assert_eq!(pg_latest_version(), 27, "latest PG migration must be 27");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
