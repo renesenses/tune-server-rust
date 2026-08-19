@@ -1546,6 +1546,14 @@ impl PlaybackOrchestrator {
                 // (Progman/Cyrille: Qobuz shown compressed / wrong format).
                 .or_else(|| match resolved.source.as_str() {
                     "qobuz" => Some("flac".to_string()),
+                    // Bandcamp ne diffuse QUE du mp3-128 sans achat. Le dire
+                    // ici — et non depuis le client — pour deux raisons : le
+                    // repli sur le type MIME afficherait « MPEG » au lieu de
+                    // « MP3 », et surtout l'avance de file re-résout la piste
+                    // SANS qu'aucun client repasse un format. Sans cette
+                    // ligne, la piste 1 s'affichait autrement que la piste 2
+                    // du même album.
+                    "bandcamp" => Some("mp3".to_string()),
                     _ => None,
                 })
                 // A media-server (UPnP/NAS) item has no local track row, so the
@@ -2157,7 +2165,14 @@ impl PlaybackOrchestrator {
                     .ok_or("upload source requires source_id (file path)")?;
                 return self.resolve_uploaded_file(path, req).await;
             }
-            if source == "podcast" || source == "radio" || source == "upnp" {
+            // `bandcamp` entre par la MÊME porte qu'un podcast ou une radio :
+            // une URL distante déjà jouable, sans service enregistré derrière.
+            // Sans cette ligne il tombait dans `resolve_streaming_url`, qui
+            // cherche un service nommé « bandcamp » dans le registre et
+            // échoue — c'est pour ça que la vue jouait dans l'onglet plutôt
+            // que dans la zone (#1768).
+            if source == "podcast" || source == "radio" || source == "upnp" || source == "bandcamp"
+            {
                 return self.resolve_direct_url(req).await;
             }
             return self.resolve_streaming_url(source, req).await;
@@ -2250,8 +2265,18 @@ impl PlaybackOrchestrator {
         let cover_url = req.cover_url.clone();
         let duration_ms = req.duration_ms;
         let source = req.source.clone().unwrap_or_else(|| "podcast".into());
-        let mime_type = guess_mime_from_url(audio_url);
+        // Bandcamp ne sert QUE du `mp3-128`, et ses URL de flux
+        // (`t4.bcbits.com/stream/<hash>/mp3-128/<id>?…`) n'ont pas
+        // d'extension : `guess_mime_from_url` retombe sur son défaut, qui se
+        // trouve être le bon. On l'affirme ici plutôt que de dépendre d'un
+        // défaut — si ce défaut changeait, la zone recevrait un MIME faux.
+        let mime_type = if source == "bandcamp" {
+            "audio/mpeg"
+        } else {
+            guess_mime_from_url(audio_url)
+        };
         let is_radio = source == "radio";
+        let is_bandcamp = source == "bandcamp";
 
         let is_local_output = req
             .output_device_id
@@ -2343,6 +2368,107 @@ impl PlaybackOrchestrator {
                 stream_url,
                 Some(session_id),
                 "audio/wav".to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
+        } else if is_bandcamp && is_oaat_output {
+            // Un endpoint OAAT ne consomme que du PCM en conteneur WAV : son
+            // chemin HTTP le dit noir sur blanc (« Compressed formats fall
+            // through to HTTP streaming where the orchestrator already decoded
+            // them to WAV »). Lui pousser le mp3-128 de Bandcamp tel quel
+            // donnerait un flux qu'il ne sait pas ouvrir — c'est-à-dire le
+            // silence, exactement ce qu'on corrige.
+            //
+            // On réutilise la MÊME session de décodage que la radio sur OAAT,
+            // qui tourne en production sur .18 : `decode_radio_stream_to_pcm`
+            // décode un flux HTTP au fil de l'eau et se termine proprement à
+            // la fin des octets — une piste finie n'est qu'un flux qui
+            // s'arrête. Aucun chemin existant n'est modifié : la branche est
+            // fermée sur `source == "bandcamp"`.
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+                ..Default::default()
+            };
+            let (session_id, tx, data_ready, session) =
+                self.streamer.create_radio_session(wav_info, 256).await;
+            info!(url = %audio_url, "bandcamp_decode_to_wav_for_oaat_output");
+            let bc_url = audio_url.to_string();
+            let bc_levels_tx = if let Some(ref bus) = self.event_bus {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                Some(spawn_paced_levels_forwarder(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    0,
+                ))
+            } else {
+                None
+            };
+            let session_for_done = session.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    decode_radio_stream_to_pcm(bc_url, tx, data_ready, session, bc_levels_tx)
+                })
+                .await;
+                session_for_done
+                    .producer_done
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                match result {
+                    Ok(Ok(())) => debug!("bandcamp_oaat_decode_stream_ended"),
+                    Ok(Err(e)) => warn!(error = %e, "bandcamp_oaat_decode_failed"),
+                    Err(e) => warn!(error = %e, "bandcamp_oaat_decode_task_panic"),
+                }
+            });
+            let server_ip = self.server_ip();
+            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (
+                stream_url,
+                Some(session_id),
+                "audio/wav".to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
+        } else if is_bandcamp && !is_local_output && req.output_device_id.is_some() {
+            // Sortie RÉSEAU (DLNA/OpenHome). Bandcamp ne publie ses flux qu'en
+            // HTTPS, et un renderer DLNA ne sait pas ouvrir TLS : lui passer
+            // l'URL telle quelle donne un « PLAYING » suivi de silence — le
+            // même faux positif que la radio TSF Jazz envoyée en direct au
+            // Yamaha R-N2000A.
+            //
+            // On la sert donc par une session proxy locale, en clair, comme
+            // les pistes Tidal/Qobuz (`create_proxy_session`). Les octets
+            // passent verbatim : c'est du MP3 que tout renderer sait lire, il
+            // n'y a rien à transcoder.
+            let info = StreamInfo {
+                format: "mp3".into(),
+                mime_type: "audio/mpeg".into(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: duration_ms.map(|d| d as u64),
+                ..Default::default()
+            };
+            let session_id = self
+                .streamer
+                .create_proxy_session(info, audio_url.to_string(), false)
+                .await;
+            let server_ip = self.server_ip();
+            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "mp3");
+            info!(url = %audio_url, "bandcamp_proxy_for_network_output");
+            (
+                stream_url,
+                Some(session_id),
+                "audio/mpeg".to_string(),
                 Some(44100u32),
                 Some(16u32),
                 Some(2u32),
@@ -2455,6 +2581,24 @@ impl PlaybackOrchestrator {
                 };
                 (direct_url, None, mime_type.to_string(), None, None, None)
             }
+        } else if is_bandcamp {
+            // Sortie LOCALE (ou aucune sortie encore liée). `LocalOutput`
+            // télécharge et décode lui-même un flux HTTP compressé
+            // (`local_audio_non_wav_stream_detected_decoding`) : rien à
+            // interposer, et un transcodage ne ferait que dégrader deux fois.
+            //
+            // La résolution est AFFIRMÉE plutôt que laissée au défaut
+            // (44,1 kHz / 16 bits est ce que le mp3-128 de Bandcamp décode) :
+            // le chemin du signal doit annoncer « MP3 — Avec perte », et non
+            // hériter d'une valeur par défaut qu'on n'aurait pas choisie.
+            (
+                audio_url.to_string(),
+                None,
+                mime_type.to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
         } else {
             // Media-server / podcast direct URL. Carry the real resolution the
             // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
@@ -10088,6 +10232,170 @@ mod tests {
             "podcast should not create proxy session"
         );
         assert_eq!(resolved.url, "https://cdn.podcast.com/episode.mp3");
+    }
+
+    /// Une URL de flux Bandcamp telle qu'elle est publiée : pas d'extension,
+    /// le codec est dans le CHEMIN (`/mp3-128/`), pas au bout du nom.
+    const BC_STREAM: &str =
+        "https://t4.bcbits.com/stream/0123456789abcdef/mp3-128/1234567?p=0&ts=1&sig=deadbeef";
+
+    #[tokio::test]
+    async fn bandcamp_resolves_by_the_direct_url_door() {
+        // Le point de la correction : `source = "bandcamp"` doit ARRIVER dans
+        // `resolve_direct_url` via `resolve_stream`, et non partir chercher un
+        // service « bandcamp » dans le registre (qui n'existe pas) — c'est
+        // l'échec qui laissait la lecture dans l'onglet du navigateur.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: Some("An Artist".into()),
+            album_title: Some("An Album".into()),
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: Some("mp3".into()),
+        };
+        let resolved = orch.resolve_stream(&req).await.unwrap();
+        assert_eq!(resolved.source, "bandcamp");
+        assert_eq!(
+            resolved.url, BC_STREAM,
+            "sans sortie : URL servie telle quelle"
+        );
+        assert!(resolved.stream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn bandcamp_mime_is_asserted_not_guessed() {
+        // L'URL n'a pas d'extension : `guess_mime_from_url` retomberait sur son
+        // défaut. On veut que le MIME soit AFFIRMÉ — Bandcamp ne sert que du
+        // mp3-128 —, pas hérité d'un défaut qui pourrait changer.
+        assert_eq!(super::guess_mime_from_url(BC_STREAM), "audio/mpeg");
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some("https://t4.bcbits.com/stream/x/mp3-128/42".into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn bandcamp_is_proxied_in_clear_http_for_a_network_renderer() {
+        // Bandcamp ne publie qu'en HTTPS ; un renderer DLNA ne sait pas ouvrir
+        // TLS. Sans proxy local, il annonce PLAYING et n'émet rien — le faux
+        // positif déjà vu sur le Yamaha R-N2000A.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("dlna:uuid-1234".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "une sortie réseau doit passer par une session proxy locale"
+        );
+        assert!(
+            resolved.url.starts_with("http://"),
+            "l'URL servie au renderer doit être en clair, pas en TLS : {}",
+            resolved.url
+        );
+        // Les octets passent verbatim : c'est toujours du MP3, rien n'est
+        // transcodé. Le renderer doit donc lire « audio/mpeg ».
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn bandcamp_is_decoded_to_wav_for_an_oaat_endpoint() {
+        // Un endpoint OAAT ne consomme que du PCM en conteneur WAV.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("oaat:endpoint-1".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(resolved.stream_id.is_some());
+        assert_eq!(resolved.mime_type, "audio/wav");
+        assert_eq!(resolved.sample_rate, Some(44100));
+    }
+
+    #[tokio::test]
+    async fn bandcamp_goes_straight_to_a_local_dac() {
+        // La sortie locale télécharge et décode elle-même un flux HTTP
+        // compressé (`local_audio_non_wav_stream_detected_decoding`) : rien à
+        // interposer, et surtout rien à transcoder pour rien.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("local:default".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(resolved.stream_id.is_none());
+        assert_eq!(resolved.url, BC_STREAM);
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+        // Affirmée, pas héritée d'un défaut : le chemin du signal doit
+        // annoncer « MP3 — Avec perte » de sa propre autorité.
+        assert_eq!(resolved.sample_rate, Some(44100));
+        assert_eq!(resolved.bit_depth, Some(16));
     }
 
     /// An output that rejects `play_media` — mirrors an AirPlay renderer whose
