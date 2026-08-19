@@ -856,50 +856,48 @@ jobs:
   # Docker Hub publication is handled separately by docker.yml on the
   # same tag, so no docker job here.
 
-  # Image appliance x86-64. Appelée ICI, et pas déclenchée par
-  # `on: release: [published]` dans tune-os.yml : la release est créée avec le
-  # `GITHUB_TOKEN`, et GitHub refuse par conception qu'un évènement émis par ce
-  # jeton déclenche un autre workflow. Le déclencheur existait, n'a jamais
-  # fonctionné, et son silence a coûté six versions sans image (0.9.63 → 0.9.68)
-  # sans un seul run en échec pour l'annoncer.
+  # L'image appliance DEBIAN n'est plus construite ni publiee.
   #
-  # `needs: release` garantit que l'asset linux-x86_64 est attaché — l'étape
-  # « Resolve version » de tune-os.yml échoue explicitement s'il manque.
-  tune-os-image:
-    name: Build Tune OS image
-    needs: release
-    # Stables uniquement : une RC n'a pas d'image, comme elle n'a pas de tap.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
-    uses: ./.github/workflows/tune-os.yml
-    permissions:
-      contents: write
-    with:
-      version: ${{ github.ref_name }}
-      attach_to_release: true
+  # Elle etait declaree depreciee — remplacee par l'ISO Fedora et l'image
+  # flashable du depot renesenses/tune-os — mais la chaine continuait de la
+  # produire a chaque release. La page /download offrait donc DEUX images x86
+  # sous le meme numero de version, l'une Fedora et l'autre Debian, sans que
+  # rien ne dise laquelle prendre. Benjithom s'etait deja trompe de fichier
+  # entre l'ISO et l'image a graver ; un troisieme candidat d'un AUTRE systeme
+  # d'exploitation rendait le choix intenable.
+  #
+  # Une deprecation qui n'est pas appliquee a la chaine de construction n'est
+  # pas une deprecation : c'est un cout de maintenance double d'une confusion
+  # chez l'utilisateur.
+  #
+  # `.github/workflows/tune-os.yml` est conserve avec son `workflow_dispatch` :
+  # reconstruire une image Debian a posteriori reste possible a la main, si un
+  # utilisateur historique en a besoin. Ce qui disparait, c'est sa production
+  # automatique a chaque version.
 
   # ─── La bascule en public ──────────────────────────────────────────────
   #
   # Seul endroit du workflow qui rend une release visible des clients. Elle
   # ne s'ouvre que si TOUT a abouti : les binaires (`build`), leur dépôt et
-  # leurs sommes de contrôle (`release`), et l'image appliance
-  # (`tune-os-image`), qui s'attachait jusqu'ici à une release déjà publique.
+  # leurs sommes de contrôle (`release`).
   #
-  # `always()` est nécessaire pour que le job s'évalue malgré un `needs`
-  # SAUTÉ — une RC n'a pas d'image Tune OS, et sans ça la release resterait
-  # en brouillon pour toujours. Les conditions qui suivent font le tri : un
-  # `skipped` est acceptable, un `failure` ne l'est pas.
+  # `always()` est conservé : il permet au job de s'évaluer même si un `needs`
+  # est SAUTÉ, et les conditions qui suivent font le tri — un `failure` ne
+  # passe pas. Sans lui, une branche sautée laisserait la release en brouillon
+  # pour toujours, ce qui est déjà arrivé.
   #
-  # Les identifiants de job à tiret ne peuvent pas s'écrire `needs.tune-os-image`
-  # dans une expression — le tiret y serait lu comme une soustraction. D'où
-  # la notation entre crochets.
+  # ⚠️ Ce bloc mentionnait un troisième `needs`, `tune-os-image`, qui
+  # construisait l'image appliance DEBIAN. Ce job a été retiré (voir plus
+  # haut) ; sa dépendance devait l'être aussi, sans quoi le workflow échouait
+  # au chargement sur un `needs` vers un job inexistant — et la release ne
+  # serait jamais publiée.
   publish:
     name: Publish release (drop the draft)
-    needs: [build, release, tune-os-image]
+    needs: [build, release]
     if: >-
       always()
       && needs.build.result == 'success'
       && needs.release.result == 'success'
-      && (needs['tune-os-image'].result == 'success' || needs['tune-os-image'].result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
