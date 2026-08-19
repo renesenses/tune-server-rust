@@ -63,7 +63,19 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Meme dependance systeme que le job de build : sans elle, la compilation
       # s'arrete sur « Package alsa was not found in the pkg-config ».
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 6
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
       - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
@@ -99,7 +111,19 @@ jobs:
       # `audio-embedding` pulls audio crates (via ort/cpal deps) that link ALSA;
       # install it like the main build job does, or the compile-check fails on
       # `Package alsa was not found in the pkg-config`.
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 6
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
       - run: cargo check -p tune-server --features audio-embedding
       - run: cargo test -p tune-core --features audio-embedding
 
@@ -149,7 +173,24 @@ jobs:
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 6
+        run: |
+          # Les runners Ubuntu de GitHub ont deux fois bloque cette commande
+          # indefiniment (0.9.86 : 6 h avant que le plafond ne tue le job et
+          # emporte la release ; 0.9.87 : rebelote). apt n'a pas de delai par
+          # defaut et githubstatus ne declare rien : sans garde-fou, une panne
+          # de miroir passagere coute une version entiere.
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              echo "libasound2-dev installe (essai $essai)"
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3) — nouvel essai dans 20 s"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+          exit 1
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
