@@ -188,7 +188,24 @@ jobs:
 
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 6
+        run: |
+          # Les runners Ubuntu de GitHub ont deux fois bloque cette commande
+          # indefiniment (0.9.86 : 6 h avant que le plafond ne tue le job et
+          # emporte la release ; 0.9.87 : rebelote). apt n'a pas de delai par
+          # defaut et githubstatus ne declare rien : sans garde-fou, une panne
+          # de miroir passagere coute une version entiere.
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              echo "libasound2-dev installe (essai $essai)"
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3) — nouvel essai dans 20 s"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+          exit 1
 
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
