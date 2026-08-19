@@ -107,3 +107,52 @@ mod tests {
         assert!(v.split('.').count() >= 3, "version must be semver: {v}");
     }
 }
+
+#[cfg(test)]
+mod manifeste_tests {
+    /// Une dependance ajoutee a la suite de `libc` herite silencieusement de
+    /// `[target.'cfg(unix)'.dependencies]`.
+    ///
+    /// C'est ce qui est arrive aux cinq bibliotheques de l'appairage AirPlay 2
+    /// (#1911) : sur Windows elles n'existaient pas, alors que
+    /// `outputs/airplay2/pairing.rs` n'est restreint a rien. La ligne de
+    /// release ne compilait plus sous Windows, et seulement sous Windows —
+    /// Linux et macOS passaient, donc le defaut n'apparaissait qu'au moment de
+    /// construire les artefacts.
+    ///
+    /// Ce test lit le manifeste : la section `cfg(unix)` ne doit contenir que
+    /// `libc`. Toute autre dependance qui s'y retrouve est presque surement
+    /// tombee la par accident.
+    #[test]
+    fn la_section_unix_ne_contient_que_libc() {
+        let manifeste = include_str!("../Cargo.toml");
+
+        // Par LIGNES, et non par decoupage sur la chaine : cet en-tete
+        // apparait aussi dans le commentaire qui explique le piege, et un
+        // `split` naif tomberait dessus. Le piege attrape jusqu'a son propre
+        // garde-fou.
+        let mut dedans = false;
+        let mut dependances: Vec<&str> = Vec::new();
+        for ligne in manifeste.lines() {
+            let l = ligne.trim();
+            if l.starts_with('[') {
+                dedans = l == "[target.'cfg(unix)'.dependencies]";
+                continue;
+            }
+            if dedans && !l.is_empty() && !l.starts_with('#') {
+                if let Some(nom) = l.split('=').next() {
+                    dependances.push(nom.trim());
+                }
+            }
+        }
+
+        assert_eq!(
+            dependances,
+            vec!["libc"],
+            "la section cfg(unix) ne doit contenir que `libc`. Les autres y \
+             tombent par accident — on ajoute a la suite sans voir l'en-tete — \
+             et disparaissent de la compilation Windows sans que rien ne le \
+             signale avant la construction des artefacts."
+        );
+    }
+}
