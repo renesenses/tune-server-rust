@@ -127,6 +127,43 @@ jobs:
       - run: cargo check -p tune-server --features audio-embedding
       - run: cargo test -p tune-core --features audio-embedding
 
+  # Windows casse SEUL, et tard. Le job `build` couvre bien la cible, mais il a
+  # `needs: test`, et compile en --release : le verdict arrive apres de longues
+  # minutes, quand la PR a deja l'air verte. C'est ainsi que #1911 a ete
+  # fusionnee avec un build Windows rouge, et que la v0.9.88 a ete taguee sur
+  # une ligne qui ne compilait pas pour Windows — donc sans installeur, l'etape
+  # Package etant sautee alors que `Create Release` publie en `if: always()`.
+  #
+  # Le defaut : cinq caisses de cryptographie ajoutees par proximite sous
+  # `[target.'cfg(unix)'.dependencies]` alors que `airplay2/pairing.rs` les
+  # importe sans conditionnelle. Windows n'est pas unix — imports non resolus,
+  # et toutes les autres cibles vertes.
+  #
+  # Ce job fait `cargo check` (pas --release, pas d'edition de liens du binaire
+  # final) et surtout SANS `needs:` : il demarre avec les tests au lieu de les
+  # attendre. Il ne remplace pas le build de release, il le devance.
+  #
+  # ⚠️ Il tourne sur windows-latest et NON en verification croisee depuis
+  # ubuntu : cet espace de travail tire ring, aws-lc-sys, libsqlite3-sys et
+  # audiopus_sys, dont les scripts de construction exigent un compilateur C
+  # Windows. Une compilation croisee echoue des ces scripts — verifie.
+  windows-check:
+    name: Compilation Windows (verification precoce)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Jeu de fonctionnalites IDENTIQUE a l'etape « Build (native, Windows) »
+      # du job build : c'est parce que Windows est la seule cible sans
+      # local-audio ni audio-embedding qu'elle casse seule.
+      - run: cargo check -p tune-core -p tune-server --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+
   build:
     name: Build ${{ matrix.target }}
     needs: test
