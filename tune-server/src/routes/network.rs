@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::process::Command;
+use tracing::{info, warn};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -561,18 +562,104 @@ async fn mount_smb_share(
         )
         .await
     } else {
-        // Linux: mount.cifs
+        // Linux: mount.cifs, en NEGOCIANT le dialecte au lieu de l'imposer.
+        //
+        // `vers=3.0` etait code en dur, sans repli ni choix. Or le module CIFS
+        // du noyau ne negocie de lui-meme qu'entre 2.1, 3.0 et 3.1.1 : il ne
+        // descend jamais plus bas et refuse par `mount error(22): Invalid
+        // argument`, un message qui ne dit rien de la cause.
+        //
+        // Philippe Landes l'a paye cher : `smbclient -L` listait parfaitement
+        // le partage ROSEDISK de son NAS Rose, avec les memes identifiants,
+        // pendant que le montage echouait. L'asymetrie tient a ce que
+        // `smbclient` est du Samba en espace utilisateur — il descend plus bas
+        // que le noyau. Le materiel audio embarque souvent un Samba ancien ;
+        // tout ce parc etait donc inaccessible, sans que rien ne l'explique.
+        //
+        // On essaie donc, dans l'ordre : negociation libre (le noyau prend le
+        // meilleur dialecte moderne), puis 2.0, puis 1.0. Le premier qui monte
+        // gagne.
         let user = body.username.as_deref().unwrap_or("guest");
         let pass = body.password.as_deref().unwrap_or("");
         let unc = format!("//{}/{}", body.host, body.share_name);
-        let opts = format!("username={user},password={pass},vers=3.0");
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            Command::new("mount.cifs")
-                .args([&unc, &mount_path, "-o", &opts])
-                .output(),
-        )
-        .await
+
+        // `None` = pas d'option `vers=` du tout : c'est ce qui declenche la
+        // negociation du noyau, et non une valeur particuliere.
+        const DIALECTES: [Option<&str>; 3] = [None, Some("2.0"), Some("1.0")];
+        // 10 s par essai : trois essais tiennent alors sous le delai d'attente
+        // de 60 s de l'API, la ou 15 s l'auraient frole.
+        const ESSAI_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let mut dernier = None;
+        for dialecte in DIALECTES {
+            let mut opts = format!("username={user},password={pass}");
+            if let Some(v) = dialecte {
+                opts.push_str(&format!(",vers={v}"));
+            }
+            // JAMAIS `opts` dans une trace : il porte le mot de passe.
+            info!(
+                host = %body.host,
+                share = %body.share_name,
+                dialect = dialecte.unwrap_or("negocie"),
+                "smb_mount_attempt"
+            );
+            let res = tokio::time::timeout(
+                ESSAI_TIMEOUT,
+                Command::new("mount.cifs")
+                    .args([&unc, &mount_path, "-o", &opts])
+                    .output(),
+            )
+            .await;
+
+            let arreter = match &res {
+                Ok(Ok(out)) if out.status.success() => {
+                    info!(
+                        host = %body.host,
+                        share = %body.share_name,
+                        dialect = dialecte.unwrap_or("negocie"),
+                        "smb_mount_ok"
+                    );
+                    true
+                }
+                Ok(Ok(out)) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    // Sans cette trace, un echec de montage ne laissait AUCUNE
+                    // marque nulle part : ni a l'ecran (le client jetait le
+                    // corps de la reponse), ni au journal. Le diagnostic
+                    // existait deux fois et disparaissait deux fois.
+                    warn!(
+                        host = %body.host,
+                        share = %body.share_name,
+                        dialect = dialecte.unwrap_or("negocie"),
+                        error = %stderr,
+                        "smb_mount_failed"
+                    );
+                    // Un refus d'authentification ne se repare pas en changeant
+                    // de dialecte : inutile de faire patienter l'utilisateur
+                    // vingt secondes de plus pour la meme reponse.
+                    est_refus_d_authentification(&stderr)
+                }
+                Ok(Err(e)) => {
+                    // mount.cifs absent ou non executable : reessayer avec un
+                    // autre dialecte ne changera rien.
+                    warn!(host = %body.host, error = %e, "smb_mount_command_failed");
+                    true
+                }
+                Err(_) => {
+                    warn!(
+                        host = %body.host,
+                        dialect = dialecte.unwrap_or("negocie"),
+                        "smb_mount_timeout"
+                    );
+                    false
+                }
+            };
+            dernier = Some(res);
+            if arreter {
+                break;
+            }
+        }
+        dernier.expect("DIALECTES n'est jamais vide")
     };
 
     let mount_ok = match mount_result {
@@ -1255,5 +1342,61 @@ mod tests {
         let resources = parse_res_elements(element);
         let best = select_best_res(&resources).unwrap();
         assert!(best.url.ends_with("track.mp3"));
+    }
+}
+
+/// Le message d'erreur de `mount.cifs` traduit-il un refus d'identifiants ?
+///
+/// Extrait pour etre testable, et parce que la distinction porte une decision :
+/// un dialecte inadapte se repare en en essayant un autre, un mot de passe
+/// refuse non. Reessayer trois fois ferait patienter l'utilisateur trente
+/// secondes pour lui resservir la meme reponse.
+fn est_refus_d_authentification(stderr: &str) -> bool {
+    let bas = stderr.to_lowercase();
+    bas.contains("permission denied")
+        || bas.contains("access denied")
+        || bas.contains("bad user name or password")
+}
+
+#[cfg(test)]
+mod tests_smb_dialecte {
+    use super::est_refus_d_authentification;
+
+    #[test]
+    fn un_refus_d_identifiants_arrete_les_essais() {
+        assert!(est_refus_d_authentification(
+            "mount error(13): Permission denied"
+        ));
+        assert!(est_refus_d_authentification("Access denied"));
+        assert!(est_refus_d_authentification(
+            "mount error: bad user name or password"
+        ));
+    }
+
+    /// Le cas de Philippe Landes : `mount error(22): Invalid argument`, obtenu
+    /// avec vers=3.0, puis en negociation libre, puis avec vers=2.0 — alors que
+    /// `smbclient -L` listait le partage avec les MEMES identifiants. Si ce
+    /// message etait pris pour un refus d'authentification, la boucle
+    /// s'arreterait au premier essai et n'atteindrait jamais le dialecte qui
+    /// marche : le correctif ne corrigerait rien.
+    #[test]
+    fn un_dialecte_inadapte_laisse_la_boucle_continuer() {
+        assert!(!est_refus_d_authentification(
+            "mount error(22): Invalid argument"
+        ));
+        assert!(!est_refus_d_authentification(
+            "mount error(112): Host is down"
+        ));
+        assert!(!est_refus_d_authentification("Device or resource busy"));
+        assert!(!est_refus_d_authentification(""));
+    }
+
+    /// La casse de `mount.cifs` varie selon les versions.
+    #[test]
+    fn la_casse_du_message_ne_change_rien() {
+        assert!(est_refus_d_authentification("PERMISSION DENIED"));
+        assert!(est_refus_d_authentification(
+            "Mount Error(13): Permission Denied"
+        ));
     }
 }
