@@ -492,6 +492,12 @@ fn album_jouable(tralbum: &Value) -> Value {
         "artist": tralbum["artist"],
         "title": tralbum["current"]["title"],
         "art_id": tralbum["art_id"],
+        // La pochette RÉSOLUE, et pas seulement l'`art_id` brut. La découverte
+        // et la recherche la servent déjà ; l'album, lui, laissait le client
+        // recomposer l'URL — c'est-à-dire réinventer le préfixe `a` dont
+        // l'oubli renvoyait un 404 (#1768). Une lecture vers une zone a besoin
+        // d'une pochette : c'est elle qui part dans le DIDL du renderer.
+        "pochette": pochette(tralbum.get("art_id")),
         "track_count": pistes.len(),
         "tracks": pistes,
         // Annoncé à chaque réponse, pas seulement par piste : un client qui
@@ -1179,6 +1185,16 @@ mod tests {
         assert_eq!(a["lossless"], false);
         assert!(a["quality_note"].as_str().unwrap().contains("128"));
         assert_eq!(a["tracks"][0]["quality"], "mp3-128");
+    }
+
+    #[test]
+    fn lalbum_sert_la_pochette_resolue_pas_seulement_lart_id() {
+        // Une lecture vers une zone envoie la pochette dans le DIDL du
+        // renderer. La laisser recomposer par le client, c'est lui faire
+        // réinventer le préfixe `a` — celui dont l'oubli renvoyait un 404.
+        let t = extraire_tralbum(PAGE).unwrap();
+        let a = album_jouable(&t);
+        assert_eq!(a["pochette"], "https://f4.bcbits.com/img/a4034627626_2.jpg");
     }
 
     #[test]

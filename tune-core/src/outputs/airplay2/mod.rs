@@ -17,6 +17,7 @@ use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportSta
 /// Curve25519). Protocole complet et testé hors ligne, mais **dormant** :
 /// aucun chemin de découverte ou de sortie ne l'appelle, et le transport RTSP
 /// réel n'a jamais été confronté à un appareil. Voir l'en-tête du module.
+#[cfg(unix)]
 pub mod pairing;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
