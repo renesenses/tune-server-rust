@@ -100,7 +100,18 @@ jobs:
             -e TUNE_TARBALL_PATH="$TUNE_TARBALL_PATH" \
             debian:bookworm bash -ec '
               apt-get update -qq
-              apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null
+              for essai in 1 2 3; do
+                if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null; then
+                  break
+                fi
+                if [ "$essai" = "3" ]; then
+                  echo "::error::apt injoignable apres 3 essais"
+                  exit 1
+                fi
+                echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+                sudo rm -rf /var/lib/apt/lists/*
+                sleep 20
+              done
               ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}" || {
                 echo "=== debootstrap.log (fin) ==="
                 tail -n 150 /tmp/tune-os-build/rootfs/debootstrap/debootstrap.log 2>/dev/null || true

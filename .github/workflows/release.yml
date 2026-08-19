@@ -242,7 +242,18 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            sudo apt-get install -y --no-install-recommends cmake clang
+            for essai in 1 2 3; do
+              if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y --no-install-recommends cmake clang; then
+                break
+              fi
+              if [ "$essai" = "3" ]; then
+                echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+                exit 1
+              fi
+              echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+              sudo rm -rf /var/lib/apt/lists/*
+              sleep 20
+            done
           fi
           if cargo install --git https://github.com/renesenses/airplay2-rs \
                --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
@@ -811,7 +822,18 @@ jobs:
             echo "MINISIGN_SECRET_KEY not set — skipping release signing"
             exit 0
           fi
-          sudo apt-get update && sudo apt-get install -y minisign
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y minisign; then
+              break
+            fi
+            if [ "$essai" = "3" ]; then
+              echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+              exit 1
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
           # minisign needs the 2-line key format (comment + base64). The secret
           # may be stored with or without the leading "untrusted comment:" line,
           # so reconstruct it when absent.
