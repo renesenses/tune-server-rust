@@ -1320,6 +1320,89 @@ pub async fn pair_verify(
 mod tests {
     use super::*;
 
+    /// Un **vrai** M2, capturé sur un Apple TV 4K (`AppleTV14,1`,
+    /// `AirTunes/960.13.1`) le 19/08/2026, en réponse au M1 que
+    /// [`build_setup_m1`] produit.
+    ///
+    /// Ce qu'il apporte que l'accessoire simulé ne peut pas apporter : le
+    /// simulateur est écrit par le même auteur que le décodeur, donc il
+    /// partage ses hypothèses. Une règle de fragmentation mal comprise
+    /// passerait des deux côtés. Ces octets-ci viennent d'Apple.
+    ///
+    /// Rien de secret n'y figure : `s` est un sel public et `B` une clé
+    /// publique éphémère d'une session jamais menée au-delà de M2. Aucune clé
+    /// privée, aucun code.
+    const M2_APPLE_TV_REEL: &str = concat!(
+        "06010202105835a9ead283e8c57554205dbfc7b8e203ff43658e31d64b5579dd",
+        "5fc957092117b2d4370bcf413ce76368e9b27351f0d6bfaaa777025a1b2b48b7",
+        "303b700fefe88a924e0b2316f969df0d0483aefec9a25c93617277e4bcfdefd4",
+        "433f4bac720ee909874408610d7f101f8af1d344a259eb30ad82ebe800982b63",
+        "8304064d2bd801f58b2e5cdb4452cb5f5360d17b78b0b2814067e7e8698c8d7f",
+        "7fdd3ce10b52f1b82b33069d71b0353954ff42df29667914fea89376163f42fe",
+        "e444e2ed13831079aa8b0e7588742b8ca3a84aa1c41b648d56e8e0e40456c0e1",
+        "ba14b5f739e55a36251fe7816c4014b401b73d6253d7f8cbd95bd19d6834bfe0",
+        "18edfbc7717cb9ef3e884275a476b04fa7f579f1cedc0381e60ceee623921ebe",
+        "20140466e2be861f6328ebd5d1481b08762b6338a7bd64b2004586fcbd22c365",
+        "1fc85ec1480645f086059509807d07627e1596e14a53a6587a37b80caa6ac64c",
+        "b145d2636c99d256d6b1dd7c52a5f38fd0d71347d256696809c26dbef704fb05",
+        "e0943122ce3564585b635c380e294d7d7f181f5fd0869cff22",
+    );
+
+    fn octets(hexa: &str) -> Vec<u8> {
+        (0..hexa.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hexa[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn un_vrai_m2_d_apple_tv_se_decode() {
+        let brut = octets(M2_APPLE_TV_REEL);
+        assert_eq!(brut.len(), 409, "la capture doit etre intacte");
+
+        let m2 = parse_setup_m2(&brut).expect("un M2 reel doit se decoder");
+
+        // 16 octets : le sel HAP, invariable.
+        assert_eq!(m2.salt.len(), 16, "sel HAP de 16 octets");
+
+        // 384 octets = 3072 bits. C'est la preuve materielle que le groupe
+        // SRP vise juste : `SrpClient::<Sha512>::new(&G_3072)`. Un G_2048
+        // aurait rendu 256 octets.
+        assert_eq!(
+            m2.server_pubkey.len(),
+            384,
+            "B doit faire 3072 bits — sinon le groupe SRP est faux"
+        );
+    }
+
+    #[test]
+    fn la_fragmentation_hap_est_reelle_et_recollee() {
+        // Un item TLV8 ne peut pas depasser 255 octets, donc Apple envoie B en
+        // DEUX items de type 0x03 consecutifs : 255 puis 129. Le decodeur doit
+        // les recoller. C'est la regle la plus facile a mal comprendre, et la
+        // capture prouve qu'elle s'applique vraiment.
+        let brut = octets(M2_APPLE_TV_REEL);
+
+        // Le premier fragment de PUBLIC_KEY est bien annonce a 0xFF.
+        let pos = brut
+            .windows(2)
+            .position(|w| w[0] == tlv_type::PUBLIC_KEY && w[1] == 0xFF)
+            .expect("un fragment de 255 octets doit exister");
+        assert_eq!(brut[pos + 1], 0xFF, "premier fragment plein");
+
+        // Et apres recollement on retrouve les 384 octets d'un seul tenant.
+        let items = tlv8_decode(&brut).unwrap();
+        let b = tlv8_find(&items, tlv_type::PUBLIC_KEY).unwrap();
+        assert_eq!(b.len(), 384, "les deux fragments doivent etre concatenes");
+    }
+
+    #[test]
+    fn le_m1_que_nous_envoyons_est_celui_qu_apple_accepte() {
+        // Ces six octets exacts ont recu un `RTSP/1.0 200 OK` et un M2 complet
+        // d'un Apple TV 4K. Les changer, c'est repartir de zero cote appareil.
+        assert_eq!(build_setup_m1(), vec![0x06, 0x01, 0x01, 0x00, 0x01, 0x00]);
+    }
+
     // ---- TLV8 -------------------------------------------------------------
 
     #[test]
