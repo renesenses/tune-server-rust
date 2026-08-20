@@ -512,13 +512,13 @@ mod tests {
         // the poller's natural-end advance. Without this the poller would sit
         // out its guard waiting for a transition that cannot come — silence,
         // then the same track replayed (local→local on an OAAT zone, 29/07).
-        output.set_direct_chain_exhausted_for_test(true);
+        output.set_chain_exhausted_for_test(true);
         assert!(
             !output.supports_internal_gapless(),
             "an exhausted chain must hand the queue back to the poller"
         );
 
-        output.set_direct_chain_exhausted_for_test(false);
+        output.set_chain_exhausted_for_test(false);
         output.set_direct_pcm_active_for_test(false);
         assert!(output.supports_internal_gapless());
 
@@ -528,6 +528,244 @@ mod tests {
             !output.prefers_local_file_gapless(),
             "after stop(), the next (PCM) track must return to url-prefetch gapless"
         );
+    }
+
+    /// La fin d'un morceau ne doit pas être prise pour une panne de flux — et
+    /// une boucle qui s'arrête doit le DIRE au poller.
+    ///
+    /// Xavier Joly (#1323), 7 août 2026, endpoint OAAT + DAC SMSL : Toccata puis
+    /// Fugue, ALAC transcodé en WAV progressif. Le gapless était armé
+    /// (`next track prefetched (gapless ready)`), puis contourné, et il
+    /// s'écoulait ~83 s de silence avant que la Fugue reparte à froid.
+    ///
+    /// Le banc reproduit la cause exacte : `StreamInfo::wav_content_length()`
+    /// annonce une taille PRÉDITE depuis la durée en bibliothèque, le décodeur
+    /// produit le nombre exact d'échantillons du fichier, et les deux ne
+    /// coïncident jamais. Le corps se termine donc AVANT son `Content-Length`
+    /// annoncé, ce qui remonte en `error decoding response body` — au moment
+    /// précis de la fin du morceau. Le mock annonce ici 20 000 octets de plus
+    /// qu'il n'en envoie, puis ferme proprement.
+    ///
+    /// Deux propriétés, une par défaut :
+    ///
+    /// 1. **Une seule requête HTTP, sans `Range`.** Une reprise par `Range`
+    ///    prouverait que la fin de piste est classée comme panne. Elle ne peut
+    ///    rien resservir (les octets demandés n'existent pas), échoue, et fait
+    ///    sortir la boucle par un chemin qui saute la transition gapless.
+    ///
+    /// 2. **`supports_internal_gapless()` rend `false` une fois la boucle
+    ///    terminée.** Le poller relit cette réponse pendant qu'il attend ; tant
+    ///    qu'elle vaut `true`, il attend une transition d'une tâche qui n'existe
+    ///    plus — les 34 s entre `gapless_natural_end_waiting_for_transition`
+    ///    (16:34:06) et `oaat: stop` (16:34:40) dans son journal.
+    ///
+    /// Le mock ferme par `shutdown()` APRÈS avoir lu la requête : fermer avec
+    /// des octets non lus déclenche un RST, qui détruit la réponse en vol et
+    /// rend le test instable (#1358).
+    #[tokio::test]
+    async fn track_end_is_not_a_stream_failure_and_releases_the_poller() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        // Endpoint factice : Hello/HelloAck, puis FormatAccept sur proposition.
+        let endpoint_handle = tokio::spawn(async move {
+            let _audio_drain = tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                while (tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    audio_udp.recv(&mut buf),
+                )
+                .await)
+                    .is_ok()
+                {}
+            });
+            let _clock = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    match clock_udp.recv_from(&mut buf).await {
+                        Ok((n, peer)) if n >= 28 => {
+                            let _ = clock_udp.send_to(&buf[..n], peer).await;
+                        }
+                        _ => break,
+                    }
+                }
+            });
+
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), tcp.accept()).await
+            else {
+                return;
+            };
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let n = stream.read(&mut read_buf).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            codec.feed(&read_buf[..n]);
+            if !matches!(codec.decode_next(), Ok(Some(Message::Hello(_)))) {
+                return;
+            }
+            let ack = Message::HelloAck(HelloAck {
+                protocol_version: oaat_core::PROTOCOL_VERSION,
+                endpoint_id: "mock-ep-1323".into(),
+                endpoint_name: "Mock SMSL".into(),
+                capabilities: EndpointCapabilities {
+                    pcm_max_rate: 192000,
+                    pcm_max_bits: 32,
+                    dsd_max_rate: None,
+                    channels_max: 2,
+                    formats: vec![
+                        oaat_core::format::AudioFormat::PcmS16le,
+                        oaat_core::format::AudioFormat::PcmS24le,
+                    ],
+                    volume: None,
+                    gapless: true,
+                    seek: false,
+                },
+                audio_port,
+                clock_port,
+                buffer_size_ms: 100,
+            });
+            let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+
+            loop {
+                let n = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(msg)) = codec.decode_next() {
+                    if let Message::FormatPropose(fp) = msg {
+                        let accept = Message::FormatAccept(FormatAccept {
+                            stream_id: fp.stream_id,
+                        });
+                        let _ = stream.write_all(&FrameCodec::encode(&accept)).await;
+                    }
+                }
+            }
+        });
+
+        // 500 ms de PCM 44,1/16/2 : sous le seuil de 50 paquets qui déclenche
+        // le cadencement temps réel, donc le morceau s'écoule vite.
+        let track_ms = 500u32;
+        let wav = make_test_wav_sized(16, track_ms);
+
+        let http_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_tcp.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_srv = requests.clone();
+        let http_handle = tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut s, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), http_tcp.accept())
+                        .await
+                else {
+                    break;
+                };
+                // Lire la requête ENTIÈRE avant de répondre (sinon RST, #1358).
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte).await {
+                        Ok(1) => req.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                requests_srv
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).into_owned());
+
+                // Content-Length PRÉDIT : plus long que le corps réellement
+                // servi, exactement comme wav_content_length() le calcule
+                // depuis la durée en bibliothèque.
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                    wav.len() + 20_000
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&wav).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        let output = OaatOutput::new(
+            "Mock SMSL".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-ep-1323".into(),
+        );
+        assert!(
+            output.supports_internal_gapless(),
+            "au repos, la sortie doit annoncer le gapless interne — sinon le poller ne l'arme jamais"
+        );
+
+        let url = format!("http://127.0.0.1:{http_port}/toccata.wav");
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Toccata"),
+                // La durée vient de la BIBLIOTHÈQUE, pas de l'en-tête : c'est
+                // elle qui permet de reconnaître la fin (#1365).
+                duration_ms: Some(track_ms as u64),
+                ..Default::default()
+            })
+            .await
+            .expect("play_media");
+
+        // Attendre la fin de la lecture (borné).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while std::time::Instant::now() < deadline {
+            if !output.diagnostics_snapshot()["playing"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let seen = requests.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "le flux n'a jamais été demandé — le banc n'a rien prouvé"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.to_ascii_lowercase().contains("range:")),
+            "la fin du morceau a été prise pour une panne : une reprise par Range a été tentée ({} requêtes) — {seen:?}",
+            seen.len()
+        );
+        assert_eq!(
+            seen.len(),
+            1,
+            "une fin propre ne doit provoquer aucune re-requête — {seen:?}"
+        );
+
+        assert!(
+            !output.supports_internal_gapless(),
+            "la boucle est terminée : sans le dire au poller, il attend une transition d'une tâche qui n'existe plus (34 s puis redémarrage à froid, #1323)"
+        );
+
+        output.stop().await.ok();
+        assert!(
+            output.supports_internal_gapless(),
+            "stop() doit réarmer le gapless pour la lecture suivante"
+        );
+        endpoint_handle.abort();
+        http_handle.abort();
     }
 
     fn make_test_wav() -> Vec<u8> {
