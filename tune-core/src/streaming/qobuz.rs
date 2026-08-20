@@ -116,10 +116,28 @@ fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
 /// éléments au-delà. Un `total` incohérent (0 alors que la page est pleine)
 /// arrête la pagination, comme avant.
 fn remaining_page_offsets(first_count: usize, total: usize, page_size: usize) -> Vec<usize> {
+    remaining_page_offsets_bornees(first_count, total, page_size, usize::MAX)
+}
+
+/// Décalages des pages restantes, sans jamais dépasser `plafond` éléments.
+///
+/// `get_featured_playlists` récupérait TOUT le catalogue éditorial — Qobuz en
+/// expose plusieurs milliers sans tag — puis appelait `truncate(500)`. Des
+/// dizaines à des centaines d'allers-retours HTTP pour jeter 90 % du résultat
+/// (#1969). Le plafond doit borner la PAGINATION, pas le tableau final.
+fn remaining_page_offsets_bornees(
+    first_count: usize,
+    total: usize,
+    page_size: usize,
+    plafond: usize,
+) -> Vec<usize> {
     if first_count < page_size || total <= first_count {
         return Vec::new();
     }
-    (page_size..total).step_by(page_size).collect()
+    // Une page dont le décalage atteint déjà le plafond n'apporterait que des
+    // éléments destinés à être jetés.
+    let borne = total.min(plafond);
+    (page_size..borne).step_by(page_size).collect()
 }
 
 /// Trace le résultat d'une écriture de favori chez Qobuz.
@@ -295,6 +313,19 @@ impl QobuzService {
         base_params: &[(&str, &str)],
         items_key: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.api_get_all_pages_bornee(path, base_params, items_key, usize::MAX)
+            .await
+    }
+
+    /// Comme `api_get_all_pages`, mais cesse de paginer une fois `plafond`
+    /// éléments atteints. Voir `remaining_page_offsets_bornees` (#1969).
+    async fn api_get_all_pages_bornee(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        items_key: &str,
+        plafond: usize,
+    ) -> Result<Vec<serde_json::Value>, String> {
         use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
         const MAX_CONCURRENT_PAGES: usize = 4;
@@ -345,7 +376,7 @@ impl QobuzService {
             }
         }
 
-        let offsets = remaining_page_offsets(count, total, PAGE_SIZE);
+        let offsets = remaining_page_offsets_bornees(count, total, PAGE_SIZE, plafond);
         if offsets.is_empty() {
             return Ok(all_items);
         }
@@ -1288,8 +1319,10 @@ impl StreamingService for QobuzService {
             params.push(("genre_ids", g));
         }
         let mut items = self
-            .api_get_all_pages("/playlist/getFeatured", &params, "playlists")
+            .api_get_all_pages_bornee("/playlist/getFeatured", &params, "playlists", MAX)
             .await?;
+        // La pagination s'arrête déjà au plafond ; ce `truncate` ne rogne plus
+        // que le trop-plein de la dernière page.
         items.truncate(MAX);
         Ok(items.iter().map(Self::map_featured_playlist).collect())
     }
@@ -1767,6 +1800,57 @@ mod tests {
         assert_eq!(remaining_page_offsets(50, 230, 50), vec![50, 100, 150, 200]);
         // Un seul élément au-delà de la première page.
         assert_eq!(remaining_page_offsets(50, 51, 50), vec![50]);
+    }
+
+    /// Le plafond doit borner la PAGINATION, pas le tableau final.
+    ///
+    /// `get_featured_playlists` demandait tout le catalogue éditorial — Qobuz
+    /// en expose plusieurs milliers sans tag — puis jetait au-delà de 500.
+    /// Sur 4000 entrées, c'était 79 pages récupérées pour en garder 10 (#1969).
+    #[test]
+    fn le_plafond_arrete_la_pagination_au_lieu_de_tronquer_apres() {
+        // Sans plafond : tout le catalogue, 79 pages après la première.
+        assert_eq!(remaining_page_offsets(50, 4000, 50).len(), 79);
+        // Avec le plafond de 500 : 9 pages, et la dernière commence à 450.
+        let bornees = remaining_page_offsets_bornees(50, 4000, 50, 500);
+        assert_eq!(bornees.len(), 9);
+        assert_eq!(bornees.last(), Some(&450));
+        // 10 pages de 50 en tout, première comprise = exactement le plafond.
+        assert_eq!((bornees.len() + 1) * 50, 500);
+    }
+
+    /// Un catalogue plus petit que le plafond n'est pas amputé : c'est `total`
+    /// qui borne, pas le plafond.
+    #[test]
+    fn un_catalogue_plus_petit_que_le_plafond_est_pris_en_entier() {
+        assert_eq!(
+            remaining_page_offsets_bornees(50, 230, 50, 500),
+            vec![50, 100, 150, 200]
+        );
+    }
+
+    /// Sans plafond, le comportement est celui d'avant, au décalage près.
+    #[test]
+    fn sans_plafond_le_comportement_est_inchange() {
+        for (count, total) in [(50usize, 2000usize), (50, 230), (50, 51), (37, 37), (0, 0)] {
+            assert_eq!(
+                remaining_page_offsets(count, total, 50),
+                remaining_page_offsets_bornees(count, total, 50, usize::MAX),
+                "count={count} total={total}"
+            );
+        }
+    }
+
+    /// Cas limites du plafond : ne jamais demander une page qui serait
+    /// entièrement jetée, ni retomber en boucle infinie.
+    #[test]
+    fn les_plafonds_degeneres_ne_demandent_aucune_page() {
+        // Plafond sous la première page : rien de plus à chercher.
+        assert!(remaining_page_offsets_bornees(50, 4000, 50, 50).is_empty());
+        assert!(remaining_page_offsets_bornees(50, 4000, 50, 10).is_empty());
+        assert!(remaining_page_offsets_bornees(50, 4000, 50, 0).is_empty());
+        // Plafond juste au-dessus : une seule page de plus.
+        assert_eq!(remaining_page_offsets_bornees(50, 4000, 50, 51), vec![50]);
     }
 
     #[test]
