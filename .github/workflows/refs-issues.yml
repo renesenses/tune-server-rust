@@ -1,18 +1,23 @@
 name: Références d'issues
 
-# Une PR qui DIT fermer une issue doit la fermer reellement.
+# Rendre visible, et actionnable, ce qu'une PR declare corriger.
 #
-# Mesure du 20/08/2026 sur les 600 dernieres PR fusionnees : 390 citent une
-# issue, 54 seulement emploient un mot-cle que GitHub reconnait. 27 issues
-# corrigees ET livrees etaient restees ouvertes, la plus ancienne depuis la
-# v0.9.63 — au point de faire classer en tete de bilan une perte de donnees
-# deja reparee.
+# Le probleme mesure le 20/08/2026 : 27 issues corrigees ET LIVREES etaient
+# restees ouvertes, la plus ancienne depuis la v0.9.63. Le suivi mentait d'un
+# mois, au point de faire classer en tete d'un bilan une perte de donnees
+# (#1943) deja reparee.
 #
-# Ce garde-fou echoue UNIQUEMENT sur une intention trahie : un mot-cle de
-# fermeture ecrit en francais (« Ferme #1819 »), que GitHub ignore en silence.
-# Une reference nue (« suite de #1897 ») est legitime et majoritaire : elle est
-# seulement listee dans le resume du job, pour que le relecteur voie ce qui
-# restera ouvert apres la fusion.
+# ⚠️ Sur ce depot, AUCUN mot-cle de fermeture ne ferme quoi que ce soit — pas
+# meme en anglais. GitHub n'auto-ferme que sur la branche PAR DEFAUT, et la
+# doctrine impose que tout correctif cible `release/v0.9`. Mesure du 20/08/2026
+# sur 18 PR portant Closes/Fixes fusionnees sur cette branche : 0 fermeture
+# automatique, 18 faites a la main. GitHub n'enregistre meme pas le LIEN —
+# `closingIssuesReferences` rend une liste vide.
+#
+# Ce controle ne fait donc pas la police de la langue : ce serait imposer une
+# forme sans effet. Il rassemble ce que la PR declare corriger et rend la
+# commande de fermeture MANUELLE prete a coller, puisque c'est le seul
+# mecanisme qui marche ici. Il n'echoue jamais.
 #
 # La logique et ses cas de preuve vivent dans scripts/verifier-refs-issues.sh,
 # qui porte son propre --autotest. Il est joue A CHAQUE FOIS, avant l'analyse :
@@ -28,7 +33,7 @@ permissions:
 
 jobs:
   refs:
-    name: Mots-clés de fermeture
+    name: Issues déclarées corrigées
     runs-on: ubuntu-latest
     # Sans plafond, un blocage tourne SIX HEURES avant que GitHub ne le tue.
     # Trois releases l'ont paye (0.9.86, 0.9.87, 0.9.88).
