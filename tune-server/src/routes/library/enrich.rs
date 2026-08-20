@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use tune_core::db::backend::ToSqlValue;
-use tune_core::metadata::enrichment::RecordingDetails;
+use tune_core::metadata::enrichment::{MetadataEnricher, RecordingDetails};
 
 use crate::state::AppState;
 
@@ -61,6 +61,12 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 // t.artist_name", which .unwrap_or_default() swallowed to an empty
                 // Vec → total=0, so enrich-all silently did nothing for everyone
                 // (Fabien, v0.9.0). Join albums and read the joined columns.
+                //
+                // `t.composer` compte parmi les champs manquants qui rendent une
+                // piste candidate. Sans lui, une piste deja pourvue en mb_id,
+                // genre, annee et label n'entrait meme pas dans la selection :
+                // corriger la boucle en aval n'aurait servi a rien, elle n'y
+                // serait jamais parvenue (#1890).
                 "SELECT t.id, t.title, a.name, al.title, t.file_path, \
                  t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
                  t.artist_id, a.musicbrainz_id \
@@ -72,6 +78,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                    OR t.genre IS NULL OR t.genre = '' \
                    OR t.year IS NULL \
                    OR t.label IS NULL OR t.label = '' \
+                   OR t.composer IS NULL OR t.composer = '' \
                    OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
                  )",
                 &[],
@@ -139,7 +146,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 .get(8)
                 .and_then(|v| v.as_string())
                 .filter(|s| !s.is_empty());
-            let _existing_composer = row
+            let existing_composer = row
                 .get(9)
                 .and_then(|v| v.as_string())
                 .filter(|s| !s.is_empty());
@@ -155,11 +162,17 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 None => false,
             };
 
-            // If track already has all fields (and the artist MBID too), skip
+            // If track already has all fields (and the artist MBID too), skip.
+            // Le compositeur compte parmi ces champs : sans lui, une piste deja
+            // pourvue en genre/annee/label etait sautee AVANT toute requete, et
+            // une bibliotheque soigneusement taguee — le cas de la musique
+            // classique, ou le compositeur importe le plus — n'avait aucune
+            // chance d'en obtenir un (#1890).
             if existing_mb_id.is_some()
                 && existing_genre.is_some()
                 && existing_year.is_some()
                 && existing_label.is_some()
+                && existing_composer.is_some()
                 && !artist_needs_mbid
             {
                 continue;
@@ -197,6 +210,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
             let needs_details = existing_genre.is_none()
                 || existing_year.is_none()
                 || existing_label.is_none()
+                || existing_composer.is_none()
                 || artist_needs_mbid;
 
             let details = if needs_details {
@@ -216,11 +230,32 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 RecordingDetails::default()
             };
 
+            // Le compositeur coute un second aller-retour sur l'oeuvre. A
+            // MB_RATE_LIMIT_MS par requete, l'ajouter partout allongerait d'un
+            // tiers une passe qui se compte en heures — pour un champ que le
+            // COALESCE ci-dessous ignorerait si la piste en a deja un. On ne le
+            // paie donc que pour les pistes qui en manquent (#1890).
+            let composer_val: Option<String> =
+                match (existing_composer.as_deref(), details.work_id.as_deref()) {
+                    (None, Some(work_id)) => {
+                        let c = match mb_fetch_work_composer(&mb_client, work_id).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(track_id, work_id, error = %e, "mb_work_composer_failed");
+                                errors += 1;
+                                None
+                            }
+                        };
+                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                        c
+                    }
+                    _ => details.composer.clone(),
+                };
+
             // Update tracks DB with COALESCE so we never overwrite existing data
             let genre_val: Option<String> = details.genre.clone();
             let year_val: Option<i32> = details.year;
             let label_val: Option<String> = details.label.clone();
-            let composer_val: Option<String> = details.composer.clone();
             let mb_id_val: Option<String> = Some(mb_id.clone());
             let isrc_val: Option<String> = details.isrc.clone();
 
@@ -365,7 +400,8 @@ pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Val
     Json(result)
 }
 
-// ── MusicBrainz helper functions (standalone, no MetadataEnricher needed) ──
+// ── MusicBrainz helper functions (HTTP autonome ; l'analyse des reponses est
+//    empruntee a MetadataEnricher pour ne pas diverger d'une route a l'autre) ──
 
 /// Send a GET request to MusicBrainz, retrying on transient 503 responses.
 ///
@@ -446,17 +482,44 @@ async fn mb_lookup_recording(
     Ok(recording_id)
 }
 
+/// Le ou les compositeurs de l'oeuvre interpretee par un enregistrement.
+///
+/// Requete distincte : `inc=work-rels` sur l'enregistrement ne rend que
+/// l'oeuvre et son titre, jamais ses propres relations d'artiste. L'analyse est
+/// celle de `tune-core` — la meme reponse MusicBrainz ne doit pas se lire de
+/// deux facons selon la route qui l'a demandee.
+async fn mb_fetch_work_composer(
+    client: &reqwest::Client,
+    work_id: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("{MUSICBRAINZ_API}/work/{work_id}");
+    let resp = mb_get_with_retry(
+        client
+            .get(&url)
+            .query(&[("inc", "artist-rels"), ("fmt", "json")]),
+    )
+    .await
+    .map_err(|e| format!("mb work: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("mb work: HTTP {}", resp.status()));
+    }
+
+    let data: Value = resp.json().await.map_err(|e| format!("mb parse: {e}"))?;
+
+    Ok(MetadataEnricher::pick_composers(&data["relations"]))
+}
+
 /// Fetch detailed metadata for a MusicBrainz recording.
 async fn mb_fetch_recording_details(
     client: &reqwest::Client,
     recording_id: &str,
 ) -> Result<RecordingDetails, String> {
     let url = format!("{MUSICBRAINZ_API}/recording/{recording_id}");
-    let resp = mb_get_with_retry(
-        client
-            .get(&url)
-            .query(&[("inc", "releases+tags+artist-credits"), ("fmt", "json")]),
-    )
+    let resp = mb_get_with_retry(client.get(&url).query(&[
+        ("inc", "releases+tags+artist-credits+work-rels"),
+        ("fmt", "json"),
+    ]))
     .await
     .map_err(|e| format!("mb details: {e}"))?;
 
@@ -523,6 +586,8 @@ async fn mb_fetch_recording_details(
         .and_then(|ac| ac["artist"]["id"].as_str())
         .map(String::from);
 
+    let work_id = MetadataEnricher::pick_work_id(&data["relations"]);
+
     Ok(RecordingDetails {
         genre,
         year,
@@ -532,6 +597,7 @@ async fn mb_fetch_recording_details(
         barcode,
         country,
         composer: None,
+        work_id,
         isrc,
         release_id,
         release_group_id,

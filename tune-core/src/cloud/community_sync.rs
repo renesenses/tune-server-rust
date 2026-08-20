@@ -151,7 +151,8 @@ pub async fn pull_community_enrichments(
                  composer = COALESCE(composer, ?), \
                  label = COALESCE(label, ?), \
                  isrc = COALESCE(isrc, ?) \
-                 WHERE musicbrainz_recording_id = ? AND (genre IS NULL OR year IS NULL)",
+                 WHERE musicbrainz_recording_id = ? \
+                 AND (genre IS NULL OR year IS NULL OR composer IS NULL)",
                 &[
                     &genre as &dyn ToSqlValue,
                     &year as &dyn ToSqlValue,
