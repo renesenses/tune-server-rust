@@ -196,6 +196,14 @@ pub(super) struct ScanQuery {
     /// track's album_id points at a wrong same-titled album. Slower (re-reads
     /// every file's metadata); default false keeps the fast incremental scan.
     force: Option<bool>,
+    /// Autorise une purge qui dépasse le plafond volumétrique.
+    ///
+    /// DÉLIBÉRÉMENT distinct de `force`. `force` est le bouton « Scan complet »,
+    /// que l'on clique pour relire ses fichiers — c'est exactement ce que clique
+    /// quelqu'un dont le NAS était hors ligne, pour réparer sa bibliothèque. Y
+    /// accrocher l'autorisation de supprimer en masse recréerait #1943 par la
+    /// porte de service.
+    confirmer_purge: Option<bool>,
     /// Alias for `force` sent by the clients' "Full scan / Scan complet" button.
     /// The web/Flutter clients pass `?full=true`; without this field serde
     /// silently dropped it, so "Scan complet" behaved like an ordinary
@@ -219,6 +227,7 @@ pub(super) async fn trigger_scan(
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
     let force = q.force.unwrap_or(false) || q.full.unwrap_or(false);
+    let confirmer_purge = q.confirmer_purge.unwrap_or(false);
     // Targeted sub-folder scan (empty/blank string = full scan as before).
     let targeted_req: Option<String> = q
         .path
@@ -226,7 +235,7 @@ pub(super) async fn trigger_scan(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| tune_core::scanner::walker::normalize_path(s));
-    spawn_library_scan(state, force, targeted_req).await;
+    spawn_library_scan_avec(state, force, confirmer_purge, targeted_req).await;
     (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
 }
 
@@ -235,6 +244,17 @@ pub(super) async fn trigger_scan(
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
 /// folders stayed invisible until the app was restarted).
 pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
+    spawn_library_scan_avec(state, force, false, targeted_req).await
+}
+
+/// Comme `spawn_library_scan`, mais peut autoriser une purge au-delà du plafond
+/// volumétrique. Voir `ScanQuery::confirmer_purge` : ce n'est PAS `force`.
+pub(crate) async fn spawn_library_scan_avec(
+    state: AppState,
+    force: bool,
+    confirmer_purge: bool,
+    targeted_req: Option<String>,
+) {
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
@@ -774,6 +794,14 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // savoir qu'une racine s'est vidée. Elle l'ignorait, et supprimait
         // DÉFINITIVEMENT les favoris de pistes pourtant conservées (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Hissés pour la même raison que `racines_videes` : le rapport de scan
+        // doit pouvoir DIRE ce que la purge a fait, et surtout ce qu'elle a
+        // refusé de faire. Tout cela ne vivait que dans `journalctl` (#1943, #1190).
+        let mut pruned = 0i64;
+        let mut protected = 0i64;
+        let mut hors_perimetre = 0i64;
+        // `Some((candidats, examinees))` quand le plafond a refusé la purge.
+        let mut purge_refusee: Option<(usize, usize)> = None;
         if SCAN_CANCEL.load(Ordering::SeqCst) {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
@@ -790,9 +818,6 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "post_scan_root_went_empty — ce dossier contenait des pistes et n'en présente plus aucune. Montage absent ? Les pistes sont CONSERVÉES."
                 );
             }
-            let mut pruned = 0i64;
-            let mut protected = 0i64;
-            let mut hors_perimetre = 0i64;
             // Décider AVANT de supprimer : le plafond volumétrique a besoin de
             // connaître l'ampleur totale, et une suppression au fil de la
             // boucle ne se rattrape pas.
@@ -823,7 +848,7 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     }
                 }
             }
-            if purge_trop_massive(a_supprimer.len(), examinees) {
+            if purge_trop_massive(a_supprimer.len(), examinees) && !confirmer_purge {
                 tracing::error!(
                     candidats = a_supprimer.len(),
                     examinees,
@@ -832,6 +857,7 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                      bien plus souvent un montage absent qu'une suppression réelle. Les pistes \
                      sont CONSERVÉES ; relancer le scan une fois les montages vérifiés."
                 );
+                purge_refusee = Some((a_supprimer.len(), examinees));
                 protected += a_supprimer.len() as i64;
                 a_supprimer.clear();
             }
@@ -1185,6 +1211,18 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "db_update_failed": db_update_failed,
                     "artwork_extracted": artwork_extracted,
                     "failed_paths": scan_stats.failed_paths,
+                    // Ce que la purge a fait, et surtout ce qu'elle a REFUSÉ de faire.
+                    // L'écran affichait « scan terminé » pendant qu'une racine était
+                    // partie vide ; seul `journalctl` le savait (#1943, #1190).
+                    "emptied_roots": racines_videes.clone(),
+                    "pruned": pruned,
+                    "protected": protected,
+                    "hors_perimetre": hors_perimetre,
+                    "purge_refusee": purge_refusee.map(|(candidats, examinees)| serde_json::json!({
+                        "candidats": candidats,
+                        "examinees": examinees,
+                        "plafond": PART_MAX_PURGE,
+                    })),
                 })
                 .to_string(),
             )
@@ -1210,6 +1248,18 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 "db_update_failed": db_update_failed,
                 "artwork_extracted": artwork_extracted,
                 "failed_paths": scan_stats.failed_paths,
+                // Ce que la purge a fait, et surtout ce qu'elle a REFUSÉ de faire.
+                // L'écran affichait « scan terminé » pendant qu'une racine était
+                // partie vide ; seul `journalctl` le savait (#1943, #1190).
+                "emptied_roots": racines_videes.clone(),
+                "pruned": pruned,
+                "protected": protected,
+                "hors_perimetre": hors_perimetre,
+                "purge_refusee": purge_refusee.map(|(candidats, examinees)| serde_json::json!({
+                    "candidats": candidats,
+                    "examinees": examinees,
+                    "plafond": PART_MAX_PURGE,
+                })),
             }),
         );
 
@@ -1236,6 +1286,18 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": scan_stats.failed_paths,
+            // Ce que la purge a fait, et surtout ce qu'elle a REFUSÉ de faire.
+            // L'écran affichait « scan terminé » pendant qu'une racine était
+            // partie vide ; seul `journalctl` le savait (#1943, #1190).
+            "emptied_roots": racines_videes.clone(),
+            "pruned": pruned,
+            "protected": protected,
+            "hors_perimetre": hors_perimetre,
+            "purge_refusee": purge_refusee.map(|(candidats, examinees)| serde_json::json!({
+                "candidats": candidats,
+                "examinees": examinees,
+                "plafond": PART_MAX_PURGE,
+            })),
             // Fichiers audio rencontrés mais dont Tune ne lit pas le format,
             // comptés par extension ({"mpc": 280, "cue": 132}). Presque toujours
             // vide ; quand il ne l'est pas, c'est la seule chose qui explique à
@@ -1665,6 +1727,45 @@ mod roots_gone_empty_tests {
         assert!(sous_le_dossier("/mnt/music2", "/mnt/music2"));
         // Une barre finale sur la racine ne doit rien changer.
         assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2/"));
+    }
+
+    /// La porte de sortie du plafond est un drapeau DÉDIÉ, jamais `force`.
+    ///
+    /// `force` est le bouton « Scan complet » : on le clique pour relire ses
+    /// fichiers, et c'est exactement ce que clique quelqu'un dont le NAS était
+    /// hors ligne, pour réparer sa bibliothèque. Y accrocher l'autorisation de
+    /// supprimer en masse recréerait #1943 par la porte de service. Ce test
+    /// fige la distinction : si un jour quelqu'un fusionne les deux drapeaux
+    /// par souci de simplicité, il échoue.
+    #[test]
+    fn le_plafond_ne_cede_qu_a_une_confirmation_explicite() {
+        let candidats = 21_277usize;
+        let examinees = 70_346usize;
+        // Le cas de Yacine : 30 %, franchement au-dessus du plafond.
+        assert!(purge_trop_massive(candidats, examinees));
+
+        // La décision réelle du site d'appel, dans ses deux régimes.
+        let refuse = |confirmer: bool| purge_trop_massive(candidats, examinees) && !confirmer;
+        assert!(
+            refuse(false),
+            "sans confirmation, la purge doit être refusée"
+        );
+        assert!(
+            !refuse(true),
+            "avec confirmation explicite, elle doit passer"
+        );
+    }
+
+    /// Une purge sous le plafond n'a jamais besoin d'être confirmée : la
+    /// confirmation ne doit pas devenir un passage obligé du scan ordinaire.
+    #[test]
+    fn sous_le_plafond_la_confirmation_ne_change_rien() {
+        for confirmer in [false, true] {
+            assert!(
+                !(purge_trop_massive(50, 70_346) && !confirmer),
+                "50 pistes sur 70 346 passent, confirmer={confirmer}"
+            );
+        }
     }
 
     #[test]
