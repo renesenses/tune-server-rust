@@ -2537,7 +2537,31 @@ async fn set_audiophile(
             .update_volume(zone_id, 100)
             .ok();
     }
-    Json(body)
+
+    // Repousser l'état vers la sortie qui joue. Sans cet appel, la clé était
+    // écrite, la route répondait un succès, et la bascule n'atteignait le son
+    // qu'à la piste SUIVANTE : l'égaliseur, le crossfeed, la convolution et le
+    // ReplayGain continuaient de travailler pendant que le badge PURE
+    // s'allumait (#1986). Même famille que #1725 (EQ) et #1786 (crossfeed) —
+    // et le garde-fou de `routes/mod.rs` couvre désormais cette clé aussi.
+    let applique_a_chaud = state.orchestrator.apply_audiophile_change(zone_id).await;
+    info!(
+        zone_id,
+        enabled = body
+            .get("enabled")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false),
+        applique_a_chaud,
+        "audiophile_mode_set"
+    );
+
+    let mut reponse = body;
+    // `applied_live` dit la vérité que la réponse taisait : la bascule est-elle
+    // audible MAINTENANT, ou seulement au prochain flux ?
+    if let Some(obj) = reponse.as_object_mut() {
+        obj.insert("applied_live".into(), json!(applique_a_chaud));
+    }
+    Json(reponse)
 }
 
 async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {

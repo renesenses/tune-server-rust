@@ -1966,6 +1966,9 @@ impl PositionPoller {
                 match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok(s) => {
                         idle_backoff.entry(zone_id).or_default().record_success();
+                        // Le curseur de volume est inerte tant que dure le DoP :
+                        // l'état de zone doit le dire au client (#1735).
+                        self.playback.set_dop_active(zone_id, s.dop_active).await;
                         s
                     }
                     Err(e) => {
@@ -2347,6 +2350,10 @@ impl PositionPoller {
                         if latency > ps.max_latency_ms {
                             ps.max_latency_ms = latency;
                         }
+                        // Même report que sur le chemin « zone au repos » : un
+                        // flux peut entrer ou sortir du DoP d'une piste à
+                        // l'autre sans changement d'état de zone (#1735).
+                        self.playback.set_dop_active(zone_id, s.dop_active).await;
                         s
                     }
                     Err(e) => {

@@ -6754,6 +6754,141 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Réappliquer TOUT ce que le mode PURE gouverne à la sortie locale qui
+    /// joue, sans attendre la piste suivante.
+    ///
+    /// Le bloc PURE du chemin de lecture — `set_pure_bypass`, ReplayGain,
+    /// crossfeed, égaliseur — n'était exécuté qu'au démarrage d'une piste, et
+    /// son commentaire l'assumait : « so a zone toggled in/out of PURE takes
+    /// effect on the **next track** ». Or basculer PURE est un geste qu'on fait
+    /// en écoutant, exactement comme bouger un curseur d'égaliseur (#1725) ou
+    /// de crossfeed (#1786). Entre le clic et la piste suivante, l'interrupteur
+    /// est vert, le badge PURE est allumé, le panneau annonce un chemin
+    /// intouché — et l'`EqProcessor` installé dans la sortie continue de
+    /// filtrer chaque échantillon (Jean Valjean, #1986 : « il me semble que
+    /// l'égaliseur est toujours actif », +8 dB de Bass Boost en PURE).
+    ///
+    /// Ici l'écart est plus grave que pour l'EQ ou le crossfeed : ces deux-là
+    /// ne promettaient qu'un réglage tardif. PURE promet, lui, que rien ne
+    /// touche le signal — et l'affichage le REPETE, puisque le chemin du signal
+    /// lit la même clé (`zones.rs`, `zone_eq_alters_signal`). Le panneau disait
+    /// donc vrai sur l'intention et faux sur le son.
+    ///
+    /// La sortie de PURE est tout aussi concernée, et c'est le point 3 du même
+    /// signalement (« je devrais revenir au réglage précédent ») : les
+    /// processeurs restent alors à `None` et l'égaliseur choisi par
+    /// l'utilisateur ne revient qu'à la piste suivante.
+    ///
+    /// Les quatre réglages sont repoussés ensemble, sous le même verrou, parce
+    /// qu'ils décrivent un seul état : en repousser trois laisserait une
+    /// combinaison que le chemin de lecture ne produit jamais.
+    ///
+    /// Rend `true` quand une sortie locale VIVANTE a reçu le nouvel état —
+    /// sans rien dire de ce qu'il contient. C'est la différence avec
+    /// [`Self::refresh_zone_eq`], qui rend `true` si un égaliseur est actif :
+    /// entrer en PURE éteint tout, donc un `false` de ce genre signifierait
+    /// « rien reçu » alors que tout vient d'être appliqué.
+    pub async fn refresh_zone_pure_dsp(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            // Le track_id est lu AVANT de prendre le verrou de la sortie : le
+            // ReplayGain en dépend, et `get_state` prend ses propres verrous.
+            let track_id = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id);
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            // Rien en cours : la prochaine lecture appliquera l'état complet de
+            // toute façon, et bâtir des filtres pour un format inconnu donnerait
+            // des coefficients faux. Même garde que les deux jumelles.
+            let Some((taux, canaux)) = local_output.current_format() else {
+                return false;
+            };
+
+            let pure = self.zone_audiophile(zone_id);
+            local_output.set_pure_bypass(pure);
+            // Mêmes expressions que le bloc du chemin de lecture, à dessein :
+            // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
+            // celui qu'une lecture démarrée maintenant produirait.
+            let rg = match (pure, track_id) {
+                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+                _ => 1.0,
+            };
+            local_output.set_replaygain_factor(rg);
+            // `replace_*_live` et non `set_*` : la piste est en cours, donc
+            // l'historique des biquads et les lignes à retard doivent survivre
+            // au remplacement — sinon la bascule claque.
+            local_output.replace_crossfeed_live(self.load_crossfeed_processor(zone_id, taux));
+            local_output.replace_eq_live(self.load_eq_processor(zone_id, taux, canaux));
+            info!(
+                zone_id,
+                device_id = %device_id,
+                pure,
+                sample_rate = taux,
+                channels = canaux,
+                replaygain = rg,
+                "zone_pure_dsp_refreshed_live"
+            );
+            true
+        }
+    }
+
+    /// Faire prendre effet une bascule du mode PURE, PAR TOUS LES CHEMINS.
+    ///
+    /// Jumeau de [`Self::apply_eq_change`], et pour la même raison : la règle
+    /// « local d'abord, redémarrage sinon » ne doit vivre qu'à un endroit.
+    ///
+    /// - **sortie locale** : [`Self::refresh_zone_pure_dsp`] repousse l'état
+    ///   derrière les mutex de la sortie — immédiat, sans coupure ;
+    /// - **tout le reste** (DLNA, navigateur) : les traitements ont été gravés
+    ///   dans le fichier transcodé, déjà écrit et déjà téléchargé. Rien à
+    ///   remplacer ; seul un redémarrage du flux le re-rend, et c'est
+    ///   exactement ce que [`Self::schedule_eq_replay`] sait faire — même
+    ///   anti-rebond, même plancher, parce que c'est le même coût (environ une
+    ///   seconde de silence) et le même geste répétable.
+    ///
+    /// Rend `true` quand la bascule a atteint le son **immédiatement**. Un
+    /// redémarrage programmé rend `false` : il n'a pas encore eu lieu.
+    pub async fn apply_audiophile_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        if self.refresh_zone_pure_dsp(zone_id).await {
+            return true;
+        }
+        // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
+        // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
+        let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
+        if joue {
+            self.schedule_eq_replay(zone_id);
+        }
+        false
+    }
+
     fn zone_has_active_eq(&self, zone_id: i64) -> bool {
         // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
         // gains, not the rate.
@@ -9347,6 +9482,167 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    /// Zone locale gréée pour les tests de bascule PURE : une `LocalOutput`
+    /// enregistrée, un format déclaré (sinon les rafraîchisseurs renoncent), et
+    /// un profil d'égaliseur audible en base.
+    #[cfg(feature = "local-audio")]
+    async fn zone_locale_avec_eq(orch: &PlaybackOrchestrator) -> i64 {
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Salon", Some("local"), Some("local:DAC"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(crate::outputs::local::LocalOutput::new(
+                "DAC".to_string(),
+            )));
+
+        let profil = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 80.0,
+                gain: 8.0,
+                q: 0.71,
+                band_type: "low_shelf".into(),
+            }],
+            ..Default::default()
+        };
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&profil).unwrap(),
+            )
+            .unwrap();
+        zone_id
+    }
+
+    #[cfg(feature = "local-audio")]
+    async fn avec_sortie_locale<T>(
+        orch: &PlaybackOrchestrator,
+        f: impl FnOnce(&crate::outputs::local::LocalOutput) -> T,
+    ) -> T {
+        let arc = orch.outputs.lock().await.get("local:DAC").unwrap();
+        let sortie = arc.lock().await;
+        let local = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::local::LocalOutput>()
+            .expect("sortie locale");
+        f(local)
+    }
+
+    #[cfg(feature = "local-audio")]
+    fn regler_pure(orch: &PlaybackOrchestrator, zone_id: i64, actif: bool) {
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(
+                &format!("zone_{zone_id}_audiophile"),
+                &format!(r#"{{"enabled":{actif}}}"#),
+            )
+            .unwrap();
+    }
+
+    /// Le signalement de Jean Valjean (#1986), rejoué : Bass Boost audible,
+    /// bascule en PURE **pendant** la lecture. Avant, la clé était écrite et la
+    /// sortie n'apprenait rien — l'`EqProcessor` restait monté et `pure_bypass`
+    /// à faux, donc chaque échantillon continuait d'être filtré pendant que le
+    /// badge PURE s'allumait.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn switching_to_pure_mid_track_stops_the_eq_at_once() {
+        let orch = test_orchestrator();
+        let zone_id = zone_locale_avec_eq(&orch).await;
+
+        // Ce que fait le chemin de lecture au démarrage d'une piste hors PURE.
+        avec_sortie_locale(&orch, |local| {
+            local.declare_current_format_for_test(44_100, 2);
+            local.set_eq(orch.load_eq_processor(zone_id, 44_100, 2));
+            local.set_pure_bypass(false);
+            local.set_replaygain_factor(0.5);
+        })
+        .await;
+        avec_sortie_locale(&orch, |local| {
+            assert!(local.has_eq(), "l'égaliseur doit être monté au départ");
+        })
+        .await;
+
+        regler_pure(&orch, zone_id, true);
+        assert!(
+            orch.refresh_zone_pure_dsp(zone_id).await,
+            "une sortie locale vivante doit recevoir le nouvel état"
+        );
+
+        avec_sortie_locale(&orch, |local| {
+            assert!(
+                !local.has_eq(),
+                "PURE promet un chemin intouché : l'EqProcessor doit être retiré"
+            );
+            assert!(
+                local.pure_bypass_for_test(),
+                "le drapeau que lit apply_local_dsp doit être armé"
+            );
+            // Le ReplayGain n'est PAS couvert par ce drapeau — il multiplie les
+            // échantillons dans les callbacks de rendu. Sans sa remise à
+            // l'unité, PURE laisserait un gain en place.
+            assert_eq!(local.replaygain_units_for_test(), 1000);
+        })
+        .await;
+    }
+
+    /// Point 3 du même signalement : « je devrais revenir au réglage
+    /// précédent ». Sortir de PURE doit remonter l'égaliseur choisi par
+    /// l'utilisateur, sans attendre la piste suivante.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn leaving_pure_mid_track_brings_the_eq_back() {
+        let orch = test_orchestrator();
+        let zone_id = zone_locale_avec_eq(&orch).await;
+        regler_pure(&orch, zone_id, true);
+
+        avec_sortie_locale(&orch, |local| {
+            local.declare_current_format_for_test(44_100, 2);
+            local.set_eq(None);
+            local.set_pure_bypass(true);
+        })
+        .await;
+
+        regler_pure(&orch, zone_id, false);
+        assert!(orch.refresh_zone_pure_dsp(zone_id).await);
+
+        avec_sortie_locale(&orch, |local| {
+            assert!(
+                local.has_eq(),
+                "hors PURE, le profil activé de la zone doit revenir tout de suite"
+            );
+            assert!(!local.pure_bypass_for_test());
+        })
+        .await;
+    }
+
+    /// Sans flux en cours, on ne rafraîchit rien : bâtir des biquads pour un
+    /// format inconnu donnerait des coefficients faux, et la prochaine lecture
+    /// appliquera l'état complet de toute façon. Le `false` rendu est ce qui
+    /// distingue « rien reçu » de « reçu, et vide ».
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn nothing_playing_means_nothing_to_refresh() {
+        let orch = test_orchestrator();
+        let zone_id = zone_locale_avec_eq(&orch).await;
+        regler_pure(&orch, zone_id, true);
+        // `declare_current_format_for_test` volontairement non appelé.
+        assert!(!orch.refresh_zone_pure_dsp(zone_id).await);
+    }
+
+    /// Une zone réseau n'a pas de sortie locale à rafraîchir : le traitement est
+    /// gravé dans le fichier transcodé. `refresh_zone_pure_dsp` doit rendre
+    /// `false` pour que `apply_audiophile_change` bascule sur le redémarrage.
+    #[tokio::test]
+    async fn a_network_zone_has_no_live_local_output() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ampli", Some("dlna"), Some("dlna:uuid-42"))
+            .unwrap();
+        assert!(!orch.refresh_zone_pure_dsp(zone_id).await);
     }
 
     /// Régression #1629 — reprendre une webradio dont le PRODUCTEUR de
