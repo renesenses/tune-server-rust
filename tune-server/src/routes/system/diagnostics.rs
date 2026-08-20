@@ -80,6 +80,34 @@ fn niveau_de_ligne(ligne: &str) -> Option<&'static str> {
     None
 }
 
+/// L'horodatage en tête d'une ligne de journal, sous la forme brute écrite par
+/// `tracing` (`2026-08-20T09:03:15.059+02:00`), tronqué à la minute.
+fn horodatage_de_ligne(ligne: &str) -> Option<&str> {
+    let premier = ligne.split_whitespace().next()?;
+    // `2026-08-20T09:03` — dix caractères de date, un `T`, cinq d'heure.
+    if premier.len() >= 16 && premier.as_bytes()[10] == b'T' && premier.starts_with("20") {
+        Some(&premier[..16])
+    } else {
+        None
+    }
+}
+
+/// La période réellement couverte par un extrait de journal, `du … au …`.
+///
+/// Trois mille lignes couvrent des heures sur un serveur au repos et **dix
+/// minutes** sur un serveur qui scanne (#2028). L'utilisateur qui décrit un
+/// blocage vieux de plusieurs heures nous envoie alors un journal qui ne peut
+/// rien en contenir — et rien, ni pour lui ni pour nous, ne distingue ce
+/// rapport-là d'un rapport qui couvre la journée. On l'annonce donc.
+fn periode_couverte(extrait: &str) -> Option<String> {
+    let mut lignes = extrait.lines().filter_map(horodatage_de_ligne);
+    let debut = lignes.next()?;
+    match lignes.last() {
+        Some(fin) if fin != debut => Some(format!("du {debut} au {fin}")),
+        _ => Some(format!("à {debut}")),
+    }
+}
+
 /// Public bug-intake endpoint on the community site. It creates a *moderated*
 /// (pending) forum thread server-side with the site's own credentials — the
 /// distributed Tune server never holds a forum admin token. Same
@@ -842,8 +870,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let filtre = lignes_utiles_pour_un_rapport(brut, BUG_REPORT_LOG_LINES);
     let log_text = filtre.trim();
     let log_source = logs_json["source"].as_str().unwrap_or("none");
+    let periode = periode_couverte(log_text)
+        .map(|p| format!(", {p}"))
+        .unwrap_or_default();
     md.push_str(&format!(
-        "\n## Recent Logs ({BUG_REPORT_LOG_LINES} dernières lignes INFO et au-dessus, source: {log_source} — le DEBUG est dans l'export complet)\n"
+        "\n## Recent Logs ({BUG_REPORT_LOG_LINES} dernières lignes INFO et au-dessus{periode}, source: {log_source} — le DEBUG est dans l'export complet)\n"
     ));
     if log_text.is_empty() {
         md.push_str("_No logs available._\n");
@@ -1402,7 +1433,9 @@ mod log_tail_tests {
 
 #[cfg(test)]
 mod tests_journal_rapport {
-    use super::{lignes_utiles_pour_un_rapport, niveau_de_ligne};
+    use super::{
+        horodatage_de_ligne, lignes_utiles_pour_un_rapport, niveau_de_ligne, periode_couverte,
+    };
 
     /// Le cas mesuré : 160 sondes SSDP en DEBUG chassaient tout le reste.
     #[test]
@@ -1487,5 +1520,54 @@ mod tests_journal_rapport {
 
         let journal = "2026-08-17T10:00:00Z  INFO m: log_level=DEBUG applique\n";
         assert!(lignes_utiles_pour_un_rapport(journal, 10).contains("log_level=DEBUG"));
+    }
+
+    #[test]
+    fn la_periode_couverte_est_annoncee() {
+        let j = "2026-08-20T09:03:15.059+02:00  INFO a: debut\n\
+                 2026-08-20T09:08:00.000+02:00  WARN a: milieu\n\
+                 2026-08-20T09:13:13.491+02:00  INFO a: fin\n";
+        assert_eq!(
+            periode_couverte(j).unwrap(),
+            "du 2026-08-20T09:03 au 2026-08-20T09:13"
+        );
+    }
+
+    #[test]
+    fn une_seule_minute_ne_sannonce_pas_comme_un_intervalle() {
+        let j = "2026-08-20T09:03:15.059+02:00  INFO a: seule\n";
+        assert_eq!(periode_couverte(j).unwrap(), "à 2026-08-20T09:03");
+        let deux = "2026-08-20T09:03:15.059+02:00  INFO a: une\n\
+                    2026-08-20T09:03:59.000+02:00  INFO a: deux\n";
+        assert_eq!(periode_couverte(deux).unwrap(), "à 2026-08-20T09:03");
+    }
+
+    #[test]
+    fn un_journal_sans_horodatage_ne_promet_aucune_periode() {
+        // Un format inattendu ne doit pas produire une période inventée : mieux
+        // vaut ne rien annoncer que d'annoncer faux.
+        assert!(periode_couverte("Tune Server 0.9.90 | windows\n=====\n").is_none());
+        assert!(periode_couverte("").is_none());
+        assert!(horodatage_de_ligne("    at src/lib.rs:12").is_none());
+        assert!(horodatage_de_ligne("2026-08-20 09:03:15 INFO a: espace au lieu de T").is_none());
+    }
+
+    /// Le cas qui a motivé #2028 : trois mille lignes qui ne couvrent que dix
+    /// minutes. Rien ne le disait, et l'en-tête laissait croire à un journal
+    /// représentatif.
+    #[test]
+    fn dix_minutes_de_scan_sannoncent_comme_dix_minutes() {
+        let mut j = String::new();
+        for i in 0..600 {
+            j.push_str(&format!(
+                "2026-08-20T09:{:02}:{:02}.000+02:00  INFO tune_server::scan_import: DIAG\n",
+                3 + i / 60,
+                i % 60
+            ));
+        }
+        assert_eq!(
+            periode_couverte(&j).unwrap(),
+            "du 2026-08-20T09:03 au 2026-08-20T09:12"
+        );
     }
 }
