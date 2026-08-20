@@ -937,6 +937,35 @@ fn dop_wire_params(
     (rate, channels)
 }
 
+/// Le conteneur peut-il porter plus de 16 bits alors que la base l'ignore ?
+///
+/// Seul l'ALAC est concerné : sa profondeur ne se lit ni dans les tags ni par
+/// `lofty`, mais dans le cookie magique du fichier. Tous les autres conteneurs
+/// renseignent la leur au scan, donc les sonder serait de l'E/S pour rien.
+fn conteneur_a_profondeur_cachee(fmt: Option<AudioFormat>) -> bool {
+    matches!(fmt, Some(AudioFormat::Alac))
+}
+
+/// Profondeur réelle lue DANS le fichier, quand la base ne la connaît pas.
+///
+/// Rend `None` — donc « garder ce que dit la base » — dès que le conteneur
+/// n'est pas concerné, que le fichier est illisible, ou que la sonde ne trouve
+/// rien. Ne jamais échouer la lecture pour une profondeur : au pire on reste
+/// sur le comportement d'avant.
+fn profondeur_sondee_si_la_base_ignore(file_path: &str, fmt: Option<AudioFormat>) -> Option<u16> {
+    if !conteneur_a_profondeur_cachee(fmt) {
+        return None;
+    }
+    let (_, bd) = crate::metadata::probe_m4a_props(std::path::Path::new(file_path))?;
+    let bd = bd?;
+    info!(
+        path = %file_path,
+        bit_depth = bd,
+        "alac_bit_depth_probed_from_file_for_wav24"
+    );
+    Some(bd)
+}
+
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
     (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
 }
@@ -2828,6 +2857,31 @@ impl PlaybackOrchestrator {
         };
         let dop_requested = dop_requested(is_local_output, is_network_output, &dsd_mode);
 
+        // Un mode « auto » qui ne fait rien d'automatique, et qui se taisait.
+        //
+        // `dop_requested` ne reconnaît que `"native"` et `"dop"` — et en réseau,
+        // `"dop"` seul. Le mode par DÉFAUT, `"auto"`, ne produit donc JAMAIS de
+        // DoP, nulle part. Une piste DSD y part en PCM, ce qui est un choix
+        // défendable, mais rien ne le disait : ni à l'écran, ni au journal.
+        //
+        // Conséquence vécue : un testeur dont un autre serveur lit le même
+        // fichier sur le même DAC conclut que Tune « bloque sur le DSD », et
+        // nous cherchons un défaut de lecture là où il n'y a qu'un réglage par
+        // défaut trompeur (Tades, Hifiman Serenade, #1657). Une ligne de journal
+        // aurait suffi à le voir sans lui poser la question.
+        //
+        // Tracé ici plutôt qu'en amont : c'est le seul endroit qui connaisse à
+        // la fois le format de la source, le type de sortie et le mode réglé.
+        if source_format == Some(AudioFormat::Dsd) && !dop_requested {
+            info!(
+                zone_id = req.zone_id,
+                dsd_mode = %dsd_mode,
+                is_local_output,
+                is_network_output,
+                "dsd_dop_not_requested_track_will_be_converted_to_pcm"
+            );
+        }
+
         if source_format == Some(AudioFormat::Dsd) {
             if dop_requested {
                 // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
@@ -3011,9 +3065,26 @@ impl PlaybackOrchestrator {
         // longer maps the stream back to 16-bit and reads misaligned samples
         // (the #1137 silence class). Only meaningful when the source is deeper
         // than 16-bit; a 16-bit source keeps the plain LPCM path.
-        let dlna_wav24 = is_network_output
-            && bit_depth > 16
+        // `bit_depth` vient de la ligne `tracks`, et pour un ALAC elle peut y
+        // être absente : la profondeur n'est lisible que par une sonde
+        // Symphonia sur le cookie magique (`probe_m4a_props`), arrivée après
+        // coup. Une piste scannée avant — ou dont la sonde a échoué — porte
+        // alors le défaut `16`, et l'opt-in 24 bits ne s'arme JAMAIS, quel que
+        // soit le réglage : coché, vérifié, sans effet (Yves, ALAC 24/96, #1654).
+        //
+        // Sonder le fichier lève l'ambiguïté, et le coût est nul en pratique :
+        // la sonde ne tourne que si la zone a EXPLICITEMENT demandé le 24 bits
+        // (opt-in rare) et que la base annonce 16 ou moins sur un conteneur qui
+        // sait porter davantage. Un vrai ALAC 16 bits répond 16 et rien ne
+        // change.
+        let wav24_opt_in = is_network_output
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
+        let bit_depth_wire = if wav24_opt_in && bit_depth <= 16 {
+            profondeur_sondee_si_la_base_ignore(&file_path, source_format).unwrap_or(bit_depth)
+        } else {
+            bit_depth
+        };
+        let dlna_wav24 = wav24_opt_in && bit_depth_wire > 16;
         // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
         //
         // …SAUF sur une source FLAC dont la zone demande explicitement le FLAC
@@ -3288,8 +3359,15 @@ impl PlaybackOrchestrator {
                 // on this bit_depth), so the renderer parses the real 24-bit WAV
                 // header instead of mapping a false profile back to 16-bit and
                 // reading misaligned samples (#1137). `dlna_wav24` is already
-                // gated on `bit_depth > 16` above; cap at 24 (FLAC/WAV ceiling).
-                bit_depth.min(24)
+                // gated on `bit_depth_wire > 16` above; cap at 24 (FLAC/WAV
+                // ceiling).
+                //
+                // `bit_depth_wire`, pas `bit_depth` : sur un ALAC dont la base
+                // ignore la profondeur, c'est la sonde du fichier qui fait foi.
+                // Prendre la valeur de la base ici servirait un en-tête 16 bits
+                // pour un flux 24 — exactement le défaut que ce chemin corrige
+                // (#1654).
+                bit_depth_wire.min(24)
             } else if dlna_needs_wav {
                 // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
                 // 16-bit.
@@ -10913,7 +10991,10 @@ mod bit_depth_cap_tests {
 
 #[cfg(test)]
 mod dop_routing_tests {
-    use super::{dop_requested, dop_wire_params};
+    use super::{
+        AudioFormat, conteneur_a_profondeur_cachee, dop_requested, dop_wire_params,
+        profondeur_sondee_si_la_base_ignore,
+    };
 
     /// #1772 — le cas RÉEL de Marco Polo : Wiim Pro (renderer DLNA) relié en
     /// optique à un DAC Denafrips, zone réglée sur « dop ». Avant le correctif,
@@ -10959,6 +11040,53 @@ mod dop_routing_tests {
     fn ni_locale_ni_reseau_ne_recoit_rien() {
         assert!(!dop_requested(false, false, "dop"));
         assert!(!dop_requested(false, false, "native"));
+    }
+
+    /// #1657 — le mode par DÉFAUT ne produit de DoP nulle part.
+    ///
+    /// Ce test ne demande pas que « auto » change de comportement : il fixe le
+    /// fait, pour que personne ne le redécouvre en cherchant un défaut de
+    /// lecture. C'est ce fait, tu et non documenté, qui a fait passer un réglage
+    /// par défaut pour un DSD cassé.
+    #[test]
+    fn le_mode_auto_ne_produit_de_dop_nulle_part() {
+        assert!(!dop_requested(true, false, "auto"));
+        assert!(!dop_requested(false, true, "auto"));
+        assert!(!dop_requested(false, false, "auto"));
+        // Et le voisin qui piège tout autant : en RÉSEAU, « natif » non plus.
+        assert!(!dop_requested(false, true, "native"));
+    }
+
+    /// #1654 — seul l'ALAC cache sa profondeur ; sonder le reste serait de
+    /// l'E/S pour rien.
+    #[test]
+    fn seul_lalac_a_une_profondeur_cachee() {
+        assert!(conteneur_a_profondeur_cachee(Some(AudioFormat::Alac)));
+        for f in [
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Dsd,
+            AudioFormat::Aac,
+            AudioFormat::Mp3,
+        ] {
+            assert!(!conteneur_a_profondeur_cachee(Some(f)), "{f:?}");
+        }
+        assert!(!conteneur_a_profondeur_cachee(None));
+    }
+
+    /// Un fichier illisible ne doit jamais faire échouer la lecture : la sonde
+    /// rend `None`, l'appelant garde ce que dit la base.
+    #[test]
+    fn une_sonde_qui_echoue_laisse_la_base_decider() {
+        assert_eq!(
+            profondeur_sondee_si_la_base_ignore("/inexistant/x.m4a", Some(AudioFormat::Alac)),
+            None
+        );
+        // Et un conteneur hors périmètre n'est même pas ouvert.
+        assert_eq!(
+            profondeur_sondee_si_la_base_ignore("/inexistant/x.flac", Some(AudioFormat::Flac)),
+            None
+        );
     }
 
     /// #1894 — l'en-tête WAV doit décrire le FICHIER, jamais la ligne `tracks`.
