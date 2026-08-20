@@ -1068,6 +1068,36 @@ impl LocalOutput {
         Some((taux, canaux))
     }
 
+    /// Déclarer un format « en cours » sans lecture réelle — **tests
+    /// uniquement**.
+    ///
+    /// `current_format` n'est écrit que par les trois boucles d'alimentation,
+    /// qui exigent un périphérique audio ouvert. Or les rafraîchisseurs à chaud
+    /// (`refresh_zone_eq`, `refresh_zone_crossfeed`, `refresh_zone_pure_dsp`)
+    /// s'arrêtent net sur un format inconnu : sans ce point d'entrée, leur
+    /// corps utile n'est atteignable par aucun test sans matériel, et c'est
+    /// précisément le corps qui décide si le son change.
+    #[cfg(test)]
+    pub(crate) fn declare_current_format_for_test(&self, taux: u32, canaux: u16) {
+        self.current_format
+            .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
+    }
+
+    /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
+    /// consulte, donc lui qui dit si l'égaliseur installé travaille encore.
+    #[cfg(test)]
+    pub(crate) fn pure_bypass_for_test(&self) -> bool {
+        self.pure_bypass.load(Ordering::Relaxed)
+    }
+
+    /// Facteur ReplayGain courant en millièmes, pour les tests. Il n'est PAS
+    /// couvert par le drapeau PURE : c'est une multiplication faite dans les
+    /// callbacks de rendu, hors de `apply_local_dsp`.
+    #[cfg(test)]
+    pub(crate) fn replaygain_units_for_test(&self) -> u32 {
+        self.rg_factor.load(Ordering::SeqCst)
+    }
+
     /// Empaquette `(taux, canaux)` pour [`Self::current_format`]. Un taux
     /// au-delà de 16,7 MHz déborderait les 24 bits — il n'en existe pas, mais
     /// on préfère annoncer « pas de flux » qu'un taux tronqué.
