@@ -537,6 +537,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // Stop must never be destructive. Same subtree protection as the manual
         // scan for `error_dirs` (walk errors mid-scan: files exist but never
         // made it into the discovered set).
+        // Hissé hors du bloc pour la réconciliation des favoris (#1943).
+        let mut racines_videes: Vec<String> = Vec::new();
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
@@ -545,40 +547,91 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // encore être là. Le point de montage existe, il est lisible, il
             // est vide — et la bibliothèque partait avec (#1652).
             let existing_refs: Vec<&str> = existing_tracks.keys().map(|s| s.as_str()).collect();
-            let emptied_roots = crate::routes::system::scan::roots_gone_empty(
+            racines_videes = crate::routes::system::scan::roots_gone_empty(
                 &music_dirs,
                 &existing_refs,
                 &discovered_paths,
             );
+            let emptied_roots = &racines_videes;
+            // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
+            // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
+            // et tout le sous-arbre partait sans un mot (#1943).
+            let sous_arbres =
+                crate::routes::system::scan::sous_arbres_vides(&existing_refs, &discovered_paths);
+            if !sous_arbres.is_empty() {
+                tracing::error!(
+                    dossiers = ?sous_arbres,
+                    seuil = SEUIL_SOUS_ARBRE_VIDE,
+                    "auto_scan_sous_arbre_vide — ces dossiers ont perdu leurs pistes d'un coup \
+                     alors que leur racine répond. Montage imbriqué absent ? CONSERVÉES."
+                );
+            }
             if !emptied_roots.is_empty() {
                 tracing::error!(
                     roots = ?emptied_roots,
                     "auto_scan_root_went_empty — ce dossier contenait des pistes et n'en présente plus aucune. Montage absent ? Les pistes sont CONSERVÉES."
                 );
             }
+            // Même règle que le scan manuel, et au même endroit : ces deux
+            // boucles étaient des copies portant les mêmes trous (#1943).
+            // Celle-ci est la plus dangereuse des deux — elle tourne au
+            // démarrage, donc AVANT qu'un montage USB ou SMB soit prêt.
+            use crate::routes::system::scan::{
+                PART_MAX_PURGE, SEUIL_SOUS_ARBRE_VIDE, VerdictPurge, purge_trop_massive,
+                verdict_purge,
+            };
             let mut pruned = 0i64;
             let mut protected = 0i64;
+            let mut hors_perimetre = 0i64;
+            let mut a_supprimer: Vec<i64> = Vec::new();
+            let examinees = existing_tracks.len();
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_unreadable_scope = missing_dirs
-                        .iter()
-                        .chain(error_dirs.iter())
-                        .chain(emptied_roots.iter())
-                        .any(|d| db_path.starts_with(d));
-                    if in_unreadable_scope {
-                        protected += 1;
-                        continue;
-                    }
-                    if track_repo.delete(track_id).is_ok() {
-                        pruned += 1;
+                    match verdict_purge(
+                        db_path,
+                        &music_dirs,
+                        &missing_dirs,
+                        &error_dirs,
+                        emptied_roots,
+                        &sous_arbres,
+                    ) {
+                        VerdictPurge::ProtegeIllisible => protected += 1,
+                        VerdictPurge::HorsPerimetre => hors_perimetre += 1,
+                        VerdictPurge::Supprimer => a_supprimer.push(track_id),
                     }
                 }
+            }
+            if purge_trop_massive(a_supprimer.len(), examinees) {
+                tracing::error!(
+                    candidats = a_supprimer.len(),
+                    examinees,
+                    plafond = PART_MAX_PURGE,
+                    "auto_scan_purge_refusee_trop_massive — disparition massive au démarrage : \
+                     bien plus souvent un montage pas encore prêt qu'une suppression réelle. \
+                     Les pistes sont CONSERVÉES."
+                );
+                protected += a_supprimer.len() as i64;
+                a_supprimer.clear();
+            }
+            for track_id in a_supprimer {
+                if track_repo.delete(track_id).is_ok() {
+                    pruned += 1;
+                }
+            }
+            if hors_perimetre > 0 {
+                tracing::warn!(
+                    hors_perimetre,
+                    racines = ?music_dirs,
+                    "auto_scan_tracks_hors_perimetre — hors de toute racine configurée, donc \
+                     CONSERVÉES (#1943)."
+                );
             }
             if protected > 0 {
                 tracing::warn!(
                     protected,
                     missing = ?missing_dirs,
                     walk_errors = ?error_dirs,
+                    emptied = ?emptied_roots,
                     "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
@@ -608,9 +661,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // supprime un favori vraiment introuvable qu'après un scan complet
         // sain (aucune racine manquante/illisible, non annulé).
         {
+            // `emptied_roots` inclus depuis #1943 : sans lui, une racine vidée
+            // par un montage absent laissait passer la réconciliation, qui
+            // supprimait définitivement les favoris. Irréversible.
             let full_scan_ok = !crate::routes::system::scan::scan_cancel_requested()
                 && missing_dirs.is_empty()
-                && error_dirs.is_empty();
+                && error_dirs.is_empty()
+                && racines_videes.is_empty();
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {

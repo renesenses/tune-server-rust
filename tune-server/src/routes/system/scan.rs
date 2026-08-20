@@ -54,6 +54,82 @@ pub(crate) fn scan_cancel_requested() -> bool {
 ///
 /// Une racine qui n'avait AUCUNE piste n'est pas concernée : elle n'a rien à
 /// perdre, et c'est le cas normal d'un dossier fraîchement configuré.
+/// Nombre de pistes disparues sous un même dossier au-delà duquel on refuse
+/// de croire à une suppression volontaire.
+///
+/// Le garde-fou par RACINE ne voit pas un montage **imbriqué** qui tombe : la
+/// racine répond encore, `read_dir` réussit, aucune erreur n'est levée — et
+/// tout le sous-arbre part sans un avertissement (#1943).
+///
+/// Le seuil existe pour ne pas empêcher le geste normal : supprimer un album
+/// fait disparaître dix à vingt pistes d'un dossier, et ces fantômes-là
+/// doivent bien être nettoyés. Un point de montage qui tombe en emporte des
+/// centaines. 100 sépare les deux sans ambiguïté.
+pub(crate) const SEUIL_SOUS_ARBRE_VIDE: usize = 100;
+
+/// Sous-arbres devenus vides d'un coup, sous une racine qui répond encore.
+///
+/// Pour chaque piste absente du disque, on remonte ses dossiers parents. Un
+/// dossier qui a perdu au moins [`SEUIL_SOUS_ARBRE_VIDE`] pistes **et** ne
+/// présente plus aucun fichier découvert est traité comme un montage absent :
+/// tout ce qu'il contenait est conservé.
+///
+/// Rend les dossiers les plus HAUTS qui qualifient — inutile de lister aussi
+/// leurs enfants, `sous_le_dossier` les couvre.
+pub(crate) fn sous_arbres_vides(
+    existants: &[&str],
+    decouverts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Dossiers qui présentent encore au moins un fichier : eux vont bien.
+    let mut vivants: HashSet<&str> = HashSet::new();
+    for p in decouverts {
+        let mut cur = p.as_str();
+        while let Some(i) = cur.rfind('/') {
+            if i == 0 {
+                break;
+            }
+            cur = &cur[..i];
+            if !vivants.insert(cur) {
+                break; // déjà marqué : ses ancêtres le sont aussi.
+            }
+        }
+    }
+
+    // Pistes perdues par dossier, tous niveaux confondus.
+    let mut perdues: HashMap<&str, usize> = HashMap::new();
+    for p in existants {
+        if decouverts.contains(*p) {
+            continue;
+        }
+        let mut cur = *p;
+        while let Some(i) = cur.rfind('/') {
+            if i == 0 {
+                break;
+            }
+            cur = &cur[..i];
+            *perdues.entry(cur).or_insert(0) += 1;
+        }
+    }
+
+    let mut candidats: Vec<&str> = perdues
+        .into_iter()
+        .filter(|(d, n)| *n >= SEUIL_SOUS_ARBRE_VIDE && !vivants.contains(*d))
+        .map(|(d, _)| d)
+        .collect();
+    // Du plus court au plus long, pour ne garder que les ancêtres.
+    candidats.sort_by_key(|d| d.len());
+    let mut retenus: Vec<String> = Vec::new();
+    for d in candidats {
+        if !retenus.iter().any(|r| sous_le_dossier(d, r)) {
+            retenus.push(d.to_string());
+        }
+    }
+    retenus.sort();
+    retenus
+}
+
 pub(crate) fn roots_gone_empty(
     roots: &[String],
     existing_paths: &[&str],
@@ -69,6 +145,88 @@ pub(crate) fn roots_gone_empty(
         })
         .cloned()
         .collect()
+}
+
+/// Le chemin `path` est-il ce répertoire, ou sous lui ?
+///
+/// `starts_with` seul ne suffit pas : `/mnt/music2` est un préfixe de
+/// `/mnt/music22`, et la protection s'appliquerait alors à un dossier voisin
+/// — ou pire, ne s'appliquerait pas là où on la croit.
+pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
+    let d = dossier.trim_end_matches('/');
+    path == d || path.starts_with(&format!("{d}/"))
+}
+
+/// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
+/// disque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictPurge {
+    /// Le fichier a vraiment disparu d'une racine saine et lue : on retire.
+    Supprimer,
+    /// La racine est absente, illisible, ou s'est vidée d'un coup — un montage
+    /// qui n'est pas là ne prouve rien sur le contenu.
+    ProtegeIllisible,
+    /// La piste n'est sous AUCUNE racine configurée. Elle n'est pas
+    /// « disparue » : elle est hors périmètre. C'est le trou par lequel
+    /// 21 277 pistes de Yacine ont été supprimées (#1943) — un point de
+    /// montage avait changé, l'ancienne racine n'était plus configurée, donc
+    /// aucune des trois protections ne pouvait la couvrir : elle n'était ni
+    /// manquante, ni en erreur, ni vidée, puisque personne n'y était allé.
+    HorsPerimetre,
+}
+
+/// Décider du sort d'une piste absente du disque, en un seul endroit.
+///
+/// Cette règle existait en DEUX copies — `routes/system/scan.rs` et
+/// `auto_scan.rs` — portant les mêmes trous. Les faire diverger encore serait
+/// reproduire #1943 ; les faire vivre ici les corrige des deux côtés à la fois.
+pub(crate) fn verdict_purge(
+    db_path: &str,
+    racines_configurees: &[String],
+    missing_dirs: &[String],
+    error_dirs: &[String],
+    emptied_roots: &[String],
+    sous_arbres_vides: &[String],
+) -> VerdictPurge {
+    if missing_dirs
+        .iter()
+        .chain(error_dirs.iter())
+        .chain(emptied_roots.iter())
+        .chain(sous_arbres_vides.iter())
+        .any(|d| sous_le_dossier(db_path, d))
+    {
+        return VerdictPurge::ProtegeIllisible;
+    }
+    // Une liste de racines VIDE ne veut pas dire « tout est hors périmètre » :
+    // elle veut dire qu'on ne sait rien. Ne rien supprimer dans ce cas.
+    if racines_configurees.is_empty()
+        || !racines_configurees
+            .iter()
+            .any(|r| sous_le_dossier(db_path, r))
+    {
+        return VerdictPurge::HorsPerimetre;
+    }
+    VerdictPurge::Supprimer
+}
+
+/// Part maximale de la bibliothèque locale qu'une seule purge peut retirer.
+///
+/// Aucun plafond n'existait : rien n'empêchait une purge de 100 %. Chez
+/// Yacine, 21 277 lignes sur 70 346 — 30 % — sont parties en un cycle sans
+/// que rien ne s'y oppose. Une disparition massive est bien plus souvent un
+/// montage absent qu'une suppression réelle de fichiers ; au-delà de ce
+/// seuil on refuse et on demande à l'utilisateur, plutôt que d'agir.
+pub(crate) const PART_MAX_PURGE: f64 = 0.20;
+
+/// La purge dépasse-t-elle le plafond ? `candidats` sont les pistes qui
+/// seraient retirées, `total` la population locale examinée.
+pub(crate) fn purge_trop_massive(candidats: usize, total: usize) -> bool {
+    // En deçà de 50 pistes, un pourcentage n'a pas de sens : retirer 10 pistes
+    // sur 20 est banal quand on range sa bibliothèque à la main.
+    if total < 50 {
+        return false;
+    }
+    (candidats as f64) / (total as f64) > PART_MAX_PURGE
 }
 
 /// Pre-scan skip decision: does `path` need (re)scanning, or is it unchanged
@@ -690,6 +848,16 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // errored (unreadable subfolder, SMB stall mid-scan) has files that
         // exist but never made it into `discovered_paths`.
         // A cancelled scan never prunes: Stop must never be destructive.
+        // Hissé hors du bloc : la réconciliation des favoris, plus bas, doit
+        // savoir qu'une racine s'est vidée. Elle l'ignorait, et supprimait
+        // DÉFINITIVEMENT les favoris de pistes pourtant conservées (#1943).
+        // Hissés pour le rapport : l'écran n'affichait que « purge terminée »,
+        // et seul `journalctl` portait l'alerte (#1943, cf. #1190). Un
+        // utilisateur qui ne voit rien croit que tout va bien.
+        let mut racines_videes: Vec<String> = Vec::new();
+        let mut sous_arbres_proteges: Vec<String> = Vec::new();
+        let mut pistes_hors_perimetre = 0i64;
+        let mut pistes_protegees = 0i64;
         if SCAN_CANCEL.load(Ordering::SeqCst) {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
@@ -698,7 +866,21 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             // nettoyage ci-dessous efface la bibliothèque entière (#1652).
             let existing_refs: Vec<&str> =
                 existing_tracks.keys().map(|s| s.as_str()).collect();
-            let emptied_roots = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
+            racines_videes = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
+            let emptied_roots = &racines_videes;
+            // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
+            // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
+            // et tout le sous-arbre partait sans un mot (#1943).
+            sous_arbres_proteges = sous_arbres_vides(&existing_refs, &discovered_paths);
+            let sous_arbres = &sous_arbres_proteges;
+            if !sous_arbres.is_empty() {
+                tracing::error!(
+                    dossiers = ?sous_arbres,
+                    seuil = SEUIL_SOUS_ARBRE_VIDE,
+                    "post_scan_sous_arbre_vide — ces dossiers ont perdu leurs pistes d'un coup \
+                     alors que leur racine répond. Montage imbriqué absent ? CONSERVÉES."
+                );
+            }
             if !emptied_roots.is_empty() {
                 tracing::error!(
                     roots = ?emptied_roots,
@@ -707,36 +889,72 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             }
             let mut pruned = 0i64;
             let mut protected = 0i64;
+            let mut hors_perimetre = 0i64;
+            // Décider AVANT de supprimer : le plafond volumétrique a besoin de
+            // connaître l'ampleur totale, et une suppression au fil de la
+            // boucle ne se rattrape pas.
+            let mut a_supprimer: Vec<i64> = Vec::new();
+            let mut examinees = 0usize;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 // Targeted scan: only consider tracks under the scanned sub-tree.
                 // `discovered_paths` only holds files below that folder, so a
                 // track anywhere else would look "missing" and get wrongly
                 // deleted — pruning the whole library except the sub-folder.
                 if let Some(ref t) = targeted {
-                    if db_path.as_str() != t && !db_path.starts_with(&format!("{t}/")) {
+                    if !sous_le_dossier(db_path, t) {
                         continue;
                     }
                 }
+                examinees += 1;
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_unreadable_scope = missing_dirs
-                        .iter()
-                        .chain(error_dirs.iter())
-                        .chain(emptied_roots.iter())
-                        .any(|d| db_path.starts_with(d));
-                    if in_unreadable_scope {
-                        protected += 1;
-                        continue;
-                    }
-                    if track_repo.delete(track_id).is_ok() {
-                        pruned += 1;
+                    match verdict_purge(
+                        db_path,
+                        &scan_dirs,
+                        &missing_dirs,
+                        &error_dirs,
+                        emptied_roots,
+                        sous_arbres,
+                    ) {
+                        VerdictPurge::ProtegeIllisible => protected += 1,
+                        VerdictPurge::HorsPerimetre => hors_perimetre += 1,
+                        VerdictPurge::Supprimer => a_supprimer.push(track_id),
                     }
                 }
+            }
+            if purge_trop_massive(a_supprimer.len(), examinees) {
+                tracing::error!(
+                    candidats = a_supprimer.len(),
+                    examinees,
+                    plafond = PART_MAX_PURGE,
+                    "post_scan_purge_refusee_trop_massive — une disparition de cette ampleur est \
+                     bien plus souvent un montage absent qu'une suppression réelle. Les pistes \
+                     sont CONSERVÉES ; relancer le scan une fois les montages vérifiés."
+                );
+                protected += a_supprimer.len() as i64;
+                a_supprimer.clear();
+            }
+            for track_id in a_supprimer {
+                if track_repo.delete(track_id).is_ok() {
+                    pruned += 1;
+                }
+            }
+            pistes_hors_perimetre = hors_perimetre;
+            pistes_protegees = protected;
+            if hors_perimetre > 0 {
+                tracing::warn!(
+                    hors_perimetre,
+                    racines = ?scan_dirs,
+                    "post_scan_tracks_hors_perimetre — ces pistes ne sont sous aucune racine \
+                     configurée. Elles sont CONSERVÉES : un point de montage qui a changé n'est \
+                     pas un fichier supprimé (#1943)."
+                );
             }
             if protected > 0 {
                 tracing::warn!(
                     protected,
                     missing = ?missing_dirs,
                     walk_errors = ?error_dirs,
+                    emptied = ?emptied_roots,
                     "post_scan_tracks_protected_unreadable_dirs"
                 );
             }
@@ -936,10 +1154,17 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
         // scan COMPLET et sain (pas ciblé, pas annulé, aucune racine
         // manquante/illisible) — jamais sur un scan partiel.
         {
+            // `emptied_roots` fait partie de la condition depuis #1943 : il
+            // manquait ici alors qu'il protégeait déjà la boucle de purge.
+            // Conséquence vécue — une racine vidée par un montage absent
+            // laissait `full_scan_ok = true`, et la réconciliation supprimait
+            // DÉFINITIVEMENT les favoris des pistes conservées. Une purge de
+            // pistes se répare par un rescan ; une perte de favoris, non.
             let full_scan_ok = !SCAN_CANCEL.load(Ordering::SeqCst)
                 && targeted.is_none()
                 && missing_dirs.is_empty()
-                && error_dirs.is_empty();
+                && error_dirs.is_empty()
+                && racines_videes.is_empty();
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
@@ -1046,6 +1271,15 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     "missing_dirs": missing_dirs.clone(),
                     "missing_dir_reasons": missing_dir_reasons.clone(),
                     "error_dirs": error_dirs.clone(),
+            "emptied_roots": racines_videes.clone(),
+            "protected_subtrees": sous_arbres_proteges.clone(),
+            "tracks_protected": pistes_protegees,
+            "tracks_out_of_scope": pistes_hors_perimetre,
+                    // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi.
+                    "emptied_roots": racines_videes.clone(),
+                    "protected_subtrees": sous_arbres_proteges.clone(),
+                    "tracks_protected": pistes_protegees,
+                    "tracks_out_of_scope": pistes_hors_perimetre,
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
@@ -1072,6 +1306,10 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                 "missing_dirs": missing_dirs.clone(),
                 "missing_dir_reasons": missing_dir_reasons.clone(),
                 "error_dirs": error_dirs.clone(),
+            "emptied_roots": racines_videes.clone(),
+            "protected_subtrees": sous_arbres_proteges.clone(),
+            "tracks_protected": pistes_protegees,
+            "tracks_out_of_scope": pistes_hors_perimetre,
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "metadata_timeout": scan_stats.metadata_timeout,
@@ -1097,6 +1335,10 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            "emptied_roots": racines_videes.clone(),
+            "protected_subtrees": sous_arbres_proteges.clone(),
+            "tracks_protected": pistes_protegees,
+            "tracks_out_of_scope": pistes_hors_perimetre,
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "metadata_failed": scan_stats.metadata_failed,
@@ -1423,7 +1665,10 @@ pub(super) async fn artist_split_preview(State(state): State<AppState>) -> Json<
 
 #[cfg(test)]
 mod roots_gone_empty_tests {
-    use super::roots_gone_empty;
+    use super::{
+        PART_MAX_PURGE, VerdictPurge, purge_trop_massive, roots_gone_empty, sous_arbres_vides,
+        sous_le_dossier, verdict_purge,
+    };
     use std::collections::HashSet;
 
     fn set(paths: &[&str]) -> HashSet<String> {
@@ -1468,6 +1713,183 @@ mod roots_gone_empty_tests {
         ];
         let decouverts = set(&["/mnt/nas/musique/Bach/01.flac"]);
         assert!(roots_gone_empty(&[NAS.to_string()], &existants, &decouverts).is_empty());
+    }
+
+    // ── Purge de fin de scan : le sort d'une piste absente (#1943) ────────
+
+    /// Le cas de Yacine, 17/08 : bibliothèque sur `/mnt/music2`, et 21 277
+    /// lignes en base portant un ANCIEN point de montage qui n'est plus
+    /// configuré. Elles ont été supprimées sans qu'aucune protection ne
+    /// s'applique — elles n'étaient ni manquantes, ni en erreur, ni sous une
+    /// racine vidée, puisque personne n'était allé voir.
+    #[test]
+    fn une_piste_hors_de_toute_racine_configuree_est_conservee() {
+        let v = verdict_purge(
+            "/mnt/music/Bach/01.flac",    // ancien montage
+            &["/mnt/music2".to_string()], // seule racine configurée aujourd'hui
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            v,
+            VerdictPurge::HorsPerimetre,
+            "un point de montage qui a changé n'est pas un fichier supprimé"
+        );
+    }
+
+    #[test]
+    fn une_piste_sous_une_racine_saine_et_absente_du_disque_est_supprimee() {
+        // Sans ça, plus rien ne serait jamais nettoyé.
+        let v = verdict_purge(
+            "/mnt/music2/Bach/01.flac",
+            &["/mnt/music2".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(v, VerdictPurge::Supprimer);
+    }
+
+    #[test]
+    fn une_racine_videe_protege_ce_qu_elle_contenait() {
+        let v = verdict_purge(
+            "/mnt/music2/Bach/01.flac",
+            &["/mnt/music2".to_string()],
+            &[],
+            &[],
+            &["/mnt/music2".to_string()],
+            &[],
+        );
+        assert_eq!(v, VerdictPurge::ProtegeIllisible);
+    }
+
+    #[test]
+    fn sans_aucune_racine_configuree_on_ne_supprime_rien() {
+        // Une liste vide ne dit pas « tout est hors périmètre », elle dit
+        // qu'on ne sait rien. Le pire moment pour purger.
+        let v = verdict_purge("/mnt/music2/Bach/01.flac", &[], &[], &[], &[], &[]);
+        assert_eq!(v, VerdictPurge::HorsPerimetre);
+    }
+
+    #[test]
+    fn un_dossier_voisin_ne_beneficie_pas_du_prefixe() {
+        // `/mnt/music2` est un préfixe de `/mnt/music22` : avec un simple
+        // `starts_with`, une piste de `music22` passerait pour être sous
+        // `music2` — protection appliquée au mauvais endroit, ou pas appliquée
+        // là où on la croit.
+        assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2"));
+        assert!(!sous_le_dossier("/mnt/music22/a.flac", "/mnt/music2"));
+        assert!(sous_le_dossier("/mnt/music2", "/mnt/music2"));
+        // Une barre finale sur la racine ne doit rien changer.
+        assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2/"));
+    }
+
+    #[test]
+    fn une_purge_massive_est_refusee() {
+        // Chez Yacine : 21 277 sur 70 346, soit 30 %. Au-dessus du plafond,
+        // on refuse — une disparition de cette ampleur est bien plus souvent
+        // un montage absent qu'une suppression réelle.
+        assert!(purge_trop_massive(21_277, 70_346));
+        // Une purge ordinaire passe.
+        assert!(!purge_trop_massive(50, 70_346));
+        // Le plafond exact ne déclenche pas ; au-delà, oui.
+        assert!(!purge_trop_massive(200, 1000));
+        assert!(purge_trop_massive(201, 1000));
+    }
+
+    #[test]
+    fn une_petite_bibliotheque_n_est_pas_soumise_au_plafond() {
+        // Retirer 10 pistes sur 20 est banal quand on range à la main : un
+        // pourcentage n'a pas de sens à cette échelle.
+        assert!(!purge_trop_massive(10, 20));
+        assert!(!purge_trop_massive(49, 49));
+    }
+
+    // ── Sous-arbres vidés : le montage IMBRIQUÉ qui tombe (#1943) ─────────
+
+    fn perdues(prefixe: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefixe}/{i:04}.flac")).collect()
+    }
+
+    #[test]
+    fn un_montage_imbrique_qui_tombe_protege_son_sous_arbre() {
+        // La RACINE répond encore — un fichier y est découvert — donc ni
+        // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne voient rien.
+        // C'est exactement le cas que le garde par racine laissait passer.
+        let mut chemins = perdues("/mnt/music/nas/Jazz", 150);
+        chemins.push("/mnt/music/local/ok.flac".to_string());
+        let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
+        let decouverts = set(&["/mnt/music/local/ok.flac"]);
+
+        // Le garde par racine ne bronche pas :
+        assert!(roots_gone_empty(&["/mnt/music".to_string()], &refs, &decouverts).is_empty());
+        // Celui par sous-arbre, si :
+        let v = sous_arbres_vides(&refs, &decouverts);
+        assert!(
+            v.iter()
+                .any(|d| d == "/mnt/music/nas/Jazz" || d == "/mnt/music/nas"),
+            "le sous-arbre perdu doit etre protege, obtenu {v:?}"
+        );
+    }
+
+    #[test]
+    fn supprimer_un_album_reste_possible() {
+        // 15 pistes disparues d'un dossier : c'est un geste normal, et ces
+        // fantomes-la doivent bien etre nettoyes. Proteger ici rendrait toute
+        // suppression definitive impossible a refleter.
+        let mut chemins = perdues("/mnt/music/Bach/Cantates", 15);
+        chemins.push("/mnt/music/autre/ok.flac".to_string());
+        let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
+        let decouverts = set(&["/mnt/music/autre/ok.flac"]);
+        assert!(
+            sous_arbres_vides(&refs, &decouverts).is_empty(),
+            "sous le seuil, on laisse nettoyer"
+        );
+    }
+
+    #[test]
+    fn un_dossier_qui_repond_encore_n_est_jamais_protege() {
+        // Meme au-dela du seuil : s'il reste un fichier decouvert dessous, le
+        // montage est la, et les absences sont de vraies suppressions.
+        let chemins = perdues("/mnt/music/nas/Jazz", 200);
+        let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
+        let decouverts = set(&["/mnt/music/nas/Jazz/0000.flac"]);
+        let v = sous_arbres_vides(&refs, &decouverts);
+        assert!(
+            !v.iter().any(|d| d == "/mnt/music/nas/Jazz"),
+            "un dossier vivant ne se protege pas, obtenu {v:?}"
+        );
+    }
+
+    #[test]
+    fn seul_l_ancetre_est_retenu_pas_ses_enfants() {
+        // Inutile de lister /nas ET /nas/Jazz : `sous_le_dossier` couvre deja
+        // les enfants, et une liste redondante brouille le journal.
+        let mut chemins = perdues("/mnt/music/nas/Jazz", 120);
+        chemins.extend(perdues("/mnt/music/nas/Rock", 120));
+        chemins.push("/mnt/music/local/ok.flac".to_string());
+        let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
+        let decouverts = set(&["/mnt/music/local/ok.flac"]);
+        let v = sous_arbres_vides(&refs, &decouverts);
+        assert_eq!(v.len(), 1, "un seul ancetre attendu, obtenu {v:?}");
+        assert_eq!(v[0], "/mnt/music/nas");
+    }
+
+    #[test]
+    fn un_sous_arbre_protege_empeche_la_suppression() {
+        // Le bout de la chaine : le verdict doit changer.
+        let v = verdict_purge(
+            "/mnt/music/nas/Jazz/01.flac",
+            &["/mnt/music".to_string()],
+            &[],
+            &[],
+            &[],
+            &["/mnt/music/nas".to_string()],
+        );
+        assert_eq!(v, VerdictPurge::ProtegeIllisible);
     }
 
     #[test]

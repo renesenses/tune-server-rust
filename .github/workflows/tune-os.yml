@@ -99,9 +99,15 @@ jobs:
           docker run --rm --privileged -v "$PWD":/repo -w /repo -v /dev:/dev \
             -e TUNE_TARBALL_PATH="$TUNE_TARBALL_PATH" \
             debian:bookworm bash -ec '
-              apt-get update -qq
+              # PAS de `sudo` ici : on est root dans un `debian:bookworm` nu,
+              # qui ne contient pas sudo. Chaque ligne `sudo ...` echouerait en
+              # « command not found » et casserait la construction de l image a
+              # TOUS les coups — pas seulement quand apt est en panne.
+              #
+              # Et pas d `apt-get update -qq` non borne avant la boucle : il
+              # annulerait le garde-fou en pendant avant tout `timeout`.
               for essai in 1 2 3; do
-                if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null; then
+                if timeout 100 apt-get update -qq && timeout 200 apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null; then
                   break
                 fi
                 if [ "$essai" = "3" ]; then
@@ -109,7 +115,7 @@ jobs:
                   exit 1
                 fi
                 echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
-                sudo rm -rf /var/lib/apt/lists/*
+                rm -rf /var/lib/apt/lists/*
                 sleep 20
               done
               ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}" || {

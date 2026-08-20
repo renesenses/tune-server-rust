@@ -423,7 +423,16 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // Try journalctl on Linux (multiple service names)
     #[cfg(target_os = "linux")]
     {
-        for service in &["tune-server", "tune-rust"] {
+        // `tune` D'ABORD : c'est le nom de l'unité sur Tune OS
+        // (`/etc/systemd/system/tune.service`, posé par l'image), et il
+        // manquait à cette liste. Conséquence : sur l'appliance que nous
+        // distribuons, l'export de journaux ne trouvait JAMAIS rien — ni
+        // fichier (le serveur y écrit sur la sortie standard, captée par
+        // systemd), ni journalctl (mauvais nom d'unité), ni syslog. Le
+        // testeur recevait « No log file found. Launch Tune from a terminal »,
+        // conseil absurde sur un boîtier sans écran, et nous joignait un
+        // fichier de quatre lignes (Stéphane Villerio, 19/08).
+        for service in &["tune", "tune-server", "tune-rust"] {
             if let Ok(output) = std::process::Command::new("journalctl")
                 .args([
                     "-u",
@@ -562,8 +571,25 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
         }
     }
 
+    // Dire ce qui a été tenté, pas seulement ce qui a échoué.
+    //
+    // « No log file found » avec un seul chemin laissait croire à un problème
+    // de fichier, alors que trois mécanismes distincts ont été essayés. Sans
+    // cette liste, ni le testeur ni nous ne pouvons dire lequel a manqué — et
+    // c'est nous qui redemandons un journal que sa machine ne sait pas
+    // produire.
+    #[cfg(target_os = "linux")]
+    let tentatives = format!(
+        "Chemins et sources essayés :\n  - fichier : {log_path}\n           - journalctl -u tune / tune-server / tune-rust\n  - /var/log/syslog"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let tentatives = format!("Chemins et sources essayés :\n  - fichier : {log_path}");
+
     Json(json!({
-        "logs": "No log file found. Launch Tune from a terminal to see logs in real-time.\nChecked: ".to_owned() + &log_path,
+        "logs": format!(
+            "Aucun journal accessible. Si Tune tourne en service, la commande \
+             ci-dessous le donne en direct :\n  journalctl -u tune -n 2000 --no-pager\n\n{tentatives}"
+        ),
         "lines": 0,
         "source": "none",
     }))

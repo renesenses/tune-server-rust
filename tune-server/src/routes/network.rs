@@ -10,6 +10,7 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::error::AppError;
+use crate::smb;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -488,11 +489,24 @@ async fn trigger_smb_scan() -> impl IntoResponse {
 }
 
 /// List all stored SMB mounts from the network_mounts table.
+///
+/// La liste ne rendait que `active` — l'INTENTION de l'utilisateur. Un partage
+/// dont le remontage au demarrage avait echoue s'affichait donc exactement
+/// comme un partage monte, et l'echec ne se voyait qu'a la lecture, sous la
+/// forme d'une erreur reseau generique qui ne le nommait pas (#1916, Eric
+/// `ricouxxx`). Trois champs portent desormais le CONSTAT :
+///
+/// - `mounted` : verifie a l'instant, sur le systeme de fichiers ;
+/// - `mount_state` / `last_mount_error` : ce qu'a donne le dernier essai ;
+/// - `smb_version` : le dialecte retenu, que l'interface doit afficher quand
+///   il vaut `1.0` — retomber sur un protocole obsolete et non chiffre n'est
+///   pas neutre, et se fait aujourd'hui en silence (#1834).
 async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state
         .backend
         .query_many(
-            "SELECT id, server, share, mount_path, username, active \
+            "SELECT id, server, share, mount_path, username, active, \
+             smb_version, mount_state, last_mount_error \
              FROM network_mounts WHERE mount_type = 'smb' ORDER BY id",
             &[],
         )
@@ -500,13 +514,24 @@ async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, A
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
+            let mount_path = r.get(3).and_then(|v| v.as_string());
+            // Le constat de l'instant prime sur celui du dernier essai : un NAS
+            // rallume et remonte a la main doit apparaitre monte, meme si le
+            // demarrage s'etait solde par un echec.
+            let monte = mount_path
+                .as_deref()
+                .is_some_and(|p| smb::est_un_point_de_montage(std::path::Path::new(p)));
             json!({
                 "id": r.get(0).and_then(|v| v.as_i64()),
                 "server": r.get(1).and_then(|v| v.as_string()),
                 "share": r.get(2).and_then(|v| v.as_string()),
-                "mount_path": r.get(3).and_then(|v| v.as_string()),
+                "mount_path": mount_path,
                 "username": r.get(4).and_then(|v| v.as_string()),
                 "active": r.get(5).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+                "smb_version": r.get(6).and_then(|v| v.as_string()),
+                "mount_state": r.get(7).and_then(|v| v.as_string()),
+                "last_mount_error": r.get(8).and_then(|v| v.as_string()),
+                "mounted": monte,
             })
         })
         .collect();
@@ -528,23 +553,43 @@ async fn mount_smb_share(
         let reachable = tokio::net::TcpStream::connect(format!("{}:445", body.host))
             .await
             .is_ok();
+        // Le message disait « Host reachable on SMB port 445 », que l'interface
+        // affichait en vert comme une validation. Il ne teste QUE l'ouverture du
+        // port : ni les identifiants, ni l'existence du partage, ni la
+        // possibilite de monter. Chez Philippe Landes il etait au vert et
+        // l'etape suivante rendait 500 — un voyant vert juste avant l'etape qui
+        // echoue est pire qu'aucun voyant, il envoie chercher la panne du cote
+        // du reseau, precisement la seule chose qui ait ete verifiee (#1847).
         return Json(json!({
             "ok": reachable,
             "host": body.host,
             "share_name": body.share_name,
-            "message": if reachable { "Host reachable on SMB port 445" } else { "Cannot reach host on port 445" },
+            "message": if reachable {
+                "Serveur joignable (port 445) — identifiants et partage non vérifiés"
+            } else {
+                "Serveur injoignable sur le port 445"
+            },
         }))
         .into_response();
     }
 
     // Create mount directory
     if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
+        // Journalise AUSSI, et pas seulement dans la reponse HTTP : le client
+        // web n'affichait que le statut, donc la cause n'existait nulle part
+        // (#1847).
+        warn!(host = %body.host, path = %mount_path, error = %e, "smb_mount_dir_failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to create mount dir: {e}") })),
         )
             .into_response();
     }
+
+    // Dialecte qui a effectivement monte le partage, a persister pour que le
+    // remontage au demarrage reparte du bon (#1834). Reste NUL sur macOS :
+    // `mount_smbfs` negocie seul, des deux cotes, il n'y a rien a retenir.
+    let mut dialecte_retenu: Option<String> = None;
 
     // Build the mount command depending on the platform
     let mount_result = if cfg!(target_os = "macos") {
@@ -579,19 +624,18 @@ async fn mount_smb_share(
         // On essaie donc, dans l'ordre : negociation libre (le noyau prend le
         // meilleur dialecte moderne), puis 2.0, puis 1.0. Le premier qui monte
         // gagne.
+        //
+        // L'echelle vit desormais dans `crate::smb` : le remontage au demarrage
+        // doit imperativement essayer les MEMES dialectes, dans le MEME ordre.
+        // Il ne le faisait pas — il imposait toujours `vers=3.0` — et le partage
+        // que cette route venait de monter en SMB 1.0 se perdait au premier
+        // redemarrage (#1834).
         let user = body.username.as_deref().unwrap_or("guest");
         let pass = body.password.as_deref().unwrap_or("");
         let unc = format!("//{}/{}", body.host, body.share_name);
 
-        // `None` = pas d'option `vers=` du tout : c'est ce qui declenche la
-        // negociation du noyau, et non une valeur particuliere.
-        const DIALECTES: [Option<&str>; 3] = [None, Some("2.0"), Some("1.0")];
-        // 10 s par essai : trois essais tiennent alors sous le delai d'attente
-        // de 60 s de l'API, la ou 15 s l'auraient frole.
-        const ESSAI_TIMEOUT: Duration = Duration::from_secs(10);
-
         let mut dernier = None;
-        for dialecte in DIALECTES {
+        for dialecte in smb::DIALECTES {
             let mut opts = format!("username={user},password={pass}");
             if let Some(v) = dialecte {
                 opts.push_str(&format!(",vers={v}"));
@@ -600,11 +644,11 @@ async fn mount_smb_share(
             info!(
                 host = %body.host,
                 share = %body.share_name,
-                dialect = dialecte.unwrap_or("negocie"),
+                dialect = smb::etiquette(dialecte),
                 "smb_mount_attempt"
             );
             let res = tokio::time::timeout(
-                ESSAI_TIMEOUT,
+                smb::ESSAI_TIMEOUT,
                 Command::new("mount.cifs")
                     .args([&unc, &mount_path, "-o", &opts])
                     .output(),
@@ -616,9 +660,12 @@ async fn mount_smb_share(
                     info!(
                         host = %body.host,
                         share = %body.share_name,
-                        dialect = dialecte.unwrap_or("negocie"),
+                        dialect = smb::etiquette(dialecte),
                         "smb_mount_ok"
                     );
+                    // Le dialecte qui a gagne doit survivre a la reponse HTTP :
+                    // c'est lui que le remontage au demarrage rejouera.
+                    dialecte_retenu = Some(smb::etiquette(dialecte).to_string());
                     true
                 }
                 Ok(Ok(out)) => {
@@ -630,14 +677,14 @@ async fn mount_smb_share(
                     warn!(
                         host = %body.host,
                         share = %body.share_name,
-                        dialect = dialecte.unwrap_or("negocie"),
+                        dialect = smb::etiquette(dialecte),
                         error = %stderr,
                         "smb_mount_failed"
                     );
                     // Un refus d'authentification ne se repare pas en changeant
                     // de dialecte : inutile de faire patienter l'utilisateur
                     // vingt secondes de plus pour la meme reponse.
-                    est_refus_d_authentification(&stderr)
+                    smb::est_refus_d_authentification(&stderr)
                 }
                 Ok(Err(e)) => {
                     // mount.cifs absent ou non executable : reessayer avec un
@@ -648,7 +695,7 @@ async fn mount_smb_share(
                 Err(_) => {
                     warn!(
                         host = %body.host,
-                        dialect = dialecte.unwrap_or("negocie"),
+                        dialect = smb::etiquette(dialecte),
                         "smb_mount_timeout"
                     );
                     false
@@ -705,8 +752,15 @@ async fn mount_smb_share(
         // ici seul donnerait l'illusion d'une protection sans en apporter —
         // `secret_envelope` exige une passphrase utilisateur, incompatible avec
         // un remontage sans personne devant la machine.
-        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password) VALUES (?, ?, ?, ?, ?, ?)",
-        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue],
+        //
+        // `smb_version` retient le dialecte qui a gagne. Sans lui, le remontage
+        // au demarrage repartait de `vers=3.0` en dur : le partage SMB 1.0 de
+        // Philippe Landes montait ici, puis disparaissait au premier
+        // redemarrage (#1834). `mount_state` porte le CONSTAT, la ou `active`
+        // n'exprime qu'une intention (#1916) — on n'arrive ici qu'apres un
+        // montage reussi, d'ou 'mounted'.
+        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password, smb_version, mount_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue, &dialecte_retenu as &dyn ToSqlValue, &"mounted" as &dyn ToSqlValue],
     ) {
         Ok(id) => {
             (
@@ -715,6 +769,7 @@ async fn mount_smb_share(
                     "id": id,
                     "mounted": mount_ok,
                     "mount_path": mount_path,
+                    "smb_version": dialecte_retenu,
                 })),
             )
                 .into_response()
@@ -1342,61 +1397,5 @@ mod tests {
         let resources = parse_res_elements(element);
         let best = select_best_res(&resources).unwrap();
         assert!(best.url.ends_with("track.mp3"));
-    }
-}
-
-/// Le message d'erreur de `mount.cifs` traduit-il un refus d'identifiants ?
-///
-/// Extrait pour etre testable, et parce que la distinction porte une decision :
-/// un dialecte inadapte se repare en en essayant un autre, un mot de passe
-/// refuse non. Reessayer trois fois ferait patienter l'utilisateur trente
-/// secondes pour lui resservir la meme reponse.
-fn est_refus_d_authentification(stderr: &str) -> bool {
-    let bas = stderr.to_lowercase();
-    bas.contains("permission denied")
-        || bas.contains("access denied")
-        || bas.contains("bad user name or password")
-}
-
-#[cfg(test)]
-mod tests_smb_dialecte {
-    use super::est_refus_d_authentification;
-
-    #[test]
-    fn un_refus_d_identifiants_arrete_les_essais() {
-        assert!(est_refus_d_authentification(
-            "mount error(13): Permission denied"
-        ));
-        assert!(est_refus_d_authentification("Access denied"));
-        assert!(est_refus_d_authentification(
-            "mount error: bad user name or password"
-        ));
-    }
-
-    /// Le cas de Philippe Landes : `mount error(22): Invalid argument`, obtenu
-    /// avec vers=3.0, puis en negociation libre, puis avec vers=2.0 — alors que
-    /// `smbclient -L` listait le partage avec les MEMES identifiants. Si ce
-    /// message etait pris pour un refus d'authentification, la boucle
-    /// s'arreterait au premier essai et n'atteindrait jamais le dialecte qui
-    /// marche : le correctif ne corrigerait rien.
-    #[test]
-    fn un_dialecte_inadapte_laisse_la_boucle_continuer() {
-        assert!(!est_refus_d_authentification(
-            "mount error(22): Invalid argument"
-        ));
-        assert!(!est_refus_d_authentification(
-            "mount error(112): Host is down"
-        ));
-        assert!(!est_refus_d_authentification("Device or resource busy"));
-        assert!(!est_refus_d_authentification(""));
-    }
-
-    /// La casse de `mount.cifs` varie selon les versions.
-    #[test]
-    fn la_casse_du_message_ne_change_rien() {
-        assert!(est_refus_d_authentification("PERMISSION DENIED"));
-        assert!(est_refus_d_authentification(
-            "Mount Error(13): Permission Denied"
-        ));
     }
 }

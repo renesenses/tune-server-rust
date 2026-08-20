@@ -878,6 +878,60 @@ pub struct LocalOutput {
     open_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// What the render callbacks multiply every sample by, in thousandths.
+///
+/// `dop` is not one more attenuation to fold in — it *replaces* the whole
+/// computation with unity, and that is the point. A DoP stream is a DSD
+/// bitstream wrapped in 24-bit PCM whose top byte carries the alternating
+/// `0x05`/`0xFA` marker (`audio::dsd_to_dop`). Any factor other than exactly
+/// 1.0 rewrites that byte, the DAC stops recognising DoP, and it **mutes** —
+/// so a DSD track survived only at 100 % with ReplayGain off, and neither the
+/// slider nor the ReplayGain tag said why (Tades, #1408 → #1735).
+///
+/// Unity is exact here rather than merely close: a 24-bit integer sample is
+/// representable to the bit in an f32 mantissa, so skipping the multiply
+/// returns the marker byte untouched.
+///
+/// The consequence is deliberate and must be surfaced in the UI: **on a DSD
+/// track the volume slider does nothing.** Silently inert is a better failure
+/// than silently mute, but it is still a failure until the interface says so.
+fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
+    if dop {
+        return 1000;
+    }
+    let user = user_units as f64 / 1000.0;
+    let rg = rg_units as f64 / 1000.0;
+    // Clamped to unity: above it, a ReplayGain boost would push peaks past
+    // full scale and the user, who never touched the slider, would hear
+    // distortion appear out of nowhere.
+    ((user * rg).clamp(0.0, 1.0) * 1000.0).round() as u32
+}
+
+/// Reporte une bascule DoP sur le facteur que lisent les callbacks de rendu.
+///
+/// Appelée depuis les trois boucles d'alimentation, dont celle du bras ASIO,
+/// qui vit sous `#[cfg(all(target_os = "windows", feature = "asio"))]` et n'est
+/// donc **pas compilée ailleurs que sous Windows**. Garder le calcul ici plutôt
+/// que répété dans les trois boucles le fait type-checker et tester sur toutes
+/// les plateformes ; le bras ASIO n'en garde qu'un appel. Sans cela, une faute
+/// de frappe à cet endroit ne se découvrirait qu'au build Windows de la
+/// release — `asio` fait partie des features livrées (`release.yml`).
+fn sync_volume_to_dop(
+    volume: &AtomicU32,
+    user_volume: &AtomicU32,
+    rg_factor: &AtomicU32,
+    dop: bool,
+) {
+    volume.store(
+        effective_volume_units(
+            user_volume.load(Ordering::SeqCst),
+            rg_factor.load(Ordering::SeqCst),
+            dop,
+        ),
+        Ordering::SeqCst,
+    );
+}
+
 impl LocalOutput {
     pub fn new(device_name: String) -> Self {
         Self::with_options(device_name, false, "auto")
@@ -901,11 +955,12 @@ impl LocalOutput {
     }
 
     fn recompute_effective_volume(&self) {
-        let user = self.user_volume.load(Ordering::SeqCst) as f64 / 1000.0;
-        let rg = self.rg_factor.load(Ordering::SeqCst) as f64 / 1000.0;
-        let effective = (user * rg).clamp(0.0, 1.0);
-        self.volume
-            .store((effective * 1000.0).round() as u32, Ordering::SeqCst);
+        let v = effective_volume_units(
+            self.user_volume.load(Ordering::SeqCst),
+            self.rg_factor.load(Ordering::SeqCst),
+            self.dop_active.load(Ordering::Relaxed),
+        );
+        self.volume.store(v, Ordering::SeqCst);
     }
 
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
@@ -1011,6 +1066,36 @@ impl LocalOutput {
             return None;
         }
         Some((taux, canaux))
+    }
+
+    /// Déclarer un format « en cours » sans lecture réelle — **tests
+    /// uniquement**.
+    ///
+    /// `current_format` n'est écrit que par les trois boucles d'alimentation,
+    /// qui exigent un périphérique audio ouvert. Or les rafraîchisseurs à chaud
+    /// (`refresh_zone_eq`, `refresh_zone_crossfeed`, `refresh_zone_pure_dsp`)
+    /// s'arrêtent net sur un format inconnu : sans ce point d'entrée, leur
+    /// corps utile n'est atteignable par aucun test sans matériel, et c'est
+    /// précisément le corps qui décide si le son change.
+    #[cfg(test)]
+    pub(crate) fn declare_current_format_for_test(&self, taux: u32, canaux: u16) {
+        self.current_format
+            .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
+    }
+
+    /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
+    /// consulte, donc lui qui dit si l'égaliseur installé travaille encore.
+    #[cfg(test)]
+    pub(crate) fn pure_bypass_for_test(&self) -> bool {
+        self.pure_bypass.load(Ordering::Relaxed)
+    }
+
+    /// Facteur ReplayGain courant en millièmes, pour les tests. Il n'est PAS
+    /// couvert par le drapeau PURE : c'est une multiplication faite dans les
+    /// callbacks de rendu, hors de `apply_local_dsp`.
+    #[cfg(test)]
+    pub(crate) fn replaygain_units_for_test(&self) -> u32 {
+        self.rg_factor.load(Ordering::SeqCst)
     }
 
     /// Empaquette `(taux, canaux)` pour [`Self::current_format`]. Un taux
@@ -1748,6 +1833,12 @@ impl OutputTarget for LocalOutput {
         let pure_bypass = self.pure_bypass.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
+        // Les deux composantes du volume effectif, pour pouvoir le recalculer
+        // depuis la boucle d'alimentation quand le flux entre ou sort du DoP —
+        // `recompute_effective_volume` est une méthode et n'est pas atteignable
+        // depuis ce thread.
+        let user_volume_ref = self.user_volume.clone();
+        let rg_factor_ref = self.rg_factor.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -2293,6 +2384,10 @@ impl OutputTarget for LocalOutput {
                     let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
                     if dop_active.swap(dop, Ordering::Relaxed) != dop {
                         info!(dop, "local_audio_dop_stream_state_changed");
+                        // Le volume effectif dépend de cet état : en DoP il vaut
+                        // l'unité, sinon le produit volume × ReplayGain. C'est
+                        // le seul endroit où l'état bascule.
+                        sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
                     }
                     let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
@@ -2634,6 +2729,10 @@ impl OutputTarget for LocalOutput {
                     let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
                     if dop_active.swap(dop, Ordering::Relaxed) != dop {
                         info!(dop, "local_audio_dop_stream_state_changed");
+                        // Le volume effectif dépend de cet état : en DoP il vaut
+                        // l'unité, sinon le produit volume × ReplayGain. C'est
+                        // le seul endroit où l'état bascule.
+                        sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
                     }
                     let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
@@ -3567,6 +3666,9 @@ impl OutputTarget for LocalOutput {
                 let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
                 if dop_active.swap(dop, Ordering::Relaxed) != dop {
                     info!(dop, "local_audio_dop_stream_state_changed");
+                    // Voir la note au site jumeau : le volume effectif suit
+                    // l'état DoP, et c'est ici qu'il bascule.
+                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
                 }
                 let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                 let remainder = leftover[aligned_len..].to_vec();
@@ -4293,6 +4395,7 @@ impl OutputTarget for LocalOutput {
                 ended_naturally: true,
                 // A renderer plays at 1x: keep the poller's wall-clock guards.
                 realtime: true,
+                dop_active: self.dop_active.load(Ordering::Relaxed),
             });
         }
 
@@ -4318,6 +4421,10 @@ impl OutputTarget for LocalOutput {
             ended_naturally: self.track_ended_naturally.load(Ordering::Relaxed),
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Détecté sur les octets par `is_dop_pcm`, jamais déduit des
+            // réglages de zone : c'est la seule valeur qui dise si le volume
+            // est réellement épinglé à l'unité en ce moment (#1735).
+            dop_active: self.dop_active.load(Ordering::Relaxed),
         })
     }
 
@@ -4927,6 +5034,68 @@ mod tests {
         let before = rms(&samples);
         apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
         assert!(20.0 * (rms(&samples[1024..]) / before).log10() < -8.0);
+    }
+
+    #[test]
+    fn sync_volume_to_dop_writes_what_the_callbacks_read() {
+        // Le bras ASIO n'est pas compilé hors Windows : ce test couvre le corps
+        // qu'il appelle, pour qu'une faute à cet endroit ne se découvre pas au
+        // build Windows de la release.
+        let volume = AtomicU32::new(1000);
+        let user = AtomicU32::new(600);
+        let rg = AtomicU32::new(708);
+
+        sync_volume_to_dop(&volume, &user, &rg, false);
+        assert_eq!(volume.load(Ordering::SeqCst), 425);
+
+        sync_volume_to_dop(&volume, &user, &rg, true);
+        assert_eq!(volume.load(Ordering::SeqCst), 1000);
+
+        // Et le retour au PCM rend la main au curseur.
+        sync_volume_to_dop(&volume, &user, &rg, false);
+        assert_eq!(volume.load(Ordering::SeqCst), 425);
+    }
+
+    #[test]
+    fn dop_pins_the_effective_volume_to_unity() {
+        // #1735, moitié « volume » : sur un flux DoP, tout facteur autre que
+        // l'unité réécrit l'octet de marqueur et le DAC se coupe. Ni le curseur
+        // ni le ReplayGain ne doivent pouvoir en sortir.
+        assert_eq!(effective_volume_units(500, 1000, true), 1000);
+        assert_eq!(effective_volume_units(0, 1000, true), 1000);
+        assert_eq!(effective_volume_units(1000, 300, true), 1000);
+        assert_eq!(effective_volume_units(120, 450, true), 1000);
+    }
+
+    #[test]
+    fn ordinary_pcm_keeps_the_volume_it_had_before() {
+        // Non-régression : hors DoP, le calcul est exactement celui d'avant —
+        // produit volume × ReplayGain, borné à l'unité.
+        assert_eq!(effective_volume_units(1000, 1000, false), 1000);
+        assert_eq!(effective_volume_units(500, 1000, false), 500);
+        assert_eq!(effective_volume_units(0, 1000, false), 0);
+        assert_eq!(effective_volume_units(800, 500, false), 400);
+        // Le plafond à l'unité protège des pics d'un ReplayGain qui pousse.
+        assert_eq!(effective_volume_units(1000, 4000, false), 1000);
+        assert_eq!(effective_volume_units(900, 2000, false), 1000);
+    }
+
+    #[test]
+    fn a_dop_track_survives_a_volume_that_would_have_muted_it() {
+        // Le cas de Tades, bout à bout : volume à 60 %, ReplayGain à -3 dB.
+        // Avant, le produit (0,42) réécrivait le marqueur et le DAC se taisait.
+        let user = 600;
+        let rg = 708; // ~ -3 dB
+        assert_eq!(effective_volume_units(user, rg, false), 425);
+        assert_eq!(effective_volume_units(user, rg, true), 1000);
+
+        // Et l'unité doit être EXACTE, pas approchée : c'est ce qui rend la
+        // multiplication inoffensive sur un échantillon 24 bits, exactement
+        // représentable dans une mantisse f32.
+        let v = effective_volume_units(user, rg, true) as f32 / 1000.0;
+        assert_eq!(v, 1.0f32);
+        let sample = 0x05A3C7 as f32; // un échantillon 24 bits porteur du marqueur
+        assert_eq!((sample * v) as i32, 0x05A3C7);
     }
 
     #[test]
