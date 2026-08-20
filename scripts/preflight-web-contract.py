@@ -66,27 +66,27 @@ SOURCES_SERVEUR = ["tune-server/src", "tune-core/src", "plugins"]
 # fait échouer le préflight.
 #
 # Retirer une ligne d'ici dès que la route est servie ou l'appel supprimé.
+# SIX ENTRÉES ONT ÉTÉ RETIRÉES le 20/08, la dette étant payée — c'est le
+# script lui-même qui les a signalées, via sa ligne « est désormais servie » :
+#   /metadata/auto-fix, /auto-fix/status, /reclassify-genres-by-path  (#1920)
+#   /library/import/{roon,plex,playlists}                             (#520 web)
 SOCLE_CONNU: dict[str, str] = {
-    # Trouvées par le contrôle par segment.
-    "/metadata/auto-fix": "#1893",
-    "/metadata/auto-fix-albums": "#1893",
-    "/metadata/auto-fix/status": "#1893",
-    "/metadata/duplicates/move-album": "#1893",
-    "/metadata/reclassify-genres-by-path": "#1893",
-    # `/metadata/suggestions/accept-all` a été RETIRÉ de ce socle : le web
-    # appelle désormais `/suggestions/auto-apply`. La route est servie.
-    #
-    # Révélées par le contrôle conscient du préfixe : elles étaient invisibles
-    # au contrôle par segment, qui trouvait le mot ailleurs dans le serveur.
-    "/metadata/duplicates": "#1893",  # servi sous /library/duplicates
-    "/metadata/duplicates/resolve": "#1893",  # servi sous /library/duplicates/resolve
-    "/metadata/duplicates/scan": "#1893",
-    "/metadata/mp3/diagnose": "#1893",
+    "/metadata/auto-fix-albums": "#1893",  # sémantique d'« album créé » indécidable
+    "/metadata/duplicates/move-album": "#1893",  # destructif sur disque, à arbitrer
+    "/metadata/mp3/diagnose": "#1893",  # aucun moteur : l'écrire serait inventer
     "/metadata/mp3/repair": "#1893",  # « repaired » existait, la route non
     "/metadata/batch/tracks": "#1893",  # code mort : aucun composant l'appelle
-    "/library/import/roon": "#2004",  # servi sous /system/import/roon
-    "/library/import/plex": "#2004",  # servi sous /system/import/plex
-    "/library/import/playlists": "#2004",  # servi sous /system/import/playlists
+    #
+    # Les trois suivantes sont SERVIES — sous `/library`, pas `/metadata`. Ce
+    # n'est plus une route à écrire mais un appel web à corriger. ⚠ Le préfixe
+    # n'est pas leur seul défaut : `resolve` envoie ses arguments en query quand
+    # le serveur les attend dans le corps, et `list` rend un objet à trois
+    # familles là où le client attend un tableau plat. Renommer le préfixe seul
+    # ne suffirait pas — voir #1893.
+    "/metadata/duplicates": "#1893",  # servi : /library/duplicates
+    "/metadata/duplicates/resolve": "#1893",  # servi : /library/duplicates/resolve
+    "/metadata/duplicates/scan": "#1893",  # servi depuis #2018 : /library/duplicates/scan
+    #
     "/sonos/speakers": "#2004",
     "/sonos/discover": "#2004",
     "/sonos/groups": "#2004",
@@ -388,8 +388,18 @@ def self_test() -> int:
     if restantes:
         echecs.append(f"le contrôle reste rouge alors que tout est servi : {restantes}")
 
-    if "/metadata/auto-fix" not in SOCLE_CONNU:
-        echecs.append("le socle connu a perdu une entrée sans que personne ne le voie")
+    # Le socle se vide LÉGITIMEMENT à mesure que les routes sont servies : cette
+    # garde était épinglée sur `/metadata/auto-fix`, et elle a cassé le jour où
+    # cette route a enfin été écrite (#1920). Épingler une clef précise punit la
+    # réparation. On vérifie donc la FORME — un socle vidé d'un coup, ou dont
+    # une entrée ne référence plus rien, reste attrapé.
+    if not SOCLE_CONNU:
+        echecs.append("le socle connu est vide : soit tout est réparé, soit il a été écrasé")
+    for route, ref in SOCLE_CONNU.items():
+        if not route.startswith("/"):
+            echecs.append(f"socle : « {route} » n'est pas un chemin")
+        if not re.fullmatch(r"#\d+", ref):
+            echecs.append(f"socle : « {route} » tolérée sans numéro d'issue ({ref!r})")
 
     echecs.extend(self_test_prefixe())
 
