@@ -1582,5 +1582,29 @@
     "ko": "'{a}' 영역과 '{b}' 영역은 같은 오디오 출력을 사용하므로 그룹으로 묶을 수 없습니다. 둘 중 하나를 삭제하거나 다른 출력을 지정하세요.",
     "ro": "Zonele „{a}” și „{b}” folosesc aceeași ieșire audio: nu pot fi grupate. Ștergeți una dintre ele sau atribuiți-i altă ieșire.",
     "sv": "Zonerna ”{a}” och ”{b}” använder samma ljudutgång: de kan inte grupperas. Ta bort en av dem eller ge den en annan utgång."
+  },
+  "browse.hint.windowsMappedDrive": {
+    "fr": "« {drive} » est un lecteur réseau mappé : sous Windows, une lettre de lecteur n'appartient qu'à la session qui l'a créée et reste invisible au service Tune. Indiquez le chemin UNC du partage (\\\\serveur\\partage) au lieu de la lettre.",
+    "en": "“{drive}” is a mapped network drive: on Windows a drive letter belongs only to the session that created it and stays invisible to the Tune service. Use the share's UNC path (\\\\server\\share) instead of the letter.",
+    "de": "„{drive}“ ist ein verbundenes Netzlaufwerk: Unter Windows gehört ein Laufwerksbuchstabe nur der Sitzung, die ihn erstellt hat, und bleibt für den Tune-Dienst unsichtbar. Geben Sie den UNC-Pfad der Freigabe an (\\\\Server\\Freigabe) statt des Buchstabens.",
+    "es": "«{drive}» es una unidad de red asignada: en Windows, una letra de unidad solo pertenece a la sesión que la creó y permanece invisible para el servicio Tune. Indique la ruta UNC del recurso compartido (\\\\servidor\\recurso) en lugar de la letra.",
+    "it": "«{drive}» è un'unità di rete mappata: in Windows una lettera di unità appartiene solo alla sessione che l'ha creata e resta invisibile al servizio Tune. Indicare il percorso UNC della condivisione (\\\\server\\condivisione) invece della lettera.",
+    "zh": "“{drive}” 是映射的网络驱动器：在 Windows 上，驱动器号仅属于创建它的会话，Tune 服务无法看到。请改用共享的 UNC 路径（\\\\服务器\\共享），而不是驱动器号。",
+    "ja": "「{drive}」は割り当てられたネットワークドライブです。Windows ではドライブ文字は作成したセッションにのみ属し、Tune のサービスからは見えません。ドライブ文字ではなく共有の UNC パス（\\\\サーバー\\共有）を指定してください。",
+    "ko": "“{drive}”는 매핑된 네트워크 드라이브입니다. Windows에서 드라이브 문자는 이를 만든 세션에만 속하며 Tune 서비스에서는 보이지 않습니다. 드라이브 문자 대신 공유의 UNC 경로(\\\\서버\\공유)를 입력하세요.",
+    "ro": "„{drive}” este o unitate de rețea mapată: în Windows, o literă de unitate aparține doar sesiunii care a creat-o și rămâne invizibilă pentru serviciul Tune. Indicați calea UNC a partajării (\\\\server\\partajare) în loc de literă.",
+    "sv": "”{drive}” är en ansluten nätverksenhet: i Windows tillhör en enhetsbokstav endast den session som skapade den och förblir osynlig för Tune-tjänsten. Ange resursens UNC-sökväg (\\\\server\\resurs) i stället för bokstaven."
+  },
+  "browse.hint.uncUnreachable": {
+    "fr": "Ce partage réseau est injoignable. Vérifiez que le serveur est allumé et accessible, et que les identifiants enregistrés sont toujours valides.",
+    "en": "This network share is unreachable. Check that the server is powered on and reachable, and that the stored credentials are still valid.",
+    "de": "Diese Netzwerkfreigabe ist nicht erreichbar. Prüfen Sie, ob der Server eingeschaltet und erreichbar ist und ob die gespeicherten Anmeldedaten noch gültig sind.",
+    "es": "Este recurso compartido de red no es accesible. Compruebe que el servidor está encendido y accesible, y que las credenciales guardadas siguen siendo válidas.",
+    "it": "Questa condivisione di rete non è raggiungibile. Verificare che il server sia acceso e raggiungibile e che le credenziali salvate siano ancora valide.",
+    "zh": "无法访问该网络共享。请确认服务器已开机且可访问，并且已保存的凭据仍然有效。",
+    "ja": "このネットワーク共有に接続できません。サーバーの電源が入っていて到達可能か、保存された認証情報がまだ有効かを確認してください。",
+    "ko": "이 네트워크 공유에 연결할 수 없습니다. 서버가 켜져 있고 접근 가능한지, 저장된 자격 증명이 여전히 유효한지 확인하세요.",
+    "ro": "Această partajare de rețea este inaccesibilă. Verificați dacă serverul este pornit și accesibil și dacă datele de autentificare salvate sunt încă valide.",
+    "sv": "Den här nätverksresursen går inte att nå. Kontrollera att servern är påslagen och nåbar och att de sparade inloggningsuppgifterna fortfarande är giltiga."
   }
 }
