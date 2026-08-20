@@ -911,6 +911,32 @@ pub(crate) fn cap_output_bit_depth(bit_depth: u16) -> u16 {
 /// Règle extraite en fonction libre parce que son absence côté réseau était
 /// invisible : `"dop"` n'était comparé qu'à un seul endroit du dépôt, sous un
 /// garde `is_local_output` (#1772).
+/// Cadence et canaux à ANNONCER pour un flux DoP, le fichier faisant foi.
+///
+/// L'en-tête WAV et la charge utile doivent décrire la même chose. L'encodeur
+/// (`decode_dsd_to_dop_streaming`) se construit sur ce que rend
+/// `parse_dsf`/`parse_dff` ; annoncer la ligne `tracks` à la place revient à
+/// parier que la base et le fichier concordent. Quand ils divergent d'un canal,
+/// chaque mot de 24 bits est décalé, le marqueur DoP ne tombe plus sur l'octet
+/// de poids fort, et le DAC joue le train DSD comme du PCM : du bruit blanc.
+///
+/// La base ne sert que de repli, pour un en-tête illisible — mieux vaut
+/// diffuser avec des valeurs approximatives que refuser de lire.
+fn dop_wire_params(
+    probe: Option<(u32, u32)>,
+    db_rate: Option<u32>,
+    db_channels: u32,
+) -> (u32, u16) {
+    let rate = probe
+        .map(|(sr, _)| sr)
+        .unwrap_or_else(|| db_rate.unwrap_or(2_822_400));
+    let channels = probe
+        .map(|(_, ch)| ch as u16)
+        .unwrap_or(db_channels as u16)
+        .max(2);
+    (rate, channels)
+}
+
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
     (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
 }
@@ -2804,7 +2830,49 @@ impl PlaybackOrchestrator {
 
         if source_format == Some(AudioFormat::Dsd) {
             if dop_requested {
-                let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
+                // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
+                // pas dans la base.
+                //
+                // L'en-tête WAV décrivait la ligne `tracks` pendant que la
+                // charge utile sortait de `parse_dsf`/`parse_dff` : deux
+                // sources qui n'ont aucune raison de coïncider. Un écart d'un
+                // canal désaligne chaque mot de 24 bits, le marqueur DoP ne
+                // tombe plus sur l'octet de poids fort, le DAC ne verrouille
+                // pas en DSD et joue le train DSD comme du PCM — c'est-à-dire
+                // du bruit blanc (Marco Polo, Wiim Pro, #1894). Un écart de
+                // cadence annonce un débit que le renderer n'appliquera pas.
+                //
+                // Le fichier est la seule source qui décrit ce qui part
+                // réellement sur le fil, et c'est la même que celle dont
+                // l'encodeur se sert (`decode_dsd_to_dop_streaming`). La base
+                // ne sert plus que de repli si l'en-tête est illisible.
+                let dsd_probe = {
+                    let ext = std::path::Path::new(&file_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("dsf")
+                        .to_lowercase();
+                    if ext == "dff" {
+                        crate::audio::dff::parse_dff(&file_path)
+                            .ok()
+                            .map(|i| (i.sample_rate, i.channels))
+                    } else {
+                        crate::audio::dsf::parse_dsf(&file_path)
+                            .ok()
+                            .map(|i| (i.sample_rate, i.channels))
+                    }
+                };
+                if dsd_probe.is_none() {
+                    warn!(
+                        path = %file_path,
+                        "dsd_header_unreadable_falling_back_to_db_metadata"
+                    );
+                }
+                let (dsd_rate, dop_channels) = dop_wire_params(
+                    dsd_probe,
+                    track.sample_rate.map(|v| v as u32),
+                    track.channels as u32,
+                );
                 let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
                 // Réutilise le plafond déjà combiné avec le quirk catalogue.
                 let zone_max_sr = zone_max_sample_rate;
@@ -2818,7 +2886,8 @@ impl PlaybackOrchestrator {
                     }
                 }
                 if zone_max_sr.is_none_or(|max_sr| dop_rate <= max_sr) {
-                    let dop_channels = track.channels.max(2) as u16;
+                    // `dop_channels` vient de `dop_wire_params`, calculé plus
+                    // haut avec la cadence : même source, même raison.
 
                     let wav_info = StreamInfo {
                         format: "wav".into(),
@@ -10548,7 +10617,7 @@ mod bit_depth_cap_tests {
 
 #[cfg(test)]
 mod dop_routing_tests {
-    use super::dop_requested;
+    use super::{dop_requested, dop_wire_params};
 
     /// #1772 — le cas RÉEL de Marco Polo : Wiim Pro (renderer DLNA) relié en
     /// optique à un DAC Denafrips, zone réglée sur « dop ». Avant le correctif,
@@ -10594,5 +10663,45 @@ mod dop_routing_tests {
     fn ni_locale_ni_reseau_ne_recoit_rien() {
         assert!(!dop_requested(false, false, "dop"));
         assert!(!dop_requested(false, false, "native"));
+    }
+
+    /// #1894 — l'en-tête WAV doit décrire le FICHIER, jamais la ligne `tracks`.
+    #[test]
+    fn le_fichier_prime_sur_la_base_pour_annoncer_un_flux_dop() {
+        // Le cas qui produit du bruit blanc : la base dit stéréo, le fichier
+        // est multicanal. Annoncer 2 canaux pour une charge utile qui en porte
+        // 5 décale chaque mot de 24 bits et noie le marqueur DoP.
+        let (rate, ch) = dop_wire_params(Some((2_822_400, 5)), Some(2_822_400), 2);
+        assert_eq!(ch, 5);
+        assert_eq!(rate, 2_822_400);
+
+        // Et le cas symétrique : une cadence périmée en base (DSD64 scanné,
+        // fichier remplacé par du DSD128) annoncerait un débit DoP faux.
+        let (rate, ch) = dop_wire_params(Some((5_644_800, 2)), Some(2_822_400), 2);
+        assert_eq!(rate, 5_644_800);
+        assert_eq!(ch, 2);
+    }
+
+    #[test]
+    fn un_entete_dsd_illisible_retombe_sur_la_base_plutot_que_de_refuser() {
+        // Mieux vaut diffuser avec des valeurs approximatives que ne rien lire.
+        let (rate, ch) = dop_wire_params(None, Some(5_644_800), 2);
+        assert_eq!(rate, 5_644_800);
+        assert_eq!(ch, 2);
+
+        // Base muette : le défaut DSD64, et jamais moins de deux canaux —
+        // un en-tête WAV à 0 canal est injouable partout.
+        let (rate, ch) = dop_wire_params(None, None, 0);
+        assert_eq!(rate, 2_822_400);
+        assert_eq!(ch, 2);
+    }
+
+    #[test]
+    fn le_plancher_a_deux_canaux_ne_masque_jamais_le_fichier() {
+        // `.max(2)` est un plancher, pas un plafond : il ne doit pas rabattre
+        // un fichier multicanal — c'était le risque du `track.channels.max(2)`
+        // d'origine, qui ignorait le fichier de bout en bout.
+        assert_eq!(dop_wire_params(Some((2_822_400, 6)), None, 2).1, 6);
+        assert_eq!(dop_wire_params(Some((2_822_400, 1)), None, 2).1, 2);
     }
 }
