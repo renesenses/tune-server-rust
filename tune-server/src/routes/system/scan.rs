@@ -75,10 +75,31 @@ pub(crate) fn roots_gone_empty(
 ///
 /// `starts_with` seul ne suffit pas : `/mnt/music2` est un préfixe de
 /// `/mnt/music22`, et la protection s'appliquerait alors à un dossier voisin
-/// — ou pire, ne s'appliquerait pas là où on la croit.
+/// — ou pire, ne s'appliquerait pas là où on la croit. Il faut donc exiger
+/// qu'un SÉPARATEUR suive le préfixe.
+///
+/// Les deux séparateurs sont acceptés, et ce n'est pas de la coquetterie :
+/// `tracks.file_path` contient des ANTISLASHS sous Windows. `normalize_path`
+/// (`tune-core/src/scanner/walker.rs`) fait `replace('/', "\\")` sous
+/// `cfg(windows)`, et `track_repo.rs` le dit explicitement — « the server's
+/// `MAIN_SEPARATOR` is the separator stored in `tracks.file_path` », avec
+/// l'exemple `G:\Blues 2\%`.
+///
+/// N'accepter que `/` reviendrait à ce qu'AUCUNE piste ne soit jamais vue sous
+/// sa racine sous Windows : tout deviendrait `HorsPerimetre`, et la purge ne
+/// retirerait plus jamais rien — un fichier supprimé du disque resterait
+/// indéfiniment dans la bibliothèque, sans le moindre message. Cela échoue du
+/// bon côté, mais c'est une plateforme entière qui cesse silencieusement de
+/// faire le ménage.
 pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
-    let d = dossier.trim_end_matches('/');
-    path == d || path.starts_with(&format!("{d}/"))
+    let d = dossier.trim_end_matches(['/', '\\']);
+    if path == d {
+        return true;
+    }
+    // `strip_prefix` puis test du séparateur restant, plutôt que de construire
+    // `{d}/` : une seule comparaison couvre les deux séparateurs, sans allouer.
+    path.strip_prefix(d)
+        .is_some_and(|reste| reste.starts_with('/') || reste.starts_with('\\'))
 }
 
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
@@ -1665,6 +1686,60 @@ mod roots_gone_empty_tests {
         assert!(sous_le_dossier("/mnt/music2", "/mnt/music2"));
         // Une barre finale sur la racine ne doit rien changer.
         assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2/"));
+    }
+
+    /// Sous Windows, `tracks.file_path` contient des ANTISLASHS : `walker.rs`
+    /// fait `replace('/', "\\")` sous `cfg(windows)`, et `track_repo.rs` cite
+    /// l'exemple réel `G:\Blues 2\%`.
+    ///
+    /// Ces cas ne sont pas décoratifs : avec un séparateur `/` codé en dur,
+    /// TOUS échouaient, donc aucune piste n'était jamais vue sous sa racine et
+    /// la purge cessait silencieusement de fonctionner sur toute la plateforme.
+    /// Ce test tourne sur n'importe quel hôte — `sous_le_dossier` compare des
+    /// chaînes, pas des chemins du système de fichiers.
+    #[test]
+    fn les_chemins_windows_sont_reconnus_sous_leur_racine() {
+        assert!(sous_le_dossier(r"G:\Blues 2\track.flac", r"G:\Blues 2"));
+        assert!(sous_le_dossier(
+            r"G:\Blues 2\sous\dossier\t.flac",
+            r"G:\Blues 2"
+        ));
+        assert!(sous_le_dossier(r"G:\Blues 2", r"G:\Blues 2"));
+        // Le piège du préfixe vaut aussi avec des antislashs.
+        assert!(!sous_le_dossier(r"G:\Blues 22\track.flac", r"G:\Blues 2"));
+        // Antislash final sur la racine, comme le produit une saisie utilisateur.
+        assert!(sous_le_dossier(r"G:\Blues 2\track.flac", r"G:\Blues 2\"));
+        // Racine de lecteur : `C:\` se réduit à `C:`, le reste commence par `\`.
+        assert!(sous_le_dossier(r"C:\musique.flac", r"C:\"));
+        // Un lecteur voisin ne doit rien capter.
+        assert!(!sous_le_dossier(r"D:\musique.flac", r"C:\"));
+    }
+
+    /// Le verdict complet, et pas seulement le prédicat : sous Windows, une
+    /// piste sous sa racine doit être `Supprimer`, jamais `HorsPerimetre`.
+    /// C'est ce verdict-là qui décidait du sort de toute une bibliothèque.
+    #[test]
+    fn une_piste_windows_sous_sa_racine_n_est_pas_hors_perimetre() {
+        let racines = vec![r"G:\Blues 2".to_string()];
+        assert_eq!(
+            verdict_purge(r"G:\Blues 2\track.flac", &racines, &[], &[], &[]),
+            VerdictPurge::Supprimer
+        );
+        assert_eq!(
+            verdict_purge(r"H:\Autre\track.flac", &racines, &[], &[], &[]),
+            VerdictPurge::HorsPerimetre
+        );
+        // La protection « illisible » doit elle aussi voir les antislashs.
+        assert_eq!(
+            verdict_purge(
+                r"G:\Blues 2\track.flac",
+                &racines,
+                &[r"G:\Blues 2".to_string()],
+                &[],
+                &[]
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
     }
 
     #[test]
