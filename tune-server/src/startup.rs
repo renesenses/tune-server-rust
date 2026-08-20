@@ -133,6 +133,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     spawn_asio_warm_scan();
 
     reset_zones_offline(state);
+    marquer_enrichissements_interrompus(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     cleanup_orphan_queues(state);
@@ -187,6 +188,112 @@ fn reset_zones_offline(state: &AppState) {
         }
         Err(e) => {
             tracing::warn!(error = %e, "zones_reset_offline_failed");
+        }
+    }
+}
+
+/// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
+/// base. Chacun ne connaît que deux écritures : `running` au lancement et à
+/// chaque jalon, `done` à la fin NORMALE de la boucle.
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
+    ["enrich_all_status", "artist_artwork_enrich_result"];
+
+/// Les mêmes, dans leur forme dégradée : une chaîne nue, écrite `running` et
+/// jamais relue par personne aujourd'hui. On les neutralise quand même — un
+/// mensonge permanent en base finit toujours par trouver un lecteur.
+const DRAPEAUX_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
+    ["artwork_enrich_status", "artist_artwork_enrich_status"];
+
+/// Réécriture d'un avancement resté à `running`, ou `None` s'il n'y a rien à
+/// faire (déjà terminé, illisible, ou pas un objet).
+///
+/// Rend `(json, traité, total)` — les deux compteurs pour le journal.
+///
+/// ⚠️ Deux champs sont neutralisés, pas un. Les clients **déjà livrés** ne
+/// lisent pas le même : `status` pour l'enrichissement de métadonnées, `phase`
+/// pour les images d'artistes (`if (!phase || phase === 'done') return;`).
+/// N'en corriger qu'un ne débloquerait personne avant la prochaine version du
+/// client — or ceux qui sont coincés le sont sur une version déjà publiée.
+///
+/// ⚠️ Les compteurs sont CONSERVÉS. « Interrompu à 5 650 / 16 261 » se
+/// comprend ; un réglage effacé ne dirait plus rien du tout, et l'utilisateur
+/// ne saurait pas où sa passe s'est arrêtée.
+fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
+    let mut valeur = match serde_json::from_str::<serde_json::Value>(brut) {
+        Ok(v) => v,
+        Err(_) => {
+            // Réglage illisible : on n'y touche pas. Écraser ce qu'on ne
+            // comprend pas serait pire que de le laisser.
+            warn!("enrichissement_avancement_illisible");
+            return None;
+        }
+    };
+    if valeur.get("status").and_then(|v| v.as_str()) != Some("running") {
+        return None;
+    }
+    let objet = valeur.as_object_mut()?;
+    objet.insert("status".into(), serde_json::json!("interrupted"));
+    // `phase` n'existe que sur les images d'artistes ; l'y poser à `done` est
+    // ce qui empêche le client déjà livré de reprendre un suivi fantôme. Sur
+    // les autres réglages la clé est simplement ajoutée, et ignorée.
+    objet.insert("phase".into(), serde_json::json!("done"));
+    let traite = objet
+        .get("enriched")
+        .or_else(|| objet.get("processed"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = objet.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some((valeur.to_string(), traite, total))
+}
+
+/// Déclarer interrompue toute passe d'enrichissement que la base croit encore
+/// en cours.
+///
+/// Une passe d'enrichissement vit dans un `tokio::spawn` de ce processus ; son
+/// avancement, lui, est écrit en base — et il y reste. Le `done` de fin est
+/// posé APRÈS la boucle : un redémarrage, un arrêt brutal ou une panique le
+/// sautent, et le réglage affirme alors pour toujours qu'une passe tourne
+/// pendant que le fil qui l'écrivait n'existe plus.
+///
+/// Ce n'est pas un défaut d'affichage. Le client fait confiance à cet état pour
+/// reprendre le suivi à l'ouverture de l'écran (#1867) **et** désactive le
+/// bouton de relance tant qu'il le lit `running` : l'utilisateur se retrouve
+/// devant un bouton grisé portant « 5650/16261 pistes… » qu'aucun geste ne
+/// débloque, et la seule action qui réparerait est précisément celle qu'on lui
+/// interdit (Bilou, 0.9.90, #2002).
+///
+/// Le démarrage de ce processus est la seule preuve nécessaire : aucune passe
+/// ne survit au processus qui la portait. Pas de délai de grâce, pas
+/// d'horodatage à comparer — si on est ici, elles sont mortes.
+///
+/// La réécriture elle-même vit dans [`avancement_interrompu`], testée à part.
+fn marquer_enrichissements_interrompus(state: &AppState) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+
+    for cle in REGLAGES_AVANCEMENT_ENRICHISSEMENT {
+        let Ok(Some(brut)) = settings.get(cle) else {
+            continue;
+        };
+        let Some((neuf, traite, total)) = avancement_interrompu(&brut) else {
+            continue;
+        };
+        match settings.set(cle, &neuf) {
+            Ok(()) => info!(
+                cle,
+                traite,
+                total,
+                "enrichissement_marque_interrompu — la passe ne survit pas au processus ; le bouton de relance est rendu à l'utilisateur"
+            ),
+            Err(e) => warn!(cle, error = %e, "enrichissement_marque_interrompu_echec"),
+        }
+    }
+
+    for cle in DRAPEAUX_AVANCEMENT_ENRICHISSEMENT {
+        if let Ok(Some(v)) = settings.get(cle)
+            && v == "running"
+            && let Err(e) = settings.set(cle, "interrupted")
+        {
+            warn!(cle, error = %e, "enrichissement_drapeau_interrompu_echec");
         }
     }
 }
@@ -1396,6 +1503,8 @@ mod asio_warm_scan_tests {
 
 #[cfg(test)]
 mod demarrage_sans_doublon_tests {
+    use super::*;
+
     /// Le re-sondage DLNA au demarrage etait ecrit DEUX FOIS dans
     /// `init_state`, commentaire compris. Chaque appareil persiste etait donc
     /// sonde deux fois en parallele : sur un renderer eteint, la sequence de
@@ -1427,6 +1536,86 @@ mod demarrage_sans_doublon_tests {
              init_state. Chaque appel sonde TOUS les appareils persistes : le \
              doubler double aussi la sequence de reprises sur un renderer \
              injoignable."
+        );
+    }
+
+    // ---- #2002 : un `running` en base survit au processus qui l'a ecrit ----
+
+    /// Le cas de Bilou, tel quel : sa passe s'est arretee a 5 650 / 16 261 et
+    /// le reglage l'annonce encore en cours.
+    #[test]
+    fn un_enrichissement_reste_running_est_declare_interrompu() {
+        let brut =
+            r#"{"status":"running","task_id":"abc","enriched":5650,"errors":3,"total":16261}"#;
+        let (neuf, traite, total) =
+            avancement_interrompu(brut).expect("un `running` doit etre reecrit");
+        let v: serde_json::Value = serde_json::from_str(&neuf).unwrap();
+
+        assert_eq!(v["status"], "interrupted");
+        assert_eq!(traite, 5650);
+        assert_eq!(total, 16261);
+
+        // Les compteurs survivent : « interrompu a 5 650 / 16 261 » se
+        // comprend, un reglage efface ne dirait plus rien.
+        assert_eq!(v["enriched"], 5650);
+        assert_eq!(v["errors"], 3);
+        assert_eq!(v["task_id"], "abc");
+    }
+
+    /// Le client des images d'artistes NE LIT PAS `status` mais `phase`
+    /// (`if (!phase || phase === 'done') return;`). Corriger `status` seul
+    /// laisserait ce client-la reprendre un suivi fantome — et garder son
+    /// bouton grise.
+    #[test]
+    fn la_phase_est_neutralisee_pour_le_client_deja_livre() {
+        let brut = r#"{"status":"running","phase":"images","processed":340,"total":1183}"#;
+        let (neuf, traite, total) = avancement_interrompu(brut).expect("reecriture attendue");
+        let v: serde_json::Value = serde_json::from_str(&neuf).unwrap();
+
+        assert_eq!(v["status"], "interrupted");
+        assert_eq!(
+            v["phase"], "done",
+            "sans `phase: done`, le client deja publie reprend un suivi fantome"
+        );
+        assert_eq!(traite, 340, "`processed` sert de repli a `enriched`");
+        assert_eq!(total, 1183);
+    }
+
+    /// Une passe terminee normalement n'est pas retouchee : la reecrire
+    /// effacerait le bilan de la derniere passe reussie.
+    #[test]
+    fn une_passe_terminee_n_est_pas_retouchee() {
+        assert!(avancement_interrompu(r#"{"status":"done","enriched":42,"total":42}"#).is_none());
+        assert!(avancement_interrompu(r#"{"status":"idle"}"#).is_none());
+    }
+
+    /// Un reglage illisible ou d'une autre forme est laisse intact : ecraser ce
+    /// qu'on ne comprend pas est pire que de le laisser.
+    #[test]
+    fn un_reglage_illisible_est_laisse_intact() {
+        assert!(avancement_interrompu("pas du json").is_none());
+        assert!(avancement_interrompu(r#""running""#).is_none());
+        assert!(avancement_interrompu("[1,2,3]").is_none());
+        assert!(avancement_interrompu("{}").is_none());
+    }
+
+    /// L'appel doit rester dans `init_state` : c'est le demarrage du processus
+    /// qui PROUVE qu'aucune passe ne tourne. Deplace ailleurs, la preuve tombe.
+    #[test]
+    fn le_marquage_est_bien_appele_au_demarrage() {
+        let source = include_str!("startup.rs");
+        let init = source
+            .split("pub async fn init_state")
+            .nth(1)
+            .expect("init_state introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de init_state introuvable");
+        assert_eq!(
+            init.matches("marquer_enrichissements_interrompus").count(),
+            1,
+            "le marquage des enrichissements interrompus doit etre appele une \
+             fois et une seule dans init_state"
         );
     }
 }
