@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Verifie qu'une PR qui DIT fermer une issue la ferme reellement.
+# Rend visible, et actionnable, ce qu'une PR declare corriger.
 #
-# Pourquoi ce garde-fou existe. Mesure du 20/08/2026 sur les 600 dernieres PR
-# fusionnees de ce depot :
-#
-#   citant au moins une issue dans le corps ......... 390
-#   avec un mot-cle de fermeture reconnu par GitHub .. 54
-#   => citent sans rien fermer ..................... 336
-#
-# Consequence : 27 issues corrigees ET livrees sont restees ouvertes, certaines
-# depuis la v0.9.63. Le suivi mentait d'un mois, au point de faire classer en
-# tete de liste une perte de donnees deja reparee.
+# Le probleme mesure le 20/08/2026 : 27 issues corrigees ET LIVREES etaient
+# restees ouvertes, la plus ancienne depuis la v0.9.63. Le suivi mentait d'un
+# mois, au point de faire classer en tete d'un bilan une perte de donnees
+# (#1943) deja reparee.
 #
 # ⚠️ CE QUI NE MARCHE PAS, ET QU'IL FAUT AVOIR EN TETE AVANT DE LIRE LA SUITE.
 #
@@ -68,19 +62,24 @@ analyser() {
   # coller un extrait de journal contenant « Fixes #123 » suffirait a faire
   # passer — ou echouer — une PR sur du texte cite.
   #
-  # ⚠️ Le code en ligne a ete oublie a la premiere ecriture, et ce garde-fou
-  # s'est declenche SUR SA PROPRE PR : elle explique la regle en citant
-  # « `Ferme #1819` » entre accents graves. Toute PR, toute doc, toute issue qui
-  # DECRIT la regle aurait ete bloquee par elle — le defaut le plus vicieux
-  # d'un garde-fou, puisqu'il frappe precisement ceux qui l'expliquent. Deja
-  # rencontre cette semaine : le garde-fou apt decoupait sur un libelle present
-  # dans son propre commentaire.
+  # ⚠️ Ce script s'est declenche DEUX FOIS sur sa propre PR, qui explique la
+  # regle et doit donc citer les formes fautives :
+  #   1. accents graves oublies — la citation en code en ligne comptait ;
+  #   2. GUILLEMETS FRANCAIS oublies — en francais on cite entre « … », et le
+  #      corps corrige de la PR #2010 disait « Ferme #1819 » sans accents
+  #      graves. Le script proposait de fermer #1819 et #1744, que cette PR ne
+  #      corrige pas : une commande destructrice prete a coller, sur les
+  #      mauvaises issues.
+  # C'est le defaut le plus vicieux d'un controle : il frappe precisement ceux
+  # qui l'expliquent. Quatrieme occurrence de cette famille dans le depot cette
+  # semaine — le garde-fou apt decoupait deja sur un libelle present dans son
+  # propre commentaire.
   local propre
   propre=$(printf '%s\n' "$corps" | awk '
     /^[[:space:]]*```/ { dans = !dans; next }
     dans { next }
     /^[[:space:]]*>/   { next }
-    { gsub(/`[^`]*`/, " "); print }
+    { gsub(/`[^`]*`/, " "); gsub(/«[^»]*»/, " "); print }
   ')
 
   # Une declaration d'intention, dans l'une ou l'autre langue. Les deux sont
@@ -220,6 +219,14 @@ autotest() {
   absent_de "code EN LIGNE ignore"  'On ecrit parfois `Ferme #1819`.'    '- #1819'
   absent_de "bloc de code ignore"   '```\nFerme #1819\n```'              '- #1819'
   absent_de "citation ignoree"      '> Ferme #1819'                      '- #1819'
+  # En francais on cite entre guillemets, pas entre accents graves. Sans ce
+  # filtre, le corps corrige de la PR #2010 faisait emettre « gh issue close
+  # 1819 » et « ... 1744 » — des commandes pretes a coller, sur des issues que
+  # la PR ne corrige pas.
+  absent_de "guillemets francais ignores" 'On ecrit « Ferme #1819 », ce qui ne ferme rien.' '- #1819'
+  absent_de "guillemets — cas reel PR #2010" 'la #1838 (« Ferme #1819 ») ne cree aucun lien' '- #1819'
+  # L'inverse : hors guillemets, toujours attrape.
+  classe "hors guillemets, attrape" 'Voir « le guide ». Ferme #1819' 'Déclarées corrigées' '#1819'
   # Et l'inverse, sans quoi le filtre pourrait tout avaler.
   classe "hors accents graves, attrape" 'Voir `le guide`. Ferme #1819' 'Déclarées corrigées' '#1819'
   # « fermeture » contient « ferme » mais n'est pas suivi d'un numero.
