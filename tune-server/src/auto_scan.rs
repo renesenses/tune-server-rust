@@ -553,6 +553,19 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 &discovered_paths,
             );
             let emptied_roots = &racines_videes;
+            // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
+            // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
+            // et tout le sous-arbre partait sans un mot (#1943).
+            let sous_arbres =
+                crate::routes::system::scan::sous_arbres_vides(&existing_refs, &discovered_paths);
+            if !sous_arbres.is_empty() {
+                tracing::error!(
+                    dossiers = ?sous_arbres,
+                    seuil = SEUIL_SOUS_ARBRE_VIDE,
+                    "auto_scan_sous_arbre_vide — ces dossiers ont perdu leurs pistes d'un coup \
+                     alors que leur racine répond. Montage imbriqué absent ? CONSERVÉES."
+                );
+            }
             if !emptied_roots.is_empty() {
                 tracing::error!(
                     roots = ?emptied_roots,
@@ -564,7 +577,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Celle-ci est la plus dangereuse des deux — elle tourne au
             // démarrage, donc AVANT qu'un montage USB ou SMB soit prêt.
             use crate::routes::system::scan::{
-                PART_MAX_PURGE, VerdictPurge, purge_trop_massive, verdict_purge,
+                PART_MAX_PURGE, SEUIL_SOUS_ARBRE_VIDE, VerdictPurge, purge_trop_massive,
+                verdict_purge,
             };
             let mut pruned = 0i64;
             let mut protected = 0i64;
@@ -579,6 +593,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         &missing_dirs,
                         &error_dirs,
                         emptied_roots,
+                        &sous_arbres,
                     ) {
                         VerdictPurge::ProtegeIllisible => protected += 1,
                         VerdictPurge::HorsPerimetre => hors_perimetre += 1,
