@@ -113,6 +113,24 @@ pub struct ZoneState {
     /// besoin d'affichage. Ce booléen ne modifie aucune décision de lecture.
     #[serde(default)]
     pub resolving: bool,
+    /// La zone sert un flux DoP en ce moment — donc **son curseur de volume ne
+    /// fait rien**.
+    ///
+    /// Le serveur épingle le volume à l'unité tant que dure le DoP : tout autre
+    /// facteur réécrit le marqueur du flux, le DAC quitte le mode DSD et se
+    /// coupe (#1735). Le client a besoin de le savoir pour le dire, sans quoi
+    /// on aura remplacé un silence inexpliqué par une commande morte
+    /// inexpliquée.
+    ///
+    /// Recopié du `OutputStatus` de la sortie, qui le **détecte sur les octets**
+    /// (`is_dop_pcm`). Ce n'est pas le mode DSD de la zone : celui-ci dit ce qui
+    /// a été demandé, pas ce qui part sur le fil — le plafond « Fréquence max »
+    /// peut faire retomber en PCM sans rien annoncer. Déduire l'un de l'autre
+    /// est exactement ce qui a fait mentir le chemin du signal (#1595).
+    ///
+    /// Additif, comme `resolving` : ne modifie aucune décision de lecture.
+    #[serde(default)]
+    pub dop_active: bool,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -222,6 +240,7 @@ impl Default for ZoneState {
             state: PlayState::Stopped,
             now_playing: None,
             resolving: false,
+            dop_active: false,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -410,6 +429,23 @@ impl PlaybackManager {
                 ..Default::default()
             })
             .resolving = value;
+    }
+
+    /// Reporte l'état DoP lu sur la sortie dans l'état de zone servi au client.
+    ///
+    /// Appelée à chaque tour du poller, sur les deux chemins (zone au repos et
+    /// zone en lecture) : un flux peut basculer en DoP ou en sortir d'une piste
+    /// à l'autre sans que la zone change d'état, et le curseur de volume doit
+    /// suivre dans les deux sens.
+    pub async fn set_dop_active(&self, zone_id: i64, value: bool) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .dop_active = value;
     }
 
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
@@ -774,6 +810,7 @@ mod tests {
             zone_id: 1,
             state: PlayState::Playing,
             resolving: false,
+            dop_active: false,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),

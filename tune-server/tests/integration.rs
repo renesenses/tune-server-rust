@@ -1452,3 +1452,74 @@ async fn playlist_depuis_favoris_radio_rend_compte_de_chaque_favori() {
         );
     }
 }
+
+/// Le scan de doublons : la porte manquante d'un moteur qui existait.
+///
+/// `duplicate_detector::scan_duplicates` était complet dans `tune-core` et
+/// n'avait AUCUN appelant. L'interface, elle, appelait
+/// `/metadata/duplicates/scan` — un chemin qui n'a jamais existé (#1893). Ce
+/// test garde les deux moitiés du contrat : la route répond, et elle rend les
+/// deux champs que l'écran Métadonnées lit pour composer sa phrase de résultat.
+#[tokio::test]
+async fn library_duplicates_scan_repond_les_compteurs_attendus() {
+    let app = make_app();
+    let (status, body) = post_json(&app, "/api/v1/library/duplicates/scan", json!({})).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "la route doit exister (elle 404ait)"
+    );
+    assert!(
+        body["total_scanned"].is_number(),
+        "l'écran affiche « X doublons sur Y pistes » : total_scanned est obligatoire, reçu {body}"
+    );
+    assert!(
+        body["duplicates_found"].is_number(),
+        "duplicates_found est obligatoire, reçu {body}"
+    );
+}
+
+/// Une bibliothèque vide rend zéro, pas une erreur.
+///
+/// L'écran distingue « aucun doublon » de « le scan a échoué » : rendre une
+/// erreur sur une bibliothèque vide afficherait un échec là où il n'y a
+/// simplement rien à trouver.
+#[tokio::test]
+async fn library_duplicates_scan_bibliotheque_vide_rend_zero() {
+    let app = make_app();
+    let (status, body) =
+        post_json(&app, "/api/v1/library/duplicates/scan?limit=10", json!({})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_scanned"], 0);
+    assert_eq!(body["duplicates_found"], 0);
+    assert_eq!(
+        body["errors"], 0,
+        "aucun fichier lu, donc aucune erreur de lecture"
+    );
+}
+
+/// `/sonos/speakers` : la seule des quatre routes Sonos que l'interface appelle
+/// réellement (`Sidebar.svelte`) ; les trois autres n'ont aucun appelant et ne
+/// sont donc pas écrites.
+///
+/// Elle n'existait pas — la section multiroom restait vide sans rien dire.
+/// `/rooms` sert les mêmes appareils mais sous d'autres noms (`id`/`host` au
+/// lieu de `uid`/`ip`) : renommer la route n'aurait pas suffi, c'est la forme
+/// qui diffère (#2004).
+#[tokio::test]
+async fn sonos_speakers_rend_un_tableau() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/sonos/speakers").await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "la route doit exister (elle 404ait)"
+    );
+    assert!(
+        body.is_array(),
+        "la barre latérale fait `for sp of speakers` : un objet la casserait, reçu {body}"
+    );
+}

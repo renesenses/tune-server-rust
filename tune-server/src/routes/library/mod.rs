@@ -316,6 +316,7 @@ pub fn router() -> Router<AppState> {
             get(artwork::batch_enrich_artist_artwork_status),
         )
         .route("/duplicates", get(duplicates::list_duplicates))
+        .route("/duplicates/scan", post(duplicates::scan_duplicates))
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
         .route("/activity", get(stats::library_activity))
         .route("/albums/{id}/bio", get(albums::album_bio))
