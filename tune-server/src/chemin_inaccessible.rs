@@ -65,10 +65,7 @@ pub fn est_un_chemin_unc(chemin: &str) -> bool {
 pub fn cle_du_conseil(chemin: &str, sous_windows: bool) -> Option<(&'static str, String)> {
     if sous_windows {
         if let Some(lettre) = lettre_de_lecteur(chemin) {
-            return Some((
-                "browse.hint.windowsMappedDrive",
-                format!("{lettre}:"),
-            ));
+            return Some(("browse.hint.windowsMappedDrive", format!("{lettre}:")));
         }
     }
     if est_un_chemin_unc(chemin) {
