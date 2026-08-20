@@ -1833,11 +1833,11 @@ mod roots_gone_empty_tests {
     fn une_piste_windows_sous_sa_racine_n_est_pas_hors_perimetre() {
         let racines = vec![r"G:\Blues 2".to_string()];
         assert_eq!(
-            verdict_purge(r"G:\Blues 2\track.flac", &racines, &[], &[], &[]),
+            verdict_purge(r"G:\Blues 2\track.flac", &racines, &[], &[], &[], &[]),
             VerdictPurge::Supprimer
         );
         assert_eq!(
-            verdict_purge(r"H:\Autre\track.flac", &racines, &[], &[], &[]),
+            verdict_purge(r"H:\Autre\track.flac", &racines, &[], &[], &[], &[]),
             VerdictPurge::HorsPerimetre
         );
         assert_eq!(
@@ -1845,6 +1845,7 @@ mod roots_gone_empty_tests {
                 r"G:\Blues 2\track.flac",
                 &racines,
                 &[r"G:\Blues 2".to_string()],
+                &[],
                 &[],
                 &[]
             ),
