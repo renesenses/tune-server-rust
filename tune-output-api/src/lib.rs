@@ -48,6 +48,27 @@ pub struct OutputStatus {
     /// `ended_naturally` + `Stopped` means the track really is done, one second
     /// into a five-minute piece.
     pub realtime: bool,
+    /// La sortie est en train de servir du **DoP** : un train DSD emballé dans
+    /// du PCM 24 bits, reconnu à son marqueur alternant dans l'octet de poids
+    /// fort (`0x05`/`0xFA`).
+    ///
+    /// Conséquence visible pour l'utilisateur, et seule raison d'être de ce
+    /// champ : **le curseur de volume ne fait plus rien.** Tout facteur autre
+    /// que l'unité réécrit le marqueur, le DAC quitte le mode DSD et se coupe ;
+    /// le serveur épingle donc le volume à l'unité tant que dure le DoP
+    /// (#1735). Sans ce champ, le client ne peut pas distinguer un curseur
+    /// inerte d'un curseur cassé — et on remplacerait un silence inexpliqué par
+    /// une commande morte inexpliquée.
+    ///
+    /// **Détecté sur les octets, pas déduit des réglages.** Le mode DSD de la
+    /// zone dit ce qui a été *demandé* ; le plafond « Fréquence max » peut faire
+    /// retomber en PCM sans rien annoncer. Rejouer ces règles côté affichage
+    /// est précisément ce qui a fait mentir le chemin du signal (#1595).
+    ///
+    /// `false` pour tout ce qui n'est pas une sortie locale en DoP, donc pour
+    /// l'immense majorité des lectures et pour tous les plugins : champ
+    /// additif, aucun n'a à le renseigner.
+    pub dop_active: bool,
 }
 
 impl Default for OutputStatus {
@@ -63,6 +84,7 @@ impl Default for OutputStatus {
             track_artist: None,
             ended_naturally: false,
             realtime: true,
+            dop_active: false,
         }
     }
 }
