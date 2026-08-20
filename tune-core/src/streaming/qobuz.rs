@@ -495,6 +495,46 @@ impl QobuzService {
             .unwrap_or_default()
     }
 
+    /// Pochette d'une playlist Qobuz, quel que soit le champ qui la porte.
+    ///
+    /// Qobuz expose l'image sous plusieurs noms selon l'endpoint, et sans
+    /// garantie de présence. Trois extractions divergentes coexistaient ici —
+    /// `map_featured_playlist` en tentait trois, `get_playlist` un seul, et
+    /// `get_user_playlists` aucun (`cover_path: None` en dur) — si bien que la
+    /// même playlist avait une pochette dans les sélections et aucune dans la
+    /// liste de l'utilisateur (#1970).
+    ///
+    /// L'ordre préserve le rendu actuel des playlists éditoriales :
+    /// `image_rectangle` reste en tête, les autres ne font que rattraper les
+    /// cas où il est absent.
+    fn pochette_playlist(item: &serde_json::Value) -> Option<String> {
+        const CHAMPS_TABLEAU: [&str; 5] = [
+            "image_rectangle",
+            "images300",
+            "images150",
+            "images",
+            "image_rectangle_mini",
+        ];
+        for champ in CHAMPS_TABLEAU {
+            if let Some(url) = item[champ]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(url.to_string());
+            }
+        }
+        // `image` est tantôt une chaîne, tantôt l'objet `{large, small}` que
+        // porte déjà un album (cf. `get_album_tracks`).
+        item["image"]
+            .as_str()
+            .or_else(|| item["image"]["large"].as_str())
+            .or_else(|| item["image"]["small"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(Into::into)
+    }
+
     /// Map a Qobuz playlist item (editorial selection or search hit) to
     /// StreamPlaylist.
     fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
@@ -506,18 +546,7 @@ impl QobuzService {
                 .unwrap_or_default(),
             name: item["name"].as_str().unwrap_or("").into(),
             description: item["description"].as_str().map(Into::into),
-            cover_path: item["image_rectangle"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    item["images150"]
-                        .as_array()
-                        .and_then(|a| a.first())?
-                        .as_str()
-                })
-                .or_else(|| item["images"].as_array().and_then(|a| a.first())?.as_str())
-                .map(Into::into),
+            cover_path: Self::pochette_playlist(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: item["owner"]["name"].as_str().map(Into::into),
         }
@@ -1010,11 +1039,7 @@ impl StreamingService for QobuzService {
             id: data["id"].as_u64().unwrap_or(0).to_string(),
             name: data["name"].as_str().unwrap_or("").into(),
             description: data["description"].as_str().map(Into::into),
-            cover_path: data["image_rectangle_mini"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(Into::into),
+            cover_path: Self::pochette_playlist(&data),
             track_count: data["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: data["owner"]["name"].as_str().map(Into::into),
         })
@@ -1406,7 +1431,7 @@ impl StreamingService for QobuzService {
                         id: item["id"].as_u64().unwrap_or(0).to_string(),
                         name: item["name"].as_str().unwrap_or("").into(),
                         description: item["description"].as_str().map(Into::into),
-                        cover_path: None,
+                        cover_path: Self::pochette_playlist(item),
                         track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
                         owner: None,
                     })
@@ -2314,5 +2339,84 @@ mod tests {
         assert!(!svc.supports_write());
         svc.user_auth_token = Some("token".into());
         assert!(svc.supports_write());
+    }
+
+    /// La liste des playlists de l'utilisateur renvoyait `cover_path: None` en
+    /// dur, alors que `/playlist/getUserPlaylists` porte les mêmes champs image
+    /// que l'éditorial — Qobuz y compose une mosaïque des pochettes d'albums.
+    /// La donnée était là ; on ne la lisait pas (#1970).
+    #[test]
+    fn une_playlist_utilisateur_recupere_sa_pochette() {
+        let item = serde_json::json!({
+            "id": 42, "name": "Ma liste", "tracks_count": 12,
+            "images300": ["https://static.qobuz.com/p300.jpg"],
+        });
+        let p = QobuzService::map_featured_playlist(&item);
+        assert_eq!(
+            p.cover_path.as_deref(),
+            Some("https://static.qobuz.com/p300.jpg")
+        );
+    }
+
+    /// L'ordre préserve le rendu actuel des sélections éditoriales :
+    /// `image_rectangle` passe devant, les autres ne font que rattraper.
+    #[test]
+    fn image_rectangle_reste_prioritaire_pour_l_editorial() {
+        let item = serde_json::json!({
+            "id": 1, "name": "Sélection",
+            "image_rectangle": ["https://q/rect.jpg"],
+            "images300": ["https://q/300.jpg"],
+            "images150": ["https://q/150.jpg"],
+        });
+        assert_eq!(
+            QobuzService::pochette_playlist(&item).as_deref(),
+            Some("https://q/rect.jpg")
+        );
+    }
+
+    /// La cascade descend jusqu'au dernier champ plutôt que d'abandonner au
+    /// premier absent — c'est exactement ce que `get_playlist` ne faisait pas :
+    /// il ne tentait que `image_rectangle_mini`.
+    #[test]
+    fn la_cascade_descend_jusqu_au_dernier_champ() {
+        for (champ, attendu) in [
+            ("images300", "https://q/a.jpg"),
+            ("images150", "https://q/a.jpg"),
+            ("images", "https://q/a.jpg"),
+            ("image_rectangle_mini", "https://q/a.jpg"),
+        ] {
+            let item = serde_json::json!({ champ: ["https://q/a.jpg"] });
+            assert_eq!(
+                QobuzService::pochette_playlist(&item).as_deref(),
+                Some(attendu),
+                "le champ {champ} devrait être lu"
+            );
+        }
+    }
+
+    /// `image` est tantôt une chaîne, tantôt l'objet `{large, small}` que porte
+    /// déjà un album.
+    #[test]
+    fn le_champ_image_est_accepte_dans_ses_deux_formes() {
+        let chaine = serde_json::json!({ "image": "https://q/s.jpg" });
+        assert_eq!(
+            QobuzService::pochette_playlist(&chaine).as_deref(),
+            Some("https://q/s.jpg")
+        );
+        let objet = serde_json::json!({ "image": { "large": "https://q/l.jpg" } });
+        assert_eq!(
+            QobuzService::pochette_playlist(&objet).as_deref(),
+            Some("https://q/l.jpg")
+        );
+    }
+
+    /// Une playlist sans aucune image ne doit pas rendre une chaîne vide : le
+    /// client afficherait une pochette cassée plutôt que son repli.
+    #[test]
+    fn aucune_image_rend_none_et_jamais_une_chaine_vide() {
+        let vide = serde_json::json!({ "id": 7, "name": "Sans image" });
+        assert_eq!(QobuzService::pochette_playlist(&vide), None);
+        let chaine_vide = serde_json::json!({ "images300": [""], "image": "" });
+        assert_eq!(QobuzService::pochette_playlist(&chaine_vide), None);
     }
 }
