@@ -23,4 +23,5 @@ tower-http = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 dashmap = "6"
+reqwest = { workspace = true }
 dotenvy = { workspace = true }
