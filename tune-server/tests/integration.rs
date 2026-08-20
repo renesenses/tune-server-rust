@@ -1499,3 +1499,27 @@ async fn library_duplicates_scan_bibliotheque_vide_rend_zero() {
         "aucun fichier lu, donc aucune erreur de lecture"
     );
 }
+
+/// `/sonos/speakers` : la seule des quatre routes Sonos que l'interface appelle
+/// réellement (`Sidebar.svelte`) ; les trois autres n'ont aucun appelant et ne
+/// sont donc pas écrites.
+///
+/// Elle n'existait pas — la section multiroom restait vide sans rien dire.
+/// `/rooms` sert les mêmes appareils mais sous d'autres noms (`id`/`host` au
+/// lieu de `uid`/`ip`) : renommer la route n'aurait pas suffi, c'est la forme
+/// qui diffère (#2004).
+#[tokio::test]
+async fn sonos_speakers_rend_un_tableau() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/sonos/speakers").await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "la route doit exister (elle 404ait)"
+    );
+    assert!(
+        body.is_array(),
+        "la barre latérale fait `for sp of speakers` : un objet la casserait, reçu {body}"
+    );
+}
