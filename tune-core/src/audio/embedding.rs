@@ -909,6 +909,11 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // Latch for the playback hold, same style as `low_memory`: one line on
         // the way in, one on the way out, silence in between.
         let mut playback_hold = false;
+        // Le modèle est-il là ? Verrou de boucle, pour ne pas relire 287 Mo à
+        // chaque tour (voir le bloc de téléchargement plus bas). Et l'instant
+        // du dernier essai infructueux, pour espacer les tentatives réseau.
+        let mut modele_present = false;
+        let mut dernier_essai_modele: Option<std::time::Instant> = None;
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
             // Garde premium. Vérifié à CHAQUE tour, et non une seule fois au
@@ -945,6 +950,65 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 info!("audio_embed_premium_ok — licence validée, l'analyse acoustique reprend");
             }
             if enabled(&settings) {
+                // TÉLÉCHARGEMENT DU MODÈLE — avant la cession à la lecture.
+                //
+                // Il était placé plus bas, derrière trois `continue` (lecture,
+                // thermique, mémoire). Conséquence : chez quelqu'un qui écoute
+                // de la musique, la boucle repartait dormir avant de l'avoir
+                // atteint, et le modèle ne se téléchargeait JAMAIS. L'interface
+                // affichait un message exact et sans issue — « il se récupère
+                // tout seul au premier usage » — pour un premier usage qui ne
+                // pouvait pas arriver.
+                //
+                // Trois testeurs, trois plateformes, une cause : Sevy Tabroc
+                // (#1658), Bilou (#1512, #1866 — son journal ne contenait
+                // qu'une ligne acoustique, `audio_embed_yield_to_playback`).
+                // Le paradoxe se résumait ainsi : le modèle ne se téléchargeait
+                // que chez ceux qui n'écoutent pas de musique.
+                //
+                // Ce qui justifie de passer devant la garde : la garde de #1515
+                // protège la lecture du DÉCODAGE audio et de l'inférence ONNX
+                // multi-fils (~380 % de CPU sur .18). Un téléchargement est du
+                // réseau et du disque. Il ne dispute rien au chemin audio.
+                //
+                // La suite — `ensure_runtime_loaded`, `AudioEmbedder::load`,
+                // l'inférence — reste APRÈS les trois gardes, dont celle de la
+                // mémoire : la session ORT pèse ~300 Mo résidents, et c'est
+                // elle que le budget mémoire vise, pas le fichier.
+                if !modele_present {
+                    let p = configured_model_path(&settings);
+                    if p.exists() {
+                        // Présent : on ne rappelle PAS `ensure_model`, qui
+                        // relit et re-hache les 287 Mo pour vérifier la somme.
+                        // Toutes les 30 s pendant la lecture, ce serait pire
+                        // que le défaut qu'on corrige. La vérification de
+                        // fraîcheur garde sa place plus bas, une fois par
+                        // construction de session.
+                        modele_present = true;
+                    } else if dernier_essai_modele
+                        .is_none_or(|t| t.elapsed().as_secs() >= IDLE_SLEEP_SECS)
+                    {
+                        // Un échec ne doit pas déclencher une tentative à
+                        // chaque tour : pendant la lecture, la boucle repasse
+                        // toutes les 30 s. Un serveur sans Internet martèlerait
+                        // le réseau pour rien.
+                        dernier_essai_modele = Some(std::time::Instant::now());
+                        match ensure_model(&p).await {
+                            Ok(()) => {
+                                modele_present = true;
+                                info!(
+                                    model = %p.display(),
+                                    "audio_model_ready — modèle acoustique disponible"
+                                );
+                            }
+                            Err(e) => warn!(
+                                error = %e, path = %p.display(),
+                                "audio_model_download_failed — nouvel essai dans 15 min"
+                            ),
+                        }
+                    }
+                }
+
                 // Yield to playback, like the ReplayGain pass (#1310) — this
                 // sweep was the only analysis without the guard (#1515). It
                 // decodes audio AND runs multi-threaded ONNX inference: left
@@ -1486,5 +1550,52 @@ mod tests {
     fn la_raison_porte_le_message_du_decodeur() {
         let r = DecodeFailure::Decode("unsupported codec: mpc".into()).raison();
         assert!(r.contains("unsupported codec: mpc"), "message perdu : {r}");
+    }
+
+    /// Garde-fou de couture : le téléchargement du modèle doit rester DEVANT
+    /// la cession à la lecture.
+    ///
+    /// C'est tout le défaut de #1866/#1658, et il est invisible à la lecture du
+    /// code comme à la compilation : deux blocs corrects, dans le mauvais
+    /// ordre, séparés par cinquante lignes de commentaires. Le coût était que
+    /// le modèle ne se téléchargeait **que chez ceux qui n'écoutent pas de
+    /// musique** — pour un lecteur audio, à peu près personne.
+    ///
+    /// Aucun test fonctionnel ne peut garder ce contrat : il faudrait une zone
+    /// qui joue, un réseau, et 287 Mo à télécharger en CI. On lit donc la
+    /// source, sur le modèle d'`output_provider_seam.rs`.
+    #[test]
+    fn le_telechargement_du_modele_precede_la_cession_a_la_lecture() {
+        let source = include_str!("embedding.rs");
+
+        let dl = source
+            .find("if !modele_present {")
+            .expect("le bloc de téléchargement a disparu ou a été renommé");
+        let cession = source
+            .find("if crate::audio::replaygain::any_zone_playing(&backend) {")
+            .expect("la cession à la lecture a disparu ou a été renommée");
+
+        assert!(
+            dl < cession,
+            "le téléchargement du modèle ({dl}) est repassé DERRIÈRE la cession à \
+             la lecture ({cession}). Une zone qui joue suffit alors à ce que la \
+             boucle reparte dormir sans jamais télécharger : le modèle ne se \
+             récupère plus que chez ceux qui n'écoutent pas de musique (#1866, \
+             #1658, #1512)."
+        );
+
+        // L'inverse compte tout autant : la session ORT (~300 Mo résidents) et
+        // l'inférence doivent rester DERRIÈRE les gardes. Les remonter avec le
+        // téléchargement rouvrirait #1515 — 380 % de CPU et des micro-coupures
+        // audibles pendant la lecture.
+        let charge = source
+            .find("ensure_runtime_loaded(&p)")
+            .expect("le chargement du runtime a disparu ou a été renommé");
+        assert!(
+            cession < charge,
+            "le chargement de la session ONNX ({charge}) est passé DEVANT la \
+             cession à la lecture ({cession}) : c'est exactement ce que la garde \
+             de #1515 interdit."
+        );
     }
 }

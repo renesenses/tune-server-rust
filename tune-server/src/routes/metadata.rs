@@ -118,6 +118,11 @@ pub fn router() -> Router<AppState> {
         // partait en 404 (#1893).
         .route("/auto-fix", post(start_auto_fix))
         .route("/auto-fix/status", get(auto_fix_status))
+        // Un balayage qui dure des heures doit pouvoir s'interrompre, et ce
+        // qu'il trouve doit pouvoir se lire. Le moteur sait faire les deux
+        // depuis toujours ; aucune route ne les atteignait (#1893, #1993).
+        .route("/auto-fix/stop", post(auto_fix_stop))
+        .route("/auto-fix/suggestions", get(auto_fix_suggestions))
         .route(
             "/reclassify-genres-by-path",
             post(reclassify_genres_by_path),
@@ -2219,12 +2224,60 @@ async fn start_auto_fix(
     }
 }
 
+/// Coût réel d'une piste : au moins deux appels MusicBrainz, espacés de
+/// 1100 ms par la limitation de `enrichment.rs`. Sur les 5 000 pistes que
+/// `find_incomplete_tracks` peut retenir, le balayage dure des HEURES.
+const SECONDES_PAR_PISTE: u64 = 3;
+
 /// GET /metadata/auto-fix/status — progression du balayage.
 async fn auto_fix_status(State(state): State<AppState>) -> impl IntoResponse {
     let Some(engine) = auto_fix_engine(&state) else {
         return auto_fix_unavailable();
     };
-    Json(engine.status().await).into_response()
+    let p = engine.status().await;
+    let restantes = p.total.saturating_sub(p.current) as u64;
+    Json(json!({
+        "status": p.status,
+        "current": p.current,
+        "total": p.total,
+        "fixed": p.fixed,
+        "suggestions": p.suggestions,
+        "running": engine.is_running().await,
+        // Sans estimation, l'utilisateur ne distingue pas dix minutes de trois
+        // heures et conclut que « ça ne marche pas ». C'est exactement le
+        // silence qui a produit #1372, #1555 et #1688 sur l'égaliseur.
+        "eta_seconds": restantes * SECONDES_PAR_PISTE,
+        // `scan_loop` reçoit un `auto_apply_threshold` et l'IGNORE
+        // (`_auto_apply_threshold`) : auto-fix SUGGÈRE, il ne corrige pas. Le
+        // nom promet autre chose ; la réponse rétablit la vérité (#1993).
+        "applies_changes": false,
+    }))
+    .into_response()
+}
+
+/// POST /metadata/auto-fix/stop — interrompre le balayage.
+///
+/// `AutoFixEngine::stop` existe depuis toujours et n'était atteignable par
+/// aucune route. Un travail de plusieurs heures qu'on ne peut pas arrêter
+/// n'est pas une fonctionnalité, c'est un piège.
+async fn auto_fix_stop(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    engine.stop().await;
+    Json(json!({ "ok": true, "status": "stopping" })).into_response()
+}
+
+/// GET /metadata/auto-fix/suggestions — ce que le balayage a trouvé.
+///
+/// Le moteur accumule ses trouvailles en mémoire ; sans cette route, elles
+/// n'étaient lisibles par personne.
+async fn auto_fix_suggestions(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    let s = engine.get_suggestions().await;
+    Json(json!({ "count": s.len(), "suggestions": s })).into_response()
 }
 
 // ---------------------------------------------------------------------------
