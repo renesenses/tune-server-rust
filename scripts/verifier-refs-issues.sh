@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# Verifie qu'une PR qui DIT fermer une issue la ferme reellement.
+# Rend visible, et actionnable, ce qu'une PR declare corriger.
 #
-# Pourquoi ce garde-fou existe. Mesure du 20/08/2026 sur les 600 dernieres PR
-# fusionnees de ce depot :
+# Le probleme mesure le 20/08/2026 : 27 issues corrigees ET LIVREES etaient
+# restees ouvertes, la plus ancienne depuis la v0.9.63. Le suivi mentait d'un
+# mois, au point de faire classer en tete d'un bilan une perte de donnees
+# (#1943) deja reparee.
 #
-#   citant au moins une issue dans le corps ......... 390
-#   avec un mot-cle de fermeture reconnu par GitHub .. 54
-#   => citent sans rien fermer ..................... 336
+# ⚠️ CE QUI NE MARCHE PAS, ET QU'IL FAUT AVOIR EN TETE AVANT DE LIRE LA SUITE.
 #
-# Consequence : 27 issues corrigees ET livrees sont restees ouvertes, certaines
-# depuis la v0.9.63. Le suivi mentait d'un mois, au point de faire classer en
-# tete de liste une perte de donnees deja reparee.
+# Sur ce depot, AUCUN mot-cle de fermeture ne ferme quoi que ce soit — pas meme
+# en anglais impeccable. GitHub n'auto-ferme que sur la branche PAR DEFAUT, et
+# la doctrine impose que tout correctif cible `release/v0.9`. Mesure du
+# 20/08/2026 sur 18 PR portant `Closes`/`Fixes`/`Resolves` et fusionnees sur
+# `release/v0.9` :
 #
-# Deux fautes distinctes, deux severites distinctes.
+#   fermeture automatique par le merge .... 0
+#   fermeture faite a la main plus tard ... 18
 #
-# 1. ERREUR — le mot-cle est ecrit EN FRANCAIS. « Ferme #1819 », « Corrige
-#    #1348 », « Resout #1679 » : l'intention est explicite, et GitHub l'ignore
-#    totalement. Il n'accepte que close/closes/closed, fix/fixes/fixed,
-#    resolve/resolves/resolved. L'auteur croit avoir ferme, l'issue reste
-#    ouverte, et personne ne repasse. 22 PR sont dans ce cas.
+# Pire, GitHub n'enregistre meme pas le LIEN : `closingIssuesReferences` rend
+# une liste vide pour la PR #1749 (« Fixes #1744 ») comme pour la #1838
+# (« Ferme #1819 »). Sur cette branche, la ligne de fermeture est du texte
+# decoratif, quelle que soit sa langue.
 #
-# 2. AVERTISSEMENT — une reference nue « #1897 » sans mot-cle. C'est le cas
-#    MAJORITAIRE et souvent LEGITIME : « suite de #1897 », « cause racine de
-#    #1528 ». On ne bloque pas, on affiche la liste dans le resume du job pour
-#    que le relecteur voie ce qui restera ouvert apres la fusion.
+# Ce script ne fait donc PAS la police de la langue : ce serait imposer une
+# forme sans effet. Il fait la seule chose utile ici — rassembler ce que la PR
+# declare corriger, et rendre la commande de fermeture MANUELLE prete a coller,
+# puisque c'est le seul mecanisme qui marche.
 #
-# Autrement dit : on echoue sur une intention trahie, jamais sur une simple
-# citation.
+# Il n'echoue jamais. Un controle qui bloque sur une regle inoperante se fait
+# desactiver dans la semaine.
 #
 # Usage :
 #   verifier-refs-issues.sh            lit le corps sur STDIN
@@ -51,8 +53,7 @@ readonly MOTS_ANGLAIS='close[sd]?|fix(es|ed)?|resolve[sd]?'
 # passer que bloquer a tort.
 readonly MOTS_FRANCAIS='ferm(e|ee|ent)|corrig(e|ee|ent)|r(e|é)sou(t|d|dre)|cl(o|ô)t'
 
-# Analyse un corps de PR. Ecrit son verdict sur STDOUT.
-# Sortie : 0 = conforme, 1 = intention de fermeture en francais.
+# Analyse un corps de PR. Ecrit son rapport sur STDOUT. Sortie toujours 0.
 analyser() {
   local corps="$1" resume="${2:-/dev/null}"
 
@@ -61,65 +62,71 @@ analyser() {
   # coller un extrait de journal contenant « Fixes #123 » suffirait a faire
   # passer — ou echouer — une PR sur du texte cite.
   #
-  # ⚠️ Le code en ligne a ete oublie a la premiere ecriture, et ce garde-fou
-  # s'est declenche SUR SA PROPRE PR : elle explique la regle en citant
-  # « `Ferme #1819` » entre accents graves. Toute PR, toute doc, toute issue qui
-  # DECRIT la regle aurait ete bloquee par elle — le defaut le plus vicieux
-  # d'un garde-fou, puisqu'il frappe precisement ceux qui l'expliquent. Deja
-  # rencontre cette semaine : le garde-fou apt decoupait sur un libelle present
-  # dans son propre commentaire.
+  # ⚠️ Ce script s'est declenche DEUX FOIS sur sa propre PR, qui explique la
+  # regle et doit donc citer les formes fautives :
+  #   1. accents graves oublies — la citation en code en ligne comptait ;
+  #   2. GUILLEMETS FRANCAIS oublies — en francais on cite entre « … », et le
+  #      corps corrige de la PR #2010 disait « Ferme #1819 » sans accents
+  #      graves. Le script proposait de fermer #1819 et #1744, que cette PR ne
+  #      corrige pas : une commande destructrice prete a coller, sur les
+  #      mauvaises issues.
+  # C'est le defaut le plus vicieux d'un controle : il frappe precisement ceux
+  # qui l'expliquent. Quatrieme occurrence de cette famille dans le depot cette
+  # semaine — le garde-fou apt decoupait deja sur un libelle present dans son
+  # propre commentaire.
   local propre
   propre=$(printf '%s\n' "$corps" | awk '
     /^[[:space:]]*```/ { dans = !dans; next }
     dans { next }
     /^[[:space:]]*>/   { next }
-    { gsub(/`[^`]*`/, " "); print }
+    { gsub(/`[^`]*`/, " "); gsub(/«[^»]*»/, " "); print }
   ')
 
-  local francais
-  francais=$(printf '%s\n' "$propre" \
-    | grep -oiE "(^|[^[:alnum:]_])(${MOTS_FRANCAIS}) +#[0-9]+" \
-    | sed -E 's/^[^[:alnum:]]*//' | sort -u)
-
-  if [ -n "$francais" ]; then
-    {
-      echo "## Mot-cle de fermeture en francais — GitHub ne le lit pas"
-      echo
-      echo "Ces mentions n'auront **aucun effet** a la fusion :"
-      echo
-      printf '%s\n' "$francais" | sed 's/^/- `/; s/$/`/'
-      echo
-      echo "GitHub n'accepte que \`Closes #N\`, \`Fixes #N\` ou \`Resolves #N\`."
-      echo "Remplacez, ou dites explicitement que c'est une simple reference."
-    } | tee -a "$resume"
-    return 1
-  fi
+  # Une declaration d'intention, dans l'une ou l'autre langue. Les deux sont
+  # exactement aussi inertes ici : on ne les distingue donc pas.
+  local declarees
+  declarees=$(printf '%s\n' "$propre" \
+    | grep -oiE "(^|[^[:alnum:]_])(${MOTS_ANGLAIS}|${MOTS_FRANCAIS}) +#[0-9]+" \
+    | grep -oE '#[0-9]+' | sort -u)
 
   local nues
   nues=$(printf '%s\n' "$propre" | grep -oE '#[0-9]{2,5}' | sort -u)
-  local fermees
-  fermees=$(printf '%s\n' "$propre" \
-    | grep -oiE "(${MOTS_ANGLAIS}) +#[0-9]+" | grep -oE '#[0-9]+' | sort -u)
 
-  local restantes
-  restantes=$(comm -23 <(printf '%s\n' "$nues" | grep . || true) \
-                       <(printf '%s\n' "$fermees" | grep . || true))
+  local citees
+  citees=$(comm -23 <(printf '%s\n' "$nues" | grep . || true) \
+                    <(printf '%s\n' "$declarees" | grep . || true))
 
   {
-    if [ -n "$fermees" ]; then
-      echo "### Sera ferme a la fusion"
-      printf '%s\n' "$fermees" | sed 's/^/- /'
+    if [ -n "$declarees" ]; then
+      echo "### Déclarées corrigées par cette PR"
+      printf '%s\n' "$declarees" | sed 's/^/- /'
+      echo
+      echo "⚠️ **Elles ne se fermeront pas toutes seules.** La base est"
+      echo "\`release/v0.9\` ; GitHub n'auto-ferme que sur la branche par défaut."
+      echo "Mesuré le 20/08/2026 : sur 18 PR portant \`Closes\`/\`Fixes\` fusionnées"
+      echo "sur cette branche, **0 fermeture automatique, 18 faites à la main**."
+      echo
+      echo "À coller après la fusion :"
+      echo
+      echo '```bash'
+      printf '%s\n' "$declarees" | tr -d '#' | while read -r i; do
+        [ -n "$i" ] && echo "gh issue close $i --comment \"Corrigé par cette PR, fusionnée sur release/v0.9.\""
+      done
+      echo '```'
+      echo
+      echo "Puis **vérifier**, ne pas supposer : \`gh issue view <n> --json state\`."
       echo
     fi
-    if [ -n "$restantes" ]; then
-      echo "### Cité sans mot-clé de fermeture"
-      printf '%s\n' "$restantes" | sed 's/^/- /'
+    if [ -n "$citees" ]; then
+      echo "### Simplement citées"
+      printf '%s\n' "$citees" | sed 's/^/- /'
       echo
-      echo "Si l'une de ces issues est reellement traitee par cette PR, ecrivez"
-      echo "\`Closes #N\`. Sinon il n'y a rien a faire : une reference est legitime."
+      echo "Aucune action : « suite de #N », « cause racine de #N » sont légitimes"
+      echo "et majoritaires — 336 des 390 PR qui citent une issue sont dans ce cas."
+      echo
     fi
-    if [ -z "$fermees" ] && [ -z "$restantes" ]; then
-      echo "Aucune reference d'issue dans cette PR."
+    if [ -z "$declarees" ] && [ -z "$citees" ]; then
+      echo "Aucune référence d'issue dans cette PR."
     fi
   } | tee -a "$resume"
   return 0
@@ -144,47 +151,24 @@ autotest() {
     fi
   }
 
-  attendu "« Ferme #1819 » est refuse"            1 'Ferme #1819'
-  attendu "« Corrige #1348 » est refuse"          1 'Corrige #1348'
-  attendu "« Résout #1679 » est refuse"           1 'Résout #1679'
-  attendu "« Clôt #12 » est refuse"               1 'Clôt #12'
-  # L'inverse : la bonne forme doit passer, sinon le garde-fou bloque tout.
-  attendu "« Closes #1819 » passe"                0 'Closes #1819'
-  attendu "« Fixes #1819 » passe"                 0 'Fixes #1819'
-  attendu "« Resolves #1819 » passe"              0 'Resolves #1819'
-  attendu "casse indifferente"                    0 'closes #1819'
-  # Une reference nue est legitime : 336 PR sur 390 sont dans ce cas.
-  attendu "reference nue « suite de #1897 »"      0 'Cette PR est la suite de #1897.'
+  # Le script n'echoue plus jamais : la langue du mot-cle n'a aucun effet ici,
+  # et bloquer sur une regle inoperante ne ferait que le faire desactiver.
+  attendu "« Ferme #1819 » ne bloque plus"        0 'Ferme #1819'
+  attendu "« Closes #1819 » ne bloque pas non plus" 0 'Closes #1819'
+  attendu "reference nue"                         0 'Cette PR est la suite de #1897.'
   attendu "corps vide"                            0 ''
-  # « fermeture » contient « ferme » mais n'est pas suivi d'un numero.
-  attendu "« fermeture du chantier » n'est pas un mot-cle" 0 'Fermeture du chantier, voir #1897.'
-  # Le piege qui a fait echouer deux garde-fous cette semaine : le texte cite.
-  attendu "« Ferme #1 » dans un bloc de code est ignore" 0 '```
-Ferme #1819
-```'
-  attendu "« Ferme #1 » dans une citation est ignore" 0 '> Ferme #1819'
-  # Le cas qui a fait echouer ce garde-fou sur sa PROPRE PR.
-  attendu "« \`Ferme #1\` » en code EN LIGNE est ignore" 0 'On ecrit parfois `Ferme #1819`, ce qui ne ferme rien.'
-  attendu "plusieurs spans en ligne sur la meme ligne"   0 'Ni `Ferme #1819` ni `Corrige #1348` ne ferment quoi que ce soit.'
-  # Son inverse : hors accents graves, toujours attrape.
-  attendu "hors accents graves, toujours attrape"        1 'Voir `le guide`. Ferme #1819'
-  # Et son inverse : hors bloc, il doit toujours etre attrape.
-  attendu "hors bloc, toujours attrape"           1 '```
-du code
-```
-Ferme #1819'
 
   # ------------------------------------------------------------------
-  # Les cas ci-dessus ne lisent que le CODE DE SORTIE. Ca ne suffit pas :
-  # un classement faux (une issue fermee annoncee « restera ouverte »)
-  # sort 0 lui aussi, donc reste invisible. C'est exactement ce qui est
-  # arrive avec `fix(|es|ed)`. Les cas suivants lisent la SORTIE.
+  # Le code de sortie ne prouve plus rien puisqu'il vaut toujours 0. Tout
+  # se joue desormais dans le CLASSEMENT, donc dans la SORTIE. C'est deja
+  # ce qui avait sauve la mise avec `fix(|es|ed)` : l'alternative vide que
+  # grep -E refuse vidait la liste des declarations, et le script sortait
+  # 0 en annoncant le contraire de la verite.
   # ------------------------------------------------------------------
   classe() {
     local libelle="$1" corps="$2" section="$3" numero="$4"
     local sortie
     sortie=$(analyser "$corps" 2>/dev/null)
-    # La ligne « - #N » doit apparaitre APRES le titre de section attendu.
     if printf '%s\n' "$sortie" | sed -n "/$section/,\$p" | grep -qx -- "- $numero"; then
       printf '  ok    %s\n' "$libelle"
     else
@@ -192,15 +176,61 @@ Ferme #1819'
       echecs=$((echecs + 1))
     fi
   }
+  absent_de() {
+    local libelle="$1" corps="$2" motif="$3"
+    if analyser "$corps" 2>/dev/null | grep -q -- "$motif"; then
+      printf '  ECHEC %s — « %s » ne devrait pas apparaitre\n' "$libelle" "$motif"
+      echecs=$((echecs + 1))
+    else
+      printf '  ok    %s\n' "$libelle"
+    fi
+  }
 
-  classe "Closes #1993 est classe FERME"  'Closes #1993'            'Sera ferme'   '#1993'
-  classe "Fixes #1993 est classe FERME"   'Fixes #1993'             'Sera ferme'   '#1993'
-  classe "Fix #1993 est classe FERME"     'Fix #1993'               'Sera ferme'   '#1993'
-  classe "Resolved #1993 est classe FERME" 'Resolved #1993'         'Sera ferme'   '#1993'
-  classe "une reference nue n'est pas fermee" 'Suite de #1897.'      'sans mot-clé' '#1897'
-  # Le cas mixte, le plus proche du reel : une PR ferme l'une et cite l'autre.
-  classe "cas mixte — la fermee"  'Closes #1993, suite de #1897.'  'Sera ferme'   '#1993'
-  classe "cas mixte — la citee"   'Closes #1993, suite de #1897.'  'sans mot-clé' '#1897'
+  # Les deux langues sont desormais traitees a l'identique.
+  classe "Closes  -> declaree"  'Closes #1993'   'Déclarées corrigées' '#1993'
+  classe "Fixes   -> declaree"  'Fixes #1993'    'Déclarées corrigées' '#1993'
+  classe "Fix     -> declaree"  'Fix #1993'      'Déclarées corrigées' '#1993'
+  classe "Ferme   -> declaree"  'Ferme #1993'    'Déclarées corrigées' '#1993'
+  classe "Corrige -> declaree"  'Corrige #1993'  'Déclarées corrigées' '#1993'
+  classe "Résout  -> declaree"  'Résout #1993'   'Déclarées corrigées' '#1993'
+  classe "reference nue -> citee" 'Suite de #1897.' 'Simplement citées' '#1897'
+  # Cas mixte : l'une declaree, l'autre citee, dans le meme corps.
+  classe "mixte — la declaree" 'Closes #1993, suite de #1897.' 'Déclarées corrigées' '#1993'
+  classe "mixte — la citee"    'Closes #1993, suite de #1897.' 'Simplement citées'   '#1897'
+
+  contient() {
+    local libelle="$1" corps="$2" motif="$3"
+    if analyser "$corps" 2>/dev/null | grep -qF -- "$motif"; then
+      printf '  ok    %s\n' "$libelle"
+    else
+      printf '  ECHEC %s — « %s » absent de la sortie\n' "$libelle" "$motif"
+      echecs=$((echecs + 1))
+    fi
+  }
+
+  # Le seul mecanisme qui marche ici, c'est la fermeture manuelle : la commande
+  # doit sortir prete a coller, sinon ce script ne sert a rien.
+  contient "la commande gh est emise"   'Closes #1993' 'gh issue close 1993'
+  contient "l'avertissement est present" 'Closes #1993' "ne se fermeront pas toutes seules"
+  contient "les deux langues emettent la commande" 'Ferme #1993' 'gh issue close 1993'
+
+  # Le texte cite ne doit rien declencher — le piege qui a fait echouer ce
+  # garde-fou sur sa PROPRE PR, qui explique la regle en la citant.
+  absent_de "code EN LIGNE ignore"  'On ecrit parfois `Ferme #1819`.'    '- #1819'
+  absent_de "bloc de code ignore"   '```\nFerme #1819\n```'              '- #1819'
+  absent_de "citation ignoree"      '> Ferme #1819'                      '- #1819'
+  # En francais on cite entre guillemets, pas entre accents graves. Sans ce
+  # filtre, le corps corrige de la PR #2010 faisait emettre « gh issue close
+  # 1819 » et « ... 1744 » — des commandes pretes a coller, sur des issues que
+  # la PR ne corrige pas.
+  absent_de "guillemets francais ignores" 'On ecrit « Ferme #1819 », ce qui ne ferme rien.' '- #1819'
+  absent_de "guillemets — cas reel PR #2010" 'la #1838 (« Ferme #1819 ») ne cree aucun lien' '- #1819'
+  # L'inverse : hors guillemets, toujours attrape.
+  classe "hors guillemets, attrape" 'Voir « le guide ». Ferme #1819' 'Déclarées corrigées' '#1819'
+  # Et l'inverse, sans quoi le filtre pourrait tout avaler.
+  classe "hors accents graves, attrape" 'Voir `le guide`. Ferme #1819' 'Déclarées corrigées' '#1819'
+  # « fermeture » contient « ferme » mais n'est pas suivi d'un numero.
+  absent_de "« Fermeture du chantier » n'est pas un mot-cle" 'Fermeture du chantier, voir #1897.' 'Déclarées corrigées'
 
   echo
   if [ "$echecs" -eq 0 ]; then
