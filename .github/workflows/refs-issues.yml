@@ -1,0 +1,51 @@
+name: Références d'issues
+
+# Une PR qui DIT fermer une issue doit la fermer reellement.
+#
+# Mesure du 20/08/2026 sur les 600 dernieres PR fusionnees : 390 citent une
+# issue, 54 seulement emploient un mot-cle que GitHub reconnait. 27 issues
+# corrigees ET livrees etaient restees ouvertes, la plus ancienne depuis la
+# v0.9.63 — au point de faire classer en tete de bilan une perte de donnees
+# deja reparee.
+#
+# Ce garde-fou echoue UNIQUEMENT sur une intention trahie : un mot-cle de
+# fermeture ecrit en francais (« Ferme #1819 »), que GitHub ignore en silence.
+# Une reference nue (« suite de #1897 ») est legitime et majoritaire : elle est
+# seulement listee dans le resume du job, pour que le relecteur voie ce qui
+# restera ouvert apres la fusion.
+#
+# La logique et ses cas de preuve vivent dans scripts/verifier-refs-issues.sh,
+# qui porte son propre --autotest. Il est joue A CHAQUE FOIS, avant l'analyse :
+# un garde-fou dont la contre-epreuve ne tourne pas finit par repondre vert sur
+# le defaut qu'il devait attraper (deux fois cette semaine dans ce depot).
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  refs:
+    name: Mots-clés de fermeture
+    runs-on: ubuntu-latest
+    # Sans plafond, un blocage tourne SIX HEURES avant que GitHub ne le tue.
+    # Trois releases l'ont paye (0.9.86, 0.9.87, 0.9.88).
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Contre-épreuve du garde-fou
+        run: bash scripts/verifier-refs-issues.sh --autotest
+
+      - name: Analyser le corps de la PR
+        env:
+          # Le corps passe par l'ENVIRONNEMENT, jamais par une interpolation
+          # ${{ }} dans `run:` — un corps de PR est du texte fourni par
+          # l'exterieur, et l'interpoler directement dans le shell permettrait
+          # d'y injecter des commandes.
+          CORPS: ${{ github.event.pull_request.body }}
+          TITRE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n%s\n' "$TITRE" "$CORPS" | bash scripts/verifier-refs-issues.sh
