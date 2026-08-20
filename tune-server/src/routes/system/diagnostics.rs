@@ -323,11 +323,16 @@ pub(super) struct LogsQuery {
     lines: Option<usize>,
 }
 
-/// Bounded tail window for `/system/logs`. 2 MiB comfortably covers the
-/// default 1000 lines while keeping the read bounded regardless of how large
-/// the append-only log has grown (rotation only runs at startup, so a
+/// Bounded tail window for `/system/logs`, kept bounded regardless of how
+/// large the append-only log has grown (rotation only runs at startup, so a
 /// long-running server's file can reach hundreds of MB).
-const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+///
+/// 8 MiB et non 2 : depuis #1974 on lit `CANDIDATE_FACTOR` fois plus de lignes
+/// que demandé pour pouvoir SÉLECTIONNER au lieu de tronquer. 8 000 lignes de
+/// journal pèsent environ 1,6 Mo — 2 Mo passait tout juste, et « tout juste »
+/// se transforme en fenêtre amputée le jour où les messages s'allongent, sans
+/// que rien ne le dise.
+const LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 enum LogTailError {
@@ -369,6 +374,157 @@ fn read_log_tail(
     Ok(lines.into_iter().rev().map(str::to_string).collect())
 }
 
+/// Combien de lignes brutes lire avant d'en selectionner `max_lines`.
+///
+/// Rebalancer suppose d'avoir le choix : prendre exactement les 1000
+/// dernieres lignes, c'est deja avoir subi la troncature qu'on veut corriger.
+/// On lit donc large, puis on selectionne.
+const CANDIDATE_FACTOR: usize = 8;
+
+/// Part maximale d'une fenetre d'export qu'un seul sous-systeme peut occuper.
+///
+/// Les sous-systemes n'ecrivent pas au meme rythme : `discovery::ssdp` ecrit
+/// toutes les quelques secondes (annonces reseau, re-enregistrements),
+/// `audio::embedding` une ligne par lot — une toutes les quinze minutes. Sur
+/// une fenetre a plafond simple, le premier chasse mecaniquement le second.
+///
+/// Autrement dit : **plus un traitement est lent, donc plus il est suspect,
+/// moins il a de chances d'apparaitre dans l'export.** L'outil de diagnostic
+/// est aveugle exactement la ou on en a besoin.
+///
+/// Mesure sur deux exports de Bilou (#1974) : 529 et 562 lignes de SSDP sur
+/// 1003. Le second ne contenait AUCUNE ligne d'embedding, alors que l'analyse
+/// acoustique etait l'objet du signalement. Il avait fourni le bon fichier, au
+/// bon moment, et il etait inexploitable.
+const QUOTA_PAR_MODULE: f64 = 0.25;
+
+/// Le module (`target` de tracing) d'une ligne de log, si elle en porte un.
+///
+/// Format du writer (`fmt::layer()` par defaut, `bootstrap.rs`) :
+/// `<horodatage>  INFO tune_core::discovery::ssdp: message`.
+///
+/// Rend `None` pour tout ce qui ne suit pas cette forme — continuation d'un
+/// message multiligne, trace de panique, sortie d'un tiers. Ces lignes-la ne
+/// sont JAMAIS ecartees : une ligne qu'on ne sait pas classer est une ligne
+/// dont on ne sait pas si elle compte.
+fn module_de_la_ligne(ligne: &str) -> Option<&str> {
+    const NIVEAUX: [&str; 5] = [" ERROR ", " WARN ", " INFO ", " DEBUG ", " TRACE "];
+    let (_, apres) = NIVEAUX
+        .iter()
+        .find_map(|n| ligne.split_once(n).map(|p| (n, p)))?;
+    let cible = apres.1.split_whitespace().next()?;
+    let cible = cible.strip_suffix(':')?;
+    // `tune_core::discovery::ssdp` — un module, pas un mot isole comme le
+    // debut d'une phrase. Sans cette exigence, un message qui commence par
+    // « erreur: » se ferait compter comme un module a lui tout seul.
+    if cible.is_empty() || !cible.contains("::") {
+        return None;
+    }
+    Some(cible)
+}
+
+/// Choisit `max_lines` lignes parmi `candidates`, en empechant un seul module
+/// d'occuper plus de [`QUOTA_PAR_MODULE`] de la fenetre.
+///
+/// Deux passes, et la seconde est ce qui rend la premiere sans risque :
+///
+/// 1. du plus recent au plus ancien, on garde chaque ligne dont le module n'a
+///    pas epuise son quota ;
+/// 2. si la fenetre n'est pas pleine — parce que les quotas ont beaucoup
+///    ecarte — on la complete avec les lignes mises de cote, toujours du plus
+///    recent au plus ancien.
+///
+/// La seconde passe garantit qu'on ne rend JAMAIS moins de lignes que la
+/// troncature simple : a taille egale, l'export dit strictement plus. Sur une
+/// machine ou seul SSDP parle, il reste donc integralement.
+///
+/// Rend les lignes dans l'ordre chronologique, et le decompte par module de ce
+/// qui a ete ecarte — un export qui tait ce qu'il a laisse tomber se lit comme
+/// s'il avait tout montre.
+fn selectionner_lignes(
+    candidates: Vec<String>,
+    max_lines: usize,
+) -> (Vec<String>, std::collections::BTreeMap<String, usize>) {
+    use std::collections::BTreeMap;
+
+    if max_lines == 0 {
+        return (Vec::new(), BTreeMap::new());
+    }
+    if candidates.len() <= max_lines {
+        return (candidates, BTreeMap::new());
+    }
+
+    let quota = ((max_lines as f64 * QUOTA_PAR_MODULE).floor() as usize).max(1);
+    let mut comptes: BTreeMap<String, usize> = BTreeMap::new();
+    // `Option<String>` et non l'indice : on garde la ligne retenue et, pour
+    // celles mises de cote, de quoi les reprendre en seconde passe.
+    let mut retenues: Vec<usize> = Vec::with_capacity(max_lines);
+    let mut ecartees: Vec<usize> = Vec::new();
+
+    for (i, ligne) in candidates.iter().enumerate().rev() {
+        if retenues.len() >= max_lines {
+            break;
+        }
+        match module_de_la_ligne(ligne) {
+            Some(m) => {
+                let n = comptes.entry(m.to_string()).or_insert(0);
+                if *n < quota {
+                    *n += 1;
+                    retenues.push(i);
+                } else {
+                    ecartees.push(i);
+                }
+            }
+            // Non classable : jamais ecartee.
+            None => retenues.push(i),
+        }
+    }
+
+    // Seconde passe : completer avec ce qu'on avait mis de cote.
+    for i in ecartees.iter().copied() {
+        if retenues.len() >= max_lines {
+            break;
+        }
+        retenues.push(i);
+    }
+
+    retenues.sort_unstable();
+
+    // Ce qu'on RAPPORTE comme mis de cote, et le calcul n'est pas celui qu'on
+    // ecrit d'abord.
+    //
+    // Compter toutes les lignes non retenues serait faux, et faussement
+    // alarmant : sur 3000 lignes lues pour une fenetre de 1000, la troncature
+    // simple en jetait deja 2000 sans jamais le dire. Les annoncer ici ferait
+    // passer pour une perte ce qui est le fonctionnement normal d'une fenetre.
+    //
+    // Le seul chiffre honnete est le DEPLACEMENT : les lignes qui auraient
+    // figure dans la fenetre d'avant — les `max_lines` dernieres — et qu'on a
+    // ecartees au profit d'autres. C'est exactement ce que le quota a coute, ni
+    // plus ni moins. Un module bavard seul en scene n'y apparait donc pas : il
+    // n'a rien cede a personne.
+    //
+    // Ce calcul est le second : le premier comptait tout, et le test de
+    // non-regression `un_seul_module_bavard_reste_entier` l'a refuse.
+    let seuil_ancienne_fenetre = candidates.len().saturating_sub(max_lines);
+    let retenu: std::collections::BTreeSet<usize> = retenues.iter().copied().collect();
+    let mut vraiment_ecartees: BTreeMap<String, usize> = BTreeMap::new();
+    for i in seuil_ancienne_fenetre..candidates.len() {
+        if retenu.contains(&i) {
+            continue;
+        }
+        if let Some(m) = module_de_la_ligne(&candidates[i]) {
+            *vraiment_ecartees.entry(m.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let lignes = retenues
+        .into_iter()
+        .map(|i| candidates[i].clone())
+        .collect::<Vec<_>>();
+    (lignes, vraiment_ecartees)
+}
+
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     collect_recent_logs(q.lines.unwrap_or(1000)).await
 }
@@ -395,16 +551,36 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // 1 GB RAM).
     {
         let path = log_path.clone();
+        // On lit CANDIDATE_FACTOR fois plus de lignes que demandé, puis on
+        // sélectionne : rebalancer suppose d'avoir le choix, et prendre
+        // exactement les N dernières lignes c'est déjà avoir subi la troncature
+        // qu'on veut corriger (#1974).
+        let a_lire = max_lines.saturating_mul(CANDIDATE_FACTOR).max(max_lines);
         let tail =
-            tokio::task::spawn_blocking(move || read_log_tail(&path, max_lines, LOG_TAIL_BYTES))
-                .await;
+            tokio::task::spawn_blocking(move || read_log_tail(&path, a_lire, LOG_TAIL_BYTES)).await;
         match tail {
-            Ok(Ok(lines)) => {
+            Ok(Ok(brutes)) => {
+                let lues = brutes.len();
+                let (lines, ecartees) = selectionner_lignes(brutes, max_lines);
+                if !ecartees.is_empty() {
+                    tracing::info!(
+                        lues,
+                        rendues = lines.len(),
+                        ecartees = ?ecartees,
+                        "log_export_rebalanced"
+                    );
+                }
                 return Json(json!({
                     "logs": lines.join("\n"),
                     "lines": lines.len(),
                     "source": "file",
                     "path": log_path,
+                    // Ce qui a été mis de côté, par module. Un export qui tait
+                    // ce qu'il a laissé tomber se lit comme s'il avait tout
+                    // montré — et c'est exactement ce qui a coûté deux
+                    // allers-retours à Bilou.
+                    "scanned_lines": lues,
+                    "set_aside": ecartees,
                 }));
             }
             Ok(Err(LogTailError::Unreadable(e))) => {
@@ -1487,5 +1663,146 @@ mod tests_journal_rapport {
 
         let journal = "2026-08-17T10:00:00Z  INFO m: log_level=DEBUG applique\n";
         assert!(lignes_utiles_pour_un_rapport(journal, 10).contains("log_level=DEBUG"));
+    }
+}
+
+/// #1974 — l'export de journaux était noyé par la découverte SSDP.
+///
+/// Deux exports successifs de Bilou (fil forum 1479, 0.9.88 · Windows) :
+/// 529 puis **562 lignes de SSDP sur 1003**. Le second ne contenait AUCUNE
+/// ligne d'embedding, alors que l'analyse acoustique était l'objet même du
+/// signalement. Il avait fourni le bon fichier, au bon moment, et il était
+/// inexploitable.
+#[cfg(test)]
+mod selection_de_lignes {
+    use super::*;
+
+    fn ligne(module: &str, n: usize) -> String {
+        format!("2026-08-20T10:00:00.000+02:00  INFO {module}: message {n}")
+    }
+
+    /// Reproduit la proportion mesurée : 562 lignes de SSDP, une poignée du
+    /// sujet, et le reste réparti. Avant, la fenêtre de 1000 les avalait.
+    fn journal_de_bilou() -> Vec<String> {
+        let mut v = Vec::new();
+        // L'embedding écrit une ligne par lot — une toutes les quinze minutes.
+        // Elles sont donc ANCIENNES, et c'est précisément ce qui les
+        // condamnait : la troncature garde la fin.
+        for i in 0..4 {
+            v.push(ligne("tune_core::audio::embedding", i));
+        }
+        for i in 0..151 {
+            v.push(ligne("tune_core::metadata::matcher", i));
+        }
+        for i in 0..1400 {
+            v.push(ligne("tune_core::discovery::ssdp", i));
+        }
+        v
+    }
+
+    #[test]
+    fn le_module_est_lu_dans_la_ligne() {
+        assert_eq!(
+            module_de_la_ligne(&ligne("tune_core::discovery::ssdp", 1)),
+            Some("tune_core::discovery::ssdp")
+        );
+        // Une continuation de message multiligne, une trace de panique : pas de
+        // module, donc jamais écartée.
+        assert_eq!(module_de_la_ligne("    at src/main.rs:42"), None);
+        assert_eq!(module_de_la_ligne(""), None);
+        // Un mot isolé suivi de « : » n'est pas un module — sans l'exigence du
+        // `::`, un message commençant par « erreur: » compterait pour un module
+        // à lui tout seul et se ferait rationner.
+        assert_eq!(
+            module_de_la_ligne("2026-08-20T10:00:00.000+02:00  WARN erreur: ceci"),
+            None
+        );
+    }
+
+    #[test]
+    fn le_signalement_de_bilou_ne_disparait_plus() {
+        let (retenues, ecartees) = selectionner_lignes(journal_de_bilou(), 1000);
+
+        assert_eq!(retenues.len(), 1000, "la fenêtre doit rester pleine");
+
+        let compte = |m: &str| retenues.iter().filter(|l| l.contains(m)).count();
+        // LE point du ticket : les quatre lignes d'embedding survivent.
+        assert_eq!(
+            compte("audio::embedding"),
+            4,
+            "les lignes du sujet signalé ont de nouveau disparu"
+        );
+        // Et SSDP ne peut plus prendre plus du quart... en première passe.
+        // Il en reprend ensuite, faute d'autre chose à montrer — c'est voulu.
+        assert!(
+            compte("discovery::ssdp") < 1400,
+            "SSDP occupe encore toute la fenêtre"
+        );
+        assert!(!ecartees.is_empty(), "rien n'a été mis de côté ?");
+    }
+
+    /// La troncature simple est le point de comparaison : avec la même fenêtre,
+    /// elle perdait tout du sujet. Ce test échouerait sur l'ancien code.
+    #[test]
+    fn la_troncature_simple_perdait_tout() {
+        let journal = journal_de_bilou();
+        let ancienne: Vec<&String> = journal.iter().rev().take(1000).collect();
+        assert_eq!(
+            ancienne
+                .iter()
+                .filter(|l| l.contains("audio::embedding"))
+                .count(),
+            0,
+            "le journal d'essai ne reproduit pas le défaut : revoir les proportions"
+        );
+    }
+
+    /// Garde-fou de non-régression, et le plus important des trois : on ne rend
+    /// JAMAIS moins de lignes qu'avant. Sur une machine où seul SSDP parle, le
+    /// quota ne doit rien retirer — il n'y a rien d'autre à montrer.
+    #[test]
+    fn un_seul_module_bavard_reste_entier() {
+        let journal: Vec<String> = (0..3000)
+            .map(|i| ligne("tune_core::discovery::ssdp", i))
+            .collect();
+        let (retenues, ecartees) = selectionner_lignes(journal, 1000);
+        assert_eq!(retenues.len(), 1000);
+        assert!(
+            ecartees.is_empty(),
+            "des lignes ont été perdues alors qu'il n'y avait rien à leur préférer"
+        );
+    }
+
+    #[test]
+    fn l_ordre_chronologique_est_conserve() {
+        let mut journal = Vec::new();
+        for i in 0..50 {
+            journal.push(ligne("a::b", i));
+            journal.push(ligne("c::d", i));
+        }
+        let (retenues, _) = selectionner_lignes(journal.clone(), 40);
+        // Les retenues doivent apparaître dans le même ordre relatif que dans
+        // le journal : un export dont les lignes sont mélangées ne se lit pas.
+        let positions: Vec<usize> = retenues
+            .iter()
+            .map(|l| journal.iter().position(|j| j == l).unwrap())
+            .collect();
+        let mut triees = positions.clone();
+        triees.sort_unstable();
+        assert_eq!(positions, triees);
+    }
+
+    #[test]
+    fn moins_de_candidats_que_demande_rend_tout() {
+        let journal: Vec<String> = (0..10).map(|i| ligne("a::b", i)).collect();
+        let (retenues, ecartees) = selectionner_lignes(journal.clone(), 1000);
+        assert_eq!(retenues, journal);
+        assert!(ecartees.is_empty());
+    }
+
+    #[test]
+    fn une_fenetre_nulle_ne_panique_pas() {
+        let (retenues, _) = selectionner_lignes(journal_de_bilou(), 0);
+        assert!(retenues.is_empty());
     }
 }
