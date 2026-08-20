@@ -22,6 +22,9 @@ pub mod plugins_host;
 pub mod premium_guard;
 pub mod routes;
 pub mod scan_import;
+/// L'echelle de dialectes CIFS, partagee par la route de montage et par le
+/// remontage au demarrage. Voir [`smb`] pour ce que leur divergence coutait.
+pub mod smb;
 pub mod startup;
 pub mod state;
 pub mod windows_migrate;
