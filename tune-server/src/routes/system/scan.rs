@@ -138,9 +138,13 @@ pub(crate) fn roots_gone_empty(
     roots
         .iter()
         .filter(|root| {
-            let prefix = format!("{}/", root.trim_end_matches('/'));
-            let had = existing_paths.iter().any(|p| p.starts_with(&prefix));
-            let has = discovered_paths.iter().any(|p| p.starts_with(&prefix));
+            // Via `sous_le_dossier`, et non un préfixe reconstruit ici : la
+            // duplication EST la cause. Ce filtre codait `/` en dur, donc sous
+            // Windows `had` était toujours faux et ce garde-fou — celui qui
+            // empêche d'effacer la bibliothèque quand un partage n'est pas
+            // monté (#1652) — ne se déclenchait JAMAIS.
+            let had = existing_paths.iter().any(|p| sous_le_dossier(p, root));
+            let has = discovered_paths.iter().any(|p| sous_le_dossier(p, root));
             had && !has
         })
         .cloned()
@@ -151,10 +155,21 @@ pub(crate) fn roots_gone_empty(
 ///
 /// `starts_with` seul ne suffit pas : `/mnt/music2` est un préfixe de
 /// `/mnt/music22`, et la protection s'appliquerait alors à un dossier voisin
-/// — ou pire, ne s'appliquerait pas là où on la croit.
+/// — ou pire, ne s'appliquerait pas là où on la croit. Il faut donc exiger
+/// qu'un SÉPARATEUR suive le préfixe.
+///
+/// Les deux séparateurs sont acceptés : `tracks.file_path` contient des
+/// ANTISLASHS sous Windows. `normalize_path` (`tune-core/src/scanner/walker.rs`)
+/// fait `replace('/', "\\")` sous `cfg(windows)`, et `track_repo.rs` le dit —
+/// « the server's `MAIN_SEPARATOR` is the separator stored in
+/// `tracks.file_path` », avec l'exemple `G:\Blues 2\%`.
 pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
-    let d = dossier.trim_end_matches('/');
-    path == d || path.starts_with(&format!("{d}/"))
+    let d = dossier.trim_end_matches(['/', '\\']);
+    if path == d {
+        return true;
+    }
+    path.strip_prefix(d)
+        .is_some_and(|reste| reste.starts_with('/') || reste.starts_with('\\'))
 }
 
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
@@ -1785,6 +1800,83 @@ mod roots_gone_empty_tests {
         assert!(sous_le_dossier("/mnt/music2", "/mnt/music2"));
         // Une barre finale sur la racine ne doit rien changer.
         assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2/"));
+    }
+
+    /// Sous Windows, `tracks.file_path` contient des ANTISLASHS. Avec un `/`
+    /// codé en dur, TOUS ces cas échouaient — aucune piste n'était vue sous sa
+    /// racine, et la purge cessait silencieusement de fonctionner.
+    ///
+    /// Ces tests tournent sur n'importe quel hôte : `sous_le_dossier` compare
+    /// des chaînes, pas des chemins du système de fichiers.
+    #[test]
+    fn les_chemins_windows_sont_reconnus_sous_leur_racine() {
+        assert!(sous_le_dossier(r"G:\Blues 2\track.flac", r"G:\Blues 2"));
+        assert!(sous_le_dossier(
+            r"G:\Blues 2\sous\dossier\t.flac",
+            r"G:\Blues 2"
+        ));
+        assert!(sous_le_dossier(r"G:\Blues 2", r"G:\Blues 2"));
+        // Le piège du préfixe vaut aussi avec des antislashs.
+        assert!(!sous_le_dossier(r"G:\Blues 22\track.flac", r"G:\Blues 2"));
+        assert!(sous_le_dossier(r"G:\Blues 2\track.flac", r"G:\Blues 2\"));
+        // Racine de lecteur, et le lecteur voisin qui ne doit rien capter.
+        assert!(sous_le_dossier(r"C:\musique.flac", r"C:\"));
+        assert!(!sous_le_dossier(r"D:\musique.flac", r"C:\"));
+        // Les chemins POSIX ne régressent pas.
+        assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2"));
+        assert!(!sous_le_dossier("/mnt/music22/a.flac", "/mnt/music2"));
+    }
+
+    /// Le verdict complet, pas seulement le prédicat : c'est lui qui décidait
+    /// du sort d'une bibliothèque entière.
+    #[test]
+    fn une_piste_windows_sous_sa_racine_n_est_pas_hors_perimetre() {
+        let racines = vec![r"G:\Blues 2".to_string()];
+        assert_eq!(
+            verdict_purge(r"G:\Blues 2\track.flac", &racines, &[], &[], &[], &[]),
+            VerdictPurge::Supprimer
+        );
+        assert_eq!(
+            verdict_purge(r"H:\Autre\track.flac", &racines, &[], &[], &[], &[]),
+            VerdictPurge::HorsPerimetre
+        );
+        assert_eq!(
+            verdict_purge(
+                r"G:\Blues 2\track.flac",
+                &racines,
+                &[r"G:\Blues 2".to_string()],
+                &[],
+                &[],
+                &[]
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+    }
+
+    /// LE test de ce correctif : le garde-fou anti-effacement de #1652 doit se
+    /// déclencher sous Windows comme ailleurs.
+    ///
+    /// Avec un `/` codé en dur, `had` était toujours faux sur des chemins en
+    /// antislash — donc `roots_gone_empty` rendait TOUJOURS une liste vide, et
+    /// un partage réseau non monté (point de montage lisible et vide) faisait
+    /// effacer la bibliothèque. C'est le scénario exact de #1652.
+    #[test]
+    fn une_racine_windows_videe_est_bien_detectee() {
+        use std::collections::HashSet;
+        let racines = vec![r"G:\Musique".to_string()];
+        let avait = vec![r"G:\Musique\a.flac", r"G:\Musique\b.flac"];
+        // Le partage n'est pas monté : rien de découvert.
+        let rien: HashSet<String> = HashSet::new();
+        assert_eq!(
+            roots_gone_empty(&racines, &avait, &rien),
+            vec![r"G:\Musique".to_string()],
+            "une racine Windows vidée doit être signalée"
+        );
+        // Le partage est monté : la racine n'est pas vidée.
+        let trouve: HashSet<String> = [r"G:\Musique\a.flac".to_string()].into();
+        assert!(roots_gone_empty(&racines, &avait, &trouve).is_empty());
+        // Une racine qui n'avait rien n'a rien à perdre.
+        assert!(roots_gone_empty(&racines, &[], &rien).is_empty());
     }
 
     #[test]
