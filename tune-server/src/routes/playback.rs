@@ -1660,6 +1660,23 @@ async fn queue_add(
     }
 
     if inputs.is_empty() {
+        // Un refus muet est indistinguable d'un bouton qui ne fait rien.
+        //
+        // Cette route ne journalisait RIEN — ni succès, ni refus. Un testeur
+        // qui écrit « la fonction + ne fonctionne pas » (Tades, fil #1487) ne
+        // pouvait être ni confirmé ni contredit par son journal, et nous ne
+        // pouvions pas savoir si sa demande n'était jamais partie, était
+        // arrivée vide, ou avait été insérée sans que l'écran le montre.
+        // On dit donc ce qu'on a reçu, pas seulement qu'on refuse.
+        warn!(
+            zone_id,
+            track_id = ?body.track_id,
+            track_ids = body.track_ids.len(),
+            tracks = body.tracks.len(),
+            source = ?body.source,
+            source_id = ?body.source_id,
+            "queue_add_rejected_empty — aucune piste exploitable dans la demande"
+        );
         return (
             StatusCode::BAD_REQUEST,
             "track_ids, track_id, source+source_id, or tracks[] required".to_string(),
@@ -1679,6 +1696,17 @@ async fn queue_add(
         .update_queue_info(zone_id, current_pos, total)
         .await;
     persist_queue_async(&state, zone_id);
+    // Le succès aussi doit laisser une trace : c'est elle qui permet de dire à
+    // un utilisateur « votre ajout est bien arrivé, à telle position » plutôt
+    // que de lui demander de réessayer. `position` vaut `None` pour un ajout
+    // en fin de file, `Some(n)` pour un « Lire ensuite ».
+    info!(
+        zone_id,
+        added = count,
+        position = ?body.position,
+        queue_length = total,
+        "queue_add_ok"
+    );
     state.event_bus.emit(
         "playback.queue.track_added",
         json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
