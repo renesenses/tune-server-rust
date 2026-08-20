@@ -56,16 +56,24 @@ readonly MOTS_FRANCAIS='ferm(e|ee|ent)|corrig(e|ee|ent)|r(e|é)sou(t|d|dre)|cl(o
 analyser() {
   local corps="$1" resume="${2:-/dev/null}"
 
-  # Une reference dans un bloc de code ou une citation n'engage a rien : on
-  # retire les blocs ``` et les lignes commencant par « > » avant d'analyser.
-  # Sans ca, coller un extrait de journal contenant « Fixes #123 » suffirait a
-  # faire passer — ou echouer — une PR sur du texte cite.
+  # Une reference citee n'engage a rien : on retire les blocs ```, les lignes
+  # commencant par « > », et le code EN LIGNE entre accents graves. Sans ca,
+  # coller un extrait de journal contenant « Fixes #123 » suffirait a faire
+  # passer — ou echouer — une PR sur du texte cite.
+  #
+  # ⚠️ Le code en ligne a ete oublie a la premiere ecriture, et ce garde-fou
+  # s'est declenche SUR SA PROPRE PR : elle explique la regle en citant
+  # « `Ferme #1819` » entre accents graves. Toute PR, toute doc, toute issue qui
+  # DECRIT la regle aurait ete bloquee par elle — le defaut le plus vicieux
+  # d'un garde-fou, puisqu'il frappe precisement ceux qui l'expliquent. Deja
+  # rencontre cette semaine : le garde-fou apt decoupait sur un libelle present
+  # dans son propre commentaire.
   local propre
   propre=$(printf '%s\n' "$corps" | awk '
     /^[[:space:]]*```/ { dans = !dans; next }
     dans { next }
     /^[[:space:]]*>/   { next }
-    { print }
+    { gsub(/`[^`]*`/, " "); print }
   ')
 
   local francais
@@ -104,7 +112,7 @@ analyser() {
       echo
     fi
     if [ -n "$restantes" ]; then
-      echo "### Cite, mais restera ouvert"
+      echo "### Cité sans mot-clé de fermeture"
       printf '%s\n' "$restantes" | sed 's/^/- /'
       echo
       echo "Si l'une de ces issues est reellement traitee par cette PR, ecrivez"
@@ -155,6 +163,11 @@ autotest() {
 Ferme #1819
 ```'
   attendu "« Ferme #1 » dans une citation est ignore" 0 '> Ferme #1819'
+  # Le cas qui a fait echouer ce garde-fou sur sa PROPRE PR.
+  attendu "« \`Ferme #1\` » en code EN LIGNE est ignore" 0 'On ecrit parfois `Ferme #1819`, ce qui ne ferme rien.'
+  attendu "plusieurs spans en ligne sur la meme ligne"   0 'Ni `Ferme #1819` ni `Corrige #1348` ne ferment quoi que ce soit.'
+  # Son inverse : hors accents graves, toujours attrape.
+  attendu "hors accents graves, toujours attrape"        1 'Voir `le guide`. Ferme #1819'
   # Et son inverse : hors bloc, il doit toujours etre attrape.
   attendu "hors bloc, toujours attrape"           1 '```
 du code
@@ -184,10 +197,10 @@ Ferme #1819'
   classe "Fixes #1993 est classe FERME"   'Fixes #1993'             'Sera ferme'   '#1993'
   classe "Fix #1993 est classe FERME"     'Fix #1993'               'Sera ferme'   '#1993'
   classe "Resolved #1993 est classe FERME" 'Resolved #1993'         'Sera ferme'   '#1993'
-  classe "une reference nue reste OUVERTE" 'Suite de #1897.'        'restera ouvert' '#1897'
+  classe "une reference nue n'est pas fermee" 'Suite de #1897.'      'sans mot-clé' '#1897'
   # Le cas mixte, le plus proche du reel : une PR ferme l'une et cite l'autre.
   classe "cas mixte — la fermee"  'Closes #1993, suite de #1897.'  'Sera ferme'   '#1993'
-  classe "cas mixte — la citee"   'Closes #1993, suite de #1897.'  'restera ouvert' '#1897'
+  classe "cas mixte — la citee"   'Closes #1993, suite de #1897.'  'sans mot-clé' '#1897'
 
   echo
   if [ "$echecs" -eq 0 ]; then
