@@ -26,6 +26,23 @@ use super::dsd_to_pcm::choose_output_rate;
 /// a message can.
 const SEND_TIMEOUT_SECS: u64 = 300;
 
+/// Round a preferred PCM batch size down to a whole number of interleaved frames.
+///
+/// The streaming decode paths used to drain a fixed `32768` bytes. That length is
+/// frame-aligned for 16-bit stereo (`32768 % 4 == 0`) and 32-bit stereo
+/// (`32768 % 8 == 0`), but **not** for 24-bit stereo (`32768 % 6 == 2`). Audio
+/// consumers concatenate chunks so playback stays fine; per-chunk VU analysis
+/// (`compute_levels` / `send_windowed_pcm`) does not — after the first batch the
+/// sample boundaries are shifted and peaks peg near 0 dBFS.
+fn frame_aligned_chunk_len(preferred: usize, bit_depth: u16, channels: u16) -> usize {
+    let frame = (bit_depth as usize / 8).saturating_mul(channels.max(1) as usize);
+    if frame == 0 {
+        return preferred;
+    }
+    let aligned = (preferred / frame) * frame;
+    if aligned == 0 { frame } else { aligned }
+}
+
 /// Resolve the actual audio bit depth from codec parameters.
 ///
 /// Symphonia's ISOMP4 demuxer does not populate `bits_per_sample` for ALAC
@@ -781,7 +798,8 @@ fn decode_to_pcm_streaming_inner(
                 "streaming_decode_wav_header_sent_opus"
             );
         }
-        for chunk in pcm_bytes.chunks(chunk_size) {
+        let batch = frame_aligned_chunk_len(chunk_size, output_bd, ch);
+        for chunk in pcm_bytes.chunks(batch) {
             match rt.block_on(tokio::time::timeout(
                 std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk.to_vec()),
@@ -853,7 +871,8 @@ fn decode_to_pcm_streaming_inner(
                 "streaming_decode_wav_header_sent_fallback"
             );
         }
-        for chunk in pcm_bytes.chunks(chunk_size) {
+        let batch = frame_aligned_chunk_len(chunk_size, output_bd, ch);
+        for chunk in pcm_bytes.chunks(batch) {
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).
             match rt.block_on(tokio::time::timeout(
@@ -1009,7 +1028,10 @@ fn decode_to_pcm_streaming_inner(
 
     // Accumulate PCM bytes and flush when exceeding chunk_size.
     // This avoids sending tiny per-packet buffers over the channel.
+    // Drain size is frame-aligned so 24-bit stereo VU stays correct
+    // (fixed 32768 % 6 == 2 would shift sample boundaries after the 1st batch).
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+    let flush_len = frame_aligned_chunk_len(chunk_size, output_bd, source_channels.max(1) as u16);
     let mut total_samples: usize = 0;
     let mut decode_errors: usize = 0;
 
@@ -1116,8 +1138,8 @@ fn decode_to_pcm_streaming_inner(
             }
         }
 
-        while pcm_buf.len() >= chunk_size {
-            let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+        while pcm_buf.len() >= flush_len {
+            let chunk: Vec<u8> = pcm_buf.drain(..flush_len).collect();
             // Send PCM data FIRST to avoid delaying the audio stream.
             // compute_levels() is CPU-intensive (iterates all frames with
             // floating-point math) and was previously called before send(),
@@ -1907,6 +1929,7 @@ fn decode_dsd_streaming(
     // Accumulate PCM output and flush in chunk_size batches
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
     let ch = channels as u16;
+    let flush_len = frame_aligned_chunk_len(chunk_size, output_bd, ch);
 
     // Inner loop: feed DSD chunks, convert PCM, send downstream.
     // Factored into a closure to avoid duplicating the flush logic.
@@ -1918,8 +1941,8 @@ fn decode_dsd_streaming(
             }
             let converted = convert_24bit_pcm_to_depth(&pcm_24, output_bd);
             pcm_buf.extend_from_slice(&converted);
-            while pcm_buf.len() >= chunk_size {
-                let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+            while pcm_buf.len() >= flush_len {
+                let chunk: Vec<u8> = pcm_buf.drain(..flush_len).collect();
                 // Send PCM data first, compute levels after (same rationale
                 // as the symphonia path: avoid delaying the audio stream).
                 match rt.block_on(tokio::time::timeout(
@@ -2069,6 +2092,7 @@ pub fn decode_dsd_to_dop_streaming(
     let dop_rate = DsdToDoP::dop_rate(dsd_rate);
     let mut encoder = DsdToDoP::new(channels, lsb_first);
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+    let flush_len = frame_aligned_chunk_len(chunk_size, 24, channels as u16);
 
     let mut process_chunk = |dsd_chunk: &[u8]| -> Result<bool, String> {
         let dop_bytes = encoder.feed(dsd_chunk);
@@ -2076,8 +2100,8 @@ pub fn decode_dsd_to_dop_streaming(
             return Ok(false);
         }
         pcm_buf.extend_from_slice(&dop_bytes);
-        while pcm_buf.len() >= chunk_size {
-            let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+        while pcm_buf.len() >= flush_len {
+            let chunk: Vec<u8> = pcm_buf.drain(..flush_len).collect();
             match rt.block_on(tokio::time::timeout(
                 std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
                 tx.send(chunk),
@@ -2328,6 +2352,16 @@ fn decode_dsd_to_pcm(
 mod decode_integration_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn frame_aligned_chunk_len_fixes_24bit_stereo_32768() {
+        // The historical drain size that pegged OAAT VU meters.
+        assert_eq!(32768 % 6, 2);
+        assert_eq!(frame_aligned_chunk_len(32768, 24, 2), 32766);
+        assert_eq!(frame_aligned_chunk_len(32768, 16, 2), 32768);
+        assert_eq!(frame_aligned_chunk_len(32768, 32, 2), 32768);
+        assert_eq!(frame_aligned_chunk_len(32766, 24, 2) % 6, 0);
+    }
 
     fn fixture_path(name: &str) -> String {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
