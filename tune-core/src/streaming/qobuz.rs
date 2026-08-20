@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use tracing::{debug, info, warn};
@@ -35,7 +37,35 @@ pub struct QobuzService {
     /// Set when Qobuz rejected the token and no relogin was possible — the
     /// session is over and the persisted row is worthless.
     session_expired: bool,
+    /// Cache du contenu ÉDITORIAL uniquement — sélections, nouveautés, genres,
+    /// playlists mises en avant. Jamais les favoris ni les playlists de
+    /// l'utilisateur : ceux-là changent quand il clique, et une réponse
+    /// périmée de trente minutes serait pire que lente (#1969).
+    ///
+    /// `Mutex` et non `&mut self` : les méthodes de `StreamingService`
+    /// reçoivent `&self`. C'est exactement l'écueil sur lequel le cache Tidal
+    /// s'est échoué — `tidal.rs:1823` avoue « Can't cache here since &self is
+    /// immutable, will use the route-level cache », et ce cache au niveau route
+    /// n'a jamais existé. `featured_cache` y est défini, lu à deux endroits, et
+    /// JAMAIS écrit. Ne pas recopier ce modèle.
+    cache_editorial: Mutex<HashMap<String, EntreeCache>>,
 }
+
+/// Une réponse éditoriale, et l'instant où elle a été obtenue.
+struct EntreeCache {
+    donnees: serde_json::Value,
+    cree: Instant,
+}
+
+/// Durée de vie du cache éditorial. Les sélections Qobuz changent au mieux une
+/// fois par jour ; trente minutes sont larges et bornent la fraîcheur perdue à
+/// quelque chose que personne ne remarque.
+const TTL_EDITORIAL: Duration = Duration::from_secs(1800);
+
+/// Au-delà, on purge les entrées expirées. Une poignée de clés suffit à couvrir
+/// la page découverte ; ce plafond n'existe que pour qu'un cache oublié ne
+/// grossisse pas indéfiniment.
+const MAX_ENTREES_CACHE: usize = 64;
 
 /// (primary, fallback) API bases for the given endpoint order.
 ///
@@ -189,6 +219,7 @@ impl QobuzService {
             last_relogin_attempt: None,
             needs_token_rewrite: false,
             session_expired: false,
+            cache_editorial: Mutex::new(HashMap::new()),
         }
     }
 
@@ -307,6 +338,74 @@ impl QobuzService {
     /// library doesn't hammer the Qobuz API). Before this, a user with 2000
     /// favorite tracks paid 40 sequential round-trips per view — the "slow
     /// favorites display" reports from heavy Qobuz users.
+    /// Lecture du cache éditorial. `None` si absent ou périmé.
+    ///
+    /// `Mutex` de la bibliothèque standard et non `tokio::sync` : on ne tient
+    /// jamais ce verrou pendant un appel réseau — uniquement le temps d'un
+    /// `get` ou d'un `insert` sur une table en mémoire. Un verrou asynchrone
+    /// coûterait plus cher qu'il ne rapporte, et surtout il inviterait à le
+    /// tenir à travers un `await`, ce qui sérialiserait les requêtes.
+    fn cache_get(&self, cle: &str) -> Option<serde_json::Value> {
+        let cache = self.cache_editorial.lock().ok()?;
+        cache.get(cle).and_then(|e| {
+            if e.cree.elapsed() < TTL_EDITORIAL {
+                Some(e.donnees.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn cache_set(&self, cle: String, donnees: serde_json::Value) {
+        let Ok(mut cache) = self.cache_editorial.lock() else {
+            return;
+        };
+        if cache.len() >= MAX_ENTREES_CACHE {
+            cache.retain(|_, e| e.cree.elapsed() < TTL_EDITORIAL);
+        }
+        cache.insert(
+            cle,
+            EntreeCache {
+                donnees,
+                cree: Instant::now(),
+            },
+        );
+    }
+
+    /// Clé de cache : le chemin et ses paramètres, dans l'ordre où ils sont
+    /// passés. Deux appels identiques donnent la même clé ; un genre ou un
+    /// tag différent en donne une autre.
+    fn cle_cache(path: &str, params: &[(&str, &str)]) -> String {
+        // Encodage JSON, et non une concaténation avec un séparateur : une
+        // valeur qui CONTIENT le séparateur produirait sinon la même clé que
+        // deux paramètres distincts. Ce n'est pas théorique — le test
+        // `une_valeur_ne_peut_pas_forger_la_cle_d_une_autre` a attrapé
+        // exactement cette collision sur la première version de cette
+        // fonction. JSON échappe pour nous, sans cas particulier à prévoir.
+        serde_json::json!([path, params]).to_string()
+    }
+
+    /// `api_get` pour le contenu ÉDITORIAL : sert le cache s'il est frais.
+    ///
+    /// Réservé à ce qui ne dépend pas du compte. Ne JAMAIS l'employer pour les
+    /// favoris ou les playlists de l'utilisateur : ils changent quand il
+    /// clique, et servir une réponse vieille de trente minutes ferait
+    /// réapparaître un favori qu'il vient de retirer.
+    async fn api_get_editorial(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, String> {
+        let cle = Self::cle_cache(path, params);
+        if let Some(donnees) = self.cache_get(&cle) {
+            debug!(path, "qobuz_editorial_cache_hit");
+            return Ok(donnees);
+        }
+        let donnees = self.api_get(path, params).await?;
+        self.cache_set(cle, donnees.clone());
+        Ok(donnees)
+    }
+
     async fn api_get_all_pages(
         &self,
         path: &str,
@@ -1068,10 +1167,13 @@ impl StreamingService for QobuzService {
         if let Some(pid) = parent_id {
             params.push(("parent_id", pid));
         }
-        let data = self.api_get("/genre/list", &params).await.map_err(|e| {
-            info!(error = %e, "qobuz_genres_failed");
-            e
-        })?;
+        let data = self
+            .api_get_editorial("/genre/list", &params)
+            .await
+            .map_err(|e| {
+                info!(error = %e, "qobuz_genres_failed");
+                e
+            })?;
         let genres: Vec<StreamGenre> = data["genres"]["items"]
             .as_array()
             .or_else(|| data["genres"].as_array())
@@ -1091,7 +1193,7 @@ impl StreamingService for QobuzService {
     ) -> Result<Vec<StreamAlbum>, TuneError> {
         let limit_str = limit.to_string();
         let data = self
-            .api_get(
+            .api_get_editorial(
                 "/album/getFeatured",
                 &[
                     ("type", "new-releases"),
@@ -1109,7 +1211,7 @@ impl StreamingService for QobuzService {
 
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
-            .api_get(
+            .api_get_editorial(
                 "/album/getFeatured",
                 &[("type", "new-releases"), ("limit", "200")],
             )
@@ -1159,7 +1261,7 @@ impl StreamingService for QobuzService {
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
-            .api_get(
+            .api_get_editorial(
                 "/album/getFeatured",
                 &[("type", section_id), ("limit", "50")],
             )
@@ -1240,7 +1342,7 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, TuneError> {
-        let data = self.api_get("/playlist/getTags", &[]).await?;
+        let data = self.api_get_editorial("/playlist/getTags", &[]).await?;
         let tags = data["tags"]
             .as_array()
             .map(|items| {
@@ -1318,9 +1420,23 @@ impl StreamingService for QobuzService {
         if let Some(g) = genre {
             params.push(("genre_ids", g));
         }
-        let mut items = self
-            .api_get_all_pages_bornee("/playlist/getFeatured", &params, "playlists", MAX)
-            .await?;
+        // La pagination bornée reste coûteuse au premier appel : on met en
+        // cache la LISTE obtenue, pas chaque page. Le suffixe distingue cette
+        // clé de celle d'un `api_get` sur le même chemin.
+        let cle = Self::cle_cache("/playlist/getFeatured#pages", &params);
+        let mut items = match self.cache_get(&cle) {
+            Some(serde_json::Value::Array(v)) => {
+                debug!(path = "/playlist/getFeatured", "qobuz_editorial_cache_hit");
+                v
+            }
+            _ => {
+                let v = self
+                    .api_get_all_pages_bornee("/playlist/getFeatured", &params, "playlists", MAX)
+                    .await?;
+                self.cache_set(cle, serde_json::Value::Array(v.clone()));
+                v
+            }
+        };
         // La pagination s'arrête déjà au plafond ; ce `truncate` ne rogne plus
         // que le trop-plein de la dernière page.
         items.truncate(MAX);
@@ -1353,7 +1469,10 @@ impl StreamingService for QobuzService {
             if let Some(g) = genre {
                 params.push(("genre_ids", g));
             }
-            let data = self.api_get("/playlist/getFeatured", &params).await.ok()?;
+            let data = self
+                .api_get_editorial("/playlist/getFeatured", &params)
+                .await
+                .ok()?;
             let playlists: Vec<StreamPlaylist> = data["playlists"]["items"]
                 .as_array()
                 .map(|items| items.iter().map(Self::map_featured_playlist).collect())
@@ -2161,6 +2280,88 @@ mod tests {
         });
         let genre2 = QobuzService::map_genre(&json2);
         assert!(!genre2.has_children);
+    }
+
+    /// Une entrée fraîche est servie, et c'est tout l'intérêt.
+    #[test]
+    fn le_cache_editorial_sert_une_entree_fraiche() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        let cle = QobuzService::cle_cache("/album/getFeatured", &[("type", "new-releases")]);
+        assert!(svc.cache_get(&cle).is_none(), "cache vide au départ");
+        svc.cache_set(cle.clone(), json!({"albums": {"items": []}}));
+        assert!(svc.cache_get(&cle).is_some(), "entrée fraîche servie");
+    }
+
+    /// Une entrée périmée ne doit PAS être servie. Test posé sur l'horloge
+    /// réelle en trichant sur l'instant de création : sans lui, rien ne
+    /// distingue un cache d'une fuite de mémoire.
+    #[test]
+    fn une_entree_perimee_n_est_pas_servie() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        let cle = "/genre/list".to_string();
+        {
+            let mut cache = svc.cache_editorial.lock().unwrap();
+            cache.insert(
+                cle.clone(),
+                EntreeCache {
+                    donnees: json!({"genres": []}),
+                    // Une seconde de plus que le TTL : périmée sans ambiguïté.
+                    cree: Instant::now() - TTL_EDITORIAL - Duration::from_secs(1),
+                },
+            );
+        }
+        assert!(
+            svc.cache_get(&cle).is_none(),
+            "une entrée au-delà du TTL doit être ignorée"
+        );
+    }
+
+    /// Deux requêtes qui diffèrent par un paramètre ne doivent pas partager
+    /// leur réponse — sinon un genre servirait les albums d'un autre.
+    #[test]
+    fn les_parametres_font_partie_de_la_cle() {
+        let jazz = QobuzService::cle_cache("/genre/get", &[("genre_id", "10")]);
+        let rock = QobuzService::cle_cache("/genre/get", &[("genre_id", "40")]);
+        assert_ne!(jazz, rock);
+        // Et le chemin seul ne doit pas collisionner avec le chemin paginé.
+        assert_ne!(
+            QobuzService::cle_cache("/playlist/getFeatured", &[]),
+            QobuzService::cle_cache("/playlist/getFeatured#pages", &[])
+        );
+    }
+
+    /// Le séparateur de clé ne doit pas pouvoir être fabriqué depuis une
+    /// valeur : sans lui, `?a=b&c` et `?a=b` + `c` donneraient la même clé.
+    #[test]
+    fn une_valeur_ne_peut_pas_forger_la_cle_d_une_autre() {
+        let a = QobuzService::cle_cache("/x", &[("k", "v"), ("k2", "v2")]);
+        let b = QobuzService::cle_cache("/x", &[("k", "v\u{1f}k2=v2")]);
+        assert_ne!(
+            a, b,
+            "un séparateur dans une valeur ne doit pas tout confondre"
+        );
+    }
+
+    /// Le plafond d'entrées purge les périmées au lieu de croître sans fin.
+    #[test]
+    fn le_cache_purge_les_perimees_quand_il_est_plein() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        {
+            let mut cache = svc.cache_editorial.lock().unwrap();
+            for i in 0..MAX_ENTREES_CACHE {
+                cache.insert(
+                    format!("perimee-{i}"),
+                    EntreeCache {
+                        donnees: json!(i),
+                        cree: Instant::now() - TTL_EDITORIAL - Duration::from_secs(1),
+                    },
+                );
+            }
+        }
+        svc.cache_set("fraiche".into(), json!("ok"));
+        let cache = svc.cache_editorial.lock().unwrap();
+        assert_eq!(cache.len(), 1, "les périmées ont été purgées");
+        assert!(cache.contains_key("fraiche"));
     }
 
     #[test]
