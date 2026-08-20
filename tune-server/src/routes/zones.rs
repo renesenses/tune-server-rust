@@ -1641,115 +1641,256 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
     }
 }
 
+/// Les valeurs que `output_type` peut prendre — celles que l'orchestrateur sait
+/// router (`orchestrator.rs`). Une zone dont le type est inconnu ne joue nulle
+/// part : la refuser à l'écriture vaut mieux que la découvrir au premier « Lire ».
+const TYPES_DE_SORTIE: [&str; 8] = [
+    "local",
+    "browser",
+    "dlna",
+    "openhome",
+    "chromecast",
+    "bluos",
+    "squeezebox",
+    "oaat",
+];
+
+/// Les modes DSD reconnus par `should_dsd_passthrough` et `dop_requested`.
+/// Tout le reste retombe dans le fourre-tout « auto » sans le dire.
+const MODES_DSD: [&str; 4] = ["auto", "native", "pcm", "dop"];
+
+/// Une écriture du PATCH a échoué côté base : **journaliser**, puis 500.
+///
+/// Ces retours étaient muets : trente blocs rendaient
+/// `(INTERNAL_SERVER_ERROR, e)` sans qu'aucune ligne ne parte dans les
+/// journaux. Un 500 signalé par un testeur ne laissait donc **aucune trace
+/// exploitable** — c'est ce qui a rendu #1964 impossible à instruire, et il a
+/// fallu écrire à Gérard pour lui demander le corps de la réponse que le
+/// serveur avait déjà entre les mains.
+fn echec_ecriture(
+    zone_id: i64,
+    champ: &str,
+    valeur: &str,
+    erreur: String,
+) -> axum::response::Response {
+    tracing::error!(
+        zone_id,
+        champ,
+        valeur,
+        erreur = %erreur,
+        "zone_patch_write_failed"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("écriture impossible du champ « {champ} » : {erreur}"),
+    )
+        .into_response()
+}
+
+/// La requête elle-même est fautive : **journaliser**, puis 400.
+///
+/// 500 veut dire « le serveur a un défaut ». L'envoyer pour une valeur que le
+/// client aurait pu corriger lui interdit de faire la différence entre ce qu'il
+/// doit réparer et ce qu'il doit signaler.
+fn refus_de_valeur(
+    zone_id: i64,
+    champ: &str,
+    valeur: &str,
+    raison: &str,
+) -> axum::response::Response {
+    warn!(zone_id, champ, valeur, raison, "zone_patch_rejected");
+    (
+        StatusCode::BAD_REQUEST,
+        format!("champ « {champ} » : {raison} (reçu : « {valeur} »)"),
+    )
+        .into_response()
+}
+
 async fn patch_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<PatchZone>,
 ) -> impl IntoResponse {
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Some(ref name) = body.name
-        && let Err(e) = repo.update_name(id, name)
+
+    // La zone existe-t-elle ? Sans ce contrôle, un PATCH sur un identifiant
+    // inconnu exécutait la trentaine d'UPDATE — qui touchent zéro ligne et
+    // réussissent — avant que `get_zone` ne rende 404 tout à la fin. Le 404
+    // était juste, mais il arrivait après trente écritures inutiles et ne
+    // disait pas laquelle avait échoué en cas de vrai problème.
+    match repo.get(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            warn!(zone_id = id, "zone_patch_unknown_zone");
+            return (StatusCode::NOT_FOUND, format!("zone {id} inconnue")).into_response();
+        }
+        Err(e) => return echec_ecriture(id, "zone", &id.to_string(), e),
+    }
+
+    // Les valeurs que cette route peut juger seule, avant toute écriture : un
+    // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
+    // laisser la moitié de ses champs écrits derrière lui.
+    if let Some(ref ot) = body.output_type
+        && !TYPES_DE_SORTIE.contains(&ot.as_str())
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        return refus_de_valeur(
+            id,
+            "output_type",
+            ot,
+            &format!(
+                "type de sortie inconnu (attendu : {})",
+                TYPES_DE_SORTIE.join(", ")
+            ),
+        );
+    }
+    if let Some(ref mode) = body.dsd_mode
+        && !MODES_DSD.contains(&mode.as_str())
+    {
+        return refus_de_valeur(
+            id,
+            "dsd_mode",
+            mode,
+            &format!("mode DSD inconnu (attendu : {})", MODES_DSD.join(", ")),
+        );
     }
     if let Some(vol) = body.volume
-        && let Err(e) = repo.update_volume(id, vol)
+        && !(0..=100).contains(&vol)
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    if let Some(muted) = body.muted
-        && let Err(e) = repo.update_muted(id, muted)
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        return refus_de_valeur(id, "volume", &vol.to_string(), "hors de 0..100");
     }
     if let Some(ref device_id) = body.output_device_id
-        && let Err(e) = repo.update_output_device(id, device_id)
+        && device_id.trim().is_empty()
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        // Une chaîne vide n'efface pas la sortie, elle la rend introuvable :
+        // la zone reste « configurée » et ne joue nulle part.
+        return refus_de_valeur(
+            id,
+            "output_device_id",
+            device_id,
+            "vide — pour retirer la sortie, envoyer output_type",
+        );
     }
-    if let Some(ref ot) = body.output_type
-        && let Err(e) = repo.update_output_type(id, ot)
+    if let Some(ref name) = body.name
+        && name.trim().is_empty()
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        return refus_de_valeur(id, "name", name, "vide");
     }
-    if let Some(gapless) = body.gapless_enabled
-        && let Err(e) = repo.update_gapless_enabled(id, gapless)
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+
+    /// Écrit un champ, ou s'arrête en journalisant la cause.
+    ///
+    /// Une macro et non une closure : chaque échec doit **sortir** du handler,
+    /// et une closure ne peut pas rendre la main à sa place. C'est aussi ce qui
+    /// garantit qu'aucun des trente blocs ne puisse redevenir muet — il n'y a
+    /// plus qu'un seul endroit où le `return` est écrit.
+    macro_rules! ecrire {
+        ($champ:literal, $valeur:expr, $ecriture:expr) => {
+            if let Err(e) = $ecriture {
+                return echec_ecriture(id, $champ, &$valeur.to_string(), e);
+            }
+        };
     }
-    if let Some(ms) = body.sync_delay_ms
-        && let Err(e) = repo.update_sync_delay(id, ms)
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+
+    if let Some(ref name) = body.name {
+        ecrire!("name", name, repo.update_name(id, name));
     }
-    if let Some(rate) = body.max_sample_rate
-        && let Err(e) = repo.update_max_sample_rate(id, rate)
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Some(vol) = body.volume {
+        ecrire!("volume", vol, repo.update_volume(id, vol));
+    }
+    if let Some(muted) = body.muted {
+        ecrire!("muted", muted, repo.update_muted(id, muted));
+    }
+    if let Some(ref device_id) = body.output_device_id {
+        ecrire!(
+            "output_device_id",
+            device_id,
+            repo.update_output_device(id, device_id)
+        );
+    }
+    if let Some(ref ot) = body.output_type {
+        ecrire!("output_type", ot, repo.update_output_type(id, ot));
+    }
+    if let Some(gapless) = body.gapless_enabled {
+        ecrire!(
+            "gapless_enabled",
+            gapless,
+            repo.update_gapless_enabled(id, gapless)
+        );
+    }
+    if let Some(ms) = body.sync_delay_ms {
+        ecrire!("sync_delay_ms", ms, repo.update_sync_delay(id, ms));
+    }
+    if let Some(rate) = body.max_sample_rate {
+        ecrire!(
+            "max_sample_rate",
+            rate.map(|r| r.to_string()).unwrap_or_else(|| "null".into()),
+            repo.update_max_sample_rate(id, rate)
+        );
     }
     if let Some(fixed) = body.fixed_volume {
-        if let Err(e) = repo.update_fixed_volume(id, fixed) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("fixed_volume", fixed, repo.update_fixed_volume(id, fixed));
         // When enabling fixed_volume, pin volume to 100% in DB and in-memory
         if fixed {
             repo.update_volume(id, 100).ok();
             state.playback.set_volume(id, 1.0).await;
         }
     }
-    if let Some(autoplay) = body.autoplay_enabled
-        && let Err(e) = repo.update_autoplay_enabled(id, autoplay)
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Some(autoplay) = body.autoplay_enabled {
+        ecrire!(
+            "autoplay_enabled",
+            autoplay,
+            repo.update_autoplay_enabled(id, autoplay)
+        );
     }
     if let Some(ref mode) = body.dsd_mode {
-        if let Err(e) = repo.update_dsd_mode(id, mode) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("dsd_mode", mode, repo.update_dsd_mode(id, mode));
     }
     if let Some(offset) = body.lyrics_offset_ms {
         // Borne large mais finie : au-dela d'une minute ce n'est plus un
         // reglage de latence, et une valeur folle desynchroniserait tout.
         let clamped = offset.clamp(-60_000, 60_000);
-        if let Err(e) = repo.update_lyrics_offset_ms(id, clamped) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!(
+            "lyrics_offset_ms",
+            clamped,
+            repo.update_lyrics_offset_ms(id, clamped)
+        );
     }
     if let Some(native_flac) = body.dlna_native_flac {
-        if let Err(e) = repo.update_dlna_native_flac(id, native_flac) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!(
+            "dlna_native_flac",
+            native_flac,
+            repo.update_dlna_native_flac(id, native_flac)
+        );
     }
     if let Some(passthrough) = body.alac_passthrough {
-        if let Err(e) = repo.update_alac_passthrough(id, passthrough) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!(
+            "alac_passthrough",
+            passthrough,
+            repo.update_alac_passthrough(id, passthrough)
+        );
     }
     if let Some(passthrough) = body.aac_passthrough {
-        if let Err(e) = repo.update_aac_passthrough(id, passthrough) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!(
+            "aac_passthrough",
+            passthrough,
+            repo.update_aac_passthrough(id, passthrough)
+        );
     }
     if let Some(lpcm) = body.dlna_lpcm {
-        if let Err(e) = repo.update_dlna_lpcm(id, lpcm) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("dlna_lpcm", lpcm, repo.update_dlna_lpcm(id, lpcm));
     }
     if let Some(cap) = body.dlna_cap_16bit {
-        if let Err(e) = repo.update_dlna_cap_16bit(id, cap) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("dlna_cap_16bit", cap, repo.update_dlna_cap_16bit(id, cap));
     }
     if let Some(wav24) = body.dlna_wav24 {
-        if let Err(e) = repo.update_dlna_wav24(id, wav24) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("dlna_wav24", wav24, repo.update_dlna_wav24(id, wav24));
     }
     if let Some(delay) = body.dlna_play_delay_ms {
         let delay = delay.max(0) as u64;
-        if let Err(e) = repo.update_dlna_play_delay_ms(id, delay) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!(
+            "dlna_play_delay_ms",
+            delay,
+            repo.update_dlna_play_delay_ms(id, delay)
+        );
         // Apply live to the already-registered output so the new delay takes
         // effect on the next play without a rebuild/restart. 0 = fall back to the
         // config default (`[device_delays]` / `dlna_play_delay_ms`) by name.
@@ -1780,9 +1921,7 @@ async fn patch_zone(
         } else {
             settings.set(&key, brand.trim())
         };
-        if let Err(e) = r {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("brand", brand, r);
     }
     if let Some(ref model) = body.model {
         let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1792,9 +1931,7 @@ async fn patch_zone(
         } else {
             settings.set(&key, model.trim())
         };
-        if let Err(e) = r {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("model", model, r);
     }
     // Opt-in MediaRenderer UPnP (#1750) → setting zone_{id}_upnp_renderer.
     if let Some(enabled) = body.upnp_renderer {
@@ -1805,9 +1942,7 @@ async fn patch_zone(
         } else {
             settings.delete(&key)
         };
-        if let Err(e) = r {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("upnp_renderer", enabled, r);
         // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
         crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
     }
@@ -1821,9 +1956,7 @@ async fn patch_zone(
         } else {
             settings.set(&key, &format!("{clamped}"))
         };
-        if let Err(e) = r {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        ecrire!("gain_trim_db", clamped, r);
         // Effet immédiat : re-pousser le volume courant au device (le trim est
         // composé dans orchestrator.set_volume). Sans ça, il faudrait attendre
         // le prochain coup de curseur.
@@ -4028,6 +4161,88 @@ mod aac_passthrough_tests {
         assert!(
             !repo.get_aac_passthrough(id),
             "activer l'ALAC a activé l'AAC"
+        );
+    }
+}
+
+/// Garde-fou : le PATCH d'une zone ne doit plus jamais échouer en silence.
+///
+/// Gérard Brot (#1964) : « si je change manuellement la sortie en local […]
+/// j'ai erreur 500 en retour du server ». Le message de la cause était dans le
+/// corps de la réponse — donc entre les mains du serveur — et **aucune ligne
+/// n'était journalisée**. Il a fallu lui écrire pour lui redemander ce que le
+/// serveur savait déjà.
+///
+/// Trente blocs partageaient le même moule `return (INTERNAL_SERVER_ERROR, e)`.
+/// Ils passent tous par la macro `ecrire!`, qui journalise avant de rendre la
+/// main. Ce test relit la source plutôt que d'exercer la route : la propriété à
+/// tenir est structurelle — « aucun 500 nu dans ce handler » — et c'est
+/// justement le genre qu'un nouveau champ ajouté par copier-coller ré-introduit.
+#[cfg(test)]
+mod patch_zone_error_guard {
+    use std::fs;
+    use std::path::Path;
+
+    /// Le corps de `patch_zone`, des `async fn patch_zone(` jusqu'au `\n}\n`
+    /// qui le ferme. Découpé sur la source plutôt que sur des numéros de ligne,
+    /// qui dérivent à chaque édition.
+    fn corps_du_handler() -> String {
+        let source =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/zones.rs"))
+                .expect("lecture de zones.rs");
+        let debut = source
+            .find("async fn patch_zone(")
+            .expect("`patch_zone` a été renommé — ce garde-fou ne garde plus rien");
+        let reste = &source[debut..];
+        let fin = reste
+            .find("\n}\n")
+            .expect("fin de `patch_zone` introuvable");
+        reste[..fin].to_string()
+    }
+
+    #[test]
+    fn no_bare_500_survives_in_patch_zone() {
+        let corps = corps_du_handler();
+        assert!(
+            !corps.contains("(StatusCode::INTERNAL_SERVER_ERROR, e)"),
+            "un `return (StatusCode::INTERNAL_SERVER_ERROR, e)` nu subsiste dans \
+             `patch_zone` : la cause partira sans laisser de trace, et un 500 \
+             signalé par un testeur sera de nouveau impossible à instruire \
+             (#1964). Utiliser la macro `ecrire!`, qui journalise."
+        );
+    }
+
+    #[test]
+    fn every_write_goes_through_the_logging_macro() {
+        let corps = corps_du_handler();
+        let ecritures = corps.matches("ecrire!(").count();
+        // 22 à la rédaction. Le seuil protège contre l'inverse du test
+        // précédent : quelqu'un qui remplacerait les blocs par des `.ok()`
+        // silencieux passerait le premier test et perdrait tout autant les
+        // causes.
+        assert!(
+            ecritures >= 20,
+            "seulement {ecritures} appels à `ecrire!` dans `patch_zone` — \
+             des écritures ont-elles été retirées du chemin journalisé ?"
+        );
+    }
+
+    /// Les valeurs jugeables par la route doivent l'être AVANT la première
+    /// écriture. Un PATCH à moitié appliqué est pire qu'un PATCH refusé : la
+    /// zone se retrouve dans un état que l'utilisateur n'a pas demandé.
+    #[test]
+    fn value_checks_come_before_any_write() {
+        let corps = corps_du_handler();
+        let premier_refus = corps
+            .find("refus_de_valeur(")
+            .expect("aucune validation de valeur dans `patch_zone`");
+        let premiere_ecriture = corps
+            .find("ecrire!(")
+            .expect("aucune écriture dans `patch_zone`");
+        assert!(
+            premier_refus < premiere_ecriture,
+            "une validation arrive APRÈS une écriture : un PATCH refusé aurait \
+             déjà modifié la zone"
         );
     }
 }
