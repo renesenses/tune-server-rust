@@ -58,13 +58,82 @@ const SCAN_IO_CONCURRENCY: usize = 32;
 /// more. Rather than guess, let the operator tune it against their own NAS —
 /// something we cannot benchmark centrally. Empty/invalid/zero → the default;
 /// clamped to 1..=256 so a typo can't spawn a pathological number of OS threads.
-fn scan_io_concurrency() -> usize {
-    std::env::var("TUNE_SCAN_IO_CONCURRENCY")
+pub fn scan_io_concurrency() -> usize {
+    if let Some(n) = std::env::var("TUNE_SCAN_IO_CONCURRENCY")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .map(|n| n.clamp(1, 256))
-        .unwrap_or(SCAN_IO_CONCURRENCY)
+    {
+        return n;
+    }
+    concurrence_pour_disque(disque_rotatif())
+}
+
+/// Concurrence adaptée au type de disque, une fois le réglage manuel écarté.
+///
+/// Fonction PURE, pour qu'elle soit testable sans `/sys` ni disque : la sonde
+/// système est séparée dans `disque_rotatif`.
+///
+/// Sur plateaux, 32 lectures concurrentes ne parallélisent rien — elles font
+/// osciller une tête unique entre 32 endroits. Chaque fichier demande deux
+/// déplacements (les tags au début, le hachage de déduplication à 25 %), donc
+/// 64 déplacements en vol sur un seul actionneur. Mesuré chez Yacine, 49 488
+/// fichiers sur un disque USB : **5,8 fichiers/s**, contre 44 000 en une
+/// trentaine de secondes sur SSD dans notre propre README (#1948).
+///
+/// `None` — type inconnu, ou pas Linux — garde la valeur d'origine : on ne
+/// dégrade pas un SSD par prudence mal placée.
+pub(crate) fn concurrence_pour_disque(rotatif: Option<bool>) -> usize {
+    match rotatif {
+        Some(true) => 4,
+        _ => SCAN_IO_CONCURRENCY,
+    }
+}
+
+/// Le stockage des dossiers de musique est-il sur plateaux ?
+///
+/// Lit `/sys/dev/block/<major>:<minor>/queue/rotational` — `1` = plateaux.
+/// Pour une partition, `queue/` vit sur le disque parent, d'où le repli sur
+/// `../queue/rotational`.
+///
+/// Rend `None` hors Linux, ou si quoi que ce soit dans la chaîne échoue : ce
+/// n'est qu'une heuristique de performance, elle ne doit jamais empêcher un
+/// scan. Lue une seule fois par processus — le pool n'est construit qu'une
+/// fois, et un disque ne change pas de nature en cours de route.
+pub(crate) fn disque_rotatif() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let racine = std::env::var("TUNE_MUSIC_DIRS")
+            .ok()
+            .and_then(|v| {
+                serde_json::from_str::<Vec<String>>(&v)
+                    .ok()
+                    .and_then(|d| d.into_iter().next())
+            })
+            .unwrap_or_else(|| "/".to_string());
+        let dev = std::fs::metadata(&racine).ok()?.dev();
+        let (majeur, mineur) = (unsafe { libc::major(dev) }, unsafe { libc::minor(dev) });
+        let base = format!("/sys/dev/block/{majeur}:{mineur}");
+        for chemin in [
+            format!("{base}/queue/rotational"),
+            format!("{base}/../queue/rotational"),
+        ] {
+            if let Ok(v) = std::fs::read_to_string(&chemin) {
+                return match v.trim() {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Lower CPU and I/O priority of the calling thread (Linux only, no-op
@@ -906,6 +975,38 @@ pub fn scan_directories(
 mod tests {
     use super::*;
 
+    /// Un disque à plateaux ne parallélise pas : 32 lectures concurrentes font
+    /// osciller une tête unique entre 32 endroits. Chaque fichier demande deux
+    /// déplacements — les tags au début, le hachage de déduplication à 25 % —
+    /// donc 64 en vol sur un seul actionneur. Mesuré chez Yacine : 5,8 fichiers
+    /// par seconde sur 49 488 fichiers en USB (#1948).
+    ///
+    /// Fonction pure, donc testable sans `/sys` ni disque : c'est tout l'intérêt
+    /// de l'avoir séparée de la sonde système.
+    #[test]
+    fn un_disque_a_plateaux_reduit_la_concurrence() {
+        assert_eq!(concurrence_pour_disque(Some(true)), 4);
+    }
+
+    /// Un SSD garde la valeur d'origine, et surtout un type INCONNU aussi :
+    /// hors Linux, ou si `/sys` est illisible, on ne dégrade pas tout le monde
+    /// par prudence mal placée.
+    #[test]
+    fn un_ssd_ou_un_type_inconnu_garde_la_valeur_d_origine() {
+        assert_eq!(concurrence_pour_disque(Some(false)), SCAN_IO_CONCURRENCY);
+        assert_eq!(concurrence_pour_disque(None), SCAN_IO_CONCURRENCY);
+    }
+
+    /// La sonde ne doit jamais paniquer ni bloquer : ce n'est qu'une heuristique
+    /// de performance, elle ne doit pas pouvoir empêcher un scan.
+    #[test]
+    fn la_sonde_ne_panique_jamais() {
+        let _ = disque_rotatif();
+        // Et la valeur qu'elle produit reste dans les bornes utiles.
+        let n = concurrence_pour_disque(disque_rotatif());
+        assert!((1..=256).contains(&n), "concurrence hors bornes : {n}");
+    }
+
     #[test]
     fn scan_io_concurrency_env_override() {
         // Serialize env mutation and always restore, so this can't race or leak
@@ -913,17 +1014,21 @@ mod tests {
         let key = "TUNE_SCAN_IO_CONCURRENCY";
         let saved = std::env::var(key).ok();
 
+        // Sans variable, c'est le TYPE DE DISQUE qui décide (#1948) — plus la
+        // constante. Comparer à la constante ferait passer ce test par chance
+        // sur un runner à SSD, et échouer sur une machine à plateaux.
+        let sans_variable = concurrence_pour_disque(disque_rotatif());
         unsafe { std::env::remove_var(key) };
-        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+        assert_eq!(scan_io_concurrency(), sans_variable);
 
         unsafe { std::env::set_var(key, "8") };
         assert_eq!(scan_io_concurrency(), 8);
 
         // Zero, garbage and empty all fall back to the default.
         unsafe { std::env::set_var(key, "0") };
-        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+        assert_eq!(scan_io_concurrency(), sans_variable);
         unsafe { std::env::set_var(key, "abc") };
-        assert_eq!(scan_io_concurrency(), SCAN_IO_CONCURRENCY);
+        assert_eq!(scan_io_concurrency(), sans_variable);
 
         // Over-large is clamped, not honoured verbatim.
         unsafe { std::env::set_var(key, "100000") };
