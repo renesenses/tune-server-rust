@@ -602,6 +602,11 @@ CREATE TABLE IF NOT EXISTS network_mounts (
     username TEXT,
     password TEXT,
     active TEXT DEFAULT 1,
+    -- `active` = l'intention, les trois suivantes = le constat du dernier
+    -- montage. Voir migrations/postgres/027 et tune-server/src/smb.rs.
+    smb_version TEXT,
+    mount_state TEXT,
+    last_mount_error TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
