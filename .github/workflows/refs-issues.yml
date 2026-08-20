@@ -1,12 +1,11 @@
 name: Références d'issues
 
-# Une PR qui DIT fermer une issue doit la fermer reellement.
+# Rendre visible, et actionnable, ce qu'une PR declare corriger.
 #
-# Mesure du 20/08/2026 sur les 600 dernieres PR fusionnees : 390 citent une
-# issue, 54 seulement emploient un mot-cle que GitHub reconnait. 27 issues
-# corrigees ET livrees etaient restees ouvertes, la plus ancienne depuis la
-# v0.9.63 — au point de faire classer en tete de bilan une perte de donnees
-# deja reparee.
+# Le probleme mesure le 20/08/2026 : 27 issues corrigees ET LIVREES etaient
+# restees ouvertes, la plus ancienne depuis la v0.9.63. Le suivi mentait d'un
+# mois, au point de faire classer en tete d'un bilan une perte de donnees
+# (#1943) deja reparee.
 #
 # ⚠️ Sur ce depot, AUCUN mot-cle de fermeture ne ferme quoi que ce soit — pas
 # meme en anglais. GitHub n'auto-ferme que sur la branche PAR DEFAUT, et la
