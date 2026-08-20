@@ -1670,6 +1670,37 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     None
 }
 
+/// La durée réelle d'un fichier, lue sans aucun garde-fou de vraisemblance.
+///
+/// `read_metadata` fait passer les MP3 par `mp3_duration_sanity_check`. Une
+/// passe de RÉPARATION ne peut donc pas s'en servir : elle relirait la valeur
+/// par le chemin qui l'a corrompue. Cette fonction ouvre le fichier et rend ce
+/// que lofty mesure, rien d'autre.
+///
+/// Elle reste correcte que la borne soit corrigée ou non — c'est précisément
+/// pourquoi la réparation ne dépend pas de l'ordre des correctifs.
+pub fn probe_duration_ms(path: &Path) -> Option<u64> {
+    use lofty::config::{ParseOptions, ParsingMode};
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    let tagged = Probe::open(path)
+        .and_then(|p| {
+            p.options(
+                ParseOptions::new()
+                    .parsing_mode(ParsingMode::Relaxed)
+                    .max_junk_bytes(1024 * 1024)
+                    .read_cover_art(false),
+            )
+            .guess_file_type()?
+            .read()
+        })
+        .ok()?;
+
+    let ms = tagged.properties().duration().as_millis() as u64;
+    (ms > 0).then_some(ms)
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -3562,5 +3593,45 @@ mod tests {
             mp3_duration_sanity_check(inexistant, 120_000, Some(128)),
             120_000
         );
+    }
+
+    // --- Réparation des durées MP3 rognées (#2027, #2034) ---
+
+    #[test]
+    fn probe_duration_ms_rend_none_sur_un_fichier_absent() {
+        // La passe de réparation compte les illisibles séparément des
+        // inchangées : confondre les deux ferait passer un disque débranché
+        // pour « rien à réparer ».
+        assert!(probe_duration_ms(Path::new("/nexiste/pas/rien.mp3")).is_none());
+    }
+
+    #[test]
+    fn signature_de_rognage_vaut_la_taille_divisee_par_quarante() {
+        // Ce que la borne inversée écrivait en base :
+        //     max_plausible_ms = file_size * 8 * 1000 / 320_000
+        //
+        // Cette égalité est la SIGNATURE que la requête de réparation
+        // recherche. Elle décrit une corruption HISTORIQUE, déjà écrite sur
+        // les disques des utilisateurs : elle ne doit PAS suivre une éventuelle
+        // reformulation de `mp3_duration_sanity_check`. Corriger la lecture
+        // n'efface pas les valeurs déjà persistées.
+        for taille in [1_000_000u64, 4_845_600, 7_340_032, 40, 41] {
+            let ecrit = taille * 8 * 1000 / 320_000;
+            assert_eq!(
+                ecrit,
+                taille / 40,
+                "la signature recherchée par la réparation ne tient plus pour {taille}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_mp3_a_320_kbps_constant_porte_la_signature_sans_avoir_ete_rogne() {
+        // Faux positif inoffensif, documenté pour qui relira la requête : à
+        // 320 kbps constant, la durée réelle EST `taille / 40`. La passe relit
+        // le fichier et récrit la même valeur — aucun dégât possible.
+        let taille = 4_800_000u64;
+        let duree_reelle_a_320k = taille * 8 * 1000 / 320_000;
+        assert_eq!(duree_reelle_a_320k, taille / 40);
     }
 }
