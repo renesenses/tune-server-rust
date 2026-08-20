@@ -1,0 +1,54 @@
+name: apt-install
+description: >-
+  Installe des paquets apt avec des reessais dont le budget TIENT dans le delai
+  de l'etape. Remplace quatre copies du meme bloc, qui divergeaient deja.
+
+inputs:
+  packages:
+    description: Paquets a installer, separes par des espaces.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # POURQUOI ces reessais existent, repris des blocs qu'ils remplacent :
+    # les runners Ubuntu de GitHub ont deux fois bloque `apt` indefiniment
+    # (0.9.86 : 6 h avant que le plafond ne tue le job et emporte la release ;
+    # 0.9.87 : rebelote). apt n'a pas de delai par defaut et githubstatus ne
+    # declare rien — sans garde-fou, une panne de miroir passagere coute une
+    # version entiere.
+    #
+    # Le budget total est DELIBEREMENT inferieur au `timeout-minutes` de
+    # l'appelant, et c'est tout l'objet de cette action.
+    #
+    # Les quatre copies precedentes annoncaient « 3 essais » sous un
+    # `timeout-minutes: 6`, soit 360 s — alors que trois essais coutent jusqu'a
+    # 3 x (100 + 200) + 2 x 20 = 940 s. Un premier essai qui echoue LENTEMENT,
+    # c'est-a-dire le mode de panne que ces reessais visent, consommait donc
+    # 320 s a lui seul : le deuxieme se faisait tuer en pleine descente et le
+    # troisieme n'existait pas. Le mecanisme ne fonctionnait qu'en cas d'echec
+    # RAPIDE — un 404 immediat — c'est-a-dire le cas ou il servait le moins.
+    #
+    # Constate le 19/08/2026 : deux jobs tombes sur cette meme etape, dans la
+    # meme course, malgre « 3 essais ».
+    #
+    # Nouveau budget : 3 x (60 + 120) + 2 x 15 = 570 s, sous les 720 s de
+    # `timeout-minutes: 12`. Un miroir qui met plus d'une minute a repondre a un
+    # `update` est perdu de toute facon ; mieux vaut echouer vite et reessayer
+    # vraiment trois fois.
+    - shell: bash
+      run: |
+        for essai in 1 2 3; do
+          if timeout 60 sudo apt-get update \
+             && timeout 120 sudo apt-get install -y ${{ inputs.packages }}; then
+            exit 0
+          fi
+          echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+          # Purge de l'index : le cas courant est un miroir momentanement
+          # incoherent apres une mise a jour d'image de runner, et re-tenter
+          # sans repartir de zero redonnerait la meme reponse.
+          sudo rm -rf /var/lib/apt/lists/*
+          sleep 15
+        done
+        echo "::error::apt injoignable apres 3 essais — ${{ inputs.packages }}"
+        exit 1
