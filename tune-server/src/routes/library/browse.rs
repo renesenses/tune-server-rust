@@ -19,7 +19,11 @@ pub(super) struct FolderQuery {
     path: Option<String>,
 }
 
-pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+pub(super) async fn browse_roots(
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
@@ -81,7 +85,21 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             // UI flag "introuvable / vérifier le montage" vs a genuinely empty
             // but valid directory.
             let exists = std::path::Path::new(&norm).is_dir();
-            json!({ "path": norm, "name": name, "track_count": count, "exists": exists })
+            // `exists: false` dit QUE le dossier est introuvable, jamais
+            // POURQUOI. Or la cause la plus frequente sous Windows a une
+            // reparation en un geste, et personne ne la devine : une lettre de
+            // lecteur reseau n'appartient qu'a la session qui l'a creee
+            // (testeur EverSolo, 04/08/2026 — `Z:\EDF7-FE43\EverSoloMusic`
+            // annonce a 0 piste quand l'appareil y voit 34 169 titres). Le
+            // conseil n'est calcule que sur un dossier introuvable : sur une
+            // racine saine il n'aurait rien a expliquer (#1190).
+            let hint = (!exists)
+                .then(|| crate::chemin_inaccessible::conseil(&lang, &norm))
+                .flatten();
+            json!({
+                "path": norm, "name": name, "track_count": count,
+                "exists": exists, "hint": hint,
+            })
         })
         .collect();
 
@@ -161,9 +179,11 @@ fn resolve_browse_path(raw: &str) -> Option<String> {
 }
 
 pub(super) async fn browse_directory(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let lang = crate::i18n::lang_from_header(&headers);
     let normalized_query =
         resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
     let resolved = std::path::Path::new(&normalized_query);
@@ -259,6 +279,13 @@ pub(super) async fn browse_directory(
             // conn removed — using state.backend
         }
     }
+    // Le conseil se calcule sur le chemin TEL QUE CONFIGURE (`q.path`), pas sur
+    // le chemin resolu : c'est celui que l'utilisateur a saisi, donc celui qui
+    // porte encore la lettre de lecteur qu'il faut lui apprendre a remplacer.
+    let access_hint = unreadable
+        .as_ref()
+        .and_then(|_| crate::chemin_inaccessible::conseil(&lang, &q.path));
+
     subdirs.sort_by(|a, b| {
         a.get("name")
             .and_then(|v| v.as_str())
@@ -348,25 +375,35 @@ pub(super) async fn browse_directory(
         // `accessible: false` distingue « injoignable » de « vide » : sans lui
         // le client ne peut pas faire la difference et affiche le mauvais
         // message (#1190). `access_error` porte la raison systeme.
+        //
+        // Cette raison vient du noyau — « Le peripherique n'est pas pret » — et
+        // n'indique a personne quoi faire. `access_hint` porte la reparation
+        // quand elle est connue : sous Windows, une lettre de lecteur reseau
+        // n'appartient qu'a la session qui l'a creee, et il faut lui substituer
+        // le chemin UNC.
         "accessible": unreadable.is_none(),
         "access_error": unreadable,
+        "access_hint": access_hint,
     })))
 }
 
 pub(super) async fn browse_folders(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Query(q): Query<FolderQuery>,
 ) -> axum::response::Response {
     // /library/folders?path=... is an alias for browse_directory
     // Without a path param, return browse roots
     match q.path {
-        Some(ref p) if !p.is_empty() => {
-            browse_directory(State(state), Query(BrowseQuery { path: p.clone() }))
-                .await
-                .into_response()
-        }
+        Some(ref p) if !p.is_empty() => browse_directory(
+            headers,
+            State(state),
+            Query(BrowseQuery { path: p.clone() }),
+        )
+        .await
+        .into_response(),
         _ => {
-            let roots_json = browse_roots(State(state)).await;
+            let roots_json = browse_roots(headers, State(state)).await;
             roots_json.into_response()
         }
     }

@@ -7,6 +7,9 @@ pub mod background;
 pub mod background_tasks;
 pub mod boot_status;
 pub mod bootstrap;
+/// Pourquoi un dossier configuré est-il injoignable, et que peut y faire
+/// l'utilisateur. Voir [`chemin_inaccessible`] pour le cas Windows.
+pub mod chemin_inaccessible;
 pub mod config;
 pub mod discovery_setup;
 pub mod error;
