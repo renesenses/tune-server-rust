@@ -12,9 +12,42 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::metadata::auto_fix::AutoFixEngine;
 use tune_core::metadata::{MetadataUpdate, write_metadata};
 
 use crate::state::AppState;
+
+/// Le moteur porte l'état d'un balayage en cours : il doit donc survivre à la
+/// requête qui le démarre, sans quoi `/auto-fix/status` interrogerait un objet
+/// neuf et répondrait éternellement « idle ». Un `OnceLock` de module plutôt
+/// qu'un champ d'`AppState` — même procédé que le cache du changelog, et sans
+/// faire enfler une structure partagée par tout le serveur.
+static AUTO_FIX: std::sync::OnceLock<std::sync::Arc<AutoFixEngine>> = std::sync::OnceLock::new();
+
+/// `AutoFixEngine` est bâti sur `SqliteDb`, et `AppState.db` vaut `None` en
+/// PostgreSQL. Renvoyer `None` ici permet aux routes de répondre un 501
+/// explicite — très supérieur au 404 muet d'aujourd'hui, qui laissait croire
+/// à un bouton cassé plutôt qu'à une fonction indisponible sur ce moteur.
+fn auto_fix_engine(state: &AppState) -> Option<std::sync::Arc<AutoFixEngine>> {
+    let db = state.db.as_ref()?;
+    Some(
+        AUTO_FIX
+            .get_or_init(|| std::sync::Arc::new(AutoFixEngine::new(db.clone())))
+            .clone(),
+    )
+}
+
+/// Réponse commune aux routes auto-fix quand la base n'est pas SQLite.
+fn auto_fix_unavailable() -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "ok": false,
+            "error": "auto-fix requires the SQLite backend",
+        })),
+    )
+        .into_response()
+}
 
 #[derive(Deserialize)]
 pub(crate) struct TrackEdit {
@@ -80,6 +113,15 @@ pub fn router() -> Router<AppState> {
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .route("/suggestions/auto-apply", post(auto_apply_suggestions))
+        // Le moteur d'auto-correction vit dans tune-core depuis longtemps ;
+        // aucune route ne l'exposait, et le bouton « Correction automatique »
+        // partait en 404 (#1893).
+        .route("/auto-fix", post(start_auto_fix))
+        .route("/auto-fix/status", get(auto_fix_status))
+        .route(
+            "/reclassify-genres-by-path",
+            post(reclassify_genres_by_path),
+        )
         .route("/suggestions/tracks/{track_id}", get(suggestions_for_track))
         .route("/suggestions/albums/{album_id}", get(suggestions_for_album))
         // Artist enrichment
@@ -2129,5 +2171,262 @@ mod year_path_tests {
         assert_eq!(extract_year_from_path("/Music/2200/x.flac"), None);
         // No 4-digit token at all.
         assert_eq!(extract_year_from_path("/Music/Greatest Hits/x.flac"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-fix — le moteur existait, la porte manquait
+// ---------------------------------------------------------------------------
+//
+// `tune_core::metadata::auto_fix::AutoFixEngine` est complet depuis longtemps :
+// il balaie les pistes incomplètes, enrichit, et tient un état de progression
+// dont les champs (`status`, `current`, `total`, `fixed`, `suggestions`) sont
+// exactement ceux que lit `MetadataView.svelte`. Aucune route ne l'exposait :
+// le bouton « Correction automatique » partait en 404 depuis toujours.
+
+#[derive(Deserialize, Default)]
+struct AutoFixBody {
+    /// Au-delà de ce degré de confiance, une suggestion est appliquée sans
+    /// demander. En deçà, elle est proposée. Même valeur par défaut que
+    /// `/suggestions/auto-apply`, pour que les deux chemins se comportent pareil.
+    threshold: Option<f64>,
+    batch_size: Option<usize>,
+}
+
+/// POST /metadata/auto-fix — démarre un balayage en tâche de fond.
+async fn start_auto_fix(
+    State(state): State<AppState>,
+    body: Option<Json<AutoFixBody>>,
+) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+
+    match engine
+        .start_scan(b.threshold.unwrap_or(0.9), b.batch_size.unwrap_or(50))
+        .await
+    {
+        Ok(()) => Json(json!({ "ok": true, "status": "running" })).into_response(),
+        // Un balayage déjà lancé n'est pas une erreur du client : le web
+        // s'en protège déjà (`if (autoFixStatus === 'running') return`), mais
+        // deux onglets ouverts contournent cette garde. On répond l'état réel.
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "ok": false, "error": e, "status": "running" })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /metadata/auto-fix/status — progression du balayage.
+async fn auto_fix_status(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    Json(engine.status().await).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Reclassement des genres d'après le chemin
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReclassifyQuery {
+    /// Prévisualiser sans écrire. Le web appelle d'abord ainsi, affiche le
+    /// nombre et un exemple, puis rappelle sans le drapeau si l'utilisateur
+    /// confirme.
+    dry_run: Option<bool>,
+}
+
+/// Les genres candidats sont ceux qui existent DÉJÀ dans la bibliothèque.
+///
+/// C'est le choix central de cette route : aucune taxonomie n'est inventée ni
+/// embarquée. Si un dossier s'appelle « Jazz » et qu'aucune piste n'est taguée
+/// « Jazz », rien n'est proposé — on ne devine pas ce que l'utilisateur appelle
+/// ses genres. À l'inverse, une bibliothèque rangée par genre se reclasse avec
+/// son propre vocabulaire, accents et casse compris.
+fn known_genres(state: &AppState) -> Vec<String> {
+    state
+        .backend
+        .query_many(
+            "SELECT DISTINCT genre FROM tracks \
+             WHERE genre IS NOT NULL AND genre <> '' ORDER BY genre",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| row.into_iter().next().and_then(|v| v.as_string()))
+        .filter(|g| g.chars().count() >= 3)
+        .collect()
+}
+
+/// Les pistes sans genre, avec leur chemin — ce sont les seules concernées.
+/// Écraser un genre existant d'après un nom de dossier serait une perte
+/// d'information : le tag est une donnée, le dossier une commodité.
+fn tracks_missing_genre(state: &AppState) -> Vec<(i64, String, String)> {
+    state
+        .backend
+        .query_many(
+            "SELECT id, title, file_path FROM tracks \
+             WHERE (genre IS NULL OR genre = '') \
+               AND file_path IS NOT NULL AND file_path <> ''",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let id = it.next()?.as_i64()?;
+            let title = it.next().and_then(|v| v.as_string()).unwrap_or_default();
+            let path = it.next()?.as_string()?;
+            Some((id, title, path))
+        })
+        .collect()
+}
+
+/// Un segment du chemin correspond-il à un genre connu ?
+///
+/// La comparaison ignore la casse et exige le segment ENTIER : un dossier
+/// « Rockabilly » ne doit pas être lu comme « Rock ». C'est la raison du
+/// découpage par séparateur plutôt qu'une recherche de sous-chaîne.
+fn genre_from_path(path: &str, genres: &[String]) -> Option<String> {
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
+    // Du plus proche du fichier vers la racine : le dossier le plus spécifique
+    // l'emporte sur un dossier de tête qui se trouverait porter le même nom.
+    for seg in segments.iter().rev() {
+        for g in genres {
+            if seg.eq_ignore_ascii_case(g) {
+                return Some(g.clone());
+            }
+        }
+    }
+    None
+}
+
+/// POST /metadata/reclassify-genres-by-path?dry_run=true
+async fn reclassify_genres_by_path(
+    State(state): State<AppState>,
+    Query(q): Query<ReclassifyQuery>,
+) -> impl IntoResponse {
+    let dry_run = q.dry_run.unwrap_or(false);
+    let genres = known_genres(&state);
+    let candidates = tracks_missing_genre(&state);
+    let scanned = candidates.len();
+
+    let mut details: Vec<serde_json::Value> = Vec::new();
+    let mut fixed = 0usize;
+
+    for (id, title, path) in candidates {
+        let Some(genre) = genre_from_path(&path, &genres) else {
+            continue;
+        };
+        if dry_run {
+            // Un aperçu ne doit pas grossir sans fin : le web n'en affiche
+            // qu'un exemple, le total est porté par `suggestions_total`.
+            if details.len() < 200 {
+                details.push(json!({ "title": title, "suggested": genre }));
+            }
+            fixed += 1;
+        } else {
+            let ok = state
+                .backend
+                .execute(
+                    "UPDATE tracks SET genre = ? WHERE id = ?",
+                    &[&genre as &dyn tune_core::db::backend::ToSqlValue, &id],
+                )
+                .is_ok();
+            if ok {
+                fixed += 1;
+            }
+        }
+    }
+
+    tracing::info!(scanned, fixed, dry_run, "reclassify_genres_by_path_done");
+
+    if dry_run {
+        Json(json!({
+            "ok": true,
+            "scanned": scanned,
+            "suggestions_total": fixed,
+            "details": details,
+        }))
+        .into_response()
+    } else {
+        Json(json!({ "ok": true, "scanned": scanned, "fixed": fixed })).into_response()
+    }
+}
+
+#[cfg(test)]
+mod genre_from_path_tests {
+    use super::genre_from_path;
+
+    fn genres() -> Vec<String> {
+        ["Rock", "Jazz", "Classique", "Musique du monde"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Le cas nominal : une bibliothèque rangée par genre.
+    #[test]
+    fn un_dossier_nomme_comme_un_genre_est_reconnu() {
+        assert_eq!(
+            genre_from_path(
+                "/mnt/music/Jazz/Miles Davis/Kind of Blue/01.flac",
+                &genres()
+            ),
+            Some("Jazz".to_string())
+        );
+    }
+
+    /// LA décision de conception : le segment doit correspondre ENTIÈREMENT.
+    /// Une recherche de sous-chaîne classerait « Rockabilly » en « Rock », et
+    /// l'utilisateur retrouverait un genre qu'il n'a jamais choisi.
+    #[test]
+    fn un_dossier_qui_contient_un_genre_sans_l_etre_est_ignore() {
+        assert_eq!(
+            genre_from_path("/mnt/music/Rockabilly/Stray Cats/01.flac", &genres()),
+            None
+        );
+    }
+
+    /// Le dossier le plus proche du fichier l'emporte : sur
+    /// `/Jazz/…/Rock/…`, c'est l'intention la plus précise qui compte.
+    #[test]
+    fn le_dossier_le_plus_specifique_gagne() {
+        assert_eq!(
+            genre_from_path("/mnt/Jazz/compilations/Rock/01.flac", &genres()),
+            Some("Rock".to_string())
+        );
+    }
+
+    /// La casse ne doit pas faire échouer la reconnaissance.
+    #[test]
+    fn la_casse_est_ignoree() {
+        assert_eq!(
+            genre_from_path("/mnt/music/JAZZ/x/01.flac", &genres()),
+            Some("Jazz".to_string())
+        );
+    }
+
+    /// Les chemins Windows utilisent l'antislash.
+    #[test]
+    fn les_chemins_windows_sont_decoupes() {
+        assert_eq!(
+            genre_from_path(r"C:\Musique\Classique\Bach\01.flac", &genres()),
+            Some("Classique".to_string())
+        );
+    }
+
+    /// Aucun genre connu dans le chemin : on ne propose rien plutôt que
+    /// d'inventer. C'est ce qui rend la route sûre sur une bibliothèque
+    /// rangée par artiste.
+    #[test]
+    fn rien_nest_propose_hors_correspondance() {
+        assert_eq!(
+            genre_from_path("/mnt/music/Miles Davis/Kind of Blue/01.flac", &genres()),
+            None
+        );
     }
 }
