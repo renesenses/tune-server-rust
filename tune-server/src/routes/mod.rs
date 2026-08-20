@@ -555,8 +555,17 @@ mod eq_refresh_guard {
     use std::fs;
     use std::path::Path;
 
-    /// Fichiers qui mentionnent une clé sans jamais l'écrire. Vide aujourd'hui.
-    const LECTURE_SEULE: &[&str] = &[];
+    /// Couples (clé, fichier) dispensés du garde-fou, avec leur raison.
+    ///
+    /// Indexé par clé et pas seulement par fichier : dispenser `zones.rs` en
+    /// bloc le retirerait aussi des deux autres clés, dont il n'a aucune raison
+    /// d'être exempté. Une dispense doit être aussi étroite que son motif.
+    const LECTURE_SEULE: &[(&str, &str, &str)] = &[(
+        "_audiophile",
+        "zones.rs",
+        "n'écrit la clé que dans ses propres tests (chemin du signal en PURE) ; \
+         le code de production la LIT via `audiophile::zone_enabled`",
+    )];
 
     /// Les réglages DSP par zone qui n'atteignent le son que si quelqu'un
     /// rafraîchit la sortie vivante, et la méthode qui le fait.
@@ -570,9 +579,17 @@ mod eq_refresh_guard {
     /// un redémarrage de flux. Une route qui n'appellerait que le second
     /// laisserait les zones DLNA et navigateur muettes jusqu'à la piste
     /// suivante — le défaut d'origine, à moitié réparé.
+    ///
+    /// `zone_*_audiophile` (mode PURE) est la troisième, et la plus coûteuse :
+    /// les deux premières ne promettaient qu'un réglage tardif, celle-ci promet
+    /// que RIEN ne touche le signal — pendant que l'`EqProcessor` déjà installé
+    /// continuait de filtrer (#1986). Elle exige `apply_audiophile_change`,
+    /// pour la même raison que l'EQ exige `apply_eq_change` : le cas non local
+    /// (DLNA, navigateur) n'est réglé que par un redémarrage de flux.
     const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
         ("_eq_profile", "apply_eq_change"),
         ("_crossfeed", "refresh_zone_crossfeed"),
+        ("_audiophile", "apply_audiophile_change"),
     ];
 
     #[test]
@@ -613,7 +630,11 @@ mod eq_refresh_guard {
             );
             let fautifs: Vec<&str> = concernes
                 .iter()
-                .filter(|(nom, _)| !LECTURE_SEULE.contains(&nom.as_str()))
+                .filter(|(nom, _)| {
+                    !LECTURE_SEULE
+                        .iter()
+                        .any(|(k, f, _)| k == cle && f == &nom.as_str())
+                })
                 .filter(|(_, s)| !s.contains(rafraichisseur))
                 .map(|(nom, _)| nom.as_str())
                 .collect();
