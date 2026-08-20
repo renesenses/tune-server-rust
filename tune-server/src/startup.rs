@@ -1181,14 +1181,7 @@ pub async fn remount_network_shares(state: &AppState) {
             }
             Err(_) => {
                 warn!(host = %host, share = %share, "network_share_remount_timeout");
-                noter_montage(
-                    state,
-                    id,
-                    "failed",
-                    Some("délai dépassé au montage"),
-                    None,
-                )
-                .await;
+                noter_montage(state, id, "failed", Some("délai dépassé au montage"), None).await;
             }
         }
     }
@@ -1218,11 +1211,7 @@ async fn noter_montage(
     let Some(id) = id else { return };
     let pg = state.backend.engine() == tune_core::db::engine::Engine::Postgres;
     let p = |n: usize| {
-        if pg {
-            format!("${n}")
-        } else {
-            "?".to_string()
-        }
+        if pg { format!("${n}") } else { "?".to_string() }
     };
     let erreur = erreur.map(|e| e.to_string());
     // `network_mounts.id` est INTEGER sous SQLite et TEXT sous PostgreSQL. Lier

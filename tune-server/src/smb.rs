@@ -176,7 +176,11 @@ mod tests {
     fn le_dialecte_connu_passe_en_premier_sans_perdre_les_autres() {
         let ordre = echelle(Some("1.0"));
         assert_eq!(ordre.first(), Some(&Some("1.0")));
-        assert_eq!(ordre.len(), DIALECTES.len(), "aucun dialecte perdu : {ordre:?}");
+        assert_eq!(
+            ordre.len(),
+            DIALECTES.len(),
+            "aucun dialecte perdu : {ordre:?}"
+        );
         for d in DIALECTES {
             assert!(ordre.contains(&d), "{d:?} manque dans {ordre:?}");
         }

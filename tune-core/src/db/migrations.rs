@@ -2745,7 +2745,10 @@ mod tests {
         let etat: Option<String> = conn
             .query_row("SELECT mount_state FROM network_mounts", [], |r| r.get(0))
             .unwrap();
-        assert!(etat.is_none(), "mount_state devrait être NUL, vaut {etat:?}");
+        assert!(
+            etat.is_none(),
+            "mount_state devrait être NUL, vaut {etat:?}"
+        );
     }
 
     /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
