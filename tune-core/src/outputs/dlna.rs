@@ -203,7 +203,22 @@ impl DlnaOutput {
                     Ok(text) => return Ok(text),
                     Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
                 },
-                Err(e) if e.is_connect() || e.is_timeout() => {
+                // `is_connection_closed_early` : le renderer a raccroché avant
+                // d'avoir fini sa réponse. Sans ce troisième prédicat, la panne
+                // ressortait par le bras « erreur définitive » ci-dessous et
+                // n'était JAMAIS réessayée — le Marantz ND8006 de Jean Valjean
+                // échouait dès la première tentative (#1984), y compris sur le
+                // GetProtocolInfo qui arme le bouton « 24 bits ».
+                //
+                // La deuxième tentative repart sur une connexion neuve : celle
+                // qui vient d'échouer a été évacuée du pool par l'échec même.
+                // C'est ce qui rend le simple réessai suffisant, sans avoir à
+                // désactiver la mutualisation vers tous les renderers.
+                Err(e)
+                    if e.is_connect()
+                        || e.is_timeout()
+                        || http_error::is_connection_closed_early(&e) =>
+                {
                     last_was_timeout = e.is_timeout();
                     last_err = format!("soap send: {}", http_error::chain(&e));
                 }
@@ -846,7 +861,19 @@ impl DlnaOutput {
     pub async fn probe_capabilities(&self) -> RendererCapabilities {
         match self.get_protocol_info().await {
             Ok(sink) if !sink.is_empty() => renderer_caps_from_sink(sink),
-            _ => RendererCapabilities::default(),
+            // Le `_ =>` d'origine avalait l'erreur : l'utilisateur voyait
+            // « impossible de lire les capacités » et le journal ne portait
+            // AUCUNE trace de la sonde (#1984). Dire lequel des deux cas s'est
+            // produit — l'appel a échoué, ou le Sink est vide — coûte une ligne
+            // et distingue « injoignable » de « joignable mais muet ».
+            Ok(_) => {
+                warn!(device = %self.name, "renderer_caps_probe_empty_sink");
+                RendererCapabilities::default()
+            }
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "renderer_caps_probe_failed");
+                RendererCapabilities::default()
+            }
         }
     }
 }
