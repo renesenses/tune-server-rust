@@ -72,6 +72,13 @@ pub fn router() -> Router<AppState> {
         // the /library/write-tags job (fill-missing-only, whole library).
         .route("/write-all-tags", post(write_all_tags_compat))
         .route("/doubtful", get(list_doubtful_metadata))
+        // Auto-correction (#1893, #1993). `stop` n'existait dans aucune route
+        // alors que le moteur sait s'arrêter : un travail de plusieurs heures
+        // qu'on ne peut pas interrompre n'est pas acceptable.
+        .route("/auto-fix", post(auto_fix_start))
+        .route("/auto-fix/status", get(auto_fix_status))
+        .route("/auto-fix/stop", post(auto_fix_stop))
+        .route("/auto-fix/suggestions", get(auto_fix_suggestions))
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
         .route("/lookup/album", get(lookup_album))
@@ -2130,4 +2137,124 @@ mod year_path_tests {
         // No 4-digit token at all.
         assert_eq!(extract_year_from_path("/Music/Greatest Hits/x.flac"), None);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-correction des métadonnées (#1893, #1993)
+//
+// Le moteur (`tune_core::metadata::auto_fix`) existait depuis longtemps sans
+// qu'aucune route ne l'atteigne : l'interface appelait `/metadata/auto-fix`,
+// qui répondait 404. Ce n'était pas du code mort — quatre écrans le
+// déclenchaient.
+//
+// Ce qu'il fait RÉELLEMENT, et que le nom ne dit pas : il **suggère**, il ne
+// corrige pas. `scan_loop` reçoit un `auto_apply_threshold` et l'ignore
+// (`_auto_apply_threshold`). On ne « répare » donc rien automatiquement, et
+// c'est tant mieux : appliquer sans demander des métadonnées venues du réseau
+// serait irréversible. Les réponses le disent au lieu de le laisser croire.
+// ---------------------------------------------------------------------------
+
+/// Le moteur, construit une seule fois. `None` en PostgreSQL.
+fn moteur_auto_fix(
+    state: &AppState,
+) -> Option<std::sync::Arc<tune_core::metadata::auto_fix::AutoFixEngine>> {
+    if let Some(m) = state.auto_fix.get() {
+        return Some(m.clone());
+    }
+    let db = state.sqlite().ok()?.clone();
+    let moteur = std::sync::Arc::new(tune_core::metadata::auto_fix::AutoFixEngine::new(db));
+    let _ = state.auto_fix.set(moteur.clone());
+    Some(moteur)
+}
+
+fn sans_moteur() -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "auto-fix n'est disponible qu'avec une base SQLite",
+            "raison": "AutoFixEngine::new attend un SqliteDb concret, pas le trait DbBackend",
+        })),
+    )
+        .into_response()
+}
+
+/// Chaque piste coûte au moins deux appels MusicBrainz, espacés de 1100 ms par
+/// la limitation de `enrichment.rs`. Sur 5 000 pistes cela fait des HEURES, et
+/// rien ne l'annonçait : l'utilisateur voyait un bouton, pas un engagement.
+const SECONDES_PAR_PISTE: u64 = 3;
+
+#[derive(Deserialize, Default)]
+struct AutoFixParams {
+    /// Accepté et transmis, mais le moteur ne l'honore pas encore (#1993).
+    #[serde(default)]
+    threshold: Option<f64>,
+    #[serde(default)]
+    batch_size: Option<usize>,
+}
+
+async fn auto_fix_start(
+    State(state): State<AppState>,
+    corps: Option<Json<AutoFixParams>>,
+) -> axum::response::Response {
+    let Some(moteur) = moteur_auto_fix(&state) else {
+        return sans_moteur();
+    };
+    let p = corps.map(|Json(p)| p).unwrap_or_default();
+    match moteur
+        .clone()
+        .start_scan(p.threshold.unwrap_or(0.9), p.batch_size.unwrap_or(50))
+        .await
+    {
+        Ok(()) => {
+            let etat = moteur.status().await;
+            Json(json!({
+                "status": "started",
+                // Dire ce que ça fait, pas ce que le nom laisse croire.
+                "applies_changes": false,
+                "note": "produit des suggestions ; aucune métadonnée n'est modifiée sans validation",
+                "total": etat.total,
+            }))
+            .into_response()
+        }
+        // Déjà en cours : 409, pas 500. Ce n'est pas une panne, c'est un état.
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn auto_fix_status(State(state): State<AppState>) -> axum::response::Response {
+    let Some(moteur) = moteur_auto_fix(&state) else {
+        return sans_moteur();
+    };
+    let p = moteur.status().await;
+    let restantes = p.total.saturating_sub(p.current) as u64;
+    Json(json!({
+        "status": p.status,
+        "current": p.current,
+        "total": p.total,
+        "fixed": p.fixed,
+        "suggestions": p.suggestions,
+        "running": moteur.is_running().await,
+        // Une estimation grossière vaut mieux qu'aucune : sans elle,
+        // l'utilisateur ne peut pas savoir s'il attend dix minutes ou trois
+        // heures, et conclut que « ça ne marche pas ».
+        "eta_seconds": restantes * SECONDES_PAR_PISTE,
+        "applies_changes": false,
+    }))
+    .into_response()
+}
+
+async fn auto_fix_stop(State(state): State<AppState>) -> axum::response::Response {
+    let Some(moteur) = moteur_auto_fix(&state) else {
+        return sans_moteur();
+    };
+    moteur.stop().await;
+    Json(json!({ "status": "stopping" })).into_response()
+}
+
+async fn auto_fix_suggestions(State(state): State<AppState>) -> axum::response::Response {
+    let Some(moteur) = moteur_auto_fix(&state) else {
+        return sans_moteur();
+    };
+    let s = moteur.get_suggestions().await;
+    Json(json!({ "count": s.len(), "suggestions": s })).into_response()
 }

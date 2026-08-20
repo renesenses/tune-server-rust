@@ -107,6 +107,17 @@ pub struct AppState {
     /// the default server carries neither this field nor wasmtime.
     #[cfg(feature = "plugins-wasm")]
     pub wasm_plugins: Arc<OnceLock<crate::plugins_host::WasmRegistry>>,
+    /// Moteur d'auto-correction des métadonnées (#1893, #1993).
+    ///
+    /// Un `OnceLock` et non une construction par requête : le moteur PORTE son
+    /// état — en cours, progression, suggestions accumulées. Le rebâtir à
+    /// chaque appel rendrait `/auto-fix/status` toujours « idle », et `stop`
+    /// sans effet.
+    ///
+    /// Vide en mode PostgreSQL : `AutoFixEngine::new` prend un `SqliteDb`
+    /// concret, pas le trait `DbBackend`. La route le dit franchement plutôt
+    /// que d'échouer obscurément.
+    pub auto_fix: Arc<OnceLock<Arc<tune_core::metadata::auto_fix::AutoFixEngine>>>,
     #[cfg(feature = "cloud-relay")]
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
@@ -338,6 +349,7 @@ impl AppState {
             plugin_available: Arc::new(OnceLock::new()),
             #[cfg(feature = "plugins-wasm")]
             wasm_plugins: Arc::new(OnceLock::new()),
+            auto_fix: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })
