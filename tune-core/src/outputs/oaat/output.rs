@@ -101,11 +101,20 @@ pub struct OaatOutput {
     /// dernier est rejoué » — local→local sur zone OAAT, .18, 29/07). Reset
     /// by `stop()` (called at the start of every `play_media`).
     direct_pcm_active: Arc<AtomicBool>,
-    /// Set by the direct-file loop when it reaches the end of a track with
-    /// nothing to chain into. The poller re-reads `supports_internal_gapless()`
-    /// while it waits for a transition, so flipping this releases it on the
-    /// next tick instead of letting it sit out its guard.
-    direct_chain_exhausted: Arc<AtomicBool>,
+    /// Set by a playback loop when it ends with nothing to chain into — the
+    /// direct-file loop AND the HTTP-stream loop. The poller re-reads
+    /// `supports_internal_gapless()` while it waits for a transition, so
+    /// flipping this releases it on the next tick instead of letting it sit out
+    /// its guard.
+    ///
+    /// The HTTP loop used to leave it alone, and that is the second half of
+    /// Xavier Joly's 83 seconds (#1323): once the loop was gone — end of the
+    /// queue, prefetch that returned nothing, renegotiation refused, retries
+    /// spent — the output still claimed it could transition internally, so the
+    /// poller sat in `gapless_natural_end_waiting_for_transition` waiting on a
+    /// task that no longer existed (34 s measured in his log, 16:34:06 →
+    /// 16:34:40), then restarted the track from cold.
+    chain_exhausted: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
@@ -154,7 +163,7 @@ impl OaatOutput {
             paused: Arc::new(AtomicBool::new(false)),
             native_dsd_active: Arc::new(AtomicBool::new(false)),
             direct_pcm_active: Arc::new(AtomicBool::new(false)),
-            direct_chain_exhausted: Arc::new(AtomicBool::new(false)),
+            chain_exhausted: Arc::new(AtomicBool::new(false)),
             // `volume_set` du protocole est en 0–100 (RFC), comme le
             // multiroom et l'endpoint : on stocke la meme echelle. L'ancien
             // 800, divise par 255 a la lecture, rapportait un volume de 314 %.
@@ -194,9 +203,8 @@ impl OaatOutput {
     /// Test-only: raise the flag the direct-file loop sets when it reaches an
     /// end with nothing to chain into.
     #[cfg(all(test, feature = "oaat"))]
-    pub(crate) fn set_direct_chain_exhausted_for_test(&self, exhausted: bool) {
-        self.direct_chain_exhausted
-            .store(exhausted, Ordering::SeqCst);
+    pub(crate) fn set_chain_exhausted_for_test(&self, exhausted: bool) {
+        self.chain_exhausted.store(exhausted, Ordering::SeqCst);
     }
 
     /// Test-only: mark the direct-file playback path as active.
@@ -363,14 +371,16 @@ impl OutputTarget for OaatOutput {
     ///   at EOF without tearing the connection down ("oaat: gapless transition
     ///   (native DSD)"). If the next track isn't a compatible native DSD file,
     ///   the loop ends cleanly and the poller's natural-end fallback advances.
+    ///
+    /// The answer is a live probe, not a static capability: a loop that has
+    /// ENDED can no longer transition, whatever it was capable of a second
+    /// earlier. Both loops raise `chain_exhausted` when they leave with nothing
+    /// staged (end of queue, next track not local, format change refused,
+    /// decode failure, retries spent), which is what returns the queue to the
+    /// poller's natural-end advance — the guarantee that #1006 was about, kept
+    /// intact, and what stops the poller waiting on a dead task (#1323).
     fn supports_internal_gapless(&self) -> bool {
-        // The direct-file loop now chains internally too: it stages the next
-        // local file while the current one plays and swaps buffers at EOF.
-        // It reports `direct_chain_exhausted` when it reaches an end with
-        // nothing staged (next track not local, format change, decode failure),
-        // which is what returns the queue to the poller's natural-end advance —
-        // the guarantee that #1006 was about, kept intact.
-        !self.direct_chain_exhausted.load(Ordering::Relaxed)
+        !self.chain_exhausted.load(Ordering::Relaxed)
     }
 
     /// True for the two paths that chain by opening the NEXT track's local file
@@ -428,7 +438,7 @@ impl OutputTarget for OaatOutput {
         let paused = self.paused.clone();
         let native_dsd_active = self.native_dsd_active.clone();
         let direct_pcm_active = self.direct_pcm_active.clone();
-        let direct_chain_exhausted = self.direct_chain_exhausted.clone();
+        let chain_exhausted = self.chain_exhausted.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_arc = self.duration_ms.clone();
         let current_title = self.current_title.clone();
@@ -1310,14 +1320,14 @@ impl OutputTarget for OaatOutput {
                                     // advances on its next tick (it re-reads
                                     // supports_internal_gapless while waiting)
                                     // instead of sitting out its guard.
-                                    direct_chain_exhausted.store(true, Ordering::SeqCst);
+                                    chain_exhausted.store(true, Ordering::SeqCst);
                                     break 'direct_tracks;
                                 }
                             }
                         }
 
                         if stop_rx.try_recv().is_ok() {
-                            direct_chain_exhausted.store(true, Ordering::SeqCst);
+                            chain_exhausted.store(true, Ordering::SeqCst);
                             break 'direct_tracks;
                         }
                         // Unlike the HTTP-stream path (which polls command_rx in a
@@ -1752,6 +1762,13 @@ impl OutputTarget for OaatOutput {
             let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(10));
             watchdog.tick().await; // skip first immediate tick
 
+            // An explicit stop is the ONE exit that must not raise
+            // `chain_exhausted`: `stop()` is what clears the flag before the
+            // next `play_media`, and this task's tail can still be running when
+            // it does — raising it here would leak onto the track that follows
+            // and disarm its gapless. Every other exit means the chain is over.
+            let mut exited_on_stop = false;
+
             loop {
                 tokio::select! {
                     // `biased` : l'ordre des bras est l'ordre de priorité. Sans
@@ -1767,6 +1784,7 @@ impl OutputTarget for OaatOutput {
 
                     _ = &mut stop_rx => {
                         debug!(device = %device_name, "oaat: stop signal");
+                        exited_on_stop = true;
                         break;
                     }
 
@@ -2207,6 +2225,22 @@ impl OutputTarget for OaatOutput {
                 }
             }
 
+            // The loop is over: this task will never take another gapless
+            // transition, so the output must stop claiming it can. Said before
+            // the first `.await` of the tail, so the poller learns it on its
+            // very next tick rather than after `send_stop` has round-tripped.
+            //
+            // Xavier Joly, 7 Aug 2026 (#1323): the loop left by the stream-error
+            // path at 16:34:01 and the poller, still told "a transition is
+            // coming", logged `gapless_natural_end_waiting_for_transition` at
+            // 16:34:06 and waited until 16:34:40 before giving up — the next
+            // movement then restarted from cold at 16:35:24. Correcting the
+            // end-of-track detection alone would not have closed that gap: ANY
+            // exit without a transition opens it.
+            if !exited_on_stop {
+                chain_exhausted.store(true, Ordering::SeqCst);
+            }
+
             endpoint.send_stop(&stream_id).await.ok();
             playing.store(false, Ordering::SeqCst);
             diag.connected.store(false, Ordering::SeqCst);
@@ -2273,7 +2307,7 @@ impl OutputTarget for OaatOutput {
         // path re-sets it if the next track is also native DSD.
         self.native_dsd_active.store(false, Ordering::SeqCst);
         self.direct_pcm_active.store(false, Ordering::SeqCst);
-        self.direct_chain_exhausted.store(false, Ordering::SeqCst);
+        self.chain_exhausted.store(false, Ordering::SeqCst);
         *self.current_uri.lock().await = None;
         info!(device = %self.name, "oaat: stop");
         Ok(())
