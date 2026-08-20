@@ -13,6 +13,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 pub struct RelayState {
     pub servers: DashMap<String, ServerConnection>,
     pub tokens: DashMap<String, String>,
+    /// Verificateur d'eligibilite premium, interroge AVANT tout
+    /// enregistrement. Voir `crate::licence`.
+    pub licences: std::sync::Arc<crate::licence::Licences>,
     pub max_servers: usize,
     pub max_clients_per_server: usize,
     pub max_streams_per_server: usize,
@@ -23,6 +26,7 @@ impl RelayState {
         Self {
             servers: DashMap::new(),
             tokens: DashMap::new(),
+            licences: crate::licence::Licences::depuis_environnement(),
             max_servers: 100,
             max_clients_per_server: 10,
             max_streams_per_server: 5,
@@ -133,6 +137,9 @@ mod tests {
         RelayState {
             servers: DashMap::new(),
             tokens: DashMap::new(),
+            // Sans jeton de service, `verifier` laisse passer : ces tests
+            // portent sur les regles d'enregistrement, pas sur la licence.
+            licences: crate::licence::Licences::depuis_environnement(),
             max_servers,
             max_clients_per_server: 10,
             max_streams_per_server: 5,
