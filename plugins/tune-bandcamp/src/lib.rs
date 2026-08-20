@@ -358,6 +358,10 @@ struct DiscoverQuery {
     sort: String,
     #[serde(default)]
     page: u32,
+    /// Sous-genre facultatif (`post-rock`, `math-rock`…). Absent, on explore
+    /// le genre entier — c'est le comportement d'avant, inchangé.
+    #[serde(default)]
+    subgenre: Option<String>,
 }
 
 fn default_tag() -> String {
@@ -375,7 +379,14 @@ fn default_sort() -> String {
 /// manquait deux, et Bandcamp répondait `{"error":true,"error_message":
 /// "missing key p"}` avec un HTTP 200 — d'où une panne qu'aucun code de statut
 /// ne signalait.
-async fn decouvrir(tag: &str, sort: &str, page: u32) -> axum::response::Response {
+/// `t` porte le **sous-genre** (`post-rock`, `math-rock`…). Vide, il équivaut à
+/// son absence : Bandcamp rend alors le genre entier, exactement comme avant.
+async fn decouvrir(
+    tag: &str,
+    sort: &str,
+    page: u32,
+    subgenre: Option<&str>,
+) -> axum::response::Response {
     let client = tune_core::http::client::shared();
     let resp = client
         .get(BC_DISCOVER_API)
@@ -385,6 +396,7 @@ async fn decouvrir(tag: &str, sort: &str, page: u32) -> axum::response::Response
             ("p", &page.to_string()),
             ("gn", "0"),
             ("f", "all"),
+            ("t", subgenre.unwrap_or_default()),
         ])
         .send()
         .await;
@@ -407,6 +419,7 @@ async fn decouvrir(tag: &str, sort: &str, page: u32) -> axum::response::Response
     let items = normaliser_decouverte(&brut);
     Json(json!({
         "tag": tag,
+        "sous_genre": subgenre,
         "sort": sort,
         "page": page,
         "items": items,
@@ -417,7 +430,7 @@ async fn decouvrir(tag: &str, sort: &str, page: u32) -> axum::response::Response
 }
 
 async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
-    decouvrir(&q.tag, &q.sort, q.page).await
+    decouvrir(&q.tag, &q.sort, q.page, q.subgenre.as_deref()).await
 }
 
 /// Qualité **unique** que Bandcamp sert sans session. Reprise telle quelle
@@ -681,16 +694,161 @@ async fn bc_artiste_par_url(Query(q): Query<ArtistQuery>) -> impl IntoResponse {
     .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Genres et sous-genres — lus chez Bandcamp, plus devinés
+// ---------------------------------------------------------------------------
+
+/// La page publique `/discover` embarque son propre état initial dans un
+/// attribut `data-blob`, dont `appData.initialState` porte les 27 genres ET
+/// les 237 sous-genres avec leur genre parent. C'est la seule source publique
+/// qui les donne — l'API `get_web` les consomme sans jamais les énumérer.
+const BC_DISCOVER_PAGE: &str = "https://bandcamp.com/discover";
+
+/// Repli hors ligne : les 27 genres réels de Bandcamp, sans leurs sous-genres.
+///
+/// L'ancienne liste en dur était devinée, et deux de ses entrées — `indie` et
+/// `soul` — **n'existent pas** chez Bandcamp : `indie` y est un sous-genre de
+/// `rock`, et le genre s'appelle `r-b-soul`. Or `get_web` **ignore en silence**
+/// un genre inconnu et renvoie un flux non filtré, sans erreur : `g=indie`,
+/// `g=soul` et un genre inventé rendent tous les trois exactement la même
+/// liste. Ces deux entrées offraient donc à l'utilisateur un genre qui n'en
+/// était pas un, et rien ne le lui disait.
+///
+/// Elle manquait par ailleurs `acoustic`, `alternative`, `devotional` et
+/// `funk`, qui existent bel et bien.
+const BC_GENRES_REPLI: &[&str] = &[
+    "electronic",
+    "rock",
+    "metal",
+    "alternative",
+    "hip-hop-rap",
+    "experimental",
+    "punk",
+    "folk",
+    "pop",
+    "ambient",
+    "soundtrack",
+    "world",
+    "jazz",
+    "acoustic",
+    "funk",
+    "r-b-soul",
+    "devotional",
+    "classical",
+    "reggae",
+    "podcasts",
+    "country",
+    "spoken-word",
+    "comedy",
+    "blues",
+    "kids",
+    "audiobooks",
+    "latin",
+];
+
+/// Catalogue mémorisé, et l'instant où il a été lu. Les genres de Bandcamp ne
+/// bougent pas d'une heure à l'autre : une lecture par jour suffit, et un
+/// échec n'est pas mémorisé — on retentera au prochain appel plutôt que de
+/// servir le repli pendant vingt-quatre heures.
+static CATALOGUE: tokio::sync::Mutex<Option<(std::time::Instant, Value)>> =
+    tokio::sync::Mutex::const_new(None);
+
+const CATALOGUE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Extraire `{genres, subgenres}` du `data-blob` d'une page `/discover`.
+///
+/// Séparé de l'appel réseau pour être testable sans Bandcamp : c'est la partie
+/// qui peut se tromper.
+fn catalogue_depuis_page(html: &str) -> Option<Value> {
+    let debut = html.find("data-blob=\"")? + "data-blob=\"".len();
+    let reste = &html[debut..];
+    let fin = reste.find('"')?;
+    let blob = decoder_entites(&reste[..fin]);
+    let v: Value = serde_json::from_str(&blob).ok()?;
+    let etat = v.get("appData")?.get("initialState")?;
+
+    let sous = etat.get("subgenres").and_then(|s| s.as_array());
+    let genres: Vec<Value> = etat
+        .get("genres")?
+        .as_array()?
+        .iter()
+        .filter_map(|g| {
+            let slug = g.get("slug").and_then(|s| s.as_str())?;
+            let enfants: Vec<Value> = sous
+                .into_iter()
+                .flatten()
+                .filter(|s| s.get("parentSlug").and_then(|p| p.as_str()) == Some(slug))
+                .filter_map(|s| {
+                    Some(json!({
+                        "slug": s.get("slug").and_then(|x| x.as_str())?,
+                        "label": s.get("label").and_then(|x| x.as_str()).unwrap_or_default(),
+                    }))
+                })
+                .collect();
+            Some(json!({
+                "slug": slug,
+                "label": g.get("label").and_then(|s| s.as_str()).unwrap_or(slug),
+                "sous_genres": enfants,
+            }))
+        })
+        .collect();
+
+    if genres.is_empty() {
+        return None;
+    }
+    let tags: Vec<&str> = genres
+        .iter()
+        .filter_map(|g| g.get("slug").and_then(|s| s.as_str()))
+        .collect();
+    Some(json!({ "tags": tags, "genres": genres, "source": "bandcamp" }))
+}
+
+/// Les seules entités qui apparaissent dans un attribut HTML échappé par
+/// Bandcamp. Pas de dépendance pour cinq cas.
+fn decoder_entites(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn catalogue_de_repli() -> Value {
+    let genres: Vec<Value> = BC_GENRES_REPLI
+        .iter()
+        .map(|g| json!({ "slug": g, "label": g, "sous_genres": [] }))
+        .collect();
+    json!({ "tags": BC_GENRES_REPLI, "genres": genres, "source": "repli" })
+}
+
 async fn bc_tags() -> Json<Value> {
-    // Bandcamp's main genre tags (no public API, but these are the well-known ones)
-    Json(json!({
-        "tags": [
-            "electronic", "ambient", "experimental", "hip-hop-rap", "rock", "metal",
-            "punk", "pop", "folk", "jazz", "classical", "soul", "r-b-soul", "world",
-            "soundtrack", "latin", "country", "blues", "reggae", "audiobooks",
-            "podcasts", "kids", "comedy", "spoken-word", "indie",
-        ]
-    }))
+    let mut cache = CATALOGUE.lock().await;
+    if let Some((lu, v)) = cache.as_ref()
+        && lu.elapsed() < CATALOGUE_TTL
+    {
+        return Json(v.clone());
+    }
+
+    let client = tune_core::http::client::shared();
+    let frais = match client.get(BC_DISCOVER_PAGE).send().await {
+        Ok(r) => r
+            .text()
+            .await
+            .ok()
+            .as_deref()
+            .and_then(catalogue_depuis_page),
+        Err(_) => None,
+    };
+
+    match frais {
+        Some(v) => {
+            *cache = Some((std::time::Instant::now(), v.clone()));
+            Json(v)
+        }
+        // Échec non mémorisé : le prochain appel retentera. Mieux vaut 27
+        // genres justes sans sous-genres qu'une page vide.
+        None => Json(catalogue_de_repli()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -699,10 +857,13 @@ struct TagQuery {
     sort: String,
     #[serde(default)]
     page: u32,
+    /// Sous-genre facultatif (`post-rock`, `math-rock`…), transmis tel quel.
+    #[serde(default)]
+    subgenre: Option<String>,
 }
 
 async fn bc_tag_releases(Path(tag): Path<String>, Query(q): Query<TagQuery>) -> impl IntoResponse {
-    decouvrir(&tag, &q.sort, q.page).await
+    decouvrir(&tag, &q.sort, q.page, q.subgenre.as_deref()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,5 +1364,92 @@ mod tests {
         // qu'une structure a moitie devinee.
         assert!(extraire_tralbum("<html><body>rien ici</body></html>").is_none());
         assert!(extraire_tralbum("data-tralbum=\"{ceci n'est pas du json}\"").is_none());
+    }
+
+    /// Un extrait fidèle du `data-blob` de `bandcamp.com/discover` : deux
+    /// genres, trois sous-genres, dont un rattaché à un autre parent — pour
+    /// vérifier que le rattachement se fait par `parentSlug` et pas par ordre.
+    const BLOB: &str = r#"<div id="DiscoverApp" data-blob="{&quot;appData&quot;:{&quot;initialState&quot;:{&quot;genres&quot;:[{&quot;id&quot;:23,&quot;label&quot;:&quot;rock&quot;,&quot;slug&quot;:&quot;rock&quot;},{&quot;id&quot;:10,&quot;label&quot;:&quot;electronic&quot;,&quot;slug&quot;:&quot;electronic&quot;}],&quot;subgenres&quot;:[{&quot;id&quot;:1,&quot;label&quot;:&quot;techno&quot;,&quot;slug&quot;:&quot;techno&quot;,&quot;parentSlug&quot;:&quot;electronic&quot;},{&quot;id&quot;:2,&quot;label&quot;:&quot;post-rock&quot;,&quot;slug&quot;:&quot;post-rock&quot;,&quot;parentSlug&quot;:&quot;rock&quot;},{&quot;id&quot;:3,&quot;label&quot;:&quot;math rock&quot;,&quot;slug&quot;:&quot;math-rock&quot;,&quot;parentSlug&quot;:&quot;rock&quot;}]}}}"></div>"#;
+
+    #[test]
+    fn le_catalogue_rattache_chaque_sous_genre_a_son_parent() {
+        let c = catalogue_depuis_page(BLOB).unwrap();
+        assert_eq!(c["tags"], json!(["rock", "electronic"]));
+        let rock = &c["genres"][0];
+        assert_eq!(rock["slug"], "rock");
+        assert_eq!(rock["sous_genres"][0]["slug"], "post-rock");
+        assert_eq!(rock["sous_genres"][1]["slug"], "math-rock");
+        assert_eq!(rock["sous_genres"][1]["label"], "math rock");
+        assert_eq!(rock["sous_genres"].as_array().unwrap().len(), 2);
+        assert_eq!(c["genres"][1]["sous_genres"][0]["slug"], "techno");
+        assert_eq!(c["source"], "bandcamp");
+    }
+
+    #[test]
+    fn une_page_sans_blob_exploitable_rend_none_plutot_que_de_deviner() {
+        // Même règle que pour `extraire_tralbum` : Bandcamp peut changer sa
+        // page sans préavis, et un None franc bascule sur le repli au lieu de
+        // servir une liste à moitié devinée.
+        assert!(catalogue_depuis_page("<html>rien</html>").is_none());
+        assert!(catalogue_depuis_page("data-blob=\"{pas du json}\"").is_none());
+        // Blob valide mais sans genres : une liste vide n'est pas un catalogue.
+        assert!(
+            catalogue_depuis_page(
+                "data-blob=\"{&quot;appData&quot;:{&quot;initialState&quot;:{&quot;genres&quot;:[]}}}\""
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn le_catalogue_tient_sans_sous_genres() {
+        // `subgenres` absent : les genres restent servis, chacun avec une
+        // liste vide. C'est exactement ce que rendait l'ancienne route.
+        let sans = "data-blob=\"{&quot;appData&quot;:{&quot;initialState&quot;:{&quot;genres&quot;:[{&quot;label&quot;:&quot;jazz&quot;,&quot;slug&quot;:&quot;jazz&quot;}]}}}\"";
+        let c = catalogue_depuis_page(sans).unwrap();
+        assert_eq!(c["genres"][0]["slug"], "jazz");
+        assert_eq!(c["genres"][0]["sous_genres"], json!([]));
+    }
+
+    /// L'ancienne liste en dur proposait `indie` et `soul`, qui ne sont pas des
+    /// genres Bandcamp — et `get_web` ignore un genre inconnu EN SILENCE, en
+    /// rendant un flux non filtré. Vérifié à la main contre l'API : `g=indie`,
+    /// `g=soul` et un genre inventé rendent la même liste, au même ordre.
+    #[test]
+    fn le_repli_ne_propose_aucun_genre_que_bandcamp_ignore() {
+        let c = catalogue_de_repli();
+        let tags: Vec<&str> = c["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+        assert!(!tags.contains(&"indie"), "indie est un sous-genre de rock");
+        assert!(!tags.contains(&"soul"), "le genre s'appelle r-b-soul");
+        assert!(tags.contains(&"r-b-soul"));
+        // Et les quatre genres réels que l'ancienne liste oubliait.
+        for g in ["acoustic", "alternative", "devotional", "funk"] {
+            assert!(tags.contains(&g), "{g} manque au repli");
+        }
+        assert_eq!(tags.len(), 27);
+        assert_eq!(c["source"], "repli");
+    }
+
+    #[test]
+    fn le_repli_annonce_chaque_genre_sans_sous_genre() {
+        // Hors ligne on ne connaît pas les sous-genres : les annoncer vides
+        // laisse le client masquer la rangée, plutôt que de lui faire croire
+        // à un catalogue complet.
+        let c = catalogue_de_repli();
+        for g in c["genres"].as_array().unwrap() {
+            assert_eq!(g["sous_genres"], json!([]));
+        }
+    }
+
+    #[test]
+    fn les_entites_html_de_bandcamp_sont_decodees() {
+        assert_eq!(decoder_entites("&quot;a&quot;"), "\"a\"");
+        assert_eq!(decoder_entites("d&#39;ici"), "d'ici");
+        assert_eq!(decoder_entites("a &lt;b&gt; c"), "a <b> c");
     }
 }
