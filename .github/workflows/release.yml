@@ -11,10 +11,27 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# ─── Pourquoi un plafond sur CHAQUE job ────────────────────────────────────
+#
+# Sans `timeout-minutes`, un job qui se bloque tourne jusqu'au plafond GitHub
+# de SIX HEURES, puis meurt en emportant la release. C'est arrive trois fois
+# en trois jours (0.9.86, 0.9.87, 0.9.88), toujours sur `apt-get` — mais apt
+# n'est qu'un symptome : le trou, c'est qu'aucun job n'etait borne.
+#
+# #1937 a borne LA COMMANDE qui avait echoue. Ces plafonds bornent la CLASSE
+# de panne : un `cargo` qui ne rend pas la main, une notarisation Apple qui
+# pend, un `gh api` sans reponse — tout est desormais coupe en dizaines de
+# minutes, pas en heures. Un plafond ne peut que faire echouer plus TOT ; il
+# ne change aucune logique de build.
+#
+# Les valeurs sont larges (2 a 20x la duree observee le 19/08) : le but n'est
+# pas de serrer au plus juste, c'est d'empecher les six heures.
+
 jobs:
   web-client:
     name: Build Web Client
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,6 +108,7 @@ jobs:
             ext: zip
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 75  # Build ${{ matrix.target }} — 26 min au pire, macOS x86_64
     env:
       ARTIFACT: tune-server-${{ github.ref_name }}-${{ matrix.platform }}
       # Exposé au niveau du job pour être lisible depuis un `if:` d'étape : le
@@ -188,13 +206,20 @@ jobs:
 
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
-        timeout-minutes: 6
+        timeout-minutes: 18
         run: |
-          # Les runners Ubuntu de GitHub ont deux fois bloque cette commande
+          # Les runners Ubuntu de GitHub ont TROIS fois bloque cette commande
           # indefiniment (0.9.86 : 6 h avant que le plafond ne tue le job et
-          # emporte la release ; 0.9.87 : rebelote). apt n'a pas de delai par
-          # defaut et githubstatus ne declare rien : sans garde-fou, une panne
-          # de miroir passagere coute une version entiere.
+          # emporte la release ; 0.9.87 : rebelote ; 0.9.88 : encore). apt n'a
+          # pas de delai par defaut et githubstatus ne declare rien : sans
+          # garde-fou, une panne de miroir passagere coute une version entiere.
+          #
+          # Le plafond de l'etape vaut 18 min et non 6 : trois essais bornes
+          # font au pire 3 x (100 + 200) + 2 x 20 = 940 s, soit 15 min 40. A 6
+          # min, la marche se faisait tuer PENDANT le deuxieme essai — on
+          # payait le cout de la boucle sans jamais en avoir les trois essais,
+          # et le message d'erreur final ci-dessous ne pouvait pas s'afficher.
+          # Mesure du 19/08 sur la 0.9.88 : marche tuee a 6 min 07.
           for essai in 1 2 3; do
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               echo "libasound2-dev installe (essai $essai)"
@@ -242,7 +267,12 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            sudo apt-get install -y --no-install-recommends cmake clang
+            # Meme miroir, meme risque de blocage que « Install ALSA dev » —
+            # et ici l'echec n'est pas fatal, le daemon est optionnel. On borne
+            # donc sans reprise : si apt pend, on passe sans AirPlay 2 plutot
+            # que de retenir la release entiere.
+            timeout 200 sudo apt-get install -y --no-install-recommends cmake clang \
+              || echo "::warning::apt indisponible — airplay-daemon sera absent de cet artefact"
           fi
           if cargo install --git https://github.com/renesenses/airplay2-rs \
                --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
@@ -743,6 +773,7 @@ jobs:
     needs: build
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -811,7 +842,27 @@ jobs:
             echo "MINISIGN_SECRET_KEY not set — skipping release signing"
             exit 0
           fi
-          sudo apt-get update && sudo apt-get install -y minisign
+          # Le pire endroit du workflow pour un blocage apt : tous les binaires
+          # sont construits, les sommes calculees, et la release ne sortirait
+          # jamais.
+          #
+          # On BORNE, mais on n'abandonne pas la signature : `UPDATE_PUBLIC_KEY`
+          # est renseignee dans routes/system/update.rs, donc le client EXIGE
+          # SHA256SUMS.minisig. Une release non signee casserait la mise a jour
+          # automatique de tout le parc — bien pire qu'une release en retard.
+          # Trois essais bornes, puis on echoue en le disant.
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 100 sudo apt-get install -y minisign; then
+              break
+            fi
+            if [ "$essai" -eq 3 ]; then
+              echo "::error::minisign non installable apres 3 essais — SHA256SUMS ne peut pas etre signe, et le client refuserait la mise a jour. Relancer ce job quand le miroir Ubuntu repond."
+              exit 1
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3) — nouvel essai dans 20 s"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
           # minisign needs the 2-line key format (comment + base64). The secret
           # may be stored with or without the leading "untrusted comment:" line,
           # so reconstruct it when absent.
@@ -899,6 +950,7 @@ jobs:
       && needs.build.result == 'success'
       && needs.release.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Publish release — <1 min
     permissions:
       contents: write
     env:
@@ -925,6 +977,7 @@ jobs:
     # or `brew upgrade` would move stable users onto an RC.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Update Homebrew tap — <1 min
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1026,6 +1079,7 @@ jobs:
     # Stable tags only — a pre-release must not update the public download page.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # Update mozaiklabs.fr/download — <1 min
     steps:
       - name: Notify mozaiklabs.fr webhook
         env:
@@ -1058,6 +1112,7 @@ jobs:
     # Stable tags only — un client ne se construit pas sur une pre-release.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Trigger Android build — <1 min
     steps:
       # La CI Android existe déjà dans tune-server-flutter (APK signé +
       # Firebase App Distribution) mais son déclencheur — poser le tag v* —
@@ -1108,6 +1163,7 @@ jobs:
     needs: release
     if: false  # Disabled — forum posts are written manually with better formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Announce on forum — desactive
     steps:
       - uses: actions/checkout@v4
         with:
