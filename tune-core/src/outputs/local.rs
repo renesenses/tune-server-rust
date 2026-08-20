@@ -4365,6 +4365,7 @@ impl OutputTarget for LocalOutput {
                 ended_naturally: true,
                 // A renderer plays at 1x: keep the poller's wall-clock guards.
                 realtime: true,
+                dop_active: self.dop_active.load(Ordering::Relaxed),
             });
         }
 
@@ -4390,6 +4391,10 @@ impl OutputTarget for LocalOutput {
             ended_naturally: self.track_ended_naturally.load(Ordering::Relaxed),
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Détecté sur les octets par `is_dop_pcm`, jamais déduit des
+            // réglages de zone : c'est la seule valeur qui dise si le volume
+            // est réellement épinglé à l'unité en ce moment (#1735).
+            dop_active: self.dop_active.load(Ordering::Relaxed),
         })
     }
 

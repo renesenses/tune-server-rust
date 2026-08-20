@@ -1399,6 +1399,11 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
             obj.insert("resolving".into(), json!(ps.resolving));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
+            // Flux DoP en cours : le curseur de volume ne fait rien, et
+            // l'interface doit le dire (#1735). Détecté sur les octets par la
+            // sortie, pas déduit de `dsd_mode` — celui-ci dit ce qui a été
+            // demandé, pas ce qui part sur le fil.
+            obj.insert("dop_active".into(), json!(ps.dop_active));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
             obj.insert(
@@ -1555,6 +1560,8 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("signal_path".into(), json!(signal_path));
                 // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
                 obj.insert("resolving".into(), json!(ps.resolving));
+                // Voir la note au site jumeau : DoP en cours ⇒ volume inerte.
+                obj.insert("dop_active".into(), json!(ps.dop_active));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
                 obj.insert(
                     "lyrics_offset_ms".into(),
