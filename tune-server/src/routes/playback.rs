@@ -2875,7 +2875,14 @@ pub async fn shuffle_all(
     // with no trace: track 1 played while the STALE queue stayed in the DB,
     // and the natural-end advance then resurrected yesterday's entries
     // (Villerio: album play continued into old Qobuz autoplay leftovers).
-    match queue_repo.set_queue(zone_id, &all_ids) {
+    // `set_queue_retrying` et non `set_queue` : ce site echouait au PREMIER
+    // coup. Les deux ecrivains de la connexion SQLite partagee sont un lot de
+    // scan et une ecriture de file ; le premier tient sa transaction le temps
+    // d'un lot entier, et c'est l'action de l'utilisateur qui perdait —
+    // immediatement ici, alors que le chemin « Lire » s'accordait 2,4 s
+    // (#1997). Une lecture aleatoire lancee pendant un scan vidait donc la
+    // file sans meme attendre.
+    match set_queue_retrying(&queue_repo, zone_id, &all_ids).await {
         Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
         Err(e) => {
             warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
