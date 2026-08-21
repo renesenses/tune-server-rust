@@ -182,6 +182,18 @@ pub fn build_track_from_metadata_opts(
     });
     let album_id = album.as_ref().and_then(|a| a.id);
 
+    // Garder la décision qui vient d'être prise (#1957) : c'est elle qui a
+    // envoyé l'album sous « Various Artists » plus haut. Cette voie est celle
+    // du surveillant de fichiers, où `compilation_override` reconstruit la vue
+    // du dossier depuis la base — donc le drapeau enregistré ici est bien le
+    // même que celui du scan par lots. `mark_compilation` ne fait que lever le
+    // drapeau, jamais le baisser (voir sa documentation).
+    if let Some(aid) = album_id
+        && is_compilation
+    {
+        album_repo.mark_compilation(aid).ok();
+    }
+
     // Propagate date metadata from track tags to the album (COALESCE — only
     // fills in values not already set, so the first track with dates wins).
     if let Some(aid) = album_id {
