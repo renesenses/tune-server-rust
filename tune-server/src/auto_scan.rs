@@ -402,7 +402,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
                 if db.engine() == tune_core::db::engine::Engine::Sqlite {
-                    db.execute("BEGIN IMMEDIATE", &[]).ok();
+                    if db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
+                        // Se nommer : tout `write_tx` concurrent echouera tant
+                        // que ce lot tient la connexion, et sans cette
+                        // etiquette son message n'apprend rien (#1997).
+                        tune_core::db::tx_holder::declarer("scan:auto");
+                    }
                 }
 
                 importer.begin_batch(&batch);
@@ -504,6 +509,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 if db.engine() == tune_core::db::engine::Engine::Sqlite {
                     db.execute("COMMIT", &[]).ok();
+                    // Liberer meme si le COMMIT a echoue : une etiquette
+                    // perimee accuserait un innocent au prochain incident.
+                    tune_core::db::tx_holder::liberer();
                 }
 
                 // Emit scan progress after each batch (throttled every other
