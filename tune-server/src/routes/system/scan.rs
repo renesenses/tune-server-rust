@@ -724,6 +724,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
                 if !is_pg {
+                    // Se nommer : tout `write_tx` concurrent echouera tant que ce
+                    // lot tient la connexion, et sans cette etiquette son message
+                    // n'apprend rien (#1997).
+                    tune_core::db::tx_holder::declarer("scan:lot");
                     if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
                         // A failed BEGIN means a transaction is already open on
                         // the shared connection (a previous batch that didn't
@@ -885,6 +889,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
 
                 // COMMIT this batch -- tracks + album stats are now queryable
                 if !is_pg {
+                    // Liberer meme si le COMMIT echoue : une etiquette perimee
+                    // accuserait un innocent au prochain incident.
+                    tune_core::db::tx_holder::liberer();
                     if let Err(e) = db.execute_batch("COMMIT") {
                         tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
                         // Don't leave a half-open transaction poisoning the
@@ -1082,6 +1089,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
         if !is_pg {
+            tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
                 tracing::warn!(error = %e, "post_scan_begin_failed");
                 let _ = db.execute_batch("ROLLBACK");
@@ -1231,6 +1239,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         }
         if !is_pg {
+            tune_core::db::tx_holder::liberer();
             if let Err(e) = db.execute_batch("COMMIT") {
                 tracing::warn!(error = %e, "post_scan_commit_failed");
                 let _ = db.execute_batch("ROLLBACK");
