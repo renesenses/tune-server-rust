@@ -344,3 +344,44 @@ jobs:
       # pour verifies sans l'avoir jamais ete.
       - run: cargo test
         working-directory: tune-widget/src-tauri
+
+  ffi:
+    name: FFI mobile (compilation)
+    # `tune-ffi` prend `tune-server` en `default-features = false` : c'est la
+    # SEULE configuration du depot ou la feature `oaat` est absente. Les sept
+    # cibles de release.yml l'activent toutes, `cargo test --workspace` aussi.
+    # Personne ne compilait donc cette combinaison.
+    #
+    # Resultat : b557a96f (reparation des durees MP3, livre en 0.9.93) a insere
+    # sa fonction ENTRE un `#[cfg(feature = "oaat")]` et la fonction que cet
+    # attribut protegeait. L'attribut s'est reporte sur la mauvaise, et
+    # `spawn_mp3_duration_repair` a disparu de toute build sans `oaat`.
+    # Le .so Android n'a plus compile pendant deux versions ; son propre
+    # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
+    # jamais remonte jusqu'ici.
+    #
+    # Un `cargo check` sur l'hote suffit : il reproduit exactement la resolution
+    # de features du build Android, sans NDK ni compilation croisee.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install ALSA dev
+        timeout-minutes: 6
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              echo "libasound2-dev installe (essai $essai)"
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3) — nouvel essai dans 20 s"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+          exit 1
+      - run: cargo check -p tune-ffi --all-targets
