@@ -28,4 +28,5 @@ pub mod streaming_favorites_repo;
 pub mod tag_repo;
 pub mod track_metadata_repo;
 pub mod track_repo;
+pub mod tx_holder;
 pub mod zone_repo;
