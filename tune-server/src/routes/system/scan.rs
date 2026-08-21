@@ -289,6 +289,14 @@ pub(super) struct ScanQuery {
     /// track's album_id points at a wrong same-titled album. Slower (re-reads
     /// every file's metadata); default false keeps the fast incremental scan.
     force: Option<bool>,
+    /// Autorise une purge qui dépasse le plafond volumétrique.
+    ///
+    /// DÉLIBÉRÉMENT distinct de `force`. `force` est le bouton « Scan complet »,
+    /// que l'on clique pour relire ses fichiers — c'est exactement ce que clique
+    /// quelqu'un dont le NAS était hors ligne, pour réparer sa bibliothèque. Y
+    /// accrocher l'autorisation de supprimer en masse recréerait #1943 par la
+    /// porte de service.
+    confirmer_purge: Option<bool>,
     /// Alias for `force` sent by the clients' "Full scan / Scan complet" button.
     /// The web/Flutter clients pass `?full=true`; without this field serde
     /// silently dropped it, so "Scan complet" behaved like an ordinary
@@ -312,6 +320,7 @@ pub(super) async fn trigger_scan(
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
     let force = q.force.unwrap_or(false) || q.full.unwrap_or(false);
+    let confirmer_purge = q.confirmer_purge.unwrap_or(false);
     // Targeted sub-folder scan (empty/blank string = full scan as before).
     let targeted_req: Option<String> = q
         .path
@@ -319,7 +328,7 @@ pub(super) async fn trigger_scan(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| tune_core::scanner::walker::normalize_path(s));
-    spawn_library_scan(state, force, targeted_req).await;
+    spawn_library_scan_avec(state, force, confirmer_purge, targeted_req).await;
     (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
 }
 
@@ -328,6 +337,17 @@ pub(super) async fn trigger_scan(
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
 /// folders stayed invisible until the app was restarted).
 pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
+    spawn_library_scan_avec(state, force, false, targeted_req).await
+}
+
+/// Comme `spawn_library_scan`, mais peut autoriser une purge au-delà du plafond
+/// volumétrique. Voir `ScanQuery::confirmer_purge` : ce n'est PAS `force`.
+pub(crate) async fn spawn_library_scan_avec(
+    state: AppState,
+    force: bool,
+    confirmer_purge: bool,
+    targeted_req: Option<String>,
+) {
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
@@ -936,14 +956,23 @@ pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_re
                     }
                 }
             }
-            if purge_trop_massive(a_supprimer.len(), examinees) {
+            if purge_trop_massive(a_supprimer.len(), examinees) && confirmer_purge {
+                tracing::warn!(
+                    candidats = a_supprimer.len(),
+                    examinees,
+                    "post_scan_purge_massive_confirmee — le plafond est franchi \
+                     explicitement par l'utilisateur."
+                );
+            }
+            if purge_trop_massive(a_supprimer.len(), examinees) && !confirmer_purge {
                 tracing::error!(
                     candidats = a_supprimer.len(),
                     examinees,
                     plafond = PART_MAX_PURGE,
                     "post_scan_purge_refusee_trop_massive — une disparition de cette ampleur est \
                      bien plus souvent un montage absent qu'une suppression réelle. Les pistes \
-                     sont CONSERVÉES ; relancer le scan une fois les montages vérifiés."
+                     sont CONSERVÉES ; vérifier les montages, puis relancer EN CONFIRMANT — \
+                     relancer sans confirmer donnera le même refus."
                 );
                 protected += a_supprimer.len() as i64;
                 a_supprimer.clear();
@@ -1800,6 +1829,44 @@ mod roots_gone_empty_tests {
         assert!(sous_le_dossier("/mnt/music2", "/mnt/music2"));
         // Une barre finale sur la racine ne doit rien changer.
         assert!(sous_le_dossier("/mnt/music2/a.flac", "/mnt/music2/"));
+    }
+
+    /// La porte de sortie du plafond est un drapeau DÉDIÉ, jamais `force`.
+    ///
+    /// `force` est le bouton « Scan complet » : on le clique pour relire ses
+    /// fichiers, et c'est exactement ce que clique quelqu'un dont le NAS était
+    /// hors ligne, pour réparer sa bibliothèque. Y accrocher l'autorisation de
+    /// supprimer en masse recréerait #1943 par la porte de service.
+    ///
+    /// Ce test fige la distinction : si quelqu'un fusionne un jour les deux
+    /// drapeaux par souci de simplicité, il échoue.
+    #[test]
+    fn le_plafond_ne_cede_qu_a_une_confirmation_explicite() {
+        // Les chiffres de Yacine : 21 277 sur 70 346, soit 30 %.
+        let (candidats, examinees) = (21_277usize, 70_346usize);
+        assert!(purge_trop_massive(candidats, examinees));
+
+        let refuse = |confirmer: bool| purge_trop_massive(candidats, examinees) && !confirmer;
+        assert!(
+            refuse(false),
+            "sans confirmation, la purge doit être refusée"
+        );
+        assert!(
+            !refuse(true),
+            "avec confirmation explicite, elle doit passer"
+        );
+    }
+
+    /// La confirmation ne doit pas devenir un passage obligé du scan ordinaire :
+    /// sous le plafond, elle ne change rien.
+    #[test]
+    fn sous_le_plafond_la_confirmation_ne_change_rien() {
+        for confirmer in [false, true] {
+            assert!(
+                !(purge_trop_massive(50, 70_346) && !confirmer),
+                "50 pistes sur 70 346 passent, confirmer={confirmer}"
+            );
+        }
     }
 
     /// Sous Windows, `tracks.file_path` contient des ANTISLASHS. Avec un `/`
