@@ -1464,6 +1464,7 @@ mod tests {
             release_date: None,
             original_date: None,
             added_at: None,
+            is_compilation: false,
         }
     }
 
