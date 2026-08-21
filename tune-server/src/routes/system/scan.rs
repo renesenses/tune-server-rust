@@ -67,6 +67,24 @@ pub(crate) fn scan_cancel_requested() -> bool {
 /// centaines. 100 sépare les deux sans ambiguïté.
 pub(crate) const SEUIL_SOUS_ARBRE_VIDE: usize = 100;
 
+/// Dossier parent d'un chemin, quel que soit le séparateur.
+///
+/// Remonter avec `rfind('/')` seul ne trouve RIEN dans
+/// `G:\Musique\Jazz\a.flac` : sous Windows la remontée des parents ne
+/// s'exécutait jamais, donc `sous_arbres_vides` rendait TOUJOURS une liste
+/// vide et le garde-fou du montage imbriqué (#1943) était décoratif sur cette
+/// plateforme. Même famille que #1652/#1943 : un séparateur codé en dur qui
+/// neutralise une protection en silence.
+///
+/// `None` en haut de l'arborescence : `/a.flac` n'a pas de parent nommé, et
+/// `G:` n'en a pas non plus.
+fn dossier_parent(chemin: &str) -> Option<&str> {
+    match chemin.rfind(['/', '\\']) {
+        Some(0) | None => None,
+        Some(i) => Some(&chemin[..i]),
+    }
+}
+
 /// Sous-arbres devenus vides d'un coup, sous une racine qui répond encore.
 ///
 /// Pour chaque piste absente du disque, on remonte ses dossiers parents. Un
@@ -86,11 +104,8 @@ pub(crate) fn sous_arbres_vides(
     let mut vivants: HashSet<&str> = HashSet::new();
     for p in decouverts {
         let mut cur = p.as_str();
-        while let Some(i) = cur.rfind('/') {
-            if i == 0 {
-                break;
-            }
-            cur = &cur[..i];
+        while let Some(parent) = dossier_parent(cur) {
+            cur = parent;
             if !vivants.insert(cur) {
                 break; // déjà marqué : ses ancêtres le sont aussi.
             }
@@ -104,11 +119,8 @@ pub(crate) fn sous_arbres_vides(
             continue;
         }
         let mut cur = *p;
-        while let Some(i) = cur.rfind('/') {
-            if i == 0 {
-                break;
-            }
-            cur = &cur[..i];
+        while let Some(parent) = dossier_parent(cur) {
+            cur = parent;
             *perdues.entry(cur).or_insert(0) += 1;
         }
     }
@@ -244,6 +256,41 @@ pub(crate) fn purge_trop_massive(candidats: usize, total: usize) -> bool {
     (candidats as f64) / (total as f64) > PART_MAX_PURGE
 }
 
+/// Le plafond doit-il refuser cette purge ?
+///
+/// Le plafond seul était une IMPASSE : au-delà de 20 % il refusait, et le
+/// refus se rejouait à l'identique à chaque scan. Le message envoyait pourtant
+/// l'utilisateur « relancer le scan une fois les montages vérifiés » — un
+/// geste qui ne pouvait pas aboutir, puisque relancer ne change rien au
+/// pourcentage. Quelqu'un qui a VRAIMENT effacé un tiers de ses fichiers
+/// n'avait aucun moyen de le dire.
+///
+/// `confirmee` est le nombre de pistes que l'utilisateur a explicitement
+/// accepté de perdre (`?confirm_purge=N` sur `/scan`). Trois propriétés :
+///
+/// 1. **Explicite** : on confirme un NOMBRE, pas un « oui ». Le refus publie
+///    ce nombre (log et `scan_result`), donc le geste demandé est exact.
+/// 2. **Non rejouable par accident** : une URL confirmant 21 277 pistes
+///    n'autorise pas une purge ultérieure de 40 000. Un `?confirm_purge`
+///    oublié dans un signet ne peut pas emporter une bibliothèque entière —
+///    il ne couvre que l'ampleur déjà constatée.
+/// 3. **Jamais une nouvelle impasse** : le compte peut avoir bougé entre le
+///    refus et la confirmation (une piste réapparaît, une autre est ajoutée).
+///    On honore donc la confirmation tant qu'on ne retire pas PLUS que ce qui
+///    a été autorisé — exiger l'égalité stricte recréerait l'impasse qu'on
+///    corrige ici.
+///
+/// Ce drapeau ne lève QUE le plafond volumétrique. Les protections de
+/// `verdict_purge` — racine absente, illisible, vidée (#1652), sous-arbre
+/// vidé (#1943) — s'appliquent AVANT et ne sont pas concernées : les pistes
+/// qu'elles couvrent ne sont jamais dans `candidats`.
+pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u64>) -> bool {
+    if !purge_trop_massive(candidats, total) {
+        return false;
+    }
+    !matches!(confirmee, Some(autorise) if candidats as u64 <= autorise)
+}
+
 /// Pre-scan skip decision: does `path` need (re)scanning, or is it unchanged
 /// since the last scan and safe to skip?
 ///
@@ -289,14 +336,6 @@ pub(super) struct ScanQuery {
     /// track's album_id points at a wrong same-titled album. Slower (re-reads
     /// every file's metadata); default false keeps the fast incremental scan.
     force: Option<bool>,
-    /// Autorise une purge qui dépasse le plafond volumétrique.
-    ///
-    /// DÉLIBÉRÉMENT distinct de `force`. `force` est le bouton « Scan complet »,
-    /// que l'on clique pour relire ses fichiers — c'est exactement ce que clique
-    /// quelqu'un dont le NAS était hors ligne, pour réparer sa bibliothèque. Y
-    /// accrocher l'autorisation de supprimer en masse recréerait #1943 par la
-    /// porte de service.
-    confirmer_purge: Option<bool>,
     /// Alias for `force` sent by the clients' "Full scan / Scan complet" button.
     /// The web/Flutter clients pass `?full=true`; without this field serde
     /// silently dropped it, so "Scan complet" behaved like an ordinary
@@ -304,6 +343,18 @@ pub(super) struct ScanQuery {
     /// a rescan then skipped every unchanged file, so only "Vider la
     /// bibliothèque" + cold scan repaired the DB (Yacine, Synology ARM64).
     full: Option<bool>,
+    /// Nombre de pistes que l'utilisateur autorise explicitement la purge à
+    /// retirer, malgré le plafond volumétrique (`?confirm_purge=21277`).
+    ///
+    /// DÉLIBÉRÉMENT distinct de `force`/`full`. `force` est le bouton « Scan
+    /// complet », que l'on clique pour relire ses fichiers — c'est exactement
+    /// ce que clique quelqu'un dont le NAS était hors ligne, pour réparer sa
+    /// bibliothèque. Y accrocher l'autorisation de supprimer en masse
+    /// recréerait #1943 par la porte de service.
+    ///
+    /// C'est un NOMBRE et non un booléen : voir `purge_refusee`. Confirmer une
+    /// ampleur constatée, ce n'est pas signer un blanc-seing permanent.
+    confirm_purge: Option<u64>,
     /// Targeted scan: when set, only this sub-directory is walked instead of
     /// re-walking every configured music dir. On a network mount (SMB/NFS) the
     /// live `notify` watcher receives no events, so the only way to pick up a
@@ -320,7 +371,6 @@ pub(super) async fn trigger_scan(
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
     let force = q.force.unwrap_or(false) || q.full.unwrap_or(false);
-    let confirmer_purge = q.confirmer_purge.unwrap_or(false);
     // Targeted sub-folder scan (empty/blank string = full scan as before).
     let targeted_req: Option<String> = q
         .path
@@ -328,7 +378,7 @@ pub(super) async fn trigger_scan(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| tune_core::scanner::walker::normalize_path(s));
-    spawn_library_scan_avec(state, force, confirmer_purge, targeted_req).await;
+    spawn_library_scan_confirmee(state, force, q.confirm_purge, targeted_req).await;
     (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
 }
 
@@ -336,16 +386,23 @@ pub(super) async fn trigger_scan(
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
 /// folders stayed invisible until the app was restarted).
+///
+/// Cette signature ne peut PAS exprimer de confirmation de purge, et c'est
+/// volontaire : ses appelants (ajout d'un dossier, import, réglages) sont des
+/// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
+/// une suppression de masse. Seul `trigger_scan`, qui porte une intention
+/// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
 pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
-    spawn_library_scan_avec(state, force, false, targeted_req).await
+    spawn_library_scan_confirmee(state, force, None, targeted_req).await
 }
 
-/// Comme `spawn_library_scan`, mais peut autoriser une purge au-delà du plafond
-/// volumétrique. Voir `ScanQuery::confirmer_purge` : ce n'est PAS `force`.
-pub(crate) async fn spawn_library_scan_avec(
+/// Comme `spawn_library_scan`, mais peut lever le plafond volumétrique à
+/// hauteur de ce que l'utilisateur a explicitement confirmé. Voir
+/// `purge_refusee` : ce n'est PAS `force`.
+pub(crate) async fn spawn_library_scan_confirmee(
     state: AppState,
     force: bool,
-    confirmer_purge: bool,
+    purge_confirmee: Option<u64>,
     targeted_req: Option<String>,
 ) {
     if force {
@@ -893,6 +950,9 @@ pub(crate) async fn spawn_library_scan_avec(
         let mut sous_arbres_proteges: Vec<String> = Vec::new();
         let mut pistes_hors_perimetre = 0i64;
         let mut pistes_protegees = 0i64;
+        // > 0 quand le plafond a refusé : c'est le nombre à renvoyer dans
+        // `?confirm_purge=` pour sortir de l'impasse. 0 = aucun refus.
+        let mut purge_refusee_candidats = 0i64;
         if SCAN_CANCEL.load(Ordering::SeqCst) {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
@@ -956,26 +1016,34 @@ pub(crate) async fn spawn_library_scan_avec(
                     }
                 }
             }
-            if purge_trop_massive(a_supprimer.len(), examinees) && confirmer_purge {
-                tracing::warn!(
-                    candidats = a_supprimer.len(),
-                    examinees,
-                    "post_scan_purge_massive_confirmee — le plafond est franchi \
-                     explicitement par l'utilisateur."
-                );
-            }
-            if purge_trop_massive(a_supprimer.len(), examinees) && !confirmer_purge {
+            if purge_refusee(a_supprimer.len(), examinees, purge_confirmee) {
+                // Le nombre exact est publié — log ET `scan_result` — parce
+                // que c'est lui qu'il faut renvoyer pour confirmer. Un refus
+                // qui ne dit pas quoi faire est l'impasse qu'on corrige.
+                purge_refusee_candidats = a_supprimer.len() as i64;
                 tracing::error!(
                     candidats = a_supprimer.len(),
                     examinees,
                     plafond = PART_MAX_PURGE,
+                    confirmee = ?purge_confirmee,
                     "post_scan_purge_refusee_trop_massive — une disparition de cette ampleur est \
                      bien plus souvent un montage absent qu'une suppression réelle. Les pistes \
-                     sont CONSERVÉES ; vérifier les montages, puis relancer EN CONFIRMANT — \
-                     relancer sans confirmer donnera le même refus."
+                     sont CONSERVÉES. Vérifier les montages puis relancer un scan : si tout est \
+                     revenu, il n'y aura plus rien à retirer. Si ces pistes ont VRAIMENT été \
+                     supprimées, relancer avec `?confirm_purge={}` — relancer sans ce paramètre \
+                     donnera exactement le même refus.",
+                    a_supprimer.len()
                 );
                 protected += a_supprimer.len() as i64;
                 a_supprimer.clear();
+            } else if purge_trop_massive(a_supprimer.len(), examinees) {
+                tracing::warn!(
+                    candidats = a_supprimer.len(),
+                    examinees,
+                    confirmee = ?purge_confirmee,
+                    "post_scan_purge_massive_confirmee — le plafond est franchi sur confirmation \
+                     explicite de l'utilisateur."
+                );
             }
             for track_id in a_supprimer {
                 if track_repo.delete(track_id).is_ok() {
@@ -1315,15 +1383,21 @@ pub(crate) async fn spawn_library_scan_avec(
                     "missing_dirs": missing_dirs.clone(),
                     "missing_dir_reasons": missing_dir_reasons.clone(),
                     "error_dirs": error_dirs.clone(),
-            "emptied_roots": racines_videes.clone(),
-            "protected_subtrees": sous_arbres_proteges.clone(),
-            "tracks_protected": pistes_protegees,
-            "tracks_out_of_scope": pistes_hors_perimetre,
                     // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi.
+                    // (Ces quatre clés étaient écrites DEUX fois — deux
+                    // sessions ont ajouté le même bloc ; `json!` gardait
+                    // silencieusement la dernière.)
                     "emptied_roots": racines_videes.clone(),
                     "protected_subtrees": sous_arbres_proteges.clone(),
                     "tracks_protected": pistes_protegees,
                     "tracks_out_of_scope": pistes_hors_perimetre,
+                    // Le plafond volumétrique a-t-il refusé, et sur quel
+                    // nombre ? C'est ce nombre qu'il faut renvoyer dans
+                    // `?confirm_purge=` pour autoriser la purge. 0 = pas de
+                    // refus. Sans ça, le refus n'existe que dans les logs :
+                    // l'utilisateur ne peut pas connaître le geste à faire.
+                    "purge_refused": purge_refusee_candidats > 0,
+                    "purge_refused_candidates": purge_refusee_candidats,
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
@@ -1710,7 +1784,7 @@ pub(super) async fn artist_split_preview(State(state): State<AppState>) -> Json<
 #[cfg(test)]
 mod roots_gone_empty_tests {
     use super::{
-        PART_MAX_PURGE, VerdictPurge, purge_trop_massive, roots_gone_empty, sous_arbres_vides,
+        VerdictPurge, purge_refusee, purge_trop_massive, roots_gone_empty, sous_arbres_vides,
         sous_le_dossier, verdict_purge,
     };
     use std::collections::HashSet;
@@ -1845,28 +1919,16 @@ mod roots_gone_empty_tests {
         // Les chiffres de Yacine : 21 277 sur 70 346, soit 30 %.
         let (candidats, examinees) = (21_277usize, 70_346usize);
         assert!(purge_trop_massive(candidats, examinees));
-
-        let refuse = |confirmer: bool| purge_trop_massive(candidats, examinees) && !confirmer;
+        // On interroge `purge_refusee` — la fonction de PRODUCTION. Rejouer la
+        // règle dans une closure locale ne prouverait que la closure.
         assert!(
-            refuse(false),
+            purge_refusee(candidats, examinees, None),
             "sans confirmation, la purge doit être refusée"
         );
         assert!(
-            !refuse(true),
-            "avec confirmation explicite, elle doit passer"
+            !purge_refusee(candidats, examinees, Some(candidats as u64)),
+            "avec confirmation explicite du nombre annoncé, elle doit passer"
         );
-    }
-
-    /// La confirmation ne doit pas devenir un passage obligé du scan ordinaire :
-    /// sous le plafond, elle ne change rien.
-    #[test]
-    fn sous_le_plafond_la_confirmation_ne_change_rien() {
-        for confirmer in [false, true] {
-            assert!(
-                !(purge_trop_massive(50, 70_346) && !confirmer),
-                "50 pistes sur 70 346 passent, confirmer={confirmer}"
-            );
-        }
     }
 
     /// Sous Windows, `tracks.file_path` contient des ANTISLASHS. Avec un `/`
@@ -1944,6 +2006,215 @@ mod roots_gone_empty_tests {
         assert!(roots_gone_empty(&racines, &avait, &trouve).is_empty());
         // Une racine qui n'avait rien n'a rien à perdre.
         assert!(roots_gone_empty(&racines, &[], &rien).is_empty());
+    }
+
+    // ── Cohabitation : garde-fous de chemin ET plafond volumétrique ───────
+    //
+    // Deux correctifs de #1943 sont arrivés par deux chemins différents :
+    // le séparateur Windows qui neutralisait les gardes-fous par dossier
+    // (#1652/#1943), et le plafond de 20 % qui refusait sans jamais offrir de
+    // sortie. Les tester séparément ne dit RIEN de ce qui se passe quand ils
+    // s'appliquent au même scan. Ce bloc rejoue la décision complète.
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Purge {
+        supprimees: usize,
+        protegees: usize,
+        hors_perimetre: usize,
+        /// Le plafond a refusé et rendu la main à l'utilisateur.
+        refusee: bool,
+    }
+
+    /// Rejoue la décision de purge de bout en bout, dans l'ORDRE de
+    /// production (`spawn_library_scan_confirmee`) : racines vidées →
+    /// sous-arbres vidés → verdict par piste → plafond volumétrique.
+    fn purge_simulee(
+        racines: &[&str],
+        en_base: &[String],
+        decouvertes: &[String],
+        confirmee: Option<u64>,
+    ) -> Purge {
+        use std::collections::HashSet;
+        let racines: Vec<String> = racines.iter().map(|s| s.to_string()).collect();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let trouvees: HashSet<String> = decouvertes.iter().cloned().collect();
+
+        let racines_videes = roots_gone_empty(&racines, &refs, &trouvees);
+        let sous_arbres = sous_arbres_vides(&refs, &trouvees);
+
+        let (mut candidats, mut protegees, mut hors_perimetre) = (0usize, 0usize, 0usize);
+        let examinees = en_base.len();
+        for p in &refs {
+            if trouvees.contains(*p) {
+                continue;
+            }
+            match verdict_purge(p, &racines, &[], &[], &racines_videes, &sous_arbres) {
+                VerdictPurge::ProtegeIllisible => protegees += 1,
+                VerdictPurge::HorsPerimetre => hors_perimetre += 1,
+                VerdictPurge::Supprimer => candidats += 1,
+            }
+        }
+        if purge_refusee(candidats, examinees, confirmee) {
+            return Purge {
+                supprimees: 0,
+                protegees: protegees + candidats,
+                hors_perimetre,
+                refusee: true,
+            };
+        }
+        Purge {
+            supprimees: candidats,
+            protegees,
+            hors_perimetre,
+            refusee: false,
+        }
+    }
+
+    fn pistes(prefixe: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefixe}{i}.flac")).collect()
+    }
+
+    /// LE test de cohabitation, côté garde-fou de chemin.
+    ///
+    /// NAS Windows hors ligne : la racine répond, vide. `roots_gone_empty`
+    /// doit la voir (il ne la voyait pas avant `1ecdeb5a` : le `/` codé en
+    /// dur), et cette protection doit tenir **même quand l'utilisateur
+    /// confirme une purge de masse**. La confirmation ne lève QUE le plafond
+    /// volumétrique ; elle n'a jamais le droit de passer par-dessus un
+    /// montage absent — c'est précisément ce qui a coûté 21 277 pistes.
+    #[test]
+    fn windows_nas_hors_ligne_la_confirmation_ne_perce_pas_le_garde_fou() {
+        let en_base = pistes(r"G:\Musique\album\t", 500);
+        for confirmee in [None, Some(0), Some(500), Some(u64::MAX)] {
+            let p = purge_simulee(&[r"G:\Musique"], &en_base, &[], confirmee);
+            assert_eq!(
+                p,
+                Purge {
+                    supprimees: 0,
+                    protegees: 500,
+                    hors_perimetre: 0,
+                    refusee: false,
+                },
+                "racine Windows vidée, confirmee={confirmee:?} : les pistes doivent être \
+                 CONSERVÉES par le garde-fou de racine, pas par le plafond"
+            );
+        }
+    }
+
+    /// Même exigence pour le montage IMBRIQUÉ qui tombe : la racine répond
+    /// encore, seul le sous-arbre a disparu. `sous_arbres_vides` remontait
+    /// les parents avec `rfind('/')` seul — donc ne trouvait aucun parent
+    /// dans `G:\...` et rendait TOUJOURS une liste vide sous Windows.
+    #[test]
+    fn windows_montage_imbrique_tombe_la_confirmation_ne_perce_pas_non_plus() {
+        let mut en_base = pistes(r"G:\Musique\Jazz\t", 150);
+        en_base.extend(pistes(r"G:\Musique\Rock\t", 400));
+        let decouvertes = pistes(r"G:\Musique\Rock\t", 400);
+
+        for confirmee in [None, Some(u64::MAX)] {
+            let p = purge_simulee(&[r"G:\Musique"], &en_base, &decouvertes, confirmee);
+            assert_eq!(
+                p,
+                Purge {
+                    supprimees: 0,
+                    protegees: 150,
+                    hors_perimetre: 0,
+                    refusee: false,
+                },
+                "sous-arbre Windows vidé, confirmee={confirmee:?} : CONSERVÉES"
+            );
+        }
+    }
+
+    /// LE test de cohabitation, côté plafond : il ne doit plus être une
+    /// IMPASSE.
+    ///
+    /// Ici les montages vont bien — la racine répond, aucun sous-arbre n'est
+    /// tombé — et l'utilisateur a réellement supprimé 30 % de ses fichiers.
+    /// Sans confirmation le plafond refuse (bon réflexe). Mais relancer sans
+    /// rien changer donnait le MÊME refus, indéfiniment, alors que le message
+    /// promettait que relancer suffirait. Avec la confirmation explicite du
+    /// nombre annoncé, la purge aboutit enfin.
+    #[test]
+    fn le_plafond_n_est_plus_une_impasse() {
+        let en_base = pistes(r"G:\Musique\album\t", 1000);
+        let decouvertes = pistes(r"G:\Musique\album\t", 700);
+
+        // Relancer, encore et encore, sans confirmer : toujours le même refus.
+        for _ in 0..3 {
+            let p = purge_simulee(&[r"G:\Musique"], &en_base, &decouvertes, None);
+            assert!(p.refusee, "sans confirmation, le plafond doit refuser");
+            assert_eq!(p.supprimees, 0);
+            assert_eq!(p.protegees, 300, "les 300 pistes restent en base");
+        }
+
+        // La sortie : confirmer le nombre que le refus a annoncé.
+        let p = purge_simulee(&[r"G:\Musique"], &en_base, &decouvertes, Some(300));
+        assert!(
+            !p.refusee,
+            "confirmation explicite du nombre annoncé : la purge doit aboutir"
+        );
+        assert_eq!(p.supprimees, 300);
+    }
+
+    /// La confirmation est bornée par l'ampleur constatée : elle n'est pas un
+    /// blanc-seing rejouable. Une URL qui confirmait 300 pistes ne doit pas
+    /// autoriser, plus tard, l'effacement de toute la bibliothèque.
+    #[test]
+    fn une_confirmation_perimee_n_autorise_pas_une_purge_plus_grande() {
+        let en_base = pistes(r"G:\Musique\album\t", 1000);
+        // Le NAS retombe : cette fois 900 pistes manquent, pas 300.
+        let decouvertes = pistes(r"G:\Musique\album\t", 100);
+        let p = purge_simulee(&[r"G:\Musique"], &en_base, &decouvertes, Some(300));
+        assert!(
+            p.refusee,
+            "une confirmation de 300 ne couvre pas une purge de 900"
+        );
+        assert_eq!(p.supprimees, 0);
+    }
+
+    /// …et pas non plus une NOUVELLE impasse : entre le refus et la
+    /// confirmation, le compte peut avoir bougé à la baisse (une piste
+    /// réapparaît). Exiger l'égalité stricte rejouerait le défaut corrigé.
+    #[test]
+    fn la_confirmation_tolere_une_derive_a_la_baisse() {
+        let en_base = pistes(r"G:\Musique\album\t", 1000);
+        let decouvertes = pistes(r"G:\Musique\album\t", 701); // 299 manquantes
+        let p = purge_simulee(&[r"G:\Musique"], &en_base, &decouvertes, Some(300));
+        assert!(!p.refusee, "299 ≤ 300 : la confirmation reste valable");
+        assert_eq!(p.supprimees, 299);
+    }
+
+    /// La porte de sortie du plafond est un paramètre DÉDIÉ, jamais `force`.
+    ///
+    /// `force`/`full` est le bouton « Scan complet » : on le clique pour
+    /// relire ses fichiers, et c'est exactement ce que clique quelqu'un dont
+    /// le NAS était hors ligne, pour réparer sa bibliothèque. Y accrocher
+    /// l'autorisation de supprimer en masse recréerait #1943 par la porte de
+    /// service. Ce test fige la distinction : si quelqu'un fusionne un jour
+    /// les deux drapeaux par souci de simplicité, il échoue.
+    #[test]
+    fn scan_complet_ne_vaut_pas_confirmation_de_purge() {
+        let q: super::ScanQuery =
+            serde_json::from_value(serde_json::json!({ "force": true, "full": true })).unwrap();
+        assert_eq!(
+            q.confirm_purge, None,
+            "« Scan complet » ne doit JAMAIS confirmer une purge"
+        );
+        // Et sans confirmation, le plafond refuse — quel que soit `force`.
+        assert!(purge_refusee(300, 1000, q.confirm_purge));
+    }
+
+    /// Sous le plafond, la confirmation ne change rien : elle ne doit pas
+    /// devenir un passage obligé du scan ordinaire.
+    #[test]
+    fn sous_le_plafond_la_confirmation_ne_change_rien() {
+        for confirmee in [None, Some(0), Some(50)] {
+            assert!(
+                !purge_refusee(50, 70_346, confirmee),
+                "50 pistes sur 70 346 passent, confirmee={confirmee:?}"
+            );
+        }
     }
 
     #[test]
