@@ -164,7 +164,11 @@ mod tests {
             drop(sock);
         });
 
-        let err = reqwest::Client::new()
+        // Client partage, y compris ici : le garde-fou de `http_client_seam`
+        // interdit d'en construire un a la main, meme dans un test. Un client
+        // nu utilise le verificateur TLS de plateforme, que la build FFI
+        // Android n'initialise pas.
+        let err = crate::http::client::shared()
             .post(format!("http://127.0.0.1:{port}/upnp/control"))
             .body("<s:Envelope/>")
             .send()
