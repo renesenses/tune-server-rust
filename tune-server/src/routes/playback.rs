@@ -1397,6 +1397,48 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
     Json(json!({ "status": "playing", "queue_position": next_pos })).into_response()
 }
 
+/// Dernier « précédent » ayant relancé la piste au lieu de reculer, par zone.
+///
+/// Sans cette mémoire, « précédent » n'est qu'une fonction de la position
+/// rapportée — et cette position ment pendant quelques secondes après un seek :
+/// le poller cesse de l'écraser (`SEEK_GRACE_SECS`), les sorties réseau la
+/// rendent en retard, et le tampon d'un renderer DLNA fait le reste.
+///
+/// L'utilisateur, lui, ne raisonne pas en millisecondes : il appuie deux fois
+/// pour remonter d'une piste. Fabien l'a fait, et Tune lui a redonné deux fois
+/// le début du même morceau (#1929).
+static DERNIER_REDEMARRAGE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Fenêtre pendant laquelle un second « précédent » recule au lieu de relancer.
+///
+/// Assez longue pour couvrir une hésitation humaine et le retard des sorties
+/// réseau ; assez courte pour qu'un appui isolé une minute plus tard relance
+/// bien la piste, comme attendu.
+const FENETRE_DOUBLE_PRECEDENT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Seuil au-delà duquel un « précédent » isolé relance la piste au lieu de
+/// reculer. Convention partagée par tous les lecteurs.
+const SEUIL_RELANCE_MS: i64 = 3000;
+
+/// « Précédent » doit-il RELANCER la piste, ou reculer d'une piste ?
+///
+/// Sortie en fonction pure pour être éprouvée : la version d'origine ne
+/// regardait que la position, et cette position ment pendant plusieurs
+/// secondes après un seek — la grâce du poller cesse de l'écraser, les sorties
+/// réseau la rendent en retard, le tampon d'un renderer DLNA fait le reste.
+///
+/// Fabien a appuyé deux fois pour remonter d'une piste ; Tune lui a redonné
+/// deux fois le début du même morceau (#1929). L'utilisateur ne raisonne pas
+/// en millisecondes.
+pub(crate) fn precedent_doit_relancer(position_ms: i64, vient_de_redemarrer: bool) -> bool {
+    // `i64` et non `u64` : c'est le type que `get_state` rend. Une position
+    // negative n'a pas de sens mais reste representable ; la comparaison la
+    // traite comme un debut de piste, donc on recule — le comportement sur.
+    position_ms > SEUIL_RELANCE_MS && !vient_de_redemarrer
+}
+
 async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
@@ -1404,12 +1446,30 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
     }
     let current = state.playback.get_state(zone_id).await;
 
-    if current.position_ms > 3000 {
+    // Un second appui rapproché veut dire « recule », quoi que dise la
+    // position. On consomme la marque : un troisième appui relancera de
+    // nouveau, et l'utilisateur retrouve un comportement prévisible.
+    let vient_de_redemarrer = {
+        let mut m = DERNIER_REDEMARRAGE.lock().unwrap();
+        match m.get(&zone_id) {
+            Some(t) if t.elapsed() < FENETRE_DOUBLE_PRECEDENT => {
+                m.remove(&zone_id);
+                true
+            }
+            _ => false,
+        }
+    };
+
+    if precedent_doit_relancer(current.position_ms, vient_de_redemarrer) {
         let device_id = get_zone_device_id(&state, zone_id);
         state
             .orchestrator
             .seek(zone_id, 0, device_id.as_deref())
             .await;
+        DERNIER_REDEMARRAGE
+            .lock()
+            .unwrap()
+            .insert(zone_id, std::time::Instant::now());
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
@@ -2861,7 +2921,49 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
 mod tests {
     use super::client_title_is_usable;
     use super::play_error_response;
+    use super::precedent_doit_relancer;
     use axum::http::StatusCode;
+
+    // ── « Précédent » : relancer ou reculer (#1929) ───────────────────────
+
+    #[test]
+    fn un_appui_isole_en_cours_de_piste_relance() {
+        // Convention de tous les lecteurs : au milieu d'un morceau, « précédent »
+        // le reprend au début. Sans ça, impossible de réécouter une piste.
+        assert!(precedent_doit_relancer(45_000, false));
+    }
+
+    #[test]
+    fn un_appui_isole_au_tout_debut_recule() {
+        // Juste après le démarrage, l'intention est de remonter.
+        assert!(!precedent_doit_relancer(800, false));
+    }
+
+    #[test]
+    fn un_second_appui_recule_meme_si_la_position_dit_le_contraire() {
+        // LE cas de Fabien. Après le premier appui, la position rapportée peut
+        // rester haute plusieurs secondes : la grâce du poller cesse de
+        // l'écraser, une sortie réseau la rend en retard, un renderer DLNA
+        // tamponne. Sans la mémoire du redémarrage, le second appui relançait
+        // une deuxième fois le même morceau.
+        assert!(!precedent_doit_relancer(45_000, true));
+    }
+
+    #[test]
+    fn le_seuil_est_franc() {
+        // Exactement au seuil : on recule encore. Au-dela : on relance.
+        assert!(!precedent_doit_relancer(3_000, false));
+        assert!(precedent_doit_relancer(3_001, false));
+    }
+
+    #[test]
+    fn une_position_nulle_recule_toujours() {
+        // Une sortie qui ne rapporte pas sa position rend 0. Reculer est le
+        // comportement sûr : relancer une piste déjà au début ne ferait rien
+        // de visible, et l'utilisateur croirait le bouton mort.
+        assert!(!precedent_doit_relancer(0, false));
+        assert!(!precedent_doit_relancer(0, true));
+    }
 
     #[test]
     fn empty_title_is_not_usable_and_triggers_backfill() {
