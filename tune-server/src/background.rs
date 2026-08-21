@@ -679,7 +679,7 @@ fn spawn_token_refresher(state: &AppState) {
             let registry = services.lock().await;
             for name in registry.list() {
                 if let Some(svc) = registry.get(&name) {
-                    let mut svc = svc.lock().await;
+                    let mut svc = svc.write().await;
                     match svc.refresh_if_needed().await {
                         Ok(true) => {
                             let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(
@@ -742,7 +742,7 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
 async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
     let registry = state.services.lock().await;
     if let Some(svc) = registry.get("deezer") {
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
         if let Some(deezer) = svc
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
@@ -870,7 +870,13 @@ fn spawn_heartbeat(state: &AppState) {
 
                     let mut authed = Vec::new();
                     for (name, handle) in svc_handles {
-                        if let Ok(svc) = handle.try_lock() {
+                        // `try_read` et non `try_write` : on ne fait que
+                        // LIRE l'etat d'authentification. Avec le RwLock, ce
+                        // sondage cesse d'echouer parce qu'une autre lecture
+                        // est en cours — il ne renonce plus que si une ecriture
+                        // (rafraichissement de jeton, deconnexion) tient le
+                        // verrou, ce qui est exactement l'intention (#1969).
+                        if let Ok(svc) = handle.try_read() {
                             let status = svc.auth_status().await;
                             if status.authenticated {
                                 authed.push(name);
@@ -1242,7 +1248,7 @@ pub async fn apply_qobuz_proxy_first(
 ) {
     let registry = services.lock().await;
     if let Some(svc) = registry.get("qobuz") {
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
         if let Some(qobuz) = svc
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::qobuz::QobuzService>()
