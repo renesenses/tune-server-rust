@@ -204,7 +204,32 @@ pub fn genre_key(genre: &str) -> String {
 pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
     match raw {
         "mpeg" => "mp3".to_string(),
-        "dsf" | "dff" => "dsd".to_string(),
+        // `dsf` et `dff` ne sont PLUS repliés sur « dsd ».
+        //
+        // Ils l'étaient, et l'écran s'en trouvait menteur : deux conteneurs
+        // différents produisaient une seule entrée « DSD » dans les types de
+        // fichiers — et quand une valeur écrite autrement traversait (casse,
+        // import, version antérieure), deux entrées **visuellement identiques**
+        // (Cyrille Moutia, #1612). On ne peut pas distinguer ce qu'on a
+        // confondu à l'écriture.
+        //
+        // Le conteneur est une information que l'utilisateur possède : ses
+        // fichiers sont des `.dsf` ou des `.dff`, et la bibliothèque doit le
+        // dire. Le repli faisait perdre cette information pour ne rien
+        // simplifier — tout le code qui décide « est-ce du DSD ? » teste déjà
+        // les trois valeurs :
+        //
+        //   audio/formats.rs:31   "dsf" | "dff" | "dst" | "dsd" => Dsd
+        //   db/models.rs:79       contains("dsf") || contains("dff") || …
+        //   db/track_repo.rs:1030 t.format IN ('dsd','dsf','dff')
+        //   db/album_repo.rs:1238 format IN ('dsd','dsf','dff')
+        //   routes/zones.rs:848   matches!(fmt, "dsd" | "dsf" | "dff")
+        //
+        // Rien ne repose donc sur la valeur repliée. Les lignes déjà écrites en
+        // « dsd » sont converties par la migration `format_conteneur_dsd`, qui
+        // relit l'extension du fichier — sans quoi une bibliothèque existante
+        // afficherait « DSD » (anciennes lignes) ET « DSF » (nouvelles), soit
+        // exactement le défaut d'origine sous un autre nom.
         "mp4" | "m4a" => {
             // ALAC (Apple Lossless) files in M4A containers report a bit depth
             // (typically 16 or 24), while AAC (lossy) does not.
@@ -1165,7 +1190,11 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         original_date,
         genre,
         genres,
-        format: Some("dsd".to_string()),
+        // Le conteneur réel — `dsf` ou `dff` — et non « dsd » en dur : ce
+        // chemin connaît l'extension depuis sa première ligne, et la perdre
+        // ici rouvrirait le défaut que `normalize_format` vient de fermer
+        // (#1612).
+        format: Some(ext.clone()),
         file_size,
         sample_rate,
         channels,
@@ -2929,14 +2958,20 @@ mod tests {
         assert_eq!(normalize_format("mpeg", None), "mp3");
     }
 
+    /// #1612 — le conteneur DSD est conservé, plus replié sur « dsd ».
+    ///
+    /// Ces deux tests figeaient l'inverse. Le repli faisait qu'un `.dsf` et un
+    /// `.dff` produisaient une seule entrée dans les types de fichiers, et que
+    /// l'utilisateur ne pouvait plus savoir ce qu'il possédait. Rien ne
+    /// reposait dessus : tout le code qui décide « est-ce du DSD ? » teste déjà
+    /// les trois valeurs.
     #[test]
-    fn normalize_format_dsf_to_dsd() {
-        assert_eq!(normalize_format("dsf", None), "dsd");
-    }
-
-    #[test]
-    fn normalize_format_dff_to_dsd() {
-        assert_eq!(normalize_format("dff", None), "dsd");
+    fn normalize_format_conserve_le_conteneur_dsd() {
+        assert_eq!(normalize_format("dsf", None), "dsf");
+        assert_eq!(normalize_format("dff", None), "dff");
+        // « dsd » reste accepté : c'est la valeur des lignes non encore
+        // converties, et elle reste reconnue partout.
+        assert_eq!(normalize_format("dsd", None), "dsd");
     }
 
     #[test]
@@ -2961,18 +2996,20 @@ mod tests {
     }
 
     #[test]
-    fn dsf_dff_fallback_returns_dsd_format() {
+    fn dsf_dff_fallback_rend_le_conteneur_reel() {
+        // #1612 : le repli connait l'extension des sa premiere ligne. Ecrire
+        // « dsd » en dur ici rouvrirait le defaut que `normalize_format` ferme.
         let meta = dsf_dff_fallback(Path::new("/tmp/nonexistent_track.dsf"));
         assert!(meta.is_some());
         let meta = meta.unwrap();
-        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        assert_eq!(meta.format.as_deref(), Some("dsf"));
         assert_eq!(meta.title.as_deref(), Some("nonexistent_track"));
         assert_eq!(meta.duration_ms, Some(0));
 
         let meta2 = dsf_dff_fallback(Path::new("/tmp/test_track.dff"));
         assert!(meta2.is_some());
         let meta2 = meta2.unwrap();
-        assert_eq!(meta2.format.as_deref(), Some("dsd"));
+        assert_eq!(meta2.format.as_deref(), Some("dff"));
         assert_eq!(meta2.title.as_deref(), Some("test_track"));
     }
 
@@ -2989,7 +3026,8 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
         assert!(meta.is_some());
         let meta = meta.unwrap();
-        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        // #1612 : un `.dsf` porte desormais son conteneur, plus « dsd ».
+        assert_eq!(meta.format.as_deref(), Some("dsf"));
         assert_eq!(meta.sample_rate, Some(2_822_400));
         assert_eq!(meta.channels, Some(2));
         let dur = meta.duration_ms.unwrap();
@@ -3037,7 +3075,8 @@ mod tests {
         assert_eq!(meta.year, Some(1981));
         assert_eq!(meta.genre.as_deref(), Some("Rock"));
         assert_eq!(meta.label.as_deref(), Some("Virgin Records"));
-        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        // #1612 : un `.dsf` porte desormais son conteneur, plus « dsd ».
+        assert_eq!(meta.format.as_deref(), Some("dsf"));
         assert_eq!(meta.sample_rate, Some(2_822_400));
         assert_eq!(meta.channels, Some(2));
         assert_eq!(meta.bit_depth, Some(1));
@@ -3076,7 +3115,8 @@ mod tests {
         let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.dsf"));
         assert!(result.is_ok());
         let meta = result.unwrap();
-        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        // #1612 : un `.dsf` porte desormais son conteneur, plus « dsd ».
+        assert_eq!(meta.format.as_deref(), Some("dsf"));
     }
 
     #[test]
@@ -3161,7 +3201,8 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("Aurora"));
         assert_eq!(meta.artist.as_deref(), Some("Yes"));
         assert_eq!(meta.album.as_deref(), Some("Fragile"));
-        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        // #1612 : un `.dsf` porte desormais son conteneur, plus « dsd ».
+        assert_eq!(meta.format.as_deref(), Some("dsf"));
     }
 
     #[test]
