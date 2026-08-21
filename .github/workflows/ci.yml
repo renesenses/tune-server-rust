@@ -370,8 +370,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # 16 et pas 6 : la boucle fait au pire 3 x (100 + 200) + 2 x 20 = 940 s.
+      # A 6 min la marche se fait tuer PENDANT le deuxieme essai — on paie le
+      # cout de la reprise sans en avoir le benefice, et le message d'erreur
+      # final ne s'affiche meme pas. C'est ce qui a tue la 0.9.89 a 6 min 07.
+      # `le_plafond_de_letape_apt_laisse_passer_les_trois_essais` le verifie —
+      # et il lit les 400 premiers caracteres qui SUIVENT le `- name:`, donc ce
+      # commentaire reste ici, au-dessus, ou il ne compte pas dans la fenetre.
       - name: Install ALSA dev
-        timeout-minutes: 6
+        timeout-minutes: 16
         run: |
           for essai in 1 2 3; do
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
@@ -384,4 +391,13 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
           exit 1
+      # `-A dead_code` uniquement ici. Ce job compile la SEULE configuration du
+      # depot sans `oaat` ni les features par defaut : des fonctions bien
+      # vivantes ailleurs y sont mortes, et `-D warnings` les promeut en erreurs
+      # (10 au premier passage). Ce job cherche la CASSE de compilation — le
+      # E0425 qui a fige le moteur Android deux versions — pas la proprete d'une
+      # configuration que personne ne lint. Les autres jobs gardent `-D warnings`
+      # entier, donc le code mort reel reste detecte la ou il compte.
       - run: cargo check -p tune-ffi --all-targets
+        env:
+          RUSTFLAGS: "-D warnings -A dead_code"
