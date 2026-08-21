@@ -3787,11 +3787,31 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
-                let seed_artist = zone_state
+                let mut seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let mut seed_artist = zone_state
                     .now_playing
                     .as_ref()
                     .and_then(|np| np.artist_name.clone());
+
+                // File vide DÈS LE DÉPART : rien n'a joué, donc rien à
+                // prolonger. C'était le cas d'un serveur qu'on rallume ou
+                // d'une file qu'on vient d'effacer — le réglage « lecture
+                // automatique » était activé et il ne se passait rien, la
+                // seule trace étant un `autoplay_skipped_no_seed` en DEBUG.
+                // On repart de la dernière écoute de LA ZONE, à défaut de la
+                // maison : c'est la graine la plus proche de ce que
+                // l'auditeur attend d'entendre.
+                if seed_artist.is_none() && seed_track_id.is_none() {
+                    if let Some(g) = crate::playback::auto_dj::graine_recente(&self.db, zone_id) {
+                        info!(
+                            zone_id,
+                            artist = %g.artist_name.as_deref().unwrap_or(""),
+                            "autoplay_graine_depuis_l_historique"
+                        );
+                        seed_track_id = g.track_id;
+                        seed_artist = g.artist_name;
+                    }
+                }
 
                 // « Radio artistes similaires » : la graine est le NOM d'artiste,
                 // donc une écoute streaming (pas de track_id local) alimente

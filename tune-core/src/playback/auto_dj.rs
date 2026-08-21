@@ -595,6 +595,148 @@ mod tests {
         std::sync::Arc::new(db)
     }
 
+    // --- La graine quand la file est vide dès le départ ---
+
+    fn ecoute(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: Option<i64>,
+        artiste: Option<&str>,
+        track_id: Option<i64>,
+        quand: &str,
+    ) {
+        // `listen_history` référence `zones` et `tracks` : sans les parents,
+        // l'insertion se heurte à la clé étrangère et le test ne dit plus rien
+        // de la requête qu'il prétend éprouver.
+        if let Some(z) = zone_id {
+            db.execute(
+                "INSERT OR IGNORE INTO zones (id, name) VALUES (?, 'test')",
+                &[&z],
+            )
+            .unwrap();
+        }
+        if let Some(t) = track_id {
+            db.execute(
+                "INSERT OR IGNORE INTO tracks (id, title, duration_ms) VALUES (?, 'x', 200000)",
+                &[&t],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO listen_history (track_id, title, artist_name, listened_at, zone_id) \
+             VALUES (?, 'x', ?, ?, ?)",
+            &[&track_id, &artiste, &quand, &zone_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sans_historique_il_n_y_a_pas_de_graine() {
+        // Installation neuve : on ne fabrique rien a partir de rien.
+        let db = test_db();
+        assert_eq!(graine_recente(&db, 1), None);
+    }
+
+    #[test]
+    fn la_graine_est_la_derniere_ecoute_de_la_zone() {
+        let db = test_db();
+        ecoute(
+            &db,
+            Some(1),
+            Some("Bowie"),
+            Some(10),
+            "2026-08-20T10:00:00Z",
+        );
+        ecoute(
+            &db,
+            Some(1),
+            Some("Nina Simone"),
+            Some(11),
+            "2026-08-21T10:00:00Z",
+        );
+        let g = graine_recente(&db, 1).unwrap();
+        assert_eq!(g.artist_name.as_deref(), Some("Nina Simone"));
+        assert_eq!(g.track_id, Some(11));
+    }
+
+    /// La cuisine et le salon n'ecoutent pas la meme chose : repartir sur le
+    /// dernier morceau joue N'IMPORTE OU serait plus faux que juste.
+    #[test]
+    fn la_zone_prime_sur_la_maison() {
+        let db = test_db();
+        ecoute(
+            &db,
+            Some(2),
+            Some("Motorhead"),
+            Some(20),
+            "2026-08-21T23:00:00Z",
+        );
+        ecoute(
+            &db,
+            Some(1),
+            Some("Chopin"),
+            Some(21),
+            "2026-08-20T09:00:00Z",
+        );
+        assert_eq!(
+            graine_recente(&db, 1).unwrap().artist_name.as_deref(),
+            Some("Chopin")
+        );
+    }
+
+    #[test]
+    fn une_zone_vierge_se_rabat_sur_la_maison() {
+        let db = test_db();
+        ecoute(
+            &db,
+            Some(2),
+            Some("Miles Davis"),
+            Some(30),
+            "2026-08-21T08:00:00Z",
+        );
+        assert_eq!(
+            graine_recente(&db, 9).unwrap().artist_name.as_deref(),
+            Some("Miles Davis")
+        );
+    }
+
+    /// C'est le NOM D'ARTISTE qui alimente la radio « artistes similaires ».
+    /// Une ecoute sans artiste ne mene nulle part : on l'ignore au lieu de
+    /// semer du vide.
+    #[test]
+    fn une_ecoute_sans_artiste_ne_sert_pas_de_graine() {
+        let db = test_db();
+        ecoute(
+            &db,
+            Some(1),
+            Some("Ella Fitzgerald"),
+            Some(40),
+            "2026-08-20T10:00:00Z",
+        );
+        ecoute(&db, Some(1), None, Some(41), "2026-08-21T10:00:00Z");
+        ecoute(&db, Some(1), Some("   "), Some(42), "2026-08-21T11:00:00Z");
+        assert_eq!(
+            graine_recente(&db, 1).unwrap().artist_name.as_deref(),
+            Some("Ella Fitzgerald")
+        );
+    }
+
+    #[test]
+    fn une_ecoute_de_service_sert_de_graine_sans_track_id() {
+        // Qobuz sans bibliotheque locale : pas d'identifiant de piste, mais un
+        // artiste — et c'est lui qui compte pour la radio.
+        let db = test_db();
+        ecoute(
+            &db,
+            Some(1),
+            Some("Kings Of Leon"),
+            None,
+            "2026-08-21T10:00:00Z",
+        );
+        let g = graine_recente(&db, 1).unwrap();
+        assert_eq!(g.artist_name.as_deref(), Some("Kings Of Leon"));
+        assert_eq!(g.track_id, None);
+    }
+
     #[test]
     fn empty_library_returns_empty() {
         let db = test_db();
@@ -720,6 +862,62 @@ impl Mood {
             ],
         }
     }
+}
+
+/// Ce que la zone écoutait en dernier, quand elle n'a plus rien sous la main.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraineRecente {
+    pub track_id: Option<i64>,
+    pub artist_name: Option<String>,
+}
+
+/// Une graine tirée de l'écoute passée, pour une file **vide dès le départ**.
+///
+/// L'autoplay ne se déclenchait qu'en FIN de file, et prenait sa graine dans
+/// le morceau qui venait de jouer. Une file vide au démarrage — un serveur
+/// qu'on rallume, une file qu'on vient d'effacer — n'avait donc aucune graine,
+/// et la seule trace en était un `autoplay_skipped_no_seed` en DEBUG. Le
+/// réglage « lecture automatique » était activé, et il ne se passait rien.
+///
+/// On regarde d'abord l'historique de LA ZONE, puis celui de la maison. Ce
+/// n'est pas la même chose : la cuisine et le salon n'écoutent pas la même
+/// musique, et repartir sur le dernier morceau joué n'importe où serait plus
+/// faux que juste.
+///
+/// On ne retient que les écoutes qui portent un nom d'artiste : c'est lui qui
+/// alimente la radio « artistes similaires », locale comme de service.
+pub fn graine_recente(db: &std::sync::Arc<dyn DbBackend>, zone_id: i64) -> Option<GraineRecente> {
+    const CHAMPS: &str = "track_id, artist_name";
+    const FILTRE: &str = "artist_name IS NOT NULL AND TRIM(artist_name) <> ''";
+
+    let ligne = db
+        .query_one(
+            &format!(
+                "SELECT {CHAMPS} FROM listen_history \
+                 WHERE zone_id = ? AND {FILTRE} ORDER BY listened_at DESC LIMIT 1"
+            ),
+            &[&zone_id],
+        )
+        .ok()
+        .flatten()
+        .or_else(|| {
+            // La zone n'a jamais rien joué : on se rabat sur la maison entière.
+            db.query_one(
+                &format!(
+                    "SELECT {CHAMPS} FROM listen_history \
+                     WHERE {FILTRE} ORDER BY listened_at DESC LIMIT 1"
+                ),
+                &[],
+            )
+            .ok()
+            .flatten()
+        })?;
+
+    let artiste = ligne[1].as_string().filter(|a| !a.trim().is_empty())?;
+    Some(GraineRecente {
+        track_id: ligne[0].as_i64(),
+        artist_name: Some(artiste),
+    })
 }
 
 pub fn generate_mood_queue(
