@@ -91,12 +91,30 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 /// Un MP3 réellement encodé à 320 kbps constant porte cette signature SANS
 /// avoir été rogné. Le relire est sans effet : on récrit la durée qu'il a
 /// déjà. Le faux positif est donc inoffensif par construction.
+/// ⚠ TÉMOIN VERSIONNÉ — ne pas revenir à une clef fixe.
+///
+/// Les deux moitiés du correctif sont sorties DANS LE MAUVAIS ORDRE :
+///
+///   v0.9.93 — cette passe de réparation (#2034)
+///   v0.9.94 — la correction du lecteur qui faussait les durées (#2027)
+///
+/// Quiconque a tourné en v0.9.93 a donc vu la passe réparer ses durées, poser
+/// son témoin… puis un rescan avec le lecteur ENCORE fautif les re-fausser. Le
+/// témoin étant posé, la passe ne serait jamais repassée : durées corrompues à
+/// demeure, et un scan ordinaire saute les fichiers dont le mtime et la taille
+/// n'ont pas bougé — rien ne les aurait relues.
+///
+/// Suffixer la clef fait repasser la passe UNE fois chez ces installations.
+/// C'est bon marché pour les autres : la requête ne rend que les pistes
+/// portant la signature de rognage, soit aucune sur une bibliothèque saine.
+///
+/// Toute correction future du lecteur devra incrémenter ce suffixe.
 fn spawn_mp3_duration_repair(state: &AppState) {
     let backend = state.backend.clone();
     tokio::spawn(async move {
         let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
         if reglages
-            .get("mp3_duration_repair_done")
+            .get("mp3_duration_repair_done_v2")
             .ok()
             .flatten()
             .is_some()
@@ -133,7 +151,7 @@ fn spawn_mp3_duration_repair(state: &AppState) {
 
         if candidats.is_empty() {
             info!(sans_taille, "mp3_duration_repair_rien_a_faire");
-            let _ = reglages.set("mp3_duration_repair_done", "1");
+            let _ = reglages.set("mp3_duration_repair_done_v2", "1");
             return;
         }
 
@@ -190,7 +208,7 @@ fn spawn_mp3_duration_repair(state: &AppState) {
             total,
             reparees, inchangees, illisibles, sans_taille, "mp3_duration_repair_termine"
         );
-        let _ = reglages.set("mp3_duration_repair_done", "1");
+        let _ = reglages.set("mp3_duration_repair_done_v2", "1");
     });
 }
 
