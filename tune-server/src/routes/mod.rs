@@ -195,6 +195,22 @@ async fn cache_control_middleware(
     let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    // Un gestionnaire qui a DÉJÀ décidé de sa politique de cache garde la main.
+    //
+    // Sans ce garde, la branche `!path.contains('.')` plus bas écrasait tout :
+    // elle vise les routes de l'application web, mais les chemins d'API n'ont
+    // pas de point non plus, donc `/api/v1/streaming/qobuz/featured` recevait
+    // `no-cache, must-revalidate` — par EFFET DE BORD, jamais par décision.
+    // Le commentaire d'origine ne parle que de « HTML pages and SPA routes ».
+    //
+    // Poser la politique dans le gestionnaire plutôt qu'une liste de chemins
+    // ici n'est pas un détail de style : `/playlist-tags` et
+    // `/featured-playlists` sont éditoriaux, `/playlists` ne l'est pas. Une
+    // règle par préfixe finirait par mettre en cache les playlists d'un
+    // utilisateur (#1969).
+    if headers.contains_key(axum::http::header::CACHE_CONTROL) {
+        return response;
+    }
     if path.starts_with("/assets/") {
         // Hashed assets (index-Bmb2F8zZ.js) — immutable, cache forever
         headers.insert(
