@@ -315,6 +315,28 @@ Conséquences pour vous :
   point. Certains messages de commit disent eux-mêmes « ne prétend PAS
   résoudre #N » — lisez-les.
 
+### Une preuve par contenu qui n'en est pas une
+
+Le 2026-08-21, **six issues ont été fermées en une seule commande, en treize
+secondes**, chacune avec une « preuve » produite par
+`git grep -c "<mot du domaine>" <tag> | head -1`. `head -1` rend le **premier
+fichier venu** : sur une issue de reprise DLNA, la preuve citait
+`docs/ARCHITECTURE-CIBLE-v0.9.md`. Les six ont dû être rouvertes.
+
+Ce n'est pas une preuve faible, c'est une preuve **inventée** — et c'est pire
+qu'une fermeture sans commentaire, parce que ça se relit comme une
+vérification, et qu'il faut la démonter avant de pouvoir la contredire.
+
+- **La preuve cite le fichier DU correctif et un marqueur qui lui est propre** :
+  un nom de fonction ajouté, une constante, une clause. Si le marqueur
+  apparaît dans un `.md`, ce n'est pas un marqueur.
+- **Lisez le message du commit avant de fermer.** `Refs #N` **n'est pas**
+  `Closes #N`, et plusieurs commits disent en toutes lettres *« Ne ferme
+  aucune des deux issues »*. Une PR qui se refuse le droit de fermer sait
+  quelque chose que le vérificateur ignore.
+- **Jamais de fermeture en lot.** Une issue, une lecture. Six fermetures en
+  treize secondes, ce sont six décisions que personne n'a prises.
+
 ### Vérifier, pas supposer
 
 - `cargo clippy --all-targets`, **jamais** `cargo check` seul : il ne compile
