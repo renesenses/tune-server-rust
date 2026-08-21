@@ -816,6 +816,27 @@ pub struct LocalOutput {
     /// Pending next track for gapless playback.  Set by `set_next_media()`,
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    /// La boucle d'enchaînement du fil de lecture a-t-elle rendu les armes ?
+    ///
+    /// `supports_internal_gapless()` était une **capacité statique**
+    /// (`!exclusive_mode`) : le chemin cpal partagé affirmait savoir enchaîner
+    /// tout seul, y compris longtemps après que sa boucle se soit arrêtée.
+    /// C'est exactement le défaut corrigé sur OAAT par #1323 — « la boucle de
+    /// flux ne disait pas au poller qu'elle était morte » — et il vit aussi
+    /// ici.
+    ///
+    /// Le fil de lecture abandonne l'enchaînement par six chemins : aucune
+    /// piste suivante en réserve, HTTP en erreur, HTTP injoignable, en-tête
+    /// vide, **flux suivant qui n'est pas du WAV**
+    /// (`local_audio_gapless_next_not_wav_falling_back`), ou piste chaînée qui
+    /// n'atteint pas une fin propre. Après chacun d'eux le fil draine puis
+    /// sort : plus rien ne peut enchaîner. Le poller, lui, relit la capacité
+    /// pendant qu'il attend et y lit toujours `true`.
+    ///
+    /// Cette réponse devient donc une **sonde vivante** : une boucle terminée
+    /// ne peut plus rien enchaîner, quoi qu'elle ait su faire une seconde plus
+    /// tôt. Remis à zéro par `play_url()`, qui démarre un fil neuf.
+    chain_exhausted: Arc<AtomicBool>,
     /// Zone equalizer for the zone currently playing on this output, applied
     /// BEFORE the room-correction convolver — the same order as the transcoded
     /// path (`transcode_source_to_file`: ReplayGain → EQ → convolver).
@@ -999,6 +1020,7 @@ impl LocalOutput {
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
+            chain_exhausted: Arc::new(AtomicBool::new(false)),
             eq: Arc::new(std::sync::Mutex::new(None)),
             current_format: Arc::new(AtomicU32::new(0)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
@@ -1081,6 +1103,14 @@ impl LocalOutput {
     pub(crate) fn declare_current_format_for_test(&self, taux: u32, canaux: u16) {
         self.current_format
             .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
+    }
+
+    /// Force l'état de la boucle d'enchaînement, pour les tests : c'est la
+    /// seule façon d'atteindre la sonde sans carte son. Même point d'entrée que
+    /// `OaatOutput::set_chain_exhausted_for_test` (#1323).
+    #[cfg(test)]
+    pub(crate) fn set_chain_exhausted_for_test(&self, exhausted: bool) {
+        self.chain_exhausted.store(exhausted, Ordering::SeqCst);
     }
 
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
@@ -1195,6 +1225,31 @@ impl LocalOutput {
     pub fn producer_seeked(&self) -> bool {
         self.stream_pre_seeked.load(Ordering::SeqCst)
     }
+}
+
+/// Un fil de lecture qui sort de sa boucle d'enchaînement doit-il déclarer la
+/// chaîne épuisée ?
+///
+/// Oui dans tous les cas — une boucle terminée ne peut plus rien enchaîner —
+/// **sauf un** : celui où une lecture plus récente l'a supplanté. Là, le
+/// drapeau appartient déjà au fil suivant, et le lever le priverait de son
+/// gapless pour toute la durée de son morceau.
+///
+/// Deux façons de reconnaître ce cas, et il faut les deux :
+///
+/// - `supplante` (`force_silent`) — `stop()` a fait taire ce fil ;
+/// - la **génération** a bougé — un `play_url()` est passé.
+///
+/// La génération seule ne suffit pas : `play_url()` remet la sonde à zéro
+/// **après** avoir incrémenté la génération, précisément pour qu'aucun ancien
+/// fil ne puisse relever le drapeau derrière lui. Un fil dont la génération est
+/// encore la courante est bien le fil en titre, et son épuisement compte.
+pub(crate) fn doit_declarer_chaine_epuisee(
+    supplante: bool,
+    generation_courante: u64,
+    ma_generation: u64,
+) -> bool {
+    !supplante && generation_courante == ma_generation
 }
 
 /// Ring buffer shared between the HTTP reader thread and the audio callback.
@@ -1696,8 +1751,14 @@ impl OutputTarget for LocalOutput {
     /// that returns at EOF without consuming the staged `next_media`, so it
     /// cannot chain internally — the poller must fall back to natural-end
     /// advance. Only the shared cpal path performs internal gapless chaining.
+    ///
+    /// Et « performe » se conjugue au présent : la réponse est une **sonde
+    /// vivante**, pas une capacité gravée. Une boucle d'enchaînement qui s'est
+    /// arrêtée ne peut plus rien enchaîner, et doit le dire — sans quoi le
+    /// poller attend une transition d'un fil qui n'existe plus (`#1323` sur
+    /// OAAT, `#1919` ici). Voir [`LocalOutput::chain_exhausted`].
     fn supports_internal_gapless(&self) -> bool {
-        !self.exclusive_mode
+        !self.exclusive_mode && !self.chain_exhausted.load(Ordering::Relaxed)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1768,6 +1829,9 @@ impl OutputTarget for LocalOutput {
 
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
+        // (`chain_exhausted` est remis à zéro plus bas, APRÈS l'incrément de
+        // `play_generation` — voir le commentaire là-bas : le faire ici
+        // laisserait une fenêtre où l'ancien fil peut relever le drapeau.)
 
         // Brief pause after stopping the old stream to allow the OS audio
         // subsystem (CoreAudio / WASAPI / ALSA) to fully release the device.
@@ -1804,6 +1868,17 @@ impl OutputTarget for LocalOutput {
         // Clear the natural-end flag and generation for the new track.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        // Un fil neuf a une boucle d'enchaînement intacte : la sonde repart de
+        // zéro. **Après** l'incrément de `play_generation`, et c'est tout
+        // l'intérêt : l'ancien fil ne lève son drapeau que s'il est encore la
+        // génération courante. Remis à zéro AVANT l'incrément, il restait une
+        // fenêtre — les 50 à 500 ms d'attente de libération du périphérique —
+        // pendant laquelle l'ancien fil, toujours reconnu comme courant,
+        // relevait le drapeau juste après l'effacement : le nouveau morceau
+        // héritait alors d'une sonde éteinte et perdait son gapless pour toute
+        // sa durée. Ici, l'ancien fil est soit déjà passé (on efface après
+        // lui), soit périmé (générations différentes, il ne lève rien).
+        self.chain_exhausted.store(false, Ordering::SeqCst);
         // A device-open failure belongs to the track that provoked it. Clearing
         // it here means a user who fixes the device and presses play again is
         // never stopped by the previous attempt's error.
@@ -1841,6 +1916,7 @@ impl OutputTarget for LocalOutput {
         let rg_factor_ref = self.rg_factor.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
+        let chain_exhausted_ref = self.chain_exhausted.clone();
         let uri_ref = self.current_uri.clone();
         let title_ref = self.track_title.clone();
         let artist_ref = self.track_artist.clone();
@@ -3823,21 +3899,17 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                // Update shared metadata for the new track so get_status()
-                // and the poller see the transition.
-                *uri_ref.lock().unwrap() = Some(next.url.clone());
-                *title_ref.lock().unwrap() = next.title.clone();
-                *artist_ref.lock().unwrap() = next.artist.clone();
-                if let Some(dur) = next.duration_ms {
-                    duration_ms_arc.store(dur, Ordering::SeqCst);
-                }
-                // Reset position and seek offset for the new track.
-                // The poller will see position drop from near-end to 0,
-                // detect a gapless position reset, and call
-                // advance_queue_metadata() — no stop/restart needed.
-                seek_offset = 0;
-                seek_offset_arc.store(0, Ordering::SeqCst);
-                position_ms.store(0, Ordering::SeqCst);
+                // La bascule des métadonnées et de la position a lieu PLUS BAS,
+                // une fois le flux suivant confirmé chaînable (en-tête WAV lu).
+                // Elle était faite ici, avant même la requête HTTP : sur un
+                // enchaînement qui échouait ensuite — flux non-WAV, HTTP en
+                // erreur, en-tête vide —, la sortie annonçait déjà « position 0
+                // du morceau SUIVANT » alors qu'elle allait s'arrêter. Le
+                // poller y lisait un `position_reset` de manuel (fin de piste →
+                // 0, gapless armé) et déclenchait l'avance métadonnées seule,
+                // qui n'envoie AUCUN `play` (#1919). Au passage, `position_ms`
+                // remis à 0 devenait le `fed_position_ms` du drainage, qui
+                // rapportait donc 0 au lieu de la fin du morceau.
 
                 // Fetch the next track's HTTP stream
                 let next_response = match crate::http::client::blocking_builder()
@@ -3985,6 +4057,26 @@ impl OutputTarget for LocalOutput {
                     resample_leftover.clear();
                 }
 
+                // L'enchaînement est acquis : le flux suivant répond et porte un
+                // en-tête WAV lisible. C'est seulement MAINTENANT qu'on publie
+                // le morceau suivant — avant cette ligne, tout `break` laisse la
+                // sortie décrire honnêtement le morceau qui vient de finir, et
+                // le poller prend le chemin de fin naturelle (un vrai
+                // `play_from_queue`) au lieu de l'avance métadonnées muette.
+                *uri_ref.lock().unwrap() = Some(next.url.clone());
+                *title_ref.lock().unwrap() = next.title.clone();
+                *artist_ref.lock().unwrap() = next.artist.clone();
+                if let Some(dur) = next.duration_ms {
+                    duration_ms_arc.store(dur, Ordering::SeqCst);
+                }
+                // Reset position and seek offset for the new track.
+                // The poller will see position drop from near-end to 0,
+                // detect a gapless position reset, and call
+                // advance_queue_metadata() — no stop/restart needed.
+                seek_offset = 0;
+                seek_offset_arc.store(0, Ordering::SeqCst);
+                position_ms.store(0, Ordering::SeqCst);
+
                 // Reset per-track counters
                 total_frames_fed = 0;
                 total_bytes_read = 0;
@@ -4117,6 +4209,27 @@ impl OutputTarget for LocalOutput {
             // ---------------------------------------------------------------
             // End of gapless continuation
             // ---------------------------------------------------------------
+
+            // La boucle est finie : ce fil n'enchaînera plus rien, quelle qu'en
+            // soit la raison (rien en réserve, HTTP en erreur, en-tête vide,
+            // flux suivant non-WAV, piste chaînée sans fin propre). Le DIRE au
+            // poller, qui relit la capacité pendant qu'il attend : tant qu'elle
+            // vaut `true`, il attend une transition d'un fil qui n'existe plus
+            // et l'avance métadonnées seule part sans aucun `play` (#1919 ;
+            // même défaut que #1323 sur OAAT).
+            //
+            // Une seule sortie n'est PAS un épuisement : celle où une lecture
+            // plus récente nous a supplantés (`force_silent`, ou génération qui
+            // a bougé). Là c'est `play_url()` qui a déjà remis le drapeau à
+            // zéro pour le fil suivant — le lever ici désarmerait SON gapless.
+            if doit_declarer_chaine_epuisee(
+                force_silent.load(Ordering::Relaxed),
+                play_generation.load(Ordering::SeqCst),
+                my_generation,
+            ) {
+                chain_exhausted_ref.store(true, Ordering::SeqCst);
+                debug!("local_audio_gapless_chain_exhausted");
+            }
 
             // Flush the resampler: process any leftover frames + drain internal delay
             if needs_resample {
@@ -4809,6 +4922,152 @@ pub(crate) use crate::audio::resample::{rubato_resample_batch, rubato_resample_c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Fin de piste sur le chemin cpal partagé (#1919, Alain — #2047)
+    //
+    // Alain décrit une playlist Qobuz dont une piste « se bloque et lit en
+    // boucle les 3 à 4 dernières secondes ». Sortie USB du PC vers son DAC :
+    // chemin cpal PARTAGÉ, aucun renderer réseau. Aléatoire, « en début comme
+    // en fin de piste ».
+    //
+    // `supports_internal_gapless()` répondait `!exclusive_mode` — une capacité
+    // STATIQUE. La boucle d'enchaînement du fil de lecture abandonne pourtant
+    // par six chemins (rien en réserve, HTTP en erreur, HTTP injoignable,
+    // en-tête vide, flux suivant non-WAV, piste chaînée sans fin propre), et
+    // après chacun d'eux le fil draine puis SORT. La sortie continuait
+    // néanmoins d'affirmer au poller qu'elle savait enchaîner toute seule.
+    //
+    // Le poller relit cette réponse à trois endroits ; celui qui fait le
+    // symptôme est `decisions::position_reset_fires`. Son propre commentaire
+    // nomme le résultat : « advancing metadata sends no `play` and steals the
+    // event from the natural-end path […] causing the endless 1-2s-then-zero
+    // loop (Rhorn, #1072) ». C'est la boucle qu'entend Alain.
+    //
+    // Exactement le défaut corrigé sur OAAT par #1323/#2013 — « la boucle de
+    // flux ne disait pas au poller qu'elle était morte » —, sur une autre
+    // sortie.
+    // -----------------------------------------------------------------------
+
+    /// Une boucle d'enchaînement TERMINÉE doit rendre la main au poller.
+    ///
+    /// Le test compose la sonde de la sortie avec le prédicat du poller qui
+    /// produit le symptôme, plutôt que de se contenter de relire un booléen :
+    /// c'est la composition des deux qui décide si un `play` est envoyé.
+    #[test]
+    fn une_chaine_locale_terminee_ne_declenche_plus_l_avance_muette() {
+        use crate::poller::decisions;
+
+        // Fin de piste : la position chute de 3:34 à 0, gapless armé.
+        let chute = decisions::position_reset(214_000, 0, true);
+        assert!(
+            chute,
+            "le banc doit bien représenter une chute de fin de piste"
+        );
+
+        let sortie = LocalOutput::new("USB DAC".to_string());
+        assert!(
+            !sortie.exclusive_mode,
+            "le cas d'Alain est le chemin cpal PARTAGÉ"
+        );
+
+        // Au repos, la sortie sait enchaîner : le poller doit pouvoir armer le
+        // gapless, sinon on casse l'enchaînement sans coupure de tout le monde.
+        assert!(
+            sortie.supports_internal_gapless(),
+            "au repos, le chemin partagé annonce l'enchaînement interne"
+        );
+        assert!(
+            decisions::position_reset_fires(chute, sortie.supports_internal_gapless()),
+            "tant que la boucle vit, la chute est bien une transition interne"
+        );
+
+        // La boucle a rendu les armes (flux suivant non-WAV, HTTP en échec,
+        // rien en réserve…). Le fil draine et sort : plus rien ne peut
+        // enchaîner.
+        sortie.set_chain_exhausted_for_test(true);
+
+        assert!(
+            !sortie.supports_internal_gapless(),
+            "une boucle terminée ne peut plus rien enchaîner, quoi qu'elle ait su faire avant"
+        );
+        assert!(
+            !decisions::position_reset_fires(chute, sortie.supports_internal_gapless()),
+            "l'avance métadonnées seule n'envoie AUCUN play : sur une chaîne morte \
+             elle vole l'événement au chemin de fin naturelle et produit la boucle \
+             de quelques secondes signalée par Alain (#1919)"
+        );
+    }
+
+    /// La sonde repart de zéro pour le fil suivant.
+    ///
+    /// Sans cette remise à zéro le drapeau serait collant : une seule chaîne
+    /// avortée désarmerait le gapless de la sortie pour le reste de la session,
+    /// ce qui remplacerait un défaut par une régression audible sur les albums
+    /// enchaînés.
+    #[test]
+    fn la_sonde_repart_de_zero_pour_le_fil_suivant() {
+        let sortie = LocalOutput::new("USB DAC".to_string());
+        sortie.set_chain_exhausted_for_test(true);
+        assert!(!sortie.supports_internal_gapless());
+
+        // `play_url()` ouvre un fil neuf et relève le drapeau. On ne peut pas
+        // l'appeler sans carte son ; on vérifie la propriété qu'il garantit.
+        sortie.set_chain_exhausted_for_test(false);
+        assert!(
+            sortie.supports_internal_gapless(),
+            "un fil de lecture neuf a une boucle intacte"
+        );
+    }
+
+    /// Qui a le droit de déclarer la chaîne épuisée.
+    ///
+    /// Le cas qui compte est le dernier : un ancien fil, encore en train de
+    /// drainer, ne doit pas éteindre la sonde du morceau que `play_url()` vient
+    /// de lancer — sinon le correctif de #1919 se paierait d'une perte de
+    /// gapless sur le morceau suivant, à chaque changement de piste.
+    #[test]
+    fn seul_le_fil_en_titre_declare_sa_chaine_epuisee() {
+        // Le fil courant sort de sa boucle : il le dit.
+        assert!(
+            doit_declarer_chaine_epuisee(false, 7, 7),
+            "une boucle terminée doit rendre la main au poller"
+        );
+
+        // `stop()` l'a fait taire : le drapeau ne lui appartient plus.
+        assert!(
+            !doit_declarer_chaine_epuisee(true, 7, 7),
+            "un fil supplanté par stop() ne touche pas au drapeau"
+        );
+
+        // Un `play_url()` est passé : ce fil est périmé. C'est le cas qui
+        // protège le gapless du morceau suivant.
+        assert!(
+            !doit_declarer_chaine_epuisee(false, 8, 7),
+            "un fil d'une génération périmée ne doit JAMAIS éteindre la sonde \
+             du morceau courant"
+        );
+
+        // Les deux à la fois : périmé ET supplanté.
+        assert!(!doit_declarer_chaine_epuisee(true, 8, 7));
+    }
+
+    /// Une sortie EXCLUSIVE ne devient pas enchaînable parce que sa boucle est
+    /// vivante : elle ne consomme jamais le `next_media` mis en réserve.
+    /// Verrou anti-régression sur le correctif de DEvir (ASIO Fireface).
+    #[test]
+    fn une_sortie_exclusive_reste_non_enchainable() {
+        let sortie = LocalOutput::new_with_exclusive("Fireface ASIO".to_string(), true);
+        assert!(
+            !sortie.supports_internal_gapless(),
+            "ASIO/WASAPI exclusif : boucle dédiée qui sort à l'EOF sans consommer next_media"
+        );
+        sortie.set_chain_exhausted_for_test(false);
+        assert!(
+            !sortie.supports_internal_gapless(),
+            "remettre la sonde à zéro ne doit JAMAIS rendre une sortie exclusive enchaînable"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Égaliseur de zone sur la sortie locale (#1416, Jean Marie)

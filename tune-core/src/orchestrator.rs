@@ -937,6 +937,35 @@ fn dop_wire_params(
     (rate, channels)
 }
 
+/// Le conteneur peut-il porter plus de 16 bits alors que la base l'ignore ?
+///
+/// Seul l'ALAC est concerné : sa profondeur ne se lit ni dans les tags ni par
+/// `lofty`, mais dans le cookie magique du fichier. Tous les autres conteneurs
+/// renseignent la leur au scan, donc les sonder serait de l'E/S pour rien.
+fn conteneur_a_profondeur_cachee(fmt: Option<AudioFormat>) -> bool {
+    matches!(fmt, Some(AudioFormat::Alac))
+}
+
+/// Profondeur réelle lue DANS le fichier, quand la base ne la connaît pas.
+///
+/// Rend `None` — donc « garder ce que dit la base » — dès que le conteneur
+/// n'est pas concerné, que le fichier est illisible, ou que la sonde ne trouve
+/// rien. Ne jamais échouer la lecture pour une profondeur : au pire on reste
+/// sur le comportement d'avant.
+fn profondeur_sondee_si_la_base_ignore(file_path: &str, fmt: Option<AudioFormat>) -> Option<u16> {
+    if !conteneur_a_profondeur_cachee(fmt) {
+        return None;
+    }
+    let (_, bd) = crate::metadata::probe_m4a_props(std::path::Path::new(file_path))?;
+    let bd = bd?;
+    info!(
+        path = %file_path,
+        bit_depth = bd,
+        "alac_bit_depth_probed_from_file_for_wav24"
+    );
+    Some(bd)
+}
+
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
     (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
 }
@@ -2361,6 +2390,10 @@ impl PlaybackOrchestrator {
             // production the producer can die invisibly. The flag lets
             // resume() detect that state and re-play the station (#1629).
             let session_for_done = session.clone();
+            // De quoi DIRE l'échec plutôt que de le laisser au journal.
+            let err_bus = self.event_bus.clone();
+            let err_zone = req.zone_id;
+            let err_station = title.clone();
             tokio::spawn(async move {
                 // Download + decode in a blocking thread since symphonia and
                 // reqwest::blocking are both synchronous.
@@ -2381,9 +2414,16 @@ impl PlaybackOrchestrator {
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "radio_local_decode_failed");
+                        emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
                     }
                     Err(e) => {
                         warn!(error = %e, "radio_local_decode_task_panic");
+                        emit_radio_playback_error(
+                            &err_bus,
+                            err_zone,
+                            &err_station,
+                            "erreur interne du décodeur",
+                        );
                     }
                 }
             });
@@ -2567,6 +2607,10 @@ impl PlaybackOrchestrator {
                 // drapeau pour savoir que plus rien n'alimente la session et
                 // rejouer la station (#1629).
                 let session_for_done = session.clone();
+                // Même dette que le chemin local : l'échec restait au journal.
+                let err_bus = self.event_bus.clone();
+                let err_zone = req.zone_id;
+                let err_station = title.clone();
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         decode_radio_stream_to_pcm(
@@ -2583,8 +2627,19 @@ impl PlaybackOrchestrator {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     match result {
                         Ok(Ok(())) => debug!("radio_dlna_decode_stream_ended"),
-                        Ok(Err(e)) => warn!(error = %e, "radio_dlna_decode_failed"),
-                        Err(e) => warn!(error = %e, "radio_dlna_decode_task_panic"),
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "radio_dlna_decode_failed");
+                            emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "radio_dlna_decode_task_panic");
+                            emit_radio_playback_error(
+                                &err_bus,
+                                err_zone,
+                                &err_station,
+                                "erreur interne du décodeur",
+                            );
+                        }
                     }
                 });
                 let server_ip = self.server_ip();
@@ -2828,6 +2883,31 @@ impl PlaybackOrchestrator {
         };
         let dop_requested = dop_requested(is_local_output, is_network_output, &dsd_mode);
 
+        // Un mode « auto » qui ne fait rien d'automatique, et qui se taisait.
+        //
+        // `dop_requested` ne reconnaît que `"native"` et `"dop"` — et en réseau,
+        // `"dop"` seul. Le mode par DÉFAUT, `"auto"`, ne produit donc JAMAIS de
+        // DoP, nulle part. Une piste DSD y part en PCM, ce qui est un choix
+        // défendable, mais rien ne le disait : ni à l'écran, ni au journal.
+        //
+        // Conséquence vécue : un testeur dont un autre serveur lit le même
+        // fichier sur le même DAC conclut que Tune « bloque sur le DSD », et
+        // nous cherchons un défaut de lecture là où il n'y a qu'un réglage par
+        // défaut trompeur (Tades, Hifiman Serenade, #1657). Une ligne de journal
+        // aurait suffi à le voir sans lui poser la question.
+        //
+        // Tracé ici plutôt qu'en amont : c'est le seul endroit qui connaisse à
+        // la fois le format de la source, le type de sortie et le mode réglé.
+        if source_format == Some(AudioFormat::Dsd) && !dop_requested {
+            info!(
+                zone_id = req.zone_id,
+                dsd_mode = %dsd_mode,
+                is_local_output,
+                is_network_output,
+                "dsd_dop_not_requested_track_will_be_converted_to_pcm"
+            );
+        }
+
         if source_format == Some(AudioFormat::Dsd) {
             if dop_requested {
                 // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
@@ -3011,9 +3091,26 @@ impl PlaybackOrchestrator {
         // longer maps the stream back to 16-bit and reads misaligned samples
         // (the #1137 silence class). Only meaningful when the source is deeper
         // than 16-bit; a 16-bit source keeps the plain LPCM path.
-        let dlna_wav24 = is_network_output
-            && bit_depth > 16
+        // `bit_depth` vient de la ligne `tracks`, et pour un ALAC elle peut y
+        // être absente : la profondeur n'est lisible que par une sonde
+        // Symphonia sur le cookie magique (`probe_m4a_props`), arrivée après
+        // coup. Une piste scannée avant — ou dont la sonde a échoué — porte
+        // alors le défaut `16`, et l'opt-in 24 bits ne s'arme JAMAIS, quel que
+        // soit le réglage : coché, vérifié, sans effet (Yves, ALAC 24/96, #1654).
+        //
+        // Sonder le fichier lève l'ambiguïté, et le coût est nul en pratique :
+        // la sonde ne tourne que si la zone a EXPLICITEMENT demandé le 24 bits
+        // (opt-in rare) et que la base annonce 16 ou moins sur un conteneur qui
+        // sait porter davantage. Un vrai ALAC 16 bits répond 16 et rien ne
+        // change.
+        let wav24_opt_in = is_network_output
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
+        let bit_depth_wire = if wav24_opt_in && bit_depth <= 16 {
+            profondeur_sondee_si_la_base_ignore(&file_path, source_format).unwrap_or(bit_depth)
+        } else {
+            bit_depth
+        };
+        let dlna_wav24 = wav24_opt_in && bit_depth_wire > 16;
         // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
         //
         // …SAUF sur une source FLAC dont la zone demande explicitement le FLAC
@@ -3288,8 +3385,15 @@ impl PlaybackOrchestrator {
                 // on this bit_depth), so the renderer parses the real 24-bit WAV
                 // header instead of mapping a false profile back to 16-bit and
                 // reading misaligned samples (#1137). `dlna_wav24` is already
-                // gated on `bit_depth > 16` above; cap at 24 (FLAC/WAV ceiling).
-                bit_depth.min(24)
+                // gated on `bit_depth_wire > 16` above; cap at 24 (FLAC/WAV
+                // ceiling).
+                //
+                // `bit_depth_wire`, pas `bit_depth` : sur un ALAC dont la base
+                // ignore la profondeur, c'est la sonde du fichier qui fait foi.
+                // Prendre la valeur de la base ici servirait un en-tête 16 bits
+                // pour un flux 24 — exactement le défaut que ce chemin corrige
+                // (#1654).
+                bit_depth_wire.min(24)
             } else if dlna_needs_wav {
                 // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
                 // 16-bit.
@@ -8431,6 +8535,100 @@ pub(crate) fn renderer_safe_wav_rate(source_rate: u32) -> u32 {
     }
 }
 
+/// Dire à l'auditeur pourquoi une station n'a pas joué.
+///
+/// Le décodage d'un flux radio tourne dans une tâche détachée : jusqu'ici son
+/// échec ne laissait qu'un `warn!` dans les journaux. Côté interface la lecture
+/// partait, la zone affichait la station, et il ne sortait rien — impossible de
+/// distinguer « la station est morte » de « Tune est cassé » (issue #1960).
+///
+/// `fatal: true` est indispensable et non décoratif : le client web étouffe un
+/// `zone.playback_error` reçu dans la fenêtre de grâce qui suit un ordre de
+/// lecture (elle couvre les pré-transcodages HI-RES lents, #1146), SAUF s'il
+/// est marqué fatal. Or une station morte échoue en moins d'une seconde,
+/// c'est-à-dire en plein dans cette fenêtre : sans ce drapeau le message
+/// afficherait « chargement… » puis plus rien du tout.
+fn emit_radio_playback_error(
+    bus: &Option<Arc<EventBus>>,
+    zone_id: i64,
+    station: &str,
+    error: &str,
+) {
+    let Some(bus) = bus else { return };
+    // Le flux répond, mais ce n'est pas de l'audio : on dit ce qui est arrivé
+    // en clair plutôt que de recopier une erreur de décodeur.
+    let message = if error.starts_with(RADIO_NOT_AUDIO) {
+        format!(
+            "« {station} » n'émet plus d'audio : le serveur renvoie une page web à la place du flux. La station a probablement changé d'adresse."
+        )
+    } else {
+        format!("Impossible de lire la station « {station} » : {error}")
+    };
+    bus.emit(
+        "zone.playback_error",
+        serde_json::json!({
+            "zone_id": zone_id,
+            "error": message,
+            "fatal": true,
+        }),
+    );
+}
+
+/// Préfixe des erreurs « le flux annoncé audio n'en est pas ». Il permet à
+/// l'appelant de distinguer ce cas d'une panne réseau : une station remplacée
+/// par une page web ne guérira pas en réessayant.
+pub(crate) const RADIO_NOT_AUDIO: &str = "radio_not_audio";
+
+/// Le `Content-Type` d'un flux radio dit-il, sans ambiguïté, que ce n'est PAS
+/// de l'audio ?
+///
+/// Le cas qui motive ce contrôle (issue #1960) : BBC Radio 3 a retiré son flux,
+/// `stream.live.vc.bbcmedia.co.uk/bbc_radio_three` redirige vers
+/// `www.bbc.co.uk` et répond **200 OK** en `text/html`. Rien n'échoue — le
+/// décodeur reçoit du HTML, ne trouve pas de piste audio, et l'auditeur n'a que
+/// du silence sans le moindre message. Un 404 se voit ; un 200 en HTML, non.
+///
+/// Volontairement une LISTE NOIRE, pas une liste blanche : les serveurs
+/// Icecast/Shoutcast annoncent tout et n'importe quoi (`application/octet-stream`,
+/// `application/ogg`, `audio/aacp`, parfois rien du tout), et refuser un flux
+/// sur un type inconnu ferait taire des stations qui marchent. On ne rejette
+/// donc que ce qui ne peut en aucun cas être un flux audio.
+///
+/// Renvoie `Some(étiquette)` — le type normalisé, à afficher — quand le flux
+/// n'est pas de l'audio ; `None` dans tous les autres cas, y compris un
+/// en-tête absent ou illisible.
+pub(crate) fn non_audio_content_type(content_type: &str) -> Option<String> {
+    // `text/html; charset=UTF-8` → `text/html`
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.is_empty() {
+        return None;
+    }
+    const NEVER_AUDIO: [&str; 5] = [
+        "text/html",
+        "application/xhtml+xml",
+        "text/css",
+        "application/json",
+        "image/",
+    ];
+    // Une entrée terminée par `/` est un préfixe de famille (`image/`), les
+    // autres sont des types exacts.
+    NEVER_AUDIO
+        .iter()
+        .any(|bad| {
+            if bad.ends_with('/') {
+                ct.starts_with(bad)
+            } else {
+                ct == *bad
+            }
+        })
+        .then_some(ct)
+}
+
 fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -8496,7 +8694,25 @@ fn decode_radio_stream_to_pcm(
             if !response.status().is_success() {
                 return Err(format!("radio HTTP error: {}", response.status()));
             }
-            info!(url = %url, "radio_local_decode_stream_connected");
+            // Le type réellement reçu, tracé à CHAQUE connexion : c'est la
+            // seule façon de savoir, la prochaine fois qu'une station meurt,
+            // ce que son serveur a répondu (issue #1960).
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            // Une station peut disparaître en répondant 200 : la BBC redirige
+            // son ancien flux vers sa page d'accueil. Sans ce contrôle, le
+            // décodeur avale du HTML, échoue plus loin sur un message obscur
+            // (« no audio track found ») et l'auditeur n'a que du silence.
+            if let Some(bad) = non_audio_content_type(&content_type) {
+                return Err(format!(
+                    "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
+                ));
+            }
+            info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
 
             let source = ReadOnlySource::new(response);
             let mss = MediaSourceStream::new(Box::new(source), Default::default());
@@ -8563,6 +8779,13 @@ fn decode_radio_stream_to_pcm(
             Err(e) => {
                 if reconnects == 0 {
                     // Initial connection failed — fail fast (bad URL, etc.)
+                    return Err(e);
+                }
+                // Une station remplacée par une page web ne redeviendra pas un
+                // flux audio en réessayant trente fois : on remonte l'erreur
+                // tout de suite pour qu'elle soit DITE, au lieu de quinze
+                // secondes de silence suivies d'un abandon muet.
+                if e.starts_with(RADIO_NOT_AUDIO) {
                     return Err(e);
                 }
                 reconnects += 1;
@@ -8867,6 +9090,8 @@ mod wav_override_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{RADIO_NOT_AUDIO, emit_radio_playback_error, non_audio_content_type};
+    use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
 
@@ -8890,6 +9115,115 @@ mod tests {
         // Hi-res radio kept as-is
         assert_eq!(renderer_safe_wav_rate(88200), 88200);
         assert_eq!(renderer_safe_wav_rate(96000), 96000);
+    }
+
+    /// Issue #1960 — le cas qui motive tout : BBC Radio 3 a retiré son flux,
+    /// l'ancienne adresse redirige vers la page d'accueil de la BBC et répond
+    /// **200 OK** en `text/html`. Rien n'échoue, le lecteur reçoit du HTML, et
+    /// l'auditeur n'a que du silence. Mesuré le 2026-08-20 :
+    /// `curl -sSL http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three`
+    /// → `200 | text/html | https://www.bbc.co.uk/`.
+    #[test]
+    fn html_served_instead_of_audio_is_detected() {
+        assert_eq!(
+            non_audio_content_type("text/html"),
+            Some("text/html".to_string())
+        );
+        // Le paramètre `charset` ne doit pas masquer le type — c'est la forme
+        // que renvoie Icecast sur ses 404 (`text/html; charset=UTF-8`).
+        assert_eq!(
+            non_audio_content_type("text/html; charset=UTF-8"),
+            Some("text/html".to_string())
+        );
+        // Casse et espaces : un en-tête HTTP n'est pas normalisé.
+        assert_eq!(
+            non_audio_content_type("  TEXT/HTML ;charset=utf-8"),
+            Some("text/html".to_string())
+        );
+        assert_eq!(
+            non_audio_content_type("application/json"),
+            Some("application/json".to_string())
+        );
+        assert_eq!(
+            non_audio_content_type("image/png"),
+            Some("image/png".to_string())
+        );
+    }
+
+    /// L'échec doit être DIT, et il doit survivre au client.
+    ///
+    /// Le client web étouffe un `zone.playback_error` reçu dans la fenêtre de
+    /// grâce qui suit un ordre de lecture, sauf s'il porte `fatal: true`
+    /// (App.svelte, `suppressedByPlayGrace`). Une station morte échoue en une
+    /// fraction de seconde, donc EN PLEIN dans cette fenêtre : sans le drapeau,
+    /// ce correctif afficherait « chargement… » et rien d'autre.
+    #[tokio::test]
+    async fn a_dead_station_is_reported_and_survives_the_grace_window() {
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+
+        emit_radio_playback_error(
+            &Some(bus.clone()),
+            7,
+            "BBC Radio 3",
+            &format!(
+                "{RADIO_NOT_AUDIO}: le serveur a répondu « text/html » au lieu d'un flux audio"
+            ),
+        );
+
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event_type, "zone.playback_error");
+        assert_eq!(ev.data["zone_id"], 7);
+        assert_eq!(
+            ev.data["fatal"], true,
+            "sans fatal:true le client étouffe le message dans sa fenêtre de grâce"
+        );
+        let msg = ev.data["error"].as_str().unwrap();
+        assert!(
+            msg.contains("BBC Radio 3"),
+            "le message doit nommer la station : {msg}"
+        );
+        assert!(
+            msg.contains("page web"),
+            "le message doit dire ce qui a été reçu à la place de l'audio : {msg}"
+        );
+    }
+
+    /// Sans bus (tests, démarrage partiel) on ne panique pas, on se tait.
+    #[test]
+    fn no_event_bus_is_not_a_panic() {
+        emit_radio_playback_error(&None, 1, "Station", "boom");
+    }
+
+    /// Le garde-fou ne doit RIEN casser : les types réellement servis par les
+    /// stations que nous livrons doivent tous passer. Relevés le 2026-08-20 sur
+    /// les 46 entrées de l'annuaire — `audio/aac` (Radio France),
+    /// `audio/mpeg` (Radio Classique, TSF Jazz, KEXP) — plus les fantaisies
+    /// classiques d'Icecast/Shoutcast, et le cas de l'en-tête absent.
+    #[test]
+    fn real_radio_content_types_pass_through() {
+        for ct in [
+            "audio/aac",
+            "audio/mpeg",
+            "audio/aacp",
+            "audio/ogg",
+            "audio/flac",
+            "audio/x-flac",
+            "application/ogg",
+            "application/octet-stream",
+            "audio/x-mpegurl",
+            "application/vnd.apple.mpegurl",
+            "video/mp2t",
+            // En-tête absent ou vide : on ne sait pas, donc on laisse passer.
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                non_audio_content_type(ct),
+                None,
+                "content-type « {ct} » refusé à tort — une station qui marche deviendrait muette"
+            );
+        }
     }
 
     /// Le rééchantillonnage 22050→44100 double bien le nombre de trames
@@ -10913,7 +11247,10 @@ mod bit_depth_cap_tests {
 
 #[cfg(test)]
 mod dop_routing_tests {
-    use super::{dop_requested, dop_wire_params};
+    use super::{
+        AudioFormat, conteneur_a_profondeur_cachee, dop_requested, dop_wire_params,
+        profondeur_sondee_si_la_base_ignore,
+    };
 
     /// #1772 — le cas RÉEL de Marco Polo : Wiim Pro (renderer DLNA) relié en
     /// optique à un DAC Denafrips, zone réglée sur « dop ». Avant le correctif,
@@ -10959,6 +11296,53 @@ mod dop_routing_tests {
     fn ni_locale_ni_reseau_ne_recoit_rien() {
         assert!(!dop_requested(false, false, "dop"));
         assert!(!dop_requested(false, false, "native"));
+    }
+
+    /// #1657 — le mode par DÉFAUT ne produit de DoP nulle part.
+    ///
+    /// Ce test ne demande pas que « auto » change de comportement : il fixe le
+    /// fait, pour que personne ne le redécouvre en cherchant un défaut de
+    /// lecture. C'est ce fait, tu et non documenté, qui a fait passer un réglage
+    /// par défaut pour un DSD cassé.
+    #[test]
+    fn le_mode_auto_ne_produit_de_dop_nulle_part() {
+        assert!(!dop_requested(true, false, "auto"));
+        assert!(!dop_requested(false, true, "auto"));
+        assert!(!dop_requested(false, false, "auto"));
+        // Et le voisin qui piège tout autant : en RÉSEAU, « natif » non plus.
+        assert!(!dop_requested(false, true, "native"));
+    }
+
+    /// #1654 — seul l'ALAC cache sa profondeur ; sonder le reste serait de
+    /// l'E/S pour rien.
+    #[test]
+    fn seul_lalac_a_une_profondeur_cachee() {
+        assert!(conteneur_a_profondeur_cachee(Some(AudioFormat::Alac)));
+        for f in [
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Dsd,
+            AudioFormat::Aac,
+            AudioFormat::Mp3,
+        ] {
+            assert!(!conteneur_a_profondeur_cachee(Some(f)), "{f:?}");
+        }
+        assert!(!conteneur_a_profondeur_cachee(None));
+    }
+
+    /// Un fichier illisible ne doit jamais faire échouer la lecture : la sonde
+    /// rend `None`, l'appelant garde ce que dit la base.
+    #[test]
+    fn une_sonde_qui_echoue_laisse_la_base_decider() {
+        assert_eq!(
+            profondeur_sondee_si_la_base_ignore("/inexistant/x.m4a", Some(AudioFormat::Alac)),
+            None
+        );
+        // Et un conteneur hors périmètre n'est même pas ouvert.
+        assert_eq!(
+            profondeur_sondee_si_la_base_ignore("/inexistant/x.flac", Some(AudioFormat::Flac)),
+            None
+        );
     }
 
     /// #1894 — l'en-tête WAV doit décrire le FICHIER, jamais la ligne `tracks`.

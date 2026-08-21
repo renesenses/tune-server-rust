@@ -754,7 +754,7 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
 
--- albums: drapeau « compilation » (SQLite migration v78, #1957). TEXT 0/1 comme
+-- albums: drapeau « compilation » (SQLite migration v79, #1957). TEXT 0/1 comme
 -- les autres booléens copiés ; la migration PG 028 le ramène à SMALLINT après.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS is_compilation TEXT DEFAULT 0;
 

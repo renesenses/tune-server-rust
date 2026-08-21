@@ -320,7 +320,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let is_changed = |path: &std::path::Path| {
             crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
         };
-        let stat_pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().ok();
+        // `scan_io_concurrency()` et non 32 en dur : ce pool ignorait
+        // `TUNE_SCAN_IO_CONCURRENCY`, donc régler la variable ne calmait que la
+        // moitié de la charge — et personne ne comprenait pourquoi (#1948).
+        let stat_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(tune_core::scanner::walker::scan_io_concurrency())
+            .build()
+            .ok();
         let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
             Some(pool) => {
                 pool.install(|| files.into_par_iter().filter(|p| is_changed(p)).collect())

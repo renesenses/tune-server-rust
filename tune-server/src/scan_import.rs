@@ -375,7 +375,16 @@ impl TrackImporter {
         if let Some(ref album_title) = meta.album {
             let t = album_title.to_lowercase();
             if t.contains("best") || t.contains("greatest") || t.contains("hits") {
-                tracing::info!(
+                // `debug!`, et non `info!` : cette sonde est émise UNE FOIS PAR
+                // PISTE de tout album dont le titre contient « best »,
+                // « greatest » ou « hits ». Chez un testeur, 311 lignes en dix
+                // minutes sur 35 albums — dont 31 pour le seul « Very Best of
+                // Maria Callas » — soit 31 % de la fenêtre du rapport de bogue,
+                // qui ne retient que l'INFO et au-dessus (#2028). Elle a servi
+                // à instruire les compilations ; laissée en `info!`, elle coûte
+                // désormais plus qu'elle ne rapporte : elle chasse du rapport
+                // ce qu'on y cherchait.
+                tracing::debug!(
                     album = %album_title,
                     album_artist_tag = ?meta.album_artist,
                     artist_tag = ?meta.artist,

@@ -257,4 +257,136 @@ mod tests {
         assert_eq!(status.duration_ms, 300_000);
         handle.abort();
     }
+
+    // ---- #1984 : le renderer raccroche avant d'avoir fini de répondre --------
+
+    /// Lit une requête HTTP entière (en-têtes + corps annoncé par
+    /// `Content-Length`) pour ne pas répondre avant que le client ait fini
+    /// d'écrire — sinon la réponse part dans un socket que le client est encore
+    /// en train de remplir, et le test échouerait pour une raison qui n'est pas
+    /// celle qu'il mesure.
+    async fn lire_requete_entiere(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut brut = Vec::new();
+        let mut tampon = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut tampon).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            brut.extend_from_slice(&tampon[..n]);
+            let texte = String::from_utf8_lossy(&brut).to_string();
+            let Some(fin_entetes) = texte.find("\r\n\r\n") else {
+                continue;
+            };
+            let attendu: usize = texte
+                .lines()
+                .find_map(|l| {
+                    let (nom, valeur) = l.split_once(':')?;
+                    nom.eq_ignore_ascii_case("content-length")
+                        .then(|| valeur.trim().parse().ok())?
+                })
+                .unwrap_or(0);
+            if brut.len() >= fin_entetes + 4 + attendu {
+                return texte;
+            }
+        }
+        String::from_utf8_lossy(&brut).to_string()
+    }
+
+    /// Renderer qui se comporte comme le Marantz ND8006 de Jean Valjean : la
+    /// **première** connexion est acceptée, la requête lue, puis le socket
+    /// refermé sans le moindre octet de réponse — le symptôme d'une pile HTTP
+    /// embarquée qui a raccroché sur une connexion mutualisée. Les connexions
+    /// suivantes répondent normalement.
+    ///
+    /// Renvoie l'URL de base et un compteur de connexions acceptées.
+    async fn renderer_qui_raccroche_une_fois()
+    -> (String, Arc<AtomicU32>, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connexions = Arc::new(AtomicU32::new(0));
+        let compteur = connexions.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let rang = compteur.fetch_add(1, Ordering::SeqCst);
+                if rang == 0 {
+                    // Le socket mort : on lit, on ne répond pas, on raccroche.
+                    let _ = lire_requete_entiere(&mut sock).await;
+                    drop(sock);
+                    continue;
+                }
+                let _ = lire_requete_entiere(&mut sock).await;
+                let corps = concat!(
+                    r#"<?xml version="1.0"?>"#,
+                    r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">"#,
+                    "<s:Body><u:GetProtocolInfoResponse><Sink>",
+                    "http-get:*:audio/L16;rate=44100;channels=2:*,",
+                    "http-get:*:audio/L24;rate=96000;channels=2:*,",
+                    "http-get:*:audio/flac:*",
+                    "</Sink></u:GetProtocolInfoResponse></s:Body></s:Envelope>",
+                );
+                let reponse = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{corps}",
+                    corps.len()
+                );
+                let _ = sock.write_all(reponse.as_bytes()).await;
+                let _ = sock.flush().await;
+                // Laisser le client lire avant de fermer.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://127.0.0.1:{port}"), connexions, handle)
+    }
+
+    /// #1984 — « Impossible de lire les capacités du renderer » alors que
+    /// l'appareil est allumé, détecté et en train de jouer.
+    ///
+    /// La sonde `GetProtocolInfo` tombait sur une connexion que le renderer
+    /// avait refermée. `reqwest` rend alors une erreur qui n'est ni
+    /// `is_connect()` ni `is_timeout()` : la garde de `soap_action` ne la
+    /// reconnaissait pas, sortait par le bras « erreur définitive », et
+    /// n'essayait pas une seconde fois. `caps` restait vide, et le bouton
+    /// « WAV 24 bits » restait grisé alors que le Sink annonce `audio/L24`.
+    #[tokio::test]
+    async fn les_capacites_se_lisent_malgre_une_connexion_raccrochee() {
+        let (base, connexions, handle) = renderer_qui_raccroche_une_fois().await;
+        let output = DlnaOutput::new(
+            "Marantz ND8006".into(),
+            "uuid:56fcb4ae".into(),
+            "127.0.0.1".into(),
+            format!("{base}/upnp/control/renderer_dvc/AVTransport"),
+            format!("{base}/upnp/control/renderer_dvc/RenderingControl"),
+            Some(format!(
+                "{base}/upnp/control/renderer_dvc/ConnectionManager"
+            )),
+        );
+
+        let caps = output.probe_capabilities().await;
+
+        assert!(
+            caps.probed,
+            "la sonde doit aboutir : le renderer répond dès la deuxième connexion"
+        );
+        assert!(
+            caps.lpcm24,
+            "audio/L24 est annoncé — le bouton 24 bits doit s'armer"
+        );
+        assert!(caps.flac, "audio/flac est annoncé");
+        assert_eq!(
+            connexions.load(Ordering::SeqCst),
+            2,
+            "il faut exactement une seconde tentative, sur une connexion neuve"
+        );
+        handle.abort();
+    }
 }
