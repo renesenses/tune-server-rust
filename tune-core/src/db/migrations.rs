@@ -479,11 +479,22 @@ INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Contemporaine', 'https://icecast.radiofrance.fr/francemusiquelacontemporaine-hifi.aac', 'Contemporaine', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Baroque', 'https://icecast.radiofrance.fr/francemusiquebaroque-hifi.aac', 'Classique', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Opéra', 'https://icecast.radiofrance.fr/francemusiqueopera-hifi.aac', 'Classique', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Musique Musiques du monde', 'https://icecast.radiofrance.fr/francemusiqueocoramondial-hifi.aac', 'Monde', 'France');
+-- France Musique Musiques du monde (slug francemusiqueocoramondial) used to be
+-- seeded here: Radio France answers 404 on that slug since at least
+-- 2026-08-20, while the eight other France Musique webradios above answer 200
+-- with content-type audio/aac. Migration 78 removes it from databases that
+-- already seeded it.
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Culture', 'https://icecast.radiofrance.fr/franceculture-hifi.aac', 'Culture', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('France Inter', 'https://icecast.radiofrance.fr/franceinter-hifi.aac', 'Généraliste', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('Mouv''', 'https://icecast.radiofrance.fr/mouv-hifi.aac', 'Hip-Hop', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('Mouv'' Xtra', 'https://icecast.radiofrance.fr/mouvxtra-hifi.aac', 'Hip-Hop', 'France');
+-- Mouv Xtra (slug mouvxtra) used to be seeded here, same verdict: 404 while
+-- the Mouv entry just above answers 200. Migration 78 removes it too.
+--
+-- How to check before adding a station back, or a new one (issue #1960): fetch
+-- the URL with redirects followed and look at BOTH the status and the
+-- content-type. Anything but a 2xx with an audio-ish content-type is a station
+-- that cannot play. A 200 answering text/html is the worst case: nothing errors
+-- out and the listener just gets silence.
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('Radio Classique', 'https://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3', 'Classique', 'France');
 ",
     },
@@ -1024,6 +1035,25 @@ WHERE key IN ('rg_album_gain','rg_album_peak')
         // migration 7, et un ALTER TABLE ici planterait tout le runner en
         // « duplicate column name ».
         up: "",
+    },
+    Migration {
+        version: 78,
+        name: "drop_dead_radiofrance_webradios",
+        // Deux stations semées n'ont plus de flux : Radio France répond 404 sur
+        // `francemusiqueocoramondial` (France Musique Musiques du monde) et sur
+        // `mouvxtra` (Mouv' Xtra), quand les vingt-trois autres entrées semées
+        // répondent 200 avec un content-type audio (relevé le 2026-08-20).
+        // Elles étaient donc, dans toute bibliothèque créée jusqu'ici, deux
+        // stations qui ne pouvaient pas jouer (issue #1960).
+        //
+        // Ciblé sur l'URL et jamais sur le nom, comme la migration 70 : le nom
+        // est ce que l'utilisateur a pu éditer, l'URL est ce qui identifie le
+        // flux mort. Une station repointée par l'utilisateur vers une URL qui
+        // marche survit donc. Idempotent — un second passage ne supprime rien.
+        up: "
+DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/francemusiqueocoramondial-hifi.aac';
+DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/mouvxtra-hifi.aac';
+",
     },
 ];
 
@@ -2831,6 +2861,93 @@ mod tests {
             live_after,
             live_before - 2,
             "migration 70 removed more than the two dead stations"
+        );
+    }
+
+    /// Issue #1960 : deux webradios Radio France semées dont le flux répond
+    /// 404. Une bibliothèque neuve ne doit pas les porter, et une bibliothèque
+    /// qui les a déjà semées doit les perdre.
+    #[test]
+    fn dead_radiofrance_webradios_are_gone() {
+        const DEAD: [&str; 2] = [
+            "https://icecast.radiofrance.fr/francemusiqueocoramondial-hifi.aac",
+            "https://icecast.radiofrance.fr/mouvxtra-hifi.aac",
+        ];
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let count_dead = || {
+            let conn = db.connection().lock().unwrap();
+            DEAD.iter()
+                .map(|url| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM radio_stations WHERE url = ?1",
+                        [url],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                })
+                .sum::<i64>()
+        };
+
+        // Installation neuve : jamais semées.
+        assert_eq!(count_dead(), 0, "station morte semée sur une base neuve");
+
+        // Installation existante : on les réinsère comme l'ancien seed le
+        // faisait, puis on rejoue la migration. Elle doit les retirer, et
+        // laisser les stations vivantes tranquilles.
+        {
+            let conn = db.connection().lock().unwrap();
+            for url in DEAD {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country) VALUES ('x', ?1, 'g', 'France')",
+                    [url],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(count_dead(), 2, "la fixture n'a rien inséré");
+
+        let live_before = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url LIKE '%radiofrance%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        // Rejouer la migration est ce que fait une mise à jour d'une base
+        // restée sous la version 78 ; on la force ici, cette base étant déjà
+        // à jour.
+        {
+            let conn = db.connection().lock().unwrap();
+            let m = MIGRATIONS.iter().find(|m| m.version == 78).unwrap();
+            conn.execute_batch(m.up).unwrap();
+            // Idempotent : un second passage doit aussi être un non-événement.
+            conn.execute_batch(m.up).unwrap();
+        }
+
+        assert_eq!(
+            count_dead(),
+            0,
+            "la migration 78 a laissé une station morte"
+        );
+        let live_after = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url LIKE '%radiofrance%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            live_after,
+            live_before - 2,
+            "la migration 78 a retiré plus que les deux stations mortes"
         );
     }
 
