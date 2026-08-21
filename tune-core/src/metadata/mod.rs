@@ -1459,26 +1459,70 @@ fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
     }
 }
 
-fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
+/// Écarter une durée MP3 franchement incohérente avec la taille du fichier.
+///
+/// Le besoin est réel (`1e06a2c0`) : sans en-tête XING/VBRI, ou avec un
+/// en-tête corrompu, lofty compte mal les trames et annonce n'importe quoi —
+/// 184 s pour un fichier de 84 s — d'où un `seek` au-delà de la fin.
+///
+/// # La borne était prise à l'envers
+///
+/// La version précédente divisait la taille par le débit **maximum** :
+///
+/// ```text
+/// max_plausible_ms = taille×8000 / 320_000     // « durée plausible maximale »
+/// if lofty_ms > max_plausible_ms × 2 { … }
+/// ```
+///
+/// Diviser par le débit maximum donne la durée **minimale** possible, pas la
+/// maximale. Le test se réduisait donc à `débit_réel < 160 kbps`, et **tout
+/// MP3 sous 160 kbps voyait sa durée réécrite** — à la durée qu'aurait le
+/// fichier en 320 kbps, soit divisée par `320/débit_réel`.
+///
+/// Mesuré sur l'export d'un testeur (#2027, fil forum #1479) : 322
+/// avertissements en dix minutes, débit réel de 65 à 159 kbps, **les 322 sans
+/// exception**. La borne haute mesurée est exactement le seuil théorique — ce
+/// n'était pas un lot de fichiers abîmés, c'était le seuil qui coupait la
+/// population en deux. Un fichier de 4 min 02 en 130 kbps était inscrit en
+/// base à 1 min 38.
+///
+/// # La bonne référence est le débit du fichier lui-même
+///
+/// La taille seule ne peut pas trancher : un fichier long à bas débit et un
+/// fichier court à durée sur-annoncée pèsent pareil. Aucun réglage du seuil
+/// n'y change rien — il faut la deuxième grandeur, et lofty la donne.
+///
+/// Sur un XING corrompu, c'est le **compte de trames** qui est faux ; l'en-tête
+/// de trame, donc le débit, reste juste. La durée impliquée par le débit vaut
+/// alors 84 s et écarte bien les 184 s annoncés : le cas qui a motivé la garde
+/// est mieux traité qu'avant.
+///
+/// Sans débit exploitable, on ne corrige rien : mieux vaut une durée douteuse
+/// qu'une durée inventée.
+fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64, bitrate_kbps: Option<u32>) -> u64 {
     let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
         .map(|m| m.len())
         .unwrap_or(0);
     if file_size == 0 || lofty_ms == 0 {
         return lofty_ms;
     }
-    // Estimate duration from file size assuming ~320kbps max bitrate.
-    // If lofty reports more than 2x this estimate, it's likely wrong.
-    let max_bitrate_bps = 320_000u64;
-    let max_plausible_ms = (file_size * 8 * 1000) / max_bitrate_bps;
-    if lofty_ms > max_plausible_ms * 2 {
+    let Some(kbps) = bitrate_kbps.filter(|k| *k > 0) else {
+        return lofty_ms;
+    };
+    // taille (octets) × 8 bits ÷ (kbps × 1000 bits/s) × 1000 ms/s, simplifié.
+    let implique_ms = (file_size * 8) / kbps as u64;
+    // Facteur 2 conservé : on ne corrige que l'incohérence franche, pas le
+    // flottement normal entre le débit annoncé et le débit réel d'un VBR.
+    if lofty_ms > implique_ms * 2 {
         tracing::warn!(
             path = %path.display(),
             lofty_ms,
-            max_plausible_ms,
+            implique_ms,
+            kbps,
             file_size,
             "mp3_duration_implausible_clamping"
         );
-        max_plausible_ms
+        implique_ms
     } else {
         lofty_ms
     }
@@ -1624,6 +1668,37 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// La durée réelle d'un fichier, lue sans aucun garde-fou de vraisemblance.
+///
+/// `read_metadata` fait passer les MP3 par `mp3_duration_sanity_check`. Une
+/// passe de RÉPARATION ne peut donc pas s'en servir : elle relirait la valeur
+/// par le chemin qui l'a corrompue. Cette fonction ouvre le fichier et rend ce
+/// que lofty mesure, rien d'autre.
+///
+/// Elle reste correcte que la borne soit corrigée ou non — c'est précisément
+/// pourquoi la réparation ne dépend pas de l'ordre des correctifs.
+pub fn probe_duration_ms(path: &Path) -> Option<u64> {
+    use lofty::config::{ParseOptions, ParsingMode};
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    let tagged = Probe::open(path)
+        .and_then(|p| {
+            p.options(
+                ParseOptions::new()
+                    .parsing_mode(ParsingMode::Relaxed)
+                    .max_junk_bytes(1024 * 1024)
+                    .read_cover_art(false),
+            )
+            .guess_file_type()?
+            .read()
+        })
+        .ok()?;
+
+    let ms = tagged.properties().duration().as_millis() as u64;
+    (ms > 0).then_some(ms)
 }
 
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
@@ -1867,7 +1942,11 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
                 .unwrap_or("")
                 .to_lowercase();
             if ext == "mp3" {
-                Some(mp3_duration_sanity_check(path, lofty_dur))
+                Some(mp3_duration_sanity_check(
+                    path,
+                    lofty_dur,
+                    props.audio_bitrate(),
+                ))
             } else {
                 Some(lofty_dur)
             }
@@ -3423,5 +3502,136 @@ mod tests {
         assert_eq!(syncsafe_to_u32(&[0, 0, 0, 127]), 127);
         assert_eq!(syncsafe_to_u32(&[0, 0, 1, 0]), 128);
         assert_eq!(syncsafe_to_u32(&[0, 0, 2, 0]), 256);
+    }
+
+    /// Fabriquer un fichier de la taille voulue, pour éprouver la garde de
+    /// durée sans dépendre d'un vrai MP3 : elle ne lit que `len()`.
+    fn fichier_de(taille: u64) -> tempfile::NamedTempFile {
+        let f = tempfile::Builder::new().suffix(".mp3").tempfile().unwrap();
+        f.as_file().set_len(taille).unwrap();
+        f
+    }
+
+    /// Le cas de Bilou, repris tel quel de son journal (#2027, fil #1479) :
+    /// 3 933 560 octets pour 242 051 ms, soit 130 kbps. Un MP3 parfaitement
+    /// ordinaire, que l'ancienne garde réécrivait à 98 339 ms — 1 min 38 au
+    /// lieu de 4 min 02.
+    #[test]
+    fn un_mp3_a_130_kbps_garde_sa_duree() {
+        let f = fichier_de(3_933_560);
+        let vue = mp3_duration_sanity_check(f.path(), 242_051, Some(130));
+        assert_eq!(vue, 242_051, "une durée juste ne doit pas être corrigée");
+    }
+
+    /// Le seuil de l'ancienne garde était `débit < 160 kbps`. On balaie de part
+    /// et d'autre : aucun de ces fichiers n'est incohérent, aucun ne doit être
+    /// touché.
+    #[test]
+    fn aucun_debit_courant_ne_declenche_la_garde() {
+        for kbps in [64u32, 96, 128, 159, 160, 192, 256, 320] {
+            let duree_ms = 240_000u64;
+            let taille = duree_ms * kbps as u64 / 8;
+            let f = fichier_de(taille);
+            let vue = mp3_duration_sanity_check(f.path(), duree_ms, Some(kbps));
+            assert_eq!(vue, duree_ms, "{kbps} kbps ne doit pas être corrigé");
+        }
+    }
+
+    /// Le défaut d'origine (`1e06a2c0`) : XING corrompu, 184 s annoncés pour un
+    /// fichier de 84 s. Le compte de trames est faux, le débit reste juste —
+    /// la garde doit donc toujours l'attraper, et ramener à 84 s.
+    #[test]
+    fn une_duree_sur_annoncee_est_toujours_ramenee() {
+        let kbps = 128u32;
+        let vraie_ms = 84_000u64;
+        let taille = vraie_ms * kbps as u64 / 8;
+        let f = fichier_de(taille);
+        let vue = mp3_duration_sanity_check(f.path(), 184_000, Some(kbps));
+        assert_eq!(vue, vraie_ms);
+    }
+
+    #[test]
+    fn le_facteur_deux_laisse_passer_le_flottement_dun_vbr() {
+        // Un VBR annonce son débit moyen : la durée réelle peut s'écarter un
+        // peu de celle qu'il implique. On ne corrige que l'écart franc.
+        let f = fichier_de(240_000 * 128 / 8);
+        assert_eq!(
+            mp3_duration_sanity_check(f.path(), 300_000, Some(128)),
+            300_000
+        );
+        assert_eq!(
+            mp3_duration_sanity_check(f.path(), 479_000, Some(128)),
+            479_000
+        );
+        // Au-delà du double, c'est autre chose qu'un flottement.
+        assert_eq!(
+            mp3_duration_sanity_check(f.path(), 600_000, Some(128)),
+            240_000
+        );
+    }
+
+    #[test]
+    fn sans_debit_exploitable_on_ne_corrige_rien() {
+        // Mieux vaut une durée douteuse qu'une durée inventée.
+        let f = fichier_de(1_000_000);
+        assert_eq!(mp3_duration_sanity_check(f.path(), 999_999, None), 999_999);
+        assert_eq!(
+            mp3_duration_sanity_check(f.path(), 999_999, Some(0)),
+            999_999
+        );
+    }
+
+    #[test]
+    fn un_fichier_absent_ou_vide_est_laisse_tel_quel() {
+        let f = fichier_de(0);
+        assert_eq!(
+            mp3_duration_sanity_check(f.path(), 120_000, Some(128)),
+            120_000
+        );
+        let inexistant = std::path::Path::new("/n/existe/pas/x.mp3");
+        assert_eq!(
+            mp3_duration_sanity_check(inexistant, 120_000, Some(128)),
+            120_000
+        );
+    }
+
+    // --- Réparation des durées MP3 rognées (#2027, #2034) ---
+
+    #[test]
+    fn probe_duration_ms_rend_none_sur_un_fichier_absent() {
+        // La passe de réparation compte les illisibles séparément des
+        // inchangées : confondre les deux ferait passer un disque débranché
+        // pour « rien à réparer ».
+        assert!(probe_duration_ms(Path::new("/nexiste/pas/rien.mp3")).is_none());
+    }
+
+    #[test]
+    fn signature_de_rognage_vaut_la_taille_divisee_par_quarante() {
+        // Ce que la borne inversée écrivait en base :
+        //     max_plausible_ms = file_size * 8 * 1000 / 320_000
+        //
+        // Cette égalité est la SIGNATURE que la requête de réparation
+        // recherche. Elle décrit une corruption HISTORIQUE, déjà écrite sur
+        // les disques des utilisateurs : elle ne doit PAS suivre une éventuelle
+        // reformulation de `mp3_duration_sanity_check`. Corriger la lecture
+        // n'efface pas les valeurs déjà persistées.
+        for taille in [1_000_000u64, 4_845_600, 7_340_032, 40, 41] {
+            let ecrit = taille * 8 * 1000 / 320_000;
+            assert_eq!(
+                ecrit,
+                taille / 40,
+                "la signature recherchée par la réparation ne tient plus pour {taille}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_mp3_a_320_kbps_constant_porte_la_signature_sans_avoir_ete_rogne() {
+        // Faux positif inoffensif, documenté pour qui relira la requête : à
+        // 320 kbps constant, la durée réelle EST `taille / 40`. La passe relit
+        // le fichier et récrit la même valeur — aucun dégât possible.
+        let taille = 4_800_000u64;
+        let duree_reelle_a_320k = taille * 8 * 1000 / 320_000;
+        assert_eq!(duree_reelle_a_320k, taille / 40);
     }
 }

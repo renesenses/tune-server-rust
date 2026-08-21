@@ -22,6 +22,28 @@ fn probe_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool 
     }
 }
 
+/// Session déjà ouverte sur l'appareil pour l'application `app_id`, s'il y en
+/// a une : `(transport_id, session_id)`, de quoi charger un média sans rien
+/// relancer.
+///
+/// Envoyer `LAUNCH` à un récepteur qui fait DÉJÀ tourner l'application
+/// demandée le redémarre : l'enceinte rejoue son carillon de démarrage. C'est
+/// ce que FabienM entend à chaque piste (#1953), puisque `play_url` lançait
+/// l'application sans jamais regarder si elle tournait. Les autres télécommandes
+/// Cast font ce contrôle (pychromecast n'émet `LAUNCH` que si `app_id` diffère
+/// de celui en cours) ; nous ne le faisions pas.
+///
+/// Rend `None` si l'appareil est au repos ou occupé par une AUTRE application
+/// (YouTube, Spotify…) : il faut alors bel et bien lancer la nôtre.
+fn reusable_session(
+    apps: &[rust_cast::channels::receiver::Application],
+    app_id: &str,
+) -> Option<(String, String)> {
+    apps.iter()
+        .find(|a| a.app_id == app_id)
+        .map(|a| (a.transport_id.clone(), a.session_id.clone()))
+}
+
 pub struct ChromecastOutput {
     name: String,
     device_id: String,
@@ -97,21 +119,41 @@ impl OutputTarget for ChromecastOutput {
                 .connect("receiver-0")
                 .map_err(|e| format!("connect receiver: {e}"))?;
 
-            let app = device
+            // Réutiliser la session en cours plutôt que de relancer le
+            // récepteur : un LAUNCH sur une application déjà lancée la
+            // redémarre, et l'enceinte carillonne (#1953). Un GET_STATUS
+            // en échec retombe sur le lancement — le comportement d'avant.
+            let app_id =
+                rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver.to_string();
+            let existing = device
                 .receiver
-                .launch_app(&rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver)
-                .map_err(|e| format!("launch app: {e}"))?;
+                .get_status()
+                .ok()
+                .and_then(|s| reusable_session(&s.applications, &app_id));
+
+            let (transport_id, session_id, session_reused) = match existing {
+                Some((transport_id, session_id)) => (transport_id, session_id, true),
+                None => {
+                    let app = device
+                        .receiver
+                        .launch_app(
+                            &rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver,
+                        )
+                        .map_err(|e| format!("launch app: {e}"))?;
+                    (app.transport_id, app.session_id, false)
+                }
+            };
 
             device
                 .connection
-                .connect(&app.transport_id)
+                .connect(&transport_id)
                 .map_err(|e| format!("connect transport: {e}"))?;
 
             device
                 .media
                 .load(
-                    &app.transport_id,
-                    &app.session_id,
+                    &transport_id,
+                    &session_id,
                     &rust_cast::channels::media::Media {
                         content_id: url.clone(),
                         content_type: mime,
@@ -134,7 +176,10 @@ impl OutputTarget for ChromecastOutput {
                 )
                 .map_err(|e| format!("load media: {e}"))?;
 
-            info!(device = %name, url, "chromecast_play");
+            // `session_reused=false` sur une piste qui n'est pas la première
+            // d'une écoute désigne le vrai coupable du carillon : la session
+            // n'a pas survécu au changement de piste.
+            info!(device = %name, url, session_reused, "chromecast_play");
             Ok::<(), String>(())
         })
         .await
@@ -497,6 +542,73 @@ mod probe_tests {
             8009,
             std::time::Duration::from_millis(500)
         ));
+    }
+}
+
+/// Non-régression #1953 : une piste ne doit pas relancer le récepteur.
+///
+/// `LAUNCH` sur une application déjà en cours la redémarre, et l'enceinte
+/// rejoue son carillon de démarrage — FabienM l'entendait à chaque titre.
+/// Ces tests portent sur la DÉCISION (relancer ou réutiliser), la seule
+/// partie vérifiable sans matériel : ils ne prouvent rien de l'audible.
+#[cfg(test)]
+mod session_reuse_tests {
+    use super::*;
+    use rust_cast::channels::receiver::{Application, CastDeviceApp};
+
+    const DEFAULT_MEDIA_RECEIVER: &str = "CC1AD845";
+
+    fn app(app_id: &str) -> Application {
+        Application {
+            app_id: app_id.to_string(),
+            session_id: format!("session-{app_id}"),
+            transport_id: format!("transport-{app_id}"),
+            namespaces: vec![],
+            display_name: app_id.to_string(),
+            status_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn app_id_du_lecteur_par_defaut_est_bien_celui_interroge() {
+        // La comparaison ne vaut que si les deux côtés parlent du même id.
+        assert_eq!(
+            CastDeviceApp::DefaultMediaReceiver.to_string(),
+            DEFAULT_MEDIA_RECEIVER
+        );
+    }
+
+    #[test]
+    fn session_en_cours_reutilisee_donc_aucun_relancement() {
+        let apps = vec![app(DEFAULT_MEDIA_RECEIVER)];
+        let found = reusable_session(&apps, DEFAULT_MEDIA_RECEIVER);
+        assert_eq!(
+            found,
+            Some((
+                "transport-CC1AD845".to_string(),
+                "session-CC1AD845".to_string()
+            )),
+            "le récepteur tourne déjà : il faut charger dans SA session, pas la relancer"
+        );
+    }
+
+    #[test]
+    fn appareil_au_repos_impose_un_lancement() {
+        assert_eq!(reusable_session(&[], DEFAULT_MEDIA_RECEIVER), None);
+    }
+
+    #[test]
+    fn autre_application_impose_un_lancement() {
+        // YouTube occupe l'appareil : reprendre SA session chargerait le média
+        // dans une application qui ne sait pas le lire.
+        let apps = vec![app("233637DE")];
+        assert_eq!(reusable_session(&apps, DEFAULT_MEDIA_RECEIVER), None);
+    }
+
+    #[test]
+    fn le_lecteur_est_retrouve_meme_derriere_une_autre_application() {
+        let apps = vec![app("233637DE"), app(DEFAULT_MEDIA_RECEIVER)];
+        assert!(reusable_session(&apps, DEFAULT_MEDIA_RECEIVER).is_some());
     }
 }
 

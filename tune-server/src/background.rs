@@ -36,6 +36,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
+    spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
     spawn_social_sharing_listener(state);
@@ -62,6 +63,137 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 /// 3 consecutive that don't recover → clean stop) prevents a restart loop on a
 /// permanently-dead source. History is cleared once a device plays cleanly again.
 #[cfg(feature = "oaat")]
+/// Réparer les durées MP3 rognées par la borne inversée (#2027, #2034).
+///
+/// `mp3_duration_sanity_check` divisait la taille du fichier par le débit
+/// MAXIMUM (320 kbps) pour en déduire une durée « plausible maximale ». C'est
+/// la borne MINIMALE : le garde se déclenchait donc dès que le débit réel
+/// passait sous 160 kbps, et **réécrivait la durée en base**. Un morceau de
+/// 4 min 02 en 130 kbps était inscrit à 1 min 38.
+///
+/// Corriger la lecture ne suffit pas : les valeurs fausses sont persistées, et
+/// un scan ordinaire saute les fichiers dont le mtime et la taille n'ont pas
+/// bougé — elles ne seraient donc jamais relues. D'où cette passe.
+///
+/// Ce n'est pas un détail d'affichage. `duration_ms` note les candidats
+/// MusicBrainz : ±10 points selon l'écart, sur une échelle où un candidat
+/// sous 30 est REJETÉ. Une durée fausse de deux minutes coûte 20 points et
+/// peut faire rejeter un appariement correct — l'enrichissement d'une
+/// bibliothèque en 128 kbps est silencieusement dégradé.
+///
+/// **La détection est une requête, pas un balayage.** La valeur écrite lors du
+/// rognage vaut exactement `file_size * 8 * 1000 / 320_000`, soit
+/// `file_size / 40` en division entière. On ne relit donc que les fichiers
+/// dont la durée porte cette signature. La tolérance de ±1 ms absorbe un
+/// arrondi ultérieur — une égalité stricte raterait une piste pour un
+/// millième.
+///
+/// Un MP3 réellement encodé à 320 kbps constant porte cette signature SANS
+/// avoir été rogné. Le relire est sans effet : on récrit la durée qu'il a
+/// déjà. Le faux positif est donc inoffensif par construction.
+fn spawn_mp3_duration_repair(state: &AppState) {
+    let backend = state.backend.clone();
+    tokio::spawn(async move {
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        if reglages
+            .get("mp3_duration_repair_done")
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+
+        // Laisser le démarrage se terminer : cette passe lit des fichiers, et
+        // rien ne presse au moment où l'utilisateur attend son interface.
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+
+        let candidats = match backend.query_many(
+            "SELECT id, file_path, duration_ms, file_size FROM tracks              WHERE file_path LIKE '%.mp3'                AND file_size IS NOT NULL AND file_size > 0                AND duration_ms IS NOT NULL                AND ABS(duration_ms - file_size / 40) <= 1",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "mp3_duration_repair_query_failed");
+                return;
+            }
+        };
+
+        // Combien de MP3 échappent à la détection faute de taille connue :
+        // sans ce chiffre, « 0 piste réparée » se lirait « rien à réparer ».
+        let sans_taille = backend
+            .query_one(
+                "SELECT COUNT(*) FROM tracks WHERE file_path LIKE '%.mp3'                  AND (file_size IS NULL OR file_size = 0)",
+                &[],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+
+        if candidats.is_empty() {
+            info!(sans_taille, "mp3_duration_repair_rien_a_faire");
+            let _ = reglages.set("mp3_duration_repair_done", "1");
+            return;
+        }
+
+        let total = candidats.len();
+        info!(total, sans_taille, "mp3_duration_repair_demarre");
+
+        let mut reparees = 0usize;
+        let mut inchangees = 0usize;
+        let mut illisibles = 0usize;
+
+        for ligne in &candidats {
+            let (Some(id), Some(chemin), Some(ancienne)) = (
+                ligne.first().and_then(|v| v.as_i64()),
+                ligne.get(1).and_then(|v| v.as_string()),
+                ligne.get(2).and_then(|v| v.as_i64()),
+            ) else {
+                continue;
+            };
+
+            let chemin_clone = chemin.clone();
+            let reelle = tokio::task::spawn_blocking(move || {
+                tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin_clone))
+            })
+            .await
+            .ok()
+            .flatten();
+
+            let Some(reelle) = reelle else {
+                illisibles += 1;
+                continue;
+            };
+
+            let reelle = reelle as i64;
+            // Une seconde d'écart : en-deçà, la valeur en base est déjà juste
+            // et la réécrire ne ferait que du bruit d'écriture.
+            if (reelle - ancienne).abs() <= 1000 {
+                inchangees += 1;
+                continue;
+            }
+
+            match backend.execute(
+                "UPDATE tracks SET duration_ms = ? WHERE id = ?",
+                &[&reelle as &dyn tune_core::db::backend::ToSqlValue, &id],
+            ) {
+                Ok(_) => {
+                    reparees += 1;
+                    debug!(id, ancienne, reelle, chemin = %chemin, "mp3_duration_reparee");
+                }
+                Err(e) => warn!(id, error = %e, "mp3_duration_repair_ecriture_echouee"),
+            }
+        }
+
+        info!(
+            total,
+            reparees, inchangees, illisibles, sans_taille, "mp3_duration_repair_termine"
+        );
+        let _ = reglages.set("mp3_duration_repair_done", "1");
+    });
+}
+
 fn spawn_oaat_stall_supervisor(state: &AppState) {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
