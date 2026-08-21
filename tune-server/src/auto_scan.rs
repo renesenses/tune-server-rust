@@ -182,6 +182,18 @@ pub fn build_track_from_metadata_opts(
     });
     let album_id = album.as_ref().and_then(|a| a.id);
 
+    // Garder la décision qui vient d'être prise (#1957) : c'est elle qui a
+    // envoyé l'album sous « Various Artists » plus haut. Cette voie est celle
+    // du surveillant de fichiers, où `compilation_override` reconstruit la vue
+    // du dossier depuis la base — donc le drapeau enregistré ici est bien le
+    // même que celui du scan par lots. `mark_compilation` ne fait que lever le
+    // drapeau, jamais le baisser (voir sa documentation).
+    if let Some(aid) = album_id
+        && is_compilation
+    {
+        album_repo.mark_compilation(aid).ok();
+    }
+
     // Propagate date metadata from track tags to the album (COALESCE — only
     // fills in values not already set, so the first track with dates wins).
     if let Some(aid) = album_id {
@@ -612,9 +624,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     candidats = a_supprimer.len(),
                     examinees,
                     plafond = PART_MAX_PURGE,
+                    // Pas de `confirm_purge` ici, et c'est VOLONTAIRE : un
+                    // scan automatique n'a aucune intention d'utilisateur
+                    // derrière lui. Il ne doit jamais pouvoir supprimer en
+                    // masse, quel que soit le réglage. La sortie passe par un
+                    // scan explicite — on le dit, plutôt que de laisser le
+                    // refus se rejouer sans issue.
                     "auto_scan_purge_refusee_trop_massive — disparition massive au démarrage : \
                      bien plus souvent un montage pas encore prêt qu'une suppression réelle. \
-                     Les pistes sont CONSERVÉES."
+                     Les pistes sont CONSERVÉES. Un scan automatique ne peut JAMAIS purger \
+                     au-delà du plafond : si ces pistes ont vraiment été supprimées, lancer un \
+                     scan explicite avec `?confirm_purge={}`.",
+                    a_supprimer.len()
                 );
                 protected += a_supprimer.len() as i64;
                 a_supprimer.clear();

@@ -1055,6 +1055,18 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/francemus
 DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/mouvxtra-hifi.aac';
 ",
     },
+    Migration {
+        version: 79,
+        name: "albums_is_compilation",
+        // Le drapeau « compilation » etait lu (TCMP), utilise au scan pour le
+        // regroupement, puis jete : aucune colonne ne le stockait (#1957).
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici : sur une base neuve CORE_SCHEMA la porte
+        // deja, et l'ALTER planterait tout le runner en « duplicate column
+        // name » au premier demarrage.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1967,6 +1979,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "network_mounts", "mount_state", "TEXT");
             add_column_if_missing(db, "network_mounts", "last_mount_error", "TEXT");
         }
+        if migration.version == 79 {
+            // Drapeau « compilation » de l'album (#1957). DEFAULT 0 : les
+            // lignes existantes valent « non », et le prochain scan leve le
+            // drapeau sur les disques qu'il regroupe en Various Artists.
+            add_column_if_missing(db, "albums", "is_compilation", "INTEGER DEFAULT 0");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -2082,6 +2100,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "network_mounts", "smb_version", "TEXT");
     add_column_if_missing(db, "network_mounts", "mount_state", "TEXT");
     add_column_if_missing(db, "network_mounts", "last_mount_error", "TEXT");
+
+    // Drapeau « compilation » de l'album (migration v79). Passe de surete du
+    // meme ordre que `smb_version` ci-dessus, et pour la meme raison : le
+    // SELECT commun des albums (`album_repo::sql::select_album`) lit
+    // `a.is_compilation`. Une base qui arriverait ici sans la colonne ferait
+    // echouer TOUTES les requetes d'albums — bibliotheque vide, partout.
+    add_column_if_missing(db, "albums", "is_compilation", "INTEGER DEFAULT 0");
 
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
@@ -2340,6 +2365,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         27,
         "network_mounts_mount_state",
         include_str!("../../migrations/postgres/027_network_mounts_mount_state.sql"),
+    ),
+    (
+        28,
+        "albums_is_compilation",
+        include_str!("../../migrations/postgres/028_albums_is_compilation.sql"),
     ),
 ];
 
@@ -2781,6 +2811,72 @@ mod tests {
         );
     }
 
+    /// Le SELECT commun des albums (`album_repo::sql::select_album`) lit
+    /// `a.is_compilation` (#1957). Si la colonne manque, ce n'est pas la
+    /// pastille qui manque : c'est TOUTE requête d'album qui échoue —
+    /// bibliothèque vide, partout.
+    ///
+    /// Ce test part d'une base portant `albums` dans une forme d'AVANT la v79,
+    /// rejoue les migrations, et exige la colonne, la ligne existante, et un
+    /// `SELECT` réel avec la clause du dépôt. Il ÉCHOUE contre le code d'avant.
+    #[test]
+    fn une_base_ancienne_gagne_le_drapeau_compilation() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant : aucune colonne pour le drapeau.
+        db.execute_batch(
+            "CREATE TABLE albums (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                artist_id INTEGER,
+                year INTEGER,
+                folder_path TEXT
+            );
+            INSERT INTO albums (title) VALUES ('Jazz sur Seine');",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(albums)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "is_compilation"),
+            "`is_compilation` manque après migration : {cols:?}"
+        );
+
+        // La ligne existante survit : une migration qui reconstruirait la table
+        // ferait perdre sa bibliothèque à l'utilisateur.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "l'album enregistré a disparu à la migration");
+
+        // DEFAULT 0 : un album jamais rescanné se lit « pas une compilation »,
+        // pas NUL — la vue album n'a pas à distinguer trois états.
+        let drapeau: Option<i64> = conn
+            .query_row("SELECT is_compilation FROM albums", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            drapeau,
+            Some(0),
+            "is_compilation devrait valoir 0, vaut {drapeau:?}"
+        );
+
+        // Et la requête que le serveur exécute vraiment passe.
+        conn.query_row(
+            "SELECT a.is_compilation FROM albums a WHERE a.id = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("le SELECT du dépôt d'albums doit passer après migration");
+    }
+
     /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
     /// serves. A fresh library must not carry them, and a library that already
     /// seeded them must lose them.
@@ -3059,7 +3155,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 27, "latest PG migration must be 27");
+        assert_eq!(pg_latest_version(), 28, "latest PG migration must be 28");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

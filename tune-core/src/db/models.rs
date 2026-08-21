@@ -61,6 +61,15 @@ pub struct Album {
     /// added-date scrubber (Bertrand: "slider date d'ajout manquant").
     #[serde(default)]
     pub added_at: Option<f64>,
+    /// Le disque est-il une compilation ? (#1957)
+    ///
+    /// Écrit par le scan avec EXACTEMENT la décision qui a produit le
+    /// regroupement en « Various Artists » — tag `TCMP` du fichier, artiste
+    /// d'album « Various Artists », ou pluralité d'artistes dans le dossier.
+    /// Ce n'est donc pas une seconde autorité concurrente : c'est la première,
+    /// enfin conservée.
+    #[serde(default)]
+    pub is_compilation: bool,
 }
 
 impl Album {
@@ -116,6 +125,7 @@ impl Album {
             release_date: None,
             original_date: None,
             added_at: None,
+            is_compilation: false,
         }
     }
 }
@@ -350,11 +360,16 @@ mod tests {
             release_date: None,
             original_date: None,
             added_at: None,
+            is_compilation: false,
         };
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["title"], "Kind of Blue");
         assert_eq!(json["year"], 1959);
         assert_eq!(json["label"], "Columbia");
+        // Le drapeau doit être DANS la charge utile : c'est par là que la vue
+        // album l'obtiendra (#1957). `false` et non absent — un client n'a pas
+        // à distinguer « pas une compilation » de « champ manquant ».
+        assert_eq!(json["is_compilation"], false);
     }
 
     #[test]
