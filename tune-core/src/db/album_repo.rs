@@ -10,8 +10,13 @@ use crate::TuneError;
 pub mod sql {
     use super::SqlDialect;
 
+    /// ⚠️ L'ordre des colonnes EST le contrat de [`super::row_to_album`], qui
+    /// lit par index. `is_compilation` est en 24 et `added_at` — injecté par
+    /// `list_filtered` juste avant `FROM albums a` — se retrouve en 25 : toute
+    /// colonne ajoutée ici doit l'être AVANT `FROM`, et `row_to_album` mis à
+    /// jour dans le même mouvement.
     pub fn select_album() -> &'static str {
-        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
+        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres, a.is_compilation FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -63,7 +68,7 @@ pub mod sql {
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date, is_compilation) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -86,6 +91,7 @@ pub mod sql {
             d.placeholder(20),
             d.placeholder(21),
             d.placeholder(22),
+            d.placeholder(23),
         )
     }
 
@@ -142,6 +148,17 @@ pub mod sql {
             "UPDATE albums SET folder_path = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    /// Lève le drapeau « compilation » (#1957). `COALESCE(is_compilation, 0)`
+    /// et non `is_compilation = 0` : une base migrée peut porter des NULL, et
+    /// `NULL = 0` est NULL — la ligne ne serait jamais mise à jour.
+    pub fn mark_compilation<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET is_compilation = 1 \
+             WHERE id = {} AND COALESCE(is_compilation, 0) = 0",
+            d.placeholder(1)
         )
     }
 
@@ -434,7 +451,11 @@ impl AlbumRepo {
 
     pub fn create(&self, album: &Album) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::create, sql::create);
-        let params: [&dyn ToSqlValue; 22] = [
+        // `is_compilation` en 0/1 et non en booléen natif : SQLite n'a pas de
+        // type booléen et la colonne PG est un SMALLINT 0/1 (convention du
+        // schéma, cf. l'en-tête de 001_initial_schema.sql).
+        let is_compilation: i64 = i64::from(album.is_compilation);
+        let params: [&dyn ToSqlValue; 23] = [
             &album.title,
             &album.artist_id,
             &album.year,
@@ -457,6 +478,7 @@ impl AlbumRepo {
             &album.musicbrainz_release_group_id,
             &album.release_date,
             &album.original_date,
+            &is_compilation,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -815,6 +837,30 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Marque l'album comme compilation (#1957). **Ne baisse jamais le
+    /// drapeau**, et c'est délibéré :
+    ///
+    /// - le scan voit les pistes une par une ; la première d'une anthologie
+    ///   peut, seule, ne rien avoir de « compilation ». Un `SET = <décision>`
+    ///   ferait dépendre le résultat de l'ordre d'arrivée des fichiers ;
+    /// - le regroupement lui-même est déjà irréversible dans les faits :
+    ///   l'album a pris « Various Artists » pour artiste et le rescan ne le lui
+    ///   reprend pas. Le drapeau décrit ce regroupement — il doit avoir la même
+    ///   durée de vie, sans quoi la pastille contredirait l'écran.
+    ///
+    /// La voie de réparation d'un faux positif reste le rescan complet, qui
+    /// repart d'un `DELETE FROM albums` (`track_repo::delete_all`) : les lignes
+    /// sont reconstruites, drapeau compris, d'après les tags du moment.
+    ///
+    /// Idempotent : la clause `COALESCE(is_compilation, 0) = 0` fait de tout
+    /// appel suivant un no-op, donc aucun coût sur un rescan.
+    pub fn mark_compilation(&self, album_id: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::mark_compilation, sql::mark_compilation);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
     /// read through the write connection. Called by `get_or_create` /
     /// `get_or_create_with_mbid` which run inside a scanner
@@ -1148,7 +1194,7 @@ impl AlbumRepo {
         sort: &str,
         order: &str,
     ) -> Result<Vec<Album>, TuneError> {
-        self.list_filtered(limit, offset, sort, order, None, None)
+        self.list_filtered(limit, offset, sort, order, None, None, None)
     }
 
     pub fn list_filtered(
@@ -1159,6 +1205,9 @@ impl AlbumRepo {
         order: &str,
         format: Option<&str>,
         quality: Option<&str>,
+        // `Some(true)` = seulement les compilations, `Some(false)` = tout sauf
+        // elles, `None` = pas de filtre (#1957).
+        compilation: Option<bool>,
     ) -> Result<Vec<Album>, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
@@ -1248,6 +1297,14 @@ impl AlbumRepo {
                 wheres.push("a.format IN ('mp3','aac','ogg','opus','wma')".to_string());
             }
             _ => {}
+        }
+        // `COALESCE` : une base migrée depuis SQLite peut porter des NULL, et
+        // `NULL = 0` vaut NULL — sans lui, « tout sauf les compilations »
+        // masquerait aussi les albums jamais rescannés.
+        match compilation {
+            Some(true) => wheres.push("COALESCE(a.is_compilation, 0) <> 0".to_string()),
+            Some(false) => wheres.push("COALESCE(a.is_compilation, 0) = 0".to_string()),
+            None => {}
         }
 
         let where_clause = if wheres.is_empty() {
@@ -1508,9 +1565,18 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         genre: cols.get(6).and_then(|v| v.as_string()),
         // Index 23 (after the 23-col select): a.genres
         genres: cols.get(23).and_then(|v| v.as_string()),
-        // Index 24: added_at — present only on the added-date sorted listing
+        // Index 24: a.is_compilation (#1957). `as_i64` tolère l'entier des deux
+        // moteurs ET le texte d'une base issue de `migrate-to-postgres` pas
+        // encore soignée par la migration PG 028 — donc jamais de faux « non »
+        // par simple désaccord de type. Absent/NUL = non.
+        is_compilation: cols
+            .get(24)
+            .and_then(|v| v.as_i64())
+            .map(|n| n != 0)
+            .unwrap_or(false),
+        // Index 25: added_at — present only on the added-date sorted listing
         // (list_filtered injects the column); None for every other query.
-        added_at: cols.get(24).and_then(|v| v.as_f64()),
+        added_at: cols.get(25).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
         cover_path: cols.get(9).and_then(|v| v.as_string()),
@@ -2386,6 +2452,144 @@ mod tests {
 
         let desc = repo.list_sorted(100, 0, "artist", "desc").unwrap();
         assert_eq!(desc[0].title, "Hot Rats");
+    }
+
+    /// Le drapeau « compilation » doit SURVIVRE à l'écriture (#1957). Il était
+    /// lu dans les tags, utilisé au scan, puis jeté : aucune colonne, donc
+    /// aucune requête capable de le rendre.
+    #[test]
+    fn le_drapeau_compilation_survit_a_une_relecture() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let ordinaire = repo.create(&Album::new("Kind of Blue".into())).unwrap();
+        let anthologie = repo.create(&Album::new("Jazz sur Seine".into())).unwrap();
+
+        // Par défaut, personne n'est une compilation.
+        assert!(
+            !repo.get(anthologie).unwrap().unwrap().is_compilation,
+            "un album neuf ne doit pas naître compilation"
+        );
+
+        repo.mark_compilation(anthologie).unwrap();
+
+        assert!(
+            repo.get(anthologie).unwrap().unwrap().is_compilation,
+            "le drapeau posé par le scan doit se relire"
+        );
+        assert!(
+            !repo.get(ordinaire).unwrap().unwrap().is_compilation,
+            "marquer un album ne doit pas en marquer un autre"
+        );
+
+        // Le drapeau doit aussi ressortir des listes, pas seulement du get :
+        // c'est la vue album qui le réclame.
+        let liste = repo.list(100, 0).unwrap();
+        let vue: Vec<(String, bool)> = liste
+            .iter()
+            .map(|a| (a.title.clone(), a.is_compilation))
+            .collect();
+        assert!(
+            vue.contains(&("Jazz sur Seine".to_string(), true)),
+            "la liste doit porter le drapeau : {vue:?}"
+        );
+        assert!(
+            vue.contains(&("Kind of Blue".to_string(), false)),
+            "la liste doit distinguer les deux : {vue:?}"
+        );
+    }
+
+    /// `mark_compilation` LÈVE le drapeau et ne le baisse jamais — le scan voit
+    /// les pistes une par une, et une anthologie dont la première piste, seule,
+    /// ne ressemble à rien ne doit pas dépendre de l'ordre des fichiers.
+    /// Rejouable sans effet : un rescan ne doit rien réécrire.
+    #[test]
+    fn marquer_une_compilation_est_idempotent() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        let id = repo.create(&Album::new("Anthologie".into())).unwrap();
+
+        repo.mark_compilation(id).unwrap();
+        repo.mark_compilation(id).unwrap();
+        repo.mark_compilation(id).unwrap();
+
+        assert!(repo.get(id).unwrap().unwrap().is_compilation);
+    }
+
+    /// `create` doit transporter le drapeau : sans ça, un album créé
+    /// compilation ressortirait « non » et le round-trip du modèle mentirait.
+    #[test]
+    fn create_transporte_le_drapeau() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        let mut a = Album::new("Now That's What I Call Music".into());
+        a.is_compilation = true;
+        let id = repo.create(&a).unwrap();
+        assert!(repo.get(id).unwrap().unwrap().is_compilation);
+    }
+
+    /// Filtrer la bibliothèque sur les compilations — un des trois usages que
+    /// l'absence de colonne interdisait (#1957).
+    #[test]
+    fn list_filtered_isole_les_compilations() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        repo.create(&Album::new("Kind of Blue".into())).unwrap();
+        let comp = repo.create(&Album::new("Jazz sur Seine".into())).unwrap();
+        repo.mark_compilation(comp).unwrap();
+
+        let titres = |v: Vec<Album>| -> Vec<String> { v.into_iter().map(|a| a.title).collect() };
+
+        let seulement = titres(
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(true))
+                .unwrap(),
+        );
+        assert_eq!(seulement, vec!["Jazz sur Seine".to_string()]);
+
+        let sauf = titres(
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(false))
+                .unwrap(),
+        );
+        assert_eq!(sauf, vec!["Kind of Blue".to_string()]);
+
+        let tout = titres(
+            repo.list_filtered(100, 0, "title", "asc", None, None, None)
+                .unwrap(),
+        );
+        assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
+    }
+
+    /// `added_at` est injecté JUSTE AVANT `FROM albums a`, donc l'ajout de
+    /// `is_compilation` en fin de `select_album` l'a décalé d'un index.
+    /// `row_to_album` lit par index : ce test épingle les DEUX colonnes
+    /// ensemble, pour qu'un futur ajout ne fasse pas taire la date d'ajout.
+    #[test]
+    fn is_compilation_et_added_at_cohabitent_dans_le_meme_select() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let id = repo.create(&Album::new("Anthologie".into())).unwrap();
+        repo.mark_compilation(id).unwrap();
+        let mut t = Track::new("piste".into());
+        t.album_id = Some(id);
+        t.file_path = Some("/a.flac".into());
+        t.file_mtime = Some(1000.0);
+        trepo.create(&t).unwrap();
+
+        let tries = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        let a = tries.first().expect("un album attendu");
+        assert!(
+            a.is_compilation,
+            "le drapeau doit survivre au SELECT enrichi de added_at"
+        );
+        assert!(
+            a.added_at.is_some(),
+            "added_at doit rester lu, malgré le décalage d'index"
+        );
     }
 
     #[test]

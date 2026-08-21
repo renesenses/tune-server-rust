@@ -27,6 +27,9 @@ pub(super) struct AlbumFilters {
     format: Option<String>,
     sort: Option<String>,
     order: Option<String>,
+    /// `?compilation=true` ne rend que les compilations, `false` que le reste,
+    /// absent = tout (#1957).
+    compilation: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +71,7 @@ pub(super) async fn list_albums(
         order,
         p.format.as_deref(),
         p.quality.as_deref(),
+        p.compilation,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -149,6 +153,9 @@ pub(super) async fn create_album(
         release_date: None,
         original_date: None,
         added_at: None,
+        // Un album créé à la main n'est pas une compilation : c'est le scan
+        // qui lève ce drapeau, d'après les tags (#1957).
+        is_compilation: false,
     };
     let id = repo
         .create(&album)
