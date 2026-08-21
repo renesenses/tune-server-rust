@@ -39,6 +39,39 @@ fn svc_response<R: serde::Serialize, E: std::fmt::Display>(result: Result<R, E>)
     }
 }
 
+/// En-tête complet, et non une durée : `HeaderValue::from_static` exige un
+/// littéral, donc séparer la valeur du texte les ferait diverger.
+///
+/// 1800 s — aligné sur le TTL du cache serveur (`qobuz.rs`) : les sélections
+/// changent au mieux une fois par jour.
+const CACHE_EDITORIAL: &str = "private, max-age=1800";
+
+/// Comme `svc_response`, mais autorise le navigateur à garder la réponse.
+///
+/// `private` et non `public` : ces routes sont derrière l'authentification, et
+/// même si le contenu est le même pour tous, on ne veut pas qu'un proxy
+/// partagé le stocke.
+///
+/// Réservé au contenu ÉDITORIAL — sélections, nouveautés, genres. JAMAIS les
+/// favoris ni les playlists de l'utilisateur : resservir une réponse vieille de
+/// trente minutes ferait réapparaître un favori qu'il vient de retirer.
+///
+/// Une erreur n'est pas mise en cache : un 502 passager deviendrait une panne
+/// de trente minutes.
+fn svc_response_editorial<R: serde::Serialize, E: std::fmt::Display>(
+    result: Result<R, E>,
+) -> Response {
+    let est_ok = result.is_ok();
+    let mut response = svc_response(result);
+    if est_ok {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static(CACHE_EDITORIAL),
+        );
+    }
+    response
+}
+
 /// Reduce boilerplate for read-only handlers: get_svc + lock + call + respond.
 macro_rules! with_svc {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
@@ -52,6 +85,21 @@ macro_rules! with_svc {
 }
 
 /// Same as `with_svc!` but acquires a mutable lock.
+/// Comme `with_svc!`, mais la réponse autorise le cache navigateur.
+///
+/// Une macro distincte plutôt qu'un drapeau : le choix se voit sur le
+/// gestionnaire, à la ligne où on le lit. Un booléen en fin d'appel se recopie
+/// sans y penser d'un gestionnaire éditorial vers un gestionnaire de favoris.
+macro_rules! with_svc_editorial {
+    ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
+        let arc = match get_svc($state, $service).await {
+            Ok(s) => s,
+            Err(e) => return e.into_response(),
+        };
+        let $svc = arc.lock().await;
+        svc_response_editorial($body)
+    }};
+}
 macro_rules! with_svc_mut {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
         let arc = match get_svc($state, $service).await {
@@ -337,14 +385,14 @@ async fn service_track(
 }
 
 async fn service_featured(State(state): State<AppState>, Path(service): Path<String>) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_featured().await)
+    with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
 }
 
 async fn service_new_releases(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_new_releases().await)
+    with_svc_editorial!(&state, &service, |svc| svc.get_new_releases().await)
 }
 
 #[derive(Deserialize)]
@@ -358,7 +406,7 @@ async fn service_genres(
     Query(q): Query<GenreQuery>,
 ) -> Response {
     let pid = q.parent_id.as_deref();
-    with_svc!(&state, &service, |svc| svc.get_genres(pid).await)
+    with_svc_editorial!(&state, &service, |svc| svc.get_genres(pid).await)
 }
 
 async fn service_genre_albums(
@@ -367,7 +415,7 @@ async fn service_genre_albums(
     Query(q): Query<LimitQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(50);
-    with_svc!(&state, &service, |svc| svc
+    with_svc_editorial!(&state, &service, |svc| svc
         .get_genre_albums(&genre_id, limit)
         .await)
 }
@@ -376,14 +424,14 @@ async fn service_featured_sections(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_featured_sections().await)
+    with_svc_editorial!(&state, &service, |svc| svc.get_featured_sections().await)
 }
 
 async fn service_featured_section(
     State(state): State<AppState>,
     Path((service, section)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    with_svc_editorial!(&state, &service, |svc| svc
         .get_featured_section(&section)
         .await)
 }
@@ -399,7 +447,7 @@ async fn service_playlist_tags(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_playlist_tags().await)
+    with_svc_editorial!(&state, &service, |svc| svc.get_playlist_tags().await)
 }
 
 #[derive(Deserialize)]
@@ -413,7 +461,7 @@ async fn service_featured_playlists(
     Path(service): Path<String>,
     Query(q): Query<FeaturedPlaylistsQuery>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    with_svc_editorial!(&state, &service, |svc| svc
         .get_featured_playlists(q.tag.as_deref(), q.genre.as_deref())
         .await)
 }
@@ -431,7 +479,7 @@ async fn service_featured_playlists_by_tag(
     Path(service): Path<String>,
     Query(q): Query<ByTagQuery>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    with_svc_editorial!(&state, &service, |svc| svc
         .get_featured_playlists_by_tag(q.genre.as_deref())
         .await)
 }
@@ -1013,4 +1061,65 @@ async fn compare_services(
         "services": results,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests_cache_editorial {
+    use super::*;
+
+    /// Une réponse éditorielle valide autorise le navigateur à la resservir.
+    #[test]
+    fn une_reponse_editoriale_valide_est_cachable() {
+        let r: Result<serde_json::Value, String> = Ok(serde_json::json!({"albums": []}));
+        let reponse = svc_response_editorial(r);
+        assert_eq!(
+            reponse
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some(CACHE_EDITORIAL)
+        );
+    }
+
+    /// Une ERREUR ne doit jamais être mise en cache : un 502 passager
+    /// deviendrait une panne de trente minutes, et l'utilisateur n'aurait aucun
+    /// moyen de la faire cesser.
+    #[test]
+    fn une_erreur_n_est_jamais_mise_en_cache() {
+        let r: Result<serde_json::Value, String> = Err("upstream 502".into());
+        let reponse = svc_response_editorial(r);
+        assert!(
+            reponse
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .is_none(),
+            "une erreur ne doit porter aucune politique de cache"
+        );
+    }
+
+    /// `svc_response` — celui des favoris et des playlists de l'utilisateur —
+    /// ne doit RIEN poser. C'est le middleware qui lui applique `no-cache`, et
+    /// ce test fige la frontière : si quelqu'un ajoute un jour un en-tête ici
+    /// « pour uniformiser », il échoue.
+    #[test]
+    fn la_reponse_ordinaire_ne_pose_aucune_politique() {
+        let r: Result<serde_json::Value, String> = Ok(serde_json::json!([]));
+        let reponse = svc_response(r);
+        assert!(
+            reponse
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .is_none(),
+            "les routes utilisateur doivent rester sous le no-cache du middleware"
+        );
+    }
+
+    /// `private`, jamais `public` : ces routes sont derrière l'authentification.
+    /// Même si le contenu est identique pour tous, un proxy partagé ne doit pas
+    /// le stocker.
+    #[test]
+    fn le_cache_editorial_est_prive() {
+        assert!(CACHE_EDITORIAL.starts_with("private"));
+        assert!(!CACHE_EDITORIAL.contains("public"));
+    }
 }

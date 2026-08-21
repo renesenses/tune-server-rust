@@ -1523,3 +1523,74 @@ async fn sonos_speakers_rend_un_tableau() {
         "la barre latérale fait `for sp of speakers` : un objet la casserait, reçu {body}"
     );
 }
+
+/// `/metadata/mp3/diagnose` : les compteurs que l'écran lit doivent exister.
+///
+/// Le contrat web laisse la liste des anomalies libre, mais `scanned`,
+/// `ok_files` et `missing_files` alimentent une phrase de résultat : les
+/// omettre afficherait « undefined » (#1893).
+#[tokio::test]
+async fn mp3_diagnose_rend_les_compteurs_du_contrat() {
+    let app = make_app();
+    let (status, body) = post_json(&app, "/api/v1/metadata/mp3/diagnose", json!({})).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "la route doit exister (elle 404ait)"
+    );
+    for champ in ["scanned", "ok_files", "missing_files", "issues_found"] {
+        assert!(
+            body[champ].is_number(),
+            "{champ} est lu par l'écran et doit être un nombre, reçu {body}"
+        );
+    }
+    assert!(
+        body["issues"].is_array(),
+        "issues doit être un tableau, reçu {body}"
+    );
+}
+
+/// Réparer une liste vide ne doit rien tenter et ne pas échouer.
+///
+/// L'écran envoie `mp3Issues.map(i => i.track_id)` : un diagnostic sans
+/// anomalie produit une liste vide, cas normal et non une erreur.
+#[tokio::test]
+async fn mp3_repair_liste_vide_ne_fait_rien() {
+    let app = make_app();
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/metadata/mp3/repair",
+        json!({"track_ids": []}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["repaired"], 0);
+    assert_eq!(body["requested"], 0);
+    assert!(body["failed"].is_array());
+}
+
+/// Une piste inconnue est un ÉCHEC nommé, pas un silence.
+///
+/// L'écran affiche `failed.length` : avaler l'identifiant inconnu ferait
+/// croire à une réparation réussie sur une piste qui n'existe pas.
+#[tokio::test]
+async fn mp3_repair_piste_inconnue_est_un_echec_explicite() {
+    let app = make_app();
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/metadata/mp3/repair",
+        json!({"track_ids": [999_999_999]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["repaired"], 0);
+    assert_eq!(body["requested"], 1);
+    assert_eq!(
+        body["failed"].as_array().map(|a| a.len()),
+        Some(1),
+        "l'identifiant inconnu doit apparaître dans failed, reçu {body}"
+    );
+}

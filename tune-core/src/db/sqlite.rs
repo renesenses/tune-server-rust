@@ -365,7 +365,15 @@ CREATE TABLE IF NOT EXISTS albums (
     original_date TEXT,
     -- The folder on disk holding this release. What identifies an album: see
     -- `scanner::album_folder`.
-    folder_path TEXT
+    folder_path TEXT,
+    -- Le disque est-il une compilation ? 0/1, jamais NUL en pratique (#1957).
+    -- Le drapeau etait lu dans les tags (TCMP) et servait au scan a decider du
+    -- regroupement par artiste d'album, puis il etait jete : aucune requete ne
+    -- pouvait le rendre, aucun ecran l'afficher. Il est desormais ecrit ici par
+    -- le scan, avec exactement la decision qui a produit le regroupement — donc
+    -- la pastille explique toujours ce que l'utilisateur voit.
+    -- PG : SMALLINT 0/1 (migration 028), meme convention que muted/is_hidden.
+    is_compilation INTEGER DEFAULT 0
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,
