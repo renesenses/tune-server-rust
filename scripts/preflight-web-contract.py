@@ -71,26 +71,19 @@ SOURCES_SERVEUR = ["tune-server/src", "tune-core/src", "plugins"]
 #   /metadata/auto-fix, /auto-fix/status, /reclassify-genres-by-path  (#1920)
 #   /library/import/{roon,plex,playlists}                             (#520 web)
 SOCLE_CONNU: dict[str, str] = {
-    "/metadata/auto-fix-albums": "#1893",  # sémantique d'« album créé » indécidable
-    "/metadata/duplicates/move-album": "#1893",  # destructif sur disque, à arbitrer
-    "/metadata/mp3/diagnose": "#1893",  # aucun moteur : l'écrire serait inventer
-    "/metadata/mp3/repair": "#1893",  # « repaired » existait, la route non
-    "/metadata/batch/tracks": "#1893",  # code mort : aucun composant l'appelle
+    # Il ne reste que du CODE MORT : quatre fonctions web qu'aucun composant
+    # n'appelle. Ce ne sont plus des routes a ecrire, mais des appels a
+    # supprimer — et tant qu'ils existent, ils occupent ce socle pour rien.
     #
-    # Les trois suivantes sont SERVIES — sous `/library`, pas `/metadata`. Ce
-    # n'est plus une route à écrire mais un appel web à corriger. ⚠ Le préfixe
-    # n'est pas leur seul défaut : `resolve` envoie ses arguments en query quand
-    # le serveur les attend dans le corps, et `list` rend un objet à trois
-    # familles là où le client attend un tableau plat. Renommer le préfixe seul
-    # ne suffirait pas — voir #1893.
-    "/metadata/duplicates": "#1893",  # servi : /library/duplicates
-    "/metadata/duplicates/resolve": "#1893",  # servi : /library/duplicates/resolve
-    "/metadata/duplicates/scan": "#1893",  # servi depuis #2018 : /library/duplicates/scan
-    #
-    "/sonos/speakers": "#2004",
+    # `auto-fix-albums` merite un mot : son bouton a existe (12/04/2026), la
+    # route serveur JAMAIS. Il a donc rendu 404 depuis le premier jour, puis
+    # une refonte d'interface a retire le bouton en laissant le gestionnaire
+    # orphelin derriere lui. Ce n'est pas une fonctionnalite en attente, c'est
+    # un vestige.
+    "/metadata/auto-fix-albums": "#1893",
+    "/metadata/batch/tracks": "#1893",
     "/sonos/discover": "#2004",
     "/sonos/groups": "#2004",
-    "/converter/cancel": "#2004",
 }
 
 # Segments qui ne distinguent rien : les retenir produirait du bruit, et un
