@@ -148,6 +148,8 @@ pub fn router() -> Router<AppState> {
         // (Reivax66, #1089).
         .route("/fix-years-tags", post(fix_years_tags))
         .route("/fix-years-from-path", post(fix_years_from_path))
+        .route("/mp3/diagnose", post(diagnose_mp3))
+        .route("/mp3/repair", post(repair_mp3))
         // Album merge (targeted, by IDs)
         .route("/albums/merge", post(merge_albums))
         // Batch rename artist (used by web client)
@@ -246,6 +248,202 @@ async fn fix_years_tags(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /metadata/fix-years-from-path — infer missing album years from the
 /// folder/file path (e.g. "1973 - Dark Side" or "Album (1973)").
+/// Le rapport d'une anomalie MP3, tel que l'ecran Metadonnees le lit.
+fn anomalie(track_id: i64, chemin: &str, motifs: Vec<&str>) -> serde_json::Value {
+    json!({
+        "track_id": track_id,
+        "path": chemin,
+        "issues": motifs,
+    })
+}
+
+/// Les pistes MP3 de la bibliotheque : (id, chemin, duree, taille).
+fn pistes_mp3(state: &AppState) -> Vec<(i64, String, Option<i64>, Option<i64>)> {
+    state
+        .backend
+        .query_many(
+            "SELECT id, file_path, duration_ms, file_size FROM tracks              WHERE file_path IS NOT NULL AND LOWER(file_path) LIKE '%.mp3'",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.first().and_then(|v| v.as_i64())?,
+                r.get(1).and_then(|v| v.as_string())?,
+                r.get(2).and_then(|v| v.as_i64()),
+                r.get(3).and_then(|v| v.as_i64()),
+            ))
+        })
+        .collect()
+}
+
+/// La duree en base porte-t-elle la signature du rognage ?
+///
+/// La borne inversee ecrivait `file_size * 8 * 1000 / 320_000`, soit
+/// `file_size / 40` (#2027). Tolerance de 1 ms pour absorber un arrondi
+/// ulterieur — une egalite stricte raterait une piste pour un millieme.
+///
+/// Un MP3 reellement encode a 320 kbps constant porte cette signature SANS
+/// avoir ete rogne : la relecture confirmera sa duree et ne signalera rien.
+fn signature_de_rognage(duree_ms: i64, taille: i64) -> bool {
+    taille > 0 && (duree_ms - taille / 40).abs() <= 1
+}
+
+/// POST /metadata/mp3/diagnose
+///
+/// Cherche les MP3 dont quelque chose de VERIFIABLE cloche. Le contrat du web
+/// laisse la liste des anomalies libre (`issues: string[]`) : on n'y met donc
+/// que ce qu'on sait etablir, jamais une supposition.
+///
+/// **Bornage.** Un `stat` sur chaque MP3 est bon marche ; relire chaque fichier
+/// ne l'est pas — sur un partage reseau, ce serait des heures. On ne relit donc
+/// que les pistes portant la signature de rognage, que le SQL isole sans
+/// toucher au disque.
+async fn diagnose_mp3(State(state): State<AppState>) -> impl IntoResponse {
+    let pistes = pistes_mp3(&state);
+
+    let resultat = tokio::task::spawn_blocking(move || {
+        let mut anomalies = Vec::new();
+        let mut manquants = 0usize;
+        let mut sains = 0usize;
+        let total = pistes.len();
+
+        for (id, chemin, duree, taille) in pistes {
+            if !std::path::Path::new(&chemin).exists() {
+                manquants += 1;
+                anomalies.push(anomalie(id, &chemin, vec!["missing_file"]));
+                continue;
+            }
+
+            let suspecte = matches!(
+                (duree, taille),
+                (Some(d), Some(t)) if signature_de_rognage(d, t)
+            );
+            if !suspecte {
+                sains += 1;
+                continue;
+            }
+
+            match tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin)) {
+                None => anomalies.push(anomalie(id, &chemin, vec!["unreadable"])),
+                Some(reelle) => {
+                    let ecart = (reelle as i64 - duree.unwrap_or(0)).abs();
+                    // Une seconde : en-deca, la valeur en base est deja juste.
+                    if ecart > 1000 {
+                        anomalies.push(anomalie(id, &chemin, vec!["duration_clamped"]));
+                    } else {
+                        sains += 1;
+                    }
+                }
+            }
+        }
+
+        (total, sains, manquants, anomalies)
+    })
+    .await;
+
+    let (total, sains, manquants, anomalies) = match resultat {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": format!("diagnostic interrompu : {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    Json(json!({
+        "scanned": total,
+        "ok_files": sains,
+        "missing_files": manquants,
+        "issues_found": anomalies.len(),
+        "issues": anomalies,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct DemandeReparation {
+    #[serde(default)]
+    track_ids: Vec<i64>,
+}
+
+/// POST /metadata/mp3/repair
+///
+/// Relit les fichiers demandes et corrige leur duree en base.
+///
+/// Meme moteur que la passe automatique de #2034, mais sur une SELECTION : la
+/// passe ne tourne qu'une fois, et un utilisateur qui repare un fichier a la
+/// main a besoin de la relancer sur celui-la seulement.
+///
+/// `probe_duration_ms` lit sans garde-fou de vraisemblance : passer par
+/// `read_metadata` relirait la valeur par le chemin meme qui l'a corrompue.
+async fn repair_mp3(
+    State(state): State<AppState>,
+    Json(demande): Json<DemandeReparation>,
+) -> impl IntoResponse {
+    let demandees = demande.track_ids.len();
+    if demande.track_ids.is_empty() {
+        return Json(json!({
+            "repaired": 0, "requested": 0, "skipped": 0, "failed": [],
+        }))
+        .into_response();
+    }
+
+    let connues: std::collections::HashMap<i64, (String, Option<i64>)> = pistes_mp3(&state)
+        .into_iter()
+        .map(|(id, chemin, duree, _)| (id, (chemin, duree)))
+        .collect();
+
+    let mut reparees = 0usize;
+    let mut ignorees = 0usize;
+    let mut echecs = Vec::new();
+
+    for id in demande.track_ids {
+        let Some((chemin, ancienne)) = connues.get(&id).cloned() else {
+            echecs.push(json!({"track_id": id, "error": "piste inconnue ou non MP3"}));
+            continue;
+        };
+
+        let chemin_lecture = chemin.clone();
+        let reelle = tokio::task::spawn_blocking(move || {
+            tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin_lecture))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let Some(reelle) = reelle else {
+            echecs.push(json!({"track_id": id, "error": "fichier illisible ou absent"}));
+            continue;
+        };
+
+        let reelle = reelle as i64;
+        if (reelle - ancienne.unwrap_or(0)).abs() <= 1000 {
+            ignorees += 1;
+            continue;
+        }
+
+        match state.backend.execute(
+            "UPDATE tracks SET duration_ms = ? WHERE id = ?",
+            &[&reelle as &dyn tune_core::db::backend::ToSqlValue, &id],
+        ) {
+            Ok(_) => reparees += 1,
+            Err(e) => echecs.push(json!({"track_id": id, "error": e.to_string()})),
+        }
+    }
+
+    Json(json!({
+        "repaired": reparees,
+        "requested": demandees,
+        "skipped": ignorees,
+        "failed": echecs,
+    }))
+    .into_response()
+}
+
 async fn fix_years_from_path(State(state): State<AppState>) -> impl IntoResponse {
     let albums = match albums_missing_year(&state) {
         Ok(a) => a,
