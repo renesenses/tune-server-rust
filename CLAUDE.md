@@ -232,6 +232,36 @@ l'une a failli livrer un `sudo` dans un conteneur `debian:bookworm` nu, ce qui
 aurait cassé la construction de Tune OS **à tous les coups**. Aucune n'était
 mauvaise ; elles s'ignoraient.
 
+### DEUX verrous, dans cet ordre : l'issue d'abord, la zone ensuite
+
+**Jamais deux agents sur la même issue.** Le verrou de zone ne suffit pas : il
+protège le fichier, pas le sujet. Deux agents peuvent parfaitement prendre la
+même issue si elle touche deux zones, ou si l'un travaille sans rien réserver.
+
+Le verrou d'issue emploie le même mécanisme atomique, et il se prend **en
+premier** — c'est le moins cher et le plus précis :
+
+```bash
+set -o pipefail
+gh label create "verrou:issue-<n>" --repo renesenses/tune-server-rust \
+  --color 5319E7 --description "<qui> — <ISO8601>"          # échec ⇒ prise
+gh issue edit <n> --repo renesenses/tune-server-rust --add-label "en-cours"
+```
+
+L'étiquette `verrou:issue-<n>` est le verrou (invisible, atomique) ;
+`en-cours` posée SUR l'issue est là pour qu'un humain voie d'un coup d'œil ce
+qui est pris. Les deux se rendent ensemble, à la fusion ou à l'abandon :
+
+```bash
+gh label delete "verrou:issue-<n>" --repo renesenses/tune-server-rust --yes
+gh issue edit <n> --repo renesenses/tune-server-rust --remove-label "en-cours"
+```
+
+**Échec du `label create` = l'issue est prise. On en choisit une autre.** Ne
+jamais se contenter de regarder si `en-cours` est posée : cette lecture-là
+n'est pas atomique, et deux agents qui regardent en même temps concluent tous
+les deux que c'est libre.
+
 ### Prendre le verrou de la zone AVANT d'écrire
 
 `gh label create` **échoue si l'étiquette existe déjà** : c'est un test-and-set
