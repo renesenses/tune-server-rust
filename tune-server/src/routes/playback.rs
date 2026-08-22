@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use tune_core::db::playlist_repo::PlaylistRepo;
@@ -1879,6 +1879,17 @@ async fn queue_remove(
     }
 }
 
+/// Combien de lignes de file n'ont PAS de piste locale.
+///
+/// `count_all` et `get_queue` sont deux requêtes distinctes, et la file peut
+/// bouger entre les deux : un morceau qui se termine, un autre client qui
+/// retire une piste. Le plancher à zéro n'est donc pas de la superstition —
+/// sans lui, un compte négatif finirait dans un message adressé à
+/// l'utilisateur (« ... que des pistes de service (-2) »).
+fn distantes_de(total: i64, locales: i64) -> i64 {
+    (total - locales).max(0)
+}
+
 async fn save_queue_as_playlist(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -1886,10 +1897,54 @@ async fn save_queue_as_playlist(
     Json(body): Json<SaveAsPlaylistRequest>,
 ) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    // `get_queue` ne rend QUE les lignes locales : ses neuf requêtes portent
+    // toutes `AND q.track_id IS NOT NULL`. Une file engendrée par la lecture
+    // automatique Qobuz n'a aucune ligne locale — elle revient donc vide alors
+    // que l'écran, lui, affiche une file pleine (le client tient ses propres
+    // éléments).
+    //
+    // `count_all` ne filtre pas. C'est ce qui permet de distinguer les deux
+    // situations que l'ancien code confondait sous « queue is empty » :
+    // une file RÉELLEMENT vide, et une file pleine de pistes de service.
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
-    if items.is_empty() {
-        return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
+    let total = queue_repo.count_all(zone_id).unwrap_or(0);
+    let locales = items.len() as i64;
+    let distantes = distantes_de(total, locales);
+
+    if total == 0 {
+        warn!(zone_id, "save_queue_as_playlist_refused_empty");
+        return (
+            StatusCode::BAD_REQUEST,
+            "La file d'attente est vide : il n'y a rien à enregistrer.",
+        )
+            .into_response();
     }
+
+    if locales == 0 {
+        // Le cas de Sandro (#1959). L'ancien message disait « queue is empty »
+        // devant une file qu'il voyait pleine, et rien n'était journalisé : il
+        // a vérifié les journaux du serveur, à raison, et n'y a rien trouvé.
+        //
+        // Ce n'est pas un défaut réparable ici : `playlist_tracks.track_id` est
+        // `NOT NULL REFERENCES tracks(id)`. Une playlist locale ne PEUT pas
+        // porter une piste de service. Le refus est donc légitime — c'est de
+        // mentir sur sa raison qui ne l'était pas.
+        warn!(
+            zone_id,
+            distantes, "save_queue_as_playlist_refused_streaming_only"
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Cette file ne contient que des pistes de service ({distantes}), \
+                 qui ne peuvent pas être enregistrées dans une playlist locale. \
+                 Enregistrez-la depuis le service, ou ajoutez d'abord ces titres \
+                 à votre bibliothèque."
+            ),
+        )
+            .into_response();
+    }
+
     let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
     let name = body
         .name
@@ -1897,14 +1952,41 @@ async fn save_queue_as_playlist(
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
     match playlist_repo.create(&name, None, profile.id()) {
         Ok(id) => {
-            playlist_repo.add_tracks(id, &track_ids, None).ok();
+            if let Err(e) = playlist_repo.add_tracks(id, &track_ids, None) {
+                // `.ok()` avalait cette erreur : la playlist était créée, vide,
+                // et la réponse annonçait `track_count` pistes.
+                error!(zone_id, playlist_id = id, error = %e, "save_queue_as_playlist_add_tracks_failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Playlist créée mais vide : {e}"),
+                )
+                    .into_response();
+            }
+            info!(
+                zone_id,
+                playlist_id = id,
+                enregistrees = track_ids.len(),
+                ignorees = distantes,
+                "save_queue_as_playlist_ok"
+            );
             (
                 StatusCode::CREATED,
-                Json(json!({"id": id, "name": name, "track_count": track_ids.len()})),
+                Json(json!({
+                    "id": id,
+                    "name": name,
+                    "track_count": track_ids.len(),
+                    // Une file mixte perd ses pistes de service en chemin. Le
+                    // taire produirait le défaut d'à côté : une playlist plus
+                    // courte que la file, sans que rien ne dise pourquoi.
+                    "skipped_streaming": distantes,
+                })),
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => {
+            error!(zone_id, error = %e, "save_queue_as_playlist_create_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
@@ -3056,5 +3138,57 @@ mod tests {
             body["message"],
             "La sortie de cette zone n'est plus disponible."
         );
+    }
+}
+
+/// #1959 — « Enregistrer comme playlist » refusait une file Qobuz en la
+/// déclarant vide, et ne journalisait rien.
+///
+/// Sandro (fil forum 1432) : « j'obtiens un message d'erreur d'enregistrement.
+/// J'ai vérifié les journaux du serveur juste après avoir cliqué, mais
+/// bizarrement, aucune erreur n'apparaît. » Sa question était la bonne — la
+/// requête atteignait bien le serveur, et elle était refusée pour une raison
+/// que rien n'écrivait nulle part.
+///
+/// Ces tests portent sur la DÉCISION, seule partie séparable du handler HTTP :
+/// que faire selon ce que la file contient réellement.
+#[cfg(test)]
+mod save_queue_decision {
+    use super::distantes_de;
+
+    /// LE cas du signalement : l'écran affiche une file pleine, `get_queue`
+    /// rend une liste vide parce que ses neuf requêtes portent
+    /// `AND q.track_id IS NOT NULL`, et l'ancien code en concluait
+    /// « queue is empty ». Le handler doit désormais voir douze pistes de
+    /// service, et nommer la vraie raison du refus.
+    #[test]
+    fn une_file_qobuz_compte_douze_pistes_de_service_et_non_zero() {
+        assert_eq!(distantes_de(12, 0), 12);
+    }
+
+    /// Une file mixte s'enregistre — mais en DISANT ce qui reste dehors. Sans
+    /// ce compte, la playlist serait plus courte que la file et rien
+    /// n'expliquerait pourquoi : le défaut d'à côté.
+    #[test]
+    fn une_file_mixte_dit_ce_qu_elle_perd() {
+        assert_eq!(distantes_de(10, 4), 6);
+    }
+
+    #[test]
+    fn une_file_100_pour_cent_locale_ne_perd_rien() {
+        assert_eq!(distantes_de(7, 7), 0);
+    }
+
+    /// `count_all` et `get_queue` sont deux requêtes distinctes, et la file peut
+    /// bouger entre les deux. Un total inférieur au nombre de locales ne doit
+    /// jamais produire un compte négatif affiché à l'utilisateur.
+    #[test]
+    fn un_total_incoherent_ne_produit_jamais_un_compte_negatif() {
+        assert_eq!(distantes_de(3, 5), 0);
+    }
+
+    #[test]
+    fn une_file_vide_ne_compte_rien() {
+        assert_eq!(distantes_de(0, 0), 0);
     }
 }
