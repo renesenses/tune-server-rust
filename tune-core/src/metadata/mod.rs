@@ -1133,18 +1133,19 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
     let title = title
         .filter(|s| !s.trim().is_empty())
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
-    let album = album.filter(|s| !s.trim().is_empty()).or_else(|| {
-        path.parent()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().to_string())
-    });
-    let artist_fallback = path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string());
-    let artist = artist.or(artist_fallback.clone());
-    let album_artist = album_artist.or(artist_fallback);
+    let (album_du_chemin, artiste_du_chemin, disque_du_chemin) = album_artiste_du_chemin(path);
+    let album = album.filter(|s| !s.trim().is_empty()).or(album_du_chemin);
+    let artist = artist.or(artiste_du_chemin);
+    // `album_artist` n'est PLUS déduit du chemin. C'est le seul repli à tags
+    // partiels : le fichier peut porter un ARTIST par piste sans ALBUMARTIST,
+    // et y coller un nom de dossier faisait arriver le champ REMPLI au scan.
+    // `auto_scan.rs` compare alors `album_artist` à « various artists / va /
+    // compilations » — un nom de dossier ne correspond à rien, la décision
+    // « compilation » était close avant d'être posée, et le repli « pas
+    // d'album_artist → artiste de la première piste du dossier » de
+    // `scan_import.rs` ne s'exécutait jamais. Le laisser absent rend au scan
+    // l'information dont il a besoin : ce champ est absent (#1656).
+    let disc_number = disc_number.or(disque_du_chemin);
 
     // Extract MusicBrainz IDs from TXXX frames
     let (
@@ -1223,13 +1224,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         return None;
     }
     let file_name = path.file_stem()?.to_str()?;
-    let parent = path.parent()?;
-    let album = parent.file_name()?.to_str().map(|s| s.to_string());
-    let artist = parent
-        .parent()?
-        .file_name()?
-        .to_str()
-        .map(|s| s.to_string());
+    let (album, artist, disc_number) = album_artiste_du_chemin(path);
 
     let (track_number, title) =
         if let Some(rest) = file_name.strip_prefix(|c: char| c.is_ascii_digit()) {
@@ -1255,7 +1250,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         album_artist: artist,
         album_artist_sort: None,
         track_number,
-        disc_number: None,
+        disc_number,
         total_tracks: None,
         total_discs: None,
         disc_subtitle: None,
@@ -1288,6 +1283,59 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
     })
 }
 
+/// Rend le numéro de disque quand un nom de dossier n'est QUE cela : `CD1`,
+/// `CD 2`, `Disc-3`, `Disque 1`, `disk04`.
+///
+/// Volontairement étroit. `Vol. 2` n'en fait pas partie : c'est presque
+/// toujours un vrai titre d'album (« Greatest Hits Vol. 2 »), et le confondre
+/// avec un disque effacerait un album entier. Un préfixe suivi d'autre chose
+/// qu'un nombre — `Disco`, `CD Rip` — ne correspond pas non plus.
+pub(crate) fn numero_de_disque(nom: &str) -> Option<u32> {
+    let nom = nom.trim().to_lowercase();
+    // « disque » avant « disc », sinon « disque 2 » se lirait « disc » + « ue 2 ».
+    for prefixe in ["disque", "disc", "disk", "cd"] {
+        if let Some(reste) = nom.strip_prefix(prefixe) {
+            let reste = reste.trim_start_matches([' ', '-', '_', '.', '#']);
+            return reste.parse::<u32>().ok().filter(|&d| d > 0);
+        }
+    }
+    None
+}
+
+/// Déduit `(album, artiste, disque)` de l'arborescence, convention
+/// `.../Artiste/Album/piste.ext`.
+///
+/// Quand le dossier parent n'est qu'un numéro de disque, la convention remonte
+/// d'un cran : dans `.../The Complete Motown Singles/CD1/01 - Piste.wav`, le
+/// parent est le disque, l'album est au-dessus et l'artiste encore au-dessus.
+/// Sans ce décalage, l'album s'appelait « CD1 » et **l'artiste retenu était le
+/// titre de l'album** — le symptôme signalé par jfpaquet (#1656) sur ses
+/// compilations « VA-xxx ».
+///
+/// Le numéro de disque est rendu avec le reste, et pas seulement pour
+/// l'affichage : fusionner CD1 et CD2 en un seul album sans lui ferait
+/// collisionner les numéros de piste.
+pub(crate) fn album_artiste_du_chemin(
+    path: &Path,
+) -> (Option<String>, Option<String>, Option<u32>) {
+    let nom = |p: Option<&Path>| {
+        p.and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    };
+    let parent = path.parent();
+    let disque = nom(parent).as_deref().and_then(numero_de_disque);
+    let dossier_album = match disque {
+        Some(_) => parent.and_then(|p| p.parent()),
+        None => parent,
+    };
+    (
+        nom(dossier_album),
+        nom(dossier_album.and_then(|p| p.parent())),
+        disque,
+    )
+}
+
 /// Check if a file has a known audio extension (used to decide whether to
 /// attempt a filesystem-based metadata fallback when lofty fails).
 fn is_known_audio_ext(path: &Path) -> bool {
@@ -1303,19 +1351,11 @@ fn is_known_audio_ext(path: &Path) -> bool {
 /// Extract basic metadata from the directory structure when lofty successfully
 /// parsed the audio properties but the file has no tags.
 ///
-/// Directory convention: `.../Artist/Album/01 - Title.wav`
+/// Directory convention: `.../Artist/Album/01 - Title.wav`, un dossier de
+/// disque intercalé étant sauté (voir [`album_artiste_du_chemin`]).
 fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> TrackMetadata {
     let (track_number, title) = extract_title_from_filename(path);
-    let parent = path.parent();
-    let album = parent
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string());
-    let artist = parent
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string());
+    let (album, artist, disc_number) = album_artiste_du_chemin(path);
 
     let ext = path
         .extension()
@@ -1349,7 +1389,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         album_artist: artist,
         album_artist_sort: None,
         track_number,
-        disc_number: None,
+        disc_number,
         total_tracks: None,
         total_discs: None,
         disc_subtitle: None,
@@ -1390,16 +1430,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
 /// tag reader fails or times out, so a file still appears in the library.
 pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
     let (track_number, title) = extract_title_from_filename(path);
-    let parent = path.parent();
-    let album = parent
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string());
-    let artist = parent
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string());
+    let (album, artist, disc_number) = album_artiste_du_chemin(path);
 
     let ext = path
         .extension()
@@ -1422,7 +1453,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         album_artist: artist,
         album_artist_sort: None,
         track_number,
-        disc_number: None,
+        disc_number,
         total_tracks: None,
         total_discs: None,
         disc_subtitle: None,
@@ -1923,14 +1954,14 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
         title = fname_title;
     }
+    // Le dossier parent n'est pas toujours l'album : sous `.../Titre/CD2/`,
+    // c'est un disque, et l'album est au-dessus (#1656).
+    let (album_du_chemin, _, disque_du_chemin) = album_artiste_du_chemin(path);
     if album.as_deref().map_or(true, |a| a.trim().is_empty()) {
-        album = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string());
+        album = album_du_chemin;
     }
     let track_number = tag.track().or(fname_track);
+    let disc_number = tag.disk().or(disque_du_chemin);
 
     Ok(TrackMetadata {
         title,
@@ -1939,7 +1970,7 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
         track_number,
-        disc_number: tag.disk(),
+        disc_number,
         total_tracks,
         total_discs,
         // lofty's SetSubtitle maps Vorbis DISCSUBTITLE / ID3 TSST only — it has
@@ -2508,6 +2539,126 @@ mod dynamic_range_tests {
         assert_eq!(normalise_dr("n/a"), "n/a");
         assert_eq!(normalise_dr("12.5"), "12.5");
         assert_eq!(normalise_dr(""), "");
+    }
+}
+
+#[cfg(test)]
+mod tests_dossier_de_disque {
+    use super::*;
+
+    #[test]
+    fn reconnait_les_ecritures_courantes() {
+        for (nom, attendu) in [
+            ("CD1", 1),
+            ("CD 2", 2),
+            ("cd-3", 3),
+            ("CD_4", 4),
+            ("CD.5", 5),
+            ("CD #6", 6),
+            ("cd01", 1),
+            ("Disc 2", 2),
+            ("disk3", 3),
+            ("Disque 4", 4),
+            (" CD2 ", 2),
+        ] {
+            assert_eq!(
+                numero_de_disque(nom),
+                Some(attendu),
+                "« {nom} » aurait dû être lu comme le disque {attendu}"
+            );
+        }
+    }
+
+    #[test]
+    fn ne_confond_pas_un_titre_avec_un_disque() {
+        // Chacun de ces noms est un VRAI dossier d'album. Le prendre pour un
+        // disque effacerait l'album : ses pistes remonteraient d'un cran et se
+        // rattacheraient au dossier parent.
+        for nom in [
+            "Greatest Hits Vol. 2", // « Vol » est volontairement hors liste
+            "Vol. 2",
+            "Disco",
+            "Disc Jockey",
+            "CD Rip",
+            "CDs",
+            "Discovery", // Daft Punk
+            "CD",        // un préfixe sans numéro n'est pas un disque
+            "Disque",
+            "cd 0", // un disque 0 n'existe pas — c'est un nom, pas un rang
+            "",
+            "The Complete Motown Singles",
+        ] {
+            assert_eq!(
+                numero_de_disque(nom),
+                None,
+                "« {nom} » ne doit PAS être pris pour un dossier de disque"
+            );
+        }
+    }
+
+    #[test]
+    fn coffret_l_artiste_n_est_plus_le_titre_de_l_album() {
+        // Le symptôme de jfpaquet (#1656) : sur un coffret rangé
+        // `.../Titre/CD1/`, l'artiste retenu était le TITRE DE L'ALBUM, parce
+        // que la convention `.../Artiste/Album/piste` prenait le dossier de
+        // disque pour l'album.
+        let (album, artiste, disque) = album_artiste_du_chemin(Path::new(
+            "/Musique/Various Artists/The Complete Motown Singles/CD1/01 - Piste.wav",
+        ));
+        assert_eq!(album.as_deref(), Some("The Complete Motown Singles"));
+        assert_eq!(artiste.as_deref(), Some("Various Artists"));
+        // Sans le numéro de disque, fusionner CD1 et CD2 en un seul album
+        // ferait collisionner les numéros de piste.
+        assert_eq!(disque, Some(1));
+    }
+
+    #[test]
+    fn les_deux_disques_d_un_coffret_donnent_le_meme_album() {
+        let cd1 = album_artiste_du_chemin(Path::new("/M/Artiste/Titre/CD1/01.flac"));
+        let cd2 = album_artiste_du_chemin(Path::new("/M/Artiste/Titre/CD2/01.flac"));
+        assert_eq!(
+            cd1.0, cd2.0,
+            "les deux disques doivent nommer le même album"
+        );
+        assert_eq!(cd1.1, cd2.1);
+        assert_eq!((cd1.2, cd2.2), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn sans_dossier_de_disque_la_convention_ne_bouge_pas() {
+        // Zéro régression sur le rangement habituel.
+        let (album, artiste, disque) = album_artiste_du_chemin(Path::new(
+            "/Musique/Miles Davis/Kind of Blue/01 - So What.flac",
+        ));
+        assert_eq!(album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(artiste.as_deref(), Some("Miles Davis"));
+        assert_eq!(disque, None);
+    }
+
+    #[test]
+    fn un_chemin_trop_court_ne_panique_pas() {
+        let (album, artiste, disque) = album_artiste_du_chemin(Path::new("/piste.wav"));
+        assert_eq!(album.as_deref(), None);
+        assert_eq!(artiste, None);
+        assert_eq!(disque, None);
+
+        // Un dossier de disque à la racine : l'album manque, et c'est correct —
+        // mieux vaut aucun album qu'un album nommé « CD1 ».
+        let (album, artiste, disque) = album_artiste_du_chemin(Path::new("/CD1/piste.wav"));
+        assert_eq!(album, None);
+        assert_eq!(artiste, None);
+        assert_eq!(disque, Some(1));
+    }
+
+    #[test]
+    fn le_repli_sans_tags_applique_le_decalage() {
+        // Le trajet réellement emprunté par un fichier illisible, bout en bout.
+        let m = tagless_fallback_no_props(Path::new(
+            "/Musique/Various Artists/VA-Best of 80s/CD2/03 - Piste.wav",
+        ));
+        assert_eq!(m.album.as_deref(), Some("VA-Best of 80s"));
+        assert_eq!(m.artist.as_deref(), Some("Various Artists"));
+        assert_eq!(m.disc_number, Some(2));
     }
 }
 
