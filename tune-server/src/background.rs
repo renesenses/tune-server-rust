@@ -339,6 +339,8 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                         sample_rate: None,
                         bit_depth: None,
                         media_format: None,
+                        track_number: None,
+                        disc_number: None,
                     };
                     match orchestrator.play(req).await {
                         Ok(_) => {

@@ -144,7 +144,12 @@ CREATE TABLE IF NOT EXISTS radio_favorites (
     station_name TEXT DEFAULT '',
     cover_url TEXT,
     stream_url TEXT,
-    saved_at BIGINT,
+    -- TEXTE, comme SQLite et comme `pg_migrate.rs` : la route ecrit une chaine
+    -- ISO-8601 et le client la passe a `new Date(iso)`. Ce fichier disait
+    -- BIGINT, l'autre TEXT — deux CREATE TABLE IF NOT EXISTS concurrents dont
+    -- le gagnant dependait de l'ordre d'installation (#1515). La conversion
+    -- des bases deja creees est faite par 034.
+    saved_at TEXT,
     UNIQUE(title, artist)
 );
 
