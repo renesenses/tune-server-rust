@@ -2341,8 +2341,11 @@ pub fn latest_version() -> i32 {
 /// Embedded PG migration scripts. Each tuple is (version, name, sql).
 /// The SQL files are compiled into the binary so no filesystem access
 /// is needed at runtime.
+///
+/// `pub(crate)` pour le test `pg_schema_parity`, qui rejoue cette liste sur une
+/// base nue et la compare au schema neuf de `pg_migrate.rs` (#2111).
 #[cfg(feature = "postgres")]
-const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
+pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
     (
         1,
         "initial_schema",
@@ -2512,6 +2515,17 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         32,
         "zones_reglages_manquants",
         include_str!("../../migrations/postgres/032_zones_reglages_manquants.sql"),
+    ),
+    // `podcast_subscriptions.source_id` n'arrivait par AUCUNE des trois voies
+    // d'une base PG neuve : ni script numerote, ni ENSURE_COLUMNS, ni
+    // ENSURE_TABLES. Elle n'existait que dans PG_FULL_SCHEMA, qui ne tourne
+    // QUE pendant la migration SQLite -> PG. Or `routes/podcasts.rs` la
+    // SELECT : l'ecran Podcasts tombait sur toute installation PostgreSQL
+    // partie de zero. Meme famille que l'incident `queue_items` du .15.
+    (
+        33,
+        "podcast_source_id",
+        include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
     ),
 ];
 
@@ -3299,7 +3313,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 32, "latest PG migration must be 32");
+        assert_eq!(pg_latest_version(), 33, "latest PG migration must be 33");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
