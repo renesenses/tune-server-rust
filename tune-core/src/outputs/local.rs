@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -1256,17 +1257,39 @@ pub(crate) fn doit_declarer_chaine_epuisee(
 ///
 /// Also used by `coreaudio_exclusive` on macOS for bit-perfect output.
 pub struct RingBuf {
-    buf: Box<[f32]>,
+    /// Les cases vivent dans des `UnsafeCell` : c'est la SEULE façon légale de
+    /// muter à travers un `&self`. Les atomiques ci-dessous ordonnent les
+    /// curseurs, ils ne rendent pas la mutation licite — un `Box<[f32]>` écrit
+    /// via `as_ptr() as *mut f32` est un comportement indéfini au sens du
+    /// modèle mémoire de Rust, quelle que soit la rigueur des curseurs, et le
+    /// compilateur est en droit d'optimiser en conséquence (#2204).
+    buf: Box<[UnsafeCell<f32>]>,
     /// Write position (HTTP thread writes here)
     write: AtomicU64,
     /// Read position (audio callback reads here)
     read: AtomicU64,
 }
 
+// SAFETY: SPSC strict. Un seul producteur appelle `push`/`clear`, un seul
+// consommateur appelle `pop`. `write` n'est écrit que par le producteur et
+// `read` que par le consommateur ; le couple Acquire/Release fait que le
+// consommateur ne lit une case qu'après l'écriture qui l'a remplie, et que le
+// producteur ne réécrit une case qu'après la lecture qui l'a libérée. Aucune
+// case n'est donc jamais lue et écrite en même temps.
+//
+// `UnsafeCell` n'est pas `Sync` : sans ces deux lignes, `Arc<RingBuf>` ne
+// traverserait plus les frontières de threads. Elles remplacent une hypothèse
+// tacite par une hypothèse écrite.
+unsafe impl Send for RingBuf {}
+unsafe impl Sync for RingBuf {}
+
 impl RingBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
-            buf: vec![0.0f32; capacity].into_boxed_slice(),
+            buf: (0..capacity)
+                .map(|_| UnsafeCell::new(0.0f32))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
         }
@@ -1293,12 +1316,10 @@ impl RingBuf {
         // Zero-fill the underlying storage to eliminate stale samples.
         // Safety: single-threaded clear (called before the cpal callback
         // starts reading from a freshly created ring buffer).
-        let cap = self.buf.len();
-        unsafe {
-            let ptr = self.buf.as_ptr() as *mut f32;
-            for i in 0..cap {
-                *ptr.add(i) = 0.0;
-            }
+        for cell in self.buf.iter() {
+            // SAFETY: appelé par le producteur seul, curseurs déjà remis à
+            // zéro — aucun lecteur ne peut viser une case non écrite.
+            unsafe { *cell.get() = 0.0 };
         }
     }
 
@@ -1311,11 +1332,8 @@ impl RingBuf {
         let n = samples.len().min(free);
         for i in 0..n {
             let idx = (w as usize + i) % cap;
-            // Safety: single writer thread, index always in bounds
-            unsafe {
-                let ptr = self.buf.as_ptr() as *mut f32;
-                *ptr.add(idx) = samples[i];
-            }
+            // SAFETY: producteur unique, case libre (i < free), index borné.
+            unsafe { *self.buf[idx].get() = samples[i] };
         }
         self.write.store(w + n as u64, Ordering::Release);
         n
@@ -1330,10 +1348,101 @@ impl RingBuf {
         let cap = self.capacity();
         for i in 0..n {
             let idx = (r as usize + i) % cap;
-            out[i] = self.buf[idx];
+            // SAFETY: consommateur unique, case publiée par le Release de
+            // `push` que le Acquire ci-dessus a observé.
+            out[i] = unsafe { *self.buf[idx].get() };
         }
         self.read.store(r + n as u64, Ordering::Release);
         n
+    }
+}
+
+#[cfg(test)]
+mod ringbuf_tests {
+    use super::RingBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn vide_plein_et_bouclage() {
+        let rb = RingBuf::new(4);
+        let mut out = [0.0f32; 4];
+
+        // Vide : rien à lire, et `pop` ne doit pas mentir sur le compte.
+        assert_eq!(rb.available(), 0);
+        assert_eq!(rb.pop(&mut out), 0);
+
+        // Plein : la capacité borne l'écriture, le surplus est refusé.
+        assert_eq!(rb.push(&[1.0, 2.0, 3.0, 4.0, 5.0]), 4);
+        assert_eq!(rb.available(), 4);
+        assert_eq!(rb.push(&[9.0]), 0, "un tampon plein n'accepte rien");
+
+        assert_eq!(rb.pop(&mut out), 4);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+
+        // Bouclage : on repart au début du stockage sans perdre l'ordre.
+        assert_eq!(rb.push(&[5.0, 6.0, 7.0]), 3);
+        let mut deux = [0.0f32; 2];
+        assert_eq!(rb.pop(&mut deux), 2);
+        assert_eq!(deux, [5.0, 6.0]);
+        assert_eq!(rb.push(&[8.0, 9.0, 10.0]), 3);
+        let mut reste = [0.0f32; 4];
+        assert_eq!(rb.pop(&mut reste), 4);
+        assert_eq!(reste, [7.0, 8.0, 9.0, 10.0]);
+    }
+
+    #[test]
+    fn clear_remet_a_zero_les_curseurs_et_le_stockage() {
+        let rb = RingBuf::new(8);
+        rb.push(&[1.0, 2.0, 3.0]);
+        rb.clear();
+        assert_eq!(rb.available(), 0);
+        let mut out = [42.0f32; 3];
+        assert_eq!(rb.pop(&mut out), 0, "rien ne doit survivre a un clear");
+    }
+
+    /// Le vrai contrat : un producteur, un consommateur, aucune perte, aucun
+    /// doublon, aucun desordre. C'est ce qu'un tampon SPSC promet, et c'est
+    /// exactement ce qu'un comportement indéfini peut casser silencieusement.
+    #[test]
+    fn un_producteur_un_consommateur_ne_perdent_ni_ne_reordonnent_rien() {
+        const N: usize = 100_000;
+        let rb = Arc::new(RingBuf::new(1024));
+
+        let prod = {
+            let rb = rb.clone();
+            std::thread::spawn(move || {
+                let mut envoye = 0usize;
+                while envoye < N {
+                    let lot: Vec<f32> = (envoye..(envoye + 64).min(N)).map(|i| i as f32).collect();
+                    let mut offset = 0;
+                    while offset < lot.len() {
+                        let n = rb.push(&lot[offset..]);
+                        offset += n;
+                        if n == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    envoye += lot.len();
+                }
+            })
+        };
+
+        let mut recu = Vec::with_capacity(N);
+        let mut tampon = [0.0f32; 128];
+        while recu.len() < N {
+            let n = rb.pop(&mut tampon);
+            if n == 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            recu.extend_from_slice(&tampon[..n]);
+        }
+        prod.join().unwrap();
+
+        assert_eq!(recu.len(), N);
+        for (i, v) in recu.iter().enumerate() {
+            assert_eq!(*v, i as f32, "echantillon {i} perdu, duplique ou reordonne");
+        }
     }
 }
 
