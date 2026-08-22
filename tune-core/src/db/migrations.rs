@@ -2341,8 +2341,11 @@ pub fn latest_version() -> i32 {
 /// Embedded PG migration scripts. Each tuple is (version, name, sql).
 /// The SQL files are compiled into the binary so no filesystem access
 /// is needed at runtime.
+///
+/// `pub(crate)` pour le test `pg_schema_parity`, qui rejoue cette liste sur une
+/// base nue et la compare au schema neuf de `pg_migrate.rs` (#2111).
 #[cfg(feature = "postgres")]
-const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
+pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
     (
         1,
         "initial_schema",
@@ -2496,6 +2499,17 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         30,
         "format_conteneur_dsd",
         include_str!("../../migrations/postgres/030_format_conteneur_dsd.sql"),
+    ),
+    // Les colonnes CUE n'existaient que dans le schema NEUF de pg_migrate.rs
+    // (#2111). Une base PG montee par ces scripts ne les avait donc jamais.
+    // C'est le QUATRIEME endroit ou une colonne doit s'ajouter, celui que la
+    // doctrine oubliait : schema SQLite, migration SQLite, schema PG neuf, ET
+    // migration PG. Le test `parite_du_schema_pg` echoue desormais sur tout
+    // ecart entre les deux derniers.
+    (
+        31,
+        "colonnes_manquantes_pg",
+        include_str!("../../migrations/postgres/031_colonnes_manquantes_pg.sql"),
     ),
 ];
 
