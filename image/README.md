@@ -19,6 +19,33 @@ sudo apt install debootstrap parted dosfstools qemu-user-static binfmt-support
 sudo ./build-rpi4-image.sh --version 0.8.157
 ```
 
+### Build Allwinner/sunxi image (on any Linux host)
+
+For H616/H618 boards used as a **network source**: the aarch64 release
+binary is built without `local-audio`, so this image has no local audio
+output at all — playback goes to DLNA/Chromecast/OpenHome/Squeezebox
+renderers on the network.
+
+```bash
+sudo apt install debootstrap parted qemu-user-static binfmt-support
+sudo ./build-sunxi-image.sh --version 0.9.16 --board orangepi-zero2
+```
+
+Known boards: `orangepi-zero2` (H616, gigabit), `orangepi-zero3` (H618),
+`orangepi-zero2w` (H618). For a board with no upstream DTB — a TV box —
+use `--board custom` with an explicit blob and device tree:
+
+```bash
+sudo ./build-sunxi-image.sh --board custom \
+     --uboot-bin ./u-boot-sunxi-with-spl.bin \
+     --dtb allwinner/sun50i-h618-my-box.dtb
+```
+
+Unlike the Raspberry Pi, sunxi has no FAT firmware partition: the script
+writes the SPL+U-Boot blob raw at 8 KiB and U-Boot loads the kernel from
+`/boot` over ext4 via extlinux. The serial console (`ttyS0` @ 115200) is
+enabled — it is the first thing you need if a boot goes wrong.
+
 ### Flash to disk
 
 ```bash
@@ -81,3 +108,6 @@ Add to `/etc/fstab` for permanent mount.
 | Raspberry Pi 5 | aarch64 | Supported |
 | Generic x86_64 PC | x86_64 | Supported |
 | Odroid / Rock Pi | aarch64 | Untested |
+| Orange Pi Zero 2 (H616) | aarch64 | Builds, first boot not yet validated |
+| Orange Pi Zero 3 / Zero 2W (H618) | aarch64 | Untested |
+| Allwinner TV box (custom DTB) | aarch64 | Bring-up required |

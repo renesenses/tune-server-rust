@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+# ============================================================
+# Tune OS — Allwinner (sunxi) Image Builder
+# Builds a bootable aarch64 SD card image with Tune Server for
+# Allwinner H6/H616/H618 boards.
+#
+# Reference board: Orange Pi Zero 2 (H616) — gigabit ethernet via
+# RTL8211F, upstream DTB, U-Boot defconfig in Debian. Nothing to
+# bring up: it boots on a mainline kernel as-is.
+#
+# Unlike the Raspberry Pi, sunxi has no FAT firmware partition: the
+# SPL+U-Boot blob lives raw at 8 KiB and the kernel is loaded from
+# /boot on the ext4 root through extlinux (u-boot-menu).
+#
+# Must be run on a Linux host as root.
+# Cross-builds for aarch64 using qemu-user-static.
+#
+# Usage:
+#   sudo ./build-sunxi-image.sh [--version 0.9.16] [--board orangepi-zero2]
+#   sudo ./build-sunxi-image.sh --board custom \
+#        --uboot-bin /path/u-boot-sunxi-with-spl.bin \
+#        --dtb allwinner/sun50i-h618-my-box.dtb
+# ============================================================
+set -euo pipefail
+
+TUNE_VERSION="latest"
+BOARD="orangepi-zero2"
+UBOOT_BIN=""
+DTB=""
+DEBIAN_RELEASE="bookworm"
+DEBIAN_MIRROR="http://deb.debian.org/debian"
+# Kernel from backports by default: H616/H618 support (EMAC, cpufreq,
+# thermal) landed and matured well after the 6.1 in bookworm. Use
+# --no-backports if you specifically want the release kernel.
+USE_BACKPORTS=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version)       TUNE_VERSION="$2"; shift 2 ;;
+        --board)         BOARD="$2"; shift 2 ;;
+        --uboot-bin)     UBOOT_BIN="$2"; shift 2 ;;
+        --dtb)           DTB="$2"; shift 2 ;;
+        --no-backports)  USE_BACKPORTS=0; shift ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Known boards: U-Boot package directory (the defconfig name) and the DTB
+# shipped by Debian's linux-image-arm64. Anything else needs --uboot-bin
+# and --dtb — that is the path for an anonymous TV box board, whose DTB is
+# not upstream and whose DRAM parameters have to be extracted from the
+# stock Android boot0 first.
+case "$BOARD" in
+    orangepi-zero2)
+        UBOOT_DIR="orangepi_zero2"
+        BOARD_DTB="allwinner/sun50i-h616-orangepi-zero2.dtb"
+        ;;
+    orangepi-zero3)
+        UBOOT_DIR="orangepi_zero3"
+        BOARD_DTB="allwinner/sun50i-h618-orangepi-zero3.dtb"
+        ;;
+    orangepi-zero2w)
+        # H618. Added to U-Boot after bookworm's 2023.01 — expect to need
+        # --uboot-bin with a self-built blob here.
+        UBOOT_DIR="orangepi_zero2w"
+        BOARD_DTB="allwinner/sun50i-h618-orangepi-zero2w.dtb"
+        ;;
+    custom)
+        UBOOT_DIR=""
+        BOARD_DTB=""
+        ;;
+    *) echo "Unknown board: $BOARD (orangepi-zero2, orangepi-zero3, orangepi-zero2w, custom)" >&2; exit 1 ;;
+esac
+[[ -n "$DTB" ]] && BOARD_DTB="$DTB"
+
+if [[ "$BOARD" == "custom" ]]; then
+    if [[ -z "$UBOOT_BIN" || -z "$BOARD_DTB" ]]; then
+        echo "--board custom requires both --uboot-bin and --dtb" >&2
+        exit 1
+    fi
+fi
+
+IMAGE_NAME="tune-os-${BOARD}"
+IMAGE_SIZE="2G"
+WORK_DIR="/tmp/tune-os-build-sunxi"
+ROOTFS="${WORK_DIR}/rootfs"
+IMAGE_FILE="${WORK_DIR}/${IMAGE_NAME}.img"
+LOOP_DEV=""
+HOSTNAME="tune"
+# sunxi BROM reads the SPL at 8 KiB; the SPL+ATF+U-Boot FIT that follows
+# stays well under 1 MiB. Start the root partition at 8 MiB so a rebuilt,
+# larger U-Boot never overwrites the filesystem.
+UBOOT_SEEK_KIB=8
+PART_START="8MiB"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() { echo -e "${BLUE}[tune-os]${NC} $*"; }
+ok()  { echo -e "${GREEN}[  OK  ]${NC} $*"; }
+err() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+cleanup() {
+    log "Cleaning up..."
+    umount "${ROOTFS}/proc" 2>/dev/null || true
+    umount "${ROOTFS}/sys" 2>/dev/null || true
+    umount "${ROOTFS}/dev/pts" 2>/dev/null || true
+    umount "${ROOTFS}/dev" 2>/dev/null || true
+    umount "${ROOTFS}" 2>/dev/null || true
+    if [[ -n "$LOOP_DEV" ]]; then
+        losetup -d "$LOOP_DEV" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+if [[ $EUID -ne 0 ]]; then
+    err "Must be run as root"
+    exit 1
+fi
+
+if [[ "$(uname -m)" != "aarch64" ]] && ! command -v qemu-aarch64-static &>/dev/null; then
+    err "Cross-build requires qemu-user-static: apt install qemu-user-static binfmt-support"
+    exit 1
+fi
+
+for tool in debootstrap parted mkfs.ext4 losetup blkid; do
+    command -v "$tool" &>/dev/null || { err "Missing tool: $tool"; exit 1; }
+done
+
+# --- Resolve version ---
+if [[ "$TUNE_VERSION" == "latest" ]]; then
+    TUNE_VERSION=$(curl -sL "https://api.github.com/repos/renesenses/tune-server-rust/releases/latest" \
+        | grep '"tag_name"' | head -1 | sed 's/.*"v\(.*\)".*/\1/')
+fi
+log "Building Tune OS for ${BOARD} with Tune Server v${TUNE_VERSION}"
+
+# linux-aarch64 = the glibc build, which is what a Debian rootfs wants.
+# Its release features are `oaat,postgres` — no `local-audio`, so the
+# binary links no ALSA at all. Correct for a board used as a network
+# source: playback goes out to DLNA/Chromecast/OpenHome/Squeezebox
+# renderers, never to a local card.
+TUNE_TARBALL_URL="https://github.com/renesenses/tune-server-rust/releases/download/v${TUNE_VERSION}/tune-server-v${TUNE_VERSION}-linux-aarch64.tar.gz"
+
+# --- Create image ---
+log "Creating ${IMAGE_SIZE} image..."
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR"
+truncate -s "$IMAGE_SIZE" "$IMAGE_FILE"
+
+# Single ext4 partition: U-Boot reads the kernel from /boot over ext4, so
+# there is no boot partition to keep in sync.
+parted -s "$IMAGE_FILE" mklabel msdos
+parted -s "$IMAGE_FILE" mkpart primary ext4 "$PART_START" 100%
+
+LOOP_DEV=$(losetup --find --show --partscan "$IMAGE_FILE")
+PART_ROOT="${LOOP_DEV}p1"
+sleep 1
+partprobe "$LOOP_DEV" 2>/dev/null || true
+sleep 1
+
+mkfs.ext4 -L tuneroot -q "$PART_ROOT"
+mkdir -p "$ROOTFS"
+mount "$PART_ROOT" "$ROOTFS"
+
+# --- Bootstrap ---
+log "Bootstrapping Debian ${DEBIAN_RELEASE} for aarch64..."
+debootstrap --arch=arm64 --variant=minbase --foreign \
+    --components=main,contrib,non-free-firmware \
+    --include=systemd,systemd-sysv \
+    "$DEBIAN_RELEASE" "$ROOTFS" "$DEBIAN_MIRROR" || {
+    err "debootstrap failed — last lines of debootstrap.log:"
+    tail -n 200 "${ROOTFS}/debootstrap/debootstrap.log" 2>/dev/null || true
+    exit 1
+}
+
+if [[ "$(uname -m)" != "aarch64" ]]; then
+    cp /usr/bin/qemu-aarch64-static "${ROOTFS}/usr/bin/"
+fi
+chroot "$ROOTFS" /debootstrap/debootstrap --second-stage
+ok "Debian aarch64 bootstrap complete"
+
+# --- Mount pseudo-fs ---
+mount --bind /dev "${ROOTFS}/dev"
+mount --bind /dev/pts "${ROOTFS}/dev/pts"
+mount -t proc proc "${ROOTFS}/proc"
+mount -t sysfs sys "${ROOTFS}/sys"
+
+# --- Packages via apt (proper dependency ordering, as on the NUC image) ---
+cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE} main contrib non-free-firmware
+deb http://security.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free-firmware
+EOF
+if [[ "$USE_BACKPORTS" -eq 1 ]]; then
+    echo "deb ${DEBIAN_MIRROR} ${DEBIAN_RELEASE}-backports main contrib non-free-firmware" \
+        >> "${ROOTFS}/etc/apt/sources.list"
+    KERNEL_PKG="linux-image-arm64/${DEBIAN_RELEASE}-backports"
+else
+    KERNEL_PKG="linux-image-arm64"
+fi
+
+printf '#!/bin/sh\nexit 101\n' > "${ROOTFS}/usr/sbin/policy-rc.d"
+chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
+
+# No alsa-utils / libasound2: the aarch64 release binary is built without
+# `local-audio`, so nothing here opens a sound card.
+# u-boot-menu generates /boot/extlinux/extlinux.conf on every kernel
+# upgrade; u-boot-sunxi ships the board's SPL+U-Boot blob.
+# cifs-utils + nfs-common: the library lives on a NAS.
+log "Installing packages via apt..."
+chroot "$ROOTFS" bash -ec "
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+        dbus udev kmod ${KERNEL_PKG} u-boot-menu u-boot-sunxi \
+        sudo curl ca-certificates avahi-daemon libnss-mdns \
+        network-manager wpasupplicant wireless-regdb openssh-server \
+        firmware-realtek firmware-brcm80211 firmware-atheros \
+        cifs-utils smbclient nfs-common exfatprogs ntfs-3g \
+        cloud-guest-utils e2fsprogs \
+        locales procps iproute2 less nano
+"
+ok "Packages installed"
+
+# --- Bootloader ---
+if [[ -z "$UBOOT_BIN" ]]; then
+    UBOOT_BIN="${ROOTFS}/usr/lib/u-boot/${UBOOT_DIR}/u-boot-sunxi-with-spl.bin"
+fi
+if [[ ! -f "$UBOOT_BIN" ]]; then
+    err "U-Boot blob not found: ${UBOOT_BIN}"
+    err "Debian's u-boot-sunxi may not carry this board — build U-Boot"
+    err "(${UBOOT_DIR}_defconfig) and pass it with --uboot-bin."
+    exit 1
+fi
+log "Writing U-Boot at ${UBOOT_SEEK_KIB} KiB ($(basename "$UBOOT_BIN"))..."
+dd if="$UBOOT_BIN" of="$LOOP_DEV" bs=1024 seek="$UBOOT_SEEK_KIB" conv=notrunc,fsync status=none
+ok "U-Boot written"
+
+# --- System configuration ---
+echo "$HOSTNAME" > "${ROOTFS}/etc/hostname"
+cat > "${ROOTFS}/etc/hosts" <<EOF
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME}
+EOF
+
+chroot "$ROOTFS" bash -c "echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen && locale-gen"
+chroot "$ROOTFS" ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+
+ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+cat > "${ROOTFS}/etc/fstab" <<EOF
+UUID=${ROOT_UUID}  /  ext4  errors=remount-ro  0 1
+EOF
+
+# extlinux entries for U-Boot's sysboot. The DTB is pinned explicitly
+# rather than left to fdtdir guessing: on a board brought up by hand, a
+# silently wrong DTB is the hardest failure to diagnose.
+# console=ttyS0,115200 is the sunxi debug UART — the 13-pin header on the
+# Orange Pi Zero 2, and the first thing you need when a boot goes wrong.
+cat > "${ROOTFS}/etc/default/u-boot" <<EOF
+U_BOOT_UPDATE="true"
+U_BOOT_ROOT="root=UUID=${ROOT_UUID}"
+U_BOOT_PARAMETERS="rootwait rw console=ttyS0,115200 console=tty1 consoleblank=0"
+U_BOOT_FDT="${BOARD_DTB}"
+U_BOOT_FDT_DIR="/usr/lib/linux-image-"
+U_BOOT_TIMEOUT="3"
+U_BOOT_MENU_LABEL="Tune OS"
+EOF
+
+EXTLINUX="${ROOTFS}/boot/extlinux/extlinux.conf"
+chroot "$ROOTFS" u-boot-update || err "u-boot-update failed"
+if ! grep -q "$BOARD_DTB" "$EXTLINUX" 2>/dev/null; then
+    log "extlinux.conf missing or does not pin ${BOARD_DTB} — writing it by hand"
+    KVER=$(basename "$(ls -1 "${ROOTFS}"/boot/vmlinuz-* | sort -V | tail -1)" | sed 's/^vmlinuz-//')
+    mkdir -p "${ROOTFS}/boot/extlinux"
+    cat > "${ROOTFS}/boot/extlinux/extlinux.conf" <<EOF
+default l0
+timeout 30
+menu title Tune OS
+
+label l0
+    menu label Tune OS, kernel ${KVER}
+    linux /boot/vmlinuz-${KVER}
+    initrd /boot/initrd.img-${KVER}
+    fdt /usr/lib/linux-image-${KVER}/${BOARD_DTB}
+    append root=UUID=${ROOT_UUID} rootwait rw console=ttyS0,115200 console=tty1
+EOF
+fi
+grep -q "$BOARD_DTB" "$EXTLINUX" \
+    || { err "extlinux.conf still does not reference ${BOARD_DTB}"; exit 1; }
+ok "Boot configuration written ($(basename "$BOARD_DTB"))"
+
+sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' "${ROOTFS}/etc/nsswitch.conf"
+
+cat > "${ROOTFS}/etc/NetworkManager/conf.d/tune.conf" <<EOF
+[main]
+plugins=keyfile
+
+[connection]
+wifi.powersave=2
+
+[device]
+wifi.scan-rand-mac-address=no
+EOF
+
+# Appliance marker: unlocks /api/v1/appliance (network setup from the web
+# UI) and the appliance flag in /system/config — see docs/APPLIANCE.md
+echo "Tune OS appliance image (${BOARD})" > "${ROOTFS}/etc/tune-appliance"
+
+# USB storage: auto-mount partitions under /media/<kernel> (headless, no
+# udisks session). Same rule as the NUC image.
+mkdir -p "${ROOTFS}/media"
+cat > "${ROOTFS}/etc/udev/rules.d/99-tune-usb-mount.rules" <<'EOF'
+ACTION=="add", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-mount --no-block --automount=yes --collect $devnode /media/%k"
+ACTION=="remove", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-umount /media/%k"
+EOF
+
+mkdir -p "${ROOTFS}/etc/ssh/sshd_config.d"
+cat > "${ROOTFS}/etc/ssh/sshd_config.d/tune.conf" <<EOF
+PermitRootLogin no
+PasswordAuthentication yes
+EOF
+
+chroot "$ROOTFS" bash -c "
+    useradd -m -s /bin/bash -G sudo,plugdev tune
+    echo 'tune:tune' | chpasswd
+    echo 'tune ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tune
+"
+
+# --- Install Tune ---
+log "Downloading Tune Server v${TUNE_VERSION} (aarch64)..."
+curl -fsSL "$TUNE_TARBALL_URL" -o "${WORK_DIR}/tune.tar.gz" \
+    || { err "Download failed: ${TUNE_TARBALL_URL}"; exit 1; }
+mkdir -p "${ROOTFS}/opt/tune"
+tar xzf "${WORK_DIR}/tune.tar.gz" -C "${ROOTFS}/opt/tune"
+chmod +x "${ROOTFS}/opt/tune/tune-server"
+mkdir -p "${ROOTFS}/opt/tune/data" "${ROOTFS}/mnt/music"
+
+# No [audio] section: this image has no local output by design. Renderers
+# are discovered on the network instead.
+cat > "${ROOTFS}/opt/tune/tune.toml" <<EOF
+[server]
+port = 8888
+data_dir = "/opt/tune/data"
+
+[library]
+music_dirs = ["/mnt/music"]
+EOF
+
+# Root, like the NUC appliance image: the server drives nmcli (network
+# setup) and mount.cifs (SMB shares) itself — cf. /etc/tune-appliance.
+cat > "${ROOTFS}/etc/systemd/system/tune.service" <<EOF
+[Unit]
+Description=Tune Music Server
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tune
+ExecStart=/opt/tune/tune-server
+Restart=always
+RestartSec=3
+Environment=TUNE_DATA_DIR=/opt/tune/data
+Environment=TUNE_PORT=8888
+Environment=TUNE_LOG_LEVEL=info
+Environment=RUST_LOG=info
+LimitNOFILE=65536
+
+# Hardening (root, mais système en lecture seule hors chemins listés).
+# /opt/tune entier : l'auto-update remplace le binaire et web/ in place.
+# /mnt entier : les partages SMB montés depuis l'UI apparaissent sous /mnt.
+# Pas de NoNewPrivileges : mount.cifs est un helper setuid.
+ProtectSystem=strict
+ReadWritePaths=/opt/tune /mnt /media /tmp
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Port 80 -> 8888 proxy: browsers silently upgrade http:// links to https://
+# and the TLS attempt on :8888 is refused. Port 80 lets the printed URL
+# drop the port. See build-nuc-image.sh for details.
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.socket" <<EOF
+[Unit]
+Description=Tune OS web UI on port 80 (proxied to :8888)
+
+[Socket]
+ListenStream=80
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+cat > "${ROOTFS}/etc/systemd/system/tune-web80.service" <<EOF
+[Unit]
+Description=Proxy port 80 to the Tune web UI on :8888
+Requires=tune-web80.socket
+After=tune.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8888
+PrivateTmp=yes
+PrivateNetwork=no
+EOF
+
+# --- First boot: unique machine-id, grow the filesystem, unique hostname ---
+cat > "${ROOTFS}/opt/tune/first-boot.sh" <<'FIRSTBOOT'
+#!/bin/bash
+# Tune OS first-boot setup. Runs once, then disables itself.
+
+MARKER="/opt/tune/data/.first-boot-done"
+if [[ -f "$MARKER" ]]; then
+    exit 0
+fi
+
+systemd-machine-id-setup
+
+# Grow the root partition to fill the card (the image is 2G; cards are not)
+ROOT_PART=$(findmnt -n -o SOURCE /)
+ROOT_DISK=$(lsblk -ndo pkname "$ROOT_PART")
+PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]*$')
+if [[ -n "$ROOT_DISK" && -n "$PART_NUM" ]]; then
+    growpart "/dev/$ROOT_DISK" "$PART_NUM" 2>/dev/null || true
+    resize2fs "$ROOT_PART" 2>/dev/null || true
+fi
+
+# Set hostname to tune-XXXX (last 4 of MAC) so several boxes coexist
+MAC=$(ip link show | grep -m1 'link/ether' | awk '{print $2}' | tr -d ':' | tail -c 5)
+if [[ -n "$MAC" ]]; then
+    hostnamectl set-hostname "tune-${MAC}"
+    # Keep the printed URL truthful: tune.local dies with the rename
+    sed -i "s|http://tune\.local|http://tune-${MAC}.local|" /etc/motd
+fi
+
+touch "$MARKER"
+echo "Tune OS first boot complete."
+FIRSTBOOT
+chmod +x "${ROOTFS}/opt/tune/first-boot.sh"
+
+cat > "${ROOTFS}/etc/systemd/system/tune-first-boot.service" <<EOF
+[Unit]
+Description=Tune OS First Boot Setup
+After=network-online.target
+ConditionPathExists=!/opt/tune/data/.first-boot-done
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tune/first-boot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chroot "$ROOTFS" systemctl enable tune.service
+chroot "$ROOTFS" systemctl enable tune-first-boot.service
+chroot "$ROOTFS" systemctl enable tune-web80.socket
+chroot "$ROOTFS" systemctl enable NetworkManager
+chroot "$ROOTFS" systemctl enable avahi-daemon
+chroot "$ROOTFS" systemctl enable ssh
+chroot "$ROOTFS" systemctl enable serial-getty@ttyS0.service
+
+cat > "${ROOTFS}/etc/motd" <<EOF
+
+  ♫  Tune OS v${TUNE_VERSION} (${BOARD})
+  ─────────────────────────────────────
+  Web UI:    http://tune.local   (ou http://tune.local:8888)
+  Music:     NAS/SMB shares: web UI → Settings → Network
+             USB drives auto-mount under /media
+  Renderers: réseau seulement (pas de sortie audio locale sur cette image)
+  Config:    /opt/tune/tune.toml
+  Logs:      journalctl -u tune -f
+  Console:   série ttyS0 @ 115200
+  User:      tune / tune
+
+EOF
+
+ok "Tune installed on ${BOARD} image"
+
+# --- Cleanup ---
+rm -f "${ROOTFS}/usr/sbin/policy-rc.d"
+chroot "$ROOTFS" apt-get clean
+rm -rf "${ROOTFS}/var/cache/apt/archives"/*.deb
+rm -rf "${ROOTFS}/var/lib/apt/lists"/*
+rm -f "${ROOTFS}/usr/bin/qemu-aarch64-static"
+
+umount "${ROOTFS}/proc"
+umount "${ROOTFS}/sys"
+umount "${ROOTFS}/dev/pts"
+umount "${ROOTFS}/dev"
+umount "${ROOTFS}"
+
+# --- Output ---
+OUTPUT_DIR="$(cd "$(dirname "$0")" && pwd)/output"
+mkdir -p "$OUTPUT_DIR"
+FINAL_IMG="${OUTPUT_DIR}/${IMAGE_NAME}-v${TUNE_VERSION}.img"
+cp "$IMAGE_FILE" "$FINAL_IMG"
+gzip -kf "$FINAL_IMG"
+
+ok "Build complete!"
+echo ""
+echo "  Image:  ${FINAL_IMG} ($(du -h "$FINAL_IMG" | cut -f1))"
+echo "  GZ:     ${FINAL_IMG}.gz ($(du -h "${FINAL_IMG}.gz" | cut -f1))"
+echo ""
+echo "  Flash:  sudo dd if=${FINAL_IMG} of=/dev/sdX bs=4M status=progress"
+echo "  Login:  tune / tune  (console série ttyS0 @ 115200)"
+echo "  Web:    http://tune.local"
