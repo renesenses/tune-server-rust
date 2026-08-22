@@ -203,8 +203,12 @@ fi
 printf '#!/bin/sh\nexit 101\n' > "${ROOTFS}/usr/sbin/policy-rc.d"
 chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
 
-# No alsa-utils / libasound2: the aarch64 release binary is built without
-# `local-audio`, so nothing here opens a sound card.
+# libstdc++6: the release binary's only non-base shared dependency. Verified
+# on the shipped tarball — `objdump -p tune-server` lists libstdc++.so.6,
+# libgcc_s, libdl, libpthread, libm, libc. Nothing else, in particular no
+# libasound (built without `local-audio`) and no libopus (linked static).
+# Do not rely on it arriving transitively: a minbase rootfs may not have it,
+# and the failure is the server refusing to start at all.
 # u-boot-menu generates /boot/extlinux/extlinux.conf on every kernel
 # upgrade; u-boot-sunxi ships the board's SPL+U-Boot blob.
 # cifs-utils + nfs-common: the library lives on a NAS.
@@ -214,6 +218,7 @@ chroot "$ROOTFS" bash -ec "
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends \
         dbus udev kmod ${KERNEL_PKG} u-boot-menu u-boot-sunxi \
+        libstdc++6 \
         sudo curl ca-certificates avahi-daemon libnss-mdns \
         network-manager wpasupplicant wireless-regdb openssh-server \
         firmware-realtek firmware-brcm80211 firmware-atheros \
