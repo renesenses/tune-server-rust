@@ -73,6 +73,26 @@ make BL31=../arm-trusted-firmware/build/sun50i_h616/release/bl31.bin -j"$(nproc)
 # -> u-boot-sunxi-with-spl.bin
 ```
 
+#### Where the console actually is
+
+On the Orange Pi Zero 2 the kernel console is **UART0 on PH0 (TX) / PH1 (RX)**,
+115200n8 — `serial@5000000`, the only UART left `okay` in the board DTB, with
+`chosen/stdout-path = "serial0:115200n8"`.
+
+It is **not on the 26-pin GPIO header**, which carries UART5 on physical pins 8
+and 10 (`TXD.5` / `RXD.5` in wiringOP's `physNames_ZERO_2`) — and UART5 is
+disabled in the DTB, so wiring there shows nothing. Use the board's dedicated
+debug connector.
+
+Two hardware traps that cost a full debugging session:
+
+- **Never connect the adapter's VCC wire.** With it attached the board does not
+  boot at all: 3.3 V is pushed back into a rail through the SoC's ESD diodes and
+  the AXP305 power sequencing never completes. TX, RX and GND only.
+- **A USB-PD-only charger may deliver nothing.** The board presents no CC
+  resistors, so a strict PD source (an Apple laptop brick) stays at 0 V. Use a
+  USB-A charger with an A-to-C cable, or a plain 5 V/3 A supply.
+
 Verify the result landed where the BROM looks — offset 8 KiB must carry the
 sunxi SPL magic:
 
@@ -143,6 +163,6 @@ Add to `/etc/fstab` for permanent mount.
 | Raspberry Pi 5 | aarch64 | Supported |
 | Generic x86_64 PC | x86_64 | Supported |
 | Odroid / Rock Pi | aarch64 | Untested |
-| Orange Pi Zero 2 (H616) | aarch64 | Image built &amp; verified, first boot not yet validated |
+| Orange Pi Zero 2 (H616) | aarch64 | **Boots — validated on hardware** |
 | Orange Pi Zero 3 / Zero 2W (H618) | aarch64 | Untested |
 | Allwinner TV box (custom DTB) | aarch64 | Bring-up required |
