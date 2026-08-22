@@ -329,6 +329,51 @@ mod tests {
         assert!(levels.peak_right_db() > -1.0);
     }
 
+    /// Soft 24-bit stereo sine (~−20 dBFS). Packs signed 24-bit LE samples.
+    fn sine_pcm_24(freq: f64, amp: f64, sr: u32, frames: usize) -> Vec<u8> {
+        let mut pcm = Vec::with_capacity(frames * 6);
+        let max_24 = (1i32 << 23) - 1;
+        for i in 0..frames {
+            let t = i as f64 / sr as f64;
+            let sample = amp * (2.0 * std::f64::consts::PI * freq * t).sin();
+            let val = (sample * max_24 as f64) as i32;
+            let b = val.to_le_bytes();
+            pcm.extend_from_slice(&[b[0], b[1], b[2]]);
+            pcm.extend_from_slice(&[b[0], b[1], b[2]]);
+        }
+        pcm
+    }
+
+    #[test]
+    fn compute_levels_24bit_aligned_reports_quiet_peak() {
+        // OAAT uses 24-bit WAV. When chunks stay frame-aligned, a −20 dBFS
+        // sine must not peg the VU near 0 dBFS.
+        let pcm = sine_pcm_24(1000.0, 0.1, 44100, 4096);
+        assert_eq!(pcm.len() % 6, 0);
+        let levels = compute_levels(&pcm, 24, 2, 44100);
+        let peak = levels.peak_left_db();
+        assert!(
+            peak < -15.0 && peak > -25.0,
+            "aligned 24-bit −20 dBFS sine peaked at {peak} dBFS"
+        );
+    }
+
+    #[test]
+    fn compute_levels_24bit_misaligned_chunk_pegs_peak() {
+        // Reproduces the fixed-32768 drain bug: 32768 % 6 == 2, so the 2nd
+        // batch starts mid-sample and compute_levels reads garbage → ~0 dBFS.
+        let pcm = sine_pcm_24(1000.0, 0.1, 44100, 20_000);
+        assert!(pcm.len() > 32768 + 6);
+        let misaligned = &pcm[32768..32768 + 32766];
+        assert_eq!(misaligned.len() % 6, 0);
+        let levels = compute_levels(misaligned, 24, 2, 44100);
+        let peak = levels.peak_left_db();
+        assert!(
+            peak > -6.0,
+            "misaligned 24-bit chunk should peg the VU (got {peak} dBFS)"
+        );
+    }
+
     /// PCM stéréo d'une sinusoïde à `freq`, d'amplitude `amp` (1.0 = pleine échelle).
     fn sine_pcm(freq: f64, amp: f64, sr: u32, frames: usize) -> Vec<u8> {
         let mut pcm = Vec::with_capacity(frames * 4);

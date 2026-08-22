@@ -133,6 +133,12 @@ const STOPPED_FAILURE_THRESHOLD: u8 = 30;
 /// take 5-15 seconds before the renderer receives any audio data.
 const TRACK_LOAD_GRACE_SECS: u64 = 45;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
+/// How many consecutive unplayable queue items the auto-advance will skip
+/// before giving up and stopping the zone. One or two dead tracks in an album
+/// is ordinary (a title pulled from the catalogue); a long run means something
+/// systemic — expired credentials, no network — where retrying once per queued
+/// item would just hammer the service.
+const MAX_CONSECUTIVE_SKIPS: u32 = 25;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
@@ -2553,6 +2559,8 @@ impl PositionPoller {
                                             sample_rate: None,
                                             bit_depth: None,
                                             media_format: None,
+                                            track_number: None,
+                                            disc_number: None,
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
@@ -3728,6 +3736,32 @@ impl PositionPoller {
         Self::next_position_inner(zone_state, true)
     }
 
+    /// Next-track decision *after* the track at `failed_pos` turned out to be
+    /// unplayable. Same rules as `next_position` (repeat, shuffle order), but
+    /// evaluated as if `failed_pos` had just finished playing — so skipping a
+    /// dead item keeps following the shuffle permutation instead of falling
+    /// back to raw queue order.
+    pub fn next_position_after(
+        zone_state: &crate::playback::ZoneState,
+        failed_pos: i64,
+    ) -> Option<i64> {
+        let mut as_if = zone_state.clone();
+        as_if.queue_position = failed_pos;
+        if as_if.shuffle && !as_if.shuffle_order.is_empty() {
+            // Follow the permutation from the slot we just failed on, so the
+            // walk cannot revisit it or lose its place in the cycle.
+            match as_if
+                .shuffle_order
+                .iter()
+                .position(|&i| i as i64 == failed_pos)
+            {
+                Some(idx) => as_if.shuffle_index = idx as i64,
+                None => as_if.shuffle_index += 1,
+            }
+        }
+        Self::next_position_inner(&as_if, false)
+    }
+
     fn next_position_inner(zone_state: &crate::playback::ZoneState, manual: bool) -> Option<i64> {
         if zone_state.queue_length == 0 {
             return None;
@@ -4054,10 +4088,62 @@ impl PositionPoller {
             queue_pos = zone_state.queue_position,
             "auto_next"
         );
-        if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
-            warn!(zone_id, error = %e, "auto_next_failed");
-            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+        // Skip tracks that cannot be played instead of ending the session. A
+        // single unplayable streaming track — rights withdrawn, region block,
+        // the service returning no URL at any format — used to stop the whole
+        // queue: playing 11 albums to a zone died on one blocked track with
+        // 108 items still queued, leaving nothing but a WARN behind. Walk
+        // forward over the dead items, announce each one, and stop only when
+        // the queue really is exhausted (or the failures look systemic).
+        let mut attempt_pos = next_pos;
+        let mut skipped = 0u32;
+        loop {
+            match self
+                .orchestrator
+                .play_from_queue(zone_id, attempt_pos)
+                .await
+            {
+                Ok(_) => {
+                    if skipped > 0 {
+                        info!(
+                            zone_id,
+                            skipped,
+                            next_pos = attempt_pos,
+                            "auto_next_resumed_after_skips"
+                        );
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "playback.track_skipped",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "position": attempt_pos,
+                                "reason": e.to_string(),
+                            }),
+                        );
+                    }
+                    skipped += 1;
+                    // A run this long is not "one bad track" any more — an
+                    // expired token or a dead network would otherwise have us
+                    // hammer the service once per queued item.
+                    if skipped >= MAX_CONSECUTIVE_SKIPS {
+                        warn!(zone_id, skipped, "auto_next_skip_limit_reached");
+                        break;
+                    }
+                    match Self::next_position_after(zone_state, attempt_pos) {
+                        // Same slot again means repeat-one on a dead track:
+                        // skipping would spin forever.
+                        Some(p) if p != attempt_pos => attempt_pos = p,
+                        _ => break,
+                    }
+                }
+            }
         }
+        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
     }
 
     /// Resolve the next queue item's stream URL for gapless, with one bounded
@@ -4139,6 +4225,10 @@ impl PositionPoller {
                         channels: resolved.channels,
                         live_stream: false,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     return match output.set_next_media(&media).await {
                         Ok(()) => {
@@ -4249,6 +4339,10 @@ impl PositionPoller {
                         channels: resolved.channels,
                         live_stream: false,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
@@ -4829,6 +4923,96 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PositionPoller::next_position_manual(&state), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_walks_forward() {
+        // An unplayable track at position 2 must hand back position 3, not
+        // stop the queue (the poller loops on this).
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 10,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), Some(3));
+    }
+
+    #[test]
+    fn next_position_after_end_of_queue_stops() {
+        // Last item unplayable under repeat-off: nothing left to skip to.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), None);
+    }
+
+    #[test]
+    fn next_position_after_repeat_one_returns_same_slot() {
+        // Repeat-one on a dead track: the caller must recognise the unchanged
+        // position and stop instead of spinning forever.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::One,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), Some(2));
+    }
+
+    #[test]
+    fn next_position_after_repeat_all_wraps() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::All,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_shuffle_keeps_its_place_in_the_order() {
+        // Order 3,1,4,0,2 — the item at queue position 4 (order index 2) is
+        // unplayable, so the next candidate is the order's next entry, 0.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 1,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_shuffle_last_of_cycle_stops() {
+        // Dead item is the final entry of the shuffle cycle under repeat-off.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 0,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 3,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), None);
     }
 
     #[test]
