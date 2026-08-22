@@ -37,11 +37,30 @@ numéro de fil (#1312 → PR #1344). Une seule commande `git grep` l'aurait
 Cherchez par **contenu**, pas par numéro : le même bug arrive souvent sous
 deux numéros — celui de l'issue GitHub et celui du fil forum.
 
-Et si vous touchez au schéma : une colonne s'ajoute **aux trois endroits**
-(`CORE_SCHEMA` SQLite, migration, schéma PG) et **jamais par un
-`ALTER TABLE ADD COLUMN` dans `up:`** — sur une base neuve la colonne existe
-déjà, l'ALTER échoue en « duplicate column name » et fait planter tout
-`run_migrations` au premier démarrage. Utilisez `add_column_if_missing`.
+Et si vous touchez au schéma : une colonne s'ajoute **aux quatre endroits**
+
+| # | endroit | pour qui |
+|---|---|---|
+| 1 | `CORE_SCHEMA` (`db/sqlite.rs`) | base SQLite neuve |
+| 2 | migration SQLite (`db/migrations.rs`) | base SQLite existante |
+| 3 | `PG_FULL_SCHEMA` (`db/pg_migrate.rs`) | base PG neuve, et bascule SQLite→PG |
+| 4 | migration PG (`migrations/postgres/NNN_….sql` + `PG_MIGRATIONS`) | **base PG existante** |
+
+**Longtemps on en comptait trois** — et c'est le quatrième qui manquait. Les
+colonnes du chantier CUE n'existaient que dans le `CREATE TABLE` de
+`pg_migrate.rs` : aucune base PostgreSQL existante ne les a jamais reçues, et
+personne ne s'en est aperçu pendant des mois parce qu'aucune requête ne les
+nommait encore (#2111). Le test `pg_schema_parity` refuse désormais tout écart
+entre 3 et 4.
+
+Si la copie SQLite→PG lit la colonne, l'ajouter **aussi** au bloc de rattrapage
+en fin de `PG_FULL_SCHEMA` : sans quoi l'`INSERT` de la table entière échoue et
+la bibliothèque arrive vide.
+
+Et **jamais par un `ALTER TABLE ADD COLUMN` dans `up:`** — sur une base neuve la
+colonne existe déjà, l'ALTER échoue en « duplicate column name » et fait
+planter tout `run_migrations` au premier démarrage. Utilisez
+`add_column_if_missing`.
 
 ---
 

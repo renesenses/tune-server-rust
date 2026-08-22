@@ -284,6 +284,22 @@ jobs:
       - name: Run tests with postgres feature
         run: cargo test -p tune-core --no-default-features --features postgres,oaat
 
+      # Parite des DEUX ecritures du schema PG (#2111).
+      #
+      # Ce job faisait tourner un PostgreSQL 16 que RIEN ne consommait :
+      # `TEST_DATABASE_URL` ci-dessus n'est lu par aucun test, et les tests PG
+      # cherchent `TUNE_TEST_PG_URL`. Le conteneur montait donc pour rien.
+      #
+      # Le test monte lui-meme ses deux bases jetables — les scripts numerotes
+      # d'un cote, PG_FULL_SCHEMA de l'autre — donc il ne lui faut qu'un serveur
+      # joignable. La variable est posee sur CETTE etape uniquement : la porter
+      # sur le job entier de-sauterait les tests E2E de `postgres_e2e.rs`, qui
+      # restent volontairement optionnels (scripts/pg-e2e.sh).
+      - name: Parité du schéma PG (#2111)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres,oaat pg_schema_parity -- --nocapture
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
