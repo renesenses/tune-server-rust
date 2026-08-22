@@ -477,7 +477,17 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // configured music dir (defence against scanning arbitrary paths); if it
         // is not, fall back to a full scan rather than silently doing nothing.
         let targeted: Option<String> = targeted_req.as_ref().and_then(|p| {
-            if music_dirs.iter().any(|root| p == root || p.starts_with(&format!("{root}/"))) {
+            // Via `sous_le_dossier` : TROISIÈME occurrence du même défaut de
+            // séparateur, après `sous_le_dossier` lui-même et `roots_gone_empty`
+            // (#2016). Le motif construit ici était `{root}/`, avec `/` codé en
+            // dur, alors que `music_dirs` et les chemins de la base portent des
+            // ANTISLASHS sous Windows.
+            //
+            // Conséquence mesurée sur .42 (Windows, `D:\data\music`) : AUCUN
+            // scan ciblé ne pouvait aboutir — chacun retombait en scan complet,
+            // silencieusement, en journalisant « outside music dirs » pour un
+            // chemin qui était pourtant dedans.
+            if music_dirs.iter().any(|root| sous_le_dossier(p, root)) {
                 Some(p.clone())
             } else {
                 tracing::warn!(path = %p, dirs = ?music_dirs, "scan_targeted_path_outside_music_dirs — falling back to full scan");
@@ -545,9 +555,19 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 if missing_dirs.iter().any(|m| m == dir) {
                     continue;
                 }
-                let prefix: String =
-                    format!("{}/", dir.trim_end_matches('/')).nfc().collect();
-                let has_audio = discovered_paths.iter().any(|p| p.starts_with(&prefix));
+                // `sous_le_dossier` et non un préfixe reconstruit : `{}/` code
+                // le séparateur en dur, donc sous Windows AUCUN chemin n'était
+                // jamais vu sous sa racine et ce test rendait toujours faux.
+                // Il journalisait alors « configured music folder […] contains
+                // no audio files » sur une racine pleine — message faux, et
+                // faux systématiquement (constaté sur .42, `D:\data\music`).
+                //
+                // La normalisation NFC reste nécessaire : `discovered_paths`
+                // est en NFC, `dir` vient des réglages et peut être en NFD.
+                let dir_nfc: String = dir.nfc().collect();
+                let has_audio = discovered_paths
+                    .iter()
+                    .any(|p| sous_le_dossier(p, &dir_nfc));
                 if !has_audio {
                     tracing::warn!(
                         dir = %dir,
@@ -1433,10 +1453,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 "missing_dirs": missing_dirs.clone(),
                 "missing_dir_reasons": missing_dir_reasons.clone(),
                 "error_dirs": error_dirs.clone(),
-            "emptied_roots": racines_videes.clone(),
-            "protected_subtrees": sous_arbres_proteges.clone(),
-            "tracks_protected": pistes_protegees,
-            "tracks_out_of_scope": pistes_hors_perimetre,
+                "emptied_roots": racines_videes.clone(),
+                "protected_subtrees": sous_arbres_proteges.clone(),
+                "tracks_protected": pistes_protegees,
+                "tracks_out_of_scope": pistes_hors_perimetre,
+                "purge_refused": purge_refusee_candidats > 0,
+                "purge_refused_candidates": purge_refusee_candidats,
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "metadata_timeout": scan_stats.metadata_timeout,
@@ -1466,6 +1488,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "protected_subtrees": sous_arbres_proteges.clone(),
             "tracks_protected": pistes_protegees,
             "tracks_out_of_scope": pistes_hors_perimetre,
+            "purge_refused": purge_refusee_candidats > 0,
+            "purge_refused_candidates": purge_refusee_candidats,
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "metadata_failed": scan_stats.metadata_failed,
@@ -1946,6 +1970,49 @@ mod roots_gone_empty_tests {
     ///
     /// Ces tests tournent sur n'importe quel hôte : `sous_le_dossier` compare
     /// des chaînes, pas des chemins du système de fichiers.
+    /// Les TROIS symptomes observes sur .42 (Windows, `D:\\data\\music`), qui
+    /// n'avaient aucun rapport apparent entre eux :
+    ///
+    ///   - « scan_targeted_path_outside_music_dirs » sur un chemin pourtant dedans
+    ///   - « scan_root_no_audio_files » sur une racine pleine
+    ///   - tout import refuse comme « outside the configured music directories »
+    ///
+    /// Une seule cause : `format!("{root}/")`, avec `/` code en dur, alors que
+    /// les reglages et la base portent des ANTISLASHS. Cinq sites au total
+    /// portaient cette erreur (#2016 en a corrige deux).
+    #[test]
+    fn un_chemin_windows_est_reconnu_sous_sa_racine_configuree() {
+        let racine = r"D:\data\music";
+        // Scan cible : le chemin signale par .42.
+        assert!(sous_le_dossier(
+            r"D:\data\music\Jacobs, Lisa\2016 - L'Arte del Violino",
+            racine
+        ));
+        // Racine elle-meme.
+        assert!(sous_le_dossier(racine, racine));
+        // Un volume voisin ne doit rien capter.
+        assert!(!sous_le_dossier(r"E:\data\music\x.flac", racine));
+        // Et le piege de prefixe tient aussi en antislash.
+        assert!(!sous_le_dossier(r"D:\data\music2\x.flac", racine));
+    }
+
+    /// L'ancienne formule, pour prouver que le defaut etait REEL et pas suppose.
+    /// Ce test echouerait si quelqu'un revenait a `format!("{root}/")`.
+    #[test]
+    fn l_ancienne_comparaison_echouait_bien_sous_windows() {
+        let racine = r"D:\data\music";
+        let chemin = r"D:\data\music\album\piste.flac";
+        let ancienne = chemin == racine || chemin.starts_with(&format!("{racine}/"));
+        assert!(
+            !ancienne,
+            "l'ancienne comparaison rendait faux — c'est tout le defaut"
+        );
+        assert!(
+            sous_le_dossier(chemin, racine),
+            "la nouvelle doit rendre vrai"
+        );
+    }
+
     #[test]
     fn les_chemins_windows_sont_reconnus_sous_leur_racine() {
         assert!(sous_le_dossier(r"G:\Blues 2\track.flac", r"G:\Blues 2"));

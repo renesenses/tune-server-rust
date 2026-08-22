@@ -180,7 +180,11 @@ const MIGRATION_TABLES: &[&str] = &[
 ///
 /// Every CREATE TABLE uses IF NOT EXISTS and every INSERT for seed data
 /// uses ON CONFLICT DO NOTHING, making this fully idempotent.
-const PG_FULL_SCHEMA: &str = r#"
+///
+/// `pub(crate)` pour le seul test `pg_schema_parity`, qui monte ce schema et
+/// celui des scripts numerotes dans deux bases distinctes et refuse tout ecart
+/// (#2111).
+pub(crate) const PG_FULL_SCHEMA: &str = r#"
 -- Core tables
 CREATE TABLE IF NOT EXISTS artists (
     id TEXT PRIMARY KEY,
@@ -790,6 +794,17 @@ ALTER TABLE podcast_subscriptions ADD COLUMN IF NOT EXISTS source_id TEXT;
 -- queue_items: per-album numbering for streaming tracks (SQLite migration v64)
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
+
+-- tracks: colonnes du chantier CUE (SQLite migration v76, #1763). Elles sont
+-- ici pour la meme raison que les autres : la copie qui suit lit la table
+-- SQLite colonne par colonne, et la source les possede. Sans ce rattrapage,
+-- une base PG creee par une version anterieure de ce schema ferait echouer
+-- l'INSERT de `tracks` en entier — la bibliotheque arriverait vide. La
+-- migration 031 repare le meme manque pour les bases montees par les scripts
+-- numerotes, qui ne passent jamais par ici (#2111).
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

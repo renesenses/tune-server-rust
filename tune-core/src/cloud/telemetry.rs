@@ -91,7 +91,7 @@ impl TelemetryReporter {
             let mut names = Vec::new();
             for name in registry.list() {
                 if let Some(svc) = registry.get(&name) {
-                    let svc = svc.lock().await;
+                    let svc = svc.read().await;
                     let status = svc.auth_status().await;
                     if status.authenticated {
                         names.push(name);

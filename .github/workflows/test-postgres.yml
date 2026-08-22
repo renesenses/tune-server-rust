@@ -85,3 +85,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+
+      # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
+      # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
+      # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
+      # migration n'ajoute. Sans lui, la prochaine colonne oubliee se
+      # decouvrirait comme les colonnes CUE : par hasard, des mois plus tard.
+      - name: Parité du schéma PG (#2111)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture

@@ -401,7 +401,7 @@ pub async fn run_with(opts: RunOptions) {
 
     // File watcher for live directory changes (waits for auto-scan to finish
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
-    crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done);
+    crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done, state.event_bus.clone());
 
     // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
     // partage absent fait voir un repertoire vide, et le scan qui suit conclut
