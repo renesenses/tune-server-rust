@@ -2497,6 +2497,22 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "format_conteneur_dsd",
         include_str!("../../migrations/postgres/030_format_conteneur_dsd.sql"),
     ),
+    // Jumelle PG de la migration SQLite 76 (#1763), posee avec dix migrations
+    // de retard : le chantier CUE n'avait touche que le schema NEUF cote
+    // PostgreSQL (#2111).
+    (
+        31,
+        "cue_colonnes_et_identite",
+        include_str!("../../migrations/postgres/031_cue_colonnes_et_identite.sql"),
+    ),
+    // Douze reglages de zone qui n'existaient pas cote PostgreSQL — dont
+    // `dlna_wav24`, absente meme du schema neuf. L'ecriture etait avalee en
+    // silence et l'API repondait « enregistre » (#2111).
+    (
+        32,
+        "zones_reglages_manquants",
+        include_str!("../../migrations/postgres/032_zones_reglages_manquants.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -2660,6 +2676,7 @@ pub fn pg_latest_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -3282,7 +3299,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 30, "latest PG migration must be 30");
+        assert_eq!(pg_latest_version(), 32, "latest PG migration must be 32");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -3618,6 +3635,73 @@ mod tests {
         assert_eq!(
             lire("SELECT format FROM albums ORDER BY id"),
             vec!["dsf", "dff", "dsd"]
+        );
+    }
+
+    /// Toute colonne posée côté SQLite existe aussi côté PostgreSQL — dans une
+    /// MIGRATION, pas seulement dans le schéma neuf.
+    ///
+    /// La doctrine dit « trois endroits » : `CORE_SCHEMA` SQLite, migration
+    /// SQLite, schéma PG. Il en faut **quatre** — le schéma PG neuf
+    /// (`pg_migrate.rs`) ET la migration PG pour les bases existantes. C'est
+    /// la quatrième qui manquait aux trois colonnes CUE : posées par la
+    /// migration SQLite 76 en août, elles n'ont jamais atteint une base
+    /// PostgreSQL déjà créée, et ne l'auraient jamais fait (#2111).
+    ///
+    /// Le défaut serait resté invisible jusqu'au jour où du code les aurait
+    /// écrites — et l'échec se serait alors lu comme un défaut du CUE, pas
+    /// comme une migration manquante.
+    ///
+    /// Ce test lit les SOURCES, comme `network_mounts_n_a_qu_une_definition` :
+    /// il vaut donc quel que soit le jeu de features compilé.
+    #[test]
+    fn toute_colonne_sqlite_a_sa_migration_postgres() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sqlite = fs::read_to_string(racine.join("src/db/migrations.rs")).unwrap();
+
+        // Les colonnes ajoutées par `add_column_if_missing` côté SQLite.
+        let mut colonnes: Vec<String> = Vec::new();
+        for l in sqlite.lines() {
+            let Some(i) = l.find("add_column_if_missing(db, \"") else {
+                continue;
+            };
+            let reste = &l[i..];
+            let champs: Vec<&str> = reste.split('"').collect();
+            // add_column_if_missing(db, "table", "colonne", "type")
+            if champs.len() >= 4 {
+                colonnes.push(champs[3].to_string());
+            }
+        }
+        assert!(
+            colonnes.len() > 20,
+            "aucune colonne trouvée ({}) — le motif d'appel a changé, ce test ne garde plus rien",
+            colonnes.len()
+        );
+
+        // Tout le SQL PostgreSQL, migrations numérotées SEULEMENT.
+        //
+        // `pg_migrate.rs` est délibérément EXCLU : c'est le schéma neuf, et
+        // c'est précisément là que les colonnes CUE se cachaient tout en
+        // manquant aux bases existantes.
+        let dossier = racine.join("migrations/postgres");
+        let mut sql_pg = String::new();
+        for e in fs::read_dir(&dossier).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "sql") {
+                sql_pg.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+            }
+        }
+
+        let manquantes: Vec<&String> = colonnes
+            .iter()
+            .filter(|c| !sql_pg.contains(c.as_str()))
+            .collect();
+
+        assert!(
+            manquantes.is_empty(),
+            "colonne(s) posée(s) côté SQLite et ABSENTE(S) des migrations PostgreSQL : {manquantes:?}\n\
+             Une base PostgreSQL déjà créée ne les recevra JAMAIS — `CREATE TABLE` dans\n\
+             `pg_migrate.rs` ne s'applique qu'à une base vide. Ajouter un fichier dans\n\
+             `tune-core/migrations/postgres/` avec `ADD COLUMN IF NOT EXISTS` (#2111)."
         );
     }
 
