@@ -1848,10 +1848,18 @@ impl PositionPoller {
             if np.source == "radio" {
                 if let Some(ref source_id) = np.source_id {
                     // source_id is either a numeric radio DB id or the stream URL itself
+                    // Le logo de la station sert de REPLI quand le titre en
+                    // cours n'a pas de pochette. Il faut le relire ici et non
+                    // reprendre `np.cover_path` : dès qu'un titre a posé sa
+                    // pochette, `cover_path` la porte, et le titre suivant —
+                    // une chronique, un jingle — hériterait de la pochette du
+                    // précédent au lieu de revenir au logo.
+                    let mut logo_station: Option<String> = None;
                     let (station_name, stream_url) = if let Ok(sid) = source_id.parse::<i64>() {
                         let radio_repo =
                             crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
                         if let Ok(Some(station)) = radio_repo.get(sid) {
+                            logo_station = station.logo_url.clone();
                             (station.name.clone(), station.url.clone())
                         } else {
                             // Fallback: use album_title (holds station name)
@@ -1871,7 +1879,17 @@ impl PositionPoller {
                         crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
                             .await
                     {
-                        let title_changed = np.title != meta.title || np.artist_name != meta.artist;
+                        // La pochette du titre quand la station la donne, le
+                        // logo sinon. Bertrand : « mettre la pochette de
+                        // l'album et non le logo de la radio ».
+                        let pochette = meta
+                            .cover_url
+                            .clone()
+                            .or_else(|| logo_station.clone())
+                            .or_else(|| np.cover_path.clone());
+                        let title_changed = np.title != meta.title
+                            || np.artist_name != meta.artist
+                            || np.cover_path != pochette;
                         if title_changed {
                             let title_for_icy = meta.title.clone();
                             let artist_for_icy = meta.artist.clone();
@@ -1880,7 +1898,7 @@ impl PositionPoller {
                                 title: meta.title,
                                 artist_name: meta.artist,
                                 album_title: Some(station_name.clone()),
-                                cover_path: np.cover_path.clone(),
+                                cover_path: pochette,
                                 duration_ms: 0,
                                 source: "radio".into(),
                                 source_id: np.source_id.clone(),
