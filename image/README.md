@@ -73,6 +73,34 @@ make BL31=../arm-trusted-firmware/build/sun50i_h616/release/bl31.bin -j"$(nproc)
 # -> u-boot-sunxi-with-spl.bin
 ```
 
+#### On-board WiFi: bus up, no driver
+
+The build enables the SDIO bus carrying the soldered WiFi module and wires its
+power sequence. Verified on hardware, the module now enumerates:
+
+    mmc1: new high speed SDIO card at address 8800
+
+Upstream leaves all of this out, and each piece was needed — found by comparing
+with the H616/H618 boards that *do* declare WiFi in mainline (BigTreeTech CB1,
+Transpeed 8K618-T), and confirmed one at a time:
+
+| Missing piece | Symptom without it |
+|---|---|
+| `status = "okay"` on mmc1 | no controller at all |
+| `mmc-pwrseq` releasing WL-REG-ON (PG18, active low) + PG10 muxed as the 32 kHz clock output | `Failed to initialize a non-removable card` |
+| `vmmc-supply` (same rail as mmc0) | `error -22 whilst initialising SDIO card` — empty voltage window |
+
+**But there is still no network interface.** The card reports no manufacturer
+ID (`vendor=0x0000 device=0x0000`, `modalias=sdio:c00v0000d0000`), so no in-tree
+driver matches it, and forcing `brcm,bcm4329-fmac` on the function node does not
+make `brcmfmac` bind — it is not a Broadcom part. Finishing this needs the chip
+identified and an out-of-tree driver built against the running kernel.
+
+For WiFi today, use a USB dongle: `wpasupplicant`, `wireless-regdb` and the
+Realtek/Atheros/Broadcom firmware packages are already in the image, so a
+mainline-supported dongle works with no extra install — which matters, since the
+board has no network of its own to fetch anything with.
+
 #### Where the console actually is
 
 On the Orange Pi Zero 2 the kernel console is **UART0 on PH0 (TX) / PH1 (RX)**,

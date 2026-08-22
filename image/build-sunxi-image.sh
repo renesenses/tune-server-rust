@@ -54,6 +54,9 @@ case "$BOARD" in
     orangepi-zero2)
         UBOOT_DIR="orangepi_zero2"
         BOARD_DTB="allwinner/sun50i-h616-orangepi-zero2.dtb"
+        # Bus SDIO qui porte le module WiFi soudé (AW859A). Upstream laisse ce
+        # nœud `disabled` — le pinmux et cap-sdio-irq sont pourtant déjà là.
+        SDIO_WIFI_NODE="mmc@4021000"
         ;;
     orangepi-zero3)
         UBOOT_DIR="orangepi_zero3"
@@ -68,6 +71,7 @@ case "$BOARD" in
     custom)
         UBOOT_DIR=""
         BOARD_DTB=""
+        SDIO_WIFI_NODE=""
         ;;
     *) echo "Unknown board: $BOARD (orangepi-zero2, orangepi-zero3, orangepi-zero2w, custom)" >&2; exit 1 ;;
 esac
@@ -125,7 +129,7 @@ if [[ "$(uname -m)" != "aarch64" ]] && ! command -v qemu-aarch64-static &>/dev/n
     exit 1
 fi
 
-for tool in debootstrap parted mkfs.ext4 losetup blkid; do
+for tool in debootstrap parted mkfs.ext4 losetup blkid dtc; do
     command -v "$tool" &>/dev/null || { err "Missing tool: $tool"; exit 1; }
 done
 
@@ -233,9 +237,124 @@ chroot "$ROOTFS" bash -ec "
         firmware-realtek firmware-brcm80211 firmware-atheros \
         cifs-utils smbclient nfs-common exfatprogs ntfs-3g \
         cloud-guest-utils e2fsprogs \
+        device-tree-compiler usbutils iw rfkill wireless-tools \
         locales procps iproute2 less nano
 "
 ok "Packages installed"
+
+# --- Enable the SDIO bus carrying the on-board WiFi module ---
+# Upstream ships this board's mmc1 as `status = "disabled"`, so the soldered
+# WiFi module never appears — no interface, whatever the antenna is doing. The
+# node is otherwise complete (mmc1 pinmux on PG0-PG5, cap-sdio-irq,
+# mmc-ddr-3_3v), so flipping the status is enough for the SDIO device to
+# enumerate. Whether a *driver* then binds depends on the chip; the enumeration
+# itself is what identifies it (`dmesg | grep mmc1`).
+if [[ -n "${SDIO_WIFI_NODE:-}" ]]; then
+    KVER=$(basename "$(ls -1 "${ROOTFS}"/boot/vmlinuz-* | sort -V | tail -1)" | sed 's/^vmlinuz-//')
+    DTB_FILE="${ROOTFS}/usr/lib/linux-image-${KVER}/${BOARD_DTB}"
+    if [[ ! -f "$DTB_FILE" ]]; then
+        err "DTB introuvable pour le patch SDIO : ${DTB_FILE}"; exit 1
+    fi
+    log "Enabling ${SDIO_WIFI_NODE} (on-board WiFi SDIO bus) in the board DTB..."
+    dtc -I dtb -O dts "$DTB_FILE" > "${WORK_DIR}/board.dts" 2>/dev/null
+    SDIO_WIFI_NODE="$SDIO_WIFI_NODE" python3 - "${WORK_DIR}/board.dts" <<'PATCH'
+import os, re, sys, pathlib
+
+# Upstream ships mmc1 disabled on these boards, so the soldered WiFi module
+# never appears. Three things are needed, each found by comparing with the
+# H616/H618 boards that *do* declare WiFi in mainline (BigTreeTech CB1,
+# Transpeed 8K618-T) and verified on hardware one at a time:
+#   1. status = "okay" on the bus            -> controller probes
+#   2. mmc-pwrseq releasing WL-REG-ON (PG18) -> chip answers, but -EINVAL
+#      + PG10 muxed as the 32 kHz clock out     (its external clock)
+#   3. vmmc-supply, copied from mmc0         -> voltage window valid, card
+#                                               enumerates
+# Phandles differ per DTB, so they are resolved from the tree, never hardcoded.
+
+node_name = os.environ["SDIO_WIFI_NODE"]
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+
+def find(name):
+    m = re.search(r"(\t\t" + re.escape(name) + r" \{.*?\n\t\t\};\n)", t, re.S)
+    if not m:
+        sys.exit("noeud %s introuvable" % name)
+    return m
+
+def phandle_of(name):
+    inner = find(name).group(1)
+    ph = re.findall(r"^\t\t\tphandle = <(0x[0-9a-f]+)>;", inner, re.M)
+    if len(ph) != 1:
+        sys.exit("%s : %d phandle(s) a la racine, 1 attendu" % (name, len(ph)))
+    return ph[0]
+
+pio = phandle_of("pinctrl@300b000")
+rtc = phandle_of("rtc@7000000")
+used = {int(x, 16) for x in re.findall(r"phandle = <(0x[0-9a-f]+)>", t)}
+ph_pwrseq = "0x%x" % (max(used) + 1)
+ph_clkpin = "0x%x" % (max(used) + 2)
+
+# vmmc : le meme rail que la carte SD (vcc-eth-mmc sur la Zero 2). Sans lui la
+# fenetre de tension du controleur est vide et l init SDIO rend -EINVAL.
+sd = re.search(r"vmmc-supply = <(0x[0-9a-f]+)>;", find("mmc@4020000").group(1))
+if not sd:
+    sys.exit("mmc0 n a pas de vmmc-supply : rien a copier pour mmc1")
+vmmc = sd.group(1)
+
+# --- le bus lui-meme ---
+m = find(node_name)
+node = m.group(1)
+needle = 'status = "disabled";'
+if node.count(needle) != 1:
+    sys.exit("%s : un seul status=disabled attendu, %d trouve(s)"
+             % (node_name, node.count(needle)))
+patched = node.replace(
+    "\t\t\t" + needle,
+    '\t\t\tstatus = "okay";\n'
+    "\t\t\tvmmc-supply = <%s>;\n" % vmmc +
+    "\t\t\tbus-width = <0x04>;\n"
+    "\t\t\tnon-removable;\n"
+    "\t\t\tkeep-power-in-suspend;\n"
+    "\t\t\tmmc-pwrseq = <%s>;" % ph_pwrseq)
+if patched == node:
+    sys.exit("%s : le remplacement du status n a rien change" % node_name)
+patched = patched[:-len("\t\t};\n")] + \
+    "\n\t\t\twifi@1 {\n\t\t\t\treg = <0x01>;\n\t\t\t};\n\t\t};\n"
+t = t[:m.start(1)] + patched + t[m.end(1):]
+
+# --- PG10 en sortie d horloge 32 kHz ---
+mp = find("pinctrl@300b000")
+grp = ('\t\t\tx32clk-fanout-pin {\n\t\t\t\tpins = "PG10";\n'
+       '\t\t\t\tfunction = "clock";\n\t\t\t\tphandle = <%s>;\n\t\t\t};\n\n'
+       % ph_clkpin)
+inner = mp.group(1)
+t = t[:mp.start(1)] + inner[:-len("\t\t};\n")] + grp + "\t\t};\n" + t[mp.end(1):]
+
+# --- la sequence de mise sous tension, a la racine ---
+anchor = "\tleds {"
+if anchor not in t:
+    sys.exit("ancre 'leds' introuvable a la racine du DTS")
+pwrseq = ("\twifi-pwrseq {\n"
+          '\t\tcompatible = "mmc-pwrseq-simple";\n'
+          "\t\tclocks = <%s 0x01>;\n" % rtc +
+          '\t\tclock-names = "ext_clock";\n'
+          "\t\tpinctrl-0 = <%s>;\n" % ph_clkpin +
+          '\t\tpinctrl-names = "default";\n'
+          "\t\treset-gpios = <%s 0x06 0x12 0x01>;\n" % pio +
+          "\t\tpost-power-on-delay-ms = <0xc8>;\n"
+          "\t\tphandle = <%s>;\n" % ph_pwrseq +
+          "\t};\n\n")
+t = t.replace(anchor, pwrseq + anchor, 1)
+p.write_text(t)
+PATCH
+    dtc -I dts -O dtb -o "$DTB_FILE" "${WORK_DIR}/board.dts" 2>/dev/null
+    # -A24 : `status` se trouve une dizaine de lignes après l'ouverture du
+    # nœud ; une fenêtre trop courte fait échouer la vérification, pas le patch.
+    dtc -I dtb -O dts "$DTB_FILE" 2>/dev/null \
+        | grep -A24 "${SDIO_WIFI_NODE} {" | grep -q 'status = "okay"' \
+        || { err "le patch SDIO n'a pas pris dans ${DTB_FILE}"; exit 1; }
+    ok "${SDIO_WIFI_NODE} enabled"
+fi
 
 # --- Bootloader ---
 if [[ -z "$UBOOT_BIN" ]]; then
@@ -316,6 +435,10 @@ wifi.powersave=2
 [device]
 wifi.scan-rand-mac-address=no
 EOF
+
+# Kernel log readable by the tune user: hardware diagnosis on an appliance
+# happens over the serial console, and `dmesg` denied is a dead end.
+echo 'kernel.dmesg_restrict = 0' > "${ROOTFS}/etc/sysctl.d/10-tune-dmesg.conf"
 
 # Appliance marker: unlocks /api/v1/appliance (network setup from the web
 # UI) and the appliance flag in /system/config — see docs/APPLIANCE.md
@@ -446,6 +569,9 @@ fi
 MAC=$(ip link show | grep -m1 'link/ether' | awk '{print $2}' | tr -d ':' | tail -c 5)
 if [[ -n "$MAC" ]]; then
     hostnamectl set-hostname "tune-${MAC}"
+    # /etc/hosts doit suivre, sinon chaque sudo perd deux secondes sur
+    # « unable to resolve host » (la résolution du nom court échoue).
+    sed -i "s/^127\.0\.1\.1.*/127.0.1.1\ttune-${MAC}/" /etc/hosts
     # Keep the printed URL truthful: tune.local dies with the rename
     sed -i "s|http://tune\.local|http://tune-${MAC}.local|" /etc/motd
 fi
