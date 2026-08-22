@@ -225,19 +225,24 @@ pub async fn run_with(opts: RunOptions) {
     // .app. The path is shared with the reader via config::default_log_file_path()
     // so both always agree. Previously Linux wrote no file, so any launch where
     // journalctl didn't apply exported an empty log.
+    // Plafond du journal : 10 Mio pour le fichier courant, plus une sauvegarde
+    // `.1` — soit ~2× sur le disque.
+    //
+    // Il est tenu à DEUX moments, et il faut les deux. `rotate_log_file` range
+    // au démarrage ce que la session précédente a laissé ; `JournalBorne` tient
+    // le plafond *pendant* que le serveur tourne. Jusqu'ici seul le premier
+    // existait, et #539 l'assumait — mais un serveur qui tourne longtemps est
+    // justement le seul qui puisse dépasser 10 Mio (voir tune-server/journal.rs
+    // et #2156).
+    const PLAFOND_JOURNAL: u64 = 10 * 1024 * 1024;
     let log_file = {
         let path = config::default_log_file_path();
-        // Cap the log at 10 MiB (keeping one .1 backup) so it doesn't grow
-        // without bound on a long-running server.
-        config::rotate_log_file(&path, 10 * 1024 * 1024);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        config::rotate_log_file(&path, PLAFOND_JOURNAL);
+        crate::journal::JournalBorne::ouvrir(path.clone(), PLAFOND_JOURNAL)
             .ok()
-            .map(|f| {
+            .map(|j| {
                 eprintln!("Logging to {}", path.display());
-                f
+                j
             })
     };
 
