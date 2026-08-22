@@ -242,7 +242,8 @@ chroot "$ROOTFS" bash -ec "
         network-manager wpasupplicant wireless-regdb openssh-server \
         firmware-realtek firmware-brcm80211 firmware-atheros \
         cifs-utils smbclient nfs-common exfatprogs ntfs-3g \
-        cloud-guest-utils e2fsprogs iputils-ping \
+        cloud-guest-utils e2fsprogs iputils-ping sqlite3 \
+        systemd-timesyncd \
         device-tree-compiler usbutils iw rfkill wireless-tools \
         locales procps iproute2 less nano
 "
@@ -687,6 +688,14 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Ces cartes n'ont pas de RTC : sans NTP l'horloge demarre en 1970 puis se cale
+# sur un horodatage de build (constate : 116 jours dans le passe). apt refuse
+# alors les depots (« Release file is not valid yet »), la validation TLS
+# echoue, et les comparaisons de mtime du scanner deviennent douteuses.
+# systemd-timesyncd n'est qu'une *recommandation* de systemd, donc absent avec
+# --no-install-recommends : il faut le demander explicitement.
+chroot "$ROOTFS" systemctl enable systemd-timesyncd
 
 chroot "$ROOTFS" systemctl enable tune.service
 chroot "$ROOTFS" systemctl enable tune-first-boot.service
