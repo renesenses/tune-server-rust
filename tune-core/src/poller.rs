@@ -2553,6 +2553,8 @@ impl PositionPoller {
                                             sample_rate: None,
                                             bit_depth: None,
                                             media_format: None,
+                                            track_number: None,
+                                            disc_number: None,
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
@@ -4139,6 +4141,10 @@ impl PositionPoller {
                         channels: resolved.channels,
                         live_stream: false,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     return match output.set_next_media(&media).await {
                         Ok(()) => {
@@ -4249,6 +4255,10 @@ impl PositionPoller {
                         channels: resolved.channels,
                         live_stream: false,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
