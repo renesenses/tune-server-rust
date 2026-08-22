@@ -81,7 +81,7 @@ if [[ "$BOARD" == "custom" ]]; then
 fi
 
 IMAGE_NAME="tune-os-${BOARD}"
-IMAGE_SIZE="2G"
+IMAGE_SIZE="3G"   # mesure sur un build reel : 790 Mo occupes, large marge
 WORK_DIR="/tmp/tune-os-build-sunxi"
 ROOTFS="${WORK_DIR}/rootfs"
 IMAGE_FILE="${WORK_DIR}/${IMAGE_NAME}.img"
@@ -200,6 +200,15 @@ else
     KERNEL_PKG="linux-image-arm64"
 fi
 
+# Le blob U-Boot de Debian ne sert que si --uboot-bin n'est pas fourni.
+# bookworm ne package que 13 cartes sunxi, aucune en H616/H618 : pour ces
+# cartes le blob se construit depuis les sources (cf. image/README.md).
+if [[ -n "$UBOOT_BIN" ]]; then
+    UBOOT_PKG=""
+else
+    UBOOT_PKG="u-boot-sunxi"
+fi
+
 printf '#!/bin/sh\nexit 101\n' > "${ROOTFS}/usr/sbin/policy-rc.d"
 chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
 
@@ -217,7 +226,7 @@ chroot "$ROOTFS" bash -ec "
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends \
-        dbus udev kmod ${KERNEL_PKG} u-boot-menu u-boot-sunxi \
+        dbus udev kmod ${KERNEL_PKG} u-boot-menu ${UBOOT_PKG} \
         libstdc++6 \
         sudo curl ca-certificates avahi-daemon libnss-mdns \
         network-manager wpasupplicant wireless-regdb openssh-server \

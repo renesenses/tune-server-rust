@@ -46,6 +46,41 @@ writes the SPL+U-Boot blob raw at 8 KiB and U-Boot loads the kernel from
 `/boot` over ext4 via extlinux. The serial console (`ttyS0` @ 115200) is
 enabled — it is the first thing you need if a boot goes wrong.
 
+The kernel comes from **bookworm-backports** (6.12) by default: H616/H618
+support — EMAC, cpufreq, thermal — matured well after the 6.1 in bookworm.
+`--no-backports` falls back to the release kernel.
+
+#### Building U-Boot for an H616/H618 board
+
+`--uboot-bin` is not optional in practice: Debian's `u-boot-sunxi` packages
+only 13 sunxi boards and **none on H616/H618** (for Orange Pi it carries
+`orangepi_one_plus` and `orangepi_zero_plus2` only). Build the blob
+yourself — on an aarch64 Linux host this needs no cross toolchain:
+
+```bash
+apt install build-essential git bc bison flex libssl-dev python3-dev             python3-setuptools python3-pyelftools swig             device-tree-compiler libgnutls28-dev uuid-dev
+
+# BL31 — Trusted Firmware-A for the H616 platform (also used by H618)
+git clone https://github.com/ARM-software/arm-trusted-firmware
+cd arm-trusted-firmware && git checkout lts-v2.14.6
+make CROSS_COMPILE= PLAT=sun50i_h616 DEBUG=0 bl31 -j"$(nproc)"
+
+# U-Boot, with BL31 folded into the FIT
+cd .. && git clone https://github.com/u-boot/u-boot
+cd u-boot && git checkout v2026.07
+make orangepi_zero2_defconfig
+make BL31=../arm-trusted-firmware/build/sun50i_h616/release/bl31.bin -j"$(nproc)"
+# -> u-boot-sunxi-with-spl.bin
+```
+
+Verify the result landed where the BROM looks — offset 8 KiB must carry the
+sunxi SPL magic:
+
+```bash
+dd if=tune-os-orangepi-zero2-vX.Y.Z.img bs=1024 skip=8 count=1 | strings | head -1
+# eGON.BT0
+```
+
 ### Flash to disk
 
 ```bash
@@ -108,6 +143,6 @@ Add to `/etc/fstab` for permanent mount.
 | Raspberry Pi 5 | aarch64 | Supported |
 | Generic x86_64 PC | x86_64 | Supported |
 | Odroid / Rock Pi | aarch64 | Untested |
-| Orange Pi Zero 2 (H616) | aarch64 | Builds, first boot not yet validated |
+| Orange Pi Zero 2 (H616) | aarch64 | Image built &amp; verified, first boot not yet validated |
 | Orange Pi Zero 3 / Zero 2W (H618) | aarch64 | Untested |
 | Allwinner TV box (custom DTB) | aarch64 | Bring-up required |
