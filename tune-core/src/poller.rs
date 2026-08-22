@@ -4414,7 +4414,7 @@ impl PositionPoller {
                 |query| {
                     let service = service.clone();
                     async move {
-                        let svc = service.lock().await;
+                        let svc = service.read().await;
                         match svc.search(&query, 10).await {
                             Ok(res) => res.artists,
                             Err(e) => {
@@ -4427,7 +4427,7 @@ impl PositionPoller {
                 |artist_id| {
                     let service = service.clone();
                     async move {
-                        let svc = service.lock().await;
+                        let svc = service.read().await;
                         match svc.get_similar_artists(&artist_id, 20).await {
                             Ok(artists) => artists,
                             Err(e) => {
@@ -4494,7 +4494,7 @@ impl PositionPoller {
                 let service = service.clone();
                 let artist_name = names_by_id.get(&key).cloned();
                 async move {
-                    let svc = service.lock().await;
+                    let svc = service.read().await;
                     // Chemin identifiant : les titres DE l'artiste, sans
                     // ambiguite de titre homonyme.
                     if let Some(ref name) = artist_name {

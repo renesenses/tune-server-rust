@@ -24,7 +24,7 @@ async fn spotify_token(state: &AppState) -> Option<String> {
     let registry = state.services.lock().await;
     let svc = registry.get("spotify")?;
     drop(registry);
-    let svc = svc.lock().await;
+    let svc = svc.read().await;
     let tokens = svc.save_tokens()?;
     tokens.get("access_token")?.as_str().map(Into::into)
 }
