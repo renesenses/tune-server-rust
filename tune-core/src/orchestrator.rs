@@ -664,6 +664,10 @@ pub struct PlayRequest {
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
     pub media_format: Option<String>,
+    /// Album numbering, passed on to the output in `PlayMedia`. Filled from the
+    /// queue row (or the library track) so an output does not have to guess it.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -735,6 +739,13 @@ pub struct ResolvedQueueItem {
     /// local tracks resolved via the local-file gapless path; None for streaming
     /// tracks and for the normal transcode/URL resolution.
     pub file_path: Option<String>,
+    /// Where the item came from, and its id there — passed to the output so it
+    /// can identify the track without guessing from artist/album/title.
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    /// Album numbering carried by the queue row.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 /// DIDL `res@duration` (ms) for a native passthrough stream served raw to a
@@ -1652,12 +1663,17 @@ impl PlaybackOrchestrator {
             .save_play_state(req.zone_id, "playing")
             .ok();
 
-        // Multi-service now-playing dispatch with tier gating
-        self.dispatch_now_playing(
-            &resolved.title,
-            resolved.artist.as_deref(),
-            album.as_deref(),
-        );
+        // L'annonce « en écoute » N'EST PLUS ici : elle attend de savoir si la
+        // sortie a accepté le titre. Voir plus bas, après `output_sent`.
+        //
+        // Elle partait à cet endroit, c'est-à-dire AVANT toute tentative
+        // d'envoi. Chez Bilou (#1998), quatre échecs de sortie BluOS d'affilée
+        // ont produit quatre annonces à Last.fm pour un titre jamais entendu :
+        // `output_sent=false`, zone arrêtée sur-le-champ, session de flux
+        // fermée — et 233 ms plus tard « en écoute ».
+        //
+        // Le profil d'écoute est publié hors de chez l'utilisateur, sur un
+        // service tiers, sans correction commode. Une écoute inventée y reste.
 
         // For local outputs, keep the old stream alive until after play_url()
         // calls stop() — otherwise the audio thread gets a read error when the
@@ -1675,17 +1691,40 @@ impl PlaybackOrchestrator {
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
-            let local_file_path = if resolved.source == "local" {
+            // One DB read for the local row: the output needs its path, and its
+            // album numbering when the request did not carry any (a play by
+            // track id, not from a queue row).
+            let local_track = if resolved.source == "local" {
                 req.track_id.and_then(|tid| {
                     TrackRepo::with_backend(self.db.clone())
                         .get(tid)
                         .ok()
                         .flatten()
-                        .and_then(|t| t.file_path)
                 })
             } else {
                 None
             };
+            let local_file_path = local_track.as_ref().and_then(|t| t.file_path.clone());
+            let media_source_id = req
+                .source_id
+                .clone()
+                .or_else(|| req.track_id.map(|t| t.to_string()));
+            // The library row stores 0 for "unknown", so filter it out rather
+            // than telling the output this is track 0.
+            let media_track_number = req.track_number.or_else(|| {
+                local_track
+                    .as_ref()
+                    .map(|t| t.track_number)
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
+            });
+            let media_disc_number = req.disc_number.or_else(|| {
+                local_track
+                    .as_ref()
+                    .map(|t| t.disc_number)
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
+            });
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -1704,6 +1743,10 @@ impl PlaybackOrchestrator {
                 // seekable file (Yamaha R-N2000A stays silent otherwise).
                 live_stream: resolved.source == "radio",
                 origin_url: resolved.origin_url.as_deref(),
+                source: Some(&resolved.source),
+                source_id: media_source_id.as_deref(),
+                track_number: media_track_number,
+                disc_number: media_disc_number,
             };
             let zone_audiophile = self.zone_audiophile(req.zone_id);
 
@@ -1856,7 +1899,43 @@ impl PlaybackOrchestrator {
         // relation to what was heard, plus a fresh bogus row on every replay
         // click (Bilou). Station plays are already tracked in the radio_stations
         // table (record_play), so nothing is lost.
-        if record_history && resolved.source != "radio" {
+        // Ce que la sortie a refusé n'a été entendu nulle part.
+        //
+        // `output_sent` est établi juste au-dessus, et l'arrêt immédiat de la
+        // zone s'appuie déjà dessus quelques lignes plus bas : le signal
+        // existait, dans la même fonction, et ces deux écritures ne le
+        // consultaient pas.
+        //
+        // Le cas « aucune sortie configurée » rend lui aussi `false` (avec
+        // `no_output_device_id_skipping_send_to_output`) : ne rien annoncer y
+        // est également juste — le titre n'est parti vers aucun appareil.
+        if !output_sent {
+            debug!(
+                zone_id = req.zone_id,
+                title = %resolved.title,
+                "play_not_announced_output_not_sent"
+            );
+        }
+
+        // Annonce « en écoute » multi-service, avec palier de licence.
+        if output_sent {
+            self.dispatch_now_playing(
+                &resolved.title,
+                resolved.artist.as_deref(),
+                album.as_deref(),
+            );
+        }
+
+        // `record_listen` alimente `listen_history`, la statistique locale. Il
+        // souffrait du même défaut, et l'issue posait la question sans pouvoir
+        // la trancher sur les seuls journaux : oui, l'historique local était
+        // falsifié lui aussi.
+        //
+        // Le scrobble DÉFINITIF, lui, n'a jamais été concerné : il est
+        // déclenché par le poller une fois le seuil des 50 % / 4 min franchi
+        // (`dispatch_scrobble`, #1113), et une lecture qui n'a jamais démarré
+        // ne l'atteint pas. C'est la seconde question ouverte du ticket.
+        if output_sent && record_history && resolved.source != "radio" {
             // Owning profile = the zone's current session, set by the play
             // handler from X-Profile-Id and inherited by autoplay / gapless
             // advances (which reuse the zone without touching it). Resolved here
@@ -2040,69 +2119,105 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Faut-il envoyer le DSD tel quel au renderer ?
+    ///
+    /// Fonction PURE : le mode reglé, et ce que le sondage a repondu —
+    /// `Some(true)` / `Some(false)` sur une reponse concluante, `None` sinon. La
+    /// sonde reseau vit dans `sonder_dsd` ; ici il n'y a que la decision, donc
+    /// elle se teste.
+    ///
+    /// La subtilite est le troisieme cas. `None` ne veut PAS dire « non » : des
+    /// renderers lisent le DSD sans l'annoncer dans leur GetProtocolInfo.
+    /// Ecraser un reglage explicite sur une absence de reponse priverait de DSD
+    /// natif des gens qui l'avaient — la faute symetrique de celle qu'on
+    /// corrige (#2122).
+    pub(crate) fn decider_passthrough_dsd(mode: &str, annonce: Option<bool>) -> bool {
+        match mode {
+            "pcm" => false,
+            // `dop` n'est pas du passthrough : le renderer doit recevoir le DSD
+            // emballe en trames PCM, pas le .dsf brut.
+            "dop" => false,
+            // Choix explicite : on ne le renverse que sur un NON explicite.
+            "native" => annonce != Some(false),
+            // `auto` : sans reponse claire, on prend le chemin sur.
+            _ => annonce.unwrap_or(false),
+        }
+    }
+
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
         let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
-        match dsd_mode.as_str() {
-            "pcm" => false,
-            "native" => true,
-            // « dop » n'est PAS du passthrough natif : le renderer doit recevoir
-            // le DSD emballé en trames PCM, pas le .dsf brut. Ce mode tombait
-            // dans le fourre-tout « auto » ci-dessous, qui sondait l'appareil et
-            // concluait au transcodage PCM — la moitié invisible de #1772. Le
-            // flux DoP est produit dans `resolve_local_track` ; ici on garantit
-            // seulement qu'un choix explicite ne se transforme jamais en envoi
-            // natif, y compris sur un renderer qui sait lire le DSF.
-            "dop" => false,
-            _ => {
-                // Auto mode: probe renderer.
-                //
-                // Only a CONCLUSIVE probe goes into the cache. `probe_dsd_support`
-                // returns `None` when GetProtocolInfo failed or the Sink was
-                // empty, and a renderer that isn't a DLNA output (or has since
-                // left the map) is just as inconclusive. Caching those would
-                // pin the device to "no DSD" for the whole process lifetime —
-                // a single transient failure right after discovery would
-                // silently force DSD→PCM transcoding on a renderer that plays
-                // DSD natively, with no way to recover short of a restart.
-                // Same rule as `DlnaOutput::supports_mime`.
-                let mut cache = self.dsd_capabilities.lock().await;
-                if let Some(cap) = cache.get(device_id) {
-                    return cap.supports_dsf || cap.supports_dff;
-                }
-                let cap = {
-                    let arc = { self.outputs.lock().await.get(device_id) };
-                    match arc {
-                        Some(output) => {
-                            let locked = output.lock().await;
-                            match locked
-                                .as_any()
-                                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-                            {
-                                Some(dlna) => dlna.probe_dsd_support().await,
-                                None => None,
-                            }
-                        }
+        // Le sondage n'a de sens que si la decision peut en dependre : `pcm` et
+        // `dop` tranchent sans lui, inutile d'aller sur le reseau.
+        let annonce = match dsd_mode.as_str() {
+            "pcm" | "dop" => None,
+            _ => self.sonder_dsd(device_id).await,
+        };
+        let passthrough = Self::decider_passthrough_dsd(&dsd_mode, annonce);
+        // La ligne qui manquait : ce qui part VRAIMENT sur le fil. Sans elle, le
+        // seul événement DSD du journal était celui du DoP, qui ne décide de
+        // rien sur une sortie réseau (#2122).
+        info!(
+            zone_id,
+            device_id,
+            dsd_mode = %dsd_mode,
+            annonce_du_renderer = ?annonce,
+            passthrough,
+            "dsd_passthrough_decide"
+        );
+        if dsd_mode == "native" && annonce == Some(false) {
+            tracing::warn!(
+                zone_id,
+                device_id,
+                "dsd_native_demande_mais_le_renderer_ne_l_annonce_pas — repli sur \
+                 une conversion PCM. Sans ce repli, le flux DSD brut partirait vers \
+                 un appareil incapable de le lire, et la zone resterait \
+                 silencieuse (#2122)."
+            );
+        }
+        passthrough
+    }
+
+    /// Le renderer annonce-t-il savoir lire du DSD ?
+    ///
+    /// `Some(true)` / `Some(false)` sur un sondage CONCLUANT, `None` sinon —
+    /// et la distinction compte : `None` ne veut pas dire « non ».
+    ///
+    /// Extrait pour etre partage par `native` et `auto`. Les deux posaient la
+    /// meme question ; un seul la posait.
+    async fn sonder_dsd(&self, device_id: &str) -> Option<bool> {
+        // Seul un sondage CONCLUANT entre en cache. `probe_dsd_support` rend
+        // `None` quand GetProtocolInfo a echoue ou que le Sink etait vide, et un
+        // appareil qui n'est pas une sortie DLNA (ou qui a quitte la table)
+        // n'est pas plus concluant. Mettre ces cas en cache epinglerait
+        // l'appareil sur « pas de DSD » pour toute la vie du processus — un
+        // echec passager juste apres la decouverte forcerait silencieusement le
+        // transcodage PCM sur un renderer qui lit le DSD nativement, sans
+        // recours autre qu'un redemarrage. Meme regle que `DlnaOutput::supports_mime`.
+        let mut cache = self.dsd_capabilities.lock().await;
+        if let Some(cap) = cache.get(device_id) {
+            return Some(cap.supports_dsf || cap.supports_dff);
+        }
+        let cap = {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            match arc {
+                Some(output) => {
+                    let locked = output.lock().await;
+                    match locked
+                        .as_any()
+                        .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                    {
+                        Some(dlna) => dlna.probe_dsd_support().await,
                         None => None,
                     }
-                };
-                match cap {
-                    Some(cap) => {
-                        let result = cap.supports_dsf || cap.supports_dff;
-                        cache.insert(device_id.to_string(), cap);
-                        result
-                    }
-                    None => {
-                        // Inconclusive: fall back to the safe path (transcode to
-                        // PCM) for THIS track only, and re-probe next time.
-                        tracing::debug!(
-                            device_id,
-                            "dsd_probe_inconclusive_not_cached_falling_back_to_pcm"
-                        );
-                        false
-                    }
                 }
+                None => None,
             }
-        }
+        };
+        cap.map(|cap| {
+            let resultat = cap.supports_dsf || cap.supports_dff;
+            cache.insert(device_id.to_string(), cap);
+            resultat
+        })
     }
 
     async fn resolve_uploaded_file(
@@ -2898,13 +3013,21 @@ impl PlaybackOrchestrator {
         //
         // Tracé ici plutôt qu'en amont : c'est le seul endroit qui connaisse à
         // la fois le format de la source, le type de sortie et le mode réglé.
+        //
+        // Le nom de l'événement disait « sera converti en PCM ». C'était faux sur
+        // une sortie réseau : ici, seul le DoP est écarté. La conversion, elle,
+        // dépend de `should_dsd_passthrough`, plus bas — et en mode « native »
+        // elle n'avait PAS lieu. Le journal annonçait donc du PCM pendant qu'une
+        // URL `.dsd` partait sur le fil, ce qui a coûté trois diagnostics faux
+        // (#2122). L'événement dit maintenant ce qu'il sait vraiment ; la
+        // décision de conversion est tracée là où elle est prise.
         if source_format == Some(AudioFormat::Dsd) && !dop_requested {
             info!(
                 zone_id = req.zone_id,
                 dsd_mode = %dsd_mode,
                 is_local_output,
                 is_network_output,
-                "dsd_dop_not_requested_track_will_be_converted_to_pcm"
+                "dsd_dop_not_requested"
             );
         }
 
@@ -4287,7 +4410,7 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
 
         // Try to get the track URL; if it fails with an auth error, attempt
         // a token refresh and retry once. This handles Qobuz tokens expiring
@@ -5524,7 +5647,7 @@ impl PlaybackOrchestrator {
                                 let svc = registry
                                     .get(&service_name)
                                     .ok_or_else(|| format!("unknown service: {service_name}"))?;
-                                let mut svc = svc.lock().await;
+                                let mut svc = svc.write().await;
                                 // Best-effort token refresh, then re-resolve with
                                 // the same default quality the initial play used.
                                 let _ = svc.refresh_if_needed().await;
@@ -5735,7 +5858,7 @@ impl PlaybackOrchestrator {
         if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get(&prefetched.source) {
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
                     if title.is_empty() {
                         title = track.title;
@@ -6397,7 +6520,7 @@ impl PlaybackOrchestrator {
                 let Some(svc) = registry.get(&source) else {
                     return;
                 };
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 match svc.get_track_url(&source_id, None).await {
                     Ok(d) => d,
                     Err(_) => return,
@@ -6666,6 +6789,8 @@ impl PlaybackOrchestrator {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
 
         let resultat = self.play_without_history(req).await;
@@ -7458,6 +7583,8 @@ impl PlaybackOrchestrator {
                             sample_rate: None,
                             bit_depth: None,
                             media_format: None,
+                            track_number: None,
+                            disc_number: None,
                         };
                         // Même station, même écoute logique : pas de nouvelle
                         // ligne d'historique (même règle que radio_auto_retry).
@@ -7716,6 +7843,8 @@ impl PlaybackOrchestrator {
                         sample_rate: None,
                         bit_depth: None,
                         media_format: None,
+                        track_number: None,
+                        disc_number: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -7956,6 +8085,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             }
         } else {
             // Streaming track.
@@ -8030,6 +8161,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             }
         };
 
@@ -8205,7 +8338,7 @@ impl PlaybackOrchestrator {
                         };
                         let svc = svc.clone();
                         drop(registry);
-                        let svc = svc.lock().await;
+                        let svc = svc.read().await;
                         svc.get_track_url(&source_id, None).await.ok()
                     };
                     let Some(data) = resolved else {
@@ -8296,6 +8429,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: None,
+                disc_number: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -8319,6 +8454,10 @@ impl PlaybackOrchestrator {
                 channels: resolved.channels,
                 file_size: resolved.file_size,
                 file_path: None,
+                source: Some("local".into()),
+                source_id: Some(track_id.to_string()),
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             });
         }
 
@@ -8353,7 +8492,7 @@ impl PlaybackOrchestrator {
             output_device_id,
             track_id: None,
             source: Some(source),
-            source_id: Some(source_id),
+            source_id: Some(source_id.clone()),
             title: title.clone(),
             artist_name: artist.clone(),
             album_title: album.clone(),
@@ -8364,6 +8503,8 @@ impl PlaybackOrchestrator {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -8390,6 +8531,10 @@ impl PlaybackOrchestrator {
             channels: resolved.channels,
             file_size: resolved.file_size,
             file_path: None,
+            source: entry.source.clone(),
+            source_id: Some(source_id.clone()),
+            track_number: entry.track_number.map(|n| n as u32),
+            disc_number: entry.disc_number.map(|n| n as u32),
         })
     }
 
@@ -8441,6 +8586,16 @@ impl PlaybackOrchestrator {
             channels: None,
             file_size: None,
             file_path,
+            source: entry
+                .source
+                .clone()
+                .or_else(|| entry.track_id.map(|_| "local".to_string())),
+            source_id: entry
+                .source_id
+                .clone()
+                .or_else(|| entry.track_id.map(|t| t.to_string())),
+            track_number: entry.track_number.map(|n| n as u32),
+            disc_number: entry.disc_number.map(|n| n as u32),
         })
     }
 
@@ -9052,6 +9207,79 @@ mod transcode_budget_tests {
         let huge_gib = 100.0_f64;
         let computed = (120 + (huge_gib * 120.0).round() as u64).min(ceiling);
         assert_eq!(computed, ceiling);
+    }
+}
+
+/// La regle de decision du passthrough DSD (#2122).
+///
+/// Les douze combinaisons : quatre modes croises avec les trois reponses
+/// possibles du sondage. La sonde reseau n'est pas testee ici — c'est
+/// justement pour la sortir du chemin qu'elle a ete extraite.
+#[cfg(test)]
+mod dsd_passthrough_tests {
+    use super::PlaybackOrchestrator as O;
+
+    /// Le defaut qui a rendu la zone muette : `native` reglé a la main, un
+    /// renderer qui repond noir sur blanc qu'il ne lit pas de DSD, et le flux
+    /// brut qui partait quand meme. Le repli PCM prime desormais.
+    #[test]
+    fn native_cede_devant_un_refus_explicite() {
+        assert!(!O::decider_passthrough_dsd("native", Some(false)));
+    }
+
+    /// La faute symetrique, celle qu'on ne veut PAS commettre en corrigeant :
+    /// un sondage muet n'est pas un refus. Le reglage explicite tient.
+    #[test]
+    fn native_tient_quand_le_sondage_ne_repond_pas() {
+        assert!(O::decider_passthrough_dsd("native", None));
+    }
+
+    #[test]
+    fn native_tient_quand_le_renderer_confirme() {
+        assert!(O::decider_passthrough_dsd("native", Some(true)));
+    }
+
+    /// `pcm` est un refus de l'utilisateur : aucune reponse du renderer ne le
+    /// renverse, pas meme un oui franc.
+    #[test]
+    fn pcm_refuse_quoi_que_reponde_le_renderer() {
+        for annonce in [Some(true), Some(false), None] {
+            assert!(
+                !O::decider_passthrough_dsd("pcm", annonce),
+                "pcm a laisse passer du DSD avec {annonce:?}"
+            );
+        }
+    }
+
+    /// `dop` non plus n'est pas du passthrough : le renderer doit recevoir le
+    /// DSD emballe en trames PCM, donc le fichier passe par la conversion.
+    #[test]
+    fn dop_n_est_pas_du_passthrough() {
+        for annonce in [Some(true), Some(false), None] {
+            assert!(
+                !O::decider_passthrough_dsd("dop", annonce),
+                "dop a laisse passer du DSD brut avec {annonce:?}"
+            );
+        }
+    }
+
+    /// `auto` suit le renderer, et sans reponse prend le chemin sur.
+    #[test]
+    fn auto_suit_le_sondage_et_se_replie_dans_le_doute() {
+        assert!(O::decider_passthrough_dsd("auto", Some(true)));
+        assert!(!O::decider_passthrough_dsd("auto", Some(false)));
+        assert!(!O::decider_passthrough_dsd("auto", None));
+    }
+
+    /// Un mode inconnu en base (valeur ecrite par une version future, champ
+    /// vide) doit se comporter comme `auto`, pas envoyer du DSD au hasard.
+    #[test]
+    fn un_mode_inconnu_se_comporte_comme_auto() {
+        assert!(!O::decider_passthrough_dsd("", None));
+        assert!(
+            !O::decider_passthrough_dsd("Native", None),
+            "la casse compte"
+        );
     }
 }
 
@@ -10855,6 +11083,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -10894,6 +11124,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -10924,6 +11156,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -10961,6 +11195,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: Some("mp3".into()),
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_stream(&req).await.unwrap();
         assert_eq!(resolved.source, "bandcamp");
@@ -10994,6 +11230,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert_eq!(resolved.mime_type, "audio/mpeg");
@@ -11021,6 +11259,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -11057,6 +11297,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(resolved.stream_id.is_some());
@@ -11086,6 +11328,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(resolved.stream_id.is_none());
@@ -11383,5 +11627,110 @@ mod dop_routing_tests {
         // d'origine, qui ignorait le fichier de bout en bout.
         assert_eq!(dop_wire_params(Some((2_822_400, 6)), None, 2).1, 6);
         assert_eq!(dop_wire_params(Some((2_822_400, 1)), None, 2).1, 2);
+    }
+}
+
+/// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
+///
+/// Chez Bilou, quatre échecs de sortie BluOS d'affilée ont produit quatre
+/// annonces « en écoute » à Last.fm pour un titre jamais entendu. L'annonce
+/// partait AVANT la tentative d'envoi ; `output_sent` était établi vingt lignes
+/// plus bas, dans la même fonction, et l'arrêt immédiat de la zone s'appuyait
+/// déjà dessus.
+///
+/// Ce test relit la source plutôt que d'exercer le chemin de lecture : la
+/// propriété à tenir est un ORDRE et une CONDITION dans une fonction async de
+/// plusieurs centaines de lignes, et c'est exactement ce qu'un copier-coller
+/// ultérieur ré-inverse. Même procédé que `eq_refresh_guard` dans
+/// `tune-server/src/routes/mod.rs`, et pour la même raison.
+#[cfg(test)]
+mod annonce_apres_sortie_guard {
+    /// Le fichier PRIVÉ de ce module de test.
+    ///
+    /// ⚠️ La découpe n'est pas un détail. `include_str!` rend le fichier
+    /// ENTIER, module de test compris — et les motifs cherchés ci-dessous
+    /// figurent aussi, mot pour mot, dans les messages d'assertion. Un
+    /// `code_de_production().contains(...)` sur le fichier complet se trouve donc lui-même
+    /// et rend vrai quoi qu'il arrive.
+    ///
+    /// C'est vécu : la première version de ce garde-fou a survécu au sabotage
+    /// de la condition qu'elle prétendait garder. Un contrôle qui ne peut pas
+    /// dire non ne contrôle rien (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("orchestrator.rs");
+        const BORNE: &str = "mod annonce_apres_sortie_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    /// Position de la première occurrence, ou panique avec un message qui dit
+    /// quoi chercher — un garde-fou muet sur son propre désaccordage ne garde
+    /// rien.
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans orchestrator.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #1998."
+            )
+        })
+    }
+
+    /// `output_sent` doit être CONNU avant qu'on annonce quoi que ce soit.
+    #[test]
+    fn l_annonce_vient_apres_le_resultat_de_la_sortie() {
+        let resultat = position("let (output_sent, output_error) =");
+        let annonce = position("self.dispatch_now_playing(");
+        assert!(
+            resultat < annonce,
+            "`dispatch_now_playing` est appelé AVANT que `output_sent` soit \
+             connu : une sortie en échec annoncera de nouveau une écoute qui \
+             n'a pas eu lieu (#1998)."
+        );
+    }
+
+    /// Et il doit être CONSULTÉ, pas seulement connu.
+    #[test]
+    fn l_annonce_est_conditionnee_a_output_sent() {
+        assert!(
+            code_de_production()
+                .contains("if output_sent {\n            self.dispatch_now_playing("),
+            "`dispatch_now_playing` n'est plus gardé par `if output_sent` — \
+             l'annonce « en écoute » repartirait sur un envoi refusé (#1998)."
+        );
+    }
+
+    /// L'historique local souffrait du même défaut. C'était la question laissée
+    /// ouverte par le ticket ; la réponse est oui, et elle est corrigée ici.
+    #[test]
+    fn l_historique_local_est_conditionne_lui_aussi() {
+        assert!(
+            code_de_production().contains("if output_sent && record_history"),
+            "`record_listen` n'est plus gardé par `output_sent` : \
+             `listen_history` se remplirait de titres jamais joués (#1998)."
+        );
+    }
+
+    /// Le scrobble DÉFINITIF n'a jamais été concerné — il part du poller, une
+    /// fois le seuil des 50 % / 4 min franchi. Ce test épingle cette séparation
+    /// pour que personne ne la « répare » en le ramenant au démarrage : c'est
+    /// précisément ce que #1113 avait défait.
+    #[test]
+    fn le_scrobble_definitif_reste_hors_du_demarrage() {
+        let play = position("async fn play_inner(");
+        let src = code_de_production();
+        let apres = &src[play..];
+        let fin = apres
+            .find("\n    async fn ")
+            .or_else(|| apres.find("\n    pub async fn "))
+            .unwrap_or(apres.len());
+        assert!(
+            !apres[..fin].contains("dispatch_scrobble("),
+            "le scrobble définitif est reparti dans le chemin de démarrage : \
+             il scrobblerait un titre à la seconde où il commence, en ignorant \
+             la règle des 50 % / 4 min de Last.fm (#1113)."
+        );
     }
 }

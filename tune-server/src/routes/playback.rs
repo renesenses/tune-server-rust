@@ -313,6 +313,10 @@ struct PlayRequest {
     duration_ms: Option<i64>,
     seek_ms: Option<u64>,
     temp_file_path: Option<String>,
+    // Album numbering for a single streaming track, which becomes the queue:
+    // without it the queue row has no track number (see QueueAddRequest).
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
     // Real resolution/codec for a media-server (source="upnp") item, passed by
     // the client from the DIDL res@ attributes so the signal path shows the true
     // rate/bit-depth and ALAC-vs-AAC instead of "AAC 44kHz/16bit" (Yves, NAS).
@@ -355,6 +359,12 @@ struct QueueAddRequest {
     album_title: Option<String>,
     cover_path: Option<String>,
     duration_ms: Option<i64>,
+    // Album numbering, when the client knows it. Without these the queue row
+    // has no track number, and anything that lays the queue out in album order
+    // — the queue view, an output that files tracks by their rank — has nothing
+    // to go on.
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
     // Batch streaming tracks: [{source, source_id, title?, artist_name?, ...}]
     #[serde(default)]
     tracks: Vec<StreamingTrackItem>,
@@ -369,6 +379,8 @@ struct StreamingTrackItem {
     album_title: Option<String>,
     cover_path: Option<String>,
     duration_ms: Option<i64>,
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -579,6 +591,8 @@ async fn play(
                     sample_rate: None,
                     bit_depth: None,
                     media_format: None,
+                    track_number: None,
+                    disc_number: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -655,6 +669,8 @@ async fn play(
                             sample_rate: None,
                             bit_depth: None,
                             media_format: None,
+                            track_number: None,
+                            disc_number: None,
                         };
                         if let Ok(result) = state.orchestrator.play(orch_req).await {
                             return Json(
@@ -689,7 +705,7 @@ async fn play(
                     .into_response();
             }
         };
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let tracks = match svc.get_album_tracks(album_id).await {
             Ok(t) => t,
             Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -755,6 +771,8 @@ async fn play(
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: first.track_number,
+            disc_number: first.disc_number,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -789,7 +807,7 @@ async fn play(
                     .into_response();
             }
         };
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let tracks = match svc.get_playlist_tracks(playlist_id).await {
             Ok(t) => t,
             Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -855,6 +873,8 @@ async fn play(
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: first.track_number,
+            disc_number: first.disc_number,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -886,18 +906,26 @@ async fn play(
         let source_for_q = body.source.clone();
         // Same empty-title backfill as the queue_add sites: don't persist a blank
         // title for the row we're about to make the queue (DEvir 0.9.22).
-        let (title_val, artist_val, album_val, cover_val, duration_val) =
-            resolve_streaming_queue_meta(
-                &state,
-                source_for_q.as_deref().unwrap_or_default(),
-                &source_id_val,
-                body.title.as_deref(),
-                body.artist_name.as_deref(),
-                body.album_title.as_deref(),
-                body.cover_path.as_deref(),
-                body.duration_ms,
-            )
-            .await;
+        let meta = resolve_streaming_queue_meta(
+            &state,
+            source_for_q.as_deref().unwrap_or_default(),
+            &source_id_val,
+            body.title.as_deref(),
+            body.artist_name.as_deref(),
+            body.album_title.as_deref(),
+            body.cover_path.as_deref(),
+            body.duration_ms,
+            body.track_number,
+            body.disc_number,
+        )
+        .await;
+        let (title_val, artist_val, album_val, cover_val, duration_val) = (
+            meta.title,
+            meta.artist,
+            meta.album,
+            meta.cover,
+            meta.duration_ms,
+        );
 
         let output_device_id = body.output_device_id.or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -923,6 +951,8 @@ async fn play(
             sample_rate: body.sample_rate,
             bit_depth: body.bit_depth,
             media_format: body.media_format,
+            track_number: None,
+            disc_number: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -959,9 +989,8 @@ async fn play(
                             album: album_val,
                             cover_url: cover_val,
                             duration_ms: duration_val,
-                            // Single-track play request carries no album numbering.
-                            track_number: None,
-                            disc_number: None,
+                            track_number: meta.track_number,
+                            disc_number: meta.disc_number,
                         }],
                     ) {
                         warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -1050,6 +1079,8 @@ async fn play(
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: None,
+                disc_number: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -1146,6 +1177,8 @@ async fn play(
         sample_rate: body.sample_rate,
         bit_depth: body.bit_depth,
         media_format: body.media_format,
+        track_number: None,
+        disc_number: None,
     };
 
     match state.orchestrator.play(orch_req).await {
@@ -1204,6 +1237,8 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: None,
+                disc_number: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -1304,6 +1339,8 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     sample_rate: None,
                     bit_depth: None,
                     media_format: None,
+                    track_number: None,
+                    disc_number: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -1606,6 +1643,19 @@ fn client_title_is_usable(title: Option<&str>) -> bool {
 ///
 /// The client payload wins whenever it carries a real (non-empty) title, so the
 /// network call only happens in the degraded empty-title case.
+/// Metadata for one streaming queue row: what the client sent, completed from
+/// the service when it was too thin to use.
+struct StreamingQueueMeta {
+    title: String,
+    artist: String,
+    album: Option<String>,
+    cover: Option<String>,
+    duration_ms: i64,
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn resolve_streaming_queue_meta(
     state: &AppState,
     source: &str,
@@ -1615,31 +1665,51 @@ async fn resolve_streaming_queue_meta(
     album: Option<&str>,
     cover: Option<&str>,
     duration_ms: Option<i64>,
-) -> (String, String, Option<String>, Option<String>, i64) {
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
+) -> StreamingQueueMeta {
     if client_title_is_usable(title) {
-        return (
-            title.unwrap_or_default().to_string(),
-            artist.unwrap_or_default().to_string(),
-            album.map(str::to_string),
-            cover.map(str::to_string),
-            duration_ms.unwrap_or(0),
-        );
+        // Fast path: trust the client and make no service call — a client
+        // queueing a whole album would otherwise pay one round trip per track.
+        // Numbering therefore stays as sent: a client that wants its queue rows
+        // numbered has to include track_number/disc_number.
+        return StreamingQueueMeta {
+            title: title.unwrap_or_default().to_string(),
+            artist: artist.unwrap_or_default().to_string(),
+            album: album.map(str::to_string),
+            cover: cover.map(str::to_string),
+            duration_ms: duration_ms.unwrap_or(0),
+            track_number,
+            disc_number,
+        };
     }
 
     let registry = state.services.lock().await;
     if let Some(svc) = registry.get(source) {
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         if let Ok(t) = svc.get_track(source_id).await {
-            return (
-                t.title,
-                t.artist,
-                t.album,
-                t.cover_path,
-                t.duration_ms as i64,
-            );
+            return StreamingQueueMeta {
+                title: t.title,
+                artist: t.artist,
+                album: t.album,
+                cover: t.cover_path,
+                duration_ms: t.duration_ms as i64,
+                // We are talking to the service anyway, so fill the numbering
+                // it reports — the client's value still wins when it sent one.
+                track_number: track_number.or(t.track_number.map(i64::from)),
+                disc_number: disc_number.or(t.disc_number.map(i64::from)),
+            };
         }
     }
-    ("Unknown".into(), String::new(), None, None, 0)
+    StreamingQueueMeta {
+        title: "Unknown".into(),
+        artist: String::new(),
+        album: None,
+        cover: None,
+        duration_ms: 0,
+        track_number,
+        disc_number,
+    }
 }
 
 async fn queue_add(
@@ -1658,7 +1728,7 @@ async fn queue_add(
 
     // Single streaming track.
     if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
-        let (title, artist, album, cover, duration) = resolve_streaming_queue_meta(
+        let meta = resolve_streaming_queue_meta(
             &state,
             source,
             source_id,
@@ -1667,25 +1737,26 @@ async fn queue_add(
             body.album_title.as_deref(),
             body.cover_path.as_deref(),
             body.duration_ms,
+            body.track_number,
+            body.disc_number,
         )
         .await;
         inputs.push(QueueInput::Streaming {
             source: source.clone(),
             source_id: source_id.clone(),
-            title,
-            artist,
-            album,
-            cover_url: cover,
-            duration_ms: duration,
-            // The queue-add request has no track/disc fields.
-            track_number: None,
-            disc_number: None,
+            title: meta.title,
+            artist: meta.artist,
+            album: meta.album,
+            cover_url: meta.cover,
+            duration_ms: meta.duration_ms,
+            track_number: meta.track_number,
+            disc_number: meta.disc_number,
         });
     }
 
     // Batch streaming tracks: [{source, source_id, ...}]
     for item in &body.tracks {
-        let (title, artist, album, cover, duration) = resolve_streaming_queue_meta(
+        let meta = resolve_streaming_queue_meta(
             &state,
             &item.source,
             &item.source_id,
@@ -1694,19 +1765,20 @@ async fn queue_add(
             item.album_title.as_deref(),
             item.cover_path.as_deref(),
             item.duration_ms,
+            item.track_number,
+            item.disc_number,
         )
         .await;
         inputs.push(QueueInput::Streaming {
             source: item.source.clone(),
             source_id: item.source_id.clone(),
-            title,
-            artist,
-            album,
-            cover_url: cover,
-            duration_ms: duration,
-            // Batch streaming items carry no track/disc number.
-            track_number: None,
-            disc_number: None,
+            title: meta.title,
+            artist: meta.artist,
+            album: meta.album,
+            cover_url: meta.cover,
+            duration_ms: meta.duration_ms,
+            track_number: meta.track_number,
+            disc_number: meta.disc_number,
         });
     }
 
@@ -2601,6 +2673,8 @@ async fn invoke_zone_pin(
         sample_rate: None,
         bit_depth: None,
         media_format: None,
+        track_number: None,
+        disc_number: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -2910,6 +2984,8 @@ pub async fn shuffle_all(
         sample_rate: None,
         bit_depth: None,
         media_format: None,
+        track_number: None,
+        disc_number: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -3011,6 +3087,7 @@ mod tests {
     use super::client_title_is_usable;
     use super::play_error_response;
     use super::precedent_doit_relancer;
+    use super::{PlayRequest, QueueAddRequest};
     use axum::http::StatusCode;
 
     // ── « Précédent » : relancer ou reculer (#1929) ───────────────────────
@@ -3052,6 +3129,46 @@ mod tests {
         // de visible, et l'utilisateur croirait le bouton mort.
         assert!(!precedent_doit_relancer(0, false));
         assert!(!precedent_doit_relancer(0, true));
+    }
+
+    #[test]
+    fn queue_add_accepts_album_numbering() {
+        // The regression: queue rows added track by track had no track number,
+        // so anything ordering the queue by album position — the queue view, an
+        // output that files tracks by their rank — had to invent one. A client
+        // that knows the numbering must be able to send it, per item and for a
+        // single track.
+        let body: QueueAddRequest = serde_json::from_value(serde_json::json!({
+            "tracks": [
+                {"source": "qobuz", "source_id": "42", "title": "Nightlite",
+                 "track_number": 14, "disc_number": 1},
+                {"source": "qobuz", "source_id": "43", "title": "Hatoa"},
+            ],
+            "source": "qobuz",
+            "source_id": "7",
+            "track_number": 3,
+            "disc_number": 2,
+        }))
+        .expect("queue-add payload with numbering must deserialize");
+        assert_eq!(body.tracks[0].track_number, Some(14));
+        assert_eq!(body.tracks[0].disc_number, Some(1));
+        // Omitting them stays valid — the fields are additive.
+        assert_eq!(body.tracks[1].track_number, None);
+        assert_eq!(body.track_number, Some(3));
+        assert_eq!(body.disc_number, Some(2));
+    }
+
+    #[test]
+    fn play_accepts_album_numbering() {
+        // A single streaming track becomes the queue, so the same numbering has
+        // to survive the play path too.
+        let body: PlayRequest = serde_json::from_value(serde_json::json!({
+            "source": "qobuz", "source_id": "6281809",
+            "title": "If You Stayed Over", "track_number": 16,
+        }))
+        .expect("play payload with numbering must deserialize");
+        assert_eq!(body.track_number, Some(16));
+        assert_eq!(body.disc_number, None);
     }
 
     #[test]

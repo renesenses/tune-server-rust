@@ -24,7 +24,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     configure_deezer_proxy(state, config).await;
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);
-    spawn_memory_diagnostics(state.outputs.clone());
+    spawn_memory_diagnostics(state.outputs.clone(), state.streamer.clone());
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
@@ -339,6 +339,8 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                         sample_rate: None,
                         bit_depth: None,
                         media_format: None,
+                        track_number: None,
+                        disc_number: None,
                     };
                     match orchestrator.play(req).await {
                         Ok(_) => {
@@ -679,7 +681,7 @@ fn spawn_token_refresher(state: &AppState) {
             let registry = services.lock().await;
             for name in registry.list() {
                 if let Some(svc) = registry.get(&name) {
-                    let mut svc = svc.lock().await;
+                    let mut svc = svc.write().await;
                     match svc.refresh_if_needed().await {
                         Ok(true) => {
                             let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(
@@ -742,7 +744,7 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
 async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
     let registry = state.services.lock().await;
     if let Some(svc) = registry.get("deezer") {
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
         if let Some(deezer) = svc
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
@@ -870,7 +872,13 @@ fn spawn_heartbeat(state: &AppState) {
 
                     let mut authed = Vec::new();
                     for (name, handle) in svc_handles {
-                        if let Ok(svc) = handle.try_lock() {
+                        // `try_read` et non `try_write` : on ne fait que
+                        // LIRE l'etat d'authentification. Avec le RwLock, ce
+                        // sondage cesse d'echouer parce qu'une autre lecture
+                        // est en cours — il ne renonce plus que si une ecriture
+                        // (rafraichissement de jeton, deconnexion) tient le
+                        // verrou, ce qui est exactement l'intention (#1969).
+                        if let Ok(svc) = handle.try_read() {
                             let status = svc.auth_status().await;
                             if status.authenticated {
                                 authed.push(name);
@@ -1242,7 +1250,7 @@ pub async fn apply_qobuz_proxy_first(
 ) {
     let registry = services.lock().await;
     if let Some(svc) = registry.get("qobuz") {
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
         if let Some(qobuz) = svc
             .as_any_mut()
             .downcast_mut::<tune_core::streaming::qobuz::QobuzService>()
@@ -1367,8 +1375,38 @@ fn spawn_cloud_library_sync(state: &AppState) {
     tune_core::cloud::metadata_proposals::spawn(state.backend.clone(), state.license.clone());
 }
 
-fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
+/// Relevé mémoire périodique — et ce qu'il faut pour NOMMER ce qui grossit.
+///
+/// Cette trace existait déjà et tournait toutes les cinq minutes sous Linux :
+/// elle disait `rss_mb` et le nombre de sorties. C'est-à-dire qu'elle
+/// constatait la croissance sans jamais donner de quoi l'imputer.
+///
+/// JeromeQ (#2077) est passé de 117 Mo à 1,8 Go en trente-sept minutes de
+/// lecture sur Ubuntu — donc cette trace tournait chez lui, et elle n'aurait
+/// rien appris de plus que ses captures de `smem`.
+///
+/// On y ajoute les deux compteurs qui séparent les hypothèses que le ticket
+/// n'a pas pu départager :
+///
+/// - `stream_sessions` : une session est créée par piste et n'est ramassée
+///   qu'au bout de **trente minutes** (`cleanup_stale_sessions`). Chacune tient
+///   un canal de 128 morceaux. Un compteur qui monte avec la lecture et
+///   redescend au repos désigne ce cache ; un compteur plat innocente le
+///   chemin de lecture, et c'est aussi une réponse.
+/// - `rss_delta_mb` : la croissance depuis le démarrage du serveur. Un seul
+///   relevé ne dit rien ; c'est l'écart qui parle, et le lire dans la ligne
+///   évite d'avoir à retrouver la première.
+///
+/// Ce n'est PAS un correctif. Le ticket demande explicitement trois mesures du
+/// testeur avant de coder, parce qu'une fuite de lecture et une fuite de tâche
+/// de fond n'ont pas le même correctif. Ceci rend le prochain relevé
+/// exploitable, rien de plus.
+fn spawn_memory_diagnostics(
+    outputs: Arc<tokio::sync::Mutex<OutputRegistry>>,
+    streamer: Arc<tune_core::http::streamer::AudioStreamer>,
+) {
     tokio::spawn(async move {
+        let mut rss_initial_mb: Option<u64> = None;
         loop {
             #[cfg(target_os = "linux")]
             if let Ok(statm) = tokio::fs::read_to_string("/proc/self/statm").await {
@@ -1379,9 +1417,20 @@ fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
                     .unwrap_or(0);
                 let rss_mb = rss_pages * 4 / 1024;
                 let count = outputs.lock().await.list().len();
-                info!(rss_mb, outputs_count = count, "memory_diagnostics");
+                let stream_sessions = streamer.sessions_state().lock().await.len();
+                let base = *rss_initial_mb.get_or_insert(rss_mb);
+                // Signé : un relevé sous la valeur de départ est une information
+                // (mémoire rendue), pas un débordement à cacher.
+                let rss_delta_mb = rss_mb as i64 - base as i64;
+                info!(
+                    rss_mb,
+                    rss_delta_mb,
+                    outputs_count = count,
+                    stream_sessions,
+                    "memory_diagnostics"
+                );
             }
-            let _ = &outputs; // keep alive on non-linux
+            let _ = (&outputs, &streamer); // keep alive on non-linux
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });

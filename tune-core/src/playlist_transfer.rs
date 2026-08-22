@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::streaming::registry::ServiceRegistry;
@@ -65,7 +65,7 @@ pub struct TransferProgress {
 async fn resolve_service(
     registry: &Arc<Mutex<ServiceRegistry>>,
     name: &str,
-) -> Result<Arc<Mutex<Box<dyn StreamingService>>>, String> {
+) -> Result<Arc<RwLock<Box<dyn StreamingService>>>, String> {
     let reg = registry.lock().await;
     reg.get(name)
         .ok_or_else(|| format!("service not found: {name}"))
@@ -77,13 +77,13 @@ async fn resolve_service(
 /// stripping, acceptance threshold) instead of naive equality-then-first-result,
 /// so covers, live takes and same-title different songs are no longer accepted.
 async fn search_track_on_target(
-    target: &Arc<Mutex<Box<dyn StreamingService>>>,
+    target: &Arc<RwLock<Box<dyn StreamingService>>>,
     title: &str,
     artist: &str,
 ) -> Option<(String, String, String)> {
     let query = format!("{title} {artist}");
     let results = {
-        let svc = target.lock().await;
+        let svc = target.read().await;
         match svc.search(&query, 10).await {
             Ok(r) => r,
             Err(e) => {
@@ -112,7 +112,7 @@ pub async fn preview_transfer(
     // Load source playlist tracks
     let source_svc = resolve_service(services, &req.source_service).await?;
     let source_tracks = {
-        let svc = source_svc.lock().await;
+        let svc = source_svc.read().await;
         svc.get_playlist_tracks(&req.source_playlist_id).await?
     };
 
@@ -182,7 +182,7 @@ pub async fn transfer_playlist(
     // Load source playlist metadata + tracks
     let source_svc = resolve_service(services, &req.source_service).await?;
     let (playlist_name, source_tracks) = {
-        let svc = source_svc.lock().await;
+        let svc = source_svc.read().await;
         let playlist = svc.get_playlist(&req.source_playlist_id).await?;
         let tracks = svc.get_playlist_tracks(&req.source_playlist_id).await?;
         (playlist.name, tracks)
@@ -236,13 +236,13 @@ pub async fn transfer_playlist(
 
     // Create target playlist
     let target_playlist_id = {
-        let svc = target_svc.lock().await;
+        let svc = target_svc.read().await;
         svc.create_playlist(&target_name, None).await?
     };
 
     // Add matched tracks to target playlist
     if !matched_ids.is_empty() {
-        let svc = target_svc.lock().await;
+        let svc = target_svc.read().await;
         let added = svc
             .add_tracks_to_playlist(&target_playlist_id, &matched_ids)
             .await?;

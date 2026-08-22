@@ -1115,6 +1115,41 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/mouvxtra-
         // pas encore ete converti.
         up: "",
     },
+    Migration {
+        version: 82,
+        name: "horodatage_favoris_radio_en_iso",
+        // Rendre son fuseau a chaque favori radio deja enregistre.
+        //
+        // `radio_favorites.saved_at` avait pour defaut CURRENT_TIMESTAMP, que
+        // SQLite ecrit « 2026-08-22 13:45:00 » : de l'UTC, mais SANS marqueur
+        // de fuseau et avec une espace au lieu du T.
+        //
+        // Le client fait pourtant ce qu'il faut — `new Date(iso)` puis
+        // `toLocaleDateString` — mais JavaScript, devant une chaine sans
+        // fuseau, la traite comme DEJA LOCALE. L'heure UTC etait donc affichee
+        // telle quelle : deux heures d'avance en ete, une en hiver. Signale par
+        // Reivax66 (fil forum #1515).
+        //
+        // La correction n'est pas d'ecrire l'heure locale — un serveur consulte
+        // depuis un autre fuseau, ou une base restauree ailleurs, mentirait
+        // durablement. C'est d'horodater en UTC EXPLICITE, et de laisser le
+        // client convertir, ce qu'il sait deja faire.
+        //
+        // Ces lignes ont toutes ete ecrites en UTC : la reparation est donc
+        // purement syntaxique — espace -> T, ajout du Z. Aucune heure n'est
+        // decalee ici.
+        //
+        // Idempotent : le filtre ne retient que ce qui n'a pas deja la forme
+        // ISO (pas de T, pas de Z final).
+        up: "
+UPDATE radio_favorites
+   SET saved_at = REPLACE(saved_at, ' ', 'T') || 'Z'
+ WHERE saved_at IS NOT NULL
+   AND saved_at <> ''
+   AND saved_at LIKE '____-__-__ __:__:__'
+   AND saved_at NOT LIKE '%Z';
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2341,8 +2376,11 @@ pub fn latest_version() -> i32 {
 /// Embedded PG migration scripts. Each tuple is (version, name, sql).
 /// The SQL files are compiled into the binary so no filesystem access
 /// is needed at runtime.
+///
+/// `pub(crate)` pour le test `pg_schema_parity`, qui rejoue cette liste sur une
+/// base nue et la compare au schema neuf de `pg_migrate.rs` (#2111).
 #[cfg(feature = "postgres")]
-const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
+pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
     (
         1,
         "initial_schema",
@@ -2496,6 +2534,33 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         30,
         "format_conteneur_dsd",
         include_str!("../../migrations/postgres/030_format_conteneur_dsd.sql"),
+    ),
+    // Jumelle PG de la migration SQLite 76 (#1763), posee avec dix migrations
+    // de retard : le chantier CUE n'avait touche que le schema NEUF cote
+    // PostgreSQL (#2111).
+    (
+        31,
+        "cue_colonnes_et_identite",
+        include_str!("../../migrations/postgres/031_cue_colonnes_et_identite.sql"),
+    ),
+    // Douze reglages de zone qui n'existaient pas cote PostgreSQL — dont
+    // `dlna_wav24`, absente meme du schema neuf. L'ecriture etait avalee en
+    // silence et l'API repondait « enregistre » (#2111).
+    (
+        32,
+        "zones_reglages_manquants",
+        include_str!("../../migrations/postgres/032_zones_reglages_manquants.sql"),
+    ),
+    // `podcast_subscriptions.source_id` n'arrivait par AUCUNE des trois voies
+    // d'une base PG neuve : ni script numerote, ni ENSURE_COLUMNS, ni
+    // ENSURE_TABLES. Elle n'existait que dans PG_FULL_SCHEMA, qui ne tourne
+    // QUE pendant la migration SQLite -> PG. Or `routes/podcasts.rs` la
+    // SELECT : l'ecran Podcasts tombait sur toute installation PostgreSQL
+    // partie de zero. Meme famille que l'incident `queue_items` du .15.
+    (
+        33,
+        "podcast_source_id",
+        include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
     ),
 ];
 
@@ -2660,6 +2725,7 @@ pub fn pg_latest_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -2946,6 +3012,63 @@ mod tests {
     /// Ce test part d'une base portant `albums` dans une forme d'AVANT la v79,
     /// rejoue les migrations, et exige la colonne, la ligne existante, et un
     /// `SELECT` réel avec la clause du dépôt. Il ÉCHOUE contre le code d'avant.
+    /// Les favoris radio deja enregistres retrouvent leur fuseau (#1515).
+    ///
+    /// Le scenario reel : une base d'UTILISATEUR, ou la table existe deja avec
+    /// des lignes ecrites par l'ancien defaut CURRENT_TIMESTAMP, qu'on met a
+    /// jour. Ma premiere version rejouait `run_migrations` deux fois sur une
+    /// base neuve — le second passage ne faisait RIEN, les versions appliquees
+    /// etant enregistrees, et le test echouait pour la mauvaise raison.
+    ///
+    /// Il ECHOUE contre le code d'avant : c'est sa raison d'etre.
+    #[test]
+    fn les_favoris_radio_retrouvent_leur_fuseau() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant : la table existe, ses horodatages n'ont pas de
+        // fuseau. `init_schema` la laissera en place (CREATE TABLE IF NOT
+        // EXISTS), comme sur la machine d'un utilisateur.
+        db.execute_batch(
+            "CREATE TABLE radio_favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                artist TEXT DEFAULT '',
+                station_name TEXT DEFAULT '',
+                cover_url TEXT,
+                stream_url TEXT,
+                saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(title, artist)
+            );
+            INSERT INTO radio_favorites (title, artist, saved_at) VALUES
+               ('Come on In', 'Bridge City Sinners', '2026-08-22 13:45:00'),
+               ('Pistol',     'Kings Of Leon',       '2026-08-22T11:00:00Z'),
+               ('Sans heure', 'Personne',            NULL),
+               ('Vide',       'Personne2',           '');",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let lire = |titre: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT saved_at FROM radio_favorites WHERE title = ?1",
+                [titre],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+
+        // Espace -> T, et le Z ajoute. Aucune heure n'est DECALEE : ces lignes
+        // etaient deja en UTC, il leur manquait seulement de le dire.
+        assert_eq!(lire("Come on In").as_deref(), Some("2026-08-22T13:45:00Z"));
+        // Une ligne deja au bon format n'est pas retouchee — sans quoi un
+        // second passage lui collerait un second Z.
+        assert_eq!(lire("Pistol").as_deref(), Some("2026-08-22T11:00:00Z"));
+        // Ni le NUL ni le vide ne deviennent une date inventee.
+        assert_eq!(lire("Sans heure"), None);
+        assert_eq!(lire("Vide").as_deref(), Some(""));
+    }
+
     #[test]
     fn une_base_ancienne_gagne_le_drapeau_compilation() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3282,7 +3405,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 30, "latest PG migration must be 30");
+        assert_eq!(pg_latest_version(), 33, "latest PG migration must be 33");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -3618,6 +3741,73 @@ mod tests {
         assert_eq!(
             lire("SELECT format FROM albums ORDER BY id"),
             vec!["dsf", "dff", "dsd"]
+        );
+    }
+
+    /// Toute colonne posée côté SQLite existe aussi côté PostgreSQL — dans une
+    /// MIGRATION, pas seulement dans le schéma neuf.
+    ///
+    /// La doctrine dit « trois endroits » : `CORE_SCHEMA` SQLite, migration
+    /// SQLite, schéma PG. Il en faut **quatre** — le schéma PG neuf
+    /// (`pg_migrate.rs`) ET la migration PG pour les bases existantes. C'est
+    /// la quatrième qui manquait aux trois colonnes CUE : posées par la
+    /// migration SQLite 76 en août, elles n'ont jamais atteint une base
+    /// PostgreSQL déjà créée, et ne l'auraient jamais fait (#2111).
+    ///
+    /// Le défaut serait resté invisible jusqu'au jour où du code les aurait
+    /// écrites — et l'échec se serait alors lu comme un défaut du CUE, pas
+    /// comme une migration manquante.
+    ///
+    /// Ce test lit les SOURCES, comme `network_mounts_n_a_qu_une_definition` :
+    /// il vaut donc quel que soit le jeu de features compilé.
+    #[test]
+    fn toute_colonne_sqlite_a_sa_migration_postgres() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sqlite = fs::read_to_string(racine.join("src/db/migrations.rs")).unwrap();
+
+        // Les colonnes ajoutées par `add_column_if_missing` côté SQLite.
+        let mut colonnes: Vec<String> = Vec::new();
+        for l in sqlite.lines() {
+            let Some(i) = l.find("add_column_if_missing(db, \"") else {
+                continue;
+            };
+            let reste = &l[i..];
+            let champs: Vec<&str> = reste.split('"').collect();
+            // add_column_if_missing(db, "table", "colonne", "type")
+            if champs.len() >= 4 {
+                colonnes.push(champs[3].to_string());
+            }
+        }
+        assert!(
+            colonnes.len() > 20,
+            "aucune colonne trouvée ({}) — le motif d'appel a changé, ce test ne garde plus rien",
+            colonnes.len()
+        );
+
+        // Tout le SQL PostgreSQL, migrations numérotées SEULEMENT.
+        //
+        // `pg_migrate.rs` est délibérément EXCLU : c'est le schéma neuf, et
+        // c'est précisément là que les colonnes CUE se cachaient tout en
+        // manquant aux bases existantes.
+        let dossier = racine.join("migrations/postgres");
+        let mut sql_pg = String::new();
+        for e in fs::read_dir(&dossier).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "sql") {
+                sql_pg.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+            }
+        }
+
+        let manquantes: Vec<&String> = colonnes
+            .iter()
+            .filter(|c| !sql_pg.contains(c.as_str()))
+            .collect();
+
+        assert!(
+            manquantes.is_empty(),
+            "colonne(s) posée(s) côté SQLite et ABSENTE(S) des migrations PostgreSQL : {manquantes:?}\n\
+             Une base PostgreSQL déjà créée ne les recevra JAMAIS — `CREATE TABLE` dans\n\
+             `pg_migrate.rs` ne s'applique qu'à une base vide. Ajouter un fichier dans\n\
+             `tune-core/migrations/postgres/` avec `ADD COLUMN IF NOT EXISTS` (#2111)."
         );
     }
 

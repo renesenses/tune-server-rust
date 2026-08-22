@@ -133,6 +133,12 @@ const STOPPED_FAILURE_THRESHOLD: u8 = 30;
 /// take 5-15 seconds before the renderer receives any audio data.
 const TRACK_LOAD_GRACE_SECS: u64 = 45;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
+/// How many consecutive unplayable queue items the auto-advance will skip
+/// before giving up and stopping the zone. One or two dead tracks in an album
+/// is ordinary (a title pulled from the catalogue); a long run means something
+/// systemic — expired credentials, no network — where retrying once per queued
+/// item would just hammer the service.
+const MAX_CONSECUTIVE_SKIPS: u32 = 25;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
@@ -1848,10 +1854,18 @@ impl PositionPoller {
             if np.source == "radio" {
                 if let Some(ref source_id) = np.source_id {
                     // source_id is either a numeric radio DB id or the stream URL itself
+                    // Le logo de la station sert de REPLI quand le titre en
+                    // cours n'a pas de pochette. Il faut le relire ici et non
+                    // reprendre `np.cover_path` : dès qu'un titre a posé sa
+                    // pochette, `cover_path` la porte, et le titre suivant —
+                    // une chronique, un jingle — hériterait de la pochette du
+                    // précédent au lieu de revenir au logo.
+                    let mut logo_station: Option<String> = None;
                     let (station_name, stream_url) = if let Ok(sid) = source_id.parse::<i64>() {
                         let radio_repo =
                             crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
                         if let Ok(Some(station)) = radio_repo.get(sid) {
+                            logo_station = station.logo_url.clone();
                             (station.name.clone(), station.url.clone())
                         } else {
                             // Fallback: use album_title (holds station name)
@@ -1871,7 +1885,17 @@ impl PositionPoller {
                         crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
                             .await
                     {
-                        let title_changed = np.title != meta.title || np.artist_name != meta.artist;
+                        // La pochette du titre quand la station la donne, le
+                        // logo sinon. Bertrand : « mettre la pochette de
+                        // l'album et non le logo de la radio ».
+                        let pochette = meta
+                            .cover_url
+                            .clone()
+                            .or_else(|| logo_station.clone())
+                            .or_else(|| np.cover_path.clone());
+                        let title_changed = np.title != meta.title
+                            || np.artist_name != meta.artist
+                            || np.cover_path != pochette;
                         if title_changed {
                             let title_for_icy = meta.title.clone();
                             let artist_for_icy = meta.artist.clone();
@@ -1880,7 +1904,7 @@ impl PositionPoller {
                                 title: meta.title,
                                 artist_name: meta.artist,
                                 album_title: Some(station_name.clone()),
-                                cover_path: np.cover_path.clone(),
+                                cover_path: pochette,
                                 duration_ms: 0,
                                 source: "radio".into(),
                                 source_id: np.source_id.clone(),
@@ -2535,6 +2559,8 @@ impl PositionPoller {
                                             sample_rate: None,
                                             bit_depth: None,
                                             media_format: None,
+                                            track_number: None,
+                                            disc_number: None,
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
@@ -3710,6 +3736,32 @@ impl PositionPoller {
         Self::next_position_inner(zone_state, true)
     }
 
+    /// Next-track decision *after* the track at `failed_pos` turned out to be
+    /// unplayable. Same rules as `next_position` (repeat, shuffle order), but
+    /// evaluated as if `failed_pos` had just finished playing — so skipping a
+    /// dead item keeps following the shuffle permutation instead of falling
+    /// back to raw queue order.
+    pub fn next_position_after(
+        zone_state: &crate::playback::ZoneState,
+        failed_pos: i64,
+    ) -> Option<i64> {
+        let mut as_if = zone_state.clone();
+        as_if.queue_position = failed_pos;
+        if as_if.shuffle && !as_if.shuffle_order.is_empty() {
+            // Follow the permutation from the slot we just failed on, so the
+            // walk cannot revisit it or lose its place in the cycle.
+            match as_if
+                .shuffle_order
+                .iter()
+                .position(|&i| i as i64 == failed_pos)
+            {
+                Some(idx) => as_if.shuffle_index = idx as i64,
+                None => as_if.shuffle_index += 1,
+            }
+        }
+        Self::next_position_inner(&as_if, false)
+    }
+
     fn next_position_inner(zone_state: &crate::playback::ZoneState, manual: bool) -> Option<i64> {
         if zone_state.queue_length == 0 {
             return None;
@@ -3787,11 +3839,67 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
-                let seed_artist = zone_state
+                let mut seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let mut seed_artist = zone_state
                     .now_playing
                     .as_ref()
                     .and_then(|np| np.artist_name.clone());
+
+                // File vide DÈS LE DÉPART : rien n'a joué, donc rien à
+                // prolonger. C'était le cas d'un serveur qu'on rallume ou
+                // d'une file qu'on vient d'effacer — le réglage « lecture
+                // automatique » était activé et il ne se passait rien, la
+                // seule trace étant un `autoplay_skipped_no_seed` en DEBUG.
+                // On repart de la dernière écoute de LA ZONE, à défaut de la
+                // maison : c'est la graine la plus proche de ce que
+                // l'auditeur attend d'entendre.
+                if seed_artist.is_none() && seed_track_id.is_none() {
+                    // La radio par défaut se construit sur les DERNIERS TITRES
+                    // écoutés, et non sur le seul dernier artiste : c'est la
+                    // différence entre prolonger un morceau et proposer une
+                    // radio. On demande leurs semblables à plusieurs artistes
+                    // récents, et on choisit dans tout ce pool.
+                    let radio =
+                        crate::playback::auto_dj::radio_depuis_l_historique(&self.db, zone_id, 10)
+                            .await;
+                    let ids: Vec<i64> = radio
+                        .iter()
+                        .filter_map(|t| t["track_id"].as_i64())
+                        .collect();
+                    if !ids.is_empty() {
+                        info!(
+                            zone_id,
+                            count = ids.len(),
+                            "autoplay_radio_depuis_l_historique"
+                        );
+                        let queue_repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                            self.db.clone(),
+                        );
+                        if queue_repo.append_tracks(zone_id, &ids).is_ok() {
+                            let new_pos = zone_state.queue_position + 1;
+                            if let Err(e) =
+                                self.orchestrator.play_from_queue(zone_id, new_pos).await
+                            {
+                                warn!(zone_id, error = %e, "autoplay_play_failed");
+                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            }
+                            return;
+                        }
+                    }
+
+                    // La bibliothèque n'a rien rendu : on garde une graine pour
+                    // les autres cartes de la chaîne — radio du service,
+                    // genre/BPM — plutôt que de s'arrêter là.
+                    if let Some(g) = crate::playback::auto_dj::graine_recente(&self.db, zone_id) {
+                        info!(
+                            zone_id,
+                            artist = %g.artist_name.as_deref().unwrap_or(""),
+                            "autoplay_graine_depuis_l_historique"
+                        );
+                        seed_track_id = g.track_id;
+                        seed_artist = g.artist_name;
+                    }
+                }
 
                 // « Radio artistes similaires » : la graine est le NOM d'artiste,
                 // donc une écoute streaming (pas de track_id local) alimente
@@ -3980,10 +4088,62 @@ impl PositionPoller {
             queue_pos = zone_state.queue_position,
             "auto_next"
         );
-        if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
-            warn!(zone_id, error = %e, "auto_next_failed");
-            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+        // Skip tracks that cannot be played instead of ending the session. A
+        // single unplayable streaming track — rights withdrawn, region block,
+        // the service returning no URL at any format — used to stop the whole
+        // queue: playing 11 albums to a zone died on one blocked track with
+        // 108 items still queued, leaving nothing but a WARN behind. Walk
+        // forward over the dead items, announce each one, and stop only when
+        // the queue really is exhausted (or the failures look systemic).
+        let mut attempt_pos = next_pos;
+        let mut skipped = 0u32;
+        loop {
+            match self
+                .orchestrator
+                .play_from_queue(zone_id, attempt_pos)
+                .await
+            {
+                Ok(_) => {
+                    if skipped > 0 {
+                        info!(
+                            zone_id,
+                            skipped,
+                            next_pos = attempt_pos,
+                            "auto_next_resumed_after_skips"
+                        );
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "playback.track_skipped",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "position": attempt_pos,
+                                "reason": e.to_string(),
+                            }),
+                        );
+                    }
+                    skipped += 1;
+                    // A run this long is not "one bad track" any more — an
+                    // expired token or a dead network would otherwise have us
+                    // hammer the service once per queued item.
+                    if skipped >= MAX_CONSECUTIVE_SKIPS {
+                        warn!(zone_id, skipped, "auto_next_skip_limit_reached");
+                        break;
+                    }
+                    match Self::next_position_after(zone_state, attempt_pos) {
+                        // Same slot again means repeat-one on a dead track:
+                        // skipping would spin forever.
+                        Some(p) if p != attempt_pos => attempt_pos = p,
+                        _ => break,
+                    }
+                }
+            }
         }
+        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
     }
 
     /// Resolve the next queue item's stream URL for gapless, with one bounded
@@ -4065,6 +4225,10 @@ impl PositionPoller {
                         channels: resolved.channels,
                         live_stream: false,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     return match output.set_next_media(&media).await {
                         Ok(()) => {
@@ -4175,6 +4339,10 @@ impl PositionPoller {
                         channels: resolved.channels,
                         live_stream: false,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
@@ -4246,7 +4414,7 @@ impl PositionPoller {
                 |query| {
                     let service = service.clone();
                     async move {
-                        let svc = service.lock().await;
+                        let svc = service.read().await;
                         match svc.search(&query, 10).await {
                             Ok(res) => res.artists,
                             Err(e) => {
@@ -4259,7 +4427,7 @@ impl PositionPoller {
                 |artist_id| {
                     let service = service.clone();
                     async move {
-                        let svc = service.lock().await;
+                        let svc = service.read().await;
                         match svc.get_similar_artists(&artist_id, 20).await {
                             Ok(artists) => artists,
                             Err(e) => {
@@ -4326,7 +4494,7 @@ impl PositionPoller {
                 let service = service.clone();
                 let artist_name = names_by_id.get(&key).cloned();
                 async move {
-                    let svc = service.lock().await;
+                    let svc = service.read().await;
                     // Chemin identifiant : les titres DE l'artiste, sans
                     // ambiguite de titre homonyme.
                     if let Some(ref name) = artist_name {
@@ -4755,6 +4923,96 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PositionPoller::next_position_manual(&state), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_walks_forward() {
+        // An unplayable track at position 2 must hand back position 3, not
+        // stop the queue (the poller loops on this).
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 10,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), Some(3));
+    }
+
+    #[test]
+    fn next_position_after_end_of_queue_stops() {
+        // Last item unplayable under repeat-off: nothing left to skip to.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), None);
+    }
+
+    #[test]
+    fn next_position_after_repeat_one_returns_same_slot() {
+        // Repeat-one on a dead track: the caller must recognise the unchanged
+        // position and stop instead of spinning forever.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::One,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), Some(2));
+    }
+
+    #[test]
+    fn next_position_after_repeat_all_wraps() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::All,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_shuffle_keeps_its_place_in_the_order() {
+        // Order 3,1,4,0,2 — the item at queue position 4 (order index 2) is
+        // unplayable, so the next candidate is the order's next entry, 0.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 1,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_shuffle_last_of_cycle_stops() {
+        // Dead item is the final entry of the shuffle cycle under repeat-off.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 0,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 3,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), None);
     }
 
     #[test]
