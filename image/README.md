@@ -105,6 +105,13 @@ commit, inside the chroot against the shipped kernel, and installs
 toolchain is purged afterwards. `sprdwl_ng` is loaded at boot via
 `/etc/modules-load.d`; depmod pulls the BSP module in as a dependency.
 
+**WPA3 is not supported.** The driver advertises WEP/TKIP/CCMP/CMAC and no SAE,
+so NetworkManager rejects a WPA3 AP with the misleading `The Wi-Fi network could
+not be found` — it means "no compatible AP", not "not visible". Use a WPA2 SSID;
+most routers broadcast one alongside their WPA3 network. Connecting also emits a
+`field-spanning write` warning from the driver's `add_key` — noisy but harmless,
+the link comes up and stays up.
+
 A USB dongle also works and needs nothing extra: `wpasupplicant`,
 `wireless-regdb` and the Realtek/Atheros/Broadcom firmware packages are already
 in the image — which matters, since the board has no network of its own to fetch
@@ -200,6 +207,6 @@ Add to `/etc/fstab` for permanent mount.
 | Raspberry Pi 5 | aarch64 | Supported |
 | Generic x86_64 PC | x86_64 | Supported |
 | Odroid / Rock Pi | aarch64 | Untested |
-| Orange Pi Zero 2 (H616) | aarch64 | **Boots — validated on hardware** |
+| Orange Pi Zero 2 (H616) | aarch64 | **Validated on hardware — boots, WiFi works** |
 | Orange Pi Zero 3 / Zero 2W (H618) | aarch64 | Untested |
 | Allwinner TV box (custom DTB) | aarch64 | Bring-up required |

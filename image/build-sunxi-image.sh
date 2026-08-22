@@ -242,7 +242,7 @@ chroot "$ROOTFS" bash -ec "
         network-manager wpasupplicant wireless-regdb openssh-server \
         firmware-realtek firmware-brcm80211 firmware-atheros \
         cifs-utils smbclient nfs-common exfatprogs ntfs-3g \
-        cloud-guest-utils e2fsprogs \
+        cloud-guest-utils e2fsprogs iputils-ping \
         device-tree-compiler usbutils iw rfkill wireless-tools \
         locales procps iproute2 less nano
 "
@@ -416,6 +416,13 @@ if [[ "${UWE5622:-}" == "yes" ]]; then
         || { err "wcnmodem.bin introuvable dans le depot firmware"; exit 1; }
     mkdir -p "${ROOTFS}/lib/firmware/uwe5622"
     cp "${WORK_DIR}/uwe5622-fw/uwe5622/"* "${ROOTFS}/lib/firmware/uwe5622/"
+    # The per-board RF calibration .ini must also sit directly in /lib/firmware:
+    # the driver builds its path from WIFI_BOARD_CFG_PATH, which falls back to
+    # "/lib/firmware" unless UNISOC_WIFI_CUS_CONFIG was defined at build time.
+    # Without this the chip boots and runs, then aborts with
+    # `[CMD] WIFI_CMD_DOWNLOAD_INI, [REASON] LOAD_INI_DATA_FAILED` and no
+    # interface appears. Verified on hardware.
+    cp "${WORK_DIR}/uwe5622-fw/uwe5622/"*.ini "${ROOTFS}/lib/firmware/"
 
     # The BSP module auto-loads on the SDIO alias; the WiFi one does not.
     echo sprdwl_ng > "${ROOTFS}/etc/modules-load.d/uwe5622.conf"
