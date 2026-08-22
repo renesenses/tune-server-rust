@@ -3802,6 +3802,42 @@ impl PositionPoller {
                 // maison : c'est la graine la plus proche de ce que
                 // l'auditeur attend d'entendre.
                 if seed_artist.is_none() && seed_track_id.is_none() {
+                    // La radio par défaut se construit sur les DERNIERS TITRES
+                    // écoutés, et non sur le seul dernier artiste : c'est la
+                    // différence entre prolonger un morceau et proposer une
+                    // radio. On demande leurs semblables à plusieurs artistes
+                    // récents, et on choisit dans tout ce pool.
+                    let radio =
+                        crate::playback::auto_dj::radio_depuis_l_historique(&self.db, zone_id, 10)
+                            .await;
+                    let ids: Vec<i64> = radio
+                        .iter()
+                        .filter_map(|t| t["track_id"].as_i64())
+                        .collect();
+                    if !ids.is_empty() {
+                        info!(
+                            zone_id,
+                            count = ids.len(),
+                            "autoplay_radio_depuis_l_historique"
+                        );
+                        let queue_repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                            self.db.clone(),
+                        );
+                        if queue_repo.append_tracks(zone_id, &ids).is_ok() {
+                            let new_pos = zone_state.queue_position + 1;
+                            if let Err(e) =
+                                self.orchestrator.play_from_queue(zone_id, new_pos).await
+                            {
+                                warn!(zone_id, error = %e, "autoplay_play_failed");
+                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            }
+                            return;
+                        }
+                    }
+
+                    // La bibliothèque n'a rien rendu : on garde une graine pour
+                    // les autres cartes de la chaîne — radio du service,
+                    // genre/BPM — plutôt que de s'arrêter là.
                     if let Some(g) = crate::playback::auto_dj::graine_recente(&self.db, zone_id) {
                         info!(
                             zone_id,

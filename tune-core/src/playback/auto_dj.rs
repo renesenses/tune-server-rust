@@ -629,6 +629,111 @@ mod tests {
         .unwrap();
     }
 
+    // --- Les derniers titres, pas le dernier titre ---
+
+    #[test]
+    fn les_artistes_recents_viennent_du_plus_recent_au_plus_ancien() {
+        let db = test_db();
+        ecoute(&db, Some(1), Some("Bowie"), None, "2026-08-20T10:00:00Z");
+        ecoute(
+            &db,
+            Some(1),
+            Some("Nina Simone"),
+            None,
+            "2026-08-21T10:00:00Z",
+        );
+        ecoute(
+            &db,
+            Some(1),
+            Some("Miles Davis"),
+            None,
+            "2026-08-22T10:00:00Z",
+        );
+        assert_eq!(
+            artistes_recents(&db, 1, 5),
+            vec![
+                "Miles Davis".to_string(),
+                "Nina Simone".to_string(),
+                "Bowie".to_string()
+            ]
+        );
+    }
+
+    /// Trois albums de suite du meme artiste ne doivent pas occuper les trois
+    /// places de tete : la radio se reduirait a un seul gout, ce qui est
+    /// exactement ce qu'on cherche a depasser.
+    #[test]
+    fn un_meme_artiste_ne_prend_qu_une_place() {
+        let db = test_db();
+        for h in ["08", "09", "10"] {
+            ecoute(
+                &db,
+                Some(1),
+                Some("Bowie"),
+                None,
+                &format!("2026-08-22T{h}:00:00Z"),
+            );
+        }
+        ecoute(
+            &db,
+            Some(1),
+            Some("Nina Simone"),
+            None,
+            "2026-08-22T07:00:00Z",
+        );
+        assert_eq!(
+            artistes_recents(&db, 1, 5),
+            vec!["Bowie".to_string(), "Nina Simone".to_string()]
+        );
+    }
+
+    #[test]
+    fn la_casse_ne_cree_pas_deux_artistes() {
+        let db = test_db();
+        ecoute(&db, Some(1), Some("BOWIE"), None, "2026-08-22T10:00:00Z");
+        ecoute(&db, Some(1), Some("bowie"), None, "2026-08-22T09:00:00Z");
+        assert_eq!(artistes_recents(&db, 1, 5), vec!["BOWIE".to_string()]);
+    }
+
+    #[test]
+    fn la_liste_est_bornee_a_ce_qu_on_demande() {
+        let db = test_db();
+        for (i, nom) in ["A", "B", "C", "D", "E", "F"].iter().enumerate() {
+            ecoute(
+                &db,
+                Some(1),
+                Some(nom),
+                None,
+                &format!("2026-08-2{i}T10:00:00Z"),
+            );
+        }
+        assert_eq!(artistes_recents(&db, 1, 3).len(), 3);
+    }
+
+    #[test]
+    fn la_zone_prime_puis_la_maison_complete() {
+        // La zone n'a qu'un artiste : on complete avec la maison plutot que de
+        // rendre une radio d'un seul nom.
+        let db = test_db();
+        ecoute(&db, Some(1), Some("Chopin"), None, "2026-08-22T10:00:00Z");
+        ecoute(
+            &db,
+            Some(2),
+            Some("Motorhead"),
+            None,
+            "2026-08-22T11:00:00Z",
+        );
+        let r = artistes_recents(&db, 1, 5);
+        assert_eq!(r.first().map(String::as_str), Some("Chopin"));
+        assert!(r.contains(&"Motorhead".to_string()), "{r:?}");
+    }
+
+    #[test]
+    fn sans_historique_la_liste_est_vide() {
+        let db = test_db();
+        assert!(artistes_recents(&db, 1, 5).is_empty());
+    }
+
     #[test]
     fn sans_historique_il_n_y_a_pas_de_graine() {
         // Installation neuve : on ne fabrique rien a partir de rien.
@@ -886,6 +991,118 @@ pub struct GraineRecente {
 ///
 /// On ne retient que les écoutes qui portent un nom d'artiste : c'est lui qui
 /// alimente la radio « artistes similaires », locale comme de service.
+/// Les derniers artistes écoutés par une zone, du plus récent au plus ancien.
+///
+/// Distincts, et dans l'ordre d'écoute : c'est ce qui fait la différence entre
+/// « prolonger le dernier morceau » et « une radio à partir de ce que vous
+/// venez d'écouter ». Trois albums de suite du même artiste ne doivent pas
+/// occuper les trois places de tête et réduire la radio à un seul goût.
+///
+/// La zone prime sur la maison, pour la même raison que [`graine_recente`] :
+/// la cuisine et le salon n'écoutent pas la même chose. On complète toutefois
+/// avec la maison si la zone n'a pas de quoi remplir la liste — mieux vaut une
+/// radio un peu plus large que pas de radio.
+pub fn artistes_recents(
+    db: &std::sync::Arc<dyn DbBackend>,
+    zone_id: i64,
+    combien: usize,
+) -> Vec<String> {
+    const FILTRE: &str = "artist_name IS NOT NULL AND TRIM(artist_name) <> ''";
+    // On lit large et on déduplique ensuite : `DISTINCT` sur une colonne
+    // ordonnée par une autre n'a pas le même sens d'un moteur à l'autre, et ce
+    // qu'on veut est l'ordre d'ÉCOUTE, pas l'ordre alphabétique.
+    let large = (combien * 12).max(60) as i64;
+
+    let mut noms: Vec<String> = Vec::new();
+    let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // La zone d'abord, la maison ensuite si la zone ne suffit pas à remplir.
+    let requetes: [(String, Vec<&dyn crate::db::backend::ToSqlValue>); 2] = [
+        (
+            format!(
+                "SELECT artist_name FROM listen_history \
+                 WHERE zone_id = ? AND {FILTRE} ORDER BY listened_at DESC LIMIT ?"
+            ),
+            vec![&zone_id, &large],
+        ),
+        (
+            format!(
+                "SELECT artist_name FROM listen_history \
+                 WHERE {FILTRE} ORDER BY listened_at DESC LIMIT ?"
+            ),
+            vec![&large],
+        ),
+    ];
+
+    for (sql, params) in &requetes {
+        if noms.len() >= combien {
+            break;
+        }
+        let Ok(rows) = db.query_many(sql, params) else {
+            continue;
+        };
+        for r in rows {
+            if noms.len() >= combien {
+                break;
+            }
+            let Some(nom) = r[0].as_string() else {
+                continue;
+            };
+            let nom = nom.trim().to_string();
+            if !nom.is_empty() && vus.insert(nom.to_lowercase()) {
+                noms.push(nom);
+            }
+        }
+    }
+    noms
+}
+
+/// La radio par défaut : construite sur les DERNIERS TITRES écoutés, et non
+/// sur le seul dernier artiste.
+///
+/// C'est la différence entre prolonger un morceau et proposer une radio. On
+/// part de plusieurs artistes récents, on demande à chacun ses semblables, et
+/// on choisit dans la bibliothèque parmi tout ce pool.
+///
+/// Deux replis, dans cet ordre, et aucun n'est silencieux :
+///  1. le cloud d'enrichissement est injoignable ou ne connaît personne — on
+///     rejoue alors les artistes récents eux-mêmes, ce qui reste une radio
+///     fidèle à l'écoute ;
+///  2. la bibliothèque ne contient rien de tout cela — on rend vide, et
+///     l'appelant garde ses autres cartes (radio du service, genre/BPM).
+pub async fn radio_depuis_l_historique(
+    db: &std::sync::Arc<dyn DbBackend>,
+    zone_id: i64,
+    count: usize,
+) -> Vec<Value> {
+    let recents = artistes_recents(db, zone_id, 5);
+    if recents.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pool: Vec<String> = Vec::new();
+    let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for graine in &recents {
+        for nom in similar_artist_names(db, graine, 8).await {
+            if vus.insert(nom.to_lowercase()) {
+                pool.push(nom);
+            }
+        }
+    }
+
+    // Les artistes récents ferment la marche plutôt que d'ouvrir : une radio
+    // qui commence par ce qu'on vient d'écouter donne l'impression de tourner
+    // en rond. Ils restent là comme filet, pour le cas où les semblables ne
+    // sont pas dans la bibliothèque.
+    for nom in &recents {
+        if vus.insert(nom.to_lowercase()) {
+            pool.push(nom.clone());
+        }
+    }
+
+    tracks_for_artist_names(db, &pool, 2, count)
+}
+
 pub fn graine_recente(db: &std::sync::Arc<dyn DbBackend>, zone_id: i64) -> Option<GraineRecente> {
     const CHAMPS: &str = "track_id, artist_name";
     const FILTRE: &str = "artist_name IS NOT NULL AND TRIM(artist_name) <> ''";
