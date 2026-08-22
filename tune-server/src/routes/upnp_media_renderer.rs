@@ -171,9 +171,10 @@ async fn connection_manager_scpd() -> Response {
 }
 
 async fn connection_manager_control(body: String) -> Response {
-    xml_response(tune_core::upnp_server::build_connection_manager_response(
-        &body,
-    ))
+    // Le ConnectionManager du renderer, PAS celui du media server : celui-ci
+    // annonce en `Source` ce qu'un serveur sert et rend un `Sink` vide, ce qui
+    // pour un renderer dit « je n'accepte aucun format ».
+    xml_response(tune_core::upnp_server::build_renderer_connection_manager_response(&body))
 }
 
 /// GENA minimal, identique au MediaServer : accepter l'abonnement suffit aux
