@@ -43,7 +43,7 @@ use crate::db::engine::{Engine, PostgresDialect};
 //   column "id" is of type bigint but default expression is of type text
 // and took the whole batch down with it — `pg_ensure_tables_failed`, once
 // per boot. A table that fails must never block the next one.
-const ENSURE_TABLES: &[&str] = &[
+pub(crate) const ENSURE_TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
@@ -106,7 +106,7 @@ const ENSURE_TABLES: &[&str] = &[
 //
 // Same rule as ENSURE_TABLES: one statement per entry, one round-trip
 // each, so a column that cannot be added never hides the ones after it.
-const ENSURE_COLUMNS: &[&str] = &[
+pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT '1111111'",
     "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS multi_zone_ids TEXT",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden TEXT DEFAULT '0'",
