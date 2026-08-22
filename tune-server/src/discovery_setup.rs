@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tune_core::db::backend::DbBackend;
 use tune_core::outputs::OutputRegistry;
@@ -218,6 +218,59 @@ pub fn spawn_ssdp_handler(
     });
 }
 
+/// Reconnaître une annonce SSDP émise par CE serveur.
+///
+/// Tune publie chaque zone qui l'a demandé comme un MediaRenderer UPnP, sous
+/// le nom `« {zone} (Tune) »` (`routes/upnp_media_renderer.rs`). Ces
+/// annonces repartent sur le même multicast que celles des appareils du
+/// réseau — et rien ne les distinguait à la réception. Tune se découvrait
+/// donc lui-même : la zone « ND8006 » réapparaissait comme un appareil
+/// « ND8006 (Tune) », proposé comme sortie, enregistré, et persisté parmi les
+/// renderers connus.
+///
+/// Deux testeurs l'ont signalé sans qu'on fasse le lien — Jean Valjean
+/// (« j'ai une zone ND8006(Tune), est-ce normal ? ») et Marco Polo
+/// (« pourquoi les suffixes Tune, Tune… ? »). Et au démarrage suivant, le
+/// magasin ainsi pollué faisait sonder nos propres adresses : trois
+/// `known_renderer_probe_failed` sur `192.168.1.10:8888/upnp/renderer/…` dans
+/// ses journaux, pour des zones qui n'existaient plus.
+///
+/// Le test porte sur les **trois** à la fois — chemin de montage, port d'API,
+/// et adresse locale. Le chemin et le port seuls écarteraient aussi les zones
+/// d'un AUTRE serveur Tune du réseau, qui sont, elles, parfaitement
+/// pilotables : c'est nous qu'il faut exclure, pas nos semblables.
+fn est_notre_propre_renderer(
+    location: &str,
+    port_annonce: u16,
+    port_api: u16,
+    nos_adresses: &[String],
+) -> bool {
+    if port_annonce != port_api {
+        return false;
+    }
+    if !location.contains(tune_core::upnp_renderer::RENDERER_MOUNT) {
+        return false;
+    }
+    let hote = location
+        .split("://")
+        .nth(1)
+        .and_then(|reste| reste.split('/').next())
+        .map(|hp| hp.split(':').next().unwrap_or(hp))
+        .unwrap_or_default();
+    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+}
+
+/// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
+/// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
+/// nous renvoyer.
+fn nos_adresses() -> Vec<String> {
+    let mut v = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+    if let Some(ip) = tune_core::discovery::ssdp::get_local_ip() {
+        v.push(ip.to_string());
+    }
+    v
+}
+
 async fn handle_ssdp_discovered(
     dev: &tune_core::discovery::device::DiscoveredDevice,
     outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
@@ -232,6 +285,19 @@ async fn handle_ssdp_discovered(
     let is_renderer = dev.device_type == tune_core::discovery::device::OutputType::Dlna
         || dev.device_type == tune_core::discovery::device::OutputType::Openhome;
     if !is_renderer {
+        return;
+    }
+
+    // Nos propres zones publiées : on ne se découvre pas soi-même.
+    if let Some(loc) = dev.location.as_deref()
+        && est_notre_propre_renderer(loc, dev.port, config.port, &nos_adresses())
+    {
+        debug!(
+            id = %dev.id,
+            name = %dev.name,
+            location = %loc,
+            "ssdp_notre_propre_renderer_ignore"
+        );
         return;
     }
 
@@ -516,6 +582,28 @@ pub async fn reregister_known_renderers(state: &AppState) {
     // Les magasins écrits avant #1703 portent une entrée par UDN — cinq pour
     // un seul Marantz ND8006, toutes à la même URL de description. On les
     // replie avant de sonder, et on réécrit le magasin pour qu'il guérisse.
+    // Purge des entrées que nous nous étions ajoutées à nous-mêmes avant que
+    // l'auto-découverte ne soit filtrée : sans elle, un magasin déjà pollué
+    // continuerait à sonder nos propres adresses à chaque démarrage, pour des
+    // zones souvent supprimées depuis. Le magasin se soigne, comme il le fait
+    // déjà pour les doublons par UDN.
+    let a_nous = nos_adresses();
+    let port_api = state.config.port;
+    let stored_len = stored.len();
+    let stored: Vec<KnownRenderer> = stored
+        .into_iter()
+        .filter(|kr| !est_notre_propre_renderer(&kr.location, port_api, port_api, &a_nous))
+        .collect();
+    if stored.len() != stored_len {
+        info!(
+            retires = stored_len - stored.len(),
+            "known_renderers_purge_de_nos_propres_zones"
+        );
+    }
+    if stored.is_empty() {
+        save_known_renderers(&state.backend, &stored);
+        return;
+    }
     let stored_len = stored.len();
     let renderers = dedup_renderers_by_location(stored);
     if renderers.len() != stored_len {
@@ -1637,6 +1725,95 @@ mod tests {
             let collapsed = dedup_renderers_by_location(stored);
             assert_eq!(collapsed.len(), 1);
             assert_eq!(collapsed[0].device_id, "uuid:aios-0");
+        }
+    }
+
+    // --- Ne pas se découvrir soi-même ---
+
+    mod auto_decouverte {
+        use super::super::est_notre_propre_renderer;
+
+        const NOUS: &[&str] = &["192.168.1.10", "127.0.0.1", "localhost"];
+
+        fn nos() -> Vec<String> {
+            NOUS.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// Le cas exact des journaux de Jean Valjean : trois de ces adresses
+        /// étaient sondées à chaque démarrage, pour des zones supprimées.
+        #[test]
+        fn notre_propre_zone_est_reconnue() {
+            for zone in [3, 10, 13] {
+                let loc = format!("http://192.168.1.10:8888/upnp/renderer/{zone}/description.xml");
+                assert!(est_notre_propre_renderer(&loc, 8888, 8888, &nos()), "{loc}");
+            }
+        }
+
+        /// La règle décisive : un AUTRE serveur Tune du réseau publie ses zones
+        /// au même port et au même chemin. Les siennes sont pilotables — les
+        /// écarter serait perdre une fonction, pas corriger un défaut.
+        #[test]
+        fn un_autre_serveur_tune_reste_visible() {
+            let loc = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()));
+        }
+
+        #[test]
+        fn un_vrai_appareil_nest_jamais_confondu() {
+            // Le Marantz de Jean Valjean, et un Sonos : ni le chemin ni le
+            // port ne correspondent.
+            assert!(!est_notre_propre_renderer(
+                "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml",
+                60006,
+                8888,
+                &nos()
+            ));
+            assert!(!est_notre_propre_renderer(
+                "http://192.168.1.50:1400/xml/device_description.xml",
+                1400,
+                8888,
+                &nos()
+            ));
+        }
+
+        #[test]
+        fn le_chemin_seul_ne_suffit_pas() {
+            // Un appareil tiers qui servirait par hasard un chemin semblable
+            // sur un autre port n'est pas nous.
+            let loc = "http://192.168.1.10:9999/upnp/renderer/1/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 9999, 8888, &nos()));
+        }
+
+        #[test]
+        fn le_port_seul_ne_suffit_pas() {
+            // Notre propre MediaServer — même hôte, même port, autre chemin :
+            // il ne s'agit pas d'un renderer de zone.
+            let loc = "http://192.168.1.10:8888/upnp/server/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()));
+        }
+
+        #[test]
+        fn les_formes_locales_comptent_pour_nous() {
+            // Un M-SEARCH émis depuis la machine elle-même peut nous revenir
+            // sous la boucle locale.
+            for hote in ["127.0.0.1", "localhost"] {
+                let loc = format!("http://{hote}:8888/upnp/renderer/1/description.xml");
+                assert!(est_notre_propre_renderer(&loc, 8888, 8888, &nos()), "{loc}");
+            }
+        }
+
+        #[test]
+        fn une_adresse_illisible_ne_nous_designe_pas() {
+            // Mieux vaut laisser passer un inconnu que de jeter un appareil
+            // réel sur une adresse qu'on n'a pas su lire.
+            for loc in [
+                "",
+                "pas-une-url",
+                "http://",
+                "http:///upnp/renderer/1/x.xml",
+            ] {
+                assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()), "{loc}");
+            }
         }
     }
 }
