@@ -467,9 +467,90 @@ fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ConnectionManager SOAP response builder
+// ConnectionManager SOAP response builders
 // ---------------------------------------------------------------------------
 
+/// Formats que le RENDERER accepte en entrée, pour le `Sink` de
+/// `GetProtocolInfo`.
+///
+/// Un point de contrôle qui respecte la norme lit ce champ pour choisir le
+/// format à nous envoyer ; un `Sink` vide ne lui laisse aucun choix valide et
+/// il abandonne avant même d'essayer (Lyrion/squeeze2upnp : « no matching
+/// codec p », `STMf`, lecture bloquée à 0:00 — Yacine, 22/08/2026).
+///
+/// La liste suit ce que la chaîne de décodage sait réellement lire — un
+/// `SetAVTransportURI` traverse le même chemin qu'un flux de media server
+/// externe. Les deux orthographes des types historiquement divergents sont
+/// données (`audio/flac` ET `audio/x-flac`, comme pour la sonde côté client,
+/// #435) : un contrôleur qui ne cherche que la sienne trouve la sienne.
+///
+/// `audio/L16` en est DÉLIBÉRÉMENT absent. C'est du PCM sans en-tête : rien ne
+/// permet d'en deviner la cadence ni la profondeur à la lecture, et notre
+/// probe travaille sur conteneur. L'annoncer ne ferait que déplacer l'échec
+/// du choix du format vers le décodage — un contrôleur qui voulait du PCM
+/// prendra `audio/wav`, qui porte les mêmes octets avec son en-tête.
+const RENDERER_SINK_PROTOCOL_INFO: &str = concat!(
+    "http-get:*:audio/flac:*,",
+    "http-get:*:audio/x-flac:*,",
+    "http-get:*:audio/wav:*,",
+    "http-get:*:audio/x-wav:*,",
+    "http-get:*:audio/wave:*,",
+    "http-get:*:audio/mpeg:*,",
+    "http-get:*:audio/mp3:*,",
+    "http-get:*:audio/aac:*,",
+    "http-get:*:audio/x-aac:*,",
+    "http-get:*:audio/mp4:*,",
+    "http-get:*:audio/m4a:*,",
+    "http-get:*:audio/x-m4a:*,",
+    "http-get:*:audio/ogg:*,",
+    "http-get:*:application/ogg:*,",
+    "http-get:*:audio/opus:*",
+);
+
+/// ConnectionManager du **MediaRenderer** (`/upnp/renderer/{zone}/`).
+///
+/// Le renderer répondait avec le ConnectionManager du media server : `Source`
+/// rempli de ce qu'un SERVEUR sert, et `Sink` vide. Pour un renderer c'est
+/// l'exact contraire de ce que dit la norme — `Sink` = ce qu'on sait recevoir,
+/// `Source` = rien, on ne sert pas de contenu. Le symptôme se voyait jusque
+/// dans nos propres journaux (`renderer_caps_probe_empty_sink`) : le client
+/// DLNA de Tune sondait le renderer de Tune et n'en tirait rien.
+pub fn build_renderer_connection_manager_response(soap_body: &str) -> String {
+    debug!(
+        body_len = soap_body.len(),
+        "upnp_renderer_connection_manager_request"
+    );
+
+    match parse_soap_action(soap_body).as_deref() {
+        None | Some("GetProtocolInfo") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetProtocolInfo",
+            &format!("<Source></Source><Sink>{RENDERER_SINK_PROTOCOL_INFO}</Sink>"),
+        ),
+        Some("GetCurrentConnectionIDs") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetCurrentConnectionIDs",
+            "<ConnectionIDs>0</ConnectionIDs>",
+        ),
+        // `Direction` est `Input` ici, et non `Output` : un renderer REÇOIT le
+        // flux. La réponse partagée avec le media server annonçait `Output`,
+        // soit le sens inverse du seul appareil concerne.
+        Some("GetCurrentConnectionInfo") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetCurrentConnectionInfo",
+            "<RcsID>0</RcsID><AVTransportID>0</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>",
+        ),
+        Some(other) => {
+            debug!(
+                action = other,
+                "upnp_renderer_connection_manager_unsupported_action"
+            );
+            soap_fault(401, "Invalid Action")
+        }
+    }
+}
+
+/// ConnectionManager du **MediaServer** (`/upnp/`).
 pub fn build_connection_manager_response(soap_body: &str) -> String {
     debug!(
         body_len = soap_body.len(),
@@ -618,6 +699,13 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "object.container",
             None,
         )),
+        "tracks" => Some(didl_container(
+            "tracks",
+            "0",
+            "All Tracks",
+            "object.container",
+            None,
+        )),
         "radios" => Some(didl_container(
             "radios",
             "0",
@@ -707,6 +795,7 @@ fn browse_direct_children(
         "artists" => browse_artists(state, start, count),
         "albums" => browse_albums(state, start, count),
         "genres" => browse_genres(state),
+        "tracks" => browse_all_tracks(state, start, count, &base_url),
         "radios" => browse_radios(state),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
@@ -740,10 +829,14 @@ fn browse_direct_children(
 /// annoncé ici doit être navigable dans `browse_direct_children` — un dossier
 /// visible et vide se lit comme une bibliothèque cassée, pas comme une
 /// fonction manquante.
-const ROOT_CONTAINERS: [(&str, &str, &str); 4] = [
+const ROOT_CONTAINERS: [(&str, &str, &str); 5] = [
     ("artists", "Artists", "object.container"),
     ("albums", "Albums", "object.container"),
     ("genres", "Genres", "object.container"),
+    // Parcours à plat de toute la bibliothèque. Attendu par les points de
+    // contrôle — le titre de #1390 le nomme explicitement (« Albums / All
+    // tracks / Genres ») — et il manquait, sans qu'aucun ticket ne le suive.
+    ("tracks", "All Tracks", "object.container"),
     ("radios", "Radio", "object.container"),
 ];
 
@@ -847,6 +940,62 @@ fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
         xml: didl_wrap(&inner),
         total,
         returned: albums.len() as u64,
+    }
+}
+
+/// Toute la bibliothèque à plat, paginée.
+///
+/// Manquait alors que le titre de #1390 le nomme — un point de contrôle qui
+/// cherche « All tracks » ne trouvait rien. Les hiérarchies Artists / Albums /
+/// Genres supposent des métadonnées propres ; une liste à plat reste utile
+/// quand elles ne le sont pas, et c'est souvent le seul moyen de retrouver une
+/// piste mal étiquetée.
+///
+/// ## La pagination n'est pas une politesse, c'est la condition
+///
+/// La bibliothèque de référence compte 2 222 albums, donc des dizaines de
+/// milliers de pistes. Rendre l'ensemble d'un coup produirait un DIDL de
+/// plusieurs dizaines de mégaoctets : le point de contrôle expirerait, et le
+/// conteneur se lirait comme cassé — exactement ce que le commentaire de
+/// `ROOT_CONTAINERS` interdit.
+///
+/// `start` et `count` viennent de `StartingIndex` / `RequestedCount` et sont
+/// passés tels quels à la base, qui trie de façon stable (artiste, album,
+/// disque, piste). Un tri stable est indispensable : sans lui, deux pages
+/// successives pourraient se recouvrir ou sauter des pistes.
+///
+/// `total` est le compte RÉEL de la table, pas le nombre rendu — c'est lui que
+/// le point de contrôle utilise pour savoir qu'il reste des pages.
+fn browse_all_tracks(state: &UpnpState, start: u64, count: u64, base_url: &str) -> DidlResult {
+    let repo = TrackRepo::with_backend(state.backend.clone());
+    let total = repo.count().unwrap_or(0) as u64;
+    // Borne de page, propre à ce conteneur.
+    //
+    // `RequestedCount = 0` signifie « tout » et devient ici
+    // `UNLIMITED_BROWSE_COUNT` (100 millions). Ça convient aux albums — 2 222
+    // sur la bibliothèque de référence — mais pas aux pistes : le même geste
+    // sur des dizaines de milliers de titres bâtirait un DIDL de plusieurs
+    // mégaoctets en mémoire, et le point de contrôle expirerait avant de le
+    // recevoir. Un conteneur qui met vingt secondes à ne rien rendre se lit
+    // comme cassé, ce que `ROOT_CONTAINERS` interdit explicitement.
+    //
+    // Rendre moins que demandé est permis par la spécification : c'est
+    // `TotalMatches` qui dit la taille réelle, et un point de contrôle correct
+    // pagine à partir de là. On préfère donc une première page immédiate à une
+    // réponse complète qui n'arrive jamais.
+    const MAX_PAGE: u64 = 500;
+    let count = count.min(MAX_PAGE);
+    let tracks = repo.list(count as i64, start as i64).unwrap_or_default();
+
+    let mut inner = String::new();
+    for track in &tracks {
+        inner.push_str(&didl_track_item(track, "tracks", base_url));
+    }
+
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: tracks.len() as u64,
     }
 }
 
@@ -1406,6 +1555,26 @@ mod tests {
         assert_eq!(count, 100);
     }
 
+    /// « Toutes les pistes » borne sa page même quand le point de contrôle
+    /// demande tout (`RequestedCount = 0` → `UNLIMITED_BROWSE_COUNT`).
+    ///
+    /// Sans cette borne, une bibliothèque de plusieurs dizaines de milliers de
+    /// titres bâtirait un DIDL de plusieurs mégaoctets : le point de contrôle
+    /// expire, et le conteneur se lit comme cassé.
+    #[test]
+    fn toutes_les_pistes_borne_sa_page() {
+        let source = include_str!("upnp_server.rs");
+        let debut = source
+            .find("fn browse_all_tracks(")
+            .expect("browse_all_tracks a disparu ou a été renommée");
+        let corps = &source[debut..debut + 2000];
+        assert!(
+            corps.contains("count.min(MAX_PAGE)"),
+            "browse_all_tracks ne borne plus sa page : un RequestedCount=0 sur \
+             une grosse bibliothèque rendrait un DIDL de plusieurs Mo."
+        );
+    }
+
     #[test]
     fn parse_browse_requested_count_zero_means_all() {
         // RequestedCount=0 must map to "return every child", not the default 100.
@@ -1464,6 +1633,7 @@ mod tests {
             release_date: None,
             original_date: None,
             added_at: None,
+            is_compilation: false,
         }
     }
 
@@ -1740,6 +1910,77 @@ mod tests {
 
         let fault = build_connection_manager_response(&soap_body("PrepareForConnection", urn));
         assert!(is_soap_fault(&fault));
+    }
+
+    #[test]
+    fn le_renderer_annonce_ce_qu_il_sait_recevoir() {
+        // La régression : le renderer répondait avec le ConnectionManager du
+        // media server — `Source` rempli, `Sink` VIDE. Un point de contrôle
+        // normé n'a alors aucun format valide à nous envoyer et abandonne
+        // avant d'essayer (Lyrion/squeeze2upnp : « no matching codec »,
+        // lecture bloquée à 0:00). Le sens des deux champs est inversé entre
+        // un serveur et un renderer, ils ne peuvent pas partager la réponse.
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+        let proto = build_renderer_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+
+        assert!(proto.contains("<u:GetProtocolInfoResponse"));
+        assert!(
+            !proto.contains("<Sink></Sink>"),
+            "un renderer qui n'annonce aucun format d'entrée est injouable"
+        );
+        assert!(
+            proto.contains("<Source></Source>"),
+            "un renderer ne sert rien"
+        );
+        // Les formats que le contrôleur a le plus de chances de vouloir.
+        for mime in [
+            "audio/flac",
+            "audio/x-flac",
+            "audio/wav",
+            "audio/mpeg",
+            "audio/mp4",
+            "audio/ogg",
+        ] {
+            assert!(
+                proto.contains(&format!("http-get:*:{mime}:*")),
+                "{mime} absent du Sink"
+            );
+        }
+
+        // Et le media server garde EXACTEMENT l'inverse : c'est lui qui sert.
+        let serveur = build_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+        assert!(serveur.contains("<Sink></Sink>"));
+        assert!(serveur.contains("<Source>http-get:"));
+    }
+
+    #[test]
+    fn le_renderer_recoit_le_flux_il_ne_l_emet_pas() {
+        // `Direction` venait de la réponse du media server : `Output`, soit le
+        // sens inverse du seul appareil concerné.
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+        let info =
+            build_renderer_connection_manager_response(&soap_body("GetCurrentConnectionInfo", urn));
+        assert!(info.contains("<Direction>Input</Direction>"));
+        assert!(info.contains("<Status>OK</Status>"));
+
+        let ids =
+            build_renderer_connection_manager_response(&soap_body("GetCurrentConnectionIDs", urn));
+        assert!(ids.contains("<ConnectionIDs>0</ConnectionIDs>"));
+
+        let fault =
+            build_renderer_connection_manager_response(&soap_body("PrepareForConnection", urn));
+        assert!(is_soap_fault(&fault));
+    }
+
+    #[test]
+    fn le_sink_du_renderer_ne_promet_pas_du_pcm_sans_en_tete() {
+        // `audio/L16` est du PCM nu : ni cadence ni profondeur lisibles au fil
+        // de l'eau, et notre probe travaille sur conteneur. L'annoncer
+        // déplacerait l'échec du choix du format vers le décodage, ce qui est
+        // pire — le contrôleur croirait avoir négocié.
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+        let proto = build_renderer_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+        assert!(!proto.contains("audio/L16"));
     }
 
     #[test]

@@ -268,7 +268,7 @@ impl PrefetchEngine {
                     return;
                 }
             };
-            let mut svc = svc.lock().await;
+            let mut svc = svc.write().await;
             match svc.get_track_url(&source_id, None).await {
                 Ok(data) => data,
                 Err(e) => {
@@ -308,7 +308,7 @@ impl PrefetchEngine {
             } else {
                 let registry = services.lock().await;
                 if let Some(svc) = registry.get(&source) {
-                    let svc = svc.lock().await;
+                    let svc = svc.read().await;
                     match svc.get_track(&source_id).await {
                         Ok(track) => (
                             track.title,

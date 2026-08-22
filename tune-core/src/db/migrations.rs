@@ -1,4 +1,4 @@
-use tracing::info;
+use tracing::{info, warn};
 
 use super::migration_status;
 use super::sqlite::SqliteDb;
@@ -1055,6 +1055,101 @@ DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/francemus
 DELETE FROM radio_stations WHERE url = 'https://icecast.radiofrance.fr/mouvxtra-hifi.aac';
 ",
     },
+    Migration {
+        version: 79,
+        name: "albums_is_compilation",
+        // Le drapeau « compilation » etait lu (TCMP), utilise au scan pour le
+        // regroupement, puis jete : aucune colonne ne le stockait (#1957).
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici : sur une base neuve CORE_SCHEMA la porte
+        // deja, et l'ALTER planterait tout le runner en « duplicate column
+        // name » au premier demarrage.
+        up: "",
+    },
+    Migration {
+        version: 80,
+        name: "format_lowercase",
+        // Replier la casse de `format`, une fois, sur les donnees deja ecrites.
+        //
+        // La facette des types de fichiers regroupe desormais en `LOWER(TRIM())`
+        // (#1612), ce qui corrige l'AFFICHAGE pour tout le monde sans toucher a
+        // la base. Mais les filtres, eux, comparent la valeur EXACTE : tant que
+        // `dsd` et `DSD` coexistent en lignes, cliquer sur « DSD » ne rend que
+        // la moitie des albums. L'ecran cesserait de mentir pendant que le
+        // filtre continuerait — soit le pire des deux etats.
+        //
+        // UPDATE et non ALTER : aucune colonne n'est ajoutee ici, donc pas le
+        // piege « duplicate column name » du bloc de version. Idempotent par
+        // construction — `LOWER(LOWER(x))` vaut `LOWER(x)` — et la clause
+        // `WHERE` evite de reecrire les lignes deja propres, ce qui compte sur
+        // une bibliotheque de plusieurs dizaines de milliers d'albums.
+        //
+        // `tracks` en plus d'`albums` : la meme colonne y existe, alimentee par
+        // le meme chemin de scan, et les memes filtres s'y appliquent.
+        up: "",
+    },
+    Migration {
+        version: 81,
+        name: "format_conteneur_dsd",
+        // Rendre son conteneur a chaque piste DSD deja scannee.
+        //
+        // `normalize_format` repliait `dsf` ET `dff` sur « dsd » : la
+        // bibliotheque affichait un seul type de fichier pour deux conteneurs.
+        // Il ne le fait plus, mais sans cette migration une bibliotheque
+        // existante montrerait « DSD » (anciennes lignes) A COTE de « DSF »
+        // (nouvelles) — le defaut d'origine sous un autre nom, et cette fois
+        // par notre faute.
+        //
+        // L'extension du fichier est la seule source qui sache lequel des deux
+        // c'etait : l'information a ete perdue a l'ecriture, elle se relit sur
+        // `file_path`. Les pistes CUE laissent `file_path` NUL et portent leur
+        // chemin dans `cue_media_path` (migration 76) — d'ou le COALESCE.
+        //
+        // L'album suit ses pistes : sa colonne `format` est un resume, et un
+        // album dont toutes les pistes sont des `.dsf` est un album DSF. Un
+        // album qui melangerait les deux garde « dsd », qui reste vrai et
+        // reste reconnu partout (`IN ('dsd','dsf','dff')`).
+        //
+        // Idempotent : la clause `format = 'dsd'` ne rattrape que ce qui n'a
+        // pas encore ete converti.
+        up: "",
+    },
+    Migration {
+        version: 82,
+        name: "horodatage_favoris_radio_en_iso",
+        // Rendre son fuseau a chaque favori radio deja enregistre.
+        //
+        // `radio_favorites.saved_at` avait pour defaut CURRENT_TIMESTAMP, que
+        // SQLite ecrit « 2026-08-22 13:45:00 » : de l'UTC, mais SANS marqueur
+        // de fuseau et avec une espace au lieu du T.
+        //
+        // Le client fait pourtant ce qu'il faut — `new Date(iso)` puis
+        // `toLocaleDateString` — mais JavaScript, devant une chaine sans
+        // fuseau, la traite comme DEJA LOCALE. L'heure UTC etait donc affichee
+        // telle quelle : deux heures d'avance en ete, une en hiver. Signale par
+        // Reivax66 (fil forum #1515).
+        //
+        // La correction n'est pas d'ecrire l'heure locale — un serveur consulte
+        // depuis un autre fuseau, ou une base restauree ailleurs, mentirait
+        // durablement. C'est d'horodater en UTC EXPLICITE, et de laisser le
+        // client convertir, ce qu'il sait deja faire.
+        //
+        // Ces lignes ont toutes ete ecrites en UTC : la reparation est donc
+        // purement syntaxique — espace -> T, ajout du Z. Aucune heure n'est
+        // decalee ici.
+        //
+        // Idempotent : le filtre ne retient que ce qui n'a pas deja la forme
+        // ISO (pas de T, pas de Z final).
+        up: "
+UPDATE radio_favorites
+   SET saved_at = REPLACE(saved_at, ' ', 'T') || 'Z'
+ WHERE saved_at IS NOT NULL
+   AND saved_at <> ''
+   AND saved_at LIKE '____-__-__ __:__:__'
+   AND saved_at NOT LIKE '%Z';
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1132,6 +1227,53 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
         ))
         .ok();
     }
+}
+
+/// La table porte-t-elle cette colonne ?
+///
+/// Meme lecture que `add_column_if_missing`, mais pour GARDER un UPDATE.
+/// Indispensable : une base assez ancienne n'a pas encore toutes les colonnes
+/// que les migrations suivantes ajouteront, et un UPDATE sur une colonne
+/// absente fait echouer le batch — donc TOUT le runner, donc le demarrage
+/// (vecu par le test `une_base_ancienne_gagne_le_drapeau_compilation`, qui
+/// part d'une table `albums` reduite a `title` et `folder_path`).
+
+/// SQL de la migration 80 — voir son entree dans `MIGRATIONS`.
+const SQL_FORMAT_LOWERCASE: &str = "UPDATE albums SET format = LOWER(TRIM(format)) \
+             WHERE format IS NOT NULL AND format != LOWER(TRIM(format)); \
+             UPDATE tracks SET format = LOWER(TRIM(format)) \
+             WHERE format IS NOT NULL AND format != LOWER(TRIM(format));";
+
+/// SQL de la migration 81 — voir son entree dans `MIGRATIONS`.
+const SQL_FORMAT_CONTENEUR: &str = "UPDATE tracks SET format = 'dsf' \
+             WHERE format = 'dsd' \
+               AND LOWER(COALESCE(file_path, cue_media_path, '')) LIKE '%.dsf'; \
+             UPDATE tracks SET format = 'dff' \
+             WHERE format = 'dsd' \
+               AND LOWER(COALESCE(file_path, cue_media_path, '')) LIKE '%.dff'; \
+             UPDATE albums SET format = 'dsf' \
+             WHERE format = 'dsd' \
+               AND NOT EXISTS (SELECT 1 FROM tracks t \
+                               WHERE t.album_id = albums.id AND t.format <> 'dsf') \
+               AND EXISTS (SELECT 1 FROM tracks t \
+                           WHERE t.album_id = albums.id AND t.format = 'dsf'); \
+             UPDATE albums SET format = 'dff' \
+             WHERE format = 'dsd' \
+               AND NOT EXISTS (SELECT 1 FROM tracks t \
+                               WHERE t.album_id = albums.id AND t.format <> 'dff') \
+               AND EXISTS (SELECT 1 FROM tracks t \
+                           WHERE t.album_id = albums.id AND t.format = 'dff');";
+
+fn has_column(db: &SqliteDb, table: &str, column: &str) -> bool {
+    let conn = db.connection().lock().unwrap();
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut stmt| {
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names.iter().any(|name| name == column))
+        })
+        .unwrap_or(false)
 }
 
 /// Undo the quality tier the old scanner wrote into album titles.
@@ -1967,6 +2109,29 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "network_mounts", "mount_state", "TEXT");
             add_column_if_missing(db, "network_mounts", "last_mount_error", "TEXT");
         }
+        // 80 et 81 : `up:` VIDE a dessein, le SQL vit ici sous un garde.
+        // Un UPDATE sur une colonne que la base n'a pas encore fait echouer le
+        // batch, et un echec de migration casse TOUT le runner.
+        if (migration.version == 80 || migration.version == 81)
+            && has_column(db, "albums", "format")
+            && has_column(db, "tracks", "format")
+        {
+            let sql = if migration.version == 80 {
+                SQL_FORMAT_LOWERCASE
+            } else {
+                SQL_FORMAT_CONTENEUR
+            };
+            if let Err(e) = db.execute_batch(sql) {
+                warn!(version = migration.version, error = %e, "migration_format_ignoree");
+            }
+        }
+
+        if migration.version == 79 {
+            // Drapeau « compilation » de l'album (#1957). DEFAULT 0 : les
+            // lignes existantes valent « non », et le prochain scan leve le
+            // drapeau sur les disques qu'il regroupe en Various Artists.
+            add_column_if_missing(db, "albums", "is_compilation", "INTEGER DEFAULT 0");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -2082,6 +2247,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "network_mounts", "smb_version", "TEXT");
     add_column_if_missing(db, "network_mounts", "mount_state", "TEXT");
     add_column_if_missing(db, "network_mounts", "last_mount_error", "TEXT");
+
+    // Drapeau « compilation » de l'album (migration v79). Passe de surete du
+    // meme ordre que `smb_version` ci-dessus, et pour la meme raison : le
+    // SELECT commun des albums (`album_repo::sql::select_album`) lit
+    // `a.is_compilation`. Une base qui arriverait ici sans la colonne ferait
+    // echouer TOUTES les requetes d'albums — bibliotheque vide, partout.
+    add_column_if_missing(db, "albums", "is_compilation", "INTEGER DEFAULT 0");
 
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
@@ -2204,8 +2376,11 @@ pub fn latest_version() -> i32 {
 /// Embedded PG migration scripts. Each tuple is (version, name, sql).
 /// The SQL files are compiled into the binary so no filesystem access
 /// is needed at runtime.
+///
+/// `pub(crate)` pour le test `pg_schema_parity`, qui rejoue cette liste sur une
+/// base nue et la compare au schema neuf de `pg_migrate.rs` (#2111).
 #[cfg(feature = "postgres")]
-const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
+pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
     (
         1,
         "initial_schema",
@@ -2340,6 +2515,52 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         27,
         "network_mounts_mount_state",
         include_str!("../../migrations/postgres/027_network_mounts_mount_state.sql"),
+    ),
+    (
+        28,
+        "albums_is_compilation",
+        include_str!("../../migrations/postgres/028_albums_is_compilation.sql"),
+    ),
+    // Jumelle de la migration SQLite 80. Les deux listes sont SEPAREES —
+    // `run_migrations` ne prend qu'un `SqliteDb` — donc une correction de
+    // donnees doit etre ecrite DEUX fois, sans quoi un seul moteur est repare
+    // (#1612).
+    (
+        29,
+        "format_lowercase",
+        include_str!("../../migrations/postgres/029_format_lowercase.sql"),
+    ),
+    (
+        30,
+        "format_conteneur_dsd",
+        include_str!("../../migrations/postgres/030_format_conteneur_dsd.sql"),
+    ),
+    // Jumelle PG de la migration SQLite 76 (#1763), posee avec dix migrations
+    // de retard : le chantier CUE n'avait touche que le schema NEUF cote
+    // PostgreSQL (#2111).
+    (
+        31,
+        "cue_colonnes_et_identite",
+        include_str!("../../migrations/postgres/031_cue_colonnes_et_identite.sql"),
+    ),
+    // Douze reglages de zone qui n'existaient pas cote PostgreSQL — dont
+    // `dlna_wav24`, absente meme du schema neuf. L'ecriture etait avalee en
+    // silence et l'API repondait « enregistre » (#2111).
+    (
+        32,
+        "zones_reglages_manquants",
+        include_str!("../../migrations/postgres/032_zones_reglages_manquants.sql"),
+    ),
+    // `podcast_subscriptions.source_id` n'arrivait par AUCUNE des trois voies
+    // d'une base PG neuve : ni script numerote, ni ENSURE_COLUMNS, ni
+    // ENSURE_TABLES. Elle n'existait que dans PG_FULL_SCHEMA, qui ne tourne
+    // QUE pendant la migration SQLite -> PG. Or `routes/podcasts.rs` la
+    // SELECT : l'ecran Podcasts tombait sur toute installation PostgreSQL
+    // partie de zero. Meme famille que l'incident `queue_items` du .15.
+    (
+        33,
+        "podcast_source_id",
+        include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
     ),
 ];
 
@@ -2504,6 +2725,8 @@ pub fn pg_latest_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn fresh_db_runs_all_migrations() {
@@ -2779,6 +3002,129 @@ mod tests {
             etat.is_none(),
             "mount_state devrait être NUL, vaut {etat:?}"
         );
+    }
+
+    /// Le SELECT commun des albums (`album_repo::sql::select_album`) lit
+    /// `a.is_compilation` (#1957). Si la colonne manque, ce n'est pas la
+    /// pastille qui manque : c'est TOUTE requête d'album qui échoue —
+    /// bibliothèque vide, partout.
+    ///
+    /// Ce test part d'une base portant `albums` dans une forme d'AVANT la v79,
+    /// rejoue les migrations, et exige la colonne, la ligne existante, et un
+    /// `SELECT` réel avec la clause du dépôt. Il ÉCHOUE contre le code d'avant.
+    /// Les favoris radio deja enregistres retrouvent leur fuseau (#1515).
+    ///
+    /// Le scenario reel : une base d'UTILISATEUR, ou la table existe deja avec
+    /// des lignes ecrites par l'ancien defaut CURRENT_TIMESTAMP, qu'on met a
+    /// jour. Ma premiere version rejouait `run_migrations` deux fois sur une
+    /// base neuve — le second passage ne faisait RIEN, les versions appliquees
+    /// etant enregistrees, et le test echouait pour la mauvaise raison.
+    ///
+    /// Il ECHOUE contre le code d'avant : c'est sa raison d'etre.
+    #[test]
+    fn les_favoris_radio_retrouvent_leur_fuseau() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant : la table existe, ses horodatages n'ont pas de
+        // fuseau. `init_schema` la laissera en place (CREATE TABLE IF NOT
+        // EXISTS), comme sur la machine d'un utilisateur.
+        db.execute_batch(
+            "CREATE TABLE radio_favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                artist TEXT DEFAULT '',
+                station_name TEXT DEFAULT '',
+                cover_url TEXT,
+                stream_url TEXT,
+                saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(title, artist)
+            );
+            INSERT INTO radio_favorites (title, artist, saved_at) VALUES
+               ('Come on In', 'Bridge City Sinners', '2026-08-22 13:45:00'),
+               ('Pistol',     'Kings Of Leon',       '2026-08-22T11:00:00Z'),
+               ('Sans heure', 'Personne',            NULL),
+               ('Vide',       'Personne2',           '');",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let lire = |titre: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT saved_at FROM radio_favorites WHERE title = ?1",
+                [titre],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+
+        // Espace -> T, et le Z ajoute. Aucune heure n'est DECALEE : ces lignes
+        // etaient deja en UTC, il leur manquait seulement de le dire.
+        assert_eq!(lire("Come on In").as_deref(), Some("2026-08-22T13:45:00Z"));
+        // Une ligne deja au bon format n'est pas retouchee — sans quoi un
+        // second passage lui collerait un second Z.
+        assert_eq!(lire("Pistol").as_deref(), Some("2026-08-22T11:00:00Z"));
+        // Ni le NUL ni le vide ne deviennent une date inventee.
+        assert_eq!(lire("Sans heure"), None);
+        assert_eq!(lire("Vide").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn une_base_ancienne_gagne_le_drapeau_compilation() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        // La forme d'avant : aucune colonne pour le drapeau.
+        db.execute_batch(
+            "CREATE TABLE albums (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                artist_id INTEGER,
+                year INTEGER,
+                folder_path TEXT
+            );
+            INSERT INTO albums (title) VALUES ('Jazz sur Seine');",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(albums)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "is_compilation"),
+            "`is_compilation` manque après migration : {cols:?}"
+        );
+
+        // La ligne existante survit : une migration qui reconstruirait la table
+        // ferait perdre sa bibliothèque à l'utilisateur.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "l'album enregistré a disparu à la migration");
+
+        // DEFAULT 0 : un album jamais rescanné se lit « pas une compilation »,
+        // pas NUL — la vue album n'a pas à distinguer trois états.
+        let drapeau: Option<i64> = conn
+            .query_row("SELECT is_compilation FROM albums", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            drapeau,
+            Some(0),
+            "is_compilation devrait valoir 0, vaut {drapeau:?}"
+        );
+
+        // Et la requête que le serveur exécute vraiment passe.
+        conn.query_row(
+            "SELECT a.is_compilation FROM albums a WHERE a.id = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("le SELECT du dépôt d'albums doit passer après migration");
     }
 
     /// Forum #626: two seeded FIP webradios whose stream Radio France no longer
@@ -3059,7 +3405,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 27, "latest PG migration must be 27");
+        assert_eq!(pg_latest_version(), 33, "latest PG migration must be 33");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -3291,6 +3637,217 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restants, 2, "deux disques homonymes restent deux albums");
+    }
+
+    /// #1612 — la casse de `format` est repliée sur les données déjà écrites.
+    #[test]
+    fn la_migration_80_replie_la_casse_de_format() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO albums (title, format) VALUES \
+                   ('Un', 'DSD'), ('Deux', 'dsd'), ('Trois', 'Dsd'), \
+                   ('Quatre', ' flac '), ('Cinq', NULL);",
+            )
+            .unwrap();
+        }
+
+        // Rejouer le seul `up:` de la 78 : le runner l'a déjà passé sur une base
+        // neuve, avant que ces lignes n'existent.
+        // Le SQL vit dans une constante, pas dans `up:` : il est gardé par
+        // `has_column` dans le bloc de version, parce qu'une base ancienne peut
+        // ne pas encore avoir la colonne `format` — et un UPDATE qui échoue
+        // casse TOUT le runner.
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(SQL_FORMAT_LOWERCASE)
+            .unwrap();
+
+        let formats: Vec<String> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT format FROM albums WHERE format IS NOT NULL ORDER BY format",
+                )
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        // Trois casses de « DSD » repliées en une, et l'espace de fin retiré —
+        // un blanc produit exactement le même doublon invisible à l'écran.
+        assert_eq!(formats, vec!["dsd".to_string(), "flac".to_string()]);
+    }
+
+    /// #1612 — chaque piste DSD retrouve son conteneur, lu sur son chemin.
+    #[test]
+    fn la_migration_81_rend_son_conteneur_a_chaque_piste_dsd() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO albums (id, title, format) VALUES \
+                   (1, 'Tout en DSF', 'dsd'), \
+                   (2, 'Tout en DFF', 'dsd'), \
+                   (3, 'Melange',     'dsd'); \
+                 INSERT INTO tracks (album_id, title, file_path, format) VALUES \
+                   (1, 'a', '/m/a.dsf', 'dsd'), \
+                   (1, 'b', '/m/B.DSF', 'dsd'), \
+                   (2, 'c', '/m/c.dff', 'dsd'), \
+                   (3, 'd', '/m/d.dsf', 'dsd'), \
+                   (3, 'e', '/m/e.dff', 'dsd');",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute_batch(SQL_FORMAT_CONTENEUR).unwrap();
+            // Idempotence : un second passage ne doit rien changer de plus.
+            conn.execute_batch(SQL_FORMAT_CONTENEUR).unwrap();
+        }
+
+        let lire = |sql: &str| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let v: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            v
+        };
+
+        // La casse du chemin ne doit pas décider : `.DSF` compte comme `.dsf`.
+        assert_eq!(
+            lire("SELECT format FROM tracks ORDER BY title"),
+            vec!["dsf", "dsf", "dff", "dsf", "dff"]
+        );
+
+        // Un album homogène prend le conteneur de ses pistes ; un album qui
+        // mélange les deux garde « dsd », qui reste vrai et reste reconnu.
+        assert_eq!(
+            lire("SELECT format FROM albums ORDER BY id"),
+            vec!["dsf", "dff", "dsd"]
+        );
+    }
+
+    /// Toute colonne posée côté SQLite existe aussi côté PostgreSQL — dans une
+    /// MIGRATION, pas seulement dans le schéma neuf.
+    ///
+    /// La doctrine dit « trois endroits » : `CORE_SCHEMA` SQLite, migration
+    /// SQLite, schéma PG. Il en faut **quatre** — le schéma PG neuf
+    /// (`pg_migrate.rs`) ET la migration PG pour les bases existantes. C'est
+    /// la quatrième qui manquait aux trois colonnes CUE : posées par la
+    /// migration SQLite 76 en août, elles n'ont jamais atteint une base
+    /// PostgreSQL déjà créée, et ne l'auraient jamais fait (#2111).
+    ///
+    /// Le défaut serait resté invisible jusqu'au jour où du code les aurait
+    /// écrites — et l'échec se serait alors lu comme un défaut du CUE, pas
+    /// comme une migration manquante.
+    ///
+    /// Ce test lit les SOURCES, comme `network_mounts_n_a_qu_une_definition` :
+    /// il vaut donc quel que soit le jeu de features compilé.
+    #[test]
+    fn toute_colonne_sqlite_a_sa_migration_postgres() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sqlite = fs::read_to_string(racine.join("src/db/migrations.rs")).unwrap();
+
+        // Les colonnes ajoutées par `add_column_if_missing` côté SQLite.
+        let mut colonnes: Vec<String> = Vec::new();
+        for l in sqlite.lines() {
+            let Some(i) = l.find("add_column_if_missing(db, \"") else {
+                continue;
+            };
+            let reste = &l[i..];
+            let champs: Vec<&str> = reste.split('"').collect();
+            // add_column_if_missing(db, "table", "colonne", "type")
+            if champs.len() >= 4 {
+                colonnes.push(champs[3].to_string());
+            }
+        }
+        assert!(
+            colonnes.len() > 20,
+            "aucune colonne trouvée ({}) — le motif d'appel a changé, ce test ne garde plus rien",
+            colonnes.len()
+        );
+
+        // Tout le SQL PostgreSQL, migrations numérotées SEULEMENT.
+        //
+        // `pg_migrate.rs` est délibérément EXCLU : c'est le schéma neuf, et
+        // c'est précisément là que les colonnes CUE se cachaient tout en
+        // manquant aux bases existantes.
+        let dossier = racine.join("migrations/postgres");
+        let mut sql_pg = String::new();
+        for e in fs::read_dir(&dossier).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "sql") {
+                sql_pg.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+            }
+        }
+
+        let manquantes: Vec<&String> = colonnes
+            .iter()
+            .filter(|c| !sql_pg.contains(c.as_str()))
+            .collect();
+
+        assert!(
+            manquantes.is_empty(),
+            "colonne(s) posée(s) côté SQLite et ABSENTE(S) des migrations PostgreSQL : {manquantes:?}\n\
+             Une base PostgreSQL déjà créée ne les recevra JAMAIS — `CREATE TABLE` dans\n\
+             `pg_migrate.rs` ne s'applique qu'à une base vide. Ajouter un fichier dans\n\
+             `tune-core/migrations/postgres/` avec `ADD COLUMN IF NOT EXISTS` (#2111)."
+        );
+    }
+
+    /// Les deux moteurs ont des listes SÉPARÉES : une correction de données
+    /// écrite d'un seul côté ne répare qu'une moitié du parc (#1612).
+    #[test]
+    fn toute_migration_sqlite_de_donnees_a_sa_jumelle_postgres() {
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == "format_lowercase"),
+            "la migration SQLite `format_lowercase` a disparu"
+        );
+
+        // `PG_MIGRATIONS` vit derrière `#[cfg(feature = "postgres")]`, donc le
+        // gate par défaut ne la compile pas. On lit la SOURCE plutôt que la
+        // constante — même approche que `network_mounts_n_a_qu_une_definition`,
+        // et le garde-fou vaut alors quel que soit le jeu de features.
+        let ce_fichier = include_str!("migrations.rs");
+        for (fichier, nom) in [
+            ("029_format_lowercase.sql", "format_lowercase"),
+            ("030_format_conteneur_dsd.sql", "format_conteneur_dsd"),
+        ] {
+            assert!(
+                MIGRATIONS.iter().any(|m| m.name == nom),
+                "la migration SQLite `{nom}` a disparu"
+            );
+            assert!(
+                ce_fichier.contains(fichier),
+                "`{nom}` existe côté SQLite mais n'est pas enregistrée dans \
+                 PG_MIGRATIONS : les serveurs PostgreSQL (.15, .18, Docker) \
+                 garderaient le défaut entier. Les deux listes sont SÉPARÉES — \
+                 `run_migrations` ne prend qu'un `SqliteDb`."
+            );
+            let sql = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("migrations/postgres/{fichier}"));
+            assert!(
+                sql.exists(),
+                "l'entrée PG_MIGRATIONS pointe sur un fichier absent : {}",
+                sql.display()
+            );
+        }
     }
 }
 

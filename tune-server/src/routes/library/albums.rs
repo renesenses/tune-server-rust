@@ -27,6 +27,9 @@ pub(super) struct AlbumFilters {
     format: Option<String>,
     sort: Option<String>,
     order: Option<String>,
+    /// `?compilation=true` ne rend que les compilations, `false` que le reste,
+    /// absent = tout (#1957).
+    compilation: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +71,7 @@ pub(super) async fn list_albums(
         order,
         p.format.as_deref(),
         p.quality.as_deref(),
+        p.compilation,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -149,6 +153,9 @@ pub(super) async fn create_album(
         release_date: None,
         original_date: None,
         added_at: None,
+        // Un album créé à la main n'est pas une compilation : c'est le scan
+        // qui lève ce drapeau, d'après les tags (#1957).
+        is_compilation: false,
     };
     let id = repo
         .create(&album)
@@ -157,10 +164,29 @@ pub(super) async fn create_album(
 }
 
 pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    // `LOWER(TRIM(...))`, sinon deux valeurs qui ne diffèrent que par la casse
+    // font deux entrées — et l'écran les rend IDENTIQUES, puisqu'il met tout en
+    // majuscules à l'affichage (`LibraryView.svelte`, `toUpperCase()`).
+    //
+    // C'est ainsi que « DSD » apparaissait deux fois dans les types de fichiers,
+    // en deux lignes visuellement indiscernables : `dsd` et `DSD` en base
+    // (Cyrille Moutia, #1612). Le chemin de scan actuel écrit bien en
+    // minuscules, mais toute valeur venue d'ailleurs — une version antérieure,
+    // un import — traverse sans être repliée.
+    //
+    // Le repli se fait ICI et pas dans `normalize_format` : le passthrough
+    // sensible à la casse de cette fonction est délibéré et figé par un test
+    // (`normalize_format_case_sensitivity` : « MPEG » ne doit pas devenir
+    // « mp3 »). Le lever changerait le format écrit pour d'autres fichiers.
+    //
+    // `TRIM` en plus de `LOWER` : un espace de fin produit exactement le même
+    // doublon invisible, pour la même raison.
     let formats: Vec<String> = state
         .backend
         .query_many(
-            "SELECT DISTINCT format FROM albums WHERE format IS NOT NULL ORDER BY format",
+            "SELECT DISTINCT LOWER(TRIM(format)) FROM albums \
+             WHERE format IS NOT NULL AND TRIM(format) != '' \
+             ORDER BY LOWER(TRIM(format))",
             &[],
         )
         .unwrap_or_default()

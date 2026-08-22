@@ -182,6 +182,18 @@ pub fn build_track_from_metadata_opts(
     });
     let album_id = album.as_ref().and_then(|a| a.id);
 
+    // Garder la décision qui vient d'être prise (#1957) : c'est elle qui a
+    // envoyé l'album sous « Various Artists » plus haut. Cette voie est celle
+    // du surveillant de fichiers, où `compilation_override` reconstruit la vue
+    // du dossier depuis la base — donc le drapeau enregistré ici est bien le
+    // même que celui du scan par lots. `mark_compilation` ne fait que lever le
+    // drapeau, jamais le baisser (voir sa documentation).
+    if let Some(aid) = album_id
+        && is_compilation
+    {
+        album_repo.mark_compilation(aid).ok();
+    }
+
     // Propagate date metadata from track tags to the album (COALESCE — only
     // fills in values not already set, so the first track with dates wins).
     if let Some(aid) = album_id {
@@ -390,7 +402,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
                 if db.engine() == tune_core::db::engine::Engine::Sqlite {
-                    db.execute("BEGIN IMMEDIATE", &[]).ok();
+                    if db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
+                        // Se nommer : tout `write_tx` concurrent echouera tant
+                        // que ce lot tient la connexion, et sans cette
+                        // etiquette son message n'apprend rien (#1997).
+                        tune_core::db::tx_holder::declarer("scan:auto");
+                    }
                 }
 
                 importer.begin_batch(&batch);
@@ -492,6 +509,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 if db.engine() == tune_core::db::engine::Engine::Sqlite {
                     db.execute("COMMIT", &[]).ok();
+                    // Liberer meme si le COMMIT a echoue : une etiquette
+                    // perimee accuserait un innocent au prochain incident.
+                    tune_core::db::tx_holder::liberer();
                 }
 
                 // Emit scan progress after each batch (throttled every other
@@ -917,7 +937,13 @@ mod settle_tests {
     }
 }
 
-pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<AtomicBool>>) {
+/// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
+/// a personne. Voir l'emission de `library.updated` en fin de lot.
+pub fn spawn_file_watcher(
+    db: Arc<dyn DbBackend>,
+    wait_for_scan: Option<Arc<AtomicBool>>,
+    event_bus: Arc<tune_core::event_bus::EventBus>,
+) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let music_dirs: Vec<String> = settings
         .get("music_dirs")
@@ -1217,6 +1243,25 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
+
+                    // DIRE que la bibliotheque a change.
+                    //
+                    // Le surveillant importait en silence : il ne recevait meme
+                    // pas le bus d'evenements, il ne POUVAIT donc rien annoncer.
+                    // Les listes du client restaient telles quelles, et il
+                    // fallait changer d'onglet puis revenir pour voir arriver
+                    // les albums qu'on venait de deposer — c'est mot pour mot
+                    // le contournement que Patatorz decrit (fil forum #1517).
+                    //
+                    // Un evenement PROPRE, et non `library.scan.completed` :
+                    // celui-la fait afficher au client une banniere « prete »,
+                    // qui n'aurait aucun sens a chaque fichier depose. Ici on
+                    // veut seulement que les listes se rechargent.
+                    event_bus.emit(
+                        tune_core::event_types::EventType::LibraryUpdated.as_str(),
+                        serde_json::json!({ "source": "watcher" }),
+                    );
+                    info!("watcher_library_updated_emis");
                 }
             }
         }

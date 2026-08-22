@@ -12,6 +12,8 @@ pub mod migrations;
 pub mod models;
 #[cfg(feature = "postgres")]
 pub mod pg_migrate;
+#[cfg(all(test, feature = "postgres"))]
+mod pg_schema_parity;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 #[cfg(feature = "postgres")]
@@ -28,4 +30,5 @@ pub mod streaming_favorites_repo;
 pub mod tag_repo;
 pub mod track_metadata_repo;
 pub mod track_repo;
+pub mod tx_holder;
 pub mod zone_repo;

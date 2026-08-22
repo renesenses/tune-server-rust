@@ -504,6 +504,19 @@ impl TrackImporter {
 
         let album_id = album.as_ref().and_then(|a| a.id);
 
+        // Garder la décision qui vient d'être prise (#1957). C'est elle qui a
+        // envoyé l'album sous « Various Artists » quelques lignes plus haut ;
+        // sans cette écriture elle mourait ici, et rien dans la base ne disait
+        // plus pourquoi vingt artistes tiennent dans un même disque.
+        // `mark_compilation` ne fait que lever le drapeau : la décision est
+        // prise par piste, et une anthologie dont la première piste, seule, ne
+        // ressemble à rien ne doit pas dépendre de l'ordre des fichiers.
+        if let Some(aid) = album_id
+            && is_compilation
+        {
+            self.album_repo.mark_compilation(aid).ok();
+        }
+
         // Propagate date metadata from track tags to the album.
         if let Some(aid) = album_id {
             self.album_repo
@@ -682,6 +695,93 @@ mod tests {
             albums.len(),
             4,
             "quatre dossiers, quatre pochettes ⇒ quatre albums (obtenu : {albums:?})"
+        );
+    }
+
+    /// LE FAIT de #1957, joué de bout en bout : le drapeau `TCMP` du fichier
+    /// arrive jusqu'à la LIGNE ALBUM, au lieu de servir au regroupement puis
+    /// d'être jeté. Un album ordinaire, dans le même scan, reste à « non ».
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant : `albums` n'avait pas de colonne.
+    #[test]
+    fn le_drapeau_compilation_atteint_la_ligne_album() {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let mut imp = TrackImporter::new(backend.clone(), true, tmp.path().to_path_buf());
+        let albums = AlbumRepo::with_backend(backend.clone());
+
+        // L'anthologie : deux pistes, deux artistes, `TCMP` posé sur les deux.
+        let dossier = tmp.path().join("Jazz sur Seine");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let mut anthologie = Vec::new();
+        for (n, artiste) in ["Django", "Stéphane"].iter().enumerate() {
+            let chemin = dossier
+                .join(format!("0{}.flac", n + 1))
+                .to_string_lossy()
+                .into_owned();
+            let mut f = sf(&chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("titre {n}")),
+                artist: Some((*artiste).to_string()),
+                album: Some("Jazz sur Seine".into()),
+                album_artist: Some((*artiste).to_string()),
+                track_number: Some(n as u32 + 1),
+                compilation: true,
+                ..Default::default()
+            });
+            anthologie.push(f);
+        }
+
+        // Le témoin : un vrai album d'un seul artiste, sans `TCMP`.
+        let d2 = tmp.path().join("Kind of Blue");
+        std::fs::create_dir_all(&d2).unwrap();
+        let chemin = d2.join("01.flac").to_string_lossy().into_owned();
+        let mut temoin = sf(&chemin);
+        temoin.metadata = Some(TrackMetadata {
+            title: Some("So What".into()),
+            artist: Some("Miles Davis".into()),
+            album: Some("Kind of Blue".into()),
+            album_artist: Some("Miles Davis".into()),
+            track_number: Some(1),
+            ..Default::default()
+        });
+
+        let lot: Vec<_> = anthologie
+            .into_iter()
+            .chain(std::iter::once(temoin))
+            .collect();
+        imp.begin_batch(&lot);
+
+        let mut id_compilation = None;
+        let mut id_temoin = None;
+        for f in &lot {
+            let (_, album_id) = imp.import(f).expect("import");
+            let album_id = album_id.expect("un album");
+            if f.path.contains("Kind of Blue") {
+                id_temoin = Some(album_id);
+            } else {
+                id_compilation = Some(album_id);
+            }
+        }
+
+        let compilation = albums.get(id_compilation.unwrap()).unwrap().unwrap();
+        assert!(
+            compilation.is_compilation,
+            "le drapeau TCMP doit atteindre la ligne album « {} »",
+            compilation.title
+        );
+
+        let temoin = albums.get(id_temoin.unwrap()).unwrap().unwrap();
+        assert!(
+            !temoin.is_compilation,
+            "un album ordinaire du même scan ne doit pas être marqué : « {} »",
+            temoin.title
         );
     }
 

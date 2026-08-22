@@ -180,7 +180,11 @@ const MIGRATION_TABLES: &[&str] = &[
 ///
 /// Every CREATE TABLE uses IF NOT EXISTS and every INSERT for seed data
 /// uses ON CONFLICT DO NOTHING, making this fully idempotent.
-const PG_FULL_SCHEMA: &str = r#"
+///
+/// `pub(crate)` pour le seul test `pg_schema_parity`, qui monte ce schema et
+/// celui des scripts numerotes dans deux bases distinctes et refuse tout ecart
+/// (#2111).
+pub(crate) const PG_FULL_SCHEMA: &str = r#"
 -- Core tables
 CREATE TABLE IF NOT EXISTS artists (
     id TEXT PRIMARY KEY,
@@ -229,7 +233,11 @@ CREATE TABLE IF NOT EXISTS albums (
     original_date TEXT,
     -- The folder on disk holding this release. What identifies an album: see
     -- `scanner::album_folder`.
-    folder_path TEXT
+    folder_path TEXT,
+    -- Drapeau « compilation » (#1957). TEXT ici comme tout le reste de ce
+    -- schéma de copie (voir l'en-tête) ; la migration PG 028 le ramène à
+    -- SMALLINT après la copie.
+    is_compilation TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -750,6 +758,10 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
 
+-- albums: drapeau « compilation » (SQLite migration v79, #1957). TEXT 0/1 comme
+-- les autres booléens copiés ; la migration PG 028 le ramène à SMALLINT après.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS is_compilation TEXT DEFAULT 0;
+
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
 
@@ -782,6 +794,17 @@ ALTER TABLE podcast_subscriptions ADD COLUMN IF NOT EXISTS source_id TEXT;
 -- queue_items: per-album numbering for streaming tracks (SQLite migration v64)
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
+
+-- tracks: colonnes du chantier CUE (SQLite migration v76, #1763). Elles sont
+-- ici pour la meme raison que les autres : la copie qui suit lit la table
+-- SQLite colonne par colonne, et la source les possede. Sans ce rattrapage,
+-- une base PG creee par une version anterieure de ce schema ferait echouer
+-- l'INSERT de `tracks` en entier — la bibliotheque arriverait vide. La
+-- migration 031 repare le meme manque pour les bases montees par les scripts
+-- numerotes, qui ne passent jamais par ici (#2111).
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

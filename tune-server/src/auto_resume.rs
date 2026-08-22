@@ -90,6 +90,8 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         sample_rate: None,
         bit_depth: None,
         media_format: None,
+        track_number: None,
+        disc_number: None,
     };
 
     // Auto-resume must not block on a slow track resolution. Login-gated

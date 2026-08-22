@@ -737,8 +737,14 @@ async fn save_radio_favorite(
         // verbatim → `syntax error at or near "OR"` (500), so saving a radio
         // favorite failed on PG (.15) and the heart never lit up. `ON CONFLICT
         // DO NOTHING` (no target) is valid on both SQLite (3.24+) and Postgres.
-        "INSERT INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        &[&body.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station as &dyn ToSqlValue, &body.cover_url as &dyn ToSqlValue, &body.stream_url as &dyn ToSqlValue],
+        // `saved_at` est ecrit EXPLICITEMENT, et non laisse au defaut
+        // CURRENT_TIMESTAMP : celui-ci rend « 2026-08-22 13:45:00 », de l'UTC
+        // sans marqueur de fuseau. `new Date()` traite alors la chaine comme
+        // deja locale et l'ecran affichait deux heures d'avance en ete
+        // (Reivax66, fil forum #1515). Meme forme que `RadioRepo::record_play`,
+        // qui faisait deja juste a cote.
+        "INSERT INTO radio_favorites (title, artist, station_name, cover_url, stream_url, saved_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        &[&body.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station as &dyn ToSqlValue, &body.cover_url as &dyn ToSqlValue, &body.stream_url as &dyn ToSqlValue, &tune_core::db::radio_repo::maintenant_iso8601() as &dyn ToSqlValue],
     ) {
         Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
@@ -1064,7 +1070,7 @@ async fn create_streaming_playlist_from_favorites(
             }
         }
     };
-    let svc = svc_arc.lock().await;
+    let svc = svc_arc.read().await;
 
     let mut matched_ids: Vec<String> = Vec::new();
     let mut details: Vec<Value> = Vec::new();

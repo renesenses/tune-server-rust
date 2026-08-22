@@ -477,7 +477,17 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // configured music dir (defence against scanning arbitrary paths); if it
         // is not, fall back to a full scan rather than silently doing nothing.
         let targeted: Option<String> = targeted_req.as_ref().and_then(|p| {
-            if music_dirs.iter().any(|root| p == root || p.starts_with(&format!("{root}/"))) {
+            // Via `sous_le_dossier` : TROISIÈME occurrence du même défaut de
+            // séparateur, après `sous_le_dossier` lui-même et `roots_gone_empty`
+            // (#2016). Le motif construit ici était `{root}/`, avec `/` codé en
+            // dur, alors que `music_dirs` et les chemins de la base portent des
+            // ANTISLASHS sous Windows.
+            //
+            // Conséquence mesurée sur .42 (Windows, `D:\data\music`) : AUCUN
+            // scan ciblé ne pouvait aboutir — chacun retombait en scan complet,
+            // silencieusement, en journalisant « outside music dirs » pour un
+            // chemin qui était pourtant dedans.
+            if music_dirs.iter().any(|root| sous_le_dossier(p, root)) {
                 Some(p.clone())
             } else {
                 tracing::warn!(path = %p, dirs = ?music_dirs, "scan_targeted_path_outside_music_dirs — falling back to full scan");
@@ -545,9 +555,19 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 if missing_dirs.iter().any(|m| m == dir) {
                     continue;
                 }
-                let prefix: String =
-                    format!("{}/", dir.trim_end_matches('/')).nfc().collect();
-                let has_audio = discovered_paths.iter().any(|p| p.starts_with(&prefix));
+                // `sous_le_dossier` et non un préfixe reconstruit : `{}/` code
+                // le séparateur en dur, donc sous Windows AUCUN chemin n'était
+                // jamais vu sous sa racine et ce test rendait toujours faux.
+                // Il journalisait alors « configured music folder […] contains
+                // no audio files » sur une racine pleine — message faux, et
+                // faux systématiquement (constaté sur .42, `D:\data\music`).
+                //
+                // La normalisation NFC reste nécessaire : `discovered_paths`
+                // est en NFC, `dir` vient des réglages et peut être en NFD.
+                let dir_nfc: String = dir.nfc().collect();
+                let has_audio = discovered_paths
+                    .iter()
+                    .any(|p| sous_le_dossier(p, &dir_nfc));
                 if !has_audio {
                     tracing::warn!(
                         dir = %dir,
@@ -724,6 +744,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
                 if !is_pg {
+                    // Se nommer : tout `write_tx` concurrent echouera tant que ce
+                    // lot tient la connexion, et sans cette etiquette son message
+                    // n'apprend rien (#1997).
+                    tune_core::db::tx_holder::declarer("scan:lot");
                     if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
                         // A failed BEGIN means a transaction is already open on
                         // the shared connection (a previous batch that didn't
@@ -885,6 +909,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
 
                 // COMMIT this batch -- tracks + album stats are now queryable
                 if !is_pg {
+                    // Liberer meme si le COMMIT echoue : une etiquette perimee
+                    // accuserait un innocent au prochain incident.
+                    tune_core::db::tx_holder::liberer();
                     if let Err(e) = db.execute_batch("COMMIT") {
                         tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
                         // Don't leave a half-open transaction poisoning the
@@ -1082,6 +1109,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
         if !is_pg {
+            tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
                 tracing::warn!(error = %e, "post_scan_begin_failed");
                 let _ = db.execute_batch("ROLLBACK");
@@ -1231,6 +1259,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         }
         if !is_pg {
+            tune_core::db::tx_holder::liberer();
             if let Err(e) = db.execute_batch("COMMIT") {
                 tracing::warn!(error = %e, "post_scan_commit_failed");
                 let _ = db.execute_batch("ROLLBACK");
@@ -1941,6 +1970,49 @@ mod roots_gone_empty_tests {
     ///
     /// Ces tests tournent sur n'importe quel hôte : `sous_le_dossier` compare
     /// des chaînes, pas des chemins du système de fichiers.
+    /// Les TROIS symptomes observes sur .42 (Windows, `D:\\data\\music`), qui
+    /// n'avaient aucun rapport apparent entre eux :
+    ///
+    ///   - « scan_targeted_path_outside_music_dirs » sur un chemin pourtant dedans
+    ///   - « scan_root_no_audio_files » sur une racine pleine
+    ///   - tout import refuse comme « outside the configured music directories »
+    ///
+    /// Une seule cause : `format!("{root}/")`, avec `/` code en dur, alors que
+    /// les reglages et la base portent des ANTISLASHS. Cinq sites au total
+    /// portaient cette erreur (#2016 en a corrige deux).
+    #[test]
+    fn un_chemin_windows_est_reconnu_sous_sa_racine_configuree() {
+        let racine = r"D:\data\music";
+        // Scan cible : le chemin signale par .42.
+        assert!(sous_le_dossier(
+            r"D:\data\music\Jacobs, Lisa\2016 - L'Arte del Violino",
+            racine
+        ));
+        // Racine elle-meme.
+        assert!(sous_le_dossier(racine, racine));
+        // Un volume voisin ne doit rien capter.
+        assert!(!sous_le_dossier(r"E:\data\music\x.flac", racine));
+        // Et le piege de prefixe tient aussi en antislash.
+        assert!(!sous_le_dossier(r"D:\data\music2\x.flac", racine));
+    }
+
+    /// L'ancienne formule, pour prouver que le defaut etait REEL et pas suppose.
+    /// Ce test echouerait si quelqu'un revenait a `format!("{root}/")`.
+    #[test]
+    fn l_ancienne_comparaison_echouait_bien_sous_windows() {
+        let racine = r"D:\data\music";
+        let chemin = r"D:\data\music\album\piste.flac";
+        let ancienne = chemin == racine || chemin.starts_with(&format!("{racine}/"));
+        assert!(
+            !ancienne,
+            "l'ancienne comparaison rendait faux — c'est tout le defaut"
+        );
+        assert!(
+            sous_le_dossier(chemin, racine),
+            "la nouvelle doit rendre vrai"
+        );
+    }
+
     #[test]
     fn les_chemins_windows_sont_reconnus_sous_leur_racine() {
         assert!(sous_le_dossier(r"G:\Blues 2\track.flac", r"G:\Blues 2"));
