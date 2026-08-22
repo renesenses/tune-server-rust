@@ -12,6 +12,10 @@ const API_BASE: &str = "https://www.qobuz.com/api.json/0.2";
 const API_PROXY: &str = "https://mozaiklabs.fr/qobuz-api";
 const REMOTE_CONFIG_URL: &str = "https://mozaiklabs.fr/storage/api/v1/streaming-config.json";
 
+/// Combien d'albums par page de discographie. Aligné sur ce que l'écran
+/// affiche déjà : une page de plus est une page qu'on voit apparaître.
+const QOBUZ_TAILLE_DE_PAGE: &str = "50";
+
 pub struct QobuzService {
     client: Client,
     app_id: String,
@@ -1561,13 +1565,32 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        self.get_artist_albums_page(artist_id, 0).await
+    }
+
+    /// Une page de la discographie Qobuz.
+    ///
+    /// Le `limit` de 50 était écrit en dur, et sans `offset` : la discographie
+    /// d'un artiste prolifique s'arrêtait net au cinquantième album, sans que
+    /// rien n'indique qu'il y en avait d'autres. Qobuz accepte `offset` sur
+    /// `/artist/get?extra=albums` — il n'y avait qu'à le demander.
+    ///
+    /// La taille de page reste 50 : c'est ce que l'écran affiche déjà, et la
+    /// changer déplacerait le problème au lieu de le régler.
+    async fn get_artist_albums_page(
+        &self,
+        artist_id: &str,
+        offset: u32,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        let offset = offset.to_string();
         let data = self
             .api_get(
                 "/artist/get",
                 &[
                     ("artist_id", artist_id),
                     ("extra", "albums"),
-                    ("limit", "50"),
+                    ("limit", QOBUZ_TAILLE_DE_PAGE),
+                    ("offset", &offset),
                 ],
             )
             .await?;

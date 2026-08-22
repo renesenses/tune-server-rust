@@ -285,12 +285,23 @@ async fn service_artist(
     svc_response(result)
 }
 
+/// `?offset=` pour un « voir plus » : la discographie s'arrêtait au
+/// cinquantième album sans que rien n'indique qu'il y en avait d'autres.
+/// Absent, l'offset vaut 0 — les clients antérieurs ne changent pas de
+/// comportement.
+#[derive(Deserialize)]
+struct PageQuery {
+    #[serde(default)]
+    offset: u32,
+}
+
 async fn service_artist_albums(
     State(state): State<AppState>,
     Path((service, artist_id)): Path<(String, String)>,
+    Query(q): Query<PageQuery>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
-        .get_artist_albums(&artist_id)
+        .get_artist_albums_page(&artist_id, q.offset)
         .await)
 }
 
