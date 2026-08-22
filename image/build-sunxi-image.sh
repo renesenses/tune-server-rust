@@ -555,15 +555,25 @@ tar xzf "${WORK_DIR}/tune.tar.gz" -C "${ROOTFS}/opt/tune"
 chmod +x "${ROOTFS}/opt/tune/tune-server"
 mkdir -p "${ROOTFS}/opt/tune/data" "${ROOTFS}/mnt/music"
 
-# No [audio] section: this image has no local output by design. Renderers
-# are discovered on the network instead.
+# Flat keys, no TOML sections: TuneConfig deserializes every field at the top
+# level, and serde silently drops unknown tables — a `[server]` / `[library]`
+# layout parses "fine" and yields nothing but defaults. That bug leaves
+# music_dirs empty, which startup.rs then persists as "[]" in the database,
+# where the first-run guard treats it as deliberately set: the image never
+# scans anything and no amount of editing the file afterwards helps.
+# /media covers auto-mounted USB drives, /mnt/music the NAS mounts.
 cat > "${ROOTFS}/opt/tune/tune.toml" <<EOF
-[server]
-port = 8888
-data_dir = "/opt/tune/data"
+# Tune OS default configuration
+# Edit via web UI at http://tune.local:8888/settings
 
-[library]
-music_dirs = ["/mnt/music"]
+port = 8888
+db_path = "/opt/tune/data/tune.db"
+web_dir = "/opt/tune/web"
+artwork_dir = "/opt/tune/data/artwork_cache"
+auto_scan = true
+log_level = "info"
+
+music_dirs = ["/mnt/music", "/media"]
 EOF
 
 # Root, like the NUC appliance image: the server drives nmcli (network
@@ -693,6 +703,8 @@ cat > "${ROOTFS}/etc/motd" <<EOF
   Web UI:    http://tune.local   (ou http://tune.local:8888)
   Music:     NAS/SMB shares: web UI → Settings → Network
              USB drives auto-mount under /media
+             (SMB à la main : identifiants dans un fichier 0600, jamais
+              dans fstab ; options _netdev,nofail,iocharset=utf8)
   Renderers: réseau seulement (pas de sortie audio locale sur cette image)
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
