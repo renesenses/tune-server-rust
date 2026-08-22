@@ -113,6 +113,8 @@ impl ToolExecutor {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
 
         // Queue remaining tracks
@@ -166,6 +168,8 @@ impl ToolExecutor {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
 
         match self.orchestrator.play(req).await {
