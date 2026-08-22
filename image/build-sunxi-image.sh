@@ -28,6 +28,11 @@ BOARD="orangepi-zero2"
 UBOOT_BIN=""
 DTB=""
 DEBIAN_RELEASE="bookworm"
+# Pilote WiFi Unisoc UWE5622 (module « AW859A » des Orange Pi Zero 2/3).
+# Commit epingle : c'est celui qu'Armbian reference, et le seul teste ici.
+UWE5622_REPO="https://github.com/armbian/uwe5622.git"
+UWE5622_COMMIT="d6bec7538a0b4b67e35715ad71eaa056555524cb"
+UWE5622_FW_REPO="https://github.com/armbian/firmware.git"
 DEBIAN_MIRROR="http://deb.debian.org/debian"
 # Kernel from backports by default: H616/H618 support (EMAC, cpufreq,
 # thermal) landed and matured well after the 6.1 in bookworm. Use
@@ -57,6 +62,7 @@ case "$BOARD" in
         # Bus SDIO qui porte le module WiFi soudé (AW859A). Upstream laisse ce
         # nœud `disabled` — le pinmux et cap-sdio-irq sont pourtant déjà là.
         SDIO_WIFI_NODE="mmc@4021000"
+        UWE5622="yes"
         ;;
     orangepi-zero3)
         UBOOT_DIR="orangepi_zero3"
@@ -85,7 +91,7 @@ if [[ "$BOARD" == "custom" ]]; then
 fi
 
 IMAGE_NAME="tune-os-${BOARD}"
-IMAGE_SIZE="3G"   # mesure sur un build reel : 790 Mo occupes, large marge
+IMAGE_SIZE="4G"   # 790 Mo utiles, + la chaine de build temporaire du pilote WiFi
 WORK_DIR="/tmp/tune-os-build-sunxi"
 ROOTFS="${WORK_DIR}/rootfs"
 IMAGE_FILE="${WORK_DIR}/${IMAGE_NAME}.img"
@@ -129,7 +135,7 @@ if [[ "$(uname -m)" != "aarch64" ]] && ! command -v qemu-aarch64-static &>/dev/n
     exit 1
 fi
 
-for tool in debootstrap parted mkfs.ext4 losetup blkid dtc; do
+for tool in debootstrap parted mkfs.ext4 losetup blkid dtc git; do
     command -v "$tool" &>/dev/null || { err "Missing tool: $tool"; exit 1; }
 done
 
@@ -354,6 +360,75 @@ PATCH
         | grep -A24 "${SDIO_WIFI_NODE} {" | grep -q 'status = "okay"' \
         || { err "le patch SDIO n'a pas pris dans ${DTB_FILE}"; exit 1; }
     ok "${SDIO_WIFI_NODE} enabled"
+fi
+
+# --- Unisoc UWE5622 WiFi driver (out-of-tree) ---
+# The soldered "AW859A" module is a Unisoc UWE5622. No in-tree driver matches
+# it — the chip reports vendor=0x0000/device=0x0000, and the out-of-tree driver
+# is written for exactly that: its SDIO table is `{SDIO_DEVICE(0, 0)}` and it
+# probes `/sys/bus/sdio/devices/mmc1:8800:1`, which is what the DTB patch above
+# produces. Source and firmware come from Armbian, at a pinned commit.
+#
+# Built inside the chroot so the image is self-contained and the build fails
+# loudly if the driver ever stops compiling against the shipped kernel. The
+# toolchain is purged afterwards.
+if [[ "${UWE5622:-}" == "yes" ]]; then
+    KVER=$(basename "$(ls -1 "${ROOTFS}"/boot/vmlinuz-* | sort -V | tail -1)" | sed 's/^vmlinuz-//')
+    log "Building the Unisoc UWE5622 WiFi driver (${UWE5622_COMMIT:0:12}) for ${KVER}..."
+    git clone -q "$UWE5622_REPO" "${WORK_DIR}/uwe5622" \
+        || { err "clone du pilote uwe5622 impossible"; exit 1; }
+    git -C "${WORK_DIR}/uwe5622" checkout -q "$UWE5622_COMMIT" \
+        || { err "commit ${UWE5622_COMMIT} introuvable"; exit 1; }
+    # tty-sdio hardcodes an in-tree include path; make it relative so the
+    # module can be built out of tree.
+    sed -i 's|-I$(srctree)/drivers/net/wireless/uwe5622/unisocwcn/include|-I$(src)/../unisocwcn/include|' \
+        "${WORK_DIR}/uwe5622/tty-sdio/Makefile"
+    mkdir -p "${ROOTFS}/usr/src"
+    cp -R "${WORK_DIR}/uwe5622" "${ROOTFS}/usr/src/uwe5622"
+
+    chroot "$ROOTFS" bash -ec "
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq --no-install-recommends \
+            build-essential bc linux-headers-${KVER} >/dev/null
+        make -C /lib/modules/${KVER}/build M=/usr/src/uwe5622 modules \
+            CONFIG_AW_WIFI_DEVICE_UWE5622=y \
+            CONFIG_WLAN_UWE5622=m \
+            CONFIG_TTY_OVERY_SDIO=m \
+            CONFIG_AW_BOARD=y -j\$(nproc)
+        mkdir -p /lib/modules/${KVER}/updates
+        for ko in \$(find /usr/src/uwe5622 -name '*.ko'); do
+            strip --strip-debug \"\$ko\"
+            cp \"\$ko\" /lib/modules/${KVER}/updates/
+        done
+        depmod -a ${KVER}
+    " || { err "compilation du pilote uwe5622 echouee"; exit 1; }
+
+    for m in uwe5622_bsp_sdio sprdwl_ng sprdbt_tty; do
+        [[ -f "${ROOTFS}/lib/modules/${KVER}/updates/${m}.ko" ]] \
+            || { err "module ${m}.ko manquant apres compilation"; exit 1; }
+    done
+
+    log "Fetching UWE5622 firmware..."
+    git clone -q --depth 1 --filter=blob:none --sparse "$UWE5622_FW_REPO" \
+        "${WORK_DIR}/uwe5622-fw" || { err "clone du firmware impossible"; exit 1; }
+    git -C "${WORK_DIR}/uwe5622-fw" sparse-checkout set uwe5622 >/dev/null 2>&1
+    [[ -f "${WORK_DIR}/uwe5622-fw/uwe5622/wcnmodem.bin" ]] \
+        || { err "wcnmodem.bin introuvable dans le depot firmware"; exit 1; }
+    mkdir -p "${ROOTFS}/lib/firmware/uwe5622"
+    cp "${WORK_DIR}/uwe5622-fw/uwe5622/"* "${ROOTFS}/lib/firmware/uwe5622/"
+
+    # The BSP module auto-loads on the SDIO alias; the WiFi one does not.
+    echo sprdwl_ng > "${ROOTFS}/etc/modules-load.d/uwe5622.conf"
+
+    # Drop the toolchain: it exists only to build the module above.
+    chroot "$ROOTFS" bash -ec "
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get purge -y -qq build-essential bc linux-headers-${KVER} \
+            gcc g++ cpp make libc6-dev >/dev/null 2>&1 || true
+        apt-get autoremove --purge -y -qq >/dev/null 2>&1 || true
+    "
+    rm -rf "${ROOTFS}/usr/src/uwe5622"
+    ok "UWE5622 driver + firmware installed"
 fi
 
 # --- Bootloader ---

@@ -73,7 +73,7 @@ make BL31=../arm-trusted-firmware/build/sun50i_h616/release/bl31.bin -j"$(nproc)
 # -> u-boot-sunxi-with-spl.bin
 ```
 
-#### On-board WiFi: bus up, no driver
+#### On-board WiFi: Unisoc UWE5622
 
 The build enables the SDIO bus carrying the soldered WiFi module and wires its
 power sequence. Verified on hardware, the module now enumerates:
@@ -90,16 +90,25 @@ Transpeed 8K618-T), and confirmed one at a time:
 | `mmc-pwrseq` releasing WL-REG-ON (PG18, active low) + PG10 muxed as the 32 kHz clock output | `Failed to initialize a non-removable card` |
 | `vmmc-supply` (same rail as mmc0) | `error -22 whilst initialising SDIO card` — empty voltage window |
 
-**But there is still no network interface.** The card reports no manufacturer
-ID (`vendor=0x0000 device=0x0000`, `modalias=sdio:c00v0000d0000`), so no in-tree
-driver matches it, and forcing `brcm,bcm4329-fmac` on the function node does not
-make `brcmfmac` bind — it is not a Broadcom part. Finishing this needs the chip
-identified and an out-of-tree driver built against the running kernel.
+The chip is a **Unisoc UWE5622** — what the "AW859A" can actually contains, per
+Armbian's own board config (`orangepizero2.csc` enables the `uwe5622-allwinner`
+extension). No in-tree driver matches it, because the card reports
+`vendor=0x0000 device=0x0000`: that is not a fault, it is this part's signature,
+and the out-of-tree driver is written for exactly it — its SDIO table is
+`{SDIO_DEVICE(0, 0)}` and it probes `/sys/bus/sdio/devices/mmc1:8800:1`, the
+very path the DTB patch produces.
 
-For WiFi today, use a USB dongle: `wpasupplicant`, `wireless-regdb` and the
-Realtek/Atheros/Broadcom firmware packages are already in the image, so a
-mainline-supported dongle works with no extra install — which matters, since the
-board has no network of its own to fetch anything with.
+The build therefore compiles that driver from `armbian/uwe5622` at a pinned
+commit, inside the chroot against the shipped kernel, and installs
+`uwe5622_bsp_sdio.ko`, `sprdwl_ng.ko` and `sprdbt_tty.ko` into
+`/lib/modules/<kver>/updates` with the firmware from `armbian/firmware`. The
+toolchain is purged afterwards. `sprdwl_ng` is loaded at boot via
+`/etc/modules-load.d`; depmod pulls the BSP module in as a dependency.
+
+A USB dongle also works and needs nothing extra: `wpasupplicant`,
+`wireless-regdb` and the Realtek/Atheros/Broadcom firmware packages are already
+in the image — which matters, since the board has no network of its own to fetch
+anything with.
 
 #### Where the console actually is
 
