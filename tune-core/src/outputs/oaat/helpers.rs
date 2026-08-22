@@ -17,6 +17,27 @@ pub(super) struct StreamInfo {
 
 /// Detect stream format from the first bytes and parse header.
 /// Drains the header from `buf`, leaving only audio data.
+/// Nombre d'octets suffisant pour reconnaître un format ici : `detect_and_parse`
+/// n'inspecte jamais au-delà.
+pub(super) const ENTETE_DETECTION: usize = 92;
+
+/// Cet en-tête est-il celui d'un WAV, seul format que la lecture directe OAAT
+/// sait réellement jouer ?
+///
+/// Le FLAC n'a pas de chemin de lecture directe ici (il repart sur le flux HTTP
+/// que l'orchestrateur sert déjà), le DSD doit être converti en PCM, et les
+/// formats compressés ne sont pas parsés du tout. Tout sauf le WAV finit donc
+/// en HTTP — autant s'en apercevoir sur 12 octets plutôt qu'après avoir chargé
+/// le fichier entier.
+///
+/// Mesuré sur .42, DSD128 de 868 Mo : quinze secondes de silence entre
+/// `play_media` et la bascule, et un pic mémoire de presque un gigaoctet sur un
+/// mini PC. L'utilisateur monte le volume, n'entend rien, met en pause — et la
+/// conversion démarre après qu'il a abandonné.
+pub(super) fn entete_est_wav(entete: &[u8]) -> bool {
+    entete.len() >= 12 && &entete[..4] == b"RIFF" && &entete[8..12] == b"WAVE"
+}
+
 pub(super) fn detect_and_parse(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     if buf.len() >= 44 && &buf[..4] == b"RIFF" && &buf[8..12] == b"WAVE" {
         return parse_wav(buf);
@@ -801,5 +822,50 @@ mod staged_track_tests {
             24,
             2
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests_entete_wav {
+    use super::*;
+
+    fn entete(magic: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; 92];
+        v[..magic.len().min(12)].copy_from_slice(&magic[..magic.len().min(12)]);
+        v
+    }
+
+    #[test]
+    fn un_wav_est_reconnu() {
+        assert!(entete_est_wav(&entete(b"RIFF\0\0\0\0WAVE")));
+    }
+
+    /// Les trois formats qui finissaient chargés entièrement puis jetés.
+    #[test]
+    fn flac_dsd_et_compresses_basculent_immediatement() {
+        assert!(!entete_est_wav(&entete(b"fLaC")), "FLAC part en HTTP");
+        assert!(!entete_est_wav(&entete(b"DSD ")), "DSD doit être converti");
+        assert!(!entete_est_wav(&entete(b"ID3\x03")), "MP3 non parsé ici");
+        assert!(
+            !entete_est_wav(&entete(b"ftypM4A ")),
+            "AAC/ALAC non parsé ici"
+        );
+    }
+
+    /// Un RIFF qui n'est pas du WAVE — AVI, RMI — ne doit pas passer.
+    #[test]
+    fn un_riff_non_wave_ne_passe_pas() {
+        assert!(!entete_est_wav(&entete(b"RIFF\0\0\0\0AVI ")));
+    }
+
+    /// Un fichier plus court que l'en-tête ne doit ni paniquer ni passer.
+    /// `read` peut rendre moins que demandé, et un fichier tronqué existe.
+    #[test]
+    fn un_entete_trop_court_ne_panique_pas() {
+        for n in 0..12 {
+            let court = vec![b'R'; n];
+            assert!(!entete_est_wav(&court), "n={n}");
+        }
+        assert!(!entete_est_wav(b""));
     }
 }

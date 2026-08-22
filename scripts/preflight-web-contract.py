@@ -71,26 +71,20 @@ SOURCES_SERVEUR = ["tune-server/src", "tune-core/src", "plugins"]
 #   /metadata/auto-fix, /auto-fix/status, /reclassify-genres-by-path  (#1920)
 #   /library/import/{roon,plex,playlists}                             (#520 web)
 SOCLE_CONNU: dict[str, str] = {
-    "/metadata/auto-fix-albums": "#1893",  # sémantique d'« album créé » indécidable
-    "/metadata/duplicates/move-album": "#1893",  # destructif sur disque, à arbitrer
-    "/metadata/mp3/diagnose": "#1893",  # aucun moteur : l'écrire serait inventer
-    "/metadata/mp3/repair": "#1893",  # « repaired » existait, la route non
-    "/metadata/batch/tracks": "#1893",  # code mort : aucun composant l'appelle
+    # VIDE, et c'est l'objectif atteint.
     #
-    # Les trois suivantes sont SERVIES — sous `/library`, pas `/metadata`. Ce
-    # n'est plus une route à écrire mais un appel web à corriger. ⚠ Le préfixe
-    # n'est pas leur seul défaut : `resolve` envoie ses arguments en query quand
-    # le serveur les attend dans le corps, et `list` rend un objet à trois
-    # familles là où le client attend un tableau plat. Renommer le préfixe seul
-    # ne suffirait pas — voir #1893.
-    "/metadata/duplicates": "#1893",  # servi : /library/duplicates
-    "/metadata/duplicates/resolve": "#1893",  # servi : /library/duplicates/resolve
-    "/metadata/duplicates/scan": "#1893",  # servi depuis #2018 : /library/duplicates/scan
+    # Ce socle a compte jusqu'a 18 entrees. Chacune a ete soldee : cinq routes
+    # ecrites (un moteur existait, la porte HTTP manquait), six appels corriges
+    # (la fonction etait la, sous une autre adresse), cinq fonctions mortes
+    # supprimees (tune-web-client#543), une remplacee par un refus explicite.
     #
-    "/sonos/speakers": "#2004",
-    "/sonos/discover": "#2004",
-    "/sonos/groups": "#2004",
-    "/converter/cancel": "#2004",
+    # Le controle ne tolere donc plus RIEN : toute route appelee par le web et
+    # absente du serveur le fait echouer, sans exemption ni liste a maintenir.
+    #
+    # Reouvrir ce socle est une decision, pas une commodite. Une entree se
+    # justifie par un numero d'issue et se retire des que la dette est payee —
+    # un socle qui ne maigrit jamais finit par tout tolerer, et un controle qui
+    # tolere tout ne garde rien.
 }
 
 # Segments qui ne distinguent rien : les retenir produirait du bruit, et un
@@ -393,8 +387,15 @@ def self_test() -> int:
     # cette route a enfin été écrite (#1920). Épingler une clef précise punit la
     # réparation. On vérifie donc la FORME — un socle vidé d'un coup, ou dont
     # une entrée ne référence plus rien, reste attrapé.
-    if not SOCLE_CONNU:
-        echecs.append("le socle connu est vide : soit tout est réparé, soit il a été écrasé")
+    # Un socle VIDE est l'etat vise, pas une anomalie. Cette garde exigeait
+    # qu'il soit non vide — elle a donc casse le jour ou la derniere dette a
+    # ete payee. C'est la DEUXIEME fois qu'une garde de ce fichier punit la
+    # reparation : la precedente etait epinglee sur une clef precise et a casse
+    # quand cette route a enfin ete ecrite. Une garde ne doit jamais rendre le
+    # succes plus couteux que le statu quo.
+    #
+    # Il ne reste donc que la FORME : ce qui est tolere doit ressembler a un
+    # chemin et porter un numero d'issue. Rien a verifier quand il n'y a rien.
     for route, ref in SOCLE_CONNU.items():
         if not route.startswith("/"):
             echecs.append(f"socle : « {route} » n'est pas un chemin")

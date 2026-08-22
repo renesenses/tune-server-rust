@@ -3805,11 +3805,67 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
-                let seed_artist = zone_state
+                let mut seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let mut seed_artist = zone_state
                     .now_playing
                     .as_ref()
                     .and_then(|np| np.artist_name.clone());
+
+                // File vide DÈS LE DÉPART : rien n'a joué, donc rien à
+                // prolonger. C'était le cas d'un serveur qu'on rallume ou
+                // d'une file qu'on vient d'effacer — le réglage « lecture
+                // automatique » était activé et il ne se passait rien, la
+                // seule trace étant un `autoplay_skipped_no_seed` en DEBUG.
+                // On repart de la dernière écoute de LA ZONE, à défaut de la
+                // maison : c'est la graine la plus proche de ce que
+                // l'auditeur attend d'entendre.
+                if seed_artist.is_none() && seed_track_id.is_none() {
+                    // La radio par défaut se construit sur les DERNIERS TITRES
+                    // écoutés, et non sur le seul dernier artiste : c'est la
+                    // différence entre prolonger un morceau et proposer une
+                    // radio. On demande leurs semblables à plusieurs artistes
+                    // récents, et on choisit dans tout ce pool.
+                    let radio =
+                        crate::playback::auto_dj::radio_depuis_l_historique(&self.db, zone_id, 10)
+                            .await;
+                    let ids: Vec<i64> = radio
+                        .iter()
+                        .filter_map(|t| t["track_id"].as_i64())
+                        .collect();
+                    if !ids.is_empty() {
+                        info!(
+                            zone_id,
+                            count = ids.len(),
+                            "autoplay_radio_depuis_l_historique"
+                        );
+                        let queue_repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                            self.db.clone(),
+                        );
+                        if queue_repo.append_tracks(zone_id, &ids).is_ok() {
+                            let new_pos = zone_state.queue_position + 1;
+                            if let Err(e) =
+                                self.orchestrator.play_from_queue(zone_id, new_pos).await
+                            {
+                                warn!(zone_id, error = %e, "autoplay_play_failed");
+                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            }
+                            return;
+                        }
+                    }
+
+                    // La bibliothèque n'a rien rendu : on garde une graine pour
+                    // les autres cartes de la chaîne — radio du service,
+                    // genre/BPM — plutôt que de s'arrêter là.
+                    if let Some(g) = crate::playback::auto_dj::graine_recente(&self.db, zone_id) {
+                        info!(
+                            zone_id,
+                            artist = %g.artist_name.as_deref().unwrap_or(""),
+                            "autoplay_graine_depuis_l_historique"
+                        );
+                        seed_track_id = g.track_id;
+                        seed_artist = g.artist_name;
+                    }
+                }
 
                 // « Radio artistes similaires » : la graine est le NOM d'artiste,
                 // donc une écoute streaming (pas de track_id local) alimente
