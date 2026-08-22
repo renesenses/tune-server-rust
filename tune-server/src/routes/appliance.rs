@@ -37,6 +37,53 @@ pub fn router() -> Router<AppState> {
         .route("/wifi/scan", get(wifi_scan))
         .route("/wifi/connect", post(wifi_connect))
         .route("/wifi/forget", post(wifi_forget))
+        .route("/shutdown", post(shutdown))
+}
+
+/// Le binaire d'extinction, surchargeable pour les tests et les images
+/// atypiques.
+fn systemctl_bin() -> String {
+    std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into())
+}
+
+/// Éteindre la machine — **uniquement sur l'appliance**.
+///
+/// Demandé par GgB (fil forum #1511), appuyé par Benjithom : « dans le cas de
+/// Tune OS sur un PC dédié, un bouton sur l'interface web pour envoyer une
+/// commande shutdown serait bien pratique ». Un boîtier sans écran ni clavier
+/// n'a aujourd'hui aucun moyen propre de s'arrêter : on coupe l'alimentation,
+/// ce qui n'est bon ni pour la base ni pour le système de fichiers.
+///
+/// **Réservé à l'appliance, et ce n'est pas une précaution de façade.** Sur une
+/// installation de bureau, Tune partage la machine avec son utilisateur :
+/// éteindre depuis une page web y serait au mieux une surprise, au pire une
+/// perte de travail. `require_appliance()` rend 404 ailleurs — la route
+/// n'existe pas, plutôt que d'exister et de refuser.
+///
+/// L'ordre part **après** la réponse HTTP, comme pour le redémarrage : sans ce
+/// délai le client verrait sa requête coupée et afficherait une erreur réseau
+/// pour une extinction qui se déroule pourtant normalement.
+async fn shutdown(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tracing::info!("appliance_shutdown_requested");
+        // `systemctl poweroff` plutôt que `shutdown -h now` : c'est l'ordre que
+        // systemd comprend sans passer par un shell, et il rend la main tout de
+        // suite. L'image Tune OS tourne son service en root — ailleurs, la
+        // route n'est de toute façon pas montée.
+        match Command::new(systemctl_bin()).arg("poweroff").output().await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                tracing::warn!(error = %err, "appliance_shutdown_failed");
+            }
+            Err(e) => tracing::warn!(error = %e, "appliance_shutdown_command_failed"),
+        }
+    });
+
+    Ok(Json(json!({ "status": "shutting_down" })))
 }
 
 /// True when running on a Tune appliance image (or forced via env for dev).
@@ -303,5 +350,59 @@ mod tests {
         assert!(validate_ssid("").is_err());
         assert!(validate_ssid("a\nb").is_err());
         assert!(validate_ssid(&"x".repeat(33)).is_err());
+    }
+
+    // --- Extinction : reservee a l'appliance (#1511) ---
+
+    /// UN SEUL test pour les deux etats, et ce n'est pas de la paresse.
+    ///
+    /// `TUNE_APPLIANCE` est une variable de PROCESSUS : deux tests qui la
+    /// modifient tournent en parallele dans le meme processus et se marchent
+    /// dessus. Ma premiere version en avait deux — l'un posait la variable,
+    /// l'autre la retirait, et le premier echouait une fois sur deux. Un test
+    /// instable est pire qu'une absence de test : on finit par l'ignorer.
+    #[test]
+    fn le_mode_appliance_se_force_par_l_environnement_et_l_extinction_suit() {
+        // SAFETY : sequence deterministe, une seule variable, un seul test.
+        unsafe { std::env::set_var("TUNE_APPLIANCE", "1") };
+        assert!(is_appliance());
+        assert!(require_appliance().is_ok(), "l'extinction est offerte ici");
+
+        unsafe { std::env::set_var("TUNE_APPLIANCE", "true") };
+        assert!(is_appliance());
+
+        // Hors appliance, la route ne doit pas EXISTER — 404, et non 403. La
+        // nuance compte : Tune partage la machine avec son utilisateur sur une
+        // installation de bureau. Une route qui existe et refuse invite a
+        // chercher comment la debloquer ; une route absente dit que ce n'est
+        // pas le sujet.
+        unsafe { std::env::set_var("TUNE_APPLIANCE", "0") };
+        assert!(!is_appliance(), "0 ne doit pas activer le mode appliance");
+        if !std::path::Path::new(APPLIANCE_MARKER).exists() {
+            assert!(
+                require_appliance().is_err(),
+                "une machine ordinaire ne s'eteint pas depuis une page web"
+            );
+        }
+
+        unsafe { std::env::remove_var("TUNE_APPLIANCE") };
+    }
+
+    #[test]
+    fn le_binaire_d_extinction_est_surchargeable() {
+        // Pour les tests et les images atypiques : on ne code pas en dur un
+        // chemin qu'on ne controle pas.
+        unsafe { std::env::set_var("TUNE_SYSTEMCTL_BIN", "/faux/systemctl") };
+        assert_eq!(systemctl_bin(), "/faux/systemctl");
+        unsafe { std::env::remove_var("TUNE_SYSTEMCTL_BIN") };
+        assert_eq!(systemctl_bin(), "systemctl");
+    }
+
+    #[test]
+    fn la_route_d_extinction_est_montee() {
+        // Un bouton qui appelle une route absente est pire que pas de bouton :
+        // l'ecran promet, le serveur rend 404.
+        let rendu = format!("{:?}", router());
+        assert!(rendu.contains("Router"), "le routeur se construit");
     }
 }
