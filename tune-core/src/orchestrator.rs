@@ -664,6 +664,10 @@ pub struct PlayRequest {
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
     pub media_format: Option<String>,
+    /// Album numbering, passed on to the output in `PlayMedia`. Filled from the
+    /// queue row (or the library track) so an output does not have to guess it.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -735,6 +739,13 @@ pub struct ResolvedQueueItem {
     /// local tracks resolved via the local-file gapless path; None for streaming
     /// tracks and for the normal transcode/URL resolution.
     pub file_path: Option<String>,
+    /// Where the item came from, and its id there — passed to the output so it
+    /// can identify the track without guessing from artist/album/title.
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    /// Album numbering carried by the queue row.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 /// DIDL `res@duration` (ms) for a native passthrough stream served raw to a
@@ -1680,17 +1691,40 @@ impl PlaybackOrchestrator {
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
-            let local_file_path = if resolved.source == "local" {
+            // One DB read for the local row: the output needs its path, and its
+            // album numbering when the request did not carry any (a play by
+            // track id, not from a queue row).
+            let local_track = if resolved.source == "local" {
                 req.track_id.and_then(|tid| {
                     TrackRepo::with_backend(self.db.clone())
                         .get(tid)
                         .ok()
                         .flatten()
-                        .and_then(|t| t.file_path)
                 })
             } else {
                 None
             };
+            let local_file_path = local_track.as_ref().and_then(|t| t.file_path.clone());
+            let media_source_id = req
+                .source_id
+                .clone()
+                .or_else(|| req.track_id.map(|t| t.to_string()));
+            // The library row stores 0 for "unknown", so filter it out rather
+            // than telling the output this is track 0.
+            let media_track_number = req.track_number.or_else(|| {
+                local_track
+                    .as_ref()
+                    .map(|t| t.track_number)
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
+            });
+            let media_disc_number = req.disc_number.or_else(|| {
+                local_track
+                    .as_ref()
+                    .map(|t| t.disc_number)
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
+            });
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -1709,6 +1743,10 @@ impl PlaybackOrchestrator {
                 // seekable file (Yamaha R-N2000A stays silent otherwise).
                 live_stream: resolved.source == "radio",
                 origin_url: resolved.origin_url.as_deref(),
+                source: Some(&resolved.source),
+                source_id: media_source_id.as_deref(),
+                track_number: media_track_number,
+                disc_number: media_disc_number,
             };
             let zone_audiophile = self.zone_audiophile(req.zone_id);
 
@@ -6751,6 +6789,8 @@ impl PlaybackOrchestrator {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
 
         let resultat = self.play_without_history(req).await;
@@ -7543,6 +7583,8 @@ impl PlaybackOrchestrator {
                             sample_rate: None,
                             bit_depth: None,
                             media_format: None,
+                            track_number: None,
+                            disc_number: None,
                         };
                         // Même station, même écoute logique : pas de nouvelle
                         // ligne d'historique (même règle que radio_auto_retry).
@@ -7801,6 +7843,8 @@ impl PlaybackOrchestrator {
                         sample_rate: None,
                         bit_depth: None,
                         media_format: None,
+                        track_number: None,
+                        disc_number: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -8041,6 +8085,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             }
         } else {
             // Streaming track.
@@ -8115,6 +8161,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             }
         };
 
@@ -8381,6 +8429,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: None,
+                disc_number: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -8404,6 +8454,10 @@ impl PlaybackOrchestrator {
                 channels: resolved.channels,
                 file_size: resolved.file_size,
                 file_path: None,
+                source: Some("local".into()),
+                source_id: Some(track_id.to_string()),
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             });
         }
 
@@ -8438,7 +8492,7 @@ impl PlaybackOrchestrator {
             output_device_id,
             track_id: None,
             source: Some(source),
-            source_id: Some(source_id),
+            source_id: Some(source_id.clone()),
             title: title.clone(),
             artist_name: artist.clone(),
             album_title: album.clone(),
@@ -8449,6 +8503,8 @@ impl PlaybackOrchestrator {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -8475,6 +8531,10 @@ impl PlaybackOrchestrator {
             channels: resolved.channels,
             file_size: resolved.file_size,
             file_path: None,
+            source: entry.source.clone(),
+            source_id: Some(source_id.clone()),
+            track_number: entry.track_number.map(|n| n as u32),
+            disc_number: entry.disc_number.map(|n| n as u32),
         })
     }
 
@@ -8526,6 +8586,16 @@ impl PlaybackOrchestrator {
             channels: None,
             file_size: None,
             file_path,
+            source: entry
+                .source
+                .clone()
+                .or_else(|| entry.track_id.map(|_| "local".to_string())),
+            source_id: entry
+                .source_id
+                .clone()
+                .or_else(|| entry.track_id.map(|t| t.to_string())),
+            track_number: entry.track_number.map(|n| n as u32),
+            disc_number: entry.disc_number.map(|n| n as u32),
         })
     }
 
@@ -11013,6 +11083,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -11052,6 +11124,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -11082,6 +11156,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -11119,6 +11195,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: Some("mp3".into()),
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_stream(&req).await.unwrap();
         assert_eq!(resolved.source, "bandcamp");
@@ -11152,6 +11230,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert_eq!(resolved.mime_type, "audio/mpeg");
@@ -11179,6 +11259,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -11215,6 +11297,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(resolved.stream_id.is_some());
@@ -11244,6 +11328,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(resolved.stream_id.is_none());
