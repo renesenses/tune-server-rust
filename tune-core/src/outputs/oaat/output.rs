@@ -187,6 +187,17 @@ impl OaatOutput {
         self.pending_start_ms.store(ms, Ordering::SeqCst);
     }
 
+    /// Le flux part-il en DSD 1 bit, lu directement depuis le `.dsf` ?
+    ///
+    /// Sur ce chemin l'orchestrateur ne décode rien — c'est tout l'objet du
+    /// correctif du blocage Zicmu : une URL de transcodage armée ici
+    /// orphelinait un décodage que personne ne lit. Personne ne produit donc
+    /// de fenêtre de niveaux, et les VU-mètres n'ont aucune source. Ce qui se
+    /// mesure ailleurs ne se mesure pas ici, et l'écran doit pouvoir le dire.
+    pub fn is_native_dsd_active(&self) -> bool {
+        self.native_dsd_active.load(Ordering::Relaxed)
+    }
+
     // These three exist only for `integration_test`, which is gated on
     // `all(test, feature = "oaat")`. Gating them on `test` alone — or not at
     // all — leaves them compiled but unused in a plain `cargo test`, which is

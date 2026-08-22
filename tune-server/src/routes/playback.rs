@@ -202,6 +202,12 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             "output_reach".into(),
             json!(crate::routes::zones::output_reach(state, zone, &zone_state).await),
         );
+        // Les VU ont-ils une source ? Même champ que GET /zones et
+        // GET /zones/{id} : trois surfaces, une seule vérité.
+        v.as_object_mut().unwrap().insert(
+            "levels_available".into(),
+            json!(crate::routes::zones::levels_available(state, zone).await),
+        );
     }
     if is_browser_zone {
         if let Some(ref np) = zone_state.now_playing {
