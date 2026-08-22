@@ -467,9 +467,90 @@ fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ConnectionManager SOAP response builder
+// ConnectionManager SOAP response builders
 // ---------------------------------------------------------------------------
 
+/// Formats que le RENDERER accepte en entrée, pour le `Sink` de
+/// `GetProtocolInfo`.
+///
+/// Un point de contrôle qui respecte la norme lit ce champ pour choisir le
+/// format à nous envoyer ; un `Sink` vide ne lui laisse aucun choix valide et
+/// il abandonne avant même d'essayer (Lyrion/squeeze2upnp : « no matching
+/// codec p », `STMf`, lecture bloquée à 0:00 — Yacine, 22/08/2026).
+///
+/// La liste suit ce que la chaîne de décodage sait réellement lire — un
+/// `SetAVTransportURI` traverse le même chemin qu'un flux de media server
+/// externe. Les deux orthographes des types historiquement divergents sont
+/// données (`audio/flac` ET `audio/x-flac`, comme pour la sonde côté client,
+/// #435) : un contrôleur qui ne cherche que la sienne trouve la sienne.
+///
+/// `audio/L16` en est DÉLIBÉRÉMENT absent. C'est du PCM sans en-tête : rien ne
+/// permet d'en deviner la cadence ni la profondeur à la lecture, et notre
+/// probe travaille sur conteneur. L'annoncer ne ferait que déplacer l'échec
+/// du choix du format vers le décodage — un contrôleur qui voulait du PCM
+/// prendra `audio/wav`, qui porte les mêmes octets avec son en-tête.
+const RENDERER_SINK_PROTOCOL_INFO: &str = concat!(
+    "http-get:*:audio/flac:*,",
+    "http-get:*:audio/x-flac:*,",
+    "http-get:*:audio/wav:*,",
+    "http-get:*:audio/x-wav:*,",
+    "http-get:*:audio/wave:*,",
+    "http-get:*:audio/mpeg:*,",
+    "http-get:*:audio/mp3:*,",
+    "http-get:*:audio/aac:*,",
+    "http-get:*:audio/x-aac:*,",
+    "http-get:*:audio/mp4:*,",
+    "http-get:*:audio/m4a:*,",
+    "http-get:*:audio/x-m4a:*,",
+    "http-get:*:audio/ogg:*,",
+    "http-get:*:application/ogg:*,",
+    "http-get:*:audio/opus:*",
+);
+
+/// ConnectionManager du **MediaRenderer** (`/upnp/renderer/{zone}/`).
+///
+/// Le renderer répondait avec le ConnectionManager du media server : `Source`
+/// rempli de ce qu'un SERVEUR sert, et `Sink` vide. Pour un renderer c'est
+/// l'exact contraire de ce que dit la norme — `Sink` = ce qu'on sait recevoir,
+/// `Source` = rien, on ne sert pas de contenu. Le symptôme se voyait jusque
+/// dans nos propres journaux (`renderer_caps_probe_empty_sink`) : le client
+/// DLNA de Tune sondait le renderer de Tune et n'en tirait rien.
+pub fn build_renderer_connection_manager_response(soap_body: &str) -> String {
+    debug!(
+        body_len = soap_body.len(),
+        "upnp_renderer_connection_manager_request"
+    );
+
+    match parse_soap_action(soap_body).as_deref() {
+        None | Some("GetProtocolInfo") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetProtocolInfo",
+            &format!("<Source></Source><Sink>{RENDERER_SINK_PROTOCOL_INFO}</Sink>"),
+        ),
+        Some("GetCurrentConnectionIDs") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetCurrentConnectionIDs",
+            "<ConnectionIDs>0</ConnectionIDs>",
+        ),
+        // `Direction` est `Input` ici, et non `Output` : un renderer REÇOIT le
+        // flux. La réponse partagée avec le media server annonçait `Output`,
+        // soit le sens inverse du seul appareil concerne.
+        Some("GetCurrentConnectionInfo") => soap_action_response(
+            CONNECTION_MANAGER_URN,
+            "GetCurrentConnectionInfo",
+            "<RcsID>0</RcsID><AVTransportID>0</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>",
+        ),
+        Some(other) => {
+            debug!(
+                action = other,
+                "upnp_renderer_connection_manager_unsupported_action"
+            );
+            soap_fault(401, "Invalid Action")
+        }
+    }
+}
+
+/// ConnectionManager du **MediaServer** (`/upnp/`).
 pub fn build_connection_manager_response(soap_body: &str) -> String {
     debug!(
         body_len = soap_body.len(),
@@ -1829,6 +1910,77 @@ mod tests {
 
         let fault = build_connection_manager_response(&soap_body("PrepareForConnection", urn));
         assert!(is_soap_fault(&fault));
+    }
+
+    #[test]
+    fn le_renderer_annonce_ce_qu_il_sait_recevoir() {
+        // La régression : le renderer répondait avec le ConnectionManager du
+        // media server — `Source` rempli, `Sink` VIDE. Un point de contrôle
+        // normé n'a alors aucun format valide à nous envoyer et abandonne
+        // avant d'essayer (Lyrion/squeeze2upnp : « no matching codec »,
+        // lecture bloquée à 0:00). Le sens des deux champs est inversé entre
+        // un serveur et un renderer, ils ne peuvent pas partager la réponse.
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+        let proto = build_renderer_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+
+        assert!(proto.contains("<u:GetProtocolInfoResponse"));
+        assert!(
+            !proto.contains("<Sink></Sink>"),
+            "un renderer qui n'annonce aucun format d'entrée est injouable"
+        );
+        assert!(
+            proto.contains("<Source></Source>"),
+            "un renderer ne sert rien"
+        );
+        // Les formats que le contrôleur a le plus de chances de vouloir.
+        for mime in [
+            "audio/flac",
+            "audio/x-flac",
+            "audio/wav",
+            "audio/mpeg",
+            "audio/mp4",
+            "audio/ogg",
+        ] {
+            assert!(
+                proto.contains(&format!("http-get:*:{mime}:*")),
+                "{mime} absent du Sink"
+            );
+        }
+
+        // Et le media server garde EXACTEMENT l'inverse : c'est lui qui sert.
+        let serveur = build_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+        assert!(serveur.contains("<Sink></Sink>"));
+        assert!(serveur.contains("<Source>http-get:"));
+    }
+
+    #[test]
+    fn le_renderer_recoit_le_flux_il_ne_l_emet_pas() {
+        // `Direction` venait de la réponse du media server : `Output`, soit le
+        // sens inverse du seul appareil concerné.
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+        let info =
+            build_renderer_connection_manager_response(&soap_body("GetCurrentConnectionInfo", urn));
+        assert!(info.contains("<Direction>Input</Direction>"));
+        assert!(info.contains("<Status>OK</Status>"));
+
+        let ids =
+            build_renderer_connection_manager_response(&soap_body("GetCurrentConnectionIDs", urn));
+        assert!(ids.contains("<ConnectionIDs>0</ConnectionIDs>"));
+
+        let fault =
+            build_renderer_connection_manager_response(&soap_body("PrepareForConnection", urn));
+        assert!(is_soap_fault(&fault));
+    }
+
+    #[test]
+    fn le_sink_du_renderer_ne_promet_pas_du_pcm_sans_en_tete() {
+        // `audio/L16` est du PCM nu : ni cadence ni profondeur lisibles au fil
+        // de l'eau, et notre probe travaille sur conteneur. L'annoncer
+        // déplacerait l'échec du choix du format vers le décodage, ce qui est
+        // pire — le contrôleur croirait avoir négocié.
+        let urn = "urn:schemas-upnp-org:service:ConnectionManager:1";
+        let proto = build_renderer_connection_manager_response(&soap_body("GetProtocolInfo", urn));
+        assert!(!proto.contains("audio/L16"));
     }
 
     #[test]
