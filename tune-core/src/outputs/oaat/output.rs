@@ -1111,6 +1111,58 @@ impl OutputTarget for OaatOutput {
                         break 'direct true;
                     }
 
+                    // Identifier le format AVANT de tout lire.
+                    //
+                    // `tokio::fs::read` chargeait le fichier ENTIER en mémoire,
+                    // puis regardait ce que c'était, puis le jetait si ce
+                    // n'était pas du WAV — c'est-à-dire presque toujours : le
+                    // FLAC part en HTTP (voir plus bas), le DSD aussi, les
+                    // formats compressés aussi.
+                    //
+                    // Mesuré sur .42 avec un DSD128 de 868 Mo : QUINZE SECONDES
+                    // de silence entre `play_media` et la bascule sur le flux
+                    // HTTP, et un pic mémoire de presque un gigaoctet sur un
+                    // mini PC. L'utilisateur monte le volume, n'entend rien, et
+                    // met en pause avant que la conversion ne démarre.
+                    //
+                    // `detect_and_parse` n'a besoin que de 92 octets pour
+                    // reconnaître RIFF/WAVE, fLaC ou DSD. On lit donc un
+                    // en-tête, et on ne charge la suite que si ça vaut la peine.
+                    let taille_entete = super::helpers::ENTETE_DETECTION;
+                    let entete = {
+                        use tokio::io::AsyncReadExt;
+                        match tokio::fs::File::open(fp).await {
+                            Ok(mut f) => {
+                                let mut e = vec![0u8; taille_entete];
+                                match f.read(&mut e).await {
+                                    Ok(n) => {
+                                        e.truncate(n);
+                                        e
+                                    }
+                                    Err(err) => {
+                                        debug!("header read failed, falling back to HTTP: {err}");
+                                        break 'direct false;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("file open failed, falling back to HTTP: {e}");
+                                break 'direct false;
+                            }
+                        }
+                    };
+
+                    // Seul le WAV est réellement jouable par ce chemin. Tout le
+                    // reste finit sur le flux HTTP que l'orchestrateur sert
+                    // déjà — autant s'en apercevoir maintenant.
+                    if !super::helpers::entete_est_wav(&entete) {
+                        debug!(
+                            "format non lisible en direct (en-tete: {:?}), bascule immediate sur le flux HTTP",
+                            String::from_utf8_lossy(&entete[..entete.len().min(4)])
+                        );
+                        break 'direct false;
+                    }
+
                     let file_data = match tokio::fs::read(fp).await {
                         Ok(d) => d,
                         Err(e) => {

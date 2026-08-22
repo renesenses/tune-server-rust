@@ -1848,10 +1848,18 @@ impl PositionPoller {
             if np.source == "radio" {
                 if let Some(ref source_id) = np.source_id {
                     // source_id is either a numeric radio DB id or the stream URL itself
+                    // Le logo de la station sert de REPLI quand le titre en
+                    // cours n'a pas de pochette. Il faut le relire ici et non
+                    // reprendre `np.cover_path` : dès qu'un titre a posé sa
+                    // pochette, `cover_path` la porte, et le titre suivant —
+                    // une chronique, un jingle — hériterait de la pochette du
+                    // précédent au lieu de revenir au logo.
+                    let mut logo_station: Option<String> = None;
                     let (station_name, stream_url) = if let Ok(sid) = source_id.parse::<i64>() {
                         let radio_repo =
                             crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
                         if let Ok(Some(station)) = radio_repo.get(sid) {
+                            logo_station = station.logo_url.clone();
                             (station.name.clone(), station.url.clone())
                         } else {
                             // Fallback: use album_title (holds station name)
@@ -1871,7 +1879,17 @@ impl PositionPoller {
                         crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
                             .await
                     {
-                        let title_changed = np.title != meta.title || np.artist_name != meta.artist;
+                        // La pochette du titre quand la station la donne, le
+                        // logo sinon. Bertrand : « mettre la pochette de
+                        // l'album et non le logo de la radio ».
+                        let pochette = meta
+                            .cover_url
+                            .clone()
+                            .or_else(|| logo_station.clone())
+                            .or_else(|| np.cover_path.clone());
+                        let title_changed = np.title != meta.title
+                            || np.artist_name != meta.artist
+                            || np.cover_path != pochette;
                         if title_changed {
                             let title_for_icy = meta.title.clone();
                             let artist_for_icy = meta.artist.clone();
@@ -1880,7 +1898,7 @@ impl PositionPoller {
                                 title: meta.title,
                                 artist_name: meta.artist,
                                 album_title: Some(station_name.clone()),
-                                cover_path: np.cover_path.clone(),
+                                cover_path: pochette,
                                 duration_ms: 0,
                                 source: "radio".into(),
                                 source_id: np.source_id.clone(),
@@ -3787,11 +3805,67 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
-                let seed_artist = zone_state
+                let mut seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let mut seed_artist = zone_state
                     .now_playing
                     .as_ref()
                     .and_then(|np| np.artist_name.clone());
+
+                // File vide DÈS LE DÉPART : rien n'a joué, donc rien à
+                // prolonger. C'était le cas d'un serveur qu'on rallume ou
+                // d'une file qu'on vient d'effacer — le réglage « lecture
+                // automatique » était activé et il ne se passait rien, la
+                // seule trace étant un `autoplay_skipped_no_seed` en DEBUG.
+                // On repart de la dernière écoute de LA ZONE, à défaut de la
+                // maison : c'est la graine la plus proche de ce que
+                // l'auditeur attend d'entendre.
+                if seed_artist.is_none() && seed_track_id.is_none() {
+                    // La radio par défaut se construit sur les DERNIERS TITRES
+                    // écoutés, et non sur le seul dernier artiste : c'est la
+                    // différence entre prolonger un morceau et proposer une
+                    // radio. On demande leurs semblables à plusieurs artistes
+                    // récents, et on choisit dans tout ce pool.
+                    let radio =
+                        crate::playback::auto_dj::radio_depuis_l_historique(&self.db, zone_id, 10)
+                            .await;
+                    let ids: Vec<i64> = radio
+                        .iter()
+                        .filter_map(|t| t["track_id"].as_i64())
+                        .collect();
+                    if !ids.is_empty() {
+                        info!(
+                            zone_id,
+                            count = ids.len(),
+                            "autoplay_radio_depuis_l_historique"
+                        );
+                        let queue_repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                            self.db.clone(),
+                        );
+                        if queue_repo.append_tracks(zone_id, &ids).is_ok() {
+                            let new_pos = zone_state.queue_position + 1;
+                            if let Err(e) =
+                                self.orchestrator.play_from_queue(zone_id, new_pos).await
+                            {
+                                warn!(zone_id, error = %e, "autoplay_play_failed");
+                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            }
+                            return;
+                        }
+                    }
+
+                    // La bibliothèque n'a rien rendu : on garde une graine pour
+                    // les autres cartes de la chaîne — radio du service,
+                    // genre/BPM — plutôt que de s'arrêter là.
+                    if let Some(g) = crate::playback::auto_dj::graine_recente(&self.db, zone_id) {
+                        info!(
+                            zone_id,
+                            artist = %g.artist_name.as_deref().unwrap_or(""),
+                            "autoplay_graine_depuis_l_historique"
+                        );
+                        seed_track_id = g.track_id;
+                        seed_artist = g.artist_name;
+                    }
+                }
 
                 // « Radio artistes similaires » : la graine est le NOM d'artiste,
                 // donc une écoute streaming (pas de track_id local) alimente
