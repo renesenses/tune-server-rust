@@ -3134,8 +3134,8 @@ mod tests {
     #[test]
     fn queue_add_accepts_album_numbering() {
         // The regression: queue rows added track by track had no track number,
-        // so anything ordering the queue by album position — the queue view, a
-        // recorder naming files after the track — had to invent one. A client
+        // so anything ordering the queue by album position — the queue view, an
+        // output that files tracks by their rank — had to invent one. A client
         // that knows the numbering must be able to send it, per item and for a
         // single track.
         let body: QueueAddRequest = serde_json::from_value(serde_json::json!({

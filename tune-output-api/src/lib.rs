@@ -133,16 +133,17 @@ pub struct PlayMedia<'a> {
     /// Titles are not an identity: two tracks on one album can share a title
     /// (an album and its alternate takes), and an output that keys on
     /// artist/album/title alone will treat them as the same track. This pair is
-    /// the stable identity the host already has — a recorder can use it to tell
-    /// a genuine second capture from a replay of the same track.
+    /// the stable identity the host already has — an output can use it to tell
+    /// a genuine second play from a replay of the same track.
     pub source: Option<&'a str>,
     /// Identifier of the track within `source`: the local track id as a string,
     /// or the service's own track id.
     pub source_id: Option<&'a str>,
     /// Album numbering, when the host knows it.
     ///
-    /// Anything that lays tracks out in album order — a recorder naming files,
-    /// a display showing "3 / 12" — has no other way to get it: the queue row
+    /// Anything that lays tracks out in album order — an output that files
+    /// tracks by their rank, a display showing "3 / 12" — has no other way to
+    /// get it: the queue row
     /// and the library track carry it, but it used to stop at the output
     /// boundary, leaving outputs to invent a counter of their own.
     pub track_number: Option<u32>,
