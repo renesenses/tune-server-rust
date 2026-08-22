@@ -42,7 +42,7 @@ pub async fn handle_deezer_proxy(
             Some(s) => s,
             None => return (StatusCode::NOT_FOUND, "deezer not registered").into_response(),
         };
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let deezer = match svc.as_any().downcast_ref::<DeezerService>() {
             Some(d) => d,
             None => return (StatusCode::INTERNAL_SERVER_ERROR, "not deezer").into_response(),

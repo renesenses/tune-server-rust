@@ -4410,7 +4410,7 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
 
         // Try to get the track URL; if it fails with an auth error, attempt
         // a token refresh and retry once. This handles Qobuz tokens expiring
@@ -5647,7 +5647,7 @@ impl PlaybackOrchestrator {
                                 let svc = registry
                                     .get(&service_name)
                                     .ok_or_else(|| format!("unknown service: {service_name}"))?;
-                                let mut svc = svc.lock().await;
+                                let mut svc = svc.write().await;
                                 // Best-effort token refresh, then re-resolve with
                                 // the same default quality the initial play used.
                                 let _ = svc.refresh_if_needed().await;
@@ -5858,7 +5858,7 @@ impl PlaybackOrchestrator {
         if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get(&prefetched.source) {
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
                     if title.is_empty() {
                         title = track.title;
@@ -6520,7 +6520,7 @@ impl PlaybackOrchestrator {
                 let Some(svc) = registry.get(&source) else {
                     return;
                 };
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 match svc.get_track_url(&source_id, None).await {
                     Ok(d) => d,
                     Err(_) => return,
@@ -8338,7 +8338,7 @@ impl PlaybackOrchestrator {
                         };
                         let svc = svc.clone();
                         drop(registry);
-                        let svc = svc.lock().await;
+                        let svc = svc.read().await;
                         svc.get_track_url(&source_id, None).await.ok()
                     };
                     let Some(data) = resolved else {
