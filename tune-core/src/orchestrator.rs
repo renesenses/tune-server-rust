@@ -2040,69 +2040,105 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Faut-il envoyer le DSD tel quel au renderer ?
+    ///
+    /// Fonction PURE : le mode reglé, et ce que le sondage a repondu —
+    /// `Some(true)` / `Some(false)` sur une reponse concluante, `None` sinon. La
+    /// sonde reseau vit dans `sonder_dsd` ; ici il n'y a que la decision, donc
+    /// elle se teste.
+    ///
+    /// La subtilite est le troisieme cas. `None` ne veut PAS dire « non » : des
+    /// renderers lisent le DSD sans l'annoncer dans leur GetProtocolInfo.
+    /// Ecraser un reglage explicite sur une absence de reponse priverait de DSD
+    /// natif des gens qui l'avaient — la faute symetrique de celle qu'on
+    /// corrige (#2122).
+    pub(crate) fn decider_passthrough_dsd(mode: &str, annonce: Option<bool>) -> bool {
+        match mode {
+            "pcm" => false,
+            // `dop` n'est pas du passthrough : le renderer doit recevoir le DSD
+            // emballe en trames PCM, pas le .dsf brut.
+            "dop" => false,
+            // Choix explicite : on ne le renverse que sur un NON explicite.
+            "native" => annonce != Some(false),
+            // `auto` : sans reponse claire, on prend le chemin sur.
+            _ => annonce.unwrap_or(false),
+        }
+    }
+
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
         let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
-        match dsd_mode.as_str() {
-            "pcm" => false,
-            "native" => true,
-            // « dop » n'est PAS du passthrough natif : le renderer doit recevoir
-            // le DSD emballé en trames PCM, pas le .dsf brut. Ce mode tombait
-            // dans le fourre-tout « auto » ci-dessous, qui sondait l'appareil et
-            // concluait au transcodage PCM — la moitié invisible de #1772. Le
-            // flux DoP est produit dans `resolve_local_track` ; ici on garantit
-            // seulement qu'un choix explicite ne se transforme jamais en envoi
-            // natif, y compris sur un renderer qui sait lire le DSF.
-            "dop" => false,
-            _ => {
-                // Auto mode: probe renderer.
-                //
-                // Only a CONCLUSIVE probe goes into the cache. `probe_dsd_support`
-                // returns `None` when GetProtocolInfo failed or the Sink was
-                // empty, and a renderer that isn't a DLNA output (or has since
-                // left the map) is just as inconclusive. Caching those would
-                // pin the device to "no DSD" for the whole process lifetime —
-                // a single transient failure right after discovery would
-                // silently force DSD→PCM transcoding on a renderer that plays
-                // DSD natively, with no way to recover short of a restart.
-                // Same rule as `DlnaOutput::supports_mime`.
-                let mut cache = self.dsd_capabilities.lock().await;
-                if let Some(cap) = cache.get(device_id) {
-                    return cap.supports_dsf || cap.supports_dff;
-                }
-                let cap = {
-                    let arc = { self.outputs.lock().await.get(device_id) };
-                    match arc {
-                        Some(output) => {
-                            let locked = output.lock().await;
-                            match locked
-                                .as_any()
-                                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-                            {
-                                Some(dlna) => dlna.probe_dsd_support().await,
-                                None => None,
-                            }
-                        }
+        // Le sondage n'a de sens que si la decision peut en dependre : `pcm` et
+        // `dop` tranchent sans lui, inutile d'aller sur le reseau.
+        let annonce = match dsd_mode.as_str() {
+            "pcm" | "dop" => None,
+            _ => self.sonder_dsd(device_id).await,
+        };
+        let passthrough = Self::decider_passthrough_dsd(&dsd_mode, annonce);
+        // La ligne qui manquait : ce qui part VRAIMENT sur le fil. Sans elle, le
+        // seul événement DSD du journal était celui du DoP, qui ne décide de
+        // rien sur une sortie réseau (#2122).
+        info!(
+            zone_id,
+            device_id,
+            dsd_mode = %dsd_mode,
+            annonce_du_renderer = ?annonce,
+            passthrough,
+            "dsd_passthrough_decide"
+        );
+        if dsd_mode == "native" && annonce == Some(false) {
+            tracing::warn!(
+                zone_id,
+                device_id,
+                "dsd_native_demande_mais_le_renderer_ne_l_annonce_pas — repli sur \
+                 une conversion PCM. Sans ce repli, le flux DSD brut partirait vers \
+                 un appareil incapable de le lire, et la zone resterait \
+                 silencieuse (#2122)."
+            );
+        }
+        passthrough
+    }
+
+    /// Le renderer annonce-t-il savoir lire du DSD ?
+    ///
+    /// `Some(true)` / `Some(false)` sur un sondage CONCLUANT, `None` sinon —
+    /// et la distinction compte : `None` ne veut pas dire « non ».
+    ///
+    /// Extrait pour etre partage par `native` et `auto`. Les deux posaient la
+    /// meme question ; un seul la posait.
+    async fn sonder_dsd(&self, device_id: &str) -> Option<bool> {
+        // Seul un sondage CONCLUANT entre en cache. `probe_dsd_support` rend
+        // `None` quand GetProtocolInfo a echoue ou que le Sink etait vide, et un
+        // appareil qui n'est pas une sortie DLNA (ou qui a quitte la table)
+        // n'est pas plus concluant. Mettre ces cas en cache epinglerait
+        // l'appareil sur « pas de DSD » pour toute la vie du processus — un
+        // echec passager juste apres la decouverte forcerait silencieusement le
+        // transcodage PCM sur un renderer qui lit le DSD nativement, sans
+        // recours autre qu'un redemarrage. Meme regle que `DlnaOutput::supports_mime`.
+        let mut cache = self.dsd_capabilities.lock().await;
+        if let Some(cap) = cache.get(device_id) {
+            return Some(cap.supports_dsf || cap.supports_dff);
+        }
+        let cap = {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            match arc {
+                Some(output) => {
+                    let locked = output.lock().await;
+                    match locked
+                        .as_any()
+                        .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                    {
+                        Some(dlna) => dlna.probe_dsd_support().await,
                         None => None,
                     }
-                };
-                match cap {
-                    Some(cap) => {
-                        let result = cap.supports_dsf || cap.supports_dff;
-                        cache.insert(device_id.to_string(), cap);
-                        result
-                    }
-                    None => {
-                        // Inconclusive: fall back to the safe path (transcode to
-                        // PCM) for THIS track only, and re-probe next time.
-                        tracing::debug!(
-                            device_id,
-                            "dsd_probe_inconclusive_not_cached_falling_back_to_pcm"
-                        );
-                        false
-                    }
                 }
+                None => None,
             }
-        }
+        };
+        cap.map(|cap| {
+            let resultat = cap.supports_dsf || cap.supports_dff;
+            cache.insert(device_id.to_string(), cap);
+            resultat
+        })
     }
 
     async fn resolve_uploaded_file(
@@ -2898,13 +2934,21 @@ impl PlaybackOrchestrator {
         //
         // Tracé ici plutôt qu'en amont : c'est le seul endroit qui connaisse à
         // la fois le format de la source, le type de sortie et le mode réglé.
+        //
+        // Le nom de l'événement disait « sera converti en PCM ». C'était faux sur
+        // une sortie réseau : ici, seul le DoP est écarté. La conversion, elle,
+        // dépend de `should_dsd_passthrough`, plus bas — et en mode « native »
+        // elle n'avait PAS lieu. Le journal annonçait donc du PCM pendant qu'une
+        // URL `.dsd` partait sur le fil, ce qui a coûté trois diagnostics faux
+        // (#2122). L'événement dit maintenant ce qu'il sait vraiment ; la
+        // décision de conversion est tracée là où elle est prise.
         if source_format == Some(AudioFormat::Dsd) && !dop_requested {
             info!(
                 zone_id = req.zone_id,
                 dsd_mode = %dsd_mode,
                 is_local_output,
                 is_network_output,
-                "dsd_dop_not_requested_track_will_be_converted_to_pcm"
+                "dsd_dop_not_requested"
             );
         }
 
@@ -9052,6 +9096,79 @@ mod transcode_budget_tests {
         let huge_gib = 100.0_f64;
         let computed = (120 + (huge_gib * 120.0).round() as u64).min(ceiling);
         assert_eq!(computed, ceiling);
+    }
+}
+
+/// La regle de decision du passthrough DSD (#2122).
+///
+/// Les douze combinaisons : quatre modes croises avec les trois reponses
+/// possibles du sondage. La sonde reseau n'est pas testee ici — c'est
+/// justement pour la sortir du chemin qu'elle a ete extraite.
+#[cfg(test)]
+mod dsd_passthrough_tests {
+    use super::PlaybackOrchestrator as O;
+
+    /// Le defaut qui a rendu la zone muette : `native` reglé a la main, un
+    /// renderer qui repond noir sur blanc qu'il ne lit pas de DSD, et le flux
+    /// brut qui partait quand meme. Le repli PCM prime desormais.
+    #[test]
+    fn native_cede_devant_un_refus_explicite() {
+        assert!(!O::decider_passthrough_dsd("native", Some(false)));
+    }
+
+    /// La faute symetrique, celle qu'on ne veut PAS commettre en corrigeant :
+    /// un sondage muet n'est pas un refus. Le reglage explicite tient.
+    #[test]
+    fn native_tient_quand_le_sondage_ne_repond_pas() {
+        assert!(O::decider_passthrough_dsd("native", None));
+    }
+
+    #[test]
+    fn native_tient_quand_le_renderer_confirme() {
+        assert!(O::decider_passthrough_dsd("native", Some(true)));
+    }
+
+    /// `pcm` est un refus de l'utilisateur : aucune reponse du renderer ne le
+    /// renverse, pas meme un oui franc.
+    #[test]
+    fn pcm_refuse_quoi_que_reponde_le_renderer() {
+        for annonce in [Some(true), Some(false), None] {
+            assert!(
+                !O::decider_passthrough_dsd("pcm", annonce),
+                "pcm a laisse passer du DSD avec {annonce:?}"
+            );
+        }
+    }
+
+    /// `dop` non plus n'est pas du passthrough : le renderer doit recevoir le
+    /// DSD emballe en trames PCM, donc le fichier passe par la conversion.
+    #[test]
+    fn dop_n_est_pas_du_passthrough() {
+        for annonce in [Some(true), Some(false), None] {
+            assert!(
+                !O::decider_passthrough_dsd("dop", annonce),
+                "dop a laisse passer du DSD brut avec {annonce:?}"
+            );
+        }
+    }
+
+    /// `auto` suit le renderer, et sans reponse prend le chemin sur.
+    #[test]
+    fn auto_suit_le_sondage_et_se_replie_dans_le_doute() {
+        assert!(O::decider_passthrough_dsd("auto", Some(true)));
+        assert!(!O::decider_passthrough_dsd("auto", Some(false)));
+        assert!(!O::decider_passthrough_dsd("auto", None));
+    }
+
+    /// Un mode inconnu en base (valeur ecrite par une version future, champ
+    /// vide) doit se comporter comme `auto`, pas envoyer du DSD au hasard.
+    #[test]
+    fn un_mode_inconnu_se_comporte_comme_auto() {
+        assert!(!O::decider_passthrough_dsd("", None));
+        assert!(
+            !O::decider_passthrough_dsd("Native", None),
+            "la casse compte"
+        );
     }
 }
 
