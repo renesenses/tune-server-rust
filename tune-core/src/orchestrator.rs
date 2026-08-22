@@ -1652,12 +1652,17 @@ impl PlaybackOrchestrator {
             .save_play_state(req.zone_id, "playing")
             .ok();
 
-        // Multi-service now-playing dispatch with tier gating
-        self.dispatch_now_playing(
-            &resolved.title,
-            resolved.artist.as_deref(),
-            album.as_deref(),
-        );
+        // L'annonce « en écoute » N'EST PLUS ici : elle attend de savoir si la
+        // sortie a accepté le titre. Voir plus bas, après `output_sent`.
+        //
+        // Elle partait à cet endroit, c'est-à-dire AVANT toute tentative
+        // d'envoi. Chez Bilou (#1998), quatre échecs de sortie BluOS d'affilée
+        // ont produit quatre annonces à Last.fm pour un titre jamais entendu :
+        // `output_sent=false`, zone arrêtée sur-le-champ, session de flux
+        // fermée — et 233 ms plus tard « en écoute ».
+        //
+        // Le profil d'écoute est publié hors de chez l'utilisateur, sur un
+        // service tiers, sans correction commode. Une écoute inventée y reste.
 
         // For local outputs, keep the old stream alive until after play_url()
         // calls stop() — otherwise the audio thread gets a read error when the
@@ -1856,7 +1861,43 @@ impl PlaybackOrchestrator {
         // relation to what was heard, plus a fresh bogus row on every replay
         // click (Bilou). Station plays are already tracked in the radio_stations
         // table (record_play), so nothing is lost.
-        if record_history && resolved.source != "radio" {
+        // Ce que la sortie a refusé n'a été entendu nulle part.
+        //
+        // `output_sent` est établi juste au-dessus, et l'arrêt immédiat de la
+        // zone s'appuie déjà dessus quelques lignes plus bas : le signal
+        // existait, dans la même fonction, et ces deux écritures ne le
+        // consultaient pas.
+        //
+        // Le cas « aucune sortie configurée » rend lui aussi `false` (avec
+        // `no_output_device_id_skipping_send_to_output`) : ne rien annoncer y
+        // est également juste — le titre n'est parti vers aucun appareil.
+        if !output_sent {
+            debug!(
+                zone_id = req.zone_id,
+                title = %resolved.title,
+                "play_not_announced_output_not_sent"
+            );
+        }
+
+        // Annonce « en écoute » multi-service, avec palier de licence.
+        if output_sent {
+            self.dispatch_now_playing(
+                &resolved.title,
+                resolved.artist.as_deref(),
+                album.as_deref(),
+            );
+        }
+
+        // `record_listen` alimente `listen_history`, la statistique locale. Il
+        // souffrait du même défaut, et l'issue posait la question sans pouvoir
+        // la trancher sur les seuls journaux : oui, l'historique local était
+        // falsifié lui aussi.
+        //
+        // Le scrobble DÉFINITIF, lui, n'a jamais été concerné : il est
+        // déclenché par le poller une fois le seuil des 50 % / 4 min franchi
+        // (`dispatch_scrobble`, #1113), et une lecture qui n'a jamais démarré
+        // ne l'atteint pas. C'est la seconde question ouverte du ticket.
+        if output_sent && record_history && resolved.source != "radio" {
             // Owning profile = the zone's current session, set by the play
             // handler from X-Profile-Id and inherited by autoplay / gapless
             // advances (which reuse the zone without touching it). Resolved here
@@ -11383,5 +11424,110 @@ mod dop_routing_tests {
         // d'origine, qui ignorait le fichier de bout en bout.
         assert_eq!(dop_wire_params(Some((2_822_400, 6)), None, 2).1, 6);
         assert_eq!(dop_wire_params(Some((2_822_400, 1)), None, 2).1, 2);
+    }
+}
+
+/// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
+///
+/// Chez Bilou, quatre échecs de sortie BluOS d'affilée ont produit quatre
+/// annonces « en écoute » à Last.fm pour un titre jamais entendu. L'annonce
+/// partait AVANT la tentative d'envoi ; `output_sent` était établi vingt lignes
+/// plus bas, dans la même fonction, et l'arrêt immédiat de la zone s'appuyait
+/// déjà dessus.
+///
+/// Ce test relit la source plutôt que d'exercer le chemin de lecture : la
+/// propriété à tenir est un ORDRE et une CONDITION dans une fonction async de
+/// plusieurs centaines de lignes, et c'est exactement ce qu'un copier-coller
+/// ultérieur ré-inverse. Même procédé que `eq_refresh_guard` dans
+/// `tune-server/src/routes/mod.rs`, et pour la même raison.
+#[cfg(test)]
+mod annonce_apres_sortie_guard {
+    /// Le fichier PRIVÉ de ce module de test.
+    ///
+    /// ⚠️ La découpe n'est pas un détail. `include_str!` rend le fichier
+    /// ENTIER, module de test compris — et les motifs cherchés ci-dessous
+    /// figurent aussi, mot pour mot, dans les messages d'assertion. Un
+    /// `code_de_production().contains(...)` sur le fichier complet se trouve donc lui-même
+    /// et rend vrai quoi qu'il arrive.
+    ///
+    /// C'est vécu : la première version de ce garde-fou a survécu au sabotage
+    /// de la condition qu'elle prétendait garder. Un contrôle qui ne peut pas
+    /// dire non ne contrôle rien (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("orchestrator.rs");
+        const BORNE: &str = "mod annonce_apres_sortie_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    /// Position de la première occurrence, ou panique avec un message qui dit
+    /// quoi chercher — un garde-fou muet sur son propre désaccordage ne garde
+    /// rien.
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans orchestrator.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #1998."
+            )
+        })
+    }
+
+    /// `output_sent` doit être CONNU avant qu'on annonce quoi que ce soit.
+    #[test]
+    fn l_annonce_vient_apres_le_resultat_de_la_sortie() {
+        let resultat = position("let (output_sent, output_error) =");
+        let annonce = position("self.dispatch_now_playing(");
+        assert!(
+            resultat < annonce,
+            "`dispatch_now_playing` est appelé AVANT que `output_sent` soit \
+             connu : une sortie en échec annoncera de nouveau une écoute qui \
+             n'a pas eu lieu (#1998)."
+        );
+    }
+
+    /// Et il doit être CONSULTÉ, pas seulement connu.
+    #[test]
+    fn l_annonce_est_conditionnee_a_output_sent() {
+        assert!(
+            code_de_production()
+                .contains("if output_sent {\n            self.dispatch_now_playing("),
+            "`dispatch_now_playing` n'est plus gardé par `if output_sent` — \
+             l'annonce « en écoute » repartirait sur un envoi refusé (#1998)."
+        );
+    }
+
+    /// L'historique local souffrait du même défaut. C'était la question laissée
+    /// ouverte par le ticket ; la réponse est oui, et elle est corrigée ici.
+    #[test]
+    fn l_historique_local_est_conditionne_lui_aussi() {
+        assert!(
+            code_de_production().contains("if output_sent && record_history"),
+            "`record_listen` n'est plus gardé par `output_sent` : \
+             `listen_history` se remplirait de titres jamais joués (#1998)."
+        );
+    }
+
+    /// Le scrobble DÉFINITIF n'a jamais été concerné — il part du poller, une
+    /// fois le seuil des 50 % / 4 min franchi. Ce test épingle cette séparation
+    /// pour que personne ne la « répare » en le ramenant au démarrage : c'est
+    /// précisément ce que #1113 avait défait.
+    #[test]
+    fn le_scrobble_definitif_reste_hors_du_demarrage() {
+        let play = position("async fn play_inner(");
+        let src = code_de_production();
+        let apres = &src[play..];
+        let fin = apres
+            .find("\n    async fn ")
+            .or_else(|| apres.find("\n    pub async fn "))
+            .unwrap_or(apres.len());
+        assert!(
+            !apres[..fin].contains("dispatch_scrobble("),
+            "le scrobble définitif est reparti dans le chemin de démarrage : \
+             il scrobblerait un titre à la seconde où il commence, en ignorant \
+             la règle des 50 % / 4 min de Last.fm (#1113)."
+        );
     }
 }
