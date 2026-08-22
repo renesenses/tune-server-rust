@@ -264,9 +264,30 @@ fn est_notre_propre_renderer(
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
 fn nos_adresses() -> Vec<String> {
+    nos_adresses_depuis(
+        &tune_core::discovery::ssdp::local_ipv4_addresses(),
+        tune_core::discovery::ssdp::get_local_ip(),
+    )
+}
+
+/// L'assemblage seul, sans I/O — c'est lui que le test couvre.
+///
+/// `elue` est l'adresse que `get_local_ip()` retiendrait pour s'ANNONCER. Elle
+/// ne suffit pas à se RECONNAÎTRE : une annonce SSDP porte l'adresse de
+/// l'interface qui l'a émise, et sur une machine à plusieurs interfaces — Wi-Fi
+/// et Ethernet, pont Docker, tunnel VPN — ce n'est pas la même. On prend donc
+/// toutes les interfaces, et on garde l'élue en ceinture et bretelles pour le
+/// cas où l'énumération échoue (conteneur sans droits sur les interfaces).
+fn nos_adresses_depuis(
+    interfaces: &[std::net::Ipv4Addr],
+    elue: Option<std::net::Ipv4Addr>,
+) -> Vec<String> {
     let mut v = vec!["127.0.0.1".to_string(), "localhost".to_string()];
-    if let Some(ip) = tune_core::discovery::ssdp::get_local_ip() {
-        v.push(ip.to_string());
+    for ip in interfaces.iter().copied().chain(elue) {
+        let s = ip.to_string();
+        if !v.contains(&s) {
+            v.push(s);
+        }
     }
     v
 }
@@ -1747,6 +1768,66 @@ mod tests {
                 let loc = format!("http://192.168.1.10:8888/upnp/renderer/{zone}/description.xml");
                 assert!(est_notre_propre_renderer(&loc, 8888, 8888, &nos()), "{loc}");
             }
+        }
+
+        /// Le défaut que ce lot corrige, testé LÀ OÙ IL ÉTAIT : dans
+        /// l'assemblage de nos adresses, pas dans la comparaison.
+        ///
+        /// L'ancien code ne retenait que l'adresse élue. Une annonce arrivant
+        /// par une AUTRE de nos interfaces n'était donc pas reconnue comme
+        /// nôtre, et Tune adoptait son propre renderer comme un appareil du
+        /// réseau. Ce test échoue sur l'ancienne version : elle ne rendait que
+        /// la loopback et l'élue.
+        #[test]
+        fn toutes_nos_interfaces_comptent_pour_nous() {
+            use std::net::Ipv4Addr;
+            // Ethernet, Wi-Fi, pont Docker — une seule machine, trois adresses.
+            let interfaces = [
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 4, 22),
+                Ipv4Addr::new(172, 17, 0, 1),
+            ];
+            // L'élue est l'une d'elles : c'est le cas nominal.
+            let nous = super::super::nos_adresses_depuis(&interfaces, Some(interfaces[0]));
+
+            for ip in &interfaces {
+                let loc = format!("http://{ip}:8888/upnp/renderer/1/description.xml");
+                assert!(
+                    est_notre_propre_renderer(&loc, 8888, 8888, &nous),
+                    "annonce reçue par {ip} : c'est nous, et on ne se voyait pas"
+                );
+            }
+            // Les formes locales restent portées.
+            assert!(nous.iter().any(|a| a == "127.0.0.1"));
+            assert!(nous.iter().any(|a| a == "localhost"));
+            // Et aucune adresse en double.
+            let mut tri = nous.clone();
+            tri.sort();
+            tri.dedup();
+            assert_eq!(tri.len(), nous.len(), "doublons dans nos adresses");
+        }
+
+        /// Ceinture et bretelles : énumération vide (conteneur sans droits sur
+        /// les interfaces), l'élue reste une réponse valable.
+        #[test]
+        fn sans_enumeration_lelue_suffit_encore() {
+            use std::net::Ipv4Addr;
+            let nous = super::super::nos_adresses_depuis(&[], Some(Ipv4Addr::new(192, 168, 1, 10)));
+            let loc = "http://192.168.1.10:8888/upnp/renderer/1/description.xml";
+            assert!(est_notre_propre_renderer(loc, 8888, 8888, &nous));
+        }
+
+        /// Contre-épreuve : élargir la liste ne doit pas nous faire avaler les
+        /// voisins. Un autre serveur Tune du réseau reste pilotable.
+        #[test]
+        fn plusieurs_adresses_nexcluent_pas_un_autre_serveur() {
+            use std::net::Ipv4Addr;
+            let nous = super::super::nos_adresses_depuis(
+                &[Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(172, 17, 0, 1)],
+                None,
+            );
+            let loc = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nous));
         }
 
         /// La règle décisive : un AUTRE serveur Tune du réseau publie ses zones
