@@ -186,6 +186,27 @@ pub trait StreamingService: Send + Sync {
         let _ = artist_id;
         Ok(vec![])
     }
+    /// Une PAGE de la discographie, pour un « voir plus ».
+    ///
+    /// Ajoutée à côté de [`Self::get_artist_albums`] plutôt qu'en remplacement :
+    /// six services l'implémentent, et tous ne savent pas paginer. Le repli par
+    /// défaut rend la liste unique à `offset = 0` et **rien** au-delà — ce qui
+    /// arrête proprement le « voir plus » au lieu de renvoyer indéfiniment la
+    /// même première page.
+    ///
+    /// Un service qui sait paginer surcharge cette méthode ; les autres n'ont
+    /// rien à changer et ne régressent pas.
+    async fn get_artist_albums_page(
+        &self,
+        artist_id: &str,
+        offset: u32,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        if offset == 0 {
+            self.get_artist_albums(artist_id).await
+        } else {
+            Ok(vec![])
+        }
+    }
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let _ = artist_id;
         Ok(vec![])

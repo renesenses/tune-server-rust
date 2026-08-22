@@ -62,7 +62,10 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 /// the current track. A per-device back-off (≥60s between restarts, give up after
 /// 3 consecutive that don't recover → clean stop) prevents a restart loop on a
 /// permanently-dead source. History is cleared once a device plays cleanly again.
-#[cfg(feature = "oaat")]
+///
+/// NOTE : la doc de ce superviseur precede la fonction de reparation MP3 dans
+/// ce fichier ; son `#[cfg(feature = "oaat")]` est pose sur la definition, plus
+/// bas. Ne pas le remonter ici : il se reporterait sur l'element suivant.
 /// Réparer les durées MP3 rognées par la borne inversée (#2027, #2034).
 ///
 /// `mp3_duration_sanity_check` divisait la taille du fichier par le débit
@@ -212,6 +215,7 @@ fn spawn_mp3_duration_repair(state: &AppState) {
     });
 }
 
+#[cfg(feature = "oaat")]
 fn spawn_oaat_stall_supervisor(state: &AppState) {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};

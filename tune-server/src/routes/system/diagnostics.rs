@@ -56,8 +56,32 @@ fn lignes_utiles_pour_un_rapport(journal: &str, garder: usize) -> String {
             }
         }
     }
-    let debut = retenu.len().saturating_sub(garder);
-    retenu[debut..].join("\n")
+    // Le rapport passe désormais par la MÊME sélection que l'export (#1974) :
+    // un module ne peut occuper plus d'un quart de la fenêtre. Il ne l'avait
+    // pas, et il tronquait bêtement.
+    //
+    // Trois journaux de testeurs la même semaine l'exigeaient, et jamais avec
+    // le même coupable : chez Bilou, `tune_server::scan_import` et
+    // `tune_core::metadata` prenaient les deux tiers de 1 003 lignes — zéro
+    // ligne d'enrichissement ne survivait, alors que c'était le sujet de son
+    // signalement ; chez Jean Valjean, la boucle de sondage UPnP en prenait
+    // 807 sur 1 003. Plafonner le module tient quel que soit le bavard du
+    // jour, là où nommer les coupables un à un ne tient jamais longtemps.
+    //
+    // Écrire ici un SECOND mécanisme aurait été le vrai piège : deux réponses
+    // à la même question dérivent, et c'est exactement ce que la doctrine du
+    // dépôt interdit.
+    let candidates: Vec<String> = retenu.into_iter().map(str::to_owned).collect();
+    let (gardees, ecartees) = selectionner_lignes(candidates, garder);
+    let mut sortie = gardees.join("\n");
+    // Un rapport qui tait ce qu'il a laissé tomber se lit comme s'il avait
+    // tout montré — même règle que pour l'export.
+    for (module, combien) in ecartees {
+        sortie.push_str(&format!(
+            "\n… {combien} lignes de « {module} » écartées du rapport (elles sont dans l'export complet)"
+        ));
+    }
+    sortie
 }
 
 /// Le niveau d'une ligne de journal, quand elle en porte un.
@@ -1886,5 +1910,95 @@ mod selection_de_lignes {
     fn une_fenetre_nulle_ne_panique_pas() {
         let (retenues, _) = selectionner_lignes(journal_de_bilou(), 0);
         assert!(retenues.is_empty());
+    }
+
+    // --- #2028, dernier volet : le rapport hérite du quota par module ---
+
+    fn ligne_de(module: &str, n: usize) -> String {
+        format!(
+            "2026-08-20T09:03:{:02}.000+02:00  INFO {module}: evenement n={n}",
+            n % 60
+        )
+    }
+
+    /// Le cœur du défaut : chez Bilou, 311 lignes de `scan_import` et 322 de
+    /// `metadata` ne laissaient AUCUNE ligne d'enrichissement dans le rapport
+    /// — alors que l'enrichissement était l'objet de son signalement.
+    #[test]
+    fn le_bavard_ne_chasse_plus_la_ligne_qui_compte_du_rapport() {
+        let mut journal = String::new();
+        for i in 0..311 {
+            journal.push_str(&ligne_de("tune_server::scan_import", i));
+            journal.push('\n');
+        }
+        for i in 0..322 {
+            journal.push_str(&ligne_de("tune_core::metadata", i));
+            journal.push('\n');
+        }
+        journal.push_str(
+            "2026-08-20T09:13:00.000+02:00  INFO tune_core::enrichment: batch_artist_mbid_match_started count=7837\n",
+        );
+
+        let rapport = lignes_utiles_pour_un_rapport(&journal, 200);
+        assert!(
+            rapport.contains("batch_artist_mbid_match_started"),
+            "la ligne rare doit survivre au vacarme"
+        );
+    }
+
+    /// Le décompte ne rapporte QUE le déplacement — ce que le quota a coûté à
+    /// d'autres — et pas le débordement de fenêtre, qui est son fonctionnement
+    /// normal. Il faut donc un vrai cas de sauvetage : un module ancien que le
+    /// bavard aurait entièrement chassé, et que le quota ramène.
+    #[test]
+    fn le_rapport_dit_ce_que_le_quota_a_deplace() {
+        let mut journal = String::new();
+        // Anciennes, et hors de la fenêtre simple : elles n'y seraient jamais.
+        for i in 0..50 {
+            journal.push_str(&ligne_de("tune_core::orchestrator", i));
+            journal.push('\n');
+        }
+        // Récentes, assez nombreuses pour remplir la fenêtre à elles seules.
+        for i in 0..300 {
+            journal.push_str(&ligne_de("tune_server::scan_import", i));
+            journal.push('\n');
+        }
+
+        let rapport = lignes_utiles_pour_un_rapport(&journal, 200);
+        assert!(
+            rapport.contains("tune_core::orchestrator"),
+            "le module ancien doit être sauvé par son quota"
+        );
+        assert!(rapport.contains("écartées du rapport"), "{rapport}");
+        assert!(
+            rapport.contains("tune_server::scan_import"),
+            "et c'est le bavard qui a cédé la place : {rapport}"
+        );
+        assert!(rapport.contains("export complet"), "{rapport}");
+    }
+
+    #[test]
+    fn un_journal_calme_traverse_le_rapport_sans_rien_perdre() {
+        // Le quota ne doit pas s'inviter là où personne ne monopolise rien :
+        // à taille égale, le rapport ne dit jamais moins qu'avant.
+        let mut journal = String::new();
+        for i in 0..20 {
+            journal.push_str(&ligne_de("tune_core::orchestrator", i));
+            journal.push('\n');
+        }
+        let rapport = lignes_utiles_pour_un_rapport(&journal, 200);
+        assert_eq!(rapport.lines().count(), 20);
+        assert!(!rapport.contains("écartées"), "rien à annoncer : {rapport}");
+    }
+
+    #[test]
+    fn le_niveau_filtre_toujours_avant_le_quota() {
+        // L'ordre compte : plafonner d'abord laisserait du DEBUG occuper un
+        // quota au détriment d'un WARN.
+        let journal = "2026-08-20T09:03:00.000+02:00 DEBUG tune_core::discovery::ssdp: sonde a=1\n\
+                       2026-08-20T09:03:01.000+02:00  WARN tune_core::outputs::bluos: add_rejected b=2\n";
+        let rapport = lignes_utiles_pour_un_rapport(journal, 200);
+        assert!(rapport.contains("add_rejected"));
+        assert!(!rapport.contains("sonde a=1"));
     }
 }
