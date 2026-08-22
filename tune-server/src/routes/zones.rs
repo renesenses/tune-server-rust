@@ -636,6 +636,20 @@ const BROWSER_UNATTENDED_GRACE: std::time::Duration = std::time::Duration::from_
 /// - `"browser_unattended"` — zone navigateur en lecture depuis assez
 ///   longtemps pour que ce ne soit plus un démarrage, dont pas un octet n'a
 ///   été tiré : l'onglet qui devait jouer n'est pas là.
+/// Les VU-mètres de cette zone ont-ils une source ?
+///
+/// Le client ne peut pas distinguer « aucune mesure sur ce chemin » de « des
+/// mesures qui n'arrivent pas encore » : dans les deux cas l'aiguille ne bouge
+/// pas. Une aiguille figée MENT — elle annonce un signal constant. Grisée, elle
+/// dit la vérité : on ne mesure pas ici. D'où ce champ, que le serveur seul
+/// peut renseigner. Cas unique aujourd'hui : OAAT en DSD natif (Xavier/Zicmu).
+pub(crate) async fn levels_available(state: &AppState, zone: &Zone) -> bool {
+    state
+        .orchestrator
+        .output_produces_levels(zone.output_device_id.as_deref())
+        .await
+}
+
 pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
     // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
     // On ne le demande au streamer que pour une zone navigateur en lecture,
@@ -1476,6 +1490,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "output_reach".into(),
                 json!(output_reach(&state, z, &ps).await),
             );
+            obj.insert(
+                "levels_available".into(),
+                json!(levels_available(&state, z).await),
+            );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -1616,6 +1634,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "output_reach".into(),
                     json!(output_reach(&state, &zone, &ps).await),
+                );
+                obj.insert(
+                    "levels_available".into(),
+                    json!(levels_available(&state, &zone).await),
                 );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.

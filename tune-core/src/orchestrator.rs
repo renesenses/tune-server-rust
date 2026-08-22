@@ -8047,6 +8047,38 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Cette sortie produit-elle des niveaux exploitables ?
+    ///
+    /// `false` sur le seul chemin qui n'en produit aucun : OAAT en DSD natif,
+    /// où la sortie ouvre le `.dsf` elle-même et expédie du 1 bit sans que
+    /// personne ne décode. Les VU-mètres n'y reçoivent rien — l'aiguille reste
+    /// où elle est, ce qui se lit comme une panne alors que c'est une absence
+    /// de mesure. Le client ne peut pas deviner la différence entre « pas de
+    /// niveaux » et « des niveaux qui tardent » : c'est au serveur de le dire.
+    ///
+    /// Rendre du DSD en PCM en parallèle rien que pour animer deux aiguilles
+    /// coûterait, pendant l'écoute, exactement le décodage qu'on a retiré de
+    /// ce chemin (blocage Zicmu, `dsd_streaming_send_timeout`).
+    pub async fn output_produces_levels(&self, device_id: Option<&str>) -> bool {
+        let Some(device_id) = device_id else {
+            return true;
+        };
+        #[cfg(feature = "oaat")]
+        if device_id.starts_with("oaat:") {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            if let Some(arc) = arc {
+                let output = arc.lock().await;
+                if let Some(oaat) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                {
+                    return !oaat.is_native_dsd_active();
+                }
+            }
+        }
+        true
+    }
+
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
@@ -10029,6 +10061,29 @@ mod tests {
             passthrough_didl_duration_ms(Some(f64::NAN), 180_000),
             180_000
         );
+    }
+
+    /// Une zone sans sortie, ou une sortie qui n'est pas OAAT, mesure :
+    /// `false` est réservé au seul chemin qui ne produit rien.
+    ///
+    /// Le cas DSD natif lui-même se teste là où vit le drapeau
+    /// (`outputs::oaat::integration_test`) : il demande une sortie OAAT
+    /// enregistrée, pas un orchestrateur nu.
+    #[tokio::test]
+    async fn sans_sortie_ou_hors_oaat_on_mesure() {
+        let orch = test_orchestrator();
+        assert!(orch.output_produces_levels(None).await);
+        for did in [
+            "local:Haut-parleurs",
+            "dlna:uuid:1234",
+            "airplay:salon",
+            "oaat:zicmu", // enregistré nulle part : on ne conclut pas à l'absence
+        ] {
+            assert!(
+                orch.output_produces_levels(Some(did)).await,
+                "{did} : rien ne prouve que cette sortie ne mesure pas"
+            );
+        }
     }
 
     fn test_orchestrator() -> PlaybackOrchestrator {
