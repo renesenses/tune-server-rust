@@ -2345,11 +2345,18 @@ async fn create_zone(
                     }
                 }
                 let _ = repo.update_online(id, true);
-                let zone = repo.get(id).ok().flatten();
-                let v = zone
-                    .as_ref()
-                    .map(|z| serde_json::to_value(z).unwrap_or_default())
-                    .unwrap_or(json!({"id": id}));
+                // Le contrat client AVEC l'etat REEL. Une zone qui existe deja
+                // peut etre en train de jouer : lui coller `state: "stopped"`
+                // serait un second mensonge apres le volume. `build_zone_json`
+                // sait deja produire ce contrat — s'en servir evite une
+                // troisieme copie a faire deriver (#2284, revue JP Robbe).
+                let v = crate::routes::playback::build_zone_json(&state, id).await;
+                // Une zone masquee qui reapparait est un evenement : sans
+                // annonce, les autres clients connectes ne la voient qu'au
+                // prochain refetch independant.
+                state
+                    .event_bus
+                    .emit("zone.updated", json!({ "zone_id": id }));
                 info!(zone_id = id, device_id, "zone_already_exists_returning");
                 return (StatusCode::OK, Json(v)).into_response();
             }
@@ -2440,11 +2447,11 @@ async fn create_zone(
                         let _ = repo.unhide(id);
                         let _ = repo.update_name(id, &body.name);
                         let _ = repo.update_online(id, true);
-                        let zone = repo.get(id).ok().flatten();
-                        let v = zone
-                            .as_ref()
-                            .map(|z| serde_json::to_value(z).unwrap_or_default())
-                            .unwrap_or(json!({"id": id}));
+                        // Meme contrat, meme raison qu'au-dessus (#2284).
+                        let v = crate::routes::playback::build_zone_json(&state, id).await;
+                        state
+                            .event_bus
+                            .emit("zone.updated", json!({ "zone_id": id }));
                         return (StatusCode::OK, Json(v)).into_response();
                     }
                 }
@@ -4361,5 +4368,75 @@ mod charge_utile_zone_guard {
             "{etats} charge(s) utile(s) de zone, mais {repetition} portent \
              `repeat` : même divergence, autre réglage."
         );
+    }
+}
+
+#[cfg(test)]
+mod contrat_des_retours_anticipes {
+    use crate::state::AppState;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    /// Et le VERROU de branchement, sans lequel le test ci-dessous ne prouve
+    /// rien : il valide `build_zone_json`, pas le fait que les retours
+    /// anticipés s'en servent. Rebrancher un `to_value(z)` le laisserait vert.
+    ///
+    /// C'est le même écart que JP a relevé quatre fois cette nuit — tester que
+    /// la fonction marche, pas qu'on l'appelle.
+    #[test]
+    fn les_retours_anticipes_passent_par_le_contrat() {
+        let src = std::fs::read_to_string(std::path::Path::new("src/routes/zones.rs"))
+            .expect("zones.rs doit être lisible depuis la racine du crate");
+        let debut = src
+            .find("async fn create_zone(")
+            .expect("create_zone doit exister");
+        let fin = src[debut..]
+            .find("\nasync fn ")
+            .map(|i| debut + i)
+            .unwrap_or(src.len());
+        let corps = &src[debut..fin];
+
+        assert_eq!(
+            corps.matches("build_zone_json(").count(),
+            2,
+            "les DEUX retours anticipés doivent passer par le contrat client : \
+             zone déjà associée au device, et rattrapage après collision UNIQUE"
+        );
+        assert!(
+            !corps.contains("serde_json::to_value(z)"),
+            "un retour anticipé sérialise encore la ligne brute : volume 50 au \
+             lieu de 0.5, et les six champs d'état absents (#2284)"
+        );
+    }
+
+    /// La contre-épreuve de JP Robbe sur #2284 : une zone qui existe déjà doit
+    /// ressortir dans le CONTRAT client, pas dans la forme brute de la base.
+    ///
+    /// Les deux retours anticipés de `POST /zones` — zone déjà associée au
+    /// `output_device_id`, et rattrapage après collision `UNIQUE` — faisaient un
+    /// `serde_json::to_value(&zone)` : `volume: 50` au lieu de `0.5`, et les six
+    /// champs d'état absents. Le client ajoute cet objet à son magasin, donc le
+    /// curseur repartait au maximum malgré #2278.
+    #[tokio::test]
+    async fn une_zone_existante_ressort_au_contrat_client() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let id = repo
+            .create("Salon", Some("dlna"), Some("uuid:abcd"))
+            .unwrap();
+        repo.update_volume(id, 50).unwrap();
+
+        let v = crate::routes::playback::build_zone_json(&state, id).await;
+
+        assert_eq!(
+            v.get("volume").and_then(|x| x.as_f64()),
+            Some(0.5),
+            "volume en contrat client (0..1), pas la valeur de la base"
+        );
+        for champ in ["state", "current_track", "position_ms", "queue_length"] {
+            assert!(
+                v.get(champ).is_some(),
+                "{champ} absent : le client garderait la valeur d'une autre zone"
+            );
+        }
     }
 }
