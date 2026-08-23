@@ -10170,6 +10170,7 @@ mod tests {
                 gain: 8.0,
                 q: 0.71,
                 band_type: "low_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };

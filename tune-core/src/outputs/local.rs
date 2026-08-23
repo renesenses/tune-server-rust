@@ -5280,6 +5280,7 @@ mod tests {
                 gain: -12.0,
                 q: 0.71,
                 band_type: "high_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -5439,6 +5440,7 @@ mod tests {
                 gain: -12.0,
                 q: 0.71,
                 band_type: "high_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
