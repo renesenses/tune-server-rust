@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::streaming::traits::StreamingService;
 
@@ -23,7 +23,7 @@ struct LimitQuery {
 async fn get_svc(
     state: &AppState,
     name: &str,
-) -> Result<Arc<Mutex<Box<dyn StreamingService>>>, (StatusCode, String)> {
+) -> Result<Arc<RwLock<Box<dyn StreamingService>>>, (StatusCode, String)> {
     let registry = state.services.lock().await;
     registry
         .get(name)
@@ -79,7 +79,10 @@ macro_rules! with_svc {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
-        let $svc = arc.lock().await;
+        // `.read()` : les gestionnaires en lecture ne peuvent PAS muter — leurs
+        // methodes sont en `&self` — donc l'exclusivite du Mutex leur etait
+        // inutile et les serialisait pour rien (#1969).
+        let $svc = arc.read().await;
         svc_response($body)
     }};
 }
@@ -96,7 +99,7 @@ macro_rules! with_svc_editorial {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
-        let $svc = arc.lock().await;
+        let $svc = arc.read().await;
         svc_response_editorial($body)
     }};
 }
@@ -106,7 +109,10 @@ macro_rules! with_svc_mut {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
-        let mut $svc = arc.lock().await;
+        // `.write()` : ces gestionnaires appellent des methodes `&mut self`
+        // (rafraichissement de jeton, favoris, deconnexion). Le compilateur le
+        // fait respecter — un `&mut self` ne compile pas sous un `.read()`.
+        let mut $svc = arc.write().await;
         svc_response($body)
     }};
 }
@@ -255,7 +261,7 @@ async fn service_artist(
         Err(e) => return e.into_response(),
     };
     let result = {
-        let svc = arc.lock().await;
+        let svc = arc.read().await;
         svc.get_artist(&artist_id).await
     };
 
@@ -586,7 +592,7 @@ async fn service_status(State(state): State<AppState>, Path(service): Path<Strin
         Err(e) => return e.into_response(),
     };
 
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     let mut status = svc.auth_status().await;
     if !status.authenticated
         && let Ok(poll_status) = svc.authenticate(&json!({"poll": true})).await
@@ -622,7 +628,7 @@ async fn service_auth(
         Err(e) => return e.into_response(),
     };
 
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     let credentials = body.unwrap_or(json!({"device_flow": true}));
 
     match svc.authenticate(&credentials).await {
@@ -674,7 +680,7 @@ async fn auth_poll_status(State(state): State<AppState>, Path(service): Path<Str
         Err(e) => return e.into_response(),
     };
 
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     let poll_creds = json!({"poll": true});
     match svc.authenticate(&poll_creds).await {
         Ok(status) => {
@@ -705,7 +711,7 @@ async fn service_logout(State(state): State<AppState>, Path(service): Path<Strin
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     svc.logout().await.ok();
     drop(svc);
     state.save_tokens().await;
@@ -720,7 +726,7 @@ async fn service_track_url(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
 
     match svc.get_track_url(&track_id, None).await {
         Ok(url) => Json(json!(url)).into_response(),
@@ -738,7 +744,7 @@ async fn service_track_url(
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 match svc.get_track_url(&track_id, None).await {
                     Ok(url) => Json(json!(url)).into_response(),
                     Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -771,7 +777,7 @@ async fn service_favorites(
             return Json(empty).into_response();
         }
     };
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     let result = match fav_type.as_str() {
         "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
         "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
@@ -797,7 +803,7 @@ async fn service_favorites(
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 let retry = match fav_type.as_str() {
                     "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
                     "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
@@ -821,7 +827,7 @@ async fn service_favorites(
 
 async fn service_enable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     if let Ok(svc) = get_svc(&state, &service).await {
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
         svc.set_enabled(true);
     }
 
@@ -834,7 +840,7 @@ async fn service_enable(State(state): State<AppState>, Path(service): Path<Strin
 
 async fn service_disable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     if let Ok(svc) = get_svc(&state, &service).await {
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
         svc.set_enabled(false);
     }
 
@@ -850,7 +856,7 @@ async fn service_auth_url(State(state): State<AppState>, Path(service): Path<Str
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     match svc.authenticate(&json!({"device_flow": true})).await {
         Ok(status) => Json(json!({
             "url": status.verification_url,
@@ -902,7 +908,7 @@ async fn spotify_callback(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
     match svc
         .authenticate(&json!({"code": code, "state": q.state}))
         .await
@@ -954,7 +960,7 @@ async fn tidal_callback(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.lock().await;
+    let mut svc = svc.write().await;
 
     // Use authenticate with the code+state credentials (same pattern as Spotify)
     match svc
@@ -1047,7 +1053,7 @@ async fn compare_services(
                 continue;
             }
         };
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         match svc.search(query, 10).await {
             Ok(sr) => {
                 results.insert(

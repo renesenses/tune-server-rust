@@ -1016,6 +1016,35 @@ async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
     }
 }
 
+/// TOUTES nos adresses IPv4, une par interface non-loopback.
+///
+/// `get_local_ip()` n'en rend qu'UNE : celle par laquelle on sortirait vers
+/// l'extérieur. C'est le bon choix pour s'ANNONCER, et le mauvais pour se
+/// RECONNAÎTRE. Une annonce SSDP porte l'adresse de l'interface qui l'a émise,
+/// pas celle qu'on aurait élue : sur une machine à plusieurs interfaces — Wi-Fi
+/// et Ethernet, pont Docker, tunnel VPN — les deux diffèrent, et Tune ne se
+/// reconnaît pas dans sa propre annonce.
+///
+/// La loopback est exclue : `nos_adresses()` la porte déjà sous ses deux formes
+/// écrites, et une IP de loopback n'apparaît jamais dans une annonce reçue du
+/// réseau.
+pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let mut v = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V4(ip) = iface.ip()
+                && !v.contains(&ip)
+            {
+                v.push(ip);
+            }
+        }
+    }
+    v
+}
+
 pub fn get_local_ip() -> Option<Ipv4Addr> {
     // --- Step 1: UDP connect probe (follows the OS default route → real LAN) ---
     let probe_ip = udp_probe_ip();

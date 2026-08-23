@@ -202,6 +202,12 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             "output_reach".into(),
             json!(crate::routes::zones::output_reach(state, zone, &zone_state).await),
         );
+        // Les VU ont-ils une source ? Même champ que GET /zones et
+        // GET /zones/{id} : trois surfaces, une seule vérité.
+        v.as_object_mut().unwrap().insert(
+            "levels_available".into(),
+            json!(crate::routes::zones::levels_available(state, zone).await),
+        );
     }
     if is_browser_zone {
         if let Some(ref np) = zone_state.now_playing {
@@ -705,7 +711,7 @@ async fn play(
                     .into_response();
             }
         };
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let tracks = match svc.get_album_tracks(album_id).await {
             Ok(t) => t,
             Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -807,7 +813,7 @@ async fn play(
                     .into_response();
             }
         };
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let tracks = match svc.get_playlist_tracks(playlist_id).await {
             Ok(t) => t,
             Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -1686,7 +1692,7 @@ async fn resolve_streaming_queue_meta(
 
     let registry = state.services.lock().await;
     if let Some(svc) = registry.get(source) {
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         if let Ok(t) = svc.get_track(source_id).await {
             return StreamingQueueMeta {
                 title: t.title,
