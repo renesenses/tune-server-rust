@@ -572,11 +572,18 @@ async fn stream_to_airplay(
     let pcm_be: Vec<u8> = echantillons
         .iter()
         .flat_map(|&s| {
-            let s16 = match decoded.bit_depth {
-                24 => (s >> 8) as i16,
-                32 => (s >> 16) as i16,
-                _ => s as i16,
+            // SATURER, jamais reboucler. Le repli 5.1 somme jusqu'a ~2,4 fois
+            // la pleine echelle (avant + 0,707 x centre + surrounds) : borner a
+            // `i32` dans `to_stereo_i32` ne protege donc PAS la conversion
+            // finale, et `s as i16` rebouclait — 13563 la ou il fallait 32767,
+            // c'est-a-dire une distorsion franche sur les passages forts
+            // (JP Robbe, revue de #2281).
+            let brut = match decoded.bit_depth {
+                24 => s >> 8,
+                32 => s >> 16,
+                _ => s,
             };
+            let s16 = brut.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             s16.to_be_bytes()
         })
         .collect();
@@ -623,6 +630,27 @@ async fn stream_to_airplay(
         let target = start_time
             + std::time::Duration::from_micros(total_frames * 1_000_000 / SAMPLE_RATE as u64);
         tokio::time::sleep_until(target).await;
+    }
+
+    // Le dernier paquet PARTIEL. La boucle ci-dessus s'arrete des qu'il reste
+    // moins d'un paquet plein, donc jusqu'a 351 trames — 8 ms a 44,1 kHz —
+    // etaient jetees a chaque fin de piste (critere de #2237, releve par
+    // JP Robbe).
+    //
+    // RTP n'impose pas une taille de charge utile fixe : un paquet plus court
+    // est valide, et c'est ce que fait tout emetteur en fin de flux. On garde
+    // l'alignement sur les trames, seule contrainte reelle du L16.
+    let reste = pcm_be.len() - offset;
+    if reste >= BYTES_PER_FRAME && !stop_rx.try_recv().is_ok() {
+        let trames = reste / BYTES_PER_FRAME;
+        let fin = offset + trames * BYTES_PER_FRAME;
+        let pkt = build_rtp_packet(seq, timestamp, ssrc, &pcm_be[offset..fin]);
+        if let Err(e) = udp.send(&pkt).await {
+            debug!(error = %e, "airplay_rtp_send_error");
+        }
+        total_frames += trames as u64;
+        position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
+        debug!(trames, "airplay_dernier_paquet_partiel");
     }
 
     Ok(())

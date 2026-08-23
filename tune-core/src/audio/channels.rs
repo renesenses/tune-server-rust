@@ -532,3 +532,49 @@ mod stereo_i32_tests {
         assert_eq!(to_stereo_i32(&[7, 8, 9], 3), vec![7, 8]);
     }
 }
+
+#[cfg(test)]
+mod saturation_l16_tests {
+    use super::to_stereo_i32;
+
+    /// La contre-épreuve de JP Robbe sur #2281 : un 5.1 **16 bits** à pleine
+    /// échelle, replié puis converti en L16, doit SATURER à 32767 et non
+    /// reboucler.
+    ///
+    /// `to_stereo_i32` borne à `i32`, ce qui ne protège pas la conversion
+    /// finale en `i16` : la somme du repli atteint ~2,4 fois la pleine échelle,
+    /// et `s as i16` rebouclait — 13563 mesuré au lieu de 32767, soit une
+    /// distorsion franche sur les passages forts.
+    #[test]
+    fn un_51_a_pleine_echelle_sature_au_lieu_de_reboucler() {
+        let plein = i16::MAX as i32; // source 16 bits
+        // fl, fr, centre, LFE, sl, sr — tous à fond.
+        let trame = [plein, plein, plein, plein, plein, plein];
+        let stereo = to_stereo_i32(&trame, 6);
+        assert_eq!(stereo.len(), 2);
+
+        // La somme dépasse largement i16 : c'est normal, elle est en i32.
+        assert!(
+            stereo[0] > plein,
+            "le repli doit bien sommer avant saturation : {}",
+            stereo[0]
+        );
+
+        // Ce que fait la conversion L16 d'AirPlay.
+        let en_l16 = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        assert_eq!(
+            en_l16(stereo[0]),
+            i16::MAX,
+            "la conversion L16 doit saturer, pas reboucler"
+        );
+        assert_eq!(en_l16(stereo[1]), i16::MAX);
+
+        // Et la contre-épreuve du défaut : le cast nu reboucle.
+        let cast_nu = stereo[0] as i16;
+        assert_ne!(
+            cast_nu,
+            i16::MAX,
+            "si le cast nu saturait, ce test ne prouverait rien"
+        );
+    }
+}
