@@ -12,66 +12,207 @@
 
 use std::path::Path;
 
+fn source() -> String {
+    std::fs::read_to_string(Path::new("src/outputs/local.rs"))
+        .expect("src/outputs/local.rs doit être lisible depuis la racine du crate")
+}
+
+/// La production seule : `mod tests` contient les mêmes appels et rendrait
+/// toute assertion de comptage triviale. Ma première version de
+/// `la_boucle_gapless_applique_le_dsp` allait jusqu'à la fin du fichier et
+/// restait verte en débranchant un site.
+fn production(src: &str) -> &str {
+    src.split("mod tests").next().unwrap_or(src)
+}
+
 #[test]
 fn play_url_remet_le_convolveur_a_zero() {
-    let src = std::fs::read_to_string(Path::new("src/outputs/local.rs"))
-        .expect("src/outputs/local.rs doit être lisible depuis la racine du crate");
-
+    let src = source();
     let debut = src
         .find("async fn play_url(")
         .expect("play_url doit exister — s'il a été renommé, ce test doit suivre");
     // Une fenêtre large : l'appel est en tête de fonction, juste après `stop()`.
     let fin = (debut + 4000).min(src.len());
-    let corps = &src[debut..fin];
 
     assert!(
-        corps.contains("reset_local_dsp(&self.convolver)"),
+        src[debut..fin].contains("reset_local_dsp(&self.convolver)"),
         "play_url n'appelle plus reset_local_dsp : la queue d'une piste \
          repartira dans la suivante (#2268, revue JP Robbe)"
     );
 }
 
-/// Et le drainage doit rester BRANCHÉ, sur les quatre chemins.
+/// Le drainage doit rester BRANCHÉ sur les chemins qui TERMINENT une piste.
 ///
 /// `flush_local_dsp` a existé pendant une PR entière sans un seul appel de
 /// production — le compilateur le signalait, et je ne l'ai pas lu (JP Robbe,
 /// revue de #2277). Un test qui appelle le helper directement ne peut pas voir
 /// ça : c'est le NOMBRE de points d'appel qu'il faut tenir.
 ///
-/// Quatre chemins de lecture locale appliquent le DSP, donc quatre doivent
-/// drainer : le chemin d'un seul tenant, les deux chemins en continu, et le
-/// chemin exclusif.
+/// ⚠️ L'invariant n'est PAS « autant de drainages que d'applications du DSP ».
+/// Les deux sites de la boucle gapless appliquent le DSP et ne doivent
+/// SURTOUT PAS drainer : une transition gapless est un flux continu, et vider
+/// le convolveur y insérerait la queue de la piste précédente (#2296). On
+/// compte donc les applications qui précèdent le point de chaînage.
 #[test]
-fn les_quatre_chemins_drainent_le_convolveur() {
-    let src = std::fs::read_to_string(Path::new("src/outputs/local.rs"))
-        .expect("src/outputs/local.rs doit être lisible depuis la racine du crate");
+fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
+    let src = source();
+    let prod = production(&src);
+    let chainage = prod
+        .find("local_audio_gapless_chaining_next_track")
+        .unwrap_or(prod.len());
 
-    // La définition ne compte pas, ni l'appel du test unitaire voisin.
-    let appels = src.matches("flush_local_dsp(").count();
-    let definition = 1;
-    let dans_les_tests = src
-        .split("mod tests")
-        .nth(1)
-        .map(|t| t.matches("flush_local_dsp(").count())
-        .unwrap_or(0);
-    let production = appels - definition - dans_les_tests;
-
-    let applications = src.matches("apply_local_dsp(").count()
-        - 1
-        - src
-            .split("mod tests")
-            .nth(1)
-            .map(|t| t.matches("apply_local_dsp(").count())
-            .unwrap_or(0);
+    let drainages = prod.matches("flush_local_dsp(").count() - 1; // moins la définition
+    let applications = prod[..chainage].matches("apply_local_dsp(").count() - 1; // idem
 
     assert_eq!(
-        production, applications,
-        "{production} drainage(s) pour {applications} application(s) du DSP : \
-         un chemin applique le convolveur sans jamais rendre ce qu'il retient, \
-         donc tronque la fin de sa piste (#2209)"
+        drainages, applications,
+        "{drainages} drainage(s) pour {applications} chemin(s) qui terminent une \
+         piste : un chemin applique le convolveur sans jamais rendre ce qu'il \
+         retient, donc tronque la fin de sa piste (#2209)"
     );
     assert!(
-        production >= 4,
-        "les quatre chemins de lecture locale doivent drainer, {production} trouvé(s)"
+        drainages >= 4,
+        "les quatre chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
+    );
+}
+
+/// Les pistes CHAÎNÉES en gapless doivent traverser le DSP elles aussi.
+///
+/// Les deux sites de la boucle gapless faisaient `adapt_channels` →
+/// `rubato_resample_chunk` → `feed_ring` **sans** `apply_local_dsp` : seule la
+/// première piste d'un album passait par l'EQ, la convolution et le crossfeed,
+/// toutes les suivantes partaient sèches (JP Robbe, #2296).
+///
+/// Ce défaut est antérieur à #2290 — il ne venait pas du drainage, mais il ne
+/// se voyait pas tant que personne ne regardait la chaîne complète.
+#[test]
+fn la_boucle_gapless_applique_le_dsp() {
+    let src = source();
+    let prod = production(&src);
+    let debut = prod
+        .find("local_audio_gapless_chaining_next_track")
+        .expect("le point de chaînage gapless doit exister");
+
+    assert_eq!(
+        prod[debut..].matches("apply_local_dsp(").count(),
+        2,
+        "les deux sites de la boucle gapless — premier bloc et boucle \
+         principale — doivent appliquer le DSP, sinon une correction de pièce \
+         cesse de s'appliquer après la première piste d'un album (#2296)"
+    );
+}
+
+/// Et le drainage ne doit PAS avoir lieu avant une transition gapless :
+/// `Convolver::flush()` remet le moteur à zéro, or le gapless est un flux
+/// continu.
+///
+/// ⚠️ Vérifier que `une_piste_suit` EXISTE ne prouve rien : la variable
+/// pourrait rester là, inutilisée, ou commander l'inverse. On verrouille donc
+/// l'ORDRE des deux branches — piste suivante ⇒ rien à drainer, sinon on
+/// draine. Inverser la condition fait tomber ce test.
+#[test]
+fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
+    let src = source();
+    let prod = production(&src).to_string();
+
+    let garde = prod
+        .find("let une_piste_suit")
+        .expect("le drainage doit être gardé par `une_piste_suit` (#2296)");
+    let bloc = &prod[garde..(garde + 600).min(prod.len())];
+
+    let vide = bloc
+        .find("Vec::new()")
+        .expect("la branche « une piste suit » doit rendre une queue VIDE (#2296)");
+    let draine = bloc
+        .find("flush_local_dsp(")
+        .expect("la branche « fin de chaîne » doit drainer (#2209)");
+
+    assert!(
+        bloc.contains("if une_piste_suit"),
+        "la garde doit commander la branche, pas seulement exister (#2296)"
+    );
+    assert!(
+        vide < draine,
+        "condition inversée : on draine quand une piste suit, et on ne draine \
+         pas en fin de chaîne. Vider le convolveur avant une transition gapless \
+         insère la queue de la piste précédente à la frontière (#2296)"
+    );
+}
+
+/// Aucun appel de production ne doit passer d'échantillons à un vidage.
+///
+/// `rubato_resample_chunk(.., flush = true, ..)` ne lit jamais son argument
+/// `samples` : sa branche de vidage part de `resample_leftover`, ou de rien.
+/// Le contrat est verrouillé côté moteur par
+/// `audio::resample::tests::le_vidage_du_resampleur_ignore_ses_echantillons` ;
+/// ici on vérifie que la chaîne locale le RESPECTE — c'est précisément ce que
+/// #2290 avait enfreint, jetant la queue du convolveur sur tout chemin qui
+/// rééchantillonne (#2295, JP Robbe).
+#[test]
+fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
+    let src = source();
+    let prod = production(&src);
+
+    let mut sites = 0usize;
+    let mut vidages = 0usize;
+    let mut reste = prod;
+    while let Some(pos) = reste.find("rubato_resample_chunk(") {
+        let apres = &reste[pos + "rubato_resample_chunk(".len()..];
+        // Refermer la parenthèse de l'appel pour isoler ses arguments.
+        let mut profondeur = 1usize;
+        let mut fin = 0usize;
+        for (i, c) in apres.char_indices() {
+            match c {
+                '(' => profondeur += 1,
+                ')' => {
+                    profondeur -= 1;
+                    if profondeur == 0 {
+                        fin = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let appel = &apres[..fin];
+        // Retirer les commentaires de ligne avant de découper les arguments :
+        // ils contiennent des virgules.
+        let nu: String = appel
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let args: Vec<&str> = nu
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .collect();
+        assert!(
+            args.len() >= 4,
+            "appel de rubato_resample_chunk à moins de 4 arguments : {appel}"
+        );
+        sites += 1;
+        if args[3] == "true" {
+            vidages += 1;
+            assert_eq!(
+                args[1], "&[]",
+                "un vidage du resampler reçoit « {} » : ces échantillons ne \
+                 seront JAMAIS lus, ils sont jetés en silence. Les traiter \
+                 d'abord en flush = false, puis vider avec &[] (#2295)",
+                args[1]
+            );
+        }
+        reste = &apres[fin..];
+    }
+
+    assert!(
+        sites >= 6,
+        "seulement {sites} appel(s) au resampler trouvé(s) : le test ne couvre \
+         plus la chaîne locale"
+    );
+    assert!(
+        vidages >= 3,
+        "seulement {vidages} vidage(s) trouvé(s) — les fins de piste et de \
+         chaîne doivent vider le resampler"
     );
 }

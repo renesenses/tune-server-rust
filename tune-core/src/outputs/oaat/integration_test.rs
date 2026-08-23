@@ -1426,164 +1426,193 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Le contrat de reference des tests de negociation : PCM 24/96 stereo.
+    #[cfg(feature = "oaat")]
+    fn contrat_pcm() -> crate::outputs::oaat::output::ContratPropose {
+        use oaat_core::format::{AudioFormat, ChannelLayout};
+        crate::outputs::oaat::output::ContratPropose {
+            stream_id: "flux-1".into(),
+            format: AudioFormat::PcmS24le,
+            sample_rate: 96_000,
+            channels: 2,
+            channel_layout: ChannelLayout::Stereo,
+            bits_per_sample: 24,
+            dsd_rate: None,
+        }
+    }
+
+    #[cfg(feature = "oaat")]
+    fn contre_de(
+        contrat: &crate::outputs::oaat::output::ContratPropose,
+    ) -> oaat_core::message::FormatCounter {
+        oaat_core::message::FormatCounter {
+            stream_id: contrat.stream_id.clone(),
+            format: contrat.format,
+            sample_rate: contrat.sample_rate,
+            channels: contrat.channels,
+            channel_layout: contrat.channel_layout,
+            bits_per_sample: contrat.bits_per_sample as u8,
+            dsd_rate: contrat.dsd_rate,
+        }
+    }
+
     /// La regression #2239 : une contre-proposition etait ADOPTEE sans qu'aucune
     /// conversion ne touche au payload.
     ///
-    /// Et #2283 : mon premier predicat ne comparait que codec/cadence/bits, si
-    /// bien qu'une contre-proposition MONO face a une proposition stereo passait
-    /// pour identique (JP Robbe).
+    /// Et #2283 : le predicat ne comparait que codec/cadence/bits, si bien
+    /// qu'une contre-proposition MONO face a une proposition stereo passait pour
+    /// identique (JP Robbe). On fait donc varier CHAQUE champ negocie, un a la
+    /// fois, depuis une contre-proposition par ailleurs exactement conforme.
     #[test]
-    fn une_contre_proposition_qui_differe_nest_pas_honorable() {
-        use crate::outputs::oaat::output::contre_proposition_honorable;
+    #[cfg(feature = "oaat")]
+    fn chaque_champ_negocie_suffit_a_rendre_une_contre_proposition_inacceptable() {
+        use crate::outputs::oaat::output::{ReponseNegociation, juger_reponse};
+        use oaat_controller::EndpointResponse;
         use oaat_core::format::{AudioFormat, ChannelLayout};
-        use oaat_core::message::FormatCounter;
 
-        let contre = |format, rate, ch, layout, bits, dsd| FormatCounter {
-            stream_id: "s".into(),
-            format,
-            sample_rate: rate,
-            channels: ch,
-            channel_layout: layout,
-            bits_per_sample: bits,
-            dsd_rate: dsd,
-        };
+        let contrat = contrat_pcm();
 
-        // Identique en TOUT point : il n'y a rien a faire.
-        assert!(contre_proposition_honorable(
-            AudioFormat::PcmS24le,
-            96_000,
-            2,
-            ChannelLayout::Stereo,
-            24,
-            &contre(
-                AudioFormat::PcmS24le,
-                96_000,
-                2,
-                ChannelLayout::Stereo,
-                24,
-                None
-            )
-        ));
-
-        // LA contre-epreuve de JP : mono contre stereo, tout le reste egal.
+        // Identique en TOUT point : il n'y a rien a faire, on peut jouer.
+        let conforme = EndpointResponse::FormatCounter(contre_de(&contrat));
         assert!(
-            !contre_proposition_honorable(
-                AudioFormat::PcmS24le,
-                96_000,
-                2,
-                ChannelLayout::Stereo,
-                24,
-                &contre(
-                    AudioFormat::PcmS24le,
-                    96_000,
-                    1,
-                    ChannelLayout::Mono,
-                    24,
-                    None
-                )
-            ),
-            "une contre-proposition mono ne doit pas accepter un payload stereo"
+            juger_reponse(&contrat, ReponseNegociation::Recue(&conforme)).is_ok(),
+            "une contre-proposition identique a la proposition n'a rien a refuser"
         );
 
-        // Layout seul : meme nombre de canaux, disposition differente.
-        assert!(!contre_proposition_honorable(
-            AudioFormat::PcmS24le,
-            96_000,
-            2,
-            ChannelLayout::Stereo,
-            24,
-            &contre(
-                AudioFormat::PcmS24le,
-                96_000,
-                2,
-                ChannelLayout::Mono,
-                24,
-                None
-            )
-        ));
+        // Un champ change a la fois. Chacun doit suffire.
+        #[allow(clippy::type_complexity)]
+        let ecarts: Vec<(&str, Box<dyn Fn(&mut oaat_core::message::FormatCounter)>)> = vec![
+            (
+                "codec",
+                Box::new(|c: &mut _| c.format = AudioFormat::PcmS16le),
+            ),
+            ("cadence", Box::new(|c: &mut _| c.sample_rate = 44_100)),
+            // LA contre-epreuve de JP : mono contre stereo.
+            ("canaux", Box::new(|c: &mut _| c.channels = 1)),
+            (
+                "disposition",
+                Box::new(|c: &mut _| c.channel_layout = ChannelLayout::Mono),
+            ),
+            ("profondeur", Box::new(|c: &mut _| c.bits_per_sample = 16)),
+            ("DSD", Box::new(|c: &mut _| c.dsd_rate = Some(64))),
+        ];
 
-        // L'exemple du ticket #2239 : 24/96 contre-propose en 16/48.
-        assert!(!contre_proposition_honorable(
-            AudioFormat::PcmS24le,
-            96_000,
-            2,
-            ChannelLayout::Stereo,
-            24,
-            &contre(
-                AudioFormat::PcmS16le,
-                48_000,
-                2,
-                ChannelLayout::Stereo,
-                16,
-                None
-            )
-        ));
+        for (nom, modifier) in ecarts {
+            let mut contre = contre_de(&contrat);
+            modifier(&mut contre);
+            let reponse = EndpointResponse::FormatCounter(contre);
+            assert!(
+                juger_reponse(&contrat, ReponseNegociation::Recue(&reponse)).is_err(),
+                "un ecart de {nom} doit suffire a refuser : Tune enverrait des \
+                 octets que l'etiquette ne decrit plus (#2283)"
+            );
+        }
+    }
 
-        // Profondeur seule, puis cadence seule.
-        assert!(!contre_proposition_honorable(
-            AudioFormat::PcmS24le,
-            96_000,
-            2,
-            ChannelLayout::Stereo,
-            24,
-            &contre(
-                AudioFormat::PcmS24le,
-                96_000,
-                2,
-                ChannelLayout::Stereo,
-                16,
-                None
-            )
-        ));
-        assert!(!contre_proposition_honorable(
-            AudioFormat::PcmS24le,
-            96_000,
-            2,
-            ChannelLayout::Stereo,
-            24,
-            &contre(
-                AudioFormat::PcmS24le,
-                48_000,
-                2,
-                ChannelLayout::Stereo,
-                24,
-                None
-            )
-        ));
+    /// `dsd_rate` se COMPARE, il ne s'exige pas absent.
+    ///
+    /// Exiger `None` refusait une contre-proposition DSD64 rigoureusement
+    /// identique a la proposition DSD64 — or les trois chemins qui posent un
+    /// `FormatPropose` a la main envoient bien un multiplicateur. Le garde-fou
+    /// de #2289 cassait donc le DSD natif (#2283, JP Robbe).
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn une_contre_proposition_dsd_identique_est_honorable() {
+        use crate::outputs::oaat::output::{ReponseNegociation, juger_reponse};
+        use oaat_controller::EndpointResponse;
 
-        // Codec.
-        assert!(!contre_proposition_honorable(
-            AudioFormat::Flac,
-            44_100,
-            2,
-            ChannelLayout::Stereo,
-            16,
-            &contre(
-                AudioFormat::PcmS16le,
-                44_100,
-                2,
-                ChannelLayout::Stereo,
-                16,
-                None
-            )
-        ));
+        let mut contrat = contrat_pcm();
+        contrat.format = oaat_core::format::AudioFormat::DsdU32le;
+        contrat.bits_per_sample = 1;
+        contrat.dsd_rate = Some(64);
 
-        // `dsd_rate` pose alors que `propose_format` n'en envoie pas : c'est une
-        // contrainte de plus, que ce chemin n'honore pas.
-        assert!(!contre_proposition_honorable(
-            AudioFormat::PcmS24le,
-            96_000,
-            2,
-            ChannelLayout::Stereo,
-            24,
-            &contre(
-                AudioFormat::PcmS24le,
-                96_000,
-                2,
-                ChannelLayout::Stereo,
-                24,
-                Some(64)
-            )
-        ));
+        let identique = EndpointResponse::FormatCounter(contre_de(&contrat));
+        assert!(
+            juger_reponse(&contrat, ReponseNegociation::Recue(&identique)).is_ok(),
+            "une contre-proposition DSD64 identique a la proposition DSD64 \
+             decrit exactement ce qu'on allait envoyer (#2283)"
+        );
+
+        // Et un multiplicateur DIFFERENT reste un refus.
+        let mut autre = contre_de(&contrat);
+        autre.dsd_rate = Some(128);
+        let autre = EndpointResponse::FormatCounter(autre);
+        assert!(
+            juger_reponse(&contrat, ReponseNegociation::Recue(&autre)).is_err(),
+            "DSD128 contre DSD64 n'est pas le meme flux"
+        );
+    }
+
+    /// Les huit issues de la negociation, jugees pour ce qu'elles DECIDENT.
+    ///
+    /// Mon test de #2291 lisait le texte source du helper et verifiait la
+    /// presence de la chaine `FormatReject` : il restait vert quand on
+    /// remplacait le bras `FormatReject => Err(..)` par `Ok(())` (#2297, JP
+    /// Robbe). Ici la decision est appelee, pas relue.
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn juger_reponse_decide_les_huit_issues() {
+        use crate::outputs::oaat::output::{ReponseNegociation, juger_reponse};
+        use oaat_controller::EndpointResponse;
+
+        let contrat = contrat_pcm();
+        let flux = contrat.stream_id.clone();
+
+        // 1. accord sur le bon flux -> on joue.
+        let accord = EndpointResponse::FormatAccept(oaat_core::message::FormatAccept {
+            stream_id: flux.clone(),
+        });
+        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&accord)).is_ok());
+
+        // 2. accord sur un AUTRE flux -> refus. Une reponse en retard prise
+        //    pour la bonne decale toute la suite (#2282).
+        let accord_etranger = EndpointResponse::FormatAccept(oaat_core::message::FormatAccept {
+            stream_id: "flux-precedent".into(),
+        });
+        assert!(
+            juger_reponse(&contrat, ReponseNegociation::Recue(&accord_etranger)).is_err(),
+            "un accord pour un autre flux n'est pas notre accord"
+        );
+
+        // 3. contre-proposition identique -> on joue.
+        let conforme = EndpointResponse::FormatCounter(contre_de(&contrat));
+        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&conforme)).is_ok());
+
+        // 4. contre-proposition ecartee -> refus (couvert champ par champ
+        //    ci-dessus, repris ici pour l'exhaustivite de l'enumeration).
+        let mut ecartee = contre_de(&contrat);
+        ecartee.sample_rate = 48_000;
+        let ecartee = EndpointResponse::FormatCounter(ecartee);
+        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&ecartee)).is_err());
+
+        // 5. refus explicite -> refus, avec le motif de l'endpoint.
+        let refus = EndpointResponse::FormatReject(oaat_core::message::FormatReject {
+            stream_id: flux.clone(),
+            reason: "cadence non supportee".into(),
+        });
+        let r = juger_reponse(&contrat, ReponseNegociation::Recue(&refus))
+            .expect_err("un FormatReject interdit la lecture (#2282)");
+        assert!(
+            r.raison.contains("cadence non supportee"),
+            "le motif de l'endpoint doit remonter tel quel, il finit sous les \
+             yeux de l'utilisateur (#2294) — recu : {}",
+            r.raison
+        );
+        assert_eq!(r.stream_id, flux, "le refus doit nommer le flux concerne");
+
+        // 6. reponse hors sujet -> refus : on ne joue pas sur une reponse
+        //    qu'on n'a pas comprise.
+        let hors_sujet = EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
+            stream_id: flux.clone(),
+        });
+        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&hors_sujet)).is_err());
+
+        // 7. endpoint ferme.
+        assert!(juger_reponse(&contrat, ReponseNegociation::Fermee).is_err());
+
+        // 8. silence.
+        let r = juger_reponse(&contrat, ReponseNegociation::Timeout)
+            .expect_err("le silence n'est pas un accord");
+        assert!(!r.raison.is_empty(), "un refus sans motif ne sert a rien");
     }
 }
