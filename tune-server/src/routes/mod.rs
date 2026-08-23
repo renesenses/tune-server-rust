@@ -4,6 +4,7 @@ pub mod airplay_pairing;
 pub mod appliance;
 pub mod appliance_storage;
 pub mod archive;
+pub mod artist_releases;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
