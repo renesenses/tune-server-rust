@@ -1633,17 +1633,41 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
                                 return None; // 64-bit float unsupported
                             }
                         } else {
-                            // PCM sub-format — use valid_bits for the actual
-                            // bit depth, but the byte stride comes from
-                            // nBlockAlign.
+                            // PCM sub-format : c'est le CONTENEUR qui donne le
+                            // pas d'avancement, pas la précision valide.
+                            //
+                            // `wBitsPerSample` est la taille du conteneur et
+                            // `wValidBitsPerSample` la précision réellement
+                            // portée — Microsoft distingue explicitement les
+                            // deux (WAVEFORMATEXTENSIBLE). Rendre la précision
+                            // valide faisait avancer la lecture de
+                            // `bit_depth / 8` octets : pour 24 bits valides
+                            // dans un conteneur de 32, trois octets là où le
+                            // flux en fait quatre. L'alignement des trames
+                            // était faux dès le premier échantillon (#2234).
+                            //
+                            // Lire au conteneur n'est pas qu'un rattrapage
+                            // d'alignement, c'est aussi numériquement exact :
+                            // les bits valides sont cadrés à gauche, donc un
+                            // échantillon `v` sur 24 bits vaut `v << 8` dans
+                            // son conteneur de 32, et `(v << 8) / 2^31` est
+                            // rigoureusement `v / 2^23` — la même valeur
+                            // normalisée qu'une lecture 24 bits alignée.
+                            //
+                            // `valid_bits` reste lu : il ne sert plus au pas,
+                            // mais un conteneur plus étroit que la précision
+                            // annoncée signale un en-tête incohérent, et on
+                            // suit alors le conteneur, qui est ce que le flux
+                            // fait réellement.
                             if channels > 0 {
                                 let container_bytes = block_align / channels;
-                                // Use the smaller of container size and valid
-                                // bits, rounded to a standard byte width.
-                                let effective = valid_bits.min(container_bytes * 8);
-                                bit_depth = match effective {
-                                    0..=16 => 16,
-                                    17..=24 => 24,
+                                debug_assert!(
+                                    valid_bits <= container_bytes * 8,
+                                    "wValidBitsPerSample > conteneur : en-tête incohérent"
+                                );
+                                bit_depth = match container_bytes {
+                                    0..=2 => 16,
+                                    3 => 24,
                                     _ => 32,
                                 };
                             } else {
@@ -5663,6 +5687,74 @@ mod tests {
         assert_eq!(sr, 96000);
         assert_eq!(bd, 24);
         assert_eq!(offset, 68);
+    }
+
+    /// La régression : le test existant ne couvrait que 24-valid-dans-24
+    /// (block align 6 en stéréo), donc le cas où précision et conteneur
+    /// coïncident. Il ne pouvait pas détecter 24-dans-32, où rendre la
+    /// précision valide faisait avancer la lecture de trois octets là où le
+    /// flux en fait quatre — trames désalignées dès le premier échantillon
+    /// (#2234).
+    #[test]
+    fn extensible_24_bits_valides_dans_un_conteneur_de_32() {
+        let mut header = vec![0u8; 68];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&40u32.to_le_bytes());
+        header[20..22].copy_from_slice(&0xFFFEu16.to_le_bytes()); // EXTENSIBLE
+        header[22..24].copy_from_slice(&2u16.to_le_bytes()); // stéréo
+        header[24..28].copy_from_slice(&192000u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(192000u32 * 2 * 4).to_le_bytes());
+        header[32..34].copy_from_slice(&8u16.to_le_bytes()); // block_align = 2 * 4
+        header[34..36].copy_from_slice(&32u16.to_le_bytes()); // conteneur : 32
+        header[36..38].copy_from_slice(&22u16.to_le_bytes()); // cbSize
+        header[38..40].copy_from_slice(&24u16.to_le_bytes()); // précision : 24
+        header[40..44].copy_from_slice(&0u32.to_le_bytes()); // channel mask
+        header[44..46].copy_from_slice(&1u16.to_le_bytes()); // sous-format PCM
+        header[46..60].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+        ]);
+        header[60..64].copy_from_slice(b"data");
+        header[64..68].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+
+        let (ch, sr, bd, offset) = parse_wav_header(&header).expect("en-tête valide");
+        assert_eq!(ch, 2);
+        assert_eq!(sr, 192000);
+        assert_eq!(
+            bd, 32,
+            "le pas d'avancement vient du CONTENEUR : 4 octets, pas 3"
+        );
+        assert_eq!(offset, 68);
+    }
+
+    /// Lire au conteneur n'est pas qu'un rattrapage d'alignement : c'est la
+    /// MÊME valeur normalisée. Les bits valides sont cadrés à gauche, donc
+    /// `v` sur 24 bits vaut `v << 8` dans son conteneur de 32.
+    #[test]
+    fn lire_au_conteneur_donne_la_meme_valeur_quen_24_bits() {
+        for v in [1i32, -1, 100, -100, 8_388_607, -8_388_608] {
+            // Le même échantillon, écrit dans ses deux conteneurs.
+            let en_24 = [
+                (v & 0xFF) as u8,
+                ((v >> 8) & 0xFF) as u8,
+                ((v >> 16) & 0xFF) as u8,
+            ];
+            let cadre = v << 8;
+            let en_32 = cadre.to_le_bytes();
+
+            let f24 = pcm_bytes_to_f32(&en_24, 24);
+            let f32b = pcm_bytes_to_f32(&en_32, 32);
+            assert_eq!(f24.len(), 1);
+            assert_eq!(f32b.len(), 1);
+            assert!(
+                (f24[0] - f32b[0]).abs() < 1e-9,
+                "v={v} : 24 bits donne {}, conteneur 32 donne {}",
+                f24[0],
+                f32b[0]
+            );
+        }
     }
 
     #[test]
