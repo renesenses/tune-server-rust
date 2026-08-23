@@ -102,40 +102,76 @@ fn la_boucle_gapless_applique_le_dsp() {
     );
 }
 
-/// Et le drainage ne doit PAS avoir lieu avant une transition gapless :
-/// `Convolver::flush()` remet le moteur à zéro, or le gapless est un flux
-/// continu.
+/// Le drainage appartient à la fin EFFECTIVE de la chaîne gapless.
 ///
-/// ⚠️ Vérifier que `une_piste_suit` EXISTE ne prouve rien : la variable
-/// pourrait rester là, inutilisée, ou commander l'inverse. On verrouille donc
-/// l'ORDRE des deux branches — piste suivante ⇒ rien à drainer, sinon on
-/// draine. Inverser la condition fait tomber ce test.
+/// La présence d'un `next_media` ne prouve pas qu'une piste suivra : la requête
+/// peut échouer, l'en-tête peut être vide ou non-WAV. Décider avant ces essais
+/// faisait sauter le drainage sans qu'aucune piste soit finalement chaînée.
+/// On verrouille donc l'ordre réel : boucle de chaînage terminée, puis drainage,
+/// puis vidage du resampler — uniquement après EOF naturel.
 #[test]
 fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
     let src = source();
-    let prod = production(&src).to_string();
-
-    let garde = prod
-        .find("let une_piste_suit")
-        .expect("le drainage doit être gardé par `une_piste_suit` (#2296)");
-    let bloc = &prod[garde..(garde + 600).min(prod.len())];
-
-    let vide = bloc
-        .find("Vec::new()")
-        .expect("la branche « une piste suit » doit rendre une queue VIDE (#2296)");
-    let draine = bloc
+    let prod = production(&src);
+    let debut = prod
+        .find("local_audio_gapless_chaining_next_track")
+        .expect("la boucle gapless doit exister");
+    let fin_chaine = prod[debut..]
+        .find("End of gapless continuation")
+        .map(|i| debut + i)
+        .expect("la fin de la boucle gapless doit être identifiable");
+    let draine = prod[fin_chaine..]
         .find("flush_local_dsp(")
-        .expect("la branche « fin de chaîne » doit drainer (#2209)");
+        .map(|i| fin_chaine + i)
+        .expect("la fin effective de chaîne doit drainer le DSP (#2295/#2296)");
+    let vide_resampler = prod[draine..]
+        .find("// Flush the resampler")
+        .map(|i| draine + i)
+        .expect("le resampler doit être vidé après la queue du DSP");
+    let garde = &prod[fin_chaine..draine];
 
     assert!(
-        bloc.contains("if une_piste_suit"),
-        "la garde doit commander la branche, pas seulement exister (#2296)"
+        !prod[debut..fin_chaine].contains("flush_local_dsp("),
+        "le convolveur est drainé au milieu d'une chaîne gapless (#2296)"
     );
     assert!(
-        vide < draine,
-        "condition inversée : on draine quand une piste suit, et on ne draine \
-         pas en fin de chaîne. Vider le convolveur avant une transition gapless \
-         insère la queue de la piste précédente à la frontière (#2296)"
+        garde.contains("if http_eof")
+            && garde.contains("!force_silent.load")
+            && garde.contains("!device_gone.load"),
+        "le drainage ne doit avoir lieu qu'après EOF naturel, jamais après \
+         Stop, abort ou perte du périphérique"
+    );
+    assert!(
+        draine < vide_resampler,
+        "la queue du convolveur doit traverser le resampler AVANT son vidage ; \
+         l'ordre inverse insère du silence ou jette la queue (#2295)"
+    );
+}
+
+/// À cadence identique, le resampler doit conserver sa phase et son leftover
+/// entre les pistes. Le vider puis le remettre à zéro ajoutait une frontière
+/// artificielle précisément dans le chemin annoncé gapless.
+#[test]
+fn le_gapless_preserve_le_resampler_si_la_cadence_ne_change_pas() {
+    let src = source();
+    let prod = production(&src);
+    let debut = prod
+        .find("let prev_sr = sample_rate")
+        .expect("la transition doit mémoriser la cadence précédente");
+    let fin = prod[debut..]
+        .find("L'enchaînement est acquis")
+        .map(|i| debut + i)
+        .expect("la fin de la négociation gapless doit être identifiable");
+    let transition = &prod[debut..fin];
+
+    assert!(
+        transition.contains("prev_needs_resample && (new_sr != prev_sr || !next_needs_resample)"),
+        "le resampler ne doit être vidé que si la cadence change ou si la piste \
+         suivante n'en a plus besoin"
+    );
+    assert!(
+        !transition.contains(".reset()"),
+        "remettre le resampler à zéro à cadence identique crée une discontinuité gapless"
     );
 }
 
@@ -211,8 +247,9 @@ fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
          plus la chaîne locale"
     );
     assert!(
-        vidages >= 3,
+        vidages >= 2,
         "seulement {vidages} vidage(s) trouvé(s) — les fins de piste et de \
-         chaîne doivent vider le resampler"
+         chaîne doivent vider le resampler ; une transition gapless à cadence \
+         identique ne doit précisément PAS le vider"
     );
 }
