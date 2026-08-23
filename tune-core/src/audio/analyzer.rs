@@ -414,13 +414,24 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
             break;
         }
         sample_rate = sr as f64;
+        // `decode_to_pcm` a beau recevoir `Some(1)`, il NE REMIXE PAS : il rend
+        // la source telle quelle et le dit honnêtement depuis #1498. Compter un
+        // échantillon par trame — ce que faisait le commentaire « mono » —
+        // doublait donc le décompte sur tout fichier stéréo, et avec lui la
+        // durée de silence rendue (#2230).
+        let canaux = decoded.channels.max(1) as usize;
         let scale = pcm_scale(decoded.bit_depth);
-        for (i, &s) in decoded.samples_i32.iter().enumerate() {
-            if (s as f64 / scale).abs() > threshold_linear {
-                last_loud = Some(total + i);
+        for (trame, bloc) in decoded.samples_i32.chunks(canaux).enumerate() {
+            // Une trame est sonore dès qu'UN de ses canaux l'est : un silence
+            // sur le seul canal gauche n'est pas un silence.
+            if bloc
+                .iter()
+                .any(|&s| (s as f64 / scale).abs() > threshold_linear)
+            {
+                last_loud = Some(total + trame);
             }
         }
-        let frames = decoded.samples_i32.len(); // mono: 1 sample per frame
+        let frames = decoded.samples_i32.len() / canaux;
         total += frames;
         if (frames as f64) < SEG_SECONDS * sr as f64 {
             break;
