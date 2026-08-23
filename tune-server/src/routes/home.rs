@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
         .route("/new-in-library", get(new_in_library))
+        .route("/other-versions", get(other_versions))
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
 }
@@ -463,6 +464,128 @@ async fn new_in_library(
     Ok(Json(json!(items)))
 }
 
+/// `GET /home/other-versions` — les autres versions, DANS LA BIBLIOTHEQUE, des
+/// morceaux ecoutes aujourd'hui.
+///
+/// Le cas concret : on ecoute « Ordinary World » depuis The Wedding Album, et
+/// on possede aussi la version acoustique sur une compilation. Rien ne le dit
+/// aujourd'hui — il faut chercher le titre a la main pour s'en apercevoir.
+///
+/// ## Ce que cette route fait, et ce qu'elle ne fait PAS
+///
+/// Elle rapproche **titre + artiste**, et ne retient que les pistes d'un
+/// **autre album** que celui ecoute. C'est volontairement etroit :
+///
+/// - pas de reprises par un autre interprete (« Comme d'habitude » / « My Way ») :
+///   cela demande les relations d'oeuvre de MusicBrainz, donc un MBID, et la
+///   couverture MBID de la bibliotheque est encore trop faible pour que le
+///   resultat soit autre chose qu'un hasard ;
+/// - pas de versions Qobuz : il faudrait une recherche par morceau ecoute,
+///   donc autant d'appels au service, avec le plafond de requetes que cela
+///   suppose. A brancher quand la section aura fait ses preuves en local.
+///
+/// Le rapprochement est insensible a la casse mais **exact** sur le titre. Un
+/// « (Live) » colle au titre ne sera pas rapproche : mieux vaut ne rien
+/// proposer qu'un rapprochement faux.
+async fn other_versions(
+    State(state): State<AppState>,
+    Query(p): Query<HomeParams>,
+) -> Result<Json<Value>, AppError> {
+    // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
+    // venir tel quel de l'URL.
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    let depuis = debut_de_journee();
+
+    // `listened_at` est stocke en ISO-8601 UTC (« 2026-08-23T18:00:00Z ») :
+    // une comparaison de chaines suffit et reste ordonnee, ce qui evite un
+    // cast de date different entre SQLite et PostgreSQL.
+    let sql = format!(
+        "SELECT DISTINCT lh.title, lh.artist_name, lh.album_title, \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms \
+        FROM listen_history lh \
+        JOIN tracks t ON LOWER(t.title) = LOWER(lh.title) \
+        JOIN albums al ON t.album_id = al.id \
+        LEFT JOIN artists ar ON al.artist_id = ar.id \
+        WHERE lh.listened_at >= '{depuis}' \
+          AND lh.artist_name IS NOT NULL \
+          AND LOWER(COALESCE(ar.name, '')) = LOWER(lh.artist_name) \
+          AND LOWER(COALESCE(al.title, '')) <> LOWER(COALESCE(lh.album_title, '')) \
+        ORDER BY lh.title \
+        LIMIT {limit}"
+    );
+
+    // Une piste ecoutee, ses autres versions : on regroupe cote serveur pour
+    // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
+    // chacun des trois clients).
+    let mut groupes: Vec<Value> = Vec::new();
+    for cols in state.backend.query_many(&sql, &[]).unwrap_or_default() {
+        let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+        let joue = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+        let version = json!({
+            "track_id": cols.get(3).and_then(|v| v.as_i64()),
+            "album_id": cols.get(4).and_then(|v| v.as_i64()),
+            "album_title": cols.get(5).and_then(|v| v.as_string()),
+            "cover_path": cols.get(6).and_then(|v| v.as_string()),
+            "duration_ms": cols.get(7).and_then(|v| v.as_i64()),
+        });
+        match groupes.iter_mut().find(|g| {
+            g["title"].as_str() == Some(titre.as_str())
+                && g["artist_name"].as_str() == Some(artiste.as_str())
+        }) {
+            Some(g) => {
+                if let Some(arr) = g["versions"].as_array_mut() {
+                    arr.push(version);
+                }
+            }
+            None => groupes.push(json!({
+                "title": titre,
+                "artist_name": artiste,
+                "played_album": joue,
+                "versions": [version],
+            })),
+        }
+    }
+
+    Ok(Json(json!(groupes)))
+}
+
+/// Minuit UTC du jour courant, au format de `listen_history.listened_at`.
+///
+/// Volontairement en UTC, comme la colonne : passer par l'heure locale ferait
+/// glisser la fenetre d'une ou deux heures selon la saison, et c'est
+/// exactement le defaut corrige sur les horaires des favoris radio (#2179).
+fn debut_de_journee() -> String {
+    let secondes = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let jour = secondes - (secondes % 86_400);
+    horodatage_iso(jour)
+}
+
+/// `YYYY-MM-DDT00:00:00Z` a partir d'un nombre de secondes depuis l'epoque.
+///
+/// Ecrit a la main plutot qu'avec `chrono` : la conversion se limite a une
+/// date a minuit, et l'algorithme des jours civils est celui de Howard
+/// Hinnant, verifie par les tests plus bas sur des annees bissextiles et des
+/// bascules de siecle.
+fn horodatage_iso(secondes: u64) -> String {
+    let jours = (secondes / 86_400) as i64 + 719_468;
+    let ere = if jours >= 0 { jours } else { jours - 146_096 } / 146_097;
+    let jour_de_lere = jours - ere * 146_097;
+    let annee_de_lere =
+        (jour_de_lere - jour_de_lere / 1460 + jour_de_lere / 36_524 - jour_de_lere / 146_096) / 365;
+    let annee = annee_de_lere + ere * 400;
+    let jour_de_lannee =
+        jour_de_lere - (365 * annee_de_lere + annee_de_lere / 4 - annee_de_lere / 100);
+    let mp = (5 * jour_de_lannee + 2) / 153;
+    let jour = jour_de_lannee - (153 * mp + 2) / 5 + 1;
+    let mois = if mp < 10 { mp + 3 } else { mp - 9 };
+    let annee = if mois <= 2 { annee + 1 } else { annee };
+    format!("{annee:04}-{mois:02}-{jour:02}T00:00:00Z")
+}
+
 /// Favorite radios + recently played radios.
 async fn radio_picks(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let items = fetch_radio_picks(&state)?;
@@ -567,4 +690,48 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
         "services": highlights,
         "preferred_service": preferred_service,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::horodatage_iso;
+
+    /// L'epoque elle-meme : le cas ou une erreur de constante se voit tout de
+    /// suite.
+    #[test]
+    fn lepoque_est_le_1er_janvier_1970() {
+        assert_eq!(horodatage_iso(0), "1970-01-01T00:00:00Z");
+    }
+
+    /// Le 29 fevrier d'une annee bissextile ordinaire.
+    #[test]
+    fn une_annee_bissextile_a_bien_un_29_fevrier() {
+        // 2024-02-29T00:00:00Z
+        assert_eq!(horodatage_iso(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    /// 2000 est bissextile (divisible par 400) alors que 1900 ne l'est pas :
+    /// c'est la regle que les conversions ecrites a la main ratent.
+    #[test]
+    fn lan_2000_est_bissextile() {
+        // 2000-02-29T00:00:00Z
+        assert_eq!(horodatage_iso(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// Un jour quelconque, pour verrouiller le decalage general.
+    #[test]
+    fn un_jour_courant_tombe_juste() {
+        // 2026-08-23T00:00:00Z
+        assert_eq!(horodatage_iso(1_787_443_200), "2026-08-23T00:00:00Z");
+    }
+
+    /// Toute seconde de la journee doit rendre LE MEME jour : c'est ce qui
+    /// fait que la fenetre « aujourd'hui » ne glisse pas d'une requete a
+    /// l'autre.
+    #[test]
+    fn toutes_les_secondes_dun_jour_rendent_le_meme_jour() {
+        let minuit = 1_787_443_200u64;
+        assert_eq!(horodatage_iso(minuit), horodatage_iso(minuit + 86_399));
+        assert_ne!(horodatage_iso(minuit), horodatage_iso(minuit + 86_400));
+    }
 }
