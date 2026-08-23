@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rubato::{
-    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
-    WindowFunction, calculate_cutoff,
+    Async, FixedAsync, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    calculate_cutoff,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -4057,64 +4057,6 @@ impl OutputTarget for LocalOutput {
                 position_ms.store(pos, Ordering::Relaxed);
             }
 
-            // Fin de piste : la queue du convolveur doit traverser la MEME
-            // adaptation de canaux et le meme reechantillonnage que le reste,
-            // sinon elle arriverait au mauvais format (#2209).
-            //
-            // MAIS pas avant une transition gapless : `Convolver::flush()`
-            // remet le moteur a zero, et une transition gapless est un flux
-            // CONTINU — vider et reinitialiser a cet endroit inserait la queue
-            // de la piste precedente a la frontiere et cassait la continuite
-            // que le gapless est cense preserver (#2296, JP Robbe). On draine
-            // seulement quand la chaine s'arrete vraiment.
-            let une_piste_suit = next_media_ref.lock().map(|m| m.is_some()).unwrap_or(false);
-            let queue = if une_piste_suit {
-                Vec::new()
-            } else {
-                flush_local_dsp(
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    channels,
-                    dop_active.load(Ordering::Relaxed),
-                )
-            };
-            if !queue.is_empty() {
-                let mut queue = queue;
-                if needs_channel_adapt {
-                    queue = adapt_channels(&queue, channels, output_ch);
-                }
-                if needs_resample {
-                    // ⚠️ `rubato_resample_chunk` avec `flush = true` IGNORE son
-                    // argument `samples` : sa branche de vidage ne lit que
-                    // `resample_leftover`, ou rien. Lui passer la queue
-                    // directement la jetait purement et simplement — le
-                    // correctif cense restituer la fin de la convolution ne
-                    // produisait donc rien des que le chemin reechantillonnait
-                    // (#2295, JP Robbe).
-                    //
-                    // La queue est un bloc audio comme un autre : on la traite
-                    // en `flush = false`, PUIS on vide le retard propre du
-                    // resampler avec une tranche vide, et on concatene.
-                    let mut sortie = rubato_resample_chunk(
-                        &mut resampler,
-                        &queue,
-                        output_ch,
-                        false,
-                        &mut resample_leftover,
-                    );
-                    sortie.extend_from_slice(&rubato_resample_chunk(
-                        &mut resampler,
-                        &[],
-                        output_ch,
-                        true,
-                        &mut resample_leftover,
-                    ));
-                    queue = sortie;
-                }
-                feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
-            }
-
             // If the stream was never started (very short track or error),
             // start it now with whatever data we have.
             if !stream_started {
@@ -4167,26 +4109,6 @@ impl OutputTarget for LocalOutput {
                     next_url = %next.url,
                     "local_audio_gapless_chaining_next_track"
                 );
-
-                // Flush the current resampler before switching tracks
-                if needs_resample {
-                    let flushed = rubato_resample_chunk(
-                        &mut resampler,
-                        &[],
-                        output_ch,
-                        true,
-                        &mut resample_leftover,
-                    );
-                    if !flushed.is_empty() {
-                        feed_ring_abortable(
-                            &ring,
-                            &flushed,
-                            &stop_rx,
-                            &paused,
-                            Some(&force_silent),
-                        );
-                    }
-                }
 
                 // La bascule des métadonnées et de la position a lieu PLUS BAS,
                 // une fois le flux suivant confirmé chaînable (en-tête WAV lu).
@@ -4279,8 +4201,37 @@ impl OutputTarget for LocalOutput {
                     "local_audio_gapless_next_track_format"
                 );
 
-                // Update source format variables for the new track
                 let prev_sr = sample_rate;
+                let prev_needs_resample = needs_resample;
+                let next_needs_resample = output_sr != new_sr;
+
+                // À cadence source identique, le resampler fait partie du flux
+                // continu : conserver son état et son leftover est nécessaire
+                // au vrai gapless. On ne le draine que si le prochain flux
+                // impose réellement une autre cadence (ou n'en a plus besoin).
+                // Le vidage doit avoir lieu APRÈS validation de l'en-tête : le
+                // faire dès qu'un `next_media` existe insérait du silence même
+                // quand la requête suivante échouait.
+                if prev_needs_resample && (new_sr != prev_sr || !next_needs_resample) {
+                    let flushed = rubato_resample_chunk(
+                        &mut resampler,
+                        &[],
+                        output_ch,
+                        true,
+                        &mut resample_leftover,
+                    );
+                    if !flushed.is_empty() {
+                        feed_ring_abortable(
+                            &ring,
+                            &flushed,
+                            &stop_rx,
+                            &paused,
+                            Some(&force_silent),
+                        );
+                    }
+                }
+
+                // Update source format variables for the new track
                 sample_rate = new_sr;
                 channels = new_ch;
                 bit_depth = new_bd;
@@ -4291,7 +4242,7 @@ impl OutputTarget for LocalOutput {
                 };
                 frame_bytes = new_ch as usize * new_bps;
                 needs_channel_adapt = output_ch != new_ch;
-                needs_resample = output_sr != new_sr;
+                needs_resample = next_needs_resample;
 
                 // Recreate the resampler if the source sample rate changed
                 if needs_resample && new_sr != prev_sr {
@@ -4335,11 +4286,6 @@ impl OutputTarget for LocalOutput {
                             None
                         }
                     };
-                    resample_leftover.clear();
-                } else if needs_resample && new_sr == prev_sr {
-                    if let Some(ref mut r) = resampler {
-                        r.reset();
-                    }
                     resample_leftover.clear();
                 } else if !needs_resample && resampler.is_some() {
                     resampler = None;
@@ -4545,8 +4491,51 @@ impl OutputTarget for LocalOutput {
                 debug!("local_audio_gapless_chain_exhausted");
             }
 
+            // La queue appartient à la FIN EFFECTIVE de la chaîne, pas au
+            // simple fait qu'un prochain média ait été annoncé. Celui-ci peut
+            // encore échouer en HTTP, être vide ou ne pas être un WAV : dans
+            // ces cas `next_media_ref.is_some()` avait fait sauter le drainage
+            // avant la boucle et la convolution restait tronquée (#2295/#2296).
+            //
+            // Ne rien rendre après Stop, abort ou perte du périphérique : la
+            // queue est de l'audio et ne doit jamais ressusciter une lecture
+            // interrompue.
+            if http_eof
+                && !force_silent.load(Ordering::Relaxed)
+                && !device_gone.load(Ordering::Relaxed)
+            {
+                let mut queue = flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    channels,
+                    dop_active.load(Ordering::Relaxed),
+                );
+                if !queue.is_empty() {
+                    if needs_channel_adapt {
+                        queue = adapt_channels(&queue, channels, output_ch);
+                    }
+                    if needs_resample {
+                        // La queue est d'abord un bloc normal. `flush = true`
+                        // ignore son argument `samples` et la jetterait.
+                        queue = rubato_resample_chunk(
+                            &mut resampler,
+                            &queue,
+                            output_ch,
+                            false,
+                            &mut resample_leftover,
+                        );
+                    }
+                    feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
+                }
+            }
+
             // Flush the resampler: process any leftover frames + drain internal delay
-            if needs_resample {
+            if http_eof
+                && needs_resample
+                && !force_silent.load(Ordering::Relaxed)
+                && !device_gone.load(Ordering::Relaxed)
+            {
                 let flushed = rubato_resample_chunk(
                     &mut resampler,
                     &[],
