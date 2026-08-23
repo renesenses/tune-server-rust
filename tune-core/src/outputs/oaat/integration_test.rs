@@ -485,7 +485,19 @@ mod tests {
         );
 
         // Native DSD streaming: stage the next track as a local .dsf file.
+        // Et tant qu'on est en PCM, la sortie mesure : les VU ont une source.
+        assert!(
+            !output.is_native_dsd_active(),
+            "en PCM la sortie n'est pas en DSD natif"
+        );
         output.set_native_dsd_active_for_test(true);
+        // DSD natif : plus personne ne décode, donc plus aucune fenêtre de
+        // niveaux. C'est ce que `levels_available` doit annoncer à l'écran,
+        // faute de quoi l'aiguille reste figée et se lit comme une panne.
+        assert!(
+            output.is_native_dsd_active(),
+            "le DSD natif doit se déclarer : sans mesure, l'écran doit le dire"
+        );
         assert!(output.supports_internal_gapless());
 
         assert!(
