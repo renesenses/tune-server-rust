@@ -1829,6 +1829,8 @@ impl PositionPoller {
             let notify = TRACK_END_NOTIFY.clone();
             let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
             let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
+            // Derniere valeur annoncee de `levels_available`, par zone.
+            let mut niveaux_annonces: HashMap<i64, bool> = HashMap::new();
 
             loop {
                 // Wake on either the regular 1-second tick OR an immediate
@@ -1838,6 +1840,8 @@ impl PositionPoller {
                     _ = notify.notified() => {},
                 }
                 self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                    .await;
+                self.annoncer_bascule_des_niveaux(&mut niveaux_annonces)
                     .await;
             }
         })
@@ -1928,6 +1932,56 @@ impl PositionPoller {
                             }
                             debug!(zone_id, station = %station_name, "radio_metadata_updated");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Annoncer quand une zone se met — ou cesse — de mesurer ses niveaux.
+    ///
+    /// `levels_available` est calcule a la demande sur les trois surfaces de
+    /// zone, mais le drapeau qui le determine bascule TARD : la tache OAAT ne
+    /// passe en DSD natif qu'apres l'arret, deux secondes d'attente, la
+    /// connexion et la detection du `.dsf`. La reponse HTTP du play est deja
+    /// partie, avec `levels_available: true` — le bon champ restait donc
+    /// invisible pendant exactement la lecture concernee (JP Robbe, revue de
+    /// #2220).
+    ///
+    /// On emet un `zone.updated` SANS donnees inline : le client refetch alors
+    /// toutes ses zones (`App.svelte`, branche de repli des evenements
+    /// `zone.*`). Pas de nouveau type d'evenement, pas de changement cote web.
+    ///
+    /// Le cout est nul pour les zones non-OAAT : `output_produces_levels`
+    /// teste le prefixe `oaat:` avant de prendre le moindre verrou.
+    async fn annoncer_bascule_des_niveaux(&self, dernier: &mut HashMap<i64, bool>) {
+        let Some(ref bus) = self.event_bus else {
+            return;
+        };
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let vus: std::collections::HashSet<i64> = zones.iter().filter_map(|z| z.id).collect();
+        dernier.retain(|zone_id, _| vus.contains(zone_id));
+
+        for zone in &zones {
+            let Some(zone_id) = zone.id else { continue };
+            let dispo = self
+                .orchestrator
+                .output_produces_levels(zone.output_device_id.as_deref())
+                .await;
+            match dernier.get(&zone_id) {
+                Some(&precedent) if precedent == dispo => {}
+                _ => {
+                    // Premier passage compris : une zone deja en DSD natif au
+                    // demarrage du serveur doit s'annoncer elle aussi.
+                    if dernier.insert(zone_id, dispo) != Some(dispo) {
+                        info!(
+                            zone_id,
+                            levels_available = dispo,
+                            "levels_availability_changed"
+                        );
+                        bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
                     }
                 }
             }
