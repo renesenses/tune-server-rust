@@ -87,6 +87,20 @@ debug = 0
 [profile.release]
 opt-level = 2
 lto = "thin"
-strip = true
+# `strip = true` est un alias de `strip = "symbols"` : il detruit la table des
+# symboles, donc les NOMS dont le backtrace a besoin. Les rapports de crash
+# Windows designaient alors des fonctions voisines encore exportees — des
+# `onig_*` de la bibliotheque de regex — au lieu du code fautif (#2306).
+# `"debuginfo"` retire les informations de debogage, mais garde les symboles.
+strip = "debuginfo"
 codegen-units = 4
-panic = "abort"
+# `panic = "abort"` neutralisait TOUS les `catch_unwind` du binaire : ceux du
+# decodeur (`audio/decode.rs`), celui de l'installateur de mise a jour, et le
+# hook qui ecrit `tune-crash.log`. Un seul fichier AAC malforme tuait donc le
+# serveur entier, au lieu d'echouer sur ce fichier (#2305).
+#
+# Ce reglage venait de 40002253 (« release profile — 8.3 MB binary », 19 mai),
+# une optimisation de TAILLE du debut de la migration : `tune-ffi` n'existait
+# pas encore (22 juin) et l'encodeur ALAC non plus (13 aout). Ce n'etait donc
+# pas un choix d'architecture lie a l'ABI (arbitrage JP Robbe).
+panic = "unwind"
