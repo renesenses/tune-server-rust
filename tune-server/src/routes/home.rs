@@ -30,6 +30,10 @@ pub fn router() -> Router<AppState> {
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
         .route("/new-in-library", get(new_in_library))
+        .route(
+            "/artist-releases",
+            get(super::artist_releases::artist_releases),
+        )
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
 }
