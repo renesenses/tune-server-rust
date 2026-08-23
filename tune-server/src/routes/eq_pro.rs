@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tune_core::audio::eq::EqBandSpec;
 use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::error::AppError;
@@ -140,39 +141,27 @@ async fn list_presets(State(state): State<AppState>) -> Json<Value> {
 struct CreatePresetBody {
     name: String,
     #[serde(default)]
-    bands: Vec<EqBand>,
+    bands: Vec<EqBandSpec>,
     /// "parametric", "graphic", or "custom"
     eq_type: Option<String>,
     /// Zone ID this preset is for (None = global)
     zone_id: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
-struct EqBand {
-    /// Center frequency in Hz
-    freq: f64,
-    /// Gain in dB (-12 to +12 typical)
-    gain: f64,
-    /// Q factor (0.1 to 30)
-    q: Option<f64>,
-    /// Filter type: "peak", "low_shelf", "high_shelf", "low_pass", "high_pass", "notch"
-    #[serde(rename = "type", default = "default_band_type")]
-    band_type: String,
-}
-
-fn default_band_type() -> String {
-    "peak".into()
-}
-
-impl EqBand {
-    fn to_json(&self) -> Value {
-        json!({
-            "freq": self.freq,
-            "gain": self.gain,
-            "q": self.q.unwrap_or(1.0),
-            "type": self.band_type,
-        })
-    }
+/// Les bandes d'un preset sont serialisees par `EqBandSpec` lui-meme.
+///
+/// Ce fichier portait sa PROPRE structure `EqBand` et son propre `to_json()`,
+/// qui n'ecrivait que `freq`, `gain`, `q` et `type`. Le champ `channel` — le
+/// canal vise par la bande, livre en 0.9.101 pour les pieces dissymetriques —
+/// n'y etait meme pas deserialise : enregistrer un prereglage gauche/droite le
+/// rendait stereo-identique au rechargement. Le chemin d'application, lui,
+/// relisait bien `EqBandSpec` ; c'est l'ECRITURE qui perdait le canal.
+///
+/// Une seule definition, donc, et plus de conversion manuelle a tenir a jour.
+fn bandes_en_json(bandes: &[EqBandSpec]) -> Vec<Value> {
+    // `json!` ne peut echouer ici : la structure n'a que des f64 issus de JSON
+    // (donc jamais NaN), une String et un Option<u16>.
+    bandes.iter().map(|b| json!(b)).collect()
 }
 
 /// Create a new EQ preset.
@@ -191,7 +180,7 @@ async fn create_preset(
     let mut presets = load_presets(&state);
     let id = uuid::Uuid::new_v4().to_string();
 
-    let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
+    let bands_json: Vec<Value> = bandes_en_json(&body.bands);
 
     let preset = json!({
         "id": id,
@@ -240,7 +229,7 @@ async fn update_preset(
 
     match idx {
         Some(i) => {
-            let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
+            let bands_json: Vec<Value> = bandes_en_json(&body.bands);
             presets[i]["name"] = json!(body.name);
             presets[i]["bands"] = json!(bands_json);
             if let Some(t) = &body.eq_type {
@@ -450,8 +439,80 @@ fn epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_activation_zone;
+    use super::{bandes_en_json, resolve_activation_zone};
     use serde_json::json;
+    use tune_core::audio::eq::EqBandSpec;
+
+    /// Le defaut repare : le canal survit a l'enregistrement.
+    ///
+    /// Ce test relit le JSON avec `EqBandSpec`, exactement comme le fait le
+    /// chemin d'application (`apply_preset`). Il verrouille donc l'aller ET le
+    /// retour, pas la seule presence d'une cle.
+    #[test]
+    fn une_bande_gauche_reste_gauche_apres_enregistrement() {
+        let bande = EqBandSpec {
+            freq: 120.0,
+            gain: -3.5,
+            channel: Some(0),
+            ..Default::default()
+        };
+        let ecrit = bandes_en_json(std::slice::from_ref(&bande));
+        let relu: EqBandSpec = serde_json::from_value(ecrit[0].clone()).expect("relecture");
+        assert_eq!(
+            relu.channel,
+            Some(0),
+            "le canal gauche a ete perdu a l'ecriture"
+        );
+        assert_eq!(relu.freq, 120.0);
+        assert_eq!(relu.gain, -3.5);
+    }
+
+    /// L'autre moitie du contrat, et la raison pour laquelle « les deux » ne
+    /// peut pas etre encode par une valeur : un prereglage enregistre avant la
+    /// 0.9.101 n'a pas ce champ, et ne doit pas en gagner un en repassant par
+    /// « Mes presets ». Une bande sans canal les vise TOUS.
+    #[test]
+    fn une_bande_sans_canal_nen_gagne_pas_un() {
+        let bande = EqBandSpec {
+            freq: 1000.0,
+            ..Default::default()
+        };
+        let ecrit = bandes_en_json(std::slice::from_ref(&bande));
+        assert!(
+            ecrit[0].get("channel").is_none(),
+            "une cle `channel` est apparue la ou il n'y en avait pas : {}",
+            ecrit[0]
+        );
+    }
+
+    /// Une paire gauche/droite ne doit pas se replier sur un seul canal.
+    #[test]
+    fn une_paire_gauche_droite_garde_ses_deux_canaux() {
+        let bandes = vec![
+            EqBandSpec {
+                freq: 80.0,
+                gain: 2.0,
+                channel: Some(0),
+                ..Default::default()
+            },
+            EqBandSpec {
+                freq: 80.0,
+                gain: -2.0,
+                channel: Some(1),
+                ..Default::default()
+            },
+        ];
+        let ecrit = bandes_en_json(&bandes);
+        let canaux: Vec<Option<u16>> = ecrit
+            .iter()
+            .map(|v| {
+                serde_json::from_value::<EqBandSpec>(v.clone())
+                    .unwrap()
+                    .channel
+            })
+            .collect();
+        assert_eq!(canaux, vec![Some(0), Some(1)]);
+    }
 
     #[test]
     fn le_parametre_durl_prime_sur_la_zone_du_preset() {
