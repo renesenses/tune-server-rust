@@ -296,6 +296,30 @@ fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8]) -> Vec<u8
     pkt
 }
 
+/// Conversion réellement utilisée par le payload RTP L16.
+///
+/// Un downmix multicanal peut dépasser la pleine échelle 16 bits tout en
+/// restant parfaitement valide en i32. Le cast final doit donc saturer : un
+/// `as i16` reboucle et transforme un passage fort en distorsion franche.
+///
+/// Extraite pour être TESTABLE. Tant qu'elle vivait en ligne dans
+/// `stream_to_airplay`, la contre-épreuve recopiait sa propre closure de clamp :
+/// remettre `let s16 = brut as i16` dans la production laissait le test vert
+/// (#2311, JP Robbe).
+fn pcm_i32_to_l16_be(samples: &[i32], bit_depth: u16) -> Vec<u8> {
+    samples
+        .iter()
+        .flat_map(|&sample| {
+            let scaled = match bit_depth {
+                24 => sample >> 8,
+                32 => sample >> 16,
+                _ => sample,
+            };
+            (scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_be_bytes()
+        })
+        .collect()
+}
+
 /// Temporary file guard that deletes the file on drop.
 struct TempFileGuard(std::path::PathBuf);
 
@@ -569,24 +593,7 @@ async fn stream_to_airplay(
     }
 
     // Convert i32 samples to i16, then to big-endian bytes for AirPlay RTP
-    let pcm_be: Vec<u8> = echantillons
-        .iter()
-        .flat_map(|&s| {
-            // SATURER, jamais reboucler. Le repli 5.1 somme jusqu'a ~2,4 fois
-            // la pleine echelle (avant + 0,707 x centre + surrounds) : borner a
-            // `i32` dans `to_stereo_i32` ne protege donc PAS la conversion
-            // finale, et `s as i16` rebouclait — 13563 la ou il fallait 32767,
-            // c'est-a-dire une distorsion franche sur les passages forts
-            // (JP Robbe, revue de #2281).
-            let brut = match decoded.bit_depth {
-                24 => s >> 8,
-                32 => s >> 16,
-                _ => s,
-            };
-            let s16 = brut.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            s16.to_be_bytes()
-        })
-        .collect();
+    let pcm_be = pcm_i32_to_l16_be(&echantillons, decoded.bit_depth);
 
     let ssrc: u32 = rand_random();
     let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
@@ -886,5 +893,50 @@ mod tests {
         assert_eq!(pkt[0], 0x80);
         assert_eq!(pkt[1], 96);
         assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 42);
+    }
+
+    /// La contre-épreuve de JP Robbe sur #2281, cette fois branchée sur la
+    /// PRODUCTION.
+    ///
+    /// Ma version d'origine vivait dans `channels.rs` et redéfinissait sa
+    /// propre closure de clamp : JP a remis `let s16 = brut as i16` dans
+    /// `airplay.rs` et le test est resté vert. Il prouvait que `clamp` sature —
+    /// ce que personne ne conteste — jamais que le flux RTP l'appelle (#2311).
+    ///
+    /// Ici c'est `pcm_i32_to_l16_be`, la fonction réellement appelée par
+    /// `stream_to_airplay`, qui est exercée.
+    #[test]
+    fn la_conversion_l16_de_production_sature_un_downmix_51() {
+        let plein = i16::MAX as i32; // source 16 bits à pleine échelle
+        // fl, fr, centre, LFE, sl, sr — tous à fond.
+        let stereo =
+            crate::audio::channels::to_stereo_i32(&[plein, plein, plein, plein, plein, plein], 6);
+        assert!(
+            stereo[0] > plein,
+            "le repli doit sommer au-delà de i16 avant saturation : {}",
+            stereo[0]
+        );
+
+        let l16 = pcm_i32_to_l16_be(&stereo, 16);
+        assert_eq!(
+            i16::from_be_bytes([l16[0], l16[1]]),
+            i16::MAX,
+            "la conversion L16 doit saturer, pas reboucler : un cast nu rendait \
+             13563 là où il fallait 32767, soit une distorsion franche sur les \
+             passages forts"
+        );
+        assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MAX);
+    }
+
+    /// Et la profondeur d'origine doit être respectée : un 24 bits pleine
+    /// échelle vaut i16::MAX une fois décalé, pas une saturation fortuite.
+    #[test]
+    fn la_conversion_l16_respecte_la_profondeur_source() {
+        let plein24 = (1i32 << 23) - 1;
+        let l16 = pcm_i32_to_l16_be(&[plein24, -plein24], 24);
+        assert_eq!(i16::from_be_bytes([l16[0], l16[1]]), i16::MAX);
+        // Décalage ARITHMÉTIQUE : -8388607 >> 8 arrondit vers moins l'infini,
+        // donc -32768 et non -32767. C'est le comportement de la production.
+        assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MIN);
     }
 }
