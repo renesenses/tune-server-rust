@@ -1782,6 +1782,59 @@ pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
 /// (`transcode_source_to_file`), so a zone hears the same chain whether it
 /// plays on the DAC or through a network renderer.
 #[inline]
+/// Frontière de piste : le DSP à état ne doit rien porter d'une piste à l'autre.
+///
+/// Le convolveur est installé une fois (`set_convolver_ir`) et vit aussi
+/// longtemps que la sortie. Sa file de sortie, sa ligne à retard et son overlap
+/// gardaient donc la queue de la piste précédente, qui repartait dans la
+/// suivante — et ni un seek ni un arrêt n'établissaient de frontière
+/// (JP Robbe, revue de #2268).
+///
+/// Appelé depuis `play_url`, le seul point par lequel passe un DÉBUT de piste.
+/// Une transition gapless ne passe pas par là, et c'est voulu : l'audio y est
+/// continu, le convolveur doit garder son état.
+fn reset_local_dsp(convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>) {
+    if let Ok(mut c) = convolver.lock()
+        && let Some(conv) = c.as_mut()
+    {
+        conv.reset();
+    }
+}
+
+/// Fin de piste : rendre ce que le convolveur retient encore.
+///
+/// Une convolution par blocs garde `latency_frames()` trames en réserve — c'est
+/// le prix de sa latence, et sans ce drainage elles ne partent jamais au
+/// périphérique. Les échantillons rendus traversent le crossfeed comme les
+/// autres, pour que la queue sonne comme le reste.
+fn flush_local_dsp(
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    channels: u16,
+) -> Vec<f32> {
+    if pure_bypass.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let mut queue = match convolver.lock() {
+        Ok(mut c) => match c.as_mut() {
+            Some(conv) => conv.flush(),
+            None => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    if queue.is_empty() {
+        return queue;
+    }
+    if channels == 2
+        && let Ok(mut cf) = crossfeed.lock()
+        && let Some(c) = cf.as_mut()
+    {
+        c.process_interleaved(&mut queue);
+    }
+    queue
+}
+
 fn apply_local_dsp(
     samples: &mut [f32],
     eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
@@ -1949,6 +2002,13 @@ impl OutputTarget for LocalOutput {
         artist: Option<&str>,
     ) -> Result<(), String> {
         self.stop().await.ok();
+
+        // Frontière de piste : le convolveur vit aussi longtemps que la sortie,
+        // il ne doit pas verser la queue de la piste précédente dans celle-ci
+        // (JP Robbe, revue de #2268). `play_url` est le seul point par lequel
+        // passe un début de piste — une transition gapless ne passe pas par là,
+        // et c'est voulu : l'audio y est continu.
+        reset_local_dsp(&self.convolver);
 
         // Restore seek position after stop() cleared the old state.
         let start_position_ms = self.pending_start_position_ms.swap(0, Ordering::SeqCst);
@@ -5238,6 +5298,83 @@ mod tests {
 
     fn rms(samples: &[f32]) -> f32 {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    /// LE test qui manquait, et que JP Robbe a construit hors branche : la
+    /// chaîne réelle, pas le moteur isolé.
+    ///
+    /// Mes onze tests de #2268 portaient sur `Convolver` seul. Ils ne pouvaient
+    /// pas voir que `apply_local_dsp` envoie immédiatement au `RingBuf` ce
+    /// qu'il obtient, sans jamais drainer le convolveur : les `block_size`
+    /// trames retenues n'atteignaient donc jamais le périphérique.
+    ///
+    /// Le contrat est ici écrit noir sur blanc — une IR identité doit rendre la
+    /// piste, à condition de drainer la fin.
+    #[test]
+    fn une_ir_identite_rend_la_piste_entiere_si_on_draine_la_fin() {
+        let bloc = 4usize;
+        let ir = vec![vec![1.0f32, 0.0, 0.0, 0.0]; 2]; // identité, stéréo
+        let convolver =
+            std::sync::Mutex::new(Some(crate::audio::convolver::Convolver::new(&ir, bloc)));
+        let eq = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        // Une piste d'exactement un bloc, en stéréo.
+        let piste: Vec<f32> = (0..bloc * 2).map(|i| (i as f32 + 1.0) / 16.0).collect();
+        let mut tampon = piste.clone();
+        apply_local_dsp(&mut tampon, &eq, &convolver, &crossfeed, &pure, 2, false);
+
+        // Le buffer rendu est le silence d'amorçage : c'est la latence, et
+        // c'est exactement ce que l'ancien code ne rendait jamais visible.
+        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2);
+
+        let mut restitue = tampon.clone();
+        restitue.extend_from_slice(&queue);
+        assert!(
+            restitue.len() >= piste.len(),
+            "le drainage doit rendre au moins la piste"
+        );
+
+        // Quelque part dans ce qui sort, la piste doit se retrouver intacte.
+        let debut = restitue.len() - piste.len();
+        for (i, attendu) in piste.iter().enumerate() {
+            let obtenu = restitue[debut + i];
+            assert!(
+                (obtenu - attendu).abs() < 1e-4,
+                "trame {i} : {obtenu} au lieu de {attendu} — la fin de piste est perdue"
+            );
+        }
+    }
+
+    /// Et la frontière de piste : après remise à zéro, plus rien de la
+    /// précédente. Sans elle, la queue d'une piste repartait dans la suivante.
+    #[test]
+    fn la_remise_a_zero_efface_la_queue_de_la_piste_precedente() {
+        let bloc = 4usize;
+        let ir = vec![vec![1.0f32, 0.0, 0.0, 0.0]; 2];
+        let convolver =
+            std::sync::Mutex::new(Some(crate::audio::convolver::Convolver::new(&ir, bloc)));
+        let eq = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        // Première piste : un bloc bien reconnaissable, jamais drainé.
+        let mut piste1 = vec![1.0f32; bloc * 2];
+        apply_local_dsp(&mut piste1, &eq, &convolver, &crossfeed, &pure, 2, false);
+
+        // Frontière.
+        reset_local_dsp(&convolver);
+
+        // Seconde piste : du silence. Rien de la première ne doit en sortir.
+        let mut piste2 = vec![0.0f32; bloc * 2];
+        apply_local_dsp(&mut piste2, &eq, &convolver, &crossfeed, &pure, 2, false);
+        for (i, v) in piste2.iter().enumerate() {
+            assert!(
+                v.abs() < 1e-6,
+                "trame {i} : {v} — la queue de la piste precedente a fui"
+            );
+        }
     }
 
     #[test]
