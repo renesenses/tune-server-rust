@@ -674,6 +674,23 @@ impl OutputTarget for OaatOutput {
                             return;
                         }
 
+                        // Lire la reponse AVANT de jouer (#2282).
+                        if let Err(raison) = attendre_accord_format(
+                            &mut endpoint,
+                            &device_name,
+                            cur_format,
+                            cur_sample_rate,
+                            ch,
+                            layout,
+                            1,
+                        )
+                        .await
+                        {
+                            error!(device = %device_name, raison = %raison, "oaat: DSD format non accepte, on ne joue pas");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+
                         endpoint
                             .send_metadata(oaat_core::message::TrackMetadata {
                                 title: title.clone(),
@@ -1270,6 +1287,25 @@ impl OutputTarget for OaatOutput {
                         .await
                     {
                         error!(device = %device_name, error = %e, "oaat: format propose failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+
+                    // Lire la reponse AVANT de jouer (#2282) : ce chemin
+                    // proposait puis lancait la lecture sans jamais la
+                    // consulter.
+                    if let Err(raison) = attendre_accord_format(
+                        &mut endpoint,
+                        &device_name,
+                        cur_format,
+                        cur_sample_rate,
+                        ch,
+                        layout,
+                        cur_bits,
+                    )
+                    .await
+                    {
+                        error!(device = %device_name, raison = %raison, "oaat: format non accepte, on ne joue pas");
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -2609,6 +2645,66 @@ fn open_next_dsd(
 ///
 /// `dsd_rate` doit etre absent : `propose_format` ne l'envoie pas, donc un
 /// endpoint qui en pose un ajoute une contrainte que ce chemin n'honore pas.
+/// Attendre la reponse a une proposition de format, et dire si on peut jouer.
+///
+/// Deux chemins — DSD natif et PCM direct — proposaient un format puis
+/// appelaient `send_play` **sans jamais lire `response_rx`**. Trois
+/// consequences, toutes silencieuses (JP Robbe, #2282) :
+///
+/// - un `FormatReject` etait ignore : Tune lancait la lecture alors que
+///   l'endpoint venait de dire non ;
+/// - un `FormatCounter` etait ignore : le payload source partait sans
+///   adaptation, comme dans #2239 ;
+/// - la reponse non consommee restait dans `response_rx` et pouvait etre prise
+///   pour la reponse d'une negociation ULTERIEURE.
+///
+/// Ce troisieme point est le plus vicieux : le decalage survit a la piste qui
+/// l'a cause, et ne se voit donc pas la ou il est ne.
+async fn attendre_accord_format(
+    endpoint: &mut oaat_controller::ConnectedEndpoint,
+    device_name: &str,
+    propose_format: oaat_core::format::AudioFormat,
+    propose_sample_rate: u32,
+    propose_channels: u8,
+    propose_layout: oaat_core::format::ChannelLayout,
+    propose_bits: u16,
+) -> Result<(), String> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    {
+        Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => Ok(()),
+        Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc))) => {
+            if contre_proposition_honorable(
+                propose_format,
+                propose_sample_rate,
+                propose_channels,
+                propose_layout,
+                propose_bits,
+                &fc,
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "contre-proposition non honorable : {:?} {} Hz {} bits {} canaux",
+                    fc.format, fc.sample_rate, fc.bits_per_sample, fc.channels
+                ))
+            }
+        }
+        Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
+            Err(format!("format refuse : {}", fr.reason))
+        }
+        Ok(Some(autre)) => Err(format!("reponse inattendue : {autre:?}")),
+        Ok(None) => Err("endpoint ferme pendant la negociation".into()),
+        Err(_) => {
+            warn!(device = %device_name, "oaat: pas de reponse a la proposition de format");
+            Err("delai depasse".into())
+        }
+    }
+}
+
 pub(crate) fn contre_proposition_honorable(
     propose_format: oaat_core::format::AudioFormat,
     propose_sample_rate: u32,
