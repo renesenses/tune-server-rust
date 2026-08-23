@@ -627,13 +627,28 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64, String) {
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 current_tag = name.rsplit(':').next().unwrap_or(&name).to_string();
+                if current_tag == "SearchCriteria" {
+                    // `read_text` conserve le contenu brut entier, entites
+                    // comprises. Le lire d'un bloc evite que `&quot;` soit
+                    // emis comme GeneralRef et coupe le critere en morceaux.
+                    criteria = match reader.read_text(e.name()) {
+                        Ok(raw) => {
+                            let decoded = raw.decode().unwrap_or_default().into_owned();
+                            match quick_xml::escape::unescape(&decoded) {
+                                Ok(unescaped) => unescaped.into_owned(),
+                                Err(_) => decoded,
+                            }
+                        }
+                        Err(_) => String::new(),
+                    };
+                    current_tag.clear();
+                }
             }
             Ok(Event::End(_)) => current_tag.clear(),
             Ok(Event::Text(e)) => {
                 let v = e.decode().unwrap_or_default().to_string();
                 match current_tag.as_str() {
                     "ContainerID" => container_id = v,
-                    "SearchCriteria" => criteria = v,
                     "StartingIndex" => start = v.parse().unwrap_or(0),
                     // `RequestedCount = 0` veut dire « tout », comme pour
                     // Browse : le rendre litteralement donnerait zero piste et
@@ -2108,7 +2123,21 @@ mod tests {
         // servie. Ce test attendait un 401 — il encodait l'ancien
         // comportement comme voulu, et c'est justement lui qui laissait les
         // clients d'indexation (JPlay) sans recours.
-        let search_resp = build_browse_response(&state, &soap_body("Search", urn));
+        // `Search` exige ses arguments. Un corps sans `SearchCriteria` doit
+        // désormais recevoir 708 : l'ancien test appelait donc lui-même une
+        // action invalide et masquait le contrat strict que nous annonçons.
+        let search_body = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:Search xmlns:u="{urn}">
+    <ContainerID>0</ContainerID>
+    <SearchCriteria>upnp:class derivedfrom &quot;object.item.audioItem&quot;</SearchCriteria>
+    <Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>1</RequestedCount>
+    <SortCriteria></SortCriteria>
+  </u:Search></s:Body>
+</s:Envelope>"#
+        );
+        let search_resp = build_browse_response(&state, &search_body);
         assert!(search_resp.contains("<u:SearchResponse"), "{search_resp}");
         assert!(!is_soap_fault(&search_resp));
 
@@ -2451,7 +2480,10 @@ mod ssdp_msearch_tests {
             25,
         ));
         assert_eq!(c, "0");
-        assert!(crit.contains("audioItem"), "{crit}");
+        assert_eq!(
+            crit, "upnp:class derivedfrom \"object.item.audioItem\"",
+            "les entites XML doivent etre resolues avant l'evaluation"
+        );
         assert_eq!(start, 50);
         assert_eq!(count, 25);
         assert!(sort.is_empty());
