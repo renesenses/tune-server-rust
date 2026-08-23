@@ -2152,7 +2152,13 @@ fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
     profile
         .bands
         .iter()
-        .map(|b| json!({"freq": b.freq, "gain": b.gain, "q": b.q, "type": b.band_type}))
+        // EqBandSpec est le contrat persistant et audio. Le sérialiser lui-même
+        // évite qu'une projection HTTP recopiée à la main oublie le prochain
+        // champ — c'est exactement ce qui est arrivé à `channel` (#2313).
+        .map(|band| {
+            serde_json::to_value(band)
+                .expect("EqBandSpec doit toujours pouvoir etre serialise en JSON")
+        })
         .collect()
 }
 
@@ -3091,10 +3097,29 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
 #[cfg(test)]
 mod tests {
     use super::client_title_is_usable;
+    use super::eq_bands_json;
     use super::play_error_response;
     use super::precedent_doit_relancer;
     use super::{PlayRequest, QueueAddRequest};
     use axum::http::StatusCode;
+
+    #[test]
+    fn le_json_eq_preserve_le_canal_cible() {
+        let mut profile = tune_core::audio::eq::EqProfile::default();
+        profile.bands.push(tune_core::audio::eq::EqBandSpec {
+            freq: 120.0,
+            gain: -3.5,
+            q: 1.2,
+            band_type: "peak".into(),
+            channel: Some(1),
+        });
+
+        let bands = eq_bands_json(&profile);
+        assert_eq!(bands[0]["channel"], 1);
+        let roundtrip: tune_core::audio::eq::EqBandSpec =
+            serde_json::from_value(bands[0].clone()).unwrap();
+        assert_eq!(roundtrip.channel, Some(1));
+    }
 
     // ── « Précédent » : relancer ou reculer (#1929) ───────────────────────
 
