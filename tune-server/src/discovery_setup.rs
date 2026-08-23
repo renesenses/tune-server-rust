@@ -237,14 +237,27 @@ fn charge_utile_zone_creee(
     zone_id: i64,
     mut plat: serde_json::Value,
 ) -> serde_json::Value {
+    // Lu avant l'emprunt mutable : sert de repli si la zone a disparu entre sa
+    // creation et cette relecture.
+    let nom = plat
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     if let Some(obj) = plat.as_object_mut() {
         obj.insert("id".into(), serde_json::json!(zone_id));
+        // Le CONTRAT client, pas la ligne de base : le volume y passe de 0..100
+        // a 0..1, et l'etat de lecture est pose plutot qu'omis. Un
+        // `to_value(&zone)` brut faisait repartir le volume a 50 la ou le
+        // client attend 0.5 (JP Robbe, revue de #2229).
+        //
         // Si la relecture echoue, on emet la forme plate seule plutot que rien :
         // l'ancien comportement, jamais pire.
         if let Ok(Some(zone)) = zone_repo.get(zone_id) {
-            if let Ok(v) = serde_json::to_value(&zone) {
-                obj.insert("zone".into(), v);
-            }
+            obj.insert(
+                "zone".into(),
+                tune_core::db::zone_repo::zone_creee_contrat_client(Some(&zone), zone_id, &nom),
+            );
         }
     }
     plat
@@ -1768,6 +1781,31 @@ mod tests {
                 .expect("sans la cle `zone`, le client ignore l'evenement");
             assert_eq!(zone.get("id").and_then(|v| v.as_i64()), Some(zid));
             assert_eq!(charge.get("id").and_then(|v| v.as_i64()), Some(zid));
+
+            // La contre-epreuve de JP Robbe : la charge utile doit porter le
+            // CONTRAT client, pas la ligne de base. Le volume y passe de 0..100
+            // a 0..1 — un `to_value(&zone)` brut rendait 50.0 la ou le client
+            // attend 0.5, et le curseur se collait au maximum.
+            assert_eq!(
+                zone.get("volume").and_then(|v| v.as_f64()),
+                Some(0.5),
+                "volume en contrat client (0..1), pas la valeur de la base"
+            );
+            // Et l'etat de lecture est POSE, pas omis : le client fusionne sans
+            // refetch, un champ absent y laisserait la valeur d'une autre zone.
+            for champ in [
+                "state",
+                "current_track",
+                "position_ms",
+                "queue_length",
+                "shuffle",
+                "repeat",
+            ] {
+                assert!(
+                    zone.get(champ).is_some(),
+                    "{champ} absent : le client garderait la valeur precedente"
+                );
+            }
 
             // Et ce que les autres consommateurs lisaient deja : rien n'est retire.
             assert_eq!(

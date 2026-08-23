@@ -835,15 +835,33 @@ impl SlimProtoServer {
         match zone_repo.get_or_create(&player_name, Some("slimproto"), &device_id) {
             Ok((zone_id, created)) => {
                 if created {
-                    state.event_bus.emit_typed(
-                        crate::event_types::EventType::ZoneCreated,
-                        serde_json::json!({
-                            "zone_id": zone_id,
-                            "name": player_name.clone(),
-                            "device_id": device_id.clone(),
-                            "type": "slimproto",
-                        }),
-                    );
+                    state
+                        .event_bus
+                        .emit_typed(crate::event_types::EventType::ZoneCreated, {
+                            // Meme contrat que la route API et la decouverte :
+                            // le client teste `data.zone` avant de fusionner, et
+                            // attend le volume en 0..1 (#2224).
+                            let mut charge = serde_json::json!({
+                                "zone_id": zone_id,
+                                "name": player_name.clone(),
+                                "device_id": device_id.clone(),
+                                "type": "slimproto",
+                                "id": zone_id,
+                            });
+                            if let Some(obj) = charge.as_object_mut()
+                                && let Ok(Some(z)) = zone_repo.get(zone_id)
+                            {
+                                obj.insert(
+                                    "zone".into(),
+                                    crate::db::zone_repo::zone_creee_contrat_client(
+                                        Some(&z),
+                                        zone_id,
+                                        &player_name,
+                                    ),
+                                );
+                            }
+                            charge
+                        });
                 } else {
                     let _ = zone_repo.set_online_by_device(&device_id, true);
                     state.event_bus.emit_typed(

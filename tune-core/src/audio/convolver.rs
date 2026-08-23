@@ -262,6 +262,51 @@ impl Convolver {
         Ok(Self::new(&adapted, block_size))
     }
 
+    /// Remettre le moteur à zéro : plus rien de la piste précédente.
+    ///
+    /// Le convolveur est installé une fois (`set_convolver_ir`) et vit aussi
+    /// longtemps que la sortie. Sans cette remise à zéro, la file de sortie, la
+    /// ligne à retard et l'overlap portent la queue de la piste d'avant : elle
+    /// repart dans la suivante, et un seek ou un arrêt n'établit aucune
+    /// frontière (JP Robbe, revue de #2268).
+    pub fn reset(&mut self) {
+        for c in 0..self.channels {
+            self.input_buf[c].clear();
+            self.output_buf[c].clear();
+            // Ré-amorcer la latence : sans ça, la première trame de la piste
+            // suivante sortirait du néant.
+            self.output_buf[c].extend(std::iter::repeat_n(0.0f32, self.block_size));
+            self.overlap[c].iter_mut().for_each(|v| *v = 0.0);
+            for slot in self.fdl[c].iter_mut() {
+                slot.iter_mut().for_each(|v| *v = Complex::new(0.0, 0.0));
+            }
+        }
+        self.fdl_pos = 0;
+    }
+
+    /// Rendre ce que le moteur retient encore, en fin de piste.
+    ///
+    /// Une convolution par blocs garde `latency_frames()` trames en réserve —
+    /// c'est le prix de sa latence. Sans ce drainage, ces trames ne partent
+    /// jamais au périphérique : la fin de chaque piste était tronquée
+    /// (JP Robbe, revue de #2268).
+    ///
+    /// Rend des échantillons ENTRELACÉS, prêts à suivre le même chemin que le
+    /// reste. Le moteur est remis à zéro après : la piste est finie.
+    pub fn flush(&mut self) -> Vec<f32> {
+        let ch = self.channels;
+        if ch == 0 {
+            return Vec::new();
+        }
+        // Nourrir du silence pour pousser la queue hors du moteur, puis
+        // recueillir exactement ce qui restait.
+        let latence = self.latency_frames();
+        let mut queue = vec![0.0f32; latence * ch];
+        self.process_interleaved(&mut queue);
+        self.reset();
+        queue
+    }
+
     /// Latence introduite par la convolution, en trames.
     ///
     /// Une convolution par blocs ne peut rien rendre avant d'avoir vu un bloc
