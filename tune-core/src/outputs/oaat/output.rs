@@ -187,6 +187,17 @@ impl OaatOutput {
         self.pending_start_ms.store(ms, Ordering::SeqCst);
     }
 
+    /// Le flux part-il en DSD 1 bit, lu directement depuis le `.dsf` ?
+    ///
+    /// Sur ce chemin l'orchestrateur ne décode rien — c'est tout l'objet du
+    /// correctif du blocage Zicmu : une URL de transcodage armée ici
+    /// orphelinait un décodage que personne ne lit. Personne ne produit donc
+    /// de fenêtre de niveaux, et les VU-mètres n'ont aucune source. Ce qui se
+    /// mesure ailleurs ne se mesure pas ici, et l'écran doit pouvoir le dire.
+    pub fn is_native_dsd_active(&self) -> bool {
+        self.native_dsd_active.load(Ordering::Relaxed)
+    }
+
     // These three exist only for `integration_test`, which is gated on
     // `all(test, feature = "oaat")`. Gating them on `test` alone — or not at
     // all — leaves them compiled but unused in a plain `cargo test`, which is
@@ -333,7 +344,17 @@ async fn connect_and_setup(
     .await
     {
         Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => {}
-        Ok(Some(oaat_controller::EndpointResponse::FormatCounter(_))) => {}
+        // Une contre-proposition n'est acceptee que si elle decrit exactement
+        // ce qu'on allait envoyer : on ne sait pas adapter le flux (#2239).
+        Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc)))
+            if contre_proposition_honorable(
+                (
+                    stream_info.format,
+                    stream_info.sample_rate,
+                    stream_info.bits_per_sample,
+                ),
+                (fc.format, fc.sample_rate, fc.bits_per_sample as u16),
+            ) => {}
         _ => {
             error!(device = %device_name, "oaat: reconnect format negotiation failed");
             return None;
@@ -1681,16 +1702,26 @@ impl OutputTarget for OaatOutput {
                     info!(device = %device_name, stream_id = %fa.stream_id, "oaat: format accepted");
                 }
                 Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc))) => {
-                    info!(device = %device_name, rate = fc.sample_rate, bits = fc.bits_per_sample, "oaat: format counter-proposed");
-                    cur_format = fc.format;
-                    cur_bits = fc.bits_per_sample as u16;
-                    cur_sample_rate = fc.sample_rate;
-                    bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-                    packet_size = if cur_format == AudioFormat::Flac {
-                        FLAC_CHUNK_SIZE
+                    // On ADOPTAIT les valeurs de la contre-proposition sans
+                    // toucher au payload : les memes octets partaient avec une
+                    // etiquette qui ne les decrivait plus (#2239). Tant que ce
+                    // chemin ne sait pas adapter le flux, une contre-proposition
+                    // qui differe de ce qu'on allait envoyer est un refus.
+                    if contre_proposition_honorable(
+                        (cur_format, cur_sample_rate, cur_bits),
+                        (fc.format, fc.sample_rate, fc.bits_per_sample as u16),
+                    ) {
+                        info!(device = %device_name, rate = fc.sample_rate, bits = fc.bits_per_sample, "oaat: contre-proposition identique a la proposition");
                     } else {
-                        PCM_SAMPLES_PER_PACKET * bytes_per_frame
-                    };
+                        error!(
+                            device = %device_name,
+                            propose_format = ?cur_format, propose_rate = cur_sample_rate, propose_bits = cur_bits,
+                            contre_format = ?fc.format, contre_rate = fc.sample_rate, contre_bits = fc.bits_per_sample,
+                            "oaat: contre-proposition non honorable — ce chemin ne sait pas adapter le flux, arret plutot que d'envoyer des octets mal etiquetes"
+                        );
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
                 }
                 Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
                     error!(device = %device_name, reason = %fr.reason, "oaat: format rejected");
@@ -2120,6 +2151,24 @@ impl OutputTarget for OaatOutput {
                                             break;
                                         }
                                         match tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.response_rx.recv()).await {
+                                            // Un `FormatCounter` etait traite comme un
+                                            // `FormatAccept` et ses valeurs jetees : on
+                                            // reinstallait celles de la piste suivante,
+                                            // donc on renvoyait un format que l'endpoint
+                                            // venait de refuser (#2239).
+                                            Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc)))
+                                                if !contre_proposition_honorable(
+                                                    (next.info.format, next.info.sample_rate, next.info.bits_per_sample),
+                                                    (fc.format, fc.sample_rate, fc.bits_per_sample as u16),
+                                                ) =>
+                                            {
+                                                error!(
+                                                    device = %device_name,
+                                                    contre_format = ?fc.format, contre_rate = fc.sample_rate, contre_bits = fc.bits_per_sample,
+                                                    "oaat: contre-proposition non honorable en gapless, fin de chaine"
+                                                );
+                                                break;
+                                            }
                                             Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) |
                                             Ok(Some(oaat_controller::EndpointResponse::FormatCounter(_))) => {
                                                 cur_format = next.info.format;
@@ -2534,6 +2583,27 @@ fn open_next_dsd(
 /// `prefetch_rx` du select! et le rattrapage d'un préchargement en vol à l'EOF
 /// (#1358) — les deux chemins doivent traiter le résultat À L'IDENTIQUE.
 #[allow(clippy::too_many_arguments)]
+/// Une contre-proposition d'un endpoint est-elle honorable en l'etat ?
+///
+/// Tune envoie les octets de la SOURCE. Adopter les valeurs d'une
+/// contre-proposition sans convertir le payload revient a mentir sur ce qu'on
+/// envoie : `cur_format`, `cur_bits` et `cur_sample_rate` etaient reecrits, et
+/// les memes octets partaient avec une etiquette qui ne les decrivait plus
+/// (#2239). Une source 24/96 contre-proposee en 16/48 continuait de partir en
+/// 24/96, decoupee et annoncee comme du 16/48.
+///
+/// Une contre-proposition n'est donc acceptable que si elle decrit EXACTEMENT
+/// ce qu'on allait deja envoyer — auquel cas il n'y a rien a faire. Toute autre
+/// demande une adaptation du flux (profondeur, cadence, codec) que ce chemin ne
+/// sait pas produire : la refuser rend le silence et une raison, l'accepter
+/// rendait du bruit sans explication.
+pub(crate) fn contre_proposition_honorable(
+    propose: (oaat_core::format::AudioFormat, u32, u16),
+    contre: (oaat_core::format::AudioFormat, u32, u16),
+) -> bool {
+    propose == contre
+}
+
 async fn settle_prefetch(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     mut prefetch: NextTrackPrefetch,

@@ -4410,7 +4410,7 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
 
         // Try to get the track URL; if it fails with an auth error, attempt
         // a token refresh and retry once. This handles Qobuz tokens expiring
@@ -5647,7 +5647,7 @@ impl PlaybackOrchestrator {
                                 let svc = registry
                                     .get(&service_name)
                                     .ok_or_else(|| format!("unknown service: {service_name}"))?;
-                                let mut svc = svc.lock().await;
+                                let mut svc = svc.write().await;
                                 // Best-effort token refresh, then re-resolve with
                                 // the same default quality the initial play used.
                                 let _ = svc.refresh_if_needed().await;
@@ -5858,7 +5858,7 @@ impl PlaybackOrchestrator {
         if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get(&prefetched.source) {
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
                     if title.is_empty() {
                         title = track.title;
@@ -6520,7 +6520,7 @@ impl PlaybackOrchestrator {
                 let Some(svc) = registry.get(&source) else {
                     return;
                 };
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 match svc.get_track_url(&source_id, None).await {
                     Ok(d) => d,
                     Err(_) => return,
@@ -8047,6 +8047,38 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Cette sortie produit-elle des niveaux exploitables ?
+    ///
+    /// `false` sur le seul chemin qui n'en produit aucun : OAAT en DSD natif,
+    /// où la sortie ouvre le `.dsf` elle-même et expédie du 1 bit sans que
+    /// personne ne décode. Les VU-mètres n'y reçoivent rien — l'aiguille reste
+    /// où elle est, ce qui se lit comme une panne alors que c'est une absence
+    /// de mesure. Le client ne peut pas deviner la différence entre « pas de
+    /// niveaux » et « des niveaux qui tardent » : c'est au serveur de le dire.
+    ///
+    /// Rendre du DSD en PCM en parallèle rien que pour animer deux aiguilles
+    /// coûterait, pendant l'écoute, exactement le décodage qu'on a retiré de
+    /// ce chemin (blocage Zicmu, `dsd_streaming_send_timeout`).
+    pub async fn output_produces_levels(&self, device_id: Option<&str>) -> bool {
+        let Some(device_id) = device_id else {
+            return true;
+        };
+        #[cfg(feature = "oaat")]
+        if device_id.starts_with("oaat:") {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            if let Some(arc) = arc {
+                let output = arc.lock().await;
+                if let Some(oaat) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                {
+                    return !oaat.is_native_dsd_active();
+                }
+            }
+        }
+        true
+    }
+
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
@@ -8338,7 +8370,7 @@ impl PlaybackOrchestrator {
                         };
                         let svc = svc.clone();
                         drop(registry);
-                        let svc = svc.lock().await;
+                        let svc = svc.read().await;
                         svc.get_track_url(&source_id, None).await.ok()
                     };
                     let Some(data) = resolved else {
@@ -10031,6 +10063,76 @@ mod tests {
         );
     }
 
+    /// Le garde-fou que JP Robbe a demande en revue de #2220 : une sortie OAAT
+    /// REELLEMENT ENREGISTREE, drapeau DSD natif actif, doit rendre `false`.
+    ///
+    /// Mon premier test ne couvrait que les retours `true`. Une inversion de
+    /// booleen, un mauvais prefixe ou un downcast rate y seraient passes
+    /// inapercus : c'est ce test-ci qui verrouille le prefixe, le lookup, le
+    /// downcast et l'inversion ENSEMBLE.
+    #[cfg(feature = "oaat")]
+    #[tokio::test]
+    async fn une_sortie_oaat_en_dsd_natif_ne_mesure_pas() {
+        let orch = test_orchestrator();
+        let sortie = crate::outputs::oaat::OaatOutput::new(
+            "Zicmu".into(),
+            "192.168.1.99".into(),
+            9000,
+            "oaat:zicmu-test".into(),
+        );
+        // Le constructeur pose le prefixe `oaat:`, et c'est lui qui conditionne
+        // le lookup dans `output_produces_levels`.
+        let device_id = "oaat:zicmu-test".to_string();
+
+        // En PCM la sortie mesure : ce sont les niveaux du decodage de
+        // l'orchestrateur qui alimentent les VU.
+        orch.outputs.lock().await.register(Box::new(sortie));
+        assert!(
+            orch.output_produces_levels(Some(&device_id)).await,
+            "hors DSD natif, la chaine mesure"
+        );
+
+        // DSD natif : la sortie ouvre le .dsf elle-meme, plus personne ne
+        // decode, donc plus aucune fenetre de niveaux.
+        {
+            let registre = orch.outputs.lock().await;
+            let arc = registre.get(&device_id).expect("sortie enregistree");
+            let sortie = arc.lock().await;
+            let oaat = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                .expect("downcast vers OaatOutput");
+            oaat.set_native_dsd_active_for_test(true);
+        }
+        assert!(
+            !orch.output_produces_levels(Some(&device_id)).await,
+            "en DSD natif rien ne mesure : l'ecran doit pouvoir le dire"
+        );
+    }
+
+    /// Une zone sans sortie, ou une sortie qui n'est pas OAAT, mesure :
+    /// `false` est réservé au seul chemin qui ne produit rien.
+    ///
+    /// Le cas DSD natif lui-même se teste là où vit le drapeau
+    /// (`outputs::oaat::integration_test`) : il demande une sortie OAAT
+    /// enregistrée, pas un orchestrateur nu.
+    #[tokio::test]
+    async fn sans_sortie_ou_hors_oaat_on_mesure() {
+        let orch = test_orchestrator();
+        assert!(orch.output_produces_levels(None).await);
+        for did in [
+            "local:Haut-parleurs",
+            "dlna:uuid:1234",
+            "airplay:salon",
+            "oaat:zicmu", // enregistré nulle part : on ne conclut pas à l'absence
+        ] {
+            assert!(
+                orch.output_produces_levels(Some(did)).await,
+                "{did} : rien ne prouve que cette sortie ne mesure pas"
+            );
+        }
+    }
+
     fn test_orchestrator() -> PlaybackOrchestrator {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -10068,6 +10170,7 @@ mod tests {
                 gain: 8.0,
                 q: 0.71,
                 band_type: "low_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };

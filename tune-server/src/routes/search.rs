@@ -106,7 +106,7 @@ async fn federated_search(
             }
 
             if let Some(svc) = registry.get(&svc_name) {
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 if !svc.auth_status().await.authenticated {
                     continue;
                 }

@@ -336,6 +336,48 @@ pub struct Zone {
     pub autoplay_enabled: bool,
 }
 
+/// La charge utile `zone` d'une zone qui vient de naitre, dans le contrat que
+/// le client attend.
+///
+/// Ce n'est PAS `serde_json::to_value(&zone)`. La ligne de base porte le volume
+/// en 0..100, le client le veut en 0..1 ; et une zone neuve doit ANNONCER son
+/// etat de lecture plutot que de l'omettre — le client fusionne cette charge
+/// utile sans refetch, et un champ absent y laisse la valeur precedente, celle
+/// d'une autre zone.
+///
+/// Vit ici, a cote de `Zone`, parce que TROIS emetteurs doivent l'utiliser et
+/// qu'ils ne sont pas dans le meme crate : la route `POST /zones` et la
+/// decouverte (tune-server), et SlimProto (tune-core). Trois copies du meme
+/// contrat rediverge toujours — c'est exactement ce que #2224 a mis au jour, et
+/// le `to_value` brut de son premier correctif faisait repartir le volume a 50
+/// la ou le client attend 0.5 (JP Robbe).
+pub fn zone_creee_contrat_client(
+    zone: Option<&Zone>,
+    id: i64,
+    nom_de_repli: &str,
+) -> serde_json::Value {
+    use serde_json::json;
+    let mut v = zone
+        .and_then(|z| serde_json::to_value(z).ok())
+        .unwrap_or_else(|| json!({"id": id, "name": nom_de_repli}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("state".into(), json!("stopped"));
+        obj.insert("current_track".into(), json!(null));
+        obj.insert("position_ms".into(), json!(0));
+        obj.insert("queue_length".into(), json!(0));
+        // Zone qui vient de naitre : rien ne joue. Poser l'aleatoire et la
+        // repetition plutot que de les omettre — meme divergence que #2092,
+        // en plus discret.
+        obj.insert("shuffle".into(), json!(false));
+        // Le TYPE et non la chaine « off » : un renommage de variante suit ici
+        // tout seul.
+        obj.insert("repeat".into(), json!(crate::playback::RepeatMode::Off));
+        let vol = zone.map(|z| z.volume).unwrap_or(50);
+        obj.insert("volume".into(), json!(vol as f64 / 100.0));
+    }
+    v
+}
+
 pub struct ZoneRepo {
     db: Arc<dyn DbBackend>,
 }

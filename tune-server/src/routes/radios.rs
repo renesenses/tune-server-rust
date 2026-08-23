@@ -1070,7 +1070,7 @@ async fn create_streaming_playlist_from_favorites(
             }
         }
     };
-    let svc = svc_arc.lock().await;
+    let svc = svc_arc.read().await;
 
     let mut matched_ids: Vec<String> = Vec::new();
     let mut details: Vec<Value> = Vec::new();
