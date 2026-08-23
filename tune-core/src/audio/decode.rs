@@ -352,13 +352,39 @@ fn stage_locally_for_decode(_src: &str) -> Option<StagedFile> {
     None
 }
 
+/// Décoder un fichier en PCM entier.
+///
+/// ⚠️ **`prefere_*` sont des PRÉFÉRENCES, pas des garanties.** Cette fonction ne
+/// rééchantillonne pas et ne remixe pas. Elle rend toujours la cadence et le
+/// nombre de canaux RÉELLEMENT décodés — c'est l'objet de #1498, qui a supprimé
+/// l'étiquetage mensonger — et c'est à l'appelant d'adapter s'il a besoin d'un
+/// format précis.
+///
+/// Ce que les préférences font vraiment, selon le format :
+///
+/// - **DSD** : `prefere_sample_rate` choisit la cadence de conversion DSD→PCM.
+///   C'est le seul décodeur qui l'honore.
+/// - **symphonia** (FLAC, MP3, AAC, ALAC, WAV, OGG…) : les deux sont ignorées,
+///   le décodage se fait à la source.
+/// - **Opus, AIFF** : ignorées également.
+///
+/// Le nom d'origine — `target_*` — laissait croire à un contrat que le code
+/// n'honore pas ; trois appelants s'y sont fiés et ont produit du faux (#1498,
+/// #2230, #2237). Les renommer ne corrige rien à l'exécution : ça empêche la
+/// prochaine méprise, qui est le vrai coût de ce défaut.
+///
+/// Un appelant qui a besoin d'un format exact doit adapter lui-même —
+/// `audio::resample::resample_i32` et `audio::channels::to_stereo_i32` sont là
+/// pour ça, et c'est ce que fait AirPlay depuis #2237.
 pub fn decode_to_pcm(
     file_path: &str,
-    target_sample_rate: Option<u32>,
-    target_channels: Option<u32>,
+    prefere_sample_rate: Option<u32>,
+    prefere_channels: Option<u32>,
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
+    let target_sample_rate = prefere_sample_rate;
+    let target_channels = prefere_channels;
     // Stage network/external sources to a fast local temp before decoding so the
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
@@ -2550,6 +2576,54 @@ mod decode_integration_tests {
             "duree deduite de l'etiquette ({duration:.3} s) et duree rapportee ({:.3} s) doivent concorder",
             result.duration_s
         );
+    }
+
+    /// Le contrat, epingle : les preferences n'obligent a rien sur les formats
+    /// decodes par symphonia. Ce test existe pour qu'un futur correctif qui
+    /// AJOUTERAIT le reechantillonnage soit un choix delibere et visible, pas
+    /// un effet de bord — et pour qu'un appelant ne puisse plus supposer
+    /// l'inverse sans qu'une assertion le contredise (#2230).
+    #[test]
+    fn les_preferences_ne_sont_pas_des_garanties_sur_symphonia() {
+        let dir = std::env::temp_dir().join("tune_prefs_decode");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("stereo_44100.wav");
+        ecrire_wav_stereo_44100(&path);
+
+        // On demande du mono a 48 kHz. On recoit la source, honnetement decrite.
+        let d = decode_to_pcm(path.to_str().unwrap(), Some(48_000), Some(1), 0.0, 0.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            d.sample_rate, 44_100,
+            "la cadence rendue est celle de la SOURCE"
+        );
+        assert_eq!(d.channels, 2, "les canaux rendus sont ceux de la SOURCE");
+        assert_eq!(
+            d.samples_i32.len() % 2,
+            0,
+            "les echantillons restent entrelaces stereo"
+        );
+    }
+
+    /// Un WAV PCM 16 bits stereo 44,1 kHz, deux trames.
+    fn ecrire_wav_stereo_44100(path: &std::path::Path) {
+        let donnees: [u8; 8] = [0x00, 0x10, 0x00, 0xF0, 0x00, 0x20, 0x00, 0xE0];
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        w.extend_from_slice(&44_100u32.to_le_bytes());
+        w.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes()); // block align
+        w.extend_from_slice(&16u16.to_le_bytes()); // bits
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(path, w).unwrap();
     }
 
     #[test]
