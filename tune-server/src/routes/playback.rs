@@ -151,7 +151,7 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
     });
 }
 
-async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
+pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
