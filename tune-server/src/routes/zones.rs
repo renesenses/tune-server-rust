@@ -2413,30 +2413,8 @@ async fn create_zone(
 
             // Build the full zone object for both HTTP response and WS event
             let zone = repo.get(id).ok().flatten();
-            let mut v = zone
-                .as_ref()
-                .and_then(|z| serde_json::to_value(z).ok())
-                .unwrap_or_else(|| json!({"id": id, "name": body.name}));
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("state".into(), json!("stopped"));
-                obj.insert("current_track".into(), json!(null));
-                obj.insert("position_ms".into(), json!(0));
-                obj.insert("queue_length".into(), json!(0));
-                // Zone qui vient de naitre : rien ne joue, donc l'aleatoire et
-                // la repetition sont a leur valeur par defaut. Les poser quand
-                // meme plutot que de les omettre — le client fusionne cette
-                // charge utile sans refetch, et un champ ABSENT y laisse la
-                // valeur precedente, celle d'une autre zone. C'est la meme
-                // divergence que #2092, en plus discret.
-                obj.insert("shuffle".into(), json!(false));
-                // Le TYPE et non la chaine « off » : `RepeatMode` se serialise
-                // en minuscules, et un renommage de variante suivrait ici tout
-                // seul. Une chaine en dur, c'est une copie de plus a faire
-                // deriver — ce que ce garde-fou existe justement pour empecher.
-                obj.insert("repeat".into(), json!(tune_core::playback::RepeatMode::Off));
-                let vol = zone.as_ref().map(|z| z.volume).unwrap_or(50);
-                obj.insert("volume".into(), json!(vol as f64 / 100.0));
-            }
+            let v =
+                tune_core::db::zone_repo::zone_creee_contrat_client(zone.as_ref(), id, &body.name);
 
             // Emit with full zone data so clients can merge without re-fetching
             state.event_bus.emit(
