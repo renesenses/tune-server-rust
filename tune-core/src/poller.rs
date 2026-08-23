@@ -1954,7 +1954,7 @@ impl PositionPoller {
     ///
     /// Le cout est nul pour les zones non-OAAT : `output_produces_levels`
     /// teste le prefixe `oaat:` avant de prendre le moindre verrou.
-    async fn annoncer_bascule_des_niveaux(&self, dernier: &mut HashMap<i64, bool>) {
+    pub(crate) async fn annoncer_bascule_des_niveaux(&self, dernier: &mut HashMap<i64, bool>) {
         let Some(ref bus) = self.event_bus else {
             return;
         };
@@ -6327,5 +6327,126 @@ mod autoplay_source_tests {
         // service au hasard.
         assert!(!prefers(None));
         assert!(!prefers(Some("")));
+    }
+}
+
+#[cfg(all(test, feature = "oaat"))]
+mod bascule_des_niveaux_tests {
+    use super::PositionPoller;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::outputs::OutputRegistry;
+    use crate::outputs::oaat::OaatOutput;
+    use crate::playback::PlaybackManager;
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// La dette de test relevee par JP Robbe sur #2280 : rien ne couvrait
+    /// `annoncer_bascule_des_niveaux`, ni son emission de `zone.updated`.
+    ///
+    /// Supprimer l'appel du poller ou le `bus.emit(...)` laissait les tests de
+    /// #2280 VERTS, alors que le client ne refetch plus et que
+    /// `levels_available` reste fige pendant exactement la lecture DSD.
+    ///
+    /// Le scenario est celui de son ticket, dans l'ordre : valeur initiale,
+    /// bascule en DSD natif, re-poll sans changement, retour en PCM.
+    #[tokio::test]
+    async fn la_bascule_est_annoncee_une_fois_et_une_seule() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+
+        let device_id = "oaat:zicmu-test";
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zone_id = repo.create("Zicmu", Some("oaat"), Some(device_id)).unwrap();
+
+        let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+        outputs.lock().await.register(Box::new(OaatOutput::new(
+            "Zicmu".into(),
+            "192.168.1.99".into(),
+            9000,
+            device_id.into(),
+        )));
+
+        let playback = Arc::new(PlaybackManager::new());
+        let orchestrator = Arc::new(crate::orchestrator::PlaybackOrchestrator::new(
+            db.clone(),
+            playback.clone(),
+            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            outputs.clone(),
+            None,
+        ));
+
+        let bus = Arc::new(EventBus::new());
+        let mut recu = bus.subscribe();
+        let poller = PositionPoller::new(
+            orchestrator,
+            playback,
+            outputs.clone(),
+            db.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_event_bus(bus.clone());
+
+        let compter = |recu: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>| {
+            let mut n = 0;
+            while let Ok(ev) = recu.try_recv() {
+                if ev.event_type == "zone.updated"
+                    && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(zone_id)
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        let mut dernier: HashMap<i64, bool> = HashMap::new();
+
+        // 1. Valeur initiale : une zone jamais annoncee doit l'etre, sinon une
+        //    zone deja en DSD au demarrage resterait muette.
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 1, "la valeur initiale doit s'annoncer");
+        assert_eq!(dernier.get(&zone_id), Some(&true), "en PCM, on mesure");
+
+        // 2. Bascule en DSD natif : exactement un evenement.
+        {
+            let registre = outputs.lock().await;
+            let arc = registre.get(device_id).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<OaatOutput>()
+                .unwrap()
+                .set_native_dsd_active_for_test(true);
+        }
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 1, "la bascule doit s'annoncer");
+        assert_eq!(
+            dernier.get(&zone_id),
+            Some(&false),
+            "en DSD natif, rien ne mesure"
+        );
+
+        // 3. Re-poll sans changement : aucun doublon.
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 0, "pas d'evenement sans changement");
+
+        // 4. Retour en PCM : un second evenement.
+        {
+            let registre = outputs.lock().await;
+            let arc = registre.get(device_id).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<OaatOutput>()
+                .unwrap()
+                .set_native_dsd_active_for_test(false);
+        }
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 1, "le retour en PCM doit s'annoncer");
     }
 }
