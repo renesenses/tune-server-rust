@@ -636,6 +636,20 @@ const BROWSER_UNATTENDED_GRACE: std::time::Duration = std::time::Duration::from_
 /// - `"browser_unattended"` — zone navigateur en lecture depuis assez
 ///   longtemps pour que ce ne soit plus un démarrage, dont pas un octet n'a
 ///   été tiré : l'onglet qui devait jouer n'est pas là.
+/// Les VU-mètres de cette zone ont-ils une source ?
+///
+/// Le client ne peut pas distinguer « aucune mesure sur ce chemin » de « des
+/// mesures qui n'arrivent pas encore » : dans les deux cas l'aiguille ne bouge
+/// pas. Une aiguille figée MENT — elle annonce un signal constant. Grisée, elle
+/// dit la vérité : on ne mesure pas ici. D'où ce champ, que le serveur seul
+/// peut renseigner. Cas unique aujourd'hui : OAAT en DSD natif (Xavier/Zicmu).
+pub(crate) async fn levels_available(state: &AppState, zone: &Zone) -> bool {
+    state
+        .orchestrator
+        .output_produces_levels(zone.output_device_id.as_deref())
+        .await
+}
+
 pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
     // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
     // On ne le demande au streamer que pour une zone navigateur en lecture,
@@ -1367,6 +1381,30 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             inject_metadata_anchor(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
+            // L'aleatoire et la repetition appartiennent a la ZONE, et ils
+            // survivent aux redemarrages : `queue_persistence` les enregistre
+            // avec la file, `startup.rs` les restaure.
+            //
+            // Cette charge utile ne les portait pas. Le client naissait donc a
+            // `shuffleEnabled = false` et n'avait aucun moyen d'apprendre le
+            // contraire : ses deux sites de recalage lisent `zone.shuffle` /
+            // `zone.repeat` (`App.svelte`, `syncTransportFromZone`), c'est-a-dire
+            // des champs que personne n'envoyait. Seul un CLIC sur le bouton
+            // remettait l'ecran d'accord avec le serveur — le geste qu'on
+            // cherche justement a eviter.
+            //
+            // Resultat vecu par Tades (#2092) : un aleatoire actif cote serveur
+            // et eteint a l'ecran, sans limite de duree. L'album part dans le
+            // desordre, « suivant » saute au hasard, et le bouton qui
+            // expliquerait tout parait inactif. Il a ouvert deux fils, en
+            // ecrivant « je ne pense pas avoir parametre cela » : il avait
+            // raison de ne pas s'en souvenir, rien ne le lui montrait.
+            //
+            // Le WebSocket, lui, les envoyait deja (`ws.rs`) : c'est REST qui
+            // etait en retard, et c'est REST que le client lit au changement de
+            // zone et apres chaque evenement de lecture.
+            obj.insert("shuffle".into(), json!(ps.shuffle));
+            obj.insert("repeat".into(), json!(ps.repeat));
             obj.insert(
                 "volume".into(),
                 json!(if ps.volume > 0.0 {
@@ -1476,6 +1514,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "output_reach".into(),
                 json!(output_reach(&state, z, &ps).await),
             );
+            obj.insert(
+                "levels_available".into(),
+                json!(levels_available(&state, z).await),
+            );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -1533,6 +1575,11 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 // "now playing" highlight on track change without refetching the
                 // whole queue (expensive under a large shuffle queue, #1096).
                 obj.insert("queue_position".into(), json!(ps.queue_position));
+                // Meme raison qu'au-dessus (#2092) : c'est cette charge utile
+                // que le client relit apres chaque evenement de lecture, et
+                // c'est elle qui doit lui apprendre un aleatoire deja actif.
+                obj.insert("shuffle".into(), json!(ps.shuffle));
+                obj.insert("repeat".into(), json!(ps.repeat));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
                 let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
@@ -1616,6 +1663,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "output_reach".into(),
                     json!(output_reach(&state, &zone, &ps).await),
+                );
+                obj.insert(
+                    "levels_available".into(),
+                    json!(levels_available(&state, &zone).await),
                 );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
@@ -2371,6 +2422,18 @@ async fn create_zone(
                 obj.insert("current_track".into(), json!(null));
                 obj.insert("position_ms".into(), json!(0));
                 obj.insert("queue_length".into(), json!(0));
+                // Zone qui vient de naitre : rien ne joue, donc l'aleatoire et
+                // la repetition sont a leur valeur par defaut. Les poser quand
+                // meme plutot que de les omettre — le client fusionne cette
+                // charge utile sans refetch, et un champ ABSENT y laisse la
+                // valeur precedente, celle d'une autre zone. C'est la meme
+                // divergence que #2092, en plus discret.
+                obj.insert("shuffle".into(), json!(false));
+                // Le TYPE et non la chaine « off » : `RepeatMode` se serialise
+                // en minuscules, et un renommage de variante suivrait ici tout
+                // seul. Une chaine en dur, c'est une copie de plus a faire
+                // deriver — ce que ce garde-fou existe justement pour empecher.
+                obj.insert("repeat".into(), json!(tune_core::playback::RepeatMode::Off));
                 let vol = zone.as_ref().map(|z| z.volume).unwrap_or(50);
                 obj.insert("volume".into(), json!(vol as f64 / 100.0));
             }
@@ -4250,6 +4313,75 @@ mod patch_zone_error_guard {
             premier_refus < premiere_ecriture,
             "une validation arrive APRÈS une écriture : un PATCH refusé aurait \
              déjà modifié la zone"
+        );
+    }
+}
+
+/// Garde-fou #2092 : les charges utiles d'une zone ne doivent plus diverger.
+///
+/// L'état d'aléatoire et de répétition appartient à la zone et **survit aux
+/// redémarrages** (`queue_persistence`, `startup.rs`). Le WebSocket l'envoyait
+/// déjà ; les charges REST, non — et ce sont elles que le client relit au
+/// changement de zone et après chaque événement de lecture.
+///
+/// Tades (#2092) a donc écouté des albums dans le désordre avec un bouton
+/// « aléatoire » éteint, sans limite de durée, et a ouvert deux fils en
+/// écrivant « je ne pense pas avoir paramétré cela ». Il avait raison de ne pas
+/// s'en souvenir : rien ne le lui montrait.
+///
+/// La cause de fond n'est pas l'oubli d'un champ, c'est que **cette charge
+/// utile est construite à plusieurs endroits**. Deux copies avaient déjà
+/// divergé. Ce contrôle exige qu'elles restent d'accord — c'est la même
+/// famille que #2012 (« le rapport de fin de scan est construit trois fois, et
+/// les copies ont déjà divergé »).
+#[cfg(test)]
+mod charge_utile_zone_guard {
+    /// ⚠️ La source est tronquée AVANT ce module.
+    ///
+    /// `include_str!` rend le fichier entier, module de test compris — et les
+    /// motifs cherchés ci-dessous y figurent mot pour mot. Un `contains` sur le
+    /// fichier complet se trouverait lui-même et rendrait vrai quoi qu'il
+    /// arrive. Vécu le jour même sur un autre garde-fou (#2082) : il avait
+    /// survécu au sabotage de la condition qu'il prétendait garder.
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("zones.rs");
+        const BORNE: &str = "mod charge_utile_zone_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("module renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    /// `queue_length` sert de marqueur : c'est le champ que porte toute charge
+    /// utile décrivant l'état de lecture d'une zone. Chacune doit porter aussi
+    /// l'aléatoire et la répétition.
+    #[test]
+    fn toute_charge_utile_de_zone_porte_l_aleatoire_et_la_repetition() {
+        let src = code_de_production();
+        // Les motifs ne portent PAS le `obj.insert(` qui les précède : rustfmt
+        // coupe un appel long sur trois lignes dès que ses arguments grossissent,
+        // et le compteur retomberait alors à zéro sans qu'une seule charge utile
+        // ait changé. Un garde-fou sensible à la mise en forme lâche en silence,
+        // au pire moment — c'est la première version de celui-ci qui l'a montré.
+        let etats = src.matches(r#""queue_length".into()"#).count();
+        let aleatoire = src.matches(r#""shuffle".into()"#).count();
+        let repetition = src.matches(r#""repeat".into()"#).count();
+
+        assert!(
+            etats >= 2,
+            "le marqueur `queue_length` n'apparaît que {etats} fois — la forme \
+             des charges utiles a changé, et ce contrôle ne garde plus rien."
+        );
+        assert_eq!(
+            aleatoire, etats,
+            "{etats} charge(s) utile(s) de zone, mais {aleatoire} portent \
+             `shuffle` : une copie a divergé. Le client naîtrait de nouveau à \
+             « aléatoire éteint » devant un serveur qui l'a activé (#2092)."
+        );
+        assert_eq!(
+            repetition, etats,
+            "{etats} charge(s) utile(s) de zone, mais {repetition} portent \
+             `repeat` : même divergence, autre réglage."
         );
     }
 }

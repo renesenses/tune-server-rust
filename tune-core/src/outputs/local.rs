@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -1256,17 +1257,39 @@ pub(crate) fn doit_declarer_chaine_epuisee(
 ///
 /// Also used by `coreaudio_exclusive` on macOS for bit-perfect output.
 pub struct RingBuf {
-    buf: Box<[f32]>,
+    /// Les cases vivent dans des `UnsafeCell` : c'est la SEULE façon légale de
+    /// muter à travers un `&self`. Les atomiques ci-dessous ordonnent les
+    /// curseurs, ils ne rendent pas la mutation licite — un `Box<[f32]>` écrit
+    /// via `as_ptr() as *mut f32` est un comportement indéfini au sens du
+    /// modèle mémoire de Rust, quelle que soit la rigueur des curseurs, et le
+    /// compilateur est en droit d'optimiser en conséquence (#2204).
+    buf: Box<[UnsafeCell<f32>]>,
     /// Write position (HTTP thread writes here)
     write: AtomicU64,
     /// Read position (audio callback reads here)
     read: AtomicU64,
 }
 
+// SAFETY: SPSC strict. Un seul producteur appelle `push`/`clear`, un seul
+// consommateur appelle `pop`. `write` n'est écrit que par le producteur et
+// `read` que par le consommateur ; le couple Acquire/Release fait que le
+// consommateur ne lit une case qu'après l'écriture qui l'a remplie, et que le
+// producteur ne réécrit une case qu'après la lecture qui l'a libérée. Aucune
+// case n'est donc jamais lue et écrite en même temps.
+//
+// `UnsafeCell` n'est pas `Sync` : sans ces deux lignes, `Arc<RingBuf>` ne
+// traverserait plus les frontières de threads. Elles remplacent une hypothèse
+// tacite par une hypothèse écrite.
+unsafe impl Send for RingBuf {}
+unsafe impl Sync for RingBuf {}
+
 impl RingBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
-            buf: vec![0.0f32; capacity].into_boxed_slice(),
+            buf: (0..capacity)
+                .map(|_| UnsafeCell::new(0.0f32))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
         }
@@ -1293,12 +1316,10 @@ impl RingBuf {
         // Zero-fill the underlying storage to eliminate stale samples.
         // Safety: single-threaded clear (called before the cpal callback
         // starts reading from a freshly created ring buffer).
-        let cap = self.buf.len();
-        unsafe {
-            let ptr = self.buf.as_ptr() as *mut f32;
-            for i in 0..cap {
-                *ptr.add(i) = 0.0;
-            }
+        for cell in self.buf.iter() {
+            // SAFETY: appelé par le producteur seul, curseurs déjà remis à
+            // zéro — aucun lecteur ne peut viser une case non écrite.
+            unsafe { *cell.get() = 0.0 };
         }
     }
 
@@ -1311,11 +1332,8 @@ impl RingBuf {
         let n = samples.len().min(free);
         for i in 0..n {
             let idx = (w as usize + i) % cap;
-            // Safety: single writer thread, index always in bounds
-            unsafe {
-                let ptr = self.buf.as_ptr() as *mut f32;
-                *ptr.add(idx) = samples[i];
-            }
+            // SAFETY: producteur unique, case libre (i < free), index borné.
+            unsafe { *self.buf[idx].get() = samples[i] };
         }
         self.write.store(w + n as u64, Ordering::Release);
         n
@@ -1330,10 +1348,101 @@ impl RingBuf {
         let cap = self.capacity();
         for i in 0..n {
             let idx = (r as usize + i) % cap;
-            out[i] = self.buf[idx];
+            // SAFETY: consommateur unique, case publiée par le Release de
+            // `push` que le Acquire ci-dessus a observé.
+            out[i] = unsafe { *self.buf[idx].get() };
         }
         self.read.store(r + n as u64, Ordering::Release);
         n
+    }
+}
+
+#[cfg(test)]
+mod ringbuf_tests {
+    use super::RingBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn vide_plein_et_bouclage() {
+        let rb = RingBuf::new(4);
+        let mut out = [0.0f32; 4];
+
+        // Vide : rien à lire, et `pop` ne doit pas mentir sur le compte.
+        assert_eq!(rb.available(), 0);
+        assert_eq!(rb.pop(&mut out), 0);
+
+        // Plein : la capacité borne l'écriture, le surplus est refusé.
+        assert_eq!(rb.push(&[1.0, 2.0, 3.0, 4.0, 5.0]), 4);
+        assert_eq!(rb.available(), 4);
+        assert_eq!(rb.push(&[9.0]), 0, "un tampon plein n'accepte rien");
+
+        assert_eq!(rb.pop(&mut out), 4);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+
+        // Bouclage : on repart au début du stockage sans perdre l'ordre.
+        assert_eq!(rb.push(&[5.0, 6.0, 7.0]), 3);
+        let mut deux = [0.0f32; 2];
+        assert_eq!(rb.pop(&mut deux), 2);
+        assert_eq!(deux, [5.0, 6.0]);
+        assert_eq!(rb.push(&[8.0, 9.0, 10.0]), 3);
+        let mut reste = [0.0f32; 4];
+        assert_eq!(rb.pop(&mut reste), 4);
+        assert_eq!(reste, [7.0, 8.0, 9.0, 10.0]);
+    }
+
+    #[test]
+    fn clear_remet_a_zero_les_curseurs_et_le_stockage() {
+        let rb = RingBuf::new(8);
+        rb.push(&[1.0, 2.0, 3.0]);
+        rb.clear();
+        assert_eq!(rb.available(), 0);
+        let mut out = [42.0f32; 3];
+        assert_eq!(rb.pop(&mut out), 0, "rien ne doit survivre a un clear");
+    }
+
+    /// Le vrai contrat : un producteur, un consommateur, aucune perte, aucun
+    /// doublon, aucun desordre. C'est ce qu'un tampon SPSC promet, et c'est
+    /// exactement ce qu'un comportement indéfini peut casser silencieusement.
+    #[test]
+    fn un_producteur_un_consommateur_ne_perdent_ni_ne_reordonnent_rien() {
+        const N: usize = 100_000;
+        let rb = Arc::new(RingBuf::new(1024));
+
+        let prod = {
+            let rb = rb.clone();
+            std::thread::spawn(move || {
+                let mut envoye = 0usize;
+                while envoye < N {
+                    let lot: Vec<f32> = (envoye..(envoye + 64).min(N)).map(|i| i as f32).collect();
+                    let mut offset = 0;
+                    while offset < lot.len() {
+                        let n = rb.push(&lot[offset..]);
+                        offset += n;
+                        if n == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    envoye += lot.len();
+                }
+            })
+        };
+
+        let mut recu = Vec::with_capacity(N);
+        let mut tampon = [0.0f32; 128];
+        while recu.len() < N {
+            let n = rb.pop(&mut tampon);
+            if n == 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            recu.extend_from_slice(&tampon[..n]);
+        }
+        prod.join().unwrap();
+
+        assert_eq!(recu.len(), N);
+        for (i, v) in recu.iter().enumerate() {
+            assert_eq!(*v, i as f32, "echantillon {i} perdu, duplique ou reordonne");
+        }
     }
 }
 
@@ -1524,17 +1633,41 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
                                 return None; // 64-bit float unsupported
                             }
                         } else {
-                            // PCM sub-format — use valid_bits for the actual
-                            // bit depth, but the byte stride comes from
-                            // nBlockAlign.
+                            // PCM sub-format : c'est le CONTENEUR qui donne le
+                            // pas d'avancement, pas la précision valide.
+                            //
+                            // `wBitsPerSample` est la taille du conteneur et
+                            // `wValidBitsPerSample` la précision réellement
+                            // portée — Microsoft distingue explicitement les
+                            // deux (WAVEFORMATEXTENSIBLE). Rendre la précision
+                            // valide faisait avancer la lecture de
+                            // `bit_depth / 8` octets : pour 24 bits valides
+                            // dans un conteneur de 32, trois octets là où le
+                            // flux en fait quatre. L'alignement des trames
+                            // était faux dès le premier échantillon (#2234).
+                            //
+                            // Lire au conteneur n'est pas qu'un rattrapage
+                            // d'alignement, c'est aussi numériquement exact :
+                            // les bits valides sont cadrés à gauche, donc un
+                            // échantillon `v` sur 24 bits vaut `v << 8` dans
+                            // son conteneur de 32, et `(v << 8) / 2^31` est
+                            // rigoureusement `v / 2^23` — la même valeur
+                            // normalisée qu'une lecture 24 bits alignée.
+                            //
+                            // `valid_bits` reste lu : il ne sert plus au pas,
+                            // mais un conteneur plus étroit que la précision
+                            // annoncée signale un en-tête incohérent, et on
+                            // suit alors le conteneur, qui est ce que le flux
+                            // fait réellement.
                             if channels > 0 {
                                 let container_bytes = block_align / channels;
-                                // Use the smaller of container size and valid
-                                // bits, rounded to a standard byte width.
-                                let effective = valid_bits.min(container_bytes * 8);
-                                bit_depth = match effective {
-                                    0..=16 => 16,
-                                    17..=24 => 24,
+                                debug_assert!(
+                                    valid_bits <= container_bytes * 8,
+                                    "wValidBitsPerSample > conteneur : en-tête incohérent"
+                                );
+                                bit_depth = match container_bytes {
+                                    0..=2 => 16,
+                                    3 => 24,
                                     _ => 32,
                                 };
                             } else {
@@ -1649,6 +1782,59 @@ pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
 /// (`transcode_source_to_file`), so a zone hears the same chain whether it
 /// plays on the DAC or through a network renderer.
 #[inline]
+/// Frontière de piste : le DSP à état ne doit rien porter d'une piste à l'autre.
+///
+/// Le convolveur est installé une fois (`set_convolver_ir`) et vit aussi
+/// longtemps que la sortie. Sa file de sortie, sa ligne à retard et son overlap
+/// gardaient donc la queue de la piste précédente, qui repartait dans la
+/// suivante — et ni un seek ni un arrêt n'établissaient de frontière
+/// (JP Robbe, revue de #2268).
+///
+/// Appelé depuis `play_url`, le seul point par lequel passe un DÉBUT de piste.
+/// Une transition gapless ne passe pas par là, et c'est voulu : l'audio y est
+/// continu, le convolveur doit garder son état.
+fn reset_local_dsp(convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>) {
+    if let Ok(mut c) = convolver.lock()
+        && let Some(conv) = c.as_mut()
+    {
+        conv.reset();
+    }
+}
+
+/// Fin de piste : rendre ce que le convolveur retient encore.
+///
+/// Une convolution par blocs garde `latency_frames()` trames en réserve — c'est
+/// le prix de sa latence, et sans ce drainage elles ne partent jamais au
+/// périphérique. Les échantillons rendus traversent le crossfeed comme les
+/// autres, pour que la queue sonne comme le reste.
+fn flush_local_dsp(
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    channels: u16,
+) -> Vec<f32> {
+    if pure_bypass.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let mut queue = match convolver.lock() {
+        Ok(mut c) => match c.as_mut() {
+            Some(conv) => conv.flush(),
+            None => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    if queue.is_empty() {
+        return queue;
+    }
+    if channels == 2
+        && let Ok(mut cf) = crossfeed.lock()
+        && let Some(c) = cf.as_mut()
+    {
+        c.process_interleaved(&mut queue);
+    }
+    queue
+}
+
 fn apply_local_dsp(
     samples: &mut [f32],
     eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
@@ -1816,6 +2002,13 @@ impl OutputTarget for LocalOutput {
         artist: Option<&str>,
     ) -> Result<(), String> {
         self.stop().await.ok();
+
+        // Frontière de piste : le convolveur vit aussi longtemps que la sortie,
+        // il ne doit pas verser la queue de la piste précédente dans celle-ci
+        // (JP Robbe, revue de #2268). `play_url` est le seul point par lequel
+        // passe un début de piste — une transition gapless ne passe pas par là,
+        // et c'est voulu : l'audio y est continu.
+        reset_local_dsp(&self.convolver);
 
         // Restore seek position after stop() cleared the old state.
         let start_position_ms = self.pending_start_position_ms.swap(0, Ordering::SeqCst);
@@ -5108,6 +5301,83 @@ mod tests {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
     }
 
+    /// LE test qui manquait, et que JP Robbe a construit hors branche : la
+    /// chaîne réelle, pas le moteur isolé.
+    ///
+    /// Mes onze tests de #2268 portaient sur `Convolver` seul. Ils ne pouvaient
+    /// pas voir que `apply_local_dsp` envoie immédiatement au `RingBuf` ce
+    /// qu'il obtient, sans jamais drainer le convolveur : les `block_size`
+    /// trames retenues n'atteignaient donc jamais le périphérique.
+    ///
+    /// Le contrat est ici écrit noir sur blanc — une IR identité doit rendre la
+    /// piste, à condition de drainer la fin.
+    #[test]
+    fn une_ir_identite_rend_la_piste_entiere_si_on_draine_la_fin() {
+        let bloc = 4usize;
+        let ir = vec![vec![1.0f32, 0.0, 0.0, 0.0]; 2]; // identité, stéréo
+        let convolver =
+            std::sync::Mutex::new(Some(crate::audio::convolver::Convolver::new(&ir, bloc)));
+        let eq = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        // Une piste d'exactement un bloc, en stéréo.
+        let piste: Vec<f32> = (0..bloc * 2).map(|i| (i as f32 + 1.0) / 16.0).collect();
+        let mut tampon = piste.clone();
+        apply_local_dsp(&mut tampon, &eq, &convolver, &crossfeed, &pure, 2, false);
+
+        // Le buffer rendu est le silence d'amorçage : c'est la latence, et
+        // c'est exactement ce que l'ancien code ne rendait jamais visible.
+        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2);
+
+        let mut restitue = tampon.clone();
+        restitue.extend_from_slice(&queue);
+        assert!(
+            restitue.len() >= piste.len(),
+            "le drainage doit rendre au moins la piste"
+        );
+
+        // Quelque part dans ce qui sort, la piste doit se retrouver intacte.
+        let debut = restitue.len() - piste.len();
+        for (i, attendu) in piste.iter().enumerate() {
+            let obtenu = restitue[debut + i];
+            assert!(
+                (obtenu - attendu).abs() < 1e-4,
+                "trame {i} : {obtenu} au lieu de {attendu} — la fin de piste est perdue"
+            );
+        }
+    }
+
+    /// Et la frontière de piste : après remise à zéro, plus rien de la
+    /// précédente. Sans elle, la queue d'une piste repartait dans la suivante.
+    #[test]
+    fn la_remise_a_zero_efface_la_queue_de_la_piste_precedente() {
+        let bloc = 4usize;
+        let ir = vec![vec![1.0f32, 0.0, 0.0, 0.0]; 2];
+        let convolver =
+            std::sync::Mutex::new(Some(crate::audio::convolver::Convolver::new(&ir, bloc)));
+        let eq = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        // Première piste : un bloc bien reconnaissable, jamais drainé.
+        let mut piste1 = vec![1.0f32; bloc * 2];
+        apply_local_dsp(&mut piste1, &eq, &convolver, &crossfeed, &pure, 2, false);
+
+        // Frontière.
+        reset_local_dsp(&convolver);
+
+        // Seconde piste : du silence. Rien de la première ne doit en sortir.
+        let mut piste2 = vec![0.0f32; bloc * 2];
+        apply_local_dsp(&mut piste2, &eq, &convolver, &crossfeed, &pure, 2, false);
+        for (i, v) in piste2.iter().enumerate() {
+            assert!(
+                v.abs() < 1e-6,
+                "trame {i} : {v} — la queue de la piste precedente a fui"
+            );
+        }
+    }
+
     #[test]
     fn local_dsp_applies_the_zone_eq() {
         let eq = std::sync::Mutex::new(Some(test_eq()));
@@ -5556,6 +5826,74 @@ mod tests {
         assert_eq!(sr, 96000);
         assert_eq!(bd, 24);
         assert_eq!(offset, 68);
+    }
+
+    /// La régression : le test existant ne couvrait que 24-valid-dans-24
+    /// (block align 6 en stéréo), donc le cas où précision et conteneur
+    /// coïncident. Il ne pouvait pas détecter 24-dans-32, où rendre la
+    /// précision valide faisait avancer la lecture de trois octets là où le
+    /// flux en fait quatre — trames désalignées dès le premier échantillon
+    /// (#2234).
+    #[test]
+    fn extensible_24_bits_valides_dans_un_conteneur_de_32() {
+        let mut header = vec![0u8; 68];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&40u32.to_le_bytes());
+        header[20..22].copy_from_slice(&0xFFFEu16.to_le_bytes()); // EXTENSIBLE
+        header[22..24].copy_from_slice(&2u16.to_le_bytes()); // stéréo
+        header[24..28].copy_from_slice(&192000u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(192000u32 * 2 * 4).to_le_bytes());
+        header[32..34].copy_from_slice(&8u16.to_le_bytes()); // block_align = 2 * 4
+        header[34..36].copy_from_slice(&32u16.to_le_bytes()); // conteneur : 32
+        header[36..38].copy_from_slice(&22u16.to_le_bytes()); // cbSize
+        header[38..40].copy_from_slice(&24u16.to_le_bytes()); // précision : 24
+        header[40..44].copy_from_slice(&0u32.to_le_bytes()); // channel mask
+        header[44..46].copy_from_slice(&1u16.to_le_bytes()); // sous-format PCM
+        header[46..60].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+        ]);
+        header[60..64].copy_from_slice(b"data");
+        header[64..68].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+
+        let (ch, sr, bd, offset) = parse_wav_header(&header).expect("en-tête valide");
+        assert_eq!(ch, 2);
+        assert_eq!(sr, 192000);
+        assert_eq!(
+            bd, 32,
+            "le pas d'avancement vient du CONTENEUR : 4 octets, pas 3"
+        );
+        assert_eq!(offset, 68);
+    }
+
+    /// Lire au conteneur n'est pas qu'un rattrapage d'alignement : c'est la
+    /// MÊME valeur normalisée. Les bits valides sont cadrés à gauche, donc
+    /// `v` sur 24 bits vaut `v << 8` dans son conteneur de 32.
+    #[test]
+    fn lire_au_conteneur_donne_la_meme_valeur_quen_24_bits() {
+        for v in [1i32, -1, 100, -100, 8_388_607, -8_388_608] {
+            // Le même échantillon, écrit dans ses deux conteneurs.
+            let en_24 = [
+                (v & 0xFF) as u8,
+                ((v >> 8) & 0xFF) as u8,
+                ((v >> 16) & 0xFF) as u8,
+            ];
+            let cadre = v << 8;
+            let en_32 = cadre.to_le_bytes();
+
+            let f24 = pcm_bytes_to_f32(&en_24, 24);
+            let f32b = pcm_bytes_to_f32(&en_32, 32);
+            assert_eq!(f24.len(), 1);
+            assert_eq!(f32b.len(), 1);
+            assert!(
+                (f24[0] - f32b[0]).abs() < 1e-9,
+                "v={v} : 24 bits donne {}, conteneur 32 donne {}",
+                f24[0],
+                f32b[0]
+            );
+        }
     }
 
     #[test]
