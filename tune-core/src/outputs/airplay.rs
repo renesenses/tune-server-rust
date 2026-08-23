@@ -296,6 +296,30 @@ fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8]) -> Vec<u8
     pkt
 }
 
+/// Conversion réellement utilisée par le payload RTP L16.
+///
+/// Un downmix multicanal peut dépasser la pleine échelle 16 bits tout en
+/// restant parfaitement valide en i32. Le cast final doit donc saturer : un
+/// `as i16` reboucle et transforme un passage fort en distorsion franche.
+///
+/// Extraite pour être TESTABLE. Tant qu'elle vivait en ligne dans
+/// `stream_to_airplay`, la contre-épreuve recopiait sa propre closure de clamp :
+/// remettre `let s16 = brut as i16` dans la production laissait le test vert
+/// (#2311, JP Robbe).
+fn pcm_i32_to_l16_be(samples: &[i32], bit_depth: u16) -> Vec<u8> {
+    samples
+        .iter()
+        .flat_map(|&sample| {
+            let scaled = match bit_depth {
+                24 => sample >> 8,
+                32 => sample >> 16,
+                _ => sample,
+            };
+            (scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_be_bytes()
+        })
+        .collect()
+}
+
 /// Temporary file guard that deletes the file on drop.
 struct TempFileGuard(std::path::PathBuf);
 
@@ -569,56 +593,80 @@ async fn stream_to_airplay(
     }
 
     // Convert i32 samples to i16, then to big-endian bytes for AirPlay RTP
-    let pcm_be: Vec<u8> = echantillons
-        .iter()
-        .flat_map(|&s| {
-            // SATURER, jamais reboucler. Le repli 5.1 somme jusqu'a ~2,4 fois
-            // la pleine echelle (avant + 0,707 x centre + surrounds) : borner a
-            // `i32` dans `to_stereo_i32` ne protege donc PAS la conversion
-            // finale, et `s as i16` rebouclait — 13563 la ou il fallait 32767,
-            // c'est-a-dire une distorsion franche sur les passages forts
-            // (JP Robbe, revue de #2281).
-            let brut = match decoded.bit_depth {
-                24 => s >> 8,
-                32 => s >> 16,
-                _ => s,
-            };
-            let s16 = brut.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            s16.to_be_bytes()
-        })
-        .collect();
+    let pcm_be = pcm_i32_to_l16_be(&echantillons, decoded.bit_depth);
 
     let ssrc: u32 = rand_random();
+    let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
+
+    diffuser_pcm(&pcm_be, &udp, playing, paused, position_ms, stop_rx, ssrc).await;
+
+    Ok(())
+}
+
+/// La sortie des paquets RTP.
+///
+/// En production c'est la socket UDP. La contre-epreuve de #2310 a besoin de
+/// COMPTER les paquets et de mesurer leur taille : un `UdpSocket` connecte ne
+/// permet ni l'un ni l'autre — un datagramme trop grand y echoue en silence,
+/// journalise en debug, exactement le symptome qu'on veut interdire.
+trait SortieRtp {
+    async fn envoyer(&self, pkt: &[u8]);
+}
+
+impl SortieRtp for tokio::net::UdpSocket {
+    async fn envoyer(&self, pkt: &[u8]) {
+        if let Err(e) = self.send(pkt).await {
+            debug!(error = %e, "airplay_rtp_send_error");
+        }
+    }
+}
+
+/// Emet le PCM big-endian en paquets RTP, au rythme reel.
+async fn diffuser_pcm<S: SortieRtp>(
+    pcm_be: &[u8],
+    sortie: &S,
+    playing: &AtomicBool,
+    paused: &AtomicBool,
+    position_ms: &AtomicU64,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ssrc: u32,
+) {
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
     let mut total_frames: u64 = 0;
     let mut offset: usize = 0;
-
-    let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
     let start_time = tokio::time::Instant::now();
+
+    // Pourquoi un booleen plutot qu'une seconde lecture du receiver :
+    // `oneshot::Receiver::try_recv()` CONSOMME. La boucle rend le stop, puis
+    // la garde du paquet final relisait le meme receiver, qui rendait alors
+    // `Err(Closed)` — `!is_ok()` valait `true` PRECISEMENT apres un stop, et
+    // le paquet final partait quand meme (#2310, JP Robbe). L'etat d'un
+    // canal consommable ne se deduit pas deux fois : on le retient.
+    let mut interrompu = false;
 
     while offset + BYTES_PER_PACKET <= pcm_be.len() {
         // Check for stop signal (non-blocking)
         if stop_rx.try_recv().is_ok() {
+            interrompu = true;
             break;
         }
 
         if !playing.load(Ordering::Relaxed) {
+            interrompu = true;
             break;
         }
 
         while paused.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             if !playing.load(Ordering::Relaxed) {
-                return Ok(());
+                return;
             }
         }
 
         let audio_buf = &pcm_be[offset..offset + BYTES_PER_PACKET];
         let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf);
-        if let Err(e) = udp.send(&pkt).await {
-            debug!(error = %e, "airplay_rtp_send_error");
-        }
+        sortie.envoyer(&pkt).await;
 
         seq = seq.wrapping_add(1);
         timestamp = timestamp.wrapping_add(FRAMES_PER_PACKET as u32);
@@ -640,20 +688,25 @@ async fn stream_to_airplay(
     // RTP n'impose pas une taille de charge utile fixe : un paquet plus court
     // est valide, et c'est ce que fait tout emetteur en fin de flux. On garde
     // l'alignement sur les trames, seule contrainte reelle du L16.
+    // Un arret anticipe invalide l'hypothese « il reste moins d'un paquet » :
+    // `reste` peut alors valoir TOUTE la piste non lue, et `trames` n'est
+    // borne par rien. Trois conditions, aucune deduite : la boucle a bien
+    // epuise ses paquets pleins, la lecture n'a pas ete interrompue, et il
+    // reste de quoi remplir au moins une trame.
     let reste = pcm_be.len() - offset;
-    if reste >= BYTES_PER_FRAME && !stop_rx.try_recv().is_ok() {
+    if !interrompu
+        && playing.load(Ordering::Relaxed)
+        && reste >= BYTES_PER_FRAME
+        && reste < BYTES_PER_PACKET
+    {
         let trames = reste / BYTES_PER_FRAME;
         let fin = offset + trames * BYTES_PER_FRAME;
         let pkt = build_rtp_packet(seq, timestamp, ssrc, &pcm_be[offset..fin]);
-        if let Err(e) = udp.send(&pkt).await {
-            debug!(error = %e, "airplay_rtp_send_error");
-        }
+        sortie.envoyer(&pkt).await;
         total_frames += trames as u64;
         position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
         debug!(trames, "airplay_dernier_paquet_partiel");
     }
-
-    Ok(())
 }
 
 fn rand_random() -> u32 {
@@ -676,6 +729,162 @@ mod tests {
         assert!(half < -5.0 && half > -15.0);
     }
 
+    /// La sortie de test : on garde la taille de charge utile de chaque
+    /// paquet reellement emis.
+    #[derive(Default)]
+    struct SortieDeTest(std::sync::Mutex<Vec<usize>>);
+
+    impl SortieDeTest {
+        fn charges(&self) -> Vec<usize> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl SortieRtp for SortieDeTest {
+        async fn envoyer(&self, pkt: &[u8]) {
+            self.0.lock().unwrap().push(pkt.len() - RTP_HEADER_SIZE);
+        }
+    }
+
+    fn piste(paquets_pleins: usize, trames_en_plus: usize) -> Vec<u8> {
+        vec![0u8; paquets_pleins * BYTES_PER_PACKET + trames_en_plus * BYTES_PER_FRAME]
+    }
+
+    /// Stop AVANT le premier paquet : plus un seul echantillon ne doit partir.
+    ///
+    /// C'est la contre-epreuve de #2310. `oneshot::Receiver::try_recv()` est
+    /// CONSOMMABLE : la boucle rend le stop et sort ; le second appel, dans la
+    /// garde du paquet final, rend alors `Err(Closed)`. `!is_ok()` valait donc
+    /// `true` PRECISEMENT apres un stop, et tout le reste de la piste partait
+    /// dans un unique datagramme — plusieurs megaoctets, apres le TEARDOWN.
+    #[tokio::test]
+    async fn stop_avant_le_premier_paquet_n_envoie_rien() {
+        let pcm = piste(200, 0);
+        let sortie = SortieDeTest::default();
+        let playing = AtomicBool::new(true);
+        let paused = AtomicBool::new(false);
+        let position = AtomicU64::new(0);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        stop_tx.send(()).unwrap();
+
+        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+
+        assert_eq!(
+            sortie.charges(),
+            Vec::<usize>::new(),
+            "apres un stop, zero paquet : le second try_recv rendait Err(Closed) \
+             et ouvrait la garde du paquet final (#2310)"
+        );
+    }
+
+    /// Stop en cours de piste : meme exigence, et surtout aucun datagramme
+    /// hors norme. La piste fait 200 paquets ; le reste non lu ne doit jamais
+    /// devenir UN paquet.
+    #[tokio::test]
+    async fn stop_en_cours_de_piste_ne_deverse_pas_le_reste() {
+        let pcm = piste(200, 17);
+        let sortie = SortieDeTest::default();
+        let playing = AtomicBool::new(true);
+        let paused = AtomicBool::new(false);
+        let position = AtomicU64::new(0);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+
+        // ~8 ms par paquet : le stop tombe apres quelques paquets, jamais
+        // apres les 200.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            stop_tx.send(()).ok();
+        });
+
+        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+
+        let charges = sortie.charges();
+        assert!(
+            charges.len() < 200,
+            "le stop devait interrompre la piste, {} paquets emis",
+            charges.len()
+        );
+        assert!(
+            charges.iter().all(|c| *c == BYTES_PER_PACKET),
+            "apres un stop, aucun paquet partiel ne doit partir : {:?} (#2310)",
+            charges
+                .iter()
+                .filter(|c| **c != BYTES_PER_PACKET)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// La boucle sort aussi quand `playing` tombe (Stop transport, perte du
+    /// peripherique). La garde du paquet final ne relisait pas `playing` : le
+    /// reste partait pareil, sans qu'aucun stop n'ait ete emis.
+    #[tokio::test]
+    async fn playing_a_faux_n_envoie_rien() {
+        let pcm = piste(200, 0);
+        let sortie = SortieDeTest::default();
+        let playing = AtomicBool::new(false);
+        let paused = AtomicBool::new(false);
+        let position = AtomicU64::new(0);
+        let (_stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+
+        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+
+        assert_eq!(
+            sortie.charges(),
+            Vec::<usize>::new(),
+            "playing = false : la garde du paquet final doit le revoir (#2310)"
+        );
+    }
+
+    /// Sortie de pause par un `playing` a faux : rien non plus.
+    #[tokio::test]
+    async fn pause_puis_arret_n_envoie_rien_de_plus() {
+        let pcm = piste(200, 0);
+        let sortie = SortieDeTest::default();
+        let playing = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(true));
+        let position = AtomicU64::new(0);
+        let (_stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+
+        let p = playing.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            p.store(false, Ordering::SeqCst);
+        });
+
+        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+
+        assert_eq!(
+            sortie.charges(),
+            Vec::<usize>::new(),
+            "en pause puis arret, aucun paquet ne doit partir (#2310)"
+        );
+    }
+
+    /// L'acquis de #2237 ne doit pas etre perdu : une fin NATURELLE emet bien
+    /// le dernier paquet partiel, aligne sur les trames.
+    #[tokio::test]
+    async fn fin_naturelle_emet_le_dernier_paquet_partiel() {
+        let pcm = piste(3, 100);
+        let sortie = SortieDeTest::default();
+        let playing = AtomicBool::new(true);
+        let paused = AtomicBool::new(false);
+        let position = AtomicU64::new(0);
+        let (_stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+
+        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+
+        assert_eq!(
+            sortie.charges(),
+            vec![
+                BYTES_PER_PACKET,
+                BYTES_PER_PACKET,
+                BYTES_PER_PACKET,
+                100 * BYTES_PER_FRAME
+            ],
+            "fin naturelle : 3 paquets pleins puis les 100 trames restantes (#2237)"
+        );
+    }
+
     #[test]
     fn rtp_packet_format() {
         let audio = vec![0u8; BYTES_PER_PACKET];
@@ -684,5 +893,50 @@ mod tests {
         assert_eq!(pkt[0], 0x80);
         assert_eq!(pkt[1], 96);
         assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 42);
+    }
+
+    /// La contre-épreuve de JP Robbe sur #2281, cette fois branchée sur la
+    /// PRODUCTION.
+    ///
+    /// Ma version d'origine vivait dans `channels.rs` et redéfinissait sa
+    /// propre closure de clamp : JP a remis `let s16 = brut as i16` dans
+    /// `airplay.rs` et le test est resté vert. Il prouvait que `clamp` sature —
+    /// ce que personne ne conteste — jamais que le flux RTP l'appelle (#2311).
+    ///
+    /// Ici c'est `pcm_i32_to_l16_be`, la fonction réellement appelée par
+    /// `stream_to_airplay`, qui est exercée.
+    #[test]
+    fn la_conversion_l16_de_production_sature_un_downmix_51() {
+        let plein = i16::MAX as i32; // source 16 bits à pleine échelle
+        // fl, fr, centre, LFE, sl, sr — tous à fond.
+        let stereo =
+            crate::audio::channels::to_stereo_i32(&[plein, plein, plein, plein, plein, plein], 6);
+        assert!(
+            stereo[0] > plein,
+            "le repli doit sommer au-delà de i16 avant saturation : {}",
+            stereo[0]
+        );
+
+        let l16 = pcm_i32_to_l16_be(&stereo, 16);
+        assert_eq!(
+            i16::from_be_bytes([l16[0], l16[1]]),
+            i16::MAX,
+            "la conversion L16 doit saturer, pas reboucler : un cast nu rendait \
+             13563 là où il fallait 32767, soit une distorsion franche sur les \
+             passages forts"
+        );
+        assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MAX);
+    }
+
+    /// Et la profondeur d'origine doit être respectée : un 24 bits pleine
+    /// échelle vaut i16::MAX une fois décalé, pas une saturation fortuite.
+    #[test]
+    fn la_conversion_l16_respecte_la_profondeur_source() {
+        let plein24 = (1i32 << 23) - 1;
+        let l16 = pcm_i32_to_l16_be(&[plein24, -plein24], 24);
+        assert_eq!(i16::from_be_bytes([l16[0], l16[1]]), i16::MAX);
+        // Décalage ARITHMÉTIQUE : -8388607 >> 8 arrondit vers moins l'infini,
+        // donc -32768 et non -32767. C'est le comportement de la production.
+        assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MIN);
     }
 }

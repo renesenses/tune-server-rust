@@ -158,6 +158,10 @@ struct EqBand {
     /// Filter type: "peak", "low_shelf", "high_shelf", "low_pass", "high_pass", "notch"
     #[serde(rename = "type", default = "default_band_type")]
     band_type: String,
+    /// Canal ciblé, `None` pour tous. Même contrat que EqBandSpec : les
+    /// anciens presets sans ce champ restent globaux.
+    #[serde(default)]
+    channel: Option<u16>,
 }
 
 fn default_band_type() -> String {
@@ -166,12 +170,16 @@ fn default_band_type() -> String {
 
 impl EqBand {
     fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "freq": self.freq,
             "gain": self.gain,
             "q": self.q.unwrap_or(1.0),
             "type": self.band_type,
-        })
+        });
+        if let Some(channel) = self.channel {
+            value["channel"] = json!(channel);
+        }
+        value
     }
 }
 
@@ -450,8 +458,40 @@ fn epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_activation_zone;
+    use super::{EqBand, resolve_activation_zone};
     use serde_json::json;
+
+    #[test]
+    fn un_preset_preserve_le_canal_de_sa_bande() {
+        let band: EqBand = serde_json::from_value(json!({
+            "freq": 120.0,
+            "gain": -3.5,
+            "q": 1.2,
+            "type": "peak",
+            "channel": 1,
+        }))
+        .unwrap();
+        let stored = band.to_json();
+        assert_eq!(stored["channel"], 1);
+
+        let audio_band: tune_core::audio::eq::EqBandSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(audio_band.channel, Some(1));
+    }
+
+    #[test]
+    fn un_ancien_preset_sans_canal_reste_global() {
+        let band: EqBand = serde_json::from_value(json!({
+            "freq": 1000.0,
+            "gain": 2.0,
+            "q": 1.0,
+            "type": "peak",
+        }))
+        .unwrap();
+        let stored = band.to_json();
+        assert!(stored.get("channel").is_none());
+        let audio_band: tune_core::audio::eq::EqBandSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(audio_band.channel, None);
+    }
 
     #[test]
     fn le_parametre_durl_prime_sur_la_zone_du_preset() {

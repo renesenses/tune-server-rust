@@ -32,21 +32,35 @@ fn appels_au_helper(src: &str) -> usize {
 }
 
 #[test]
-fn le_dsd_natif_et_le_pcm_direct_attendent_leur_reponse() {
+fn tous_les_chemins_attendent_leur_reponse() {
     let src = source();
     assert_eq!(
         appels_au_helper(&src),
-        2,
-        "les deux chemins qui proposaient puis jouaient sans regarder la réponse \
-         doivent appeler `attendre_accord_format` — un `FormatReject` ignoré \
-         lance la lecture alors que l'endpoint a dit non (#2282)"
+        6,
+        "les chemins qui proposent un format doivent tous appeler \
+         `attendre_accord_format` — connexion/reconnexion, DSD natif, PCM direct, \
+         chemin principal et transition gapless. Un `FormatReject` ignoré lance \
+         la lecture alors que l'endpoint a dit non ; un `FormatAccept` étranger \
+         décale le flux suivant (#2282, #2283)"
     );
 }
 
-/// Et le helper doit rester le seul endroit qui décide : s'il cessait de
-/// refuser, les deux sites appelleraient une fonction devenue complaisante.
+/// Le helper doit rester le SEUL endroit qui décide.
+///
+/// ⚠️ Ce test est un garde de BRANCHEMENT, pas une preuve de comportement.
+/// Ma première version lisait le texte source du helper et se contentait d'y
+/// trouver les chaînes `FormatReject` et `Ok(None)` : elle restait verte quand
+/// on remplaçait le bras `FormatReject => Err(..)` par `Ok(())` — le test censé
+/// garantir qu'un refus empêche la lecture passait alors que le refus était
+/// accepté (JP Robbe, #2297).
+///
+/// La décision vit maintenant dans `juger_reponse`, une fonction pure, et c'est
+/// elle qui est APPELÉE — sur les huit issues — par
+/// `outputs::oaat::integration_test::juger_reponse_decide_les_huit_issues`.
+/// Ici on vérifie seulement que le helper délègue toujours à cette fonction au
+/// lieu de rejuger dans son coin.
 #[test]
-fn le_helper_refuse_bien_les_trois_cas() {
+fn le_helper_delegue_sa_decision_a_la_fonction_pure() {
     let src = source();
     let debut = src
         .find("async fn attendre_accord_format(")
@@ -57,16 +71,16 @@ fn le_helper_refuse_bien_les_trois_cas() {
         .unwrap_or(src.len());
     let corps = &src[debut..fin];
 
-    assert!(
-        corps.contains("FormatReject"),
-        "un refus doit être traité, pas ignoré"
+    assert_eq!(
+        corps.matches("juger_reponse(").count(),
+        3,
+        "le helper doit déléguer les TROIS issues de l'attente — réponse reçue, \
+         canal fermé, silence — à `juger_reponse` ; toute décision qu'il prend \
+         lui-même échappe aux tests de comportement (#2297)"
     );
     assert!(
-        corps.contains("contre_proposition_honorable"),
-        "une contre-proposition doit être jugée sur les six champs négociés"
-    );
-    assert!(
-        corps.contains("Ok(None)"),
-        "un endpoint qui ferme pendant la négociation n'est pas un accord"
+        !corps.contains("FormatReject"),
+        "le helper ne doit plus statuer sur les messages : c'est le rôle de \
+         `juger_reponse`, qui est testée pour ce qu'elle décide (#2297)"
     );
 }
