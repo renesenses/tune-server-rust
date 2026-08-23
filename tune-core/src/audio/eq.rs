@@ -44,6 +44,44 @@ pub struct EqBandSpec {
     /// "peak" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass" | "notch"
     #[serde(rename = "type", default = "default_band_type")]
     pub band_type: String,
+    /// Le canal auquel cette bande s'applique. `None` = TOUS les canaux.
+    ///
+    /// C'est le defaut, et c'est ce qui rend les preregla­ges existants
+    /// inchanges : un profil enregistre avant cette version n'a pas ce champ,
+    /// `serde` le laisse a `None`, et la bande s'applique partout — exactement
+    /// comme avant.
+    ///
+    /// `Some(0)` = gauche, `Some(1)` = droite. Une piece dissymetrique — un mur
+    /// d'un cote, une ouverture de l'autre — ne se corrige pas avec la meme
+    /// courbe des deux cotes : c'est la demande d'Alexander Jam, abonne
+    /// Premium, qui venait chercher l'equivalent de ce que fait Roon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u16>,
+}
+
+impl Default for EqBandSpec {
+    /// Une bande neutre, sur tous les canaux. Permet aux appelants d'ecrire
+    /// `..Default::default()` et de ne plus casser quand une option s'ajoute —
+    /// c'est exactement ce qui vient d'arriver avec `channel`.
+    fn default() -> Self {
+        Self {
+            freq: 1000.0,
+            gain: 0.0,
+            q: default_band_q(),
+            band_type: default_band_type(),
+            channel: None,
+        }
+    }
+}
+
+impl EqBandSpec {
+    /// Cette bande agit-elle sur ce canal ?
+    fn vise_le_canal(&self, ch: u16) -> bool {
+        match self.channel {
+            None => true,
+            Some(c) => c == ch,
+        }
+    }
 }
 
 fn default_band_q() -> f64 {
@@ -288,9 +326,12 @@ fn notch(freq: f64, q: f64, sample_rate: f64) -> BiquadCoeffs {
 /// Processes interleaved PCM samples in-place. Supports any bit depth
 /// (samples are converted to/from f64 internally).
 pub struct EqProcessor {
-    /// Biquad cascade: 3 tilt filters (historic profiler) or one per
-    /// expert-mode band.
-    filters: Vec<BiquadCoeffs>,
+    /// Cascade biquad PAR CANAL : `[canal][etage]`.
+    ///
+    /// Elle etait partagee — les memes coefficients pour tous les canaux. Une
+    /// bande peut desormais viser un canal (#Alexander Jam), et gauche et
+    /// droite n'ont donc plus forcement la meme courbe.
+    filters: Vec<Vec<BiquadCoeffs>>,
     /// Per-channel state for each cascade stage: [channel][stage]
     states: Vec<Vec<BiquadState>>,
     channels: u16,
@@ -304,7 +345,10 @@ impl EqProcessor {
 
         // Expert-mode bands take over the whole cascade when present; the
         // 3-tilt profiler cascade is the fallback (unchanged behaviour).
-        let filters: Vec<BiquadCoeffs> = if profile.bands.is_empty() {
+        // La cascade du profileur historique (3 filtres de tilt) ne connait pas
+        // les canaux : elle s'applique partout, a l'identique. Seules les
+        // bandes du mode expert peuvent viser un canal.
+        let commune: Vec<BiquadCoeffs> = if profile.bands.is_empty() {
             let (bass_db, mid_db, treble_db) = profile.effective_gains();
             if bass_db.abs() > 0.01 || mid_db.abs() > 0.01 || treble_db.abs() > 0.01 {
                 vec![
@@ -316,16 +360,31 @@ impl EqProcessor {
                 Vec::new()
             }
         } else {
-            profile
-                .bands
-                .iter()
-                .filter(|b| !b.is_neutral())
-                .map(|b| b.coeffs(sr))
-                .collect()
+            Vec::new()
         };
 
-        let states = vec![vec![BiquadState::default(); filters.len()]; channels as usize];
-        let enabled = profile.enabled && !filters.is_empty();
+        let filters: Vec<Vec<BiquadCoeffs>> = (0..channels.max(1))
+            .map(|ch| {
+                if profile.bands.is_empty() {
+                    commune.clone()
+                } else {
+                    profile
+                        .bands
+                        .iter()
+                        .filter(|b| !b.is_neutral() && b.vise_le_canal(ch))
+                        .map(|b| b.coeffs(sr))
+                        .collect()
+                }
+            })
+            .collect();
+
+        let states = filters
+            .iter()
+            .map(|f| vec![BiquadState::default(); f.len()])
+            .collect();
+        // Un profil dont TOUTES les bandes sont neutres, ou qui ne vise aucun
+        // canal existant, ne doit pas rester « actif » a ne rien faire.
+        let enabled = profile.enabled && filters.iter().any(|f| !f.is_empty());
 
         Self {
             filters,
@@ -351,8 +410,9 @@ impl EqProcessor {
                 let sample = read_sample_f64(&frame[offset..], bytes_per_sample, bit_depth);
 
                 let state = &mut self.states[ch];
+                let cascade = &self.filters[ch];
                 let mut s = sample;
-                for (stage, coeffs) in state.iter_mut().zip(self.filters.iter()) {
+                for (stage, coeffs) in state.iter_mut().zip(cascade.iter()) {
                     s = stage.process(coeffs, s);
                 }
 
@@ -389,8 +449,9 @@ impl EqProcessor {
         for frame in samples.chunks_exact_mut(ch_count) {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let state = &mut self.states[ch];
+                let cascade = &self.filters[ch];
                 let mut s = *sample as f64;
-                for (stage, coeffs) in state.iter_mut().zip(self.filters.iter()) {
+                for (stage, coeffs) in state.iter_mut().zip(cascade.iter()) {
                     s = stage.process(coeffs, s);
                 }
                 *sample = soft_clip(s) as f32;
@@ -425,7 +486,23 @@ impl EqProcessor {
     /// transitoire-là est inévitable, et c'est le même qu'on entend déjà au
     /// début de chaque piste.
     pub fn inherit_state_from(&mut self, previous: &EqProcessor) {
-        if previous.channels != self.channels || previous.filters.len() != self.filters.len() {
+        // `filters` compte desormais les CANAUX, plus les etages : comparer sa
+        // longueur ne dit plus rien de la forme de la cascade. Il faut comparer
+        // canal par canal, sinon on recopierait l'etat d'une cascade a une
+        // autre qui n'a pas les memes etages — c'est-a-dire exactement ce que
+        // ce garde-fou existe pour empecher.
+        //
+        // Et depuis que les bandes peuvent viser un canal, deux canaux du meme
+        // profil n'ont pas forcement la meme longueur de cascade : la
+        // comparaison DOIT etre par canal.
+        if previous.channels != self.channels
+            || previous.filters.len() != self.filters.len()
+            || previous
+                .filters
+                .iter()
+                .zip(self.filters.iter())
+                .any(|(a, b)| a.len() != b.len())
+        {
             return;
         }
         self.states.clone_from(&previous.states);
@@ -534,12 +611,14 @@ mod tests {
                     gain: 0.0,
                     q: 1.0,
                     band_type: "peak".into(),
+                    ..Default::default()
                 },
                 EqBandSpec {
                     freq: 100.0,
                     gain: 0.0,
                     q: 1.0,
                     band_type: "low_shelf".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -558,6 +637,7 @@ mod tests {
                 gain: -12.0,
                 q: 0.71,
                 band_type: "high_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -630,6 +710,7 @@ mod tests {
                 gain: -12.0,
                 q: 0.71,
                 band_type: "high_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -809,6 +890,7 @@ mod tests {
             gain: 6.0,
             q: 0.71,
             band_type: "low_shelf".into(),
+            ..Default::default()
         });
 
         let (mut buf, _) = stereo_sine(8000.0, 256);
@@ -839,5 +921,117 @@ mod tests {
 
         assert_eq!(mono.states.len(), 1, "le nombre de canaux a été écrasé");
         assert_eq!(mono.states, EqProcessor::new(&profile, 44100, 1).states);
+    }
+
+    // --- Une bande peut ne viser QU'UN canal (Alexander Jam, Premium) ---
+
+    fn bande(freq: f64, gain: f64, canal: Option<u16>) -> EqBandSpec {
+        EqBandSpec {
+            freq,
+            gain,
+            q: 0.71,
+            band_type: "peak".into(),
+            channel: canal,
+        }
+    }
+
+    fn energie(samples: &[f32], pas: usize, depart: usize) -> f64 {
+        samples
+            .iter()
+            .skip(depart)
+            .step_by(pas)
+            .map(|v| (*v as f64) * (*v as f64))
+            .sum()
+    }
+
+    /// Le coeur de la demande : une piece dissymetrique se corrige d'un seul
+    /// cote. Avant, la meme courbe partait a gauche ET a droite — l'egaliseur
+    /// ne pouvait pas rattraper un desequilibre, ce pour quoi cet abonne avait
+    /// paye.
+    #[test]
+    fn une_bande_ne_touche_que_son_canal() {
+        let profil = EqProfile {
+            enabled: true,
+            bands: vec![bande(1000.0, 12.0, Some(0))],
+            ..Default::default()
+        };
+        let (mut buf, _) = stereo_sine(1000.0, 4096);
+        let avant_g = energie(&buf, 2, 0);
+        let avant_d = energie(&buf, 2, 1);
+
+        EqProcessor::new(&profil, 44100, 2).process_interleaved(&mut buf);
+
+        let apres_g = energie(&buf, 2, 0);
+        let apres_d = energie(&buf, 2, 1);
+        assert!(
+            apres_g > avant_g * 1.5,
+            "la gauche doit etre relevee : {avant_g} -> {apres_g}"
+        );
+        assert!(
+            (apres_d - avant_d).abs() / avant_d < 0.01,
+            "la droite doit rester intacte : {avant_d} -> {apres_d}"
+        );
+    }
+
+    /// Deux courbes differentes, une par canal — le cas reel d'une piece dont
+    /// un seul cote resonne.
+    #[test]
+    fn chaque_canal_peut_avoir_sa_propre_courbe() {
+        let profil = EqProfile {
+            enabled: true,
+            bands: vec![bande(1000.0, 12.0, Some(0)), bande(1000.0, -12.0, Some(1))],
+            ..Default::default()
+        };
+        let (mut buf, _) = stereo_sine(1000.0, 4096);
+        let avant = energie(&buf, 2, 0);
+        EqProcessor::new(&profil, 44100, 2).process_interleaved(&mut buf);
+        assert!(energie(&buf, 2, 0) > avant, "gauche relevee");
+        assert!(energie(&buf, 2, 1) < avant, "droite attenuee");
+    }
+
+    /// Le defaut ne change RIEN : un prereglage enregistre avant cette version
+    /// n'a pas de champ `channel`, et doit se comporter exactement comme
+    /// avant — sur les deux canaux.
+    #[test]
+    fn une_bande_sans_canal_agit_partout_comme_avant() {
+        let profil = EqProfile {
+            enabled: true,
+            bands: vec![bande(1000.0, 12.0, None)],
+            ..Default::default()
+        };
+        let (mut buf, _) = stereo_sine(1000.0, 4096);
+        let avant = energie(&buf, 2, 0);
+        EqProcessor::new(&profil, 44100, 2).process_interleaved(&mut buf);
+        let g = energie(&buf, 2, 0);
+        let d = energie(&buf, 2, 1);
+        assert!(
+            g > avant * 1.5 && d > avant * 1.5,
+            "les deux canaux montent"
+        );
+        assert!((g - d).abs() / g < 1e-6, "et de la meme facon : {g} vs {d}");
+    }
+
+    /// Un JSON d'avant cette version se relit sans `channel` — le champ est
+    /// facultatif, et son absence vaut « tous les canaux ».
+    #[test]
+    fn un_prereglage_ancien_se_relit_sans_canal() {
+        let json = r#"{"freq":100.0,"gain":3.0,"q":0.7,"type":"low_shelf"}"#;
+        let b: EqBandSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(b.channel, None);
+        assert!(b.vise_le_canal(0) && b.vise_le_canal(1));
+        // Et il ne repart PAS avec un champ que le client ne connait pas.
+        assert!(!serde_json::to_string(&b).unwrap().contains("channel"));
+    }
+
+    #[test]
+    fn une_bande_qui_ne_vise_aucun_canal_existant_n_active_rien() {
+        // Canal 5 sur une sortie stereo : le profil ne doit pas rester
+        // « actif » a ne rien faire.
+        let profil = EqProfile {
+            enabled: true,
+            bands: vec![bande(1000.0, 12.0, Some(5))],
+            ..Default::default()
+        };
+        assert!(!EqProcessor::new(&profil, 44100, 2).enabled);
     }
 }

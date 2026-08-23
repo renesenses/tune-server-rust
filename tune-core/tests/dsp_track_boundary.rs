@@ -30,3 +30,48 @@ fn play_url_remet_le_convolveur_a_zero() {
          repartira dans la suivante (#2268, revue JP Robbe)"
     );
 }
+
+/// Et le drainage doit rester BRANCHÉ, sur les quatre chemins.
+///
+/// `flush_local_dsp` a existé pendant une PR entière sans un seul appel de
+/// production — le compilateur le signalait, et je ne l'ai pas lu (JP Robbe,
+/// revue de #2277). Un test qui appelle le helper directement ne peut pas voir
+/// ça : c'est le NOMBRE de points d'appel qu'il faut tenir.
+///
+/// Quatre chemins de lecture locale appliquent le DSP, donc quatre doivent
+/// drainer : le chemin d'un seul tenant, les deux chemins en continu, et le
+/// chemin exclusif.
+#[test]
+fn les_quatre_chemins_drainent_le_convolveur() {
+    let src = std::fs::read_to_string(Path::new("src/outputs/local.rs"))
+        .expect("src/outputs/local.rs doit être lisible depuis la racine du crate");
+
+    // La définition ne compte pas, ni l'appel du test unitaire voisin.
+    let appels = src.matches("flush_local_dsp(").count();
+    let definition = 1;
+    let dans_les_tests = src
+        .split("mod tests")
+        .nth(1)
+        .map(|t| t.matches("flush_local_dsp(").count())
+        .unwrap_or(0);
+    let production = appels - definition - dans_les_tests;
+
+    let applications = src.matches("apply_local_dsp(").count()
+        - 1
+        - src
+            .split("mod tests")
+            .nth(1)
+            .map(|t| t.matches("apply_local_dsp(").count())
+            .unwrap_or(0);
+
+    assert_eq!(
+        production, applications,
+        "{production} drainage(s) pour {applications} application(s) du DSP : \
+         un chemin applique le convolveur sans jamais rendre ce qu'il retient, \
+         donc tronque la fin de sa piste (#2209)"
+    );
+    assert!(
+        production >= 4,
+        "les quatre chemins de lecture locale doivent drainer, {production} trouvé(s)"
+    );
+}

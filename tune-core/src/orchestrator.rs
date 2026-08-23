@@ -10063,6 +10063,53 @@ mod tests {
         );
     }
 
+    /// Le garde-fou que JP Robbe a demande en revue de #2220 : une sortie OAAT
+    /// REELLEMENT ENREGISTREE, drapeau DSD natif actif, doit rendre `false`.
+    ///
+    /// Mon premier test ne couvrait que les retours `true`. Une inversion de
+    /// booleen, un mauvais prefixe ou un downcast rate y seraient passes
+    /// inapercus : c'est ce test-ci qui verrouille le prefixe, le lookup, le
+    /// downcast et l'inversion ENSEMBLE.
+    #[cfg(feature = "oaat")]
+    #[tokio::test]
+    async fn une_sortie_oaat_en_dsd_natif_ne_mesure_pas() {
+        let orch = test_orchestrator();
+        let sortie = crate::outputs::oaat::OaatOutput::new(
+            "Zicmu".into(),
+            "192.168.1.99".into(),
+            9000,
+            "oaat:zicmu-test".into(),
+        );
+        // Le constructeur pose le prefixe `oaat:`, et c'est lui qui conditionne
+        // le lookup dans `output_produces_levels`.
+        let device_id = "oaat:zicmu-test".to_string();
+
+        // En PCM la sortie mesure : ce sont les niveaux du decodage de
+        // l'orchestrateur qui alimentent les VU.
+        orch.outputs.lock().await.register(Box::new(sortie));
+        assert!(
+            orch.output_produces_levels(Some(&device_id)).await,
+            "hors DSD natif, la chaine mesure"
+        );
+
+        // DSD natif : la sortie ouvre le .dsf elle-meme, plus personne ne
+        // decode, donc plus aucune fenetre de niveaux.
+        {
+            let registre = orch.outputs.lock().await;
+            let arc = registre.get(&device_id).expect("sortie enregistree");
+            let sortie = arc.lock().await;
+            let oaat = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                .expect("downcast vers OaatOutput");
+            oaat.set_native_dsd_active_for_test(true);
+        }
+        assert!(
+            !orch.output_produces_levels(Some(&device_id)).await,
+            "en DSD natif rien ne mesure : l'ecran doit pouvoir le dire"
+        );
+    }
+
     /// Une zone sans sortie, ou une sortie qui n'est pas OAAT, mesure :
     /// `false` est réservé au seul chemin qui ne produit rien.
     ///
@@ -10123,6 +10170,7 @@ mod tests {
                 gain: 8.0,
                 q: 0.71,
                 band_type: "low_shelf".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
