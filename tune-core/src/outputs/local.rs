@@ -1812,8 +1812,11 @@ fn flush_local_dsp(
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
     channels: u16,
+    dop: bool,
 ) -> Vec<f32> {
-    if pure_bypass.load(Ordering::Relaxed) {
+    // Mêmes exemptions qu'`apply_local_dsp` : ce que la chaîne n'a pas traité,
+    // elle n'a rien à en rendre.
+    if dop || pure_bypass.load(Ordering::Relaxed) {
         return Vec::new();
     }
     let mut queue = match convolver.lock() {
@@ -2388,6 +2391,13 @@ impl OutputTarget for LocalOutput {
                     false,
                 );
 
+                // Chemin d'un seul tenant : toute la piste vient de traverser le
+                // DSP, la queue du convolveur peut donc etre ajoutee ici — elle
+                // suivra la meme adaptation de canaux et le meme
+                // reechantillonnage que le reste (#2209).
+                let queue = flush_local_dsp(&convolver, &crossfeed, &pure_bypass, dec_ch, false);
+                samples.extend_from_slice(&queue);
+
                 // Memoriser le format pour un rebatissage d'EQ a chaud
                 // (#1725) : c'est le couple que la chaine DSP vient de voir.
                 current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
@@ -2679,6 +2689,22 @@ impl OutputTarget for LocalOutput {
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                // Fin de piste : rendre au périphérique ce que le convolveur
+                // retient encore. Sans ça, `latency_frames()` trames restaient
+                // dans le moteur et la fin de chaque piste était tronquée
+                // (#2209, revue JP Robbe — la fonction etait morte).
+                let queue = flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    channels,
+                    dop_active.load(Ordering::Relaxed),
+                );
+                if !queue.is_empty() {
+                    feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
+                    total_frames_fed += (queue.len() / channels.max(1) as usize) as u64;
                 }
 
                 // Signal natural track end BEFORE draining when the HTTP
@@ -3024,6 +3050,18 @@ impl OutputTarget for LocalOutput {
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                // Fin de piste : rendre ce que le convolveur retient (#2209).
+                let queue = flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    channels,
+                    dop_active.load(Ordering::Relaxed),
+                );
+                if !queue.is_empty() {
+                    feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
                 }
 
                 // Signal natural track end BEFORE draining when the HTTP
@@ -4017,6 +4055,36 @@ impl OutputTarget for LocalOutput {
                 let pos =
                     (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
                 position_ms.store(pos, Ordering::Relaxed);
+            }
+
+            // Fin de piste : la queue du convolveur doit traverser la MEME
+            // adaptation de canaux et le meme reechantillonnage que le reste,
+            // sinon elle arriverait au mauvais format (#2209).
+            let queue = flush_local_dsp(
+                &convolver,
+                &crossfeed,
+                &pure_bypass,
+                channels,
+                dop_active.load(Ordering::Relaxed),
+            );
+            if !queue.is_empty() {
+                let mut queue = queue;
+                if needs_channel_adapt {
+                    queue = adapt_channels(&queue, channels, output_ch);
+                }
+                if needs_resample {
+                    queue = rubato_resample_chunk(
+                        &mut resampler,
+                        &queue,
+                        output_ch,
+                        // `true` : c'est le dernier bloc, le resampler doit
+                        // vider son propre retard plutot que le garder pour un
+                        // appel qui ne viendra pas.
+                        true,
+                        &mut resample_leftover,
+                    );
+                }
+                feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
             }
 
             // If the stream was never started (very short track or error),
@@ -5328,7 +5396,7 @@ mod tests {
 
         // Le buffer rendu est le silence d'amorçage : c'est la latence, et
         // c'est exactement ce que l'ancien code ne rendait jamais visible.
-        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2);
+        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2, false);
 
         let mut restitue = tampon.clone();
         restitue.extend_from_slice(&queue);
