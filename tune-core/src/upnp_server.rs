@@ -229,6 +229,21 @@ pub fn content_directory_scpd() -> &'static str {
       </argumentList>
     </action>
     <action>
+      <name>Search</name>
+      <argumentList>
+        <argument><name>ContainerID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>
+        <argument><name>SearchCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SearchCriteria</relatedStateVariable></argument>
+        <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>
+        <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>
+        <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>
+        <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>
+        <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
       <name>GetSearchCapabilities</name>
       <argumentList>
         <argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument>
@@ -258,6 +273,7 @@ pub fn content_directory_scpd() -> &'static str {
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SearchCriteria</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>
@@ -420,8 +436,9 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
         Some("GetSearchCapabilities") => soap_action_response(
             CONTENT_DIRECTORY_URN,
             "GetSearchCapabilities",
-            "<SearchCaps></SearchCaps>",
+            &format!("<SearchCaps>{SEARCH_CAPS}</SearchCaps>"),
         ),
+        Some("Search") => search_action_response(state, soap_body),
         Some("GetSystemUpdateID") => {
             soap_action_response(CONTENT_DIRECTORY_URN, "GetSystemUpdateID", "<Id>1</Id>")
         }
@@ -430,6 +447,125 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
             soap_fault(401, "Invalid Action")
         }
     }
+}
+
+/// Ce sur quoi nous savons chercher, annonce a `GetSearchCapabilities`.
+///
+/// Un `SearchCaps` VIDE dit « je ne sais rien chercher ». C'est ce que Tune
+/// annoncait — tout en repondant `401 Invalid Action` a l'action `Search`
+/// elle-meme. Les points de controle qui INDEXENT une bibliotheque (JPlay,
+/// entre autres) s'en servent pour recuperer toutes les pistes en une passe
+/// paginee, bien plus vite qu'un parcours recursif : ils echouaient donc a
+/// synchroniser, sans que rien ne dise pourquoi (Patatorz, fil forum #1516).
+const SEARCH_CAPS: &str = "upnp:class,dc:title,upnp:artist,upnp:album";
+
+/// L'action `Search` de ContentDirectory.
+///
+/// Portee volontairement etroite, et annoncee comme telle : on sait rendre
+/// **les pistes**. C'est ce que demandent les clients d'indexation, et c'est
+/// la seule chose qu'on puisse servir sans inventer un moteur de criteres
+/// complet — un `SearchCriteria` peut porter des expressions booleennes
+/// arbitraires que personne ici ne sait evaluer.
+///
+/// Un critere qui ne vise pas des pistes rend une liste VIDE plutot qu'une
+/// faute : un client qui cherche des images ou des videos doit lire « rien de
+/// tel ici », pas « ce serveur est casse ».
+///
+/// La pagination est celle de `browse_all_tracks`, deja eprouvee — le client
+/// redemande par tranches, exactement comme sur le conteneur « All Tracks ».
+fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
+    let (_container_id, criteria, start, count) = parse_search_request(soap_body);
+    let base_url = state.base_url();
+
+    let didl = if criteria_vise_des_pistes(&criteria) {
+        browse_all_tracks(state, start, count, &base_url)
+    } else {
+        debug!(criteria = %criteria, "upnp_search_criteria_hors_portee");
+        empty_didl()
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:SearchResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <Result>{result}</Result>
+      <NumberReturned>{returned}</NumberReturned>
+      <TotalMatches>{total}</TotalMatches>
+      <UpdateID>1</UpdateID>
+    </u:SearchResponse>
+  </s:Body>
+</s:Envelope>"#,
+        result = quick_xml::escape::escape(&didl.xml),
+        returned = didl.returned,
+        total = didl.total,
+    )
+}
+
+/// Le critere vise-t-il des pistes audio ?
+///
+/// On ne construit PAS un evaluateur d'expressions : on reconnait les formes
+/// que les clients d'indexation emploient reellement, et on refuse le reste
+/// par une liste vide.
+///
+/// `*` est la recherche universelle (« tout ce que tu as ») : pour un serveur
+/// qui n'expose que de la musique, cela veut dire les pistes.
+fn criteria_vise_des_pistes(criteria: &str) -> bool {
+    let c = criteria.trim();
+    if c.is_empty() || c == "*" {
+        return true;
+    }
+    let bas = c.to_lowercase();
+    // Une recherche d'IMAGE ou de VIDEO ne doit rien rendre, meme si elle
+    // mentionne `object.item` : sans ce garde, un client recevrait nos pistes
+    // en reponse a une demande de photos.
+    if bas.contains("imageitem") || bas.contains("videoitem") {
+        return false;
+    }
+    bas.contains("audioitem") || bas.contains("musictrack") || bas.contains("object.item")
+}
+
+/// Les arguments de `Search` : meme forme que `Browse`, avec `ContainerID` et
+/// `SearchCriteria` a la place d'`ObjectID` et `BrowseFlag`.
+fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64) {
+    let mut container_id = "0".to_string();
+    let mut criteria = String::new();
+    let mut start: u64 = 0;
+    let mut count: u64 = 100;
+
+    let mut reader = quick_xml::Reader::from_str(soap_xml);
+    reader.config_mut().trim_text(true);
+    let mut current_tag = String::new();
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                current_tag = name.rsplit(':').next().unwrap_or(&name).to_string();
+            }
+            Ok(Event::End(_)) => current_tag.clear(),
+            Ok(Event::Text(e)) => {
+                let v = e.decode().unwrap_or_default().to_string();
+                match current_tag.as_str() {
+                    "ContainerID" => container_id = v,
+                    "SearchCriteria" => criteria = v,
+                    "StartingIndex" => start = v.parse().unwrap_or(0),
+                    // `RequestedCount = 0` veut dire « tout », comme pour
+                    // Browse : le rendre litteralement donnerait zero piste et
+                    // un client conclurait a une bibliotheque vide.
+                    "RequestedCount" => {
+                        let n: u64 = v.parse().unwrap_or(100);
+                        count = if n == 0 { u64::MAX } else { n };
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    (container_id, criteria, start, count)
 }
 
 fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
@@ -1882,8 +2018,17 @@ mod tests {
         assert!(update.contains("<u:GetSystemUpdateIDResponse"));
         assert!(update.contains("<Id>1</Id>"));
 
-        // Action non déclarée au SCPD → fault 401, pas une BrowseResponse.
-        let fault = build_browse_response(&state, &soap_body("Search", urn));
+        // `Search` REPOND desormais (#1516) : elle est declaree au SCPD et
+        // servie. Ce test attendait un 401 — il encodait l'ancien
+        // comportement comme voulu, et c'est justement lui qui laissait les
+        // clients d'indexation (JPlay) sans recours.
+        let search_resp = build_browse_response(&state, &soap_body("Search", urn));
+        assert!(search_resp.contains("<u:SearchResponse"), "{search_resp}");
+        assert!(!is_soap_fault(&search_resp));
+
+        // Une action vraiment non declaree rend toujours un fault 401 : le
+        // dispatch n'est pas devenu laxiste.
+        let fault = build_browse_response(&state, &soap_body("CreateObject", urn));
         assert!(is_soap_fault(&fault));
         assert!(fault.contains("<errorCode>401</errorCode>"));
 
@@ -2188,5 +2333,81 @@ mod ssdp_msearch_tests {
         assert!(r.contains("USN: uuid:1234::upnp:rootdevice\r\n"));
         assert!(r.contains("LOCATION: http://x/d.xml\r\n"));
         assert!(r.contains("EXT:\r\n"));
+    }
+
+    // --- L'action Search, pour les clients qui INDEXENT (#1516) ---
+
+    fn soap_search(container: &str, criteria: &str, start: u64, count: u64) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope><s:Body>
+<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ContainerID>{container}</ContainerID>
+<SearchCriteria>{criteria}</SearchCriteria>
+<StartingIndex>{start}</StartingIndex>
+<RequestedCount>{count}</RequestedCount>
+</u:Search></s:Body></s:Envelope>"#
+        )
+    }
+
+    #[test]
+    fn les_arguments_de_search_sont_lus() {
+        let (c, crit, start, count) = parse_search_request(&soap_search(
+            "0",
+            "upnp:class derivedfrom &quot;object.item.audioItem&quot;",
+            50,
+            25,
+        ));
+        assert_eq!(c, "0");
+        assert!(crit.contains("audioItem"), "{crit}");
+        assert_eq!(start, 50);
+        assert_eq!(count, 25);
+    }
+
+    /// Meme regle que pour Browse : `RequestedCount = 0` veut dire « tout ».
+    /// Le rendre litteralement donnerait zero piste, et le client conclurait a
+    /// une bibliotheque vide — ce qui ressemble exactement au defaut qu'on
+    /// corrige.
+    #[test]
+    fn requested_count_zero_veut_dire_tout() {
+        let (_, _, _, count) = parse_search_request(&soap_search("0", "*", 0, 0));
+        assert_eq!(count, u64::MAX);
+    }
+
+    #[test]
+    fn un_critere_de_pistes_est_reconnu_sous_ses_formes_usuelles() {
+        for c in [
+            "upnp:class derivedfrom \"object.item.audioItem\"",
+            "upnp:class = \"object.item.audioItem.musicTrack\"",
+            "upnp:class derivedfrom \"object.item\"",
+            "*",
+            "",
+        ] {
+            assert!(
+                criteria_vise_des_pistes(c),
+                "devrait viser des pistes : {c}"
+            );
+        }
+    }
+
+    /// Un client qui cherche des PHOTOS ne doit pas recevoir nos morceaux.
+    /// Sans ce garde, « object.item.imageItem » passerait par la clause
+    /// `object.item` et rendrait toute la discotheque.
+    #[test]
+    fn une_recherche_d_images_ou_de_videos_ne_rend_rien() {
+        for c in [
+            "upnp:class derivedfrom \"object.item.imageItem\"",
+            "upnp:class derivedfrom \"object.item.videoItem.movie\"",
+        ] {
+            assert!(!criteria_vise_des_pistes(c), "ne doit rien rendre : {c}");
+        }
+    }
+
+    #[test]
+    fn les_capacites_annoncees_ne_sont_plus_vides() {
+        // Un SearchCaps VIDE dit « je ne sais rien chercher » — tout en
+        // repondant 401 a Search. C'etait le double message qui laissait les
+        // clients d'indexation sans recours.
+        assert!(!SEARCH_CAPS.is_empty());
+        assert!(SEARCH_CAPS.contains("upnp:class"));
     }
 }

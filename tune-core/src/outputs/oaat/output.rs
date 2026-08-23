@@ -348,12 +348,12 @@ async fn connect_and_setup(
         // ce qu'on allait envoyer : on ne sait pas adapter le flux (#2239).
         Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc)))
             if contre_proposition_honorable(
-                (
-                    stream_info.format,
-                    stream_info.sample_rate,
-                    stream_info.bits_per_sample,
-                ),
-                (fc.format, fc.sample_rate, fc.bits_per_sample as u16),
+                stream_info.format,
+                stream_info.sample_rate,
+                ch,
+                ChannelLayout::Stereo,
+                stream_info.bits_per_sample,
+                &fc,
             ) => {}
         _ => {
             error!(device = %device_name, "oaat: reconnect format negotiation failed");
@@ -1708,8 +1708,12 @@ impl OutputTarget for OaatOutput {
                     // chemin ne sait pas adapter le flux, une contre-proposition
                     // qui differe de ce qu'on allait envoyer est un refus.
                     if contre_proposition_honorable(
-                        (cur_format, cur_sample_rate, cur_bits),
-                        (fc.format, fc.sample_rate, fc.bits_per_sample as u16),
+                        cur_format,
+                        cur_sample_rate,
+                        cur_channels.min(8) as u8,
+                        layout,
+                        cur_bits,
+                        &fc,
                     ) {
                         info!(device = %device_name, rate = fc.sample_rate, bits = fc.bits_per_sample, "oaat: contre-proposition identique a la proposition");
                     } else {
@@ -2158,8 +2162,12 @@ impl OutputTarget for OaatOutput {
                                             // venait de refuser (#2239).
                                             Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc)))
                                                 if !contre_proposition_honorable(
-                                                    (next.info.format, next.info.sample_rate, next.info.bits_per_sample),
-                                                    (fc.format, fc.sample_rate, fc.bits_per_sample as u16),
+                                                    next.info.format,
+                                                    next.info.sample_rate,
+                                                    ch,
+                                                    layout,
+                                                    next.info.bits_per_sample,
+                                                    &fc,
                                                 ) =>
                                             {
                                                 error!(
@@ -2587,21 +2595,34 @@ fn open_next_dsd(
 ///
 /// Tune envoie les octets de la SOURCE. Adopter les valeurs d'une
 /// contre-proposition sans convertir le payload revient a mentir sur ce qu'on
-/// envoie : `cur_format`, `cur_bits` et `cur_sample_rate` etaient reecrits, et
-/// les memes octets partaient avec une etiquette qui ne les decrivait plus
-/// (#2239). Une source 24/96 contre-proposee en 16/48 continuait de partir en
-/// 24/96, decoupee et annoncee comme du 16/48.
+/// envoie (#2239). Une contre-proposition n'est donc acceptable que si elle
+/// decrit EXACTEMENT ce qu'on allait deja envoyer — auquel cas il n'y a rien a
+/// faire.
 ///
-/// Une contre-proposition n'est donc acceptable que si elle decrit EXACTEMENT
-/// ce qu'on allait deja envoyer — auquel cas il n'y a rien a faire. Toute autre
-/// demande une adaptation du flux (profondeur, cadence, codec) que ce chemin ne
-/// sait pas produire : la refuser rend le silence et une raison, l'accepter
-/// rendait du bruit sans explication.
+/// La comparaison porte sur TOUT ce qui se negocie, pas seulement sur le
+/// triplet codec/cadence/profondeur : `FormatPropose` et `FormatCounter`
+/// portent aussi `channels`, `channel_layout` et `dsd_rate`. Mon premier
+/// predicat les omettait, si bien qu'une contre-proposition MONO face a une
+/// proposition stereo avait le meme tuple et passait pour identique — Tune
+/// continuait d'envoyer des trames stereo a un endpoint qui venait de demander
+/// du mono (JP Robbe, #2283).
+///
+/// `dsd_rate` doit etre absent : `propose_format` ne l'envoie pas, donc un
+/// endpoint qui en pose un ajoute une contrainte que ce chemin n'honore pas.
 pub(crate) fn contre_proposition_honorable(
-    propose: (oaat_core::format::AudioFormat, u32, u16),
-    contre: (oaat_core::format::AudioFormat, u32, u16),
+    propose_format: oaat_core::format::AudioFormat,
+    propose_sample_rate: u32,
+    propose_channels: u8,
+    propose_layout: oaat_core::format::ChannelLayout,
+    propose_bits: u16,
+    contre: &oaat_core::message::FormatCounter,
 ) -> bool {
-    propose == contre
+    propose_format == contre.format
+        && propose_sample_rate == contre.sample_rate
+        && propose_channels == contre.channels
+        && propose_layout == contre.channel_layout
+        && propose_bits == contre.bits_per_sample as u16
+        && contre.dsd_rate.is_none()
 }
 
 async fn settle_prefetch(
