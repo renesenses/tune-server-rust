@@ -142,7 +142,37 @@ pub struct OaatOutput {
     /// `format accepted` aussitôt suivi d'un nouveau `connected`. La piste
     /// reboucle sur ses premières secondes.
     play_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Le motif du dernier refus de negociation de format, en attente d'etre
+    /// remis au poller.
+    ///
+    /// Refuser une contre-proposition qu'on ne sait pas honorer est le bon
+    /// choix — envoyer des octets mal etiquetes produit vitesse fausse,
+    /// entrelacement faux ou bruit. Mais la raison restait dans le journal
+    /// serveur : cote utilisateur, la zone se taisait sans rien dire, et
+    /// `play_media` avait deja rendu la main quand la tache asynchrone
+    /// decouvrait le refus (#2294, JP Robbe).
+    ///
+    /// `take_output_failure()` est le canal deja ouvert pour ce cas exact — le
+    /// poller le lit a chaque tick et emet `zone.playback_error` avec
+    /// `fatal: true`, ce qui traverse jusqu'au client.
+    refus_negociation: Arc<std::sync::Mutex<Option<String>>>,
     pub diag: Arc<OaatDiagnostics>,
+}
+
+/// Deposer un refus a destination du poller.
+///
+/// Le premier refus gagne : c'est celui qui a arrete la lecture, les suivants
+/// n'en seraient que la consequence.
+#[cfg(feature = "oaat")]
+fn signaler_refus_negociation(
+    depot: &Arc<std::sync::Mutex<Option<String>>>,
+    refus: &RefusNegociation,
+) {
+    if let Ok(mut place) = depot.lock() {
+        if place.is_none() {
+            *place = Some(refus.raison.clone());
+        }
+    }
 }
 
 impl OaatOutput {
@@ -164,6 +194,7 @@ impl OaatOutput {
             native_dsd_active: Arc::new(AtomicBool::new(false)),
             direct_pcm_active: Arc::new(AtomicBool::new(false)),
             chain_exhausted: Arc::new(AtomicBool::new(false)),
+            refus_negociation: Arc::new(std::sync::Mutex::new(None)),
             // `volume_set` du protocole est en 0–100 (RFC), comme le
             // multiroom et l'endpoint : on stocke la meme echelle. L'ancien
             // 800, divise par 255 a la lecture, rapportait un volume de 314 %.
@@ -337,28 +368,26 @@ async fn connect_and_setup(
         return None;
     }
 
-    match tokio::time::timeout(
+    // `propose_format` n'envoie pas de `dsd_rate` : le contrat n'en porte pas.
+    let contrat = ContratPropose {
+        stream_id: stream_id.to_string(),
+        format: stream_info.format,
+        sample_rate: stream_info.sample_rate,
+        channels: ch,
+        channel_layout: ChannelLayout::Stereo,
+        bits_per_sample: stream_info.bits_per_sample,
+        dsd_rate: None,
+    };
+    if let Err(refus) = attendre_accord_format(
+        &mut endpoint,
+        device_name,
+        &contrat,
         std::time::Duration::from_secs(3),
-        endpoint.response_rx.recv(),
     )
     .await
     {
-        Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => {}
-        // Une contre-proposition n'est acceptee que si elle decrit exactement
-        // ce qu'on allait envoyer : on ne sait pas adapter le flux (#2239).
-        Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc)))
-            if contre_proposition_honorable(
-                stream_info.format,
-                stream_info.sample_rate,
-                ch,
-                ChannelLayout::Stereo,
-                stream_info.bits_per_sample,
-                &fc,
-            ) => {}
-        _ => {
-            error!(device = %device_name, "oaat: reconnect format negotiation failed");
-            return None;
-        }
+        error!(device = %device_name, raison = %refus.raison, "oaat: reconnect format negotiation failed");
+        return None;
     }
 
     if let Err(e) = endpoint.send_play(stream_id).await {
@@ -460,6 +489,12 @@ impl OutputTarget for OaatOutput {
         let native_dsd_active = self.native_dsd_active.clone();
         let direct_pcm_active = self.direct_pcm_active.clone();
         let chain_exhausted = self.chain_exhausted.clone();
+        // Une nouvelle lecture efface le refus de la precedente : un motif
+        // perime tuerait la piste suivante, qui n'y est pour rien.
+        if let Ok(mut place) = self.refus_negociation.lock() {
+            *place = None;
+        }
+        let refus_negociation = self.refus_negociation.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_arc = self.duration_ms.clone();
         let current_title = self.current_title.clone();
@@ -675,18 +710,29 @@ impl OutputTarget for OaatOutput {
                         }
 
                         // Lire la reponse AVANT de jouer (#2282).
-                        if let Err(raison) = attendre_accord_format(
+                        let contrat = ContratPropose {
+                            stream_id: stream_id.clone(),
+                            format: cur_format,
+                            sample_rate: cur_sample_rate,
+                            channels: ch,
+                            channel_layout: layout,
+                            bits_per_sample: 1,
+                            // Ce chemin pose son `FormatPropose` a la main et y
+                            // met bien un multiplicateur DSD : exiger `None` en
+                            // face refusait une contre-proposition DSD64
+                            // identique a la proposition DSD64 (#2283).
+                            dsd_rate: dsd_mult,
+                        };
+                        if let Err(refus) = attendre_accord_format(
                             &mut endpoint,
                             &device_name,
-                            cur_format,
-                            cur_sample_rate,
-                            ch,
-                            layout,
-                            1,
+                            &contrat,
+                            std::time::Duration::from_secs(5),
                         )
                         .await
                         {
-                            error!(device = %device_name, raison = %raison, "oaat: DSD format non accepte, on ne joue pas");
+                            error!(device = %device_name, raison = %refus.raison, "oaat: DSD format non accepte, on ne joue pas");
+                            signaler_refus_negociation(&refus_negociation, &refus);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -1294,18 +1340,26 @@ impl OutputTarget for OaatOutput {
                     // Lire la reponse AVANT de jouer (#2282) : ce chemin
                     // proposait puis lancait la lecture sans jamais la
                     // consulter.
-                    if let Err(raison) = attendre_accord_format(
+                    let contrat = ContratPropose {
+                        stream_id: stream_id.clone(),
+                        format: cur_format,
+                        sample_rate: cur_sample_rate,
+                        channels: ch,
+                        channel_layout: layout,
+                        bits_per_sample: cur_bits,
+                        // `propose_format` n'envoie pas de `dsd_rate`.
+                        dsd_rate: None,
+                    };
+                    if let Err(refus) = attendre_accord_format(
                         &mut endpoint,
                         &device_name,
-                        cur_format,
-                        cur_sample_rate,
-                        ch,
-                        layout,
-                        cur_bits,
+                        &contrat,
+                        std::time::Duration::from_secs(5),
                     )
                     .await
                     {
-                        error!(device = %device_name, raison = %raison, "oaat: format non accepte, on ne joue pas");
+                        error!(device = %device_name, raison = %refus.raison, "oaat: format non accepte, on ne joue pas");
+                        signaler_refus_negociation(&refus_negociation, &refus);
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -1743,28 +1797,46 @@ impl OutputTarget for OaatOutput {
                     // etiquette qui ne les decrivait plus (#2239). Tant que ce
                     // chemin ne sait pas adapter le flux, une contre-proposition
                     // qui differe de ce qu'on allait envoyer est un refus.
-                    if contre_proposition_honorable(
-                        cur_format,
-                        cur_sample_rate,
-                        cur_channels.min(8) as u8,
-                        layout,
-                        cur_bits,
-                        &fc,
-                    ) {
-                        info!(device = %device_name, rate = fc.sample_rate, bits = fc.bits_per_sample, "oaat: contre-proposition identique a la proposition");
-                    } else {
-                        error!(
-                            device = %device_name,
-                            propose_format = ?cur_format, propose_rate = cur_sample_rate, propose_bits = cur_bits,
-                            contre_format = ?fc.format, contre_rate = fc.sample_rate, contre_bits = fc.bits_per_sample,
-                            "oaat: contre-proposition non honorable — ce chemin ne sait pas adapter le flux, arret plutot que d'envoyer des octets mal etiquetes"
-                        );
-                        playing.store(false, Ordering::SeqCst);
-                        return;
+                    let contrat = ContratPropose {
+                        stream_id: stream_id.clone(),
+                        format: cur_format,
+                        sample_rate: cur_sample_rate,
+                        channels: cur_channels.min(8) as u8,
+                        channel_layout: layout,
+                        bits_per_sample: cur_bits,
+                        dsd_rate: si.dsd_rate,
+                    };
+                    match contrat.premier_ecart(&fc) {
+                        None => {
+                            info!(device = %device_name, rate = fc.sample_rate, bits = fc.bits_per_sample, "oaat: contre-proposition identique a la proposition");
+                        }
+                        Some(ecart) => {
+                            let refus = RefusNegociation {
+                                stream_id: stream_id.clone(),
+                                raison: format!(
+                                    "l'endpoint demande un autre format et Tune ne sait pas convertir le flux en cours : {ecart}"
+                                ),
+                            };
+                            error!(
+                                device = %device_name,
+                                raison = %refus.raison,
+                                "oaat: contre-proposition non honorable — arret plutot que d'envoyer des octets mal etiquetes"
+                            );
+                            signaler_refus_negociation(&refus_negociation, &refus);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
                     }
                 }
                 Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
                     error!(device = %device_name, reason = %fr.reason, "oaat: format rejected");
+                    signaler_refus_negociation(
+                        &refus_negociation,
+                        &RefusNegociation {
+                            stream_id: fr.stream_id.clone(),
+                            raison: format!("format refuse par l'endpoint : {}", fr.reason),
+                        },
+                    );
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -2190,39 +2262,44 @@ impl OutputTarget for OaatOutput {
                                             error!(device = %device_name, error = %e, "oaat: re-negotiate failed");
                                             break;
                                         }
-                                        match tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.response_rx.recv()).await {
-                                            // Un `FormatCounter` etait traite comme un
-                                            // `FormatAccept` et ses valeurs jetees : on
-                                            // reinstallait celles de la piste suivante,
-                                            // donc on renvoyait un format que l'endpoint
-                                            // venait de refuser (#2239).
-                                            Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc)))
-                                                if !contre_proposition_honorable(
-                                                    next.info.format,
-                                                    next.info.sample_rate,
-                                                    ch,
-                                                    layout,
-                                                    next.info.bits_per_sample,
-                                                    &fc,
-                                                ) =>
-                                            {
-                                                error!(
-                                                    device = %device_name,
-                                                    contre_format = ?fc.format, contre_rate = fc.sample_rate, contre_bits = fc.bits_per_sample,
-                                                    "oaat: contre-proposition non honorable en gapless, fin de chaine"
-                                                );
-                                                break;
-                                            }
-                                            Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) |
-                                            Ok(Some(oaat_controller::EndpointResponse::FormatCounter(_))) => {
-                                                cur_format = next.info.format;
-                                                cur_bits = next.info.bits_per_sample;
-                                                cur_sample_rate = next.info.sample_rate;
-                                                bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-                                                packet_size = if cur_format == AudioFormat::Flac { FLAC_CHUNK_SIZE } else { PCM_SAMPLES_PER_PACKET * bytes_per_frame };
-                                            }
-                                            _ => { error!(device = %device_name, "oaat: re-negotiate failed for next track"); break; }
+                                        // Un `FormatCounter` etait traite comme un
+                                        // `FormatAccept` et ses valeurs jetees : on
+                                        // reinstallait celles de la piste suivante,
+                                        // donc on renvoyait un format que l'endpoint
+                                        // venait de refuser (#2239).
+                                        //
+                                        // `propose_format` n'envoie PAS de `dsd_rate` :
+                                        // le contrat reellement propose ici n'en porte
+                                        // donc pas, et une contre-proposition qui en
+                                        // pose un ajoute bien une contrainte (#2283).
+                                        let contrat = ContratPropose {
+                                            stream_id: stream_id.clone(),
+                                            format: next.info.format,
+                                            sample_rate: next.info.sample_rate,
+                                            channels: ch,
+                                            channel_layout: layout,
+                                            bits_per_sample: next.info.bits_per_sample,
+                                            dsd_rate: None,
+                                        };
+                                        let recue = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.response_rx.recv()).await;
+                                        let verdict = match &recue {
+                                            Ok(Some(reponse)) => juger_reponse(&contrat, ReponseNegociation::Recue(reponse)),
+                                            Ok(None) => juger_reponse(&contrat, ReponseNegociation::Fermee),
+                                            Err(_) => juger_reponse(&contrat, ReponseNegociation::Timeout),
+                                        };
+                                        if let Err(refus) = verdict {
+                                            error!(
+                                                device = %device_name,
+                                                raison = %refus.raison,
+                                                "oaat: contre-proposition non honorable en gapless, fin de chaine"
+                                            );
+                                            break;
                                         }
+                                        cur_format = next.info.format;
+                                        cur_bits = next.info.bits_per_sample;
+                                        cur_sample_rate = next.info.sample_rate;
+                                        bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
+                                        packet_size = if cur_format == AudioFormat::Flac { FLAC_CHUNK_SIZE } else { PCM_SAMPLES_PER_PACKET * bytes_per_frame };
                                     }
 
                                     *current_title.lock().await = Some(next.title.clone());
@@ -2568,6 +2645,16 @@ impl OutputTarget for OaatOutput {
         })
     }
 
+    /// Le motif du refus de negociation, remis UNE fois au poller, qui en fait
+    /// un `zone.playback_error` `fatal: true` — donc un message a l'ecran au
+    /// lieu d'une zone muette (#2294).
+    fn take_output_failure(&self) -> Option<String> {
+        self.refus_negociation
+            .lock()
+            .ok()
+            .and_then(|mut s| s.take())
+    }
+
     async fn is_available(&self) -> bool {
         true
     }
@@ -2627,24 +2714,172 @@ fn open_next_dsd(
 /// `prefetch_rx` du select! et le rattrapage d'un préchargement en vol à l'EOF
 /// (#1358) — les deux chemins doivent traiter le résultat À L'IDENTIQUE.
 #[allow(clippy::too_many_arguments)]
-/// Une contre-proposition d'un endpoint est-elle honorable en l'etat ?
+/// Le contrat de format effectivement PROPOSE a l'endpoint.
 ///
-/// Tune envoie les octets de la SOURCE. Adopter les valeurs d'une
-/// contre-proposition sans convertir le payload revient a mentir sur ce qu'on
-/// envoie (#2239). Une contre-proposition n'est donc acceptable que si elle
-/// decrit EXACTEMENT ce qu'on allait deja envoyer — auquel cas il n'y a rien a
-/// faire.
+/// Tune envoie les octets de la SOURCE : il ne sait pas convertir un flux en
+/// cours de negociation. Une reponse n'est donc acceptable que si elle decrit
+/// EXACTEMENT ce qu'on allait deja envoyer — auquel cas il n'y a rien a faire.
 ///
-/// La comparaison porte sur TOUT ce qui se negocie, pas seulement sur le
-/// triplet codec/cadence/profondeur : `FormatPropose` et `FormatCounter`
-/// portent aussi `channels`, `channel_layout` et `dsd_rate`. Mon premier
-/// predicat les omettait, si bien qu'une contre-proposition MONO face a une
-/// proposition stereo avait le meme tuple et passait pour identique — Tune
-/// continuait d'envoyer des trames stereo a un endpoint qui venait de demander
-/// du mono (JP Robbe, #2283).
+/// Regrouper les champs en une structure n'est pas cosmetique. La comparaison
+/// porte sur TOUT ce qui se negocie ; tant qu'elle etait une liste d'arguments
+/// positionnels, il manquait toujours un champ et le compilateur ne pouvait
+/// rien dire (`channels` et `channel_layout` omis d'abord, puis `dsd_rate` et
+/// `stream_id` — #2283, JP Robbe).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContratPropose {
+    pub stream_id: String,
+    pub format: oaat_core::format::AudioFormat,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub channel_layout: oaat_core::format::ChannelLayout,
+    pub bits_per_sample: u16,
+    pub dsd_rate: Option<u16>,
+}
+
+impl ContratPropose {
+    /// Le premier champ par lequel une contre-proposition s'ecarte du contrat,
+    /// nomme et chiffre — `None` si elle le decrit exactement.
+    ///
+    /// Rendre le champ fautif plutot qu'un booleen sert deux fois : le journal
+    /// dit ce qui cloche, et l'utilisateur recoit une raison lisible au lieu
+    /// d'une zone qui se tait (#2294).
+    pub(crate) fn premier_ecart(
+        &self,
+        contre: &oaat_core::message::FormatCounter,
+    ) -> Option<String> {
+        if self.format != contre.format {
+            return Some(format!(
+                "codec {:?} propose contre {:?} contre-propose",
+                self.format, contre.format
+            ));
+        }
+        if self.sample_rate != contre.sample_rate {
+            return Some(format!(
+                "cadence {} Hz proposee contre {} Hz contre-proposee",
+                self.sample_rate, contre.sample_rate
+            ));
+        }
+        if self.channels != contre.channels {
+            return Some(format!(
+                "{} canaux proposes contre {} contre-proposes",
+                self.channels, contre.channels
+            ));
+        }
+        if self.channel_layout != contre.channel_layout {
+            return Some(format!(
+                "disposition {:?} proposee contre {:?} contre-proposee",
+                self.channel_layout, contre.channel_layout
+            ));
+        }
+        if self.bits_per_sample != contre.bits_per_sample as u16 {
+            return Some(format!(
+                "{} bits proposes contre {} contre-proposes",
+                self.bits_per_sample, contre.bits_per_sample
+            ));
+        }
+        // `dsd_rate` se COMPARE, il ne s'exige pas absent. Le rendre
+        // obligatoirement `None` refusait une contre-proposition DSD64
+        // rigoureusement identique a la proposition DSD64 : les trois chemins
+        // qui posent un `FormatPropose` a la main envoient bien un
+        // multiplicateur (#2283, JP Robbe).
+        if self.dsd_rate != contre.dsd_rate {
+            return Some(format!(
+                "DSD {:?} propose contre {:?} contre-propose",
+                self.dsd_rate, contre.dsd_rate
+            ));
+        }
+        None
+    }
+}
+
+/// Ce qui est arrive pendant l'attente d'une reponse a la proposition.
 ///
-/// `dsd_rate` doit etre absent : `propose_format` ne l'envoie pas, donc un
-/// endpoint qui en pose un ajoute une contrainte que ce chemin n'honore pas.
+/// Le silence et la fermeture sont des issues a part entiere, pas des cas
+/// « autres » : les distinguer permet de les tester sans horloge.
+pub(crate) enum ReponseNegociation<'a> {
+    Recue(&'a oaat_controller::EndpointResponse),
+    Fermee,
+    Timeout,
+}
+
+/// Un refus de negociation, avec de quoi le remonter jusqu'a l'utilisateur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefusNegociation {
+    pub stream_id: String,
+    pub raison: String,
+}
+
+impl std::fmt::Display for RefusNegociation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.raison)
+    }
+}
+
+/// La decision de negociation, isolee de tout reseau et de toute horloge.
+///
+/// Elle vivait dans un `match` au milieu d'une tache asynchrone : impossible a
+/// tester autrement qu'en lisant le texte source, ce que faisait mon test de
+/// #2291 — il restait vert quand on remplacait le bras `FormatReject => Err`
+/// par `Ok(())` (#2297, JP Robbe). Fonction pure, donc verifiable sur les huit
+/// issues : accord, accord d'un autre flux, contre-proposition identique,
+/// contre-proposition ecartee, refus, reponse hors sujet, fermeture, silence.
+pub(crate) fn juger_reponse(
+    contrat: &ContratPropose,
+    reponse: ReponseNegociation<'_>,
+) -> Result<(), RefusNegociation> {
+    let refus = |raison: String| {
+        Err(RefusNegociation {
+            stream_id: contrat.stream_id.clone(),
+            raison,
+        })
+    };
+    let flux_etranger = |recu: &str| {
+        format!(
+            "reponse pour le flux {recu} alors qu'on negociait {} — une reponse \
+             en retard prise pour la bonne decale toute la suite",
+            contrat.stream_id
+        )
+    };
+
+    match reponse {
+        ReponseNegociation::Timeout => {
+            refus("aucune reponse a la proposition de format (delai depasse)".into())
+        }
+        ReponseNegociation::Fermee => refus("endpoint ferme pendant la negociation".into()),
+        ReponseNegociation::Recue(recue) => match recue {
+            oaat_controller::EndpointResponse::FormatAccept(fa) => {
+                if fa.stream_id != contrat.stream_id {
+                    refus(flux_etranger(&fa.stream_id))
+                } else {
+                    Ok(())
+                }
+            }
+            oaat_controller::EndpointResponse::FormatCounter(fc) => {
+                if fc.stream_id != contrat.stream_id {
+                    refus(flux_etranger(&fc.stream_id))
+                } else if let Some(ecart) = contrat.premier_ecart(fc) {
+                    refus(format!(
+                        "l'endpoint demande un autre format et Tune ne sait pas \
+                         convertir le flux en cours : {ecart}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            oaat_controller::EndpointResponse::FormatReject(fr) => {
+                if fr.stream_id != contrat.stream_id {
+                    refus(flux_etranger(&fr.stream_id))
+                } else {
+                    refus(format!("format refuse par l'endpoint : {}", fr.reason))
+                }
+            }
+            autre => refus(format!(
+                "reponse inattendue pendant la negociation de format : {autre:?}"
+            )),
+        },
+    }
+}
+
 /// Attendre la reponse a une proposition de format, et dire si on peut jouer.
 ///
 /// Deux chemins — DSD natif et PCM direct — proposaient un format puis
@@ -2660,65 +2895,32 @@ fn open_next_dsd(
 ///
 /// Ce troisieme point est le plus vicieux : le decalage survit a la piste qui
 /// l'a cause, et ne se voit donc pas la ou il est ne.
+///
+/// Tout le jugement est delegue a `juger_reponse` : ici il ne reste que
+/// l'attente et la trace.
 async fn attendre_accord_format(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     device_name: &str,
-    propose_format: oaat_core::format::AudioFormat,
-    propose_sample_rate: u32,
-    propose_channels: u8,
-    propose_layout: oaat_core::format::ChannelLayout,
-    propose_bits: u16,
-) -> Result<(), String> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        endpoint.response_rx.recv(),
-    )
-    .await
-    {
-        Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => Ok(()),
-        Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc))) => {
-            if contre_proposition_honorable(
-                propose_format,
-                propose_sample_rate,
-                propose_channels,
-                propose_layout,
-                propose_bits,
-                &fc,
-            ) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "contre-proposition non honorable : {:?} {} Hz {} bits {} canaux",
-                    fc.format, fc.sample_rate, fc.bits_per_sample, fc.channels
-                ))
-            }
-        }
-        Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
-            Err(format!("format refuse : {}", fr.reason))
-        }
-        Ok(Some(autre)) => Err(format!("reponse inattendue : {autre:?}")),
-        Ok(None) => Err("endpoint ferme pendant la negociation".into()),
-        Err(_) => {
-            warn!(device = %device_name, "oaat: pas de reponse a la proposition de format");
-            Err("delai depasse".into())
-        }
-    }
-}
+    contrat: &ContratPropose,
+    delai: std::time::Duration,
+) -> Result<(), RefusNegociation> {
+    let recue = tokio::time::timeout(delai, endpoint.response_rx.recv()).await;
 
-pub(crate) fn contre_proposition_honorable(
-    propose_format: oaat_core::format::AudioFormat,
-    propose_sample_rate: u32,
-    propose_channels: u8,
-    propose_layout: oaat_core::format::ChannelLayout,
-    propose_bits: u16,
-    contre: &oaat_core::message::FormatCounter,
-) -> bool {
-    propose_format == contre.format
-        && propose_sample_rate == contre.sample_rate
-        && propose_channels == contre.channels
-        && propose_layout == contre.channel_layout
-        && propose_bits == contre.bits_per_sample as u16
-        && contre.dsd_rate.is_none()
+    let verdict = match &recue {
+        Ok(Some(reponse)) => juger_reponse(contrat, ReponseNegociation::Recue(reponse)),
+        Ok(None) => juger_reponse(contrat, ReponseNegociation::Fermee),
+        Err(_) => juger_reponse(contrat, ReponseNegociation::Timeout),
+    };
+
+    if let Err(refus) = &verdict {
+        error!(
+            device = %device_name,
+            stream_id = %refus.stream_id,
+            raison = %refus.raison,
+            "oaat: negociation de format refusee"
+        );
+    }
+    verdict
 }
 
 async fn settle_prefetch(
