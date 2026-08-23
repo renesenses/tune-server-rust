@@ -324,6 +324,7 @@ async fn connect_and_setup(
     device_name: &str,
     stream_id: &str,
     stream_info: &StreamInfo,
+    refus_negociation: &Arc<std::sync::Mutex<Option<String>>>,
 ) -> Option<oaat_controller::ConnectedEndpoint> {
     use oaat_core::ChannelLayout;
 
@@ -387,6 +388,7 @@ async fn connect_and_setup(
     .await
     {
         error!(device = %device_name, raison = %refus.raison, "oaat: reconnect format negotiation failed");
+        signaler_refus_negociation(refus_negociation, &refus);
         return None;
     }
 
@@ -1782,117 +1784,73 @@ impl OutputTarget for OaatOutput {
                 return;
             }
 
-            match tokio::time::timeout(
+            let contrat = ContratPropose {
+                stream_id: stream_id.clone(),
+                format: cur_format,
+                sample_rate: cur_sample_rate,
+                channels: ch,
+                channel_layout: layout,
+                bits_per_sample: cur_bits,
+                dsd_rate: si.dsd_rate,
+            };
+            let mut verdict = attendre_accord_format(
+                &mut endpoint,
+                &device_name,
+                &contrat,
                 std::time::Duration::from_secs(5),
-                endpoint.response_rx.recv(),
             )
-            .await
-            {
-                Ok(Some(oaat_controller::EndpointResponse::FormatAccept(fa))) => {
-                    info!(device = %device_name, stream_id = %fa.stream_id, "oaat: format accepted");
-                }
-                Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc))) => {
-                    // On ADOPTAIT les valeurs de la contre-proposition sans
-                    // toucher au payload : les memes octets partaient avec une
-                    // etiquette qui ne les decrivait plus (#2239). Tant que ce
-                    // chemin ne sait pas adapter le flux, une contre-proposition
-                    // qui differe de ce qu'on allait envoyer est un refus.
-                    let contrat = ContratPropose {
-                        stream_id: stream_id.clone(),
-                        format: cur_format,
-                        sample_rate: cur_sample_rate,
-                        channels: cur_channels.min(8) as u8,
-                        channel_layout: layout,
-                        bits_per_sample: cur_bits,
-                        dsd_rate: si.dsd_rate,
-                    };
-                    match contrat.premier_ecart(&fc) {
-                        None => {
-                            info!(device = %device_name, rate = fc.sample_rate, bits = fc.bits_per_sample, "oaat: contre-proposition identique a la proposition");
-                        }
-                        Some(ecart) => {
-                            let refus = RefusNegociation {
-                                stream_id: stream_id.clone(),
-                                raison: format!(
-                                    "l'endpoint demande un autre format et Tune ne sait pas convertir le flux en cours : {ecart}"
-                                ),
-                            };
-                            error!(
-                                device = %device_name,
-                                raison = %refus.raison,
-                                "oaat: contre-proposition non honorable — arret plutot que d'envoyer des octets mal etiquetes"
-                            );
-                            signaler_refus_negociation(&refus_negociation, &refus);
-                            playing.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-                }
-                Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
-                    error!(device = %device_name, reason = %fr.reason, "oaat: format rejected");
-                    signaler_refus_negociation(
-                        &refus_negociation,
-                        &RefusNegociation {
-                            stream_id: fr.stream_id.clone(),
-                            raison: format!("format refuse par l'endpoint : {}", fr.reason),
-                        },
-                    );
-                    playing.store(false, Ordering::SeqCst);
-                    return;
-                }
-                Ok(Some(other)) => {
-                    warn!(device = %device_name, response = ?other, "oaat: unexpected response");
-                }
-                Ok(None) => {
-                    warn!(device = %device_name, "oaat: endpoint closed during negotiation, reconnecting");
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    match ConnectedEndpoint::connect(&config, endpoint_addr).await {
-                        Ok(ep) => {
-                            endpoint = ep;
-                            endpoint.clock_sync_bootstrap().await.ok();
-                            if let Err(e) = endpoint
-                                .propose_format(
-                                    &stream_id,
-                                    cur_format,
-                                    cur_sample_rate,
-                                    cur_channels.min(8) as u8,
-                                    layout,
-                                    cur_bits as u8,
-                                )
-                                .await
-                            {
-                                error!(device = %device_name, error = %e, "oaat: reconnect format propose failed");
-                                playing.store(false, Ordering::SeqCst);
-                                return;
-                            }
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                endpoint.response_rx.recv(),
-                            )
+            .await;
+
+            // Une fermeture de socket pendant le handshake avait un repli
+            // utile : reconnecter une fois. On le conserve, mais la seconde
+            // réponse traverse exactement le même validateur que la première.
+            // L'ancien repli acceptait n'importe quel FormatAccept, y compris
+            // celui d'un autre flux, et perdait dsd_rate (#2283).
+            if verdict.as_ref().is_err_and(|refus| refus.reconnectable) {
+                warn!(device = %device_name, "oaat: endpoint closed during negotiation, reconnecting");
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                match ConnectedEndpoint::connect(&config, endpoint_addr).await {
+                    Ok(ep) => {
+                        endpoint = ep;
+                        endpoint.clock_sync_bootstrap().await.ok();
+                        if let Err(e) = endpoint
+                            .send_message(&oaat_core::Message::FormatPropose(
+                                oaat_core::message::FormatPropose {
+                                    stream_id: contrat.stream_id.clone(),
+                                    format: contrat.format,
+                                    sample_rate: contrat.sample_rate,
+                                    channels: contrat.channels,
+                                    channel_layout: contrat.channel_layout,
+                                    bits_per_sample: contrat.bits_per_sample as u8,
+                                    dsd_rate: contrat.dsd_rate,
+                                },
+                            ))
                             .await
-                            {
-                                Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => {
-                                    info!(device = %device_name, "oaat: format accepted after reconnect");
-                                }
-                                _ => {
-                                    error!(device = %device_name, "oaat: format negotiation failed after reconnect");
-                                    playing.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(device = %device_name, error = %e, "oaat: reconnect failed");
+                        {
+                            error!(device = %device_name, error = %e, "oaat: reconnect format propose failed");
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
+                        verdict = attendre_accord_format(
+                            &mut endpoint,
+                            &device_name,
+                            &contrat,
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        error!(device = %device_name, error = %e, "oaat: reconnect failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
                     }
                 }
-                Err(_) => {
-                    error!(device = %device_name, "oaat: format negotiation timed out");
-                    playing.store(false, Ordering::SeqCst);
-                    return;
-                }
+            }
+
+            if let Err(refus) = verdict {
+                signaler_refus_negociation(&refus_negociation, &refus);
+                playing.store(false, Ordering::SeqCst);
+                return;
             }
 
             // Metadata + Play
@@ -1994,7 +1952,14 @@ impl OutputTarget for OaatOutput {
                             if last > 0 && now.saturating_sub(last) > 10_000 {
                                 warn!(device = %device_name, stale_ms = now - last, "oaat: watchdog — stall detected, attempting reconnect");
                                 diag.reconnects.fetch_add(1, Ordering::Relaxed);
-                                match connect_and_setup(&config, endpoint_addr, &device_name, &stream_id, &cur_stream_info).await {
+                                match connect_and_setup(
+                                    &config,
+                                    endpoint_addr,
+                                    &device_name,
+                                    &stream_id,
+                                    &cur_stream_info,
+                                    &refus_negociation,
+                                ).await {
                                     Some(new_ep) => {
                                         endpoint = new_ep;
                                         diag.connected.store(true, Ordering::SeqCst);
@@ -2281,18 +2246,20 @@ impl OutputTarget for OaatOutput {
                                             bits_per_sample: next.info.bits_per_sample,
                                             dsd_rate: None,
                                         };
-                                        let recue = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.response_rx.recv()).await;
-                                        let verdict = match &recue {
-                                            Ok(Some(reponse)) => juger_reponse(&contrat, ReponseNegociation::Recue(reponse)),
-                                            Ok(None) => juger_reponse(&contrat, ReponseNegociation::Fermee),
-                                            Err(_) => juger_reponse(&contrat, ReponseNegociation::Timeout),
-                                        };
-                                        if let Err(refus) = verdict {
+                                        if let Err(refus) = attendre_accord_format(
+                                            &mut endpoint,
+                                            &device_name,
+                                            &contrat,
+                                            std::time::Duration::from_secs(5),
+                                        )
+                                        .await
+                                        {
                                             error!(
                                                 device = %device_name,
                                                 raison = %refus.raison,
                                                 "oaat: contre-proposition non honorable en gapless, fin de chaine"
                                             );
+                                            signaler_refus_negociation(&refus_negociation, &refus);
                                             break;
                                         }
                                         cur_format = next.info.format;
@@ -2391,7 +2358,14 @@ impl OutputTarget for OaatOutput {
                                     restored.extend_from_slice(&buf);
                                     buf = restored;
 
-                                    match connect_and_setup(&config, endpoint_addr, &device_name, &stream_id, &cur_stream_info).await {
+                                    match connect_and_setup(
+                                        &config,
+                                        endpoint_addr,
+                                        &device_name,
+                                        &stream_id,
+                                        &cur_stream_info,
+                                        &refus_negociation,
+                                    ).await {
                                         Some(new_ep) => {
                                             endpoint = new_ep;
                                             info!(device = %device_name, "oaat: reconnected, resuming stream");
@@ -2807,6 +2781,10 @@ pub(crate) enum ReponseNegociation<'a> {
 pub(crate) struct RefusNegociation {
     pub stream_id: String,
     pub raison: String,
+    /// Une fermeture du canal de réponse peut être réparée par une nouvelle
+    /// connexion. Un refus explicite, une contre-proposition incompatible ou
+    /// une réponse étrangère ne doivent jamais être rejoués aveuglément.
+    pub reconnectable: bool,
 }
 
 impl std::fmt::Display for RefusNegociation {
@@ -2827,10 +2805,11 @@ pub(crate) fn juger_reponse(
     contrat: &ContratPropose,
     reponse: ReponseNegociation<'_>,
 ) -> Result<(), RefusNegociation> {
-    let refus = |raison: String| {
+    let refus = |raison: String, reconnectable: bool| {
         Err(RefusNegociation {
             stream_id: contrat.stream_id.clone(),
             raison,
+            reconnectable,
         })
     };
     let flux_etranger = |recu: &str| {
@@ -2842,40 +2821,48 @@ pub(crate) fn juger_reponse(
     };
 
     match reponse {
-        ReponseNegociation::Timeout => {
-            refus("aucune reponse a la proposition de format (delai depasse)".into())
-        }
-        ReponseNegociation::Fermee => refus("endpoint ferme pendant la negociation".into()),
+        ReponseNegociation::Timeout => refus(
+            "aucune reponse a la proposition de format (delai depasse)".into(),
+            false,
+        ),
+        ReponseNegociation::Fermee => refus("endpoint ferme pendant la negociation".into(), true),
         ReponseNegociation::Recue(recue) => match recue {
             oaat_controller::EndpointResponse::FormatAccept(fa) => {
                 if fa.stream_id != contrat.stream_id {
-                    refus(flux_etranger(&fa.stream_id))
+                    refus(flux_etranger(&fa.stream_id), false)
                 } else {
                     Ok(())
                 }
             }
             oaat_controller::EndpointResponse::FormatCounter(fc) => {
                 if fc.stream_id != contrat.stream_id {
-                    refus(flux_etranger(&fc.stream_id))
+                    refus(flux_etranger(&fc.stream_id), false)
                 } else if let Some(ecart) = contrat.premier_ecart(fc) {
-                    refus(format!(
-                        "l'endpoint demande un autre format et Tune ne sait pas \
+                    refus(
+                        format!(
+                            "l'endpoint demande un autre format et Tune ne sait pas \
                          convertir le flux en cours : {ecart}"
-                    ))
+                        ),
+                        false,
+                    )
                 } else {
                     Ok(())
                 }
             }
             oaat_controller::EndpointResponse::FormatReject(fr) => {
                 if fr.stream_id != contrat.stream_id {
-                    refus(flux_etranger(&fr.stream_id))
+                    refus(flux_etranger(&fr.stream_id), false)
                 } else {
-                    refus(format!("format refuse par l'endpoint : {}", fr.reason))
+                    refus(
+                        format!("format refuse par l'endpoint : {}", fr.reason),
+                        false,
+                    )
                 }
             }
-            autre => refus(format!(
-                "reponse inattendue pendant la negociation de format : {autre:?}"
-            )),
+            autre => refus(
+                format!("reponse inattendue pendant la negociation de format : {autre:?}"),
+                false,
+            ),
         },
     }
 }
