@@ -4060,29 +4060,57 @@ impl OutputTarget for LocalOutput {
             // Fin de piste : la queue du convolveur doit traverser la MEME
             // adaptation de canaux et le meme reechantillonnage que le reste,
             // sinon elle arriverait au mauvais format (#2209).
-            let queue = flush_local_dsp(
-                &convolver,
-                &crossfeed,
-                &pure_bypass,
-                channels,
-                dop_active.load(Ordering::Relaxed),
-            );
+            //
+            // MAIS pas avant une transition gapless : `Convolver::flush()`
+            // remet le moteur a zero, et une transition gapless est un flux
+            // CONTINU — vider et reinitialiser a cet endroit inserait la queue
+            // de la piste precedente a la frontiere et cassait la continuite
+            // que le gapless est cense preserver (#2296, JP Robbe). On draine
+            // seulement quand la chaine s'arrete vraiment.
+            let une_piste_suit = next_media_ref.lock().map(|m| m.is_some()).unwrap_or(false);
+            let queue = if une_piste_suit {
+                Vec::new()
+            } else {
+                flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    channels,
+                    dop_active.load(Ordering::Relaxed),
+                )
+            };
             if !queue.is_empty() {
                 let mut queue = queue;
                 if needs_channel_adapt {
                     queue = adapt_channels(&queue, channels, output_ch);
                 }
                 if needs_resample {
-                    queue = rubato_resample_chunk(
+                    // ⚠️ `rubato_resample_chunk` avec `flush = true` IGNORE son
+                    // argument `samples` : sa branche de vidage ne lit que
+                    // `resample_leftover`, ou rien. Lui passer la queue
+                    // directement la jetait purement et simplement — le
+                    // correctif cense restituer la fin de la convolution ne
+                    // produisait donc rien des que le chemin reechantillonnait
+                    // (#2295, JP Robbe).
+                    //
+                    // La queue est un bloc audio comme un autre : on la traite
+                    // en `flush = false`, PUIS on vide le retard propre du
+                    // resampler avec une tranche vide, et on concatene.
+                    let mut sortie = rubato_resample_chunk(
                         &mut resampler,
                         &queue,
                         output_ch,
-                        // `true` : c'est le dernier bloc, le resampler doit
-                        // vider son propre retard plutot que le garder pour un
-                        // appel qui ne viendra pas.
-                        true,
+                        false,
                         &mut resample_leftover,
                     );
+                    sortie.extend_from_slice(&rubato_resample_chunk(
+                        &mut resampler,
+                        &[],
+                        output_ch,
+                        true,
+                        &mut resample_leftover,
+                    ));
+                    queue = sortie;
                 }
                 feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
             }
@@ -4354,6 +4382,20 @@ impl OutputTarget for LocalOutput {
                     let aligned = (gapless_pcm.len() / frame_bytes) * frame_bytes;
                     if aligned > 0 {
                         let mut smp = pcm_bytes_to_f32(&gapless_pcm[..aligned], bit_depth);
+                        // Le DSP s'applique AUSSI aux pistes chainees. Sans ca,
+                        // seule la premiere piste d'un album passait par l'EQ,
+                        // la convolution et le crossfeed : toutes les suivantes
+                        // partaient seches (#2296, JP Robbe). Meme ordre que la
+                        // boucle principale : DSP, puis canaux, puis cadence.
+                        apply_local_dsp(
+                            &mut smp,
+                            &eq,
+                            &convolver,
+                            &crossfeed,
+                            &pure_bypass,
+                            channels,
+                            dop_active.load(Ordering::Relaxed),
+                        );
                         if needs_channel_adapt {
                             smp = adapt_channels(&smp, channels, output_ch);
                         }
@@ -4410,6 +4452,17 @@ impl OutputTarget for LocalOutput {
                             let mut smp = pcm_bytes_to_f32(&leftover[..aligned], bit_depth);
                             let rem = leftover[aligned..].to_vec();
                             leftover = rem;
+                            // Meme raison qu'au premier bloc : la piste chainee
+                            // doit traverser le DSP (#2296).
+                            apply_local_dsp(
+                                &mut smp,
+                                &eq,
+                                &convolver,
+                                &crossfeed,
+                                &pure_bypass,
+                                channels,
+                                dop_active.load(Ordering::Relaxed),
+                            );
                             if needs_channel_adapt {
                                 smp = adapt_channels(&smp, channels, output_ch);
                             }
