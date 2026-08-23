@@ -436,3 +436,99 @@ mod tests {
         assert!((matrix[11] - 1.0).abs() < 0.001); // ch1 -> out1
     }
 }
+
+/// Ramener un flux entrelacé à la stéréo, en entiers.
+///
+/// AirPlay négocie un payload RTP L16 **fixe** — 44,1 kHz, 16 bits, stéréo — et
+/// l'annonce dans sa session. Le décodeur, lui, rend la source telle quelle :
+/// `decode_to_pcm` ne remixe pas (#2230). Un fichier mono ou multicanal partait
+/// donc entrelacé comme s'il était stéréo, et l'appareil en tirait n'importe
+/// quoi (#2237).
+///
+/// Le repli 5.1/7.1 reprend les coefficients de `adapt_channels`
+/// (`outputs/local.rs`), son jumeau en f32. Deux implémentations du même mixage
+/// est précisément le genre de doublon que l'epic #2219 vise à supprimer ; en
+/// attendant, elles portent les mêmes constantes et ce commentaire les relie.
+pub fn to_stereo_i32(samples: &[i32], from_ch: u16) -> Vec<i32> {
+    if from_ch == 2 || from_ch == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let from = from_ch as usize;
+    if from == 1 {
+        // Mono : le même échantillon dans les deux oreilles.
+        return samples.iter().flat_map(|&s| [s, s]).collect();
+    }
+    let mut out = Vec::with_capacity(samples.len() / from * 2);
+    for frame in samples.chunks_exact(from) {
+        if from >= 6 {
+            // Repli ITU : centre et surrounds à -3 dB. En i64 pour que la somme
+            // de quatre canaux à pleine échelle ne déborde pas avant le clamp.
+            const K: f64 = 0.707;
+            let fl = frame[0] as f64;
+            let fr = frame[1] as f64;
+            let c = frame[2] as f64;
+            let sl = frame[4] as f64;
+            let sr = frame[5] as f64;
+            let (bl, br) = if from >= 8 {
+                (frame[6] as f64, frame[7] as f64)
+            } else {
+                (0.0, 0.0)
+            };
+            let l = fl + K * c + K * sl + K * bl;
+            let r = fr + K * c + K * sr + K * br;
+            let borne = |v: f64| v.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            out.push(borne(l));
+            out.push(borne(r));
+        } else {
+            // 3, 4 ou 5 canaux : garder la paire avant. Inventer un mixage sans
+            // connaître la disposition ferait pire que mieux.
+            out.push(frame[0]);
+            out.push(frame[1]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod stereo_i32_tests {
+    use super::to_stereo_i32;
+
+    #[test]
+    fn la_stereo_passe_telle_quelle() {
+        let s = [1, -1, 2, -2];
+        assert_eq!(to_stereo_i32(&s, 2), s.to_vec());
+    }
+
+    #[test]
+    fn le_mono_se_dedouble_au_lieu_de_se_faire_passer_pour_de_la_stereo() {
+        // La régression : un mono partait entrelacé comme du stéréo, donc une
+        // trame sur deux atterrissait dans la mauvaise oreille et la durée
+        // doublait.
+        assert_eq!(
+            to_stereo_i32(&[10, 20, 30], 1),
+            vec![10, 10, 20, 20, 30, 30]
+        );
+    }
+
+    #[test]
+    fn le_51_est_replie_et_ne_deborde_pas() {
+        // Une trame 5.1 à pleine échelle : la somme dépasse i32 avant le clamp.
+        let plein = i32::MAX;
+        let trame = [plein, plein, plein, 0, plein, plein];
+        let out = to_stereo_i32(&trame, 6);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], i32::MAX, "le repli doit borner, pas boucler");
+        assert_eq!(out[1], i32::MAX);
+    }
+
+    #[test]
+    fn un_51_modere_garde_les_proportions() {
+        let trame = [1000, 2000, 0, 0, 0, 0];
+        assert_eq!(to_stereo_i32(&trame, 6), vec![1000, 2000]);
+    }
+
+    #[test]
+    fn trois_a_cinq_canaux_gardent_la_paire_avant() {
+        assert_eq!(to_stereo_i32(&[7, 8, 9], 3), vec![7, 8]);
+    }
+}
