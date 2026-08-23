@@ -407,4 +407,98 @@ mod tests {
         let out = rubato_resample_batch(&input, 48000, 48000, 2);
         assert_eq!(input, out);
     }
+
+    /// Le contrat de `rubato_resample_chunk` : quand `flush` vaut `true`,
+    /// l'argument `samples` n'est JAMAIS lu.
+    ///
+    /// Ce n'est pas un detail d'implementation : la PR #2290 passait la queue
+    /// du convolveur directement en `flush = true`, et cette queue etait
+    /// silencieusement jetee. Le correctif cense restituer la fin de la
+    /// convolution ne produisait donc rien des que le chemin reechantillonnait
+    /// (#2295, JP Robbe).
+    ///
+    /// On compare la sequence de reference — bloc normal, puis vidage sur une
+    /// tranche vide — au raccourci fautif, avec et sans leftover, sur un
+    /// rapport non entier (44,1 → 48 kHz).
+    fn resampleur_44_vers_48(ch: usize) -> Option<Async<f32>> {
+        use rubato::{
+            FixedAsync, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+            calculate_cutoff,
+        };
+        let sinc_len = 64;
+        let window = WindowFunction::BlackmanHarris2;
+        let params = SincInterpolationParameters {
+            sinc_len,
+            f_cutoff: calculate_cutoff(sinc_len, window),
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window,
+        };
+        Some(
+            Async::<f32>::new_sinc(48000.0 / 44100.0, 1.1, &params, 1024, ch, FixedAsync::Input)
+                .unwrap(),
+        )
+    }
+
+    fn energie(v: &[f32]) -> f64 {
+        v.iter().map(|s| (*s as f64) * (*s as f64)).sum()
+    }
+
+    #[test]
+    fn le_vidage_du_resampleur_ignore_ses_echantillons() {
+        const CH: usize = 2;
+        // Une queue FRANCHE : 900 trames a pleine amplitude. Si elle traverse,
+        // son energie est visible ; si elle est jetee, il ne reste rien.
+        let queue: Vec<f32> = (0..900 * CH)
+            .map(|i| (i as f32 * 0.01).sin() * 0.5)
+            .collect();
+
+        for avec_leftover in [false, true] {
+            let mut ref_r = resampleur_44_vers_48(CH);
+            let mut ref_lo: Vec<f32> = Vec::new();
+            let mut fautif_r = resampleur_44_vers_48(CH);
+            let mut fautif_lo: Vec<f32> = Vec::new();
+
+            if avec_leftover {
+                // 300 trames < bloc de 1024 : elles partent entierement en
+                // leftover, des deux cotes, a l'identique. Amplitude minuscule
+                // pour qu'elles ne puissent pas masquer la queue.
+                let amorce: Vec<f32> = (0..300 * CH)
+                    .map(|i| (i as f32 * 0.02).sin() * 1e-4)
+                    .collect();
+                rubato_resample_chunk(&mut ref_r, &amorce, CH as u16, false, &mut ref_lo);
+                rubato_resample_chunk(&mut fautif_r, &amorce, CH as u16, false, &mut fautif_lo);
+                assert_eq!(ref_lo.len(), fautif_lo.len(), "amorce dissymetrique");
+                assert!(!ref_lo.is_empty(), "l'amorce devait laisser un leftover");
+            }
+
+            // Reference : la queue est un bloc audio comme un autre, PUIS on
+            // vide le retard propre du resampleur sur une tranche vide.
+            let mut reference =
+                rubato_resample_chunk(&mut ref_r, &queue, CH as u16, false, &mut ref_lo);
+            reference.extend_from_slice(&rubato_resample_chunk(
+                &mut ref_r,
+                &[],
+                CH as u16,
+                true,
+                &mut ref_lo,
+            ));
+
+            // Chemin #2290 : la queue passee directement avec flush = true.
+            let fautif =
+                rubato_resample_chunk(&mut fautif_r, &queue, CH as u16, true, &mut fautif_lo);
+
+            assert!(
+                energie(&reference) > energie(&fautif) * 100.0,
+                "avec_leftover={avec_leftover} : la queue du convolveur doit \
+                 atteindre la sortie. Reference {:.6e} contre {:.6e} pour le \
+                 chemin qui la passe en flush — elle est jetee (#2295)",
+                energie(&reference),
+                energie(&fautif)
+            );
+            for s in reference.iter() {
+                assert!(s.is_finite(), "sortie non finie");
+            }
+        }
+    }
 }
