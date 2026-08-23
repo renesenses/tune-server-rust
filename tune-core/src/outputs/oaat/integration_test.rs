@@ -1425,4 +1425,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// La regression #2239 : une contre-proposition etait ADOPTEE — `cur_format`,
+    /// `cur_bits`, `cur_sample_rate`, `bytes_per_frame` et `packet_size` etaient
+    /// reecrits — sans qu'aucune conversion ne touche au payload. Les memes
+    /// octets partaient avec une etiquette qui ne les decrivait plus.
+    #[test]
+    fn une_contre_proposition_qui_differe_nest_pas_honorable() {
+        use crate::outputs::oaat::output::contre_proposition_honorable;
+        use oaat_core::format::AudioFormat;
+
+        let source = (AudioFormat::PcmS24le, 96_000u32, 24u16);
+
+        // Identique : il n'y a rien a faire, on peut continuer.
+        assert!(contre_proposition_honorable(source, source));
+
+        // L'exemple du ticket : 24/96 contre-propose en 16/48.
+        assert!(!contre_proposition_honorable(
+            source,
+            (AudioFormat::PcmS16le, 48_000, 16)
+        ));
+        // Profondeur seule : le payload reste du 24 bits, il faudrait convertir.
+        assert!(!contre_proposition_honorable(
+            source,
+            (AudioFormat::PcmS24le, 96_000, 16)
+        ));
+        // Cadence seule : il faudrait reechantillonner.
+        assert!(!contre_proposition_honorable(
+            source,
+            (AudioFormat::PcmS24le, 48_000, 24)
+        ));
+        // Codec : FLAC contre-propose en PCM, ou l'inverse.
+        assert!(!contre_proposition_honorable(
+            (AudioFormat::Flac, 44_100, 16),
+            (AudioFormat::PcmS16le, 44_100, 16)
+        ));
+    }
 }
