@@ -1425,4 +1425,165 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// La regression #2239 : une contre-proposition etait ADOPTEE sans qu'aucune
+    /// conversion ne touche au payload.
+    ///
+    /// Et #2283 : mon premier predicat ne comparait que codec/cadence/bits, si
+    /// bien qu'une contre-proposition MONO face a une proposition stereo passait
+    /// pour identique (JP Robbe).
+    #[test]
+    fn une_contre_proposition_qui_differe_nest_pas_honorable() {
+        use crate::outputs::oaat::output::contre_proposition_honorable;
+        use oaat_core::format::{AudioFormat, ChannelLayout};
+        use oaat_core::message::FormatCounter;
+
+        let contre = |format, rate, ch, layout, bits, dsd| FormatCounter {
+            stream_id: "s".into(),
+            format,
+            sample_rate: rate,
+            channels: ch,
+            channel_layout: layout,
+            bits_per_sample: bits,
+            dsd_rate: dsd,
+        };
+
+        // Identique en TOUT point : il n'y a rien a faire.
+        assert!(contre_proposition_honorable(
+            AudioFormat::PcmS24le,
+            96_000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+            &contre(
+                AudioFormat::PcmS24le,
+                96_000,
+                2,
+                ChannelLayout::Stereo,
+                24,
+                None
+            )
+        ));
+
+        // LA contre-epreuve de JP : mono contre stereo, tout le reste egal.
+        assert!(
+            !contre_proposition_honorable(
+                AudioFormat::PcmS24le,
+                96_000,
+                2,
+                ChannelLayout::Stereo,
+                24,
+                &contre(
+                    AudioFormat::PcmS24le,
+                    96_000,
+                    1,
+                    ChannelLayout::Mono,
+                    24,
+                    None
+                )
+            ),
+            "une contre-proposition mono ne doit pas accepter un payload stereo"
+        );
+
+        // Layout seul : meme nombre de canaux, disposition differente.
+        assert!(!contre_proposition_honorable(
+            AudioFormat::PcmS24le,
+            96_000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+            &contre(
+                AudioFormat::PcmS24le,
+                96_000,
+                2,
+                ChannelLayout::Mono,
+                24,
+                None
+            )
+        ));
+
+        // L'exemple du ticket #2239 : 24/96 contre-propose en 16/48.
+        assert!(!contre_proposition_honorable(
+            AudioFormat::PcmS24le,
+            96_000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+            &contre(
+                AudioFormat::PcmS16le,
+                48_000,
+                2,
+                ChannelLayout::Stereo,
+                16,
+                None
+            )
+        ));
+
+        // Profondeur seule, puis cadence seule.
+        assert!(!contre_proposition_honorable(
+            AudioFormat::PcmS24le,
+            96_000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+            &contre(
+                AudioFormat::PcmS24le,
+                96_000,
+                2,
+                ChannelLayout::Stereo,
+                16,
+                None
+            )
+        ));
+        assert!(!contre_proposition_honorable(
+            AudioFormat::PcmS24le,
+            96_000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+            &contre(
+                AudioFormat::PcmS24le,
+                48_000,
+                2,
+                ChannelLayout::Stereo,
+                24,
+                None
+            )
+        ));
+
+        // Codec.
+        assert!(!contre_proposition_honorable(
+            AudioFormat::Flac,
+            44_100,
+            2,
+            ChannelLayout::Stereo,
+            16,
+            &contre(
+                AudioFormat::PcmS16le,
+                44_100,
+                2,
+                ChannelLayout::Stereo,
+                16,
+                None
+            )
+        ));
+
+        // `dsd_rate` pose alors que `propose_format` n'en envoie pas : c'est une
+        // contrainte de plus, que ce chemin n'honore pas.
+        assert!(!contre_proposition_honorable(
+            AudioFormat::PcmS24le,
+            96_000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+            &contre(
+                AudioFormat::PcmS24le,
+                96_000,
+                2,
+                ChannelLayout::Stereo,
+                24,
+                Some(64)
+            )
+        ));
+    }
 }

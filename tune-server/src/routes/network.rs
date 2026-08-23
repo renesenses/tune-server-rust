@@ -539,6 +539,46 @@ async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, A
 }
 
 /// Mount an SMB share: execute the OS mount command, then persist in the database.
+
+/// Traduire l'échec de création du point de montage en un obstacle NOMMÉ.
+///
+/// Le message rendu était `failed to create mount dir: Permission denied
+/// (os error 13)`. Exact, et inutile : il ne dit pas ce qui manque, et surtout
+/// pas que **le montage lui-même** demandera le même privilège juste après —
+/// de sorte que créer le dossier à la main ne débloquerait rien.
+///
+/// Vécu le 2026-08-21 par Dominique Comet, dont le serveur tourne depuis son
+/// répertoire personnel et non sous `root` : trois échecs identiques dans ses
+/// journaux, un 500 à l'écran, et la conclusion naturelle — mais fausse — que
+/// son partage SMB ou son NAS étaient en cause. La découverte avait pourtant
+/// réussi juste avant (`shares=1`).
+///
+/// On sépare donc le refus de privilège du reste : c'est le seul cas où
+/// l'utilisateur peut agir, et l'action n'est pas celle qu'il croit.
+fn obstacle_de_montage(e: &std::io::Error, chemin: &str) -> (&'static str, String) {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => (
+            "privileges_insuffisants",
+            format!(
+                "Le serveur n'a pas les droits de créer le point de montage {chemin}. \
+                 Monter un partage SMB demande des privilèges système (root, ou la \
+                 capacité CAP_SYS_ADMIN) : créer ce dossier à la main ne suffira pas, \
+                 car le montage lui-même les redemandera. Deux issues : donner ces \
+                 privilèges au service, ou monter le partage par le système \
+                 (/etc/fstab) et déclarer le dossier obtenu dans les dossiers de musique."
+            ),
+        ),
+        std::io::ErrorKind::NotFound => (
+            "chemin_parent_absent",
+            format!("Le dossier parent de {chemin} n'existe pas."),
+        ),
+        _ => (
+            "creation_impossible",
+            format!("Impossible de créer le point de montage {chemin} : {e}"),
+        ),
+    }
+}
+
 async fn mount_smb_share(
     State(state): State<AppState>,
     Json(body): Json<MountRequest>,
@@ -579,9 +619,17 @@ async fn mount_smb_share(
         // web n'affichait que le statut, donc la cause n'existait nulle part
         // (#1847).
         warn!(host = %body.host, path = %mount_path, error = %e, "smb_mount_dir_failed");
+        let (motif, message) = obstacle_de_montage(&e, &mount_path);
+        // `message` porte le TEXTE, `error` porte le CODE — et cet ordre n'est
+        // pas decoratif : `apiError()` du client lit `detail` ou `message` pour
+        // ce qu'il affiche, et range `error` dans un code machine. La reponse
+        // d'avant mettait sa phrase dans `error` : elle n'etait donc affichee
+        // NULLE PART, et l'utilisateur ne voyait que « 500 Internal Server
+        // Error ». C'est ce qui a laisse Dominique Comet sans autre indice que
+        // ses journaux.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to create mount dir: {e}") })),
+            Json(json!({ "message": message, "error": motif })),
         )
             .into_response();
     }
@@ -1270,7 +1318,9 @@ async fn get_share_detail(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_didl_browse_response, parse_res_elements, select_best_res};
+    use super::{
+        obstacle_de_montage, parse_didl_browse_response, parse_res_elements, select_best_res,
+    };
 
     /// Build a SOAP Browse response whose escaped DIDL contains one item with
     /// the given raw `<res>` elements (LMS-style).
@@ -1397,5 +1447,79 @@ mod tests {
         let resources = parse_res_elements(element);
         let best = select_best_res(&resources).unwrap();
         assert!(best.url.ends_with("track.mp3"));
+    }
+
+    // --- Nommer l'obstacle, au lieu de rendre un errno (#1515 voisin) ---
+
+    fn err(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::new(kind, "essai")
+    }
+
+    /// Le cas de Dominique Comet : serveur lance depuis son repertoire
+    /// personnel, /mnt appartient a root. Le message rendu etait « failed to
+    /// create mount dir: Permission denied (os error 13) » — exact, et
+    /// inutile : il ne dit pas ce qui manque, et surtout pas que le MONTAGE
+    /// redemandera le meme privilege juste apres.
+    #[test]
+    fn un_refus_de_privilege_est_nomme_comme_tel() {
+        let (motif, msg) = obstacle_de_montage(
+            &err(std::io::ErrorKind::PermissionDenied),
+            "/mnt/192.168.1.146_Music",
+        );
+        assert_eq!(motif, "privileges_insuffisants");
+        assert!(msg.contains("/mnt/192.168.1.146_Music"), "{msg}");
+        // Le point qui a coute une soiree a Dominique : creer le dossier a la
+        // main ne suffit pas. Le message doit le dire, sinon il essaiera.
+        assert!(
+            msg.contains("ne suffira pas"),
+            "le message doit prevenir que creer le dossier ne debloque rien : {msg}"
+        );
+        assert!(
+            msg.contains("CAP_SYS_ADMIN") || msg.contains("root"),
+            "{msg}"
+        );
+        // Et il doit offrir la sortie, pas seulement le constat.
+        assert!(
+            msg.contains("fstab"),
+            "la solution non privilegiee manque : {msg}"
+        );
+    }
+
+    #[test]
+    fn les_autres_echecs_gardent_leur_cause_exacte() {
+        // On ne noie pas tout dans « privileges » : un parent absent est un
+        // probleme different, avec une reparation differente.
+        let (motif, msg) = obstacle_de_montage(&err(std::io::ErrorKind::NotFound), "/x/y");
+        assert_eq!(motif, "chemin_parent_absent");
+        assert!(msg.contains("/x/y"), "{msg}");
+        assert!(
+            !msg.contains("CAP_SYS_ADMIN"),
+            "pas de conseil hors sujet : {msg}"
+        );
+
+        let (motif, msg) = obstacle_de_montage(&err(std::io::ErrorKind::AlreadyExists), "/x/y");
+        assert_eq!(motif, "creation_impossible");
+        // Le cas inconnu garde l'erreur systeme : mieux vaut un message brut
+        // qu'un message faux.
+        assert!(
+            msg.contains("essai"),
+            "l'erreur d'origine doit survivre : {msg}"
+        );
+    }
+
+    #[test]
+    fn chaque_motif_est_distinct() {
+        // Trois motifs, trois codes : le client peut les traduire, et un
+        // journal les distingue. Les confondre ramenerait au message unique.
+        let m: Vec<&str> = [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+        ]
+        .iter()
+        .map(|k| obstacle_de_montage(&err(*k), "/x").0)
+        .collect();
+        let uniques: std::collections::HashSet<&&str> = m.iter().collect();
+        assert_eq!(uniques.len(), 3, "{m:?}");
     }
 }
