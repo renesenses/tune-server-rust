@@ -218,6 +218,38 @@ pub fn spawn_ssdp_handler(
     });
 }
 
+/// Charge utile de `zone.created`, dans la forme que le client attend.
+///
+/// La route API emet `{ "id", "zone": <la zone entiere> }` et le client teste
+/// explicitement `data.zone` avant de fusionner la zone dans son magasin. Les
+/// trois emetteurs de la decouverte publiaient a plat — `zone_id`, `name`,
+/// `device_id`, `type` — donc sans cle `zone` : la condition etait fausse,
+/// l'evenement ignore en silence, et une zone decouverte n'apparaissait qu'au
+/// rechargement de la page (#2224). Une zone creee a la main, elle, apparaissait
+/// tout de suite : deux formes pour un meme evenement.
+///
+/// On AJOUTE `id` et `zone` sans retirer les champs plats. D'autres
+/// consommateurs lisent cet evenement — plugins abonnes, passerelle
+/// `developer_api` — et n'ont pas a etre migres pour que l'interface se repare.
+/// Un evenement qui satisfait les deux formes ne casse personne.
+fn charge_utile_zone_creee(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    zone_id: i64,
+    mut plat: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(obj) = plat.as_object_mut() {
+        obj.insert("id".into(), serde_json::json!(zone_id));
+        // Si la relecture echoue, on emet la forme plate seule plutot que rien :
+        // l'ancien comportement, jamais pire.
+        if let Ok(Some(zone)) = zone_repo.get(zone_id) {
+            if let Ok(v) = serde_json::to_value(&zone) {
+                obj.insert("zone".into(), v);
+            }
+        }
+    }
+    plat
+}
+
 /// Reconnaître une annonce SSDP émise par CE serveur.
 ///
 /// Tune publie chaque zone qui l'a demandé comme un MediaRenderer UPnP, sous
@@ -560,12 +592,16 @@ async fn handle_ssdp_discovered(
                 let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
-                    serde_json::json!({
-                        "zone_id": zid,
-                        "name": zone_name,
-                        "device_id": dev.id,
-                        "type": type_str,
-                    }),
+                    charge_utile_zone_creee(
+                        &zone_repo,
+                        zid,
+                        serde_json::json!({
+                            "zone_id": zid,
+                            "name": zone_name,
+                            "device_id": dev.id,
+                            "type": type_str,
+                        }),
+                    ),
                 );
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "ssdp_zone_auto_created");
             }
@@ -1085,12 +1121,16 @@ pub fn spawn_mdns_handler(
                                                         );
                                                         event_bus.emit_typed(
                                                             EventType::ZoneCreated,
-                                                            serde_json::json!({
-                                                                "zone_id": zid,
-                                                                "name": dev.name,
-                                                                "device_id": dev.id,
-                                                                "type": output_type_str,
-                                                            }),
+                                                            charge_utile_zone_creee(
+                                                                &zone_repo,
+                                                                zid,
+                                                                serde_json::json!({
+                                                                    "zone_id": zid,
+                                                                    "name": dev.name,
+                                                                    "device_id": dev.id,
+                                                                    "type": output_type_str,
+                                                                }),
+                                                            ),
                                                         );
                                                         info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                                                     }
@@ -1458,10 +1498,14 @@ pub fn spawn_output_providers(
                                     Ok((zid, true)) => {
                                         event_bus.emit_typed(
                                             EventType::ZoneCreated,
-                                            serde_json::json!({
-                                                "zone_id": zid,
-                                                "name": name,
-                                            }),
+                                            charge_utile_zone_creee(
+                                                &zone_repo,
+                                                zid,
+                                                serde_json::json!({
+                                                    "zone_id": zid,
+                                                    "name": name,
+                                                }),
+                                            ),
                                         );
                                         set_zone_online(&event_bus, &db, &dev_id, true);
                                         info!(name = %name, id = %dev_id, zone_id = zid, "provider_zone_created");
@@ -1678,6 +1722,81 @@ mod tests {
     }
 
     // ── Un appareil physique = une LOCATION (#1703) ───────────────────────
+
+    // --- zone.created : une seule forme pour deux emetteurs ---
+
+    mod forme_de_zone_creee {
+        use super::super::charge_utile_zone_creee;
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::zone_repo::ZoneRepo;
+
+        fn base() -> Arc<dyn DbBackend> {
+            let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            tune_core::db::migrations::run_migrations(&db).unwrap();
+            Arc::new(db)
+        }
+
+        /// La regression : le client teste `data.zone` avant de fusionner. Les
+        /// trois emetteurs de la decouverte publiaient a plat, sans cette cle —
+        /// la condition etait fausse et la zone n'apparaissait qu'au
+        /// rechargement de la page (#2224).
+        #[test]
+        fn la_decouverte_porte_la_zone_entiere_comme_la_route_api() {
+            let db = base();
+            let repo = ZoneRepo::with_backend(db.clone());
+            let (zid, cree) = repo
+                .get_or_create("Salon", Some("dlna"), "uuid:abcd")
+                .expect("creation de zone");
+            assert!(cree, "la zone doit etre neuve pour que le test ait un sens");
+
+            let charge = charge_utile_zone_creee(
+                &repo,
+                zid,
+                serde_json::json!({
+                    "zone_id": zid,
+                    "name": "Salon",
+                    "device_id": "uuid:abcd",
+                    "type": "dlna",
+                }),
+            );
+
+            // Ce que le client attend, et qui manquait.
+            let zone = charge
+                .get("zone")
+                .expect("sans la cle `zone`, le client ignore l'evenement");
+            assert_eq!(zone.get("id").and_then(|v| v.as_i64()), Some(zid));
+            assert_eq!(charge.get("id").and_then(|v| v.as_i64()), Some(zid));
+
+            // Et ce que les autres consommateurs lisaient deja : rien n'est retire.
+            assert_eq!(
+                charge.get("zone_id").and_then(|v| v.as_i64()),
+                Some(zid),
+                "les champs plats restent : plugins et developer_api les lisent"
+            );
+            assert_eq!(
+                charge.get("device_id").and_then(|v| v.as_str()),
+                Some("uuid:abcd")
+            );
+        }
+
+        /// Si la relecture echoue, on emet la forme plate seule plutot que
+        /// rien : l'ancien comportement, jamais pire.
+        #[test]
+        fn une_zone_introuvable_ne_fait_pas_perdre_l_evenement() {
+            let db = base();
+            let repo = ZoneRepo::with_backend(db.clone());
+            let charge = charge_utile_zone_creee(
+                &repo,
+                4242,
+                serde_json::json!({ "zone_id": 4242, "name": "Fantome" }),
+            );
+            assert!(charge.get("zone").is_none());
+            assert_eq!(charge.get("zone_id").and_then(|v| v.as_i64()), Some(4242));
+            assert_eq!(charge.get("id").and_then(|v| v.as_i64()), Some(4242));
+        }
+    }
 
     mod known_renderers_par_location {
         use super::super::{KnownRenderer, dedup_renderers_by_location, persist_known_renderer};

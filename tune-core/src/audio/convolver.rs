@@ -1,5 +1,6 @@
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Partitioned overlap-save FFT convolver for real-time FIR filtering.
@@ -20,6 +21,20 @@ pub struct Convolver {
     fdl_pos: usize,
     /// Overlap buffer per channel (tail from previous block).
     overlap: Vec<Vec<f32>>,
+    /// File de sortie par canal, amorcée de `block_size` zéros.
+    ///
+    /// Une convolution par blocs ne peut pas rendre un échantillon avant
+    /// d'avoir vu le bloc qui le contient : elle a une latence, et c'est
+    /// `block_size`. L'ancien code la niait — il réécrivait le bloc traité
+    /// À REBOURS dans le tampon d'entrée, ce qui suppose que le bloc s'y
+    /// trouve en entier. Dès qu'un bloc partiel était reporté d'un appel au
+    /// suivant, `frame + 1 - block_size` sous-débordait (#2209).
+    ///
+    /// Avec une file amorcée, chaque trame entrée rend une trame sortie, et le
+    /// résultat ne dépend plus du découpage des appels.
+    output_buf: Vec<VecDeque<f32>>,
+    /// Tampon de travail d'un bloc, réutilisé — il était alloué à chaque bloc.
+    scratch: Vec<Vec<f32>>,
     fwd: Arc<dyn RealToComplex<f32>>,
     inv: Arc<dyn ComplexToReal<f32>>,
 }
@@ -62,6 +77,9 @@ impl Convolver {
 
         let input_buf = vec![Vec::with_capacity(block_size); channels];
         let overlap = vec![vec![0.0f32; fft_size - block_size]; channels];
+        // Amorçage : la latence de la convolution, rendue explicite.
+        let output_buf = vec![VecDeque::from(vec![0.0f32; block_size]); channels];
+        let scratch = vec![vec![0.0f32; block_size]; channels];
 
         Self {
             block_size,
@@ -72,6 +90,8 @@ impl Convolver {
             fdl,
             fdl_pos: 0,
             overlap,
+            output_buf,
+            scratch,
             fwd,
             inv,
         }
@@ -242,9 +262,25 @@ impl Convolver {
         Ok(Self::new(&adapted, block_size))
     }
 
+    /// Latence introduite par la convolution, en trames.
+    ///
+    /// Une convolution par blocs ne peut rien rendre avant d'avoir vu un bloc
+    /// entier. La déclarer permet aux appelants qui ont besoin d'un alignement
+    /// exact — `process_offline` — de la compenser.
+    pub fn latency_frames(&self) -> usize {
+        self.block_size
+    }
+
     /// Process interleaved f32 samples in-place.
+    ///
+    /// Le résultat ne dépend PAS du découpage des appels : nourrir 1024 trames
+    /// d'un coup, ou 100 puis 924, ou 1 par 1, rend exactement la même suite,
+    /// décalée de `latency_frames()`.
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
         let ch = self.channels;
+        if ch == 0 {
+            return;
+        }
         let frame_count = samples.len() / ch;
 
         for frame in 0..frame_count {
@@ -253,27 +289,31 @@ impl Convolver {
             }
 
             if self.input_buf[0].len() >= self.block_size {
-                let mut output = vec![vec![0.0f32; self.block_size]; ch];
-                self.process_block(&mut output);
-
-                let start_frame = frame + 1 - self.block_size;
-                for f in 0..self.block_size {
-                    for c in 0..ch {
-                        if start_frame + f < frame_count {
-                            samples[(start_frame + f) * ch + c] = output[c][f];
-                        }
-                    }
-                }
+                let mut sortie = std::mem::take(&mut self.scratch);
+                self.process_block(&mut sortie);
                 for c in 0..ch {
+                    self.output_buf[c].extend(sortie[c].iter().copied());
                     self.input_buf[c].drain(..self.block_size);
                 }
+                self.scratch = sortie;
+            }
+
+            // Une trame entrée, une trame sortie. La file est amorcée, donc
+            // elle n'est jamais vide — le `unwrap_or` ne couvre qu'un canal
+            // dont l'IR aurait zéro partition.
+            for c in 0..ch {
+                samples[frame * ch + c] = self.output_buf[c].pop_front().unwrap_or(0.0);
             }
         }
     }
 
     fn process_block(&mut self, output: &mut [Vec<f32>]) {
         let spectrum_len = self.fft_size / 2 + 1;
-        let num_partitions = self.ir_partitions[0].len();
+        // La ligne à retard est dimensionnée sur le MAXIMUM de partitions parmi
+        // les canaux. Prendre `ir_partitions[0].len()` ignorait la fin d'une IR
+        // plus longue sur un autre canal — une IR stéréo aux deux canaux de
+        // longueurs différentes perdait sa queue (#2209).
+        let num_partitions = self.fdl[0].len();
 
         for ch in 0..self.channels {
             let mut padded = vec![0.0f32; self.fft_size];
@@ -339,7 +379,13 @@ impl Convolver {
             let pad = (self.block_size - rem) * ch;
             samples.extend(std::iter::repeat(0.0).take(pad));
         }
+        // Compenser la latence : `process_interleaved` rend la trame `i` à la
+        // position `i + latency`. On nourrit donc `latency` trames de silence
+        // en plus, et on jette autant de trames en tête.
+        let latence = self.latency_frames();
+        samples.extend(std::iter::repeat(0.0).take(latence * ch));
         self.process_interleaved(samples);
+        samples.drain(..latence * ch);
         samples.truncate(orig_len);
     }
 
@@ -476,17 +522,148 @@ pub fn fir_frequency_response(
 mod tests {
     use super::*;
 
+    /// Une convolution par blocs a une latence : elle ne peut rendre un
+    /// echantillon avant d'avoir vu le bloc qui le contient. Ce test lisait
+    /// autrefois la sortie DANS le meme appel, ce qui n'est vrai que si la
+    /// frontiere du bloc coincide avec celle de l'appel — l'hypothese meme qui
+    /// faisait sous-deborder l'ancien code (#2209). On nourrit donc la latence
+    /// et on lit decale.
+    /// Convolution directe de reference — la definition, sans FFT ni blocs.
+    fn convolution_directe(x: &[f32], h: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; x.len()];
+        for (n, yn) in y.iter_mut().enumerate() {
+            for (k, hk) in h.iter().enumerate() {
+                if n >= k {
+                    *yn += x[n - k] * hk;
+                }
+            }
+        }
+        y
+    }
+
+    /// Nourrit un convolveur neuf par lots de tailles donnees et rend la
+    /// sortie complete, latence comprise.
+    fn passer_par_lots(ir: &[Vec<f32>], block: usize, x: &[f32], lots: &[usize]) -> Vec<f32> {
+        let mut conv = Convolver::new(ir, block);
+        let mut entree = x.to_vec();
+        entree.extend(std::iter::repeat(0.0).take(conv.latency_frames()));
+        let mut sortie = Vec::with_capacity(entree.len());
+        let mut i = 0;
+        let mut t = 0;
+        while i < entree.len() {
+            let n = lots[t % lots.len()].min(entree.len() - i);
+            t += 1;
+            let mut morceau = entree[i..i + n].to_vec();
+            conv.process_interleaved(&mut morceau);
+            sortie.extend_from_slice(&morceau);
+            i += n;
+        }
+        sortie
+    }
+
+    /// LE test que ce correctif demandait. Le decoupage des appels ne doit rien
+    /// changer au resultat — c'est toute la difference entre un convolveur et
+    /// un convolveur qui suppose que ses blocs arrivent alignes.
+    ///
+    /// Le cas `[100, 924]` est celui du ticket : bloc 1024, un premier appel de
+    /// 100 trames, un second de 924. L'ancien code calculait
+    /// `frame + 1 - block_size` = `924 - 1024` sur des `usize`.
+    #[test]
+    fn le_decoupage_des_appels_ne_change_pas_le_resultat() {
+        let block = 1024;
+        let ir = vec![
+            (0..200)
+                .map(|k| 1.0 / (1.0 + k as f32))
+                .collect::<Vec<f32>>(),
+        ];
+        let x: Vec<f32> = (0..5000)
+            .map(|n| ((n as f32) * 0.037).sin() * 0.8)
+            .collect();
+
+        let reference = passer_par_lots(&ir, block, &x, &[block]);
+        for lots in [
+            vec![1usize],
+            vec![100, 924],
+            vec![1024],
+            vec![1500],
+            vec![7, 3, 991, 64, 1500, 1],
+        ] {
+            let obtenu = passer_par_lots(&ir, block, &x, &lots);
+            assert_eq!(obtenu.len(), reference.len(), "lots {lots:?}");
+            for (i, (o, r)) in obtenu.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (o - r).abs() < 1e-4,
+                    "lots {lots:?}, trame {i} : {o} au lieu de {r}"
+                );
+            }
+        }
+    }
+
+    /// Et le resultat doit etre LA convolution, pas seulement une valeur
+    /// stable : on compare a la definition directe.
+    #[test]
+    fn le_resultat_est_la_convolution_directe() {
+        let block = 64;
+        let h: Vec<f32> = (0..40)
+            .map(|k| ((k as f32) * 0.3).cos() / (1.0 + k as f32))
+            .collect();
+        let x: Vec<f32> = (0..1000).map(|n| ((n as f32) * 0.11).sin()).collect();
+
+        let attendu = convolution_directe(&x, &h);
+        let sortie = passer_par_lots(&[h.clone()], block, &x, &[37]);
+        let latence = block;
+        for (n, a) in attendu.iter().enumerate() {
+            let obtenu = sortie[latence + n];
+            assert!(
+                (obtenu - a).abs() < 1e-3,
+                "trame {n} : {obtenu} au lieu de {a}"
+            );
+        }
+    }
+
+    /// Une IR stereo dont les canaux n'ont pas la meme longueur : la queue du
+    /// canal le plus long etait ignoree, `process_block` bornant la boucle sur
+    /// le nombre de partitions du canal 0.
+    #[test]
+    fn la_queue_dune_ir_plus_longue_sur_lautre_canal_nest_pas_perdue() {
+        let block = 16;
+        let court = vec![1.0f32];
+        // Le canal droit porte une impulsion au-dela de la premiere partition.
+        let mut long = vec![0.0f32; 40];
+        long[0] = 1.0;
+        long[33] = 0.5;
+        let ir = vec![court, long];
+
+        let mut conv = Convolver::new(&ir, block);
+        let latence = conv.latency_frames();
+        let trames = 128;
+        let mut x = vec![0.0f32; trames * 2];
+        x[0] = 1.0; // impulsion a gauche
+        x[1] = 1.0; // impulsion a droite
+        x.extend(std::iter::repeat(0.0).take(latence * 2));
+        conv.process_interleaved(&mut x);
+
+        let droite = |n: usize| x[(latence + n) * 2 + 1];
+        assert!((droite(0) - 1.0).abs() < 1e-3, "premiere partition perdue");
+        assert!(
+            (droite(33) - 0.5).abs() < 1e-3,
+            "queue au-dela de la premiere partition perdue : {}",
+            droite(33)
+        );
+    }
+
     #[test]
     fn identity_ir() {
         let ir = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let mut conv = Convolver::new(&ir, 4);
-        let mut samples = vec![1.0, 0.5, 0.25, 0.125];
+        let latence = conv.latency_frames();
+        let attendu = [1.0f32, 0.5, 0.25, 0.125];
+        let mut samples = attendu.to_vec();
+        samples.extend(std::iter::repeat(0.0).take(latence));
         conv.process_interleaved(&mut samples);
-        for (i, &s) in samples.iter().enumerate() {
-            assert!(
-                (s - [1.0, 0.5, 0.25, 0.125][i]).abs() < 0.001,
-                "sample {i}: {s}"
-            );
+        for (i, &a) in attendu.iter().enumerate() {
+            let s = samples[latence + i];
+            assert!((s - a).abs() < 0.001, "sample {i}: {s}");
         }
     }
 
@@ -494,10 +671,12 @@ mod tests {
     fn stereo_ir() {
         let ir = vec![vec![1.0, 0.0]; 2];
         let mut conv = Convolver::new(&ir, 4);
+        let latence = conv.latency_frames();
         let mut samples = vec![1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+        samples.extend(std::iter::repeat(0.0).take(latence * 2));
         conv.process_interleaved(&mut samples);
-        assert!((samples[0] - 1.0).abs() < 0.01);
-        assert!((samples[1] - 0.5).abs() < 0.01);
+        assert!((samples[latence * 2] - 1.0).abs() < 0.01);
+        assert!((samples[latence * 2 + 1] - 0.5).abs() < 0.01);
     }
 
     #[test]
@@ -537,13 +716,14 @@ mod tests {
         let mut conv = Convolver::from_wav(path.to_str().unwrap(), 4).unwrap();
         std::fs::remove_file(&path).ok();
 
-        let mut samples = vec![1.0, 0.5, 0.25, 0.125];
+        let latence = conv.latency_frames();
+        let attendu = [1.0f32, 0.5, 0.25, 0.125];
+        let mut samples = attendu.to_vec();
+        samples.extend(std::iter::repeat(0.0).take(latence));
         conv.process_interleaved(&mut samples);
-        for (i, &s) in samples.iter().enumerate() {
-            assert!(
-                (s - [1.0, 0.5, 0.25, 0.125][i]).abs() < 0.01,
-                "sample {i}: {s}"
-            );
+        for (i, &a) in attendu.iter().enumerate() {
+            let s = samples[latence + i];
+            assert!((s - a).abs() < 0.01, "sample {i}: {s}");
         }
     }
 
