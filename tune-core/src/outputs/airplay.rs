@@ -534,9 +534,42 @@ async fn stream_to_airplay(
         return Err("decoded audio is empty".into());
     }
 
+    // La session annonce un payload RTP L16 FIXE — 44,1 kHz, 16 bits, stéréo —
+    // mais `decode_to_pcm` ne remixe ni ne rééchantillonne : il rend la source
+    // telle quelle et le dit honnêtement depuis #1498. Les cibles passées
+    // ci-dessus ne sont donc pas honorées (#2230), et sans adaptation ici un
+    // 48/96/192 kHz partait horodaté à 44,1 — vitesse et hauteur fausses — et
+    // un mono ou multicanal partait entrelacé comme du stéréo (#2237).
+    //
+    // On adapte donc explicitement, dans cet ordre : les canaux d'abord (moins
+    // de données à rééchantillonner), la cadence ensuite.
+    let mut echantillons = decoded.samples_i32;
+    if decoded.channels != CHANNELS as u32 {
+        info!(
+            de = decoded.channels,
+            vers = CHANNELS,
+            "airplay_downmix_vers_stereo"
+        );
+        echantillons =
+            crate::audio::channels::to_stereo_i32(&echantillons, decoded.channels as u16);
+    }
+    if decoded.sample_rate != SAMPLE_RATE {
+        info!(
+            de = decoded.sample_rate,
+            vers = SAMPLE_RATE,
+            "airplay_reechantillonnage"
+        );
+        echantillons = crate::audio::resample::resample_i32(
+            &echantillons,
+            decoded.bit_depth,
+            CHANNELS as u16,
+            decoded.sample_rate,
+            SAMPLE_RATE,
+        );
+    }
+
     // Convert i32 samples to i16, then to big-endian bytes for AirPlay RTP
-    let pcm_be: Vec<u8> = decoded
-        .samples_i32
+    let pcm_be: Vec<u8> = echantillons
         .iter()
         .flat_map(|&s| {
             let s16 = match decoded.bit_depth {
