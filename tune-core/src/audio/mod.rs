@@ -19,6 +19,7 @@ pub mod embedding;
 pub mod embedding_store;
 pub mod encoder;
 pub mod eq;
+pub mod eq_presets;
 pub mod faststart;
 pub mod formats;
 pub mod iso_sacd;
