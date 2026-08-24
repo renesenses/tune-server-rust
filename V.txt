@@ -1,9 +1,0 @@
-### FMT
-fmt=0
-### CLIPPY CI
-0
-### CLIPPY FFI
-3
-### TESTS
-(vide = 0 echec)
-### FIN
