@@ -237,6 +237,63 @@ pub(super) async fn artist_releases(
         }
     }
 
+    // 3 bis. Bandcamp, qui n'a pas de fil de nouveautes : ses parutions sont
+    //        DEPOSEES par la veille de fond, jamais cherchees ici. Lire un
+    //        reglage coute une requete SQL ; aller voir Bandcamp couterait un
+    //        appel reseau par artiste, sur une page qui se charge a chaque
+    //        ouverture.
+    #[cfg(feature = "bandcamp")]
+    for depot in crate::bandcamp_sweep::nouveautes_deposees(&state.backend) {
+        let Some(nom) = depot.get("artist_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let cle = nom_normalise(nom);
+        if est_un_fourre_tout(&cle) {
+            continue;
+        }
+        let parutions: Vec<Value> = depot
+            .get("parutions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "service": "bandcamp",
+                    "source_id": p.get("url"),
+                    "title": p.get("titre"),
+                    "cover_path": p.get("pochette"),
+                    // Bandcamp ne date pas sa discographie : annoncer une annee
+                    // serait l'inventer.
+                    "year": Value::Null,
+                })
+            })
+            .collect();
+        if parutions.is_empty() {
+            continue;
+        }
+
+        let aime = aimes.contains(&cle);
+        let albums_possedes = connus.get(&cle).map(|(_, n)| *n).unwrap_or(0);
+        match groupes
+            .iter_mut()
+            .find(|g| g["key"].as_str() == Some(cle.as_str()))
+        {
+            Some(g) => {
+                if let Some(arr) = g["releases"].as_array_mut() {
+                    arr.extend(parutions);
+                }
+            }
+            None => groupes.push(json!({
+                "key": cle,
+                "artist_name": nom,
+                "is_favorite": aime,
+                "library_albums": albums_possedes,
+                "releases": parutions,
+            })),
+        }
+    }
+
     // 4. Les favoris d'abord, puis ceux dont on possede le plus. Un artiste
     //    dont on a cinq albums merite d'etre annonce avant celui dont on a une
     //    compilation.
