@@ -10,6 +10,7 @@
 //!   `strm`, `audg`, `setd`, `serv`
 
 pub mod cli_server;
+pub mod discovery;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
