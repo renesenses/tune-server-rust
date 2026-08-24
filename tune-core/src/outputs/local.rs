@@ -2161,6 +2161,13 @@ impl OutputTarget for LocalOutput {
         title: Option<&str>,
         artist: Option<&str>,
     ) -> Result<(), String> {
+        // Chronomètre du « temps avant la première note » : play_url couvre
+        // TOUT ce que l'utilisateur perçoit comme le chargement — arrêt de la
+        // piste précédente, remise à zéro du DSP, ouverture du flux, décodage,
+        // pré-remplissage, ouverture du périphérique. `playback_timing` de
+        // l'orchestrateur s'arrête à l'envoi de l'ordre : il ne voyait rien de
+        // tout ça (chantier lenteurs, 24/08).
+        let chrono_demarrage = std::time::Instant::now();
         self.stop().await.ok();
 
         // Frontière de piste : le convolveur vit aussi longtemps que la sortie,
@@ -2581,6 +2588,8 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
                 info!(
+                    demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
+
                     device = %device_name,
                     prefill_samples = initial_written,
                     "local_audio_compressed_playing_after_prefill"
@@ -4131,6 +4140,8 @@ impl OutputTarget for LocalOutput {
                 }
                 stream_started = true;
                 info!(
+                    demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
+
                     device = %device_name,
                     prefill_samples = ring.available(),
                     "local_audio_playing_after_prefill"
@@ -4312,6 +4323,8 @@ impl OutputTarget for LocalOutput {
                     }
                     stream_started = true;
                     info!(
+                    demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
+
                         device = %device_name,
                         prefill_samples = ring.available(),
                         total_bytes_read,
