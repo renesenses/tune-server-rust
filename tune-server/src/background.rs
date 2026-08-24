@@ -38,7 +38,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_local_audio_rescan(state);
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
-    spawn_slimproto_server(state);
+    spawn_slimproto_server(state, config.port);
     spawn_social_sharing_listener(state);
     crate::routes::developer_api::spawn_webhook_dispatcher(state);
     #[cfg(feature = "oaat")]
@@ -1274,7 +1274,7 @@ fn gethostname() -> Option<String> {
         })
 }
 
-fn spawn_slimproto_server(state: &AppState) {
+fn spawn_slimproto_server(state: &AppState, port_http: u16) {
     let local_ip = tune_core::discovery::ssdp::get_local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -1302,6 +1302,16 @@ fn spawn_slimproto_server(state: &AppState) {
     tokio::spawn(tune_core::slimproto::cli_server::start_cli_server(
         cli_state,
     ));
+
+    // Le volet UDP du port 3483 : sans lui, une Squeezebox ou un squeezelite
+    // en decouverte automatique ne trouve jamais Tune — il fallait donner
+    // l'adresse a la main. Le TCP seul est une porte sans sonnette.
+    tune_core::slimproto::discovery::spawn(tune_core::slimproto::discovery::IdentiteServeur {
+        nom: "Tune".to_string(),
+        port_http,
+        port_cli: 9090,
+        version: tune_core::version().to_string(),
+    });
 }
 
 fn spawn_bio_sync(state: &AppState) {

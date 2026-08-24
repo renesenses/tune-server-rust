@@ -717,13 +717,7 @@ pub(super) async fn identify_track(
         .ok();
 
     if let Some(m) = best {
-        if m.score >= 0.8 && !m.title.is_empty() {
-            use tune_core::db::backend::ToSqlValue;
-            state.backend.execute(
-                "UPDATE tracks SET title = ?, musicbrainz_recording_id = ? WHERE id = ? AND (title LIKE 'Track %' OR title LIKE 'Unknown%')",
-                &[&m.title as &dyn ToSqlValue, &m.recording_id as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
-            ).ok();
-        }
+        enregistrer_identification_acoustique(&state.backend, track_id, m);
     }
 
     Json(json!({
@@ -966,6 +960,170 @@ pub(super) async fn track_metadata_put(
         resp["file_write_warning"] = json!(err);
     }
     Json(resp).into_response()
+}
+
+/// Ce qu'une reconnaissance acoustique a le droit d'ecrire.
+///
+/// Deux ecritures INDEPENDANTES, et c'est tout l'objet de cette fonction :
+///
+/// - le **titre** ne se remplace que s'il n'en est pas un (`Track 03`,
+///   `Unknown…`). AcoustID rend le titre canonique de l'enregistrement, qui
+///   n'est pas forcement celui que l'utilisateur a choisi ;
+/// - l'**identifiant d'enregistrement** n'a rien a voir avec le titre
+///   affiche. Il etait pourtant ecrit par la MEME requete, sous la meme garde :
+///   une piste correctement titree — l'immense majorite d'une bibliotheque —
+///   voyait donc son identifiant, obtenu a 0,8 de confiance, purement jete.
+///
+/// L'identifiant se REMPLIT, il ne s'ecrase pas : celui qui vient des tags du
+/// fichier (Picard) fait autorite sur une reconnaissance acoustique.
+///
+/// C'est la cle dont depend tout rapprochement par oeuvre (#2374), et sa
+/// couverture est le verrou du chantier d'identification.
+fn enregistrer_identification_acoustique(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    track_id: i64,
+    m: &tune_core::metadata::fingerprint::AcoustIdMatch,
+) {
+    use tune_core::db::backend::ToSqlValue;
+
+    /// En dessous, la reconnaissance n'engage rien : on ne touche a rien.
+    const CONFIANCE_MINIMALE: f64 = 0.8;
+    if m.score < CONFIANCE_MINIMALE {
+        return;
+    }
+
+    if !m.title.is_empty() {
+        backend
+            .execute(
+                "UPDATE tracks SET title = ? \
+                 WHERE id = ? AND (title LIKE 'Track %' OR title LIKE 'Unknown%')",
+                &[&m.title as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
+    }
+
+    if !m.recording_id.is_empty() {
+        backend
+            .execute(
+                "UPDATE tracks SET musicbrainz_recording_id = ? \
+                 WHERE id = ? AND (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '')",
+                &[&m.recording_id as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
+    }
+}
+
+#[cfg(test)]
+mod identification_acoustique_tests {
+    use super::enregistrer_identification_acoustique;
+    use std::sync::Arc;
+    use tune_core::db::backend::{DbBackend, ToSqlValue};
+    use tune_core::db::models::Track;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::track_repo::TrackRepo;
+    use tune_core::metadata::fingerprint::AcoustIdMatch;
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        Arc::new(db)
+    }
+
+    fn piste(backend: &Arc<dyn DbBackend>, titre: &str, mbid: Option<&str>) -> i64 {
+        let repo = TrackRepo::with_backend(backend.clone());
+        let mut t = Track::new(titre.into());
+        t.file_path = Some(format!("/music/{titre}.flac"));
+        t.musicbrainz_recording_id = mbid.map(|s| s.to_string());
+        repo.create(&t).unwrap()
+    }
+
+    fn lire(backend: &Arc<dyn DbBackend>, id: i64) -> (String, Option<String>) {
+        let rows = backend
+            .query_many(
+                "SELECT title, musicbrainz_recording_id FROM tracks WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let r = rows.first().expect("la piste doit exister");
+        (
+            r.first().and_then(|v| v.as_string()).unwrap_or_default(),
+            r.get(1)
+                .and_then(|v| v.as_string())
+                .filter(|s| !s.is_empty()),
+        )
+    }
+
+    fn reconnaissance(score: f64) -> AcoustIdMatch {
+        AcoustIdMatch {
+            recording_id: "6f2f9b9e-1111-2222-3333-444455556666".into(),
+            title: "So What".into(),
+            artist: "Miles Davis".into(),
+            score,
+        }
+    }
+
+    /// LA contre-epreuve de #2374.
+    ///
+    /// Une piste correctement titree — l'immense majorite d'une bibliotheque —
+    /// doit garder son titre ET recevoir son identifiant. L'ancien code
+    /// ecrivait les deux dans la meme requete, sous la garde du titre : cet
+    /// identifiant etait donc jete.
+    #[test]
+    fn une_piste_bien_titree_recoit_quand_meme_son_identifiant() {
+        let backend = base();
+        let id = piste(&backend, "So What (Take 2)", None);
+
+        enregistrer_identification_acoustique(&backend, id, &reconnaissance(0.93));
+
+        let (titre, mbid) = lire(&backend, id);
+        assert_eq!(
+            titre, "So What (Take 2)",
+            "le titre choisi par l'utilisateur ne doit pas etre remplace"
+        );
+        assert_eq!(
+            mbid.as_deref(),
+            Some("6f2f9b9e-1111-2222-3333-444455556666"),
+            "l'identifiant d'enregistrement etait jete des que le titre etait correct (#2374)"
+        );
+    }
+
+    /// Un identifiant venu des tags du fichier fait autorite : on remplit, on
+    /// n'ecrase pas.
+    #[test]
+    fn un_identifiant_deja_present_n_est_pas_ecrase() {
+        let backend = base();
+        let id = piste(&backend, "So What", Some("celui-des-tags"));
+
+        enregistrer_identification_acoustique(&backend, id, &reconnaissance(0.99));
+
+        assert_eq!(lire(&backend, id).1.as_deref(), Some("celui-des-tags"));
+    }
+
+    /// Le titre sans titre, lui, est bien corrige — l'acquis d'avant.
+    #[test]
+    fn un_titre_qui_n_en_est_pas_un_est_corrige() {
+        let backend = base();
+        let id = piste(&backend, "Track 03", None);
+
+        enregistrer_identification_acoustique(&backend, id, &reconnaissance(0.91));
+
+        let (titre, mbid) = lire(&backend, id);
+        assert_eq!(titre, "So What");
+        assert!(mbid.is_some());
+    }
+
+    /// En dessous du seuil, rien ne bouge : ni titre, ni identifiant.
+    #[test]
+    fn une_reconnaissance_douteuse_n_ecrit_rien() {
+        let backend = base();
+        let id = piste(&backend, "Track 03", None);
+
+        enregistrer_identification_acoustique(&backend, id, &reconnaissance(0.42));
+
+        let (titre, mbid) = lire(&backend, id);
+        assert_eq!(titre, "Track 03");
+        assert_eq!(mbid, None);
+    }
 }
 
 #[cfg(test)]
