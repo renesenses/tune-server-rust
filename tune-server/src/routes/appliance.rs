@@ -205,15 +205,40 @@ fn validate_ssid(ssid: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// L'etat de l'appliance : ce qu'elle EST, puis ce que son reseau raconte.
+///
+/// ⚠️ Les deux ne doivent pas dependre l'un de l'autre. `appliance: true` sort
+/// du seul marqueur `/etc/tune-appliance` ; l'etat reseau vient de `nmcli`, qui
+/// peut manquer, echouer ou trainer jusqu'a vingt secondes.
+///
+/// Le `?` sur l'appel `nmcli` faisait echouer TOUTE la requete au premier
+/// hoquet. Le client web fait alors `.catch(() => estAppliance = false)` et
+/// masque le bouton « Eteindre » — sur une machine qui est pourtant bien une
+/// appliance. C'est ce qu'a vu Philippe Landes en 0.9.99 : le bouton annonce
+/// dans les notes, introuvable chez lui (24/08/2026).
+///
+/// Un reseau muet degrade donc les champs reseau, et le dit dans
+/// `network_error` — il ne fait plus disparaitre la machine elle-meme.
 async fn status(headers: HeaderMap) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     let lang = crate::i18n::lang_from_header(&headers);
-    let raw = nmcli(
+    let (raw, network_error) = match nmcli(
         &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"],
         SCAN_TIMEOUT,
         &lang,
     )
-    .await?;
+    .await
+    {
+        Ok(raw) => (raw, Value::Null),
+        Err(e) => {
+            let motif = e.message.clone();
+            tracing::warn!(
+                error = %motif,
+                "appliance_status_nmcli_indisponible_etat_reseau_degrade"
+            );
+            (String::new(), json!(motif))
+        }
+    };
     let (devices, ethernet_connected, wifi_connected) = parse_device_status(&raw);
     // Current WiFi SSID + signal (only meaningful when wifi_connected)
     let mut wifi_ssid = Value::Null;
@@ -235,14 +260,44 @@ async fn status(headers: HeaderMap) -> Result<Json<Value>, AppError> {
             }
         }
     }
-    Ok(Json(json!({
+    Ok(Json(corps_du_statut(
+        devices,
+        ethernet_connected,
+        wifi_connected,
+        wifi_ssid,
+        wifi_signal,
+        network_error,
+    )))
+}
+
+/// Assembler la reponse de `/appliance/status`.
+///
+/// Fonction pure, et separee pour cette raison : c'est ICI que se joue
+/// l'invariant du bouton « Eteindre ». `appliance` doit valoir `true` meme
+/// quand le reseau n'a rien su dire — sinon le client masque le bouton sur une
+/// machine qui est bien une appliance (#2305 du meme genre : un test qui lit la
+/// source ne prouverait que la presence d'un mot, pas la decision).
+fn corps_du_statut(
+    devices: Vec<Value>,
+    ethernet_connected: bool,
+    wifi_connected: bool,
+    wifi_ssid: Value,
+    wifi_signal: Value,
+    network_error: Value,
+) -> Value {
+    json!({
+        // Depend du SEUL marqueur : c'est lui qui autorise le bouton
+        // « Eteindre » cote client.
         "appliance": true,
         "devices": devices,
         "ethernet_connected": ethernet_connected,
         "wifi_connected": wifi_connected,
         "wifi_ssid": wifi_ssid,
         "wifi_signal": wifi_signal,
-    })))
+        // `null` quand tout va bien ; le motif de nmcli sinon, pour que le
+        // diagnostic soit lisible sans ouvrir le journal du serveur.
+        "network_error": network_error,
+    })
 }
 
 async fn wifi_scan(headers: HeaderMap) -> Result<Json<Value>, AppError> {
@@ -332,6 +387,54 @@ mod tests {
         assert_eq!(nets[0]["in_use"], false);
         assert_eq!(nets[1]["ssid"], "Atelier");
         assert_eq!(nets[1]["in_use"], true);
+    }
+
+    /// Un reseau muet ne doit PAS faire disparaitre l'appliance.
+    ///
+    /// Philippe Landes, 0.9.99 : le bouton « Eteindre » annonce dans les notes
+    /// de version, introuvable chez lui. Le bouton etait bien dans le client
+    /// web (`cc404f9`, livre avec la 0.9.99) — c'est `/appliance/status` qui
+    /// echouait en entier des que `nmcli` avait un hoquet, et le client fait
+    /// alors `.catch(() => estAppliance = false)`.
+    #[test]
+    fn un_reseau_muet_ne_masque_pas_l_appliance() {
+        // Ce que rend `parse_device_status` quand nmcli n'a rien donne.
+        let (devices, eth, wifi) = parse_device_status("");
+        assert!(devices.is_empty());
+        assert!(!eth);
+        assert!(!wifi);
+
+        let corps = corps_du_statut(
+            devices,
+            eth,
+            wifi,
+            Value::Null,
+            Value::Null,
+            json!("nmcli introuvable"),
+        );
+        assert_eq!(
+            corps["appliance"],
+            json!(true),
+            "la machine reste une appliance meme quand nmcli se tait — sinon le \
+             bouton « Eteindre » disparait d'une vraie appliance"
+        );
+        assert_eq!(
+            corps["network_error"],
+            json!("nmcli introuvable"),
+            "le motif doit remonter au client, pas seulement au journal"
+        );
+    }
+
+    /// Et quand tout va bien, `network_error` reste nul : le client ne doit pas
+    /// afficher une alarme pour un reseau qui fonctionne.
+    #[test]
+    fn un_reseau_sain_ne_declare_aucune_erreur() {
+        let (devices, eth, wifi) =
+            parse_device_status("enp1s0:ethernet:connected:Wired connection 1\n");
+        let corps = corps_du_statut(devices, eth, wifi, Value::Null, Value::Null, Value::Null);
+        assert_eq!(corps["appliance"], json!(true));
+        assert_eq!(corps["ethernet_connected"], json!(true));
+        assert_eq!(corps["network_error"], Value::Null);
     }
 
     #[test]
