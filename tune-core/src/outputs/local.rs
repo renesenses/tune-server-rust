@@ -1761,6 +1761,163 @@ pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
     true
 }
 
+/// Why a Windows exclusive backend that still crosses an `f32` ring refused
+/// a 24-bit stream.
+///
+/// The temporary refusal is intentional: WASAPI and ASIO reconstruct integer
+/// words from `f32` in their render callbacks. That route is not byte-perfect
+/// (#2205), so allowing a detected DoP carrier through it would knowingly hand
+/// corrupted DSD to the DAC. Until those backends have a raw integer ring, the
+/// only safe behaviour is to fail before a sample reaches the callback.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsExclusivePcmError {
+    DopUnsupported,
+    DopCheckIncomplete,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsExclusivePcmError {
+    fn log_event(self) -> &'static str {
+        match self {
+            Self::DopUnsupported => "windows_exclusive_dop_rejected_before_float_transport",
+            Self::DopCheckIncomplete => "windows_exclusive_24bit_rejected_incomplete_dop_probe",
+        }
+    }
+
+    fn user_message(self, backend: &str, device: &str) -> String {
+        let reason = match self {
+            Self::DopUnsupported => "un flux DoP a été détecté",
+            Self::DopCheckIncomplete => {
+                "le flux 24 bits est trop court pour exclure la présence de DoP"
+            }
+        };
+        format!(
+            "Sortie « {device} » : {reason}. Le transport {backend} exclusif actuel passe par une conversion flottante et ne peut pas garantir les bits DSD ; la lecture a été refusée avant l'envoi au périphérique. Choisissez une sortie bit-perfect compatible"
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn record_windows_exclusive_pcm_refusal(
+    error: WindowsExclusivePcmError,
+    backend: &str,
+    device: &str,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        backend,
+        device,
+        refusal_event = error.log_event(),
+        reason = ?error,
+        "windows_exclusive_pcm_refused"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(error.user_message(backend, device));
+    }
+}
+
+/// Last preparation step before the f32 ring used by Windows exclusive
+/// backends.
+///
+/// `must_classify_24_bit` is true until the first complete 32-frame probe has
+/// ruled out DoP. Returning `Ok(None)` quarantines those initial bytes: the
+/// caller must keep them in its raw-byte `leftover` buffer and must not feed
+/// the ring. Every later, sufficiently large 24-bit chunk is checked too, so a
+/// malformed stream cannot switch to DoP unnoticed at a chunk boundary.
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn prepare_windows_exclusive_pcm(
+    bytes: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: bool,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
+    let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
+    if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
+        return Ok(None);
+    }
+    if bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels) {
+        return Err(WindowsExclusivePcmError::DopUnsupported);
+    }
+
+    let mut samples = pcm_bytes_to_f32(bytes, bit_depth);
+    apply_local_dsp(
+        &mut samples,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+        channels,
+        false,
+    );
+    Ok(Some(samples))
+}
+
+/// At EOF, an initial 24-bit probe that never reached 32 frames is not proof
+/// of PCM. Failing closed avoids treating a tiny DoP payload as ordinary audio.
+#[cfg(any(target_os = "windows", test))]
+fn finish_windows_exclusive_probe(
+    bit_depth: u16,
+    must_classify_24_bit: bool,
+    pending_bytes: usize,
+) -> Result<(), WindowsExclusivePcmError> {
+    if bit_depth == 24 && must_classify_24_bit && pending_bytes > 0 {
+        Err(WindowsExclusivePcmError::DopCheckIncomplete)
+    } else {
+        Ok(())
+    }
+}
+
+/// Consume every complete frame currently staged in `leftover`, but only
+/// after the shared DoP/DSP preparation step has authorised it.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn feed_windows_exclusive_leftover(
+    leftover: &mut Vec<u8>,
+    frame_bytes: usize,
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: &mut bool,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    ring: &RingBuf,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    force_silent: &AtomicBool,
+) -> Result<u64, WindowsExclusivePcmError> {
+    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
+    if aligned_len == 0 {
+        return Ok(0);
+    }
+    let Some(samples) = prepare_windows_exclusive_pcm(
+        &leftover[..aligned_len],
+        bit_depth,
+        channels,
+        *must_classify_24_bit,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+    )?
+    else {
+        // The raw bytes remain staged until the first 24-bit probe reaches a
+        // conclusive length. In particular, no f32 sample has been produced.
+        return Ok(0);
+    };
+
+    *must_classify_24_bit = false;
+    feed_ring_abortable(ring, &samples, stop_rx, paused, Some(force_silent));
+    leftover.drain(..aligned_len);
+    Ok((aligned_len / frame_bytes) as u64)
+}
+
 /// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
 /// in place, at the three playback-loop feed sites.
 ///
@@ -2801,51 +2958,58 @@ impl OutputTarget for LocalOutput {
                 };
                 let mut skipped_bytes_asio: u64 = 0;
 
-                // Read and feed the rest of the stream
+                // Read and feed the rest of the stream. The raw-byte staging
+                // buffer is also the DoP quarantine: no initial 24-bit sample
+                // may reach the f32 ring until 32 frames have ruled DoP out.
                 let mut leftover: Vec<u8> = Vec::new();
+                let mut must_classify_24_bit = bit_depth == 24;
 
-                // Process leftover from header read
                 if !pcm_data.is_empty() {
-                    if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
-                        let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
-                        if pcm_data.len() <= remaining {
-                            skipped_bytes_asio += pcm_data.len() as u64;
-                        } else {
-                            skipped_bytes_asio = skip_bytes_asio;
-                            let kept = &pcm_data[remaining..];
-                            let aligned_len = (kept.len() / frame_bytes) * frame_bytes;
-                            if aligned_len > 0 {
-                                let samples = pcm_bytes_to_f32(&kept[..aligned_len], bit_depth);
-                                feed_ring_abortable(
-                                    &ring,
-                                    &samples,
-                                    &stop_rx,
-                                    &paused,
-                                    Some(&force_silent),
-                                );
-                                total_frames_fed += (aligned_len / frame_bytes) as u64;
-                            }
-                            if aligned_len < kept.len() {
-                                leftover.extend_from_slice(&kept[aligned_len..]);
-                            }
-                        }
+                    let discard = if skip_bytes_asio > skipped_bytes_asio {
+                        ((skip_bytes_asio - skipped_bytes_asio) as usize).min(pcm_data.len())
                     } else {
-                        let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
-                        if aligned_len > 0 {
-                            let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
-                            feed_ring_abortable(
-                                &ring,
-                                &samples,
-                                &stop_rx,
-                                &paused,
-                                Some(&force_silent),
-                            );
-                            total_frames_fed += (aligned_len / frame_bytes) as u64;
+                        0
+                    };
+                    skipped_bytes_asio += discard as u64;
+                    leftover.extend_from_slice(&pcm_data[discard..]);
+                }
+
+                match feed_windows_exclusive_leftover(
+                    &mut leftover,
+                    frame_bytes,
+                    bit_depth,
+                    channels,
+                    &mut must_classify_24_bit,
+                    &eq,
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    &ring,
+                    &stop_rx,
+                    &paused,
+                    &force_silent,
+                ) {
+                    Ok(frames) => total_frames_fed += frames,
+                    Err(error) => {
+                        record_windows_exclusive_pcm_refusal(
+                            error,
+                            "ASIO",
+                            &device_name,
+                            &open_failure,
+                        );
+                        force_silent.store(true, Ordering::SeqCst);
+                        dop_active.store(false, Ordering::SeqCst);
+                        sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
+                        drop(exclusive);
+                        if play_generation.load(Ordering::SeqCst) == my_generation {
+                            playing.store(false, Ordering::SeqCst);
                         }
-                        if aligned_len < pcm_data.len() {
-                            leftover.extend_from_slice(&pcm_data[aligned_len..]);
-                        }
+                        return;
                     }
+                }
+                if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
+                    info!(dop = false, "local_audio_dop_stream_state_changed");
+                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
                 }
 
                 let mut http_eof_asio = false;
@@ -2912,6 +3076,7 @@ impl OutputTarget for LocalOutput {
                     });
                 }
                 let mut last_stats_at = std::time::Instant::now();
+                let mut pcm_refusal = None;
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -3013,43 +3178,58 @@ impl OutputTarget for LocalOutput {
                         leftover.extend_from_slice(&chunk);
                     }
 
-                    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-                    if aligned_len == 0 {
-                        continue;
-                    }
-
-                    // Detected on the raw bytes, BEFORE they become f32 and
-                    // before `leftover` is truncated: the marker only exists in
-                    // the 24-bit packing.
-                    let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
-                    if dop_active.swap(dop, Ordering::Relaxed) != dop {
-                        info!(dop, "local_audio_dop_stream_state_changed");
-                        // Le volume effectif dépend de cet état : en DoP il vaut
-                        // l'unité, sinon le produit volume × ReplayGain. C'est
-                        // le seul endroit où l'état bascule.
-                        sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
-                    }
-                    let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
-                    let remainder = leftover[aligned_len..].to_vec();
-                    leftover = remainder;
-
-                    apply_local_dsp(
-                        &mut samples,
+                    match feed_windows_exclusive_leftover(
+                        &mut leftover,
+                        frame_bytes,
+                        bit_depth,
+                        channels,
+                        &mut must_classify_24_bit,
                         &eq,
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
-                        channels,
-                        dop,
-                    );
-
-                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
-
-                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+                        &ring,
+                        &stop_rx,
+                        &paused,
+                        &force_silent,
+                    ) {
+                        Ok(frames) => total_frames_fed += frames,
+                        Err(error) => {
+                            pcm_refusal = Some(error);
+                            break;
+                        }
+                    }
 
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                if pcm_refusal.is_none()
+                    && http_eof_asio
+                    && let Err(error) = finish_windows_exclusive_probe(
+                        bit_depth,
+                        must_classify_24_bit,
+                        leftover.len(),
+                    )
+                {
+                    pcm_refusal = Some(error);
+                }
+                if let Some(error) = pcm_refusal {
+                    record_windows_exclusive_pcm_refusal(
+                        error,
+                        "ASIO",
+                        &device_name,
+                        &open_failure,
+                    );
+                    force_silent.store(true, Ordering::SeqCst);
+                    dop_active.store(false, Ordering::SeqCst);
+                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
+                    drop(exclusive);
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
                 }
 
                 // Fin de piste : rendre ce que le convolveur retient (#2209).
@@ -3187,28 +3367,59 @@ impl OutputTarget for LocalOutput {
 
                             let mut total_frames_fed: u64 = 0;
                             let mut read_buf = vec![0u8; 65536];
-                            let mut leftover: Vec<u8> = Vec::new();
+                            let mut leftover = pcm_data;
+                            let mut must_classify_24_bit = bit_depth == 24;
 
-                            if !pcm_data.is_empty() {
-                                let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
-                                if aligned_len > 0 {
-                                    let samples =
-                                        pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
-                                    feed_ring_abortable(
-                                        &ring,
-                                        &samples,
-                                        &stop_rx,
-                                        &paused,
-                                        Some(&force_silent),
+                            match feed_windows_exclusive_leftover(
+                                &mut leftover,
+                                frame_bytes,
+                                bit_depth,
+                                channels,
+                                &mut must_classify_24_bit,
+                                &eq,
+                                &convolver,
+                                &crossfeed,
+                                &pure_bypass,
+                                &ring,
+                                &stop_rx,
+                                &paused,
+                                &force_silent,
+                            ) {
+                                Ok(frames) => total_frames_fed += frames,
+                                Err(error) => {
+                                    record_windows_exclusive_pcm_refusal(
+                                        error,
+                                        "WASAPI",
+                                        &device_name,
+                                        &open_failure,
                                     );
-                                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+                                    force_silent.store(true, Ordering::SeqCst);
+                                    dop_active.store(false, Ordering::SeqCst);
+                                    sync_volume_to_dop(
+                                        &volume,
+                                        &user_volume_ref,
+                                        &rg_factor_ref,
+                                        false,
+                                    );
+                                    wasapi.stop();
+                                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                                        playing.store(false, Ordering::SeqCst);
+                                    }
+                                    return;
                                 }
-                                if aligned_len < pcm_data.len() {
-                                    leftover.extend_from_slice(&pcm_data[aligned_len..]);
-                                }
+                            }
+                            if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
+                                info!(dop = false, "local_audio_dop_stream_state_changed");
+                                sync_volume_to_dop(
+                                    &volume,
+                                    &user_volume_ref,
+                                    &rg_factor_ref,
+                                    false,
+                                );
                             }
 
                             let mut http_eof_wasapi = false;
+                            let mut pcm_refusal = None;
                             loop {
                                 if stop_rx.try_recv().is_ok() {
                                     break;
@@ -3225,19 +3436,26 @@ impl OutputTarget for LocalOutput {
                                     }
                                     Ok(n) => {
                                         leftover.extend_from_slice(&read_buf[..n]);
-                                        let aligned = (leftover.len() / frame_bytes) * frame_bytes;
-                                        if aligned > 0 {
-                                            let samples =
-                                                pcm_bytes_to_f32(&leftover[..aligned], bit_depth);
-                                            feed_ring_abortable(
-                                                &ring,
-                                                &samples,
-                                                &stop_rx,
-                                                &paused,
-                                                Some(&force_silent),
-                                            );
-                                            total_frames_fed += (aligned / frame_bytes) as u64;
-                                            leftover.drain(..aligned);
+                                        match feed_windows_exclusive_leftover(
+                                            &mut leftover,
+                                            frame_bytes,
+                                            bit_depth,
+                                            channels,
+                                            &mut must_classify_24_bit,
+                                            &eq,
+                                            &convolver,
+                                            &crossfeed,
+                                            &pure_bypass,
+                                            &ring,
+                                            &stop_rx,
+                                            &paused,
+                                            &force_silent,
+                                        ) {
+                                            Ok(frames) => total_frames_fed += frames,
+                                            Err(error) => {
+                                                pcm_refusal = Some(error);
+                                                break;
+                                            }
                                         }
 
                                         let pos = (total_frames_fed as f64 / sample_rate as f64
@@ -3258,6 +3476,57 @@ impl OutputTarget for LocalOutput {
                                         break;
                                     }
                                 }
+                            }
+
+                            if pcm_refusal.is_none()
+                                && http_eof_wasapi
+                                && let Err(error) = finish_windows_exclusive_probe(
+                                    bit_depth,
+                                    must_classify_24_bit,
+                                    leftover.len(),
+                                )
+                            {
+                                pcm_refusal = Some(error);
+                            }
+                            if let Some(error) = pcm_refusal {
+                                record_windows_exclusive_pcm_refusal(
+                                    error,
+                                    "WASAPI",
+                                    &device_name,
+                                    &open_failure,
+                                );
+                                force_silent.store(true, Ordering::SeqCst);
+                                dop_active.store(false, Ordering::SeqCst);
+                                sync_volume_to_dop(
+                                    &volume,
+                                    &user_volume_ref,
+                                    &rg_factor_ref,
+                                    false,
+                                );
+                                wasapi.stop();
+                                if play_generation.load(Ordering::SeqCst) == my_generation {
+                                    playing.store(false, Ordering::SeqCst);
+                                }
+                                return;
+                            }
+
+                            // WASAPI exclusive now follows the same DSP tail
+                            // contract as the other local PCM paths (#2209).
+                            let queue = flush_local_dsp(
+                                &convolver,
+                                &crossfeed,
+                                &pure_bypass,
+                                channels,
+                                false,
+                            );
+                            if !queue.is_empty() {
+                                feed_ring_abortable(
+                                    &ring,
+                                    &queue,
+                                    &stop_rx,
+                                    &paused,
+                                    Some(&force_silent),
+                                );
                             }
 
                             // Signal natural track end BEFORE draining when
@@ -5578,6 +5847,119 @@ mod tests {
         // 2 octets DSD par canal et par trame DoP.
         let dsd: Vec<u8> = (0..frames * 2 * channels).map(|i| (i * 37) as u8).collect();
         enc.feed(&dsd)
+    }
+
+    fn versioned_dop_fixture() -> Vec<u8> {
+        include_str!("../../tests/fixtures/dop_stereo_24le_64frames.hex")
+            .split_ascii_whitespace()
+            .map(|octet| u8::from_str_radix(octet, 16).expect("fixture DoP hex valide"))
+            .collect()
+    }
+
+    #[test]
+    fn versioned_dop_fixture_is_the_real_encoder_output_byte_for_byte() {
+        let fixture = versioned_dop_fixture();
+        assert_eq!(fixture.len(), 64 * 2 * 3);
+        assert_eq!(fixture, real_dop_bytes(64, 2));
+    }
+
+    #[test]
+    fn windows_float_exclusive_rejects_dop_before_the_ring() {
+        let fixture = versioned_dop_fixture();
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+        let ring = RingBuf::new(4096);
+
+        // 31 frames do not prove either PCM or DoP: they stay in the raw-byte
+        // quarantine and absolutely nothing reaches the f32 ring.
+        let first_31_frames = 31 * 2 * 3;
+        let pending = prepare_windows_exclusive_pcm(
+            &fixture[..first_31_frames],
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+        );
+        assert!(matches!(pending, Ok(None)));
+        assert_eq!(ring.available(), 0);
+
+        // Once the byte window is conclusive, rejection happens at the last
+        // preparation boundary — still before conversion, DSP and ring feed.
+        let rejected = prepare_windows_exclusive_pcm(
+            &fixture, 24, 2, true, &eq, &convolver, &crossfeed, &pure,
+        );
+        assert!(matches!(
+            rejected,
+            Err(WindowsExclusivePcmError::DopUnsupported)
+        ));
+        assert_eq!(ring.available(), 0);
+    }
+
+    #[test]
+    fn windows_float_exclusive_rejects_an_inconclusive_24bit_eof() {
+        assert_eq!(
+            finish_windows_exclusive_probe(24, true, 31 * 2 * 3),
+            Err(WindowsExclusivePcmError::DopCheckIncomplete)
+        );
+        assert_eq!(finish_windows_exclusive_probe(24, false, 0), Ok(()));
+        assert_eq!(finish_windows_exclusive_probe(16, true, 17), Ok(()));
+    }
+
+    #[test]
+    fn windows_float_exclusive_exposes_the_refusal_reason() {
+        let failure = std::sync::Mutex::new(None);
+        record_windows_exclusive_pcm_refusal(
+            WindowsExclusivePcmError::DopUnsupported,
+            "WASAPI",
+            "DAC USB",
+            &failure,
+        );
+        let message = failure.lock().unwrap().take().expect("erreur remontée");
+        assert!(message.contains("DAC USB"));
+        assert!(message.contains("DoP"));
+        assert!(message.contains("WASAPI"));
+        assert!(message.contains("conversion flottante"));
+        assert!(message.contains("refusée avant l'envoi"));
+    }
+
+    #[test]
+    fn windows_float_exclusive_applies_pcm_dsp_before_the_ring() {
+        let mut pcm = Vec::new();
+        for i in 0..4096 {
+            let v = ((2.0 * std::f64::consts::PI * 8000.0 * i as f64 / 44100.0).sin() * 4_000_000.0)
+                as i32;
+            for _ in 0..2 {
+                pcm.extend_from_slice(&v.to_le_bytes()[..3]);
+            }
+        }
+        let before = pcm_bytes_to_f32(&pcm, 24);
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+
+        let prepared =
+            prepare_windows_exclusive_pcm(&pcm, 24, 2, true, &eq, &convolver, &crossfeed, &pure)
+                .expect("PCM ordinaire accepté")
+                .expect("fenêtre de détection complète");
+
+        let ring = RingBuf::new(prepared.len());
+        assert_eq!(ring.push(&prepared), prepared.len());
+        let mut observed_at_backend_boundary = vec![0.0; prepared.len()];
+        assert_eq!(ring.pop(&mut observed_at_backend_boundary), prepared.len());
+
+        let before_rms = rms(&before[1024..]);
+        let after_rms = rms(&observed_at_backend_boundary[1024..]);
+        let delta_db = 20.0 * (after_rms / before_rms).log10();
+        assert!(
+            delta_db < -8.0,
+            "le PCM WASAPI/ASIO exclusif doit traverser l'EQ avant le ring ; mesuré {delta_db:.1} dB"
+        );
     }
 
     #[test]
