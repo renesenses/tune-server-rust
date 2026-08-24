@@ -176,6 +176,12 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             "bit_depth": np.bit_depth,
             "genre": np.genre,
             "year": np.year,
+            // ⚠️ Ce JSON est ecrit A LA MAIN : ajouter un champ a `NowPlaying`
+            // ne suffit PAS a le faire sortir ici. Sans ces deux lignes, le
+            // client continuerait de deviner l'album depuis son titre — et
+            // « Entreat » retomberait sur la page de The Cure (FabienM).
+            "album_id": np.album_id,
+            "artist_id": np.artist_id,
         })),
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,

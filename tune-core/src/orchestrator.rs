@@ -1679,6 +1679,16 @@ impl PlaybackOrchestrator {
                 .or(resolved.bit_depth),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
             year: track_meta.as_ref().and_then(|t| t.year),
+            // L'album et l'artiste par IDENTIFIANT. Sans eux, le client devait
+            // deviner l'album depuis son TITRE : cliquer sur « Entreat (2010) »
+            // ouvrait la page de The Cure (FabienM, v0.9.102). `track_meta` les
+            // a deja sous la main — c'est la ligne de la bibliotheque.
+            //
+            // `None` pour une radio ou un flux : ils n'ont pas d'entree en
+            // bibliotheque, et inventer un identifiant serait pire que de n'en
+            // donner aucun.
+            album_id: track_meta.as_ref().and_then(|t| t.album_id),
+            artist_id: track_meta.as_ref().and_then(|t| t.artist_id),
         };
 
         self.playback.play(req.zone_id, np).await;
