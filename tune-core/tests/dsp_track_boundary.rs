@@ -54,10 +54,10 @@ fn play_url_remet_le_convolveur_a_zero() {
 /// le convolveur y insérerait la queue de la piste précédente (#2296). On
 /// compte donc les applications qui précèdent le point de chaînage.
 ///
-/// Autre asymétrie volontaire : WASAPI et ASIO partagent désormais UNE
-/// frontière de préparation DSP, mais terminent sur DEUX boucles qui doivent
-/// chacune drainer. Il y a donc un drainage de plus qu'un site d'application ;
-/// les assertions nommées empêchent ce delta de masquer la perte d'un chemin.
+/// Les transports Windows ont deux préparations exclusives : f32 quand le
+/// format ASIO natif est incompatible, entière pour WASAPI et les formats
+/// ASIO bit-perfect. Chaque chemin de fin possède son drainage ; les assertions
+/// nommées empêchent le comptage global de masquer la perte d'un branchement.
 #[test]
 fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let src = source();
@@ -70,10 +70,9 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let applications = prod[..chainage].matches("apply_local_dsp(").count() - 1; // idem
 
     assert_eq!(
-        drainages,
-        applications + 1,
+        drainages, applications,
         "{drainages} drainage(s) pour {applications} site(s) DSP avant le chaînage : \
-         le seul delta permis est la préparation Windows partagée par ASIO et WASAPI"
+         chaque préparation de fin de piste doit avoir son drainage"
     );
     assert!(
         drainages >= 5,
@@ -90,6 +89,16 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "la préparation Windows partagée ne passe plus par le DSP"
     );
 
+    let preparation_windows_native = prod
+        .split("fn prepare_windows_native_pcm(")
+        .nth(1)
+        .and_then(|s| s.split("impl OutputTarget for LocalOutput").next())
+        .expect("la préparation Windows entière doit rester identifiable");
+    assert!(
+        preparation_windows_native.contains("apply_local_dsp("),
+        "la préparation Windows entière ne traite plus le PCM non bit-perfect"
+    );
+
     let asio = prod
         .split("// ------- Exclusive mode path (Windows ASIO) -------")
         .nth(1)
@@ -99,8 +108,9 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         })
         .expect("le chemin ASIO doit rester identifiable");
     assert!(
-        asio.contains("feed_windows_exclusive_leftover(") && asio.contains("flush_local_dsp("),
-        "ASIO doit passer par la préparation partagée puis drainer sa propre fin de piste"
+        asio.contains("feed_selected_windows_exclusive_leftover(")
+            && asio.contains("flush_local_dsp("),
+        "ASIO doit sélectionner la préparation conforme au pilote puis drainer sa fin de piste"
     );
 
     let wasapi = prod
@@ -112,8 +122,9 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         })
         .expect("le chemin WASAPI doit rester identifiable");
     assert!(
-        wasapi.contains("feed_windows_exclusive_leftover(") && wasapi.contains("flush_local_dsp("),
-        "WASAPI doit passer par la préparation partagée puis drainer sa propre fin de piste"
+        wasapi.contains("feed_windows_native_exclusive_leftover(")
+            && wasapi.contains("flush_local_dsp("),
+        "WASAPI doit passer par la préparation entière puis drainer sa fin de piste"
     );
 }
 
