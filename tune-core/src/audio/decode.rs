@@ -10,7 +10,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use super::dsd_to_pcm::choose_output_rate;
 
@@ -320,15 +320,112 @@ impl Drop for StagedFile {
 /// sequential copy is fast even on WiFi; decoding then happens from the local
 /// copy. Returns `None` (decode the original in place) for same-device files or
 /// on any error — never fatal.
+/// Le montage qui porte `cible` est-il un système de fichiers RÉSEAU,
+/// d'après un contenu de `/proc/mounts` ?
+///
+/// Fonction PURE, hors de tout `#[cfg]` : compilée et testée sur toutes les
+/// plateformes. Un bloc `cfg(linux)` ne serait ni compilé ni testé depuis
+/// macOS — c'est ainsi qu'une fonction morte a déjà été livrée (#2277).
+/// Le point de montage le plus LONG qui préfixe le chemin gagne.
+fn montage_reseau_depuis_mounts(mounts: &str, cible: &str) -> bool {
+    const TYPES_RESEAU: &[&str] = &[
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smbfs",
+        "smb2",
+        "webdav",
+        "davfs",
+        "sshfs",
+        "fuse.sshfs",
+        "afpfs",
+        "9p",
+        "ncpfs",
+        "glusterfs",
+        "cephfs",
+        "curlftpfs",
+    ];
+
+    let mut meilleur: Option<(usize, String)> = None;
+    for ligne in mounts.lines() {
+        let mut champs = ligne.split_whitespace();
+        let (Some(_dev), Some(point), Some(genre)) = (champs.next(), champs.next(), champs.next())
+        else {
+            continue;
+        };
+        // /proc/mounts échappe les espaces en \040.
+        let point = point.replace("\\040", " ");
+        let prefixe_ok = cible == point
+            || (cible.starts_with(&point)
+                && (point == "/" || cible.as_bytes().get(point.len()) == Some(&b'/')));
+        if prefixe_ok {
+            let l = point.len();
+            if meilleur.as_ref().map(|(bl, _)| l > *bl).unwrap_or(true) {
+                meilleur = Some((l, genre.to_string()));
+            }
+        }
+    }
+    meilleur
+        .map(|(_, genre)| {
+            TYPES_RESEAU
+                .iter()
+                .any(|t| genre == *t || genre.starts_with("fuse."))
+                && genre != "fuseblk"
+        })
+        .unwrap_or(false)
+}
+
+/// Le chemin vit-il sur un montage RÉSEAU ?
+///
+/// Décision par le type de système de fichiers du point de montage, lu dans
+/// `/proc/mounts` (Linux) ou via `statfs` (macOS). En cas de doute — type
+/// inconnu, lecture impossible — on répond `false` : ne pas copier est le
+/// choix le moins coûteux, le décodeur lira sur place.
+#[cfg(unix)]
+fn chemin_sur_montage_reseau(chemin: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+            return false;
+        };
+        montage_reseau_depuis_mounts(&mounts, &chemin.to_string_lossy())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS : statfs donne le nom du système de fichiers.
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        let Ok(c) = CString::new(chemin.as_os_str().as_encoded_bytes()) else {
+            return false;
+        };
+        let mut st = MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let st = unsafe { st.assume_init() };
+        let genre = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }
+            .to_string_lossy()
+            .to_lowercase();
+        const TYPES_RESEAU_MAC: &[&str] = &["nfs", "smbfs", "webdav", "afpfs", "cifs", "ftp", "9p"];
+        TYPES_RESEAU_MAC.iter().any(|t| genre == *t)
+    }
+}
+
 #[cfg(unix)]
 fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
-    use std::os::unix::fs::MetadataExt;
     let src_path = Path::new(src);
     let tmp_dir = std::env::temp_dir();
-    let src_dev = std::fs::metadata(src_path).ok()?.dev();
-    let tmp_dev = std::fs::metadata(&tmp_dir).ok()?.dev();
-    if src_dev == tmp_dev {
-        return None; // same device as temp → already local & fast
+    // ⚠️ Le critère est le TYPE de montage, pas le numéro de périphérique.
+    // `st_dev` diffère pour TOUT point de montage distinct — y compris un
+    // disque local dédié, souvent PLUS rapide que le disque système. Sur la
+    // .18, chaque piste de /data/music (sdb1, 84 % plein) était recopiée en
+    // entier vers /tmp avant la moindre note — des .dsf de 300 Mo — alors que
+    // le décodage séquentiel lit le disque local aussi vite que la copie.
+    // Seuls les montages RÉSEAU (nfs, cifs/smb, sshfs, webdav…) paient des
+    // allers-retours par seek et justifient la copie préalable (Yves, NAS
+    // en WiFi : 90 s et plus par piste sans elle).
+    if !chemin_sur_montage_reseau(src_path) {
+        return None; // stockage local : le décodeur lit sur place
     }
     let ext = src_path
         .extension()
@@ -337,7 +434,10 @@ fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
     let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
     match std::fs::copy(src_path, &dst) {
         Ok(bytes) => {
-            debug!(src = %src, staged = %dst.display(), bytes, "decode_source_staged_locally");
+            // info!, pas debug! : cette copie retarde la première note du
+            // fichier ENTIER. Invisible, elle a fait chercher les « lenteurs
+            // au chargement » partout ailleurs (chantier du 24/08).
+            info!(src = %src, staged = %dst.display(), bytes, "decode_source_staged_locally");
             Some(StagedFile { path: dst })
         }
         Err(e) => {
@@ -2363,6 +2463,70 @@ fn decode_dsd_to_pcm(
 
 #[cfg(test)]
 mod decode_integration_tests {
+
+    // --- montage_reseau_depuis_mounts (chantier lenteurs, 24/08) -----------
+
+    const MOUNTS_18: &str = "\
+/dev/mapper/ubuntu--vg-ubuntu--lv / ext4 rw,relatime 0 0
+/dev/sda2 /boot ext4 rw,relatime 0 0
+/dev/sdb1 /data ext4 rw,relatime 0 0
+tmpfs /tmp tmpfs rw,nosuid 0 0
+//192.168.1.55/share /mnt/eversolo_nvme cifs rw,vers=3.0 0 0
+nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
+";
+
+    #[test]
+    fn un_disque_local_dedie_nest_pas_un_montage_reseau() {
+        // LE cas de la .18 : /data/music est un AUTRE périphérique que /tmp
+        // (sdb1 contre le LV système), et l'ancien critère `st_dev` copiait
+        // chaque .dsf de 300 Mo avant la moindre note. ext4 local = on lit
+        // sur place.
+        assert!(!montage_reseau_depuis_mounts(
+            MOUNTS_18,
+            "/data/music/V_DSF/Classique/101 - Lachrimae Antiquae.dsf"
+        ));
+    }
+
+    #[test]
+    fn cifs_et_nfs_sont_des_montages_reseau() {
+        // Le NVMe de Jérôme derrière l'Eversolo, monté en CIFS.
+        assert!(montage_reseau_depuis_mounts(
+            MOUNTS_18,
+            "/mnt/eversolo_nvme/77A6-799D/album/titre.flac"
+        ));
+        // Le NAS d'Yves en NFS — le cas qui a motivé le staging (90 s+ par
+        // piste en WiFi sans lui).
+        assert!(montage_reseau_depuis_mounts(
+            MOUNTS_18,
+            "/mnt/nas/musique/a.flac"
+        ));
+    }
+
+    #[test]
+    fn le_point_de_montage_le_plus_long_gagne() {
+        // /mnt/eversolo_nvme (cifs) doit l'emporter sur / (ext4) — et un
+        // chemin qui n'a que / comme préfixe reste local.
+        assert!(!montage_reseau_depuis_mounts(
+            MOUNTS_18,
+            "/home/jerome/musique/a.flac"
+        ));
+        // Préfixe TEXTUEL sans être un composant : /data-nas n'est pas /data.
+        let mounts = "nas:/v /data nfs4 rw 0 0\n/dev/sda1 / ext4 rw 0 0\n";
+        assert!(!montage_reseau_depuis_mounts(mounts, "/data-locale/a.flac"));
+        assert!(montage_reseau_depuis_mounts(mounts, "/data/a.flac"));
+    }
+
+    #[test]
+    fn dans_le_doute_on_ne_copie_pas() {
+        // Contenu illisible, vide, ou chemin hors de tout montage connu :
+        // répondre « local » — ne pas copier est le choix le moins coûteux.
+        assert!(!montage_reseau_depuis_mounts("", "/data/music/a.flac"));
+        assert!(!montage_reseau_depuis_mounts("garbage\n", "/x/a.flac"));
+        // fuseblk = NTFS local via FUSE : PAS un montage réseau.
+        let mounts = "/dev/sdc1 /mnt/usb fuseblk rw 0 0\n";
+        assert!(!montage_reseau_depuis_mounts(mounts, "/mnt/usb/a.flac"));
+    }
+
     use super::*;
     use std::path::PathBuf;
 
