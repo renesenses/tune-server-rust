@@ -46,13 +46,18 @@ fn play_url_remet_le_convolveur_a_zero() {
 /// `flush_local_dsp` a existé pendant une PR entière sans un seul appel de
 /// production — le compilateur le signalait, et je ne l'ai pas lu (JP Robbe,
 /// revue de #2277). Un test qui appelle le helper directement ne peut pas voir
-/// ça : c'est le NOMBRE de points d'appel qu'il faut tenir.
+/// ça : il faut tenir les points d'appel réels.
 ///
 /// ⚠️ L'invariant n'est PAS « autant de drainages que d'applications du DSP ».
 /// Les deux sites de la boucle gapless appliquent le DSP et ne doivent
 /// SURTOUT PAS drainer : une transition gapless est un flux continu, et vider
 /// le convolveur y insérerait la queue de la piste précédente (#2296). On
 /// compte donc les applications qui précèdent le point de chaînage.
+///
+/// Autre asymétrie volontaire : WASAPI et ASIO partagent désormais UNE
+/// frontière de préparation DSP, mais terminent sur DEUX boucles qui doivent
+/// chacune drainer. Il y a donc un drainage de plus qu'un site d'application ;
+/// les assertions nommées empêchent ce delta de masquer la perte d'un chemin.
 #[test]
 fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let src = source();
@@ -65,14 +70,50 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let applications = prod[..chainage].matches("apply_local_dsp(").count() - 1; // idem
 
     assert_eq!(
-        drainages, applications,
-        "{drainages} drainage(s) pour {applications} chemin(s) qui terminent une \
-         piste : un chemin applique le convolveur sans jamais rendre ce qu'il \
-         retient, donc tronque la fin de sa piste (#2209)"
+        drainages,
+        applications + 1,
+        "{drainages} drainage(s) pour {applications} site(s) DSP avant le chaînage : \
+         le seul delta permis est la préparation Windows partagée par ASIO et WASAPI"
     );
     assert!(
-        drainages >= 4,
-        "les quatre chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
+        drainages >= 5,
+        "les cinq chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
+    );
+
+    let preparation_windows = prod
+        .split("fn prepare_windows_exclusive_pcm(")
+        .nth(1)
+        .and_then(|s| s.split("fn finish_windows_exclusive_probe(").next())
+        .expect("la préparation Windows partagée doit rester identifiable");
+    assert!(
+        preparation_windows.contains("apply_local_dsp("),
+        "la préparation Windows partagée ne passe plus par le DSP"
+    );
+
+    let asio = prod
+        .split("// ------- Exclusive mode path (Windows ASIO) -------")
+        .nth(1)
+        .and_then(|s| {
+            s.split("// ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------")
+                .next()
+        })
+        .expect("le chemin ASIO doit rester identifiable");
+    assert!(
+        asio.contains("feed_windows_exclusive_leftover(") && asio.contains("flush_local_dsp("),
+        "ASIO doit passer par la préparation partagée puis drainer sa propre fin de piste"
+    );
+
+    let wasapi = prod
+        .split("// ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------")
+        .nth(1)
+        .and_then(|s| {
+            s.split("// ------- Open cpal device (shared mode) -------")
+                .next()
+        })
+        .expect("le chemin WASAPI doit rester identifiable");
+    assert!(
+        wasapi.contains("feed_windows_exclusive_leftover(") && wasapi.contains("flush_local_dsp("),
+        "WASAPI doit passer par la préparation partagée puis drainer sa propre fin de piste"
     );
 }
 
