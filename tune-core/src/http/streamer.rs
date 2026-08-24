@@ -100,6 +100,16 @@ pub struct StreamSession {
     pub detected_sample_rate: std::sync::atomic::AtomicU32,
     pub detected_channels: std::sync::atomic::AtomicU16,
     pub wav_header_included: std::sync::atomic::AtomicBool,
+    /// L'en-tête WAV tel que le décodeur l'a émis — pour le REJOUER.
+    ///
+    /// Sur une session de conversion (DSD→WAV), l'en-tête part DANS le canal,
+    /// comme premier chunk. Un canal ne se lit qu'une fois : seule la première
+    /// connexion HTTP le recevait. Or un renderer qui sonde (DMP-A8 : trois
+    /// requêtes — `bytes=0-`, `bytes=44-`, `bytes=0-`) consomme l'en-tête sur
+    /// une connexion qu'il referme, puis joue sur une autre — qui recevait du
+    /// PCM nu, sans RIFF. Le consommateur qui voit passer l'en-tête le range
+    /// ici ; chaque nouvelle connexion partant de l'octet 0 le reçoit d'abord.
+    pub wav_header_stash: std::sync::OnceLock<Vec<u8>>,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// Number of HTTP requests currently streaming this session. The radio→WAV
@@ -113,12 +123,12 @@ pub struct StreamSession {
     /// (buffer refill / reconnect) without closing its first connection would
     /// otherwise have BOTH connections race `recv_chunk()` for each PCM chunk,
     /// splitting the audio between them → dropouts. Each new radio consumer
-    /// calls `claim_radio_consumer()` to bump this and supersede the older
+    /// calls `claim_channel_consumer()` to bump this and supersede the older
     /// connection, which then hands off the channel and ends. `0` = no consumer.
     pub consumer_epoch: std::sync::atomic::AtomicU64,
     /// Wakes an older radio consumer the instant a newer one claims the channel
     /// so it releases the `rx` lock promptly instead of staying parked in
-    /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_radio_consumer`.
+    /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_channel_consumer`.
     pub consumer_supersede: std::sync::Arc<tokio::sync::Notify>,
     pub first_request: std::sync::Arc<tokio::sync::Notify>,
     pub data_ready: std::sync::Arc<tokio::sync::Notify>,
@@ -156,6 +166,7 @@ impl StreamSession {
             detected_sample_rate: std::sync::atomic::AtomicU32::new(0),
             detected_channels: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
+            wav_header_stash: std::sync::OnceLock::new(),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
@@ -171,21 +182,24 @@ impl StreamSession {
         self.rx.lock().await.recv().await
     }
 
-    /// Register a new HTTP consumer of the single-consumer radio PCM channel and
-    /// return its epoch token. Any consumer registered earlier is SUPERSEDED:
-    /// its epoch no longer matches (so `is_current_radio_consumer` returns
+    /// Register a new HTTP consumer of the single-consumer PCM channel and
+    /// return its epoch token. Vaut pour TOUTE session adossée au canal —
+    /// radio comme conversion finie (DSD→WAV). Le canal ne se lit qu'une
+    /// fois : deux connexions simultanées se VOLENT les chunks, et le
+    /// renderer n'entend qu'une fraction du signal. Any consumer registered earlier is SUPERSEDED:
+    /// its epoch no longer matches (so `is_current_channel_consumer` returns
     /// false) and it is woken via `consumer_supersede` so it drops its pending
     /// `recv_chunk()` (releasing the `rx` lock) and ends — handing the channel
     /// to this newest connection instead of racing it for each PCM chunk.
     ///
     /// The consumer loop must use the lost-wakeup-free pattern: subscribe to
     /// `consumer_supersede` (create + `enable()` the `Notified`) BEFORE calling
-    /// `is_current_radio_consumer`, so the epoch bump (which happens-before the
+    /// `is_current_channel_consumer`, so the epoch bump (which happens-before the
     /// notify) is observed either as a wake or as a stale epoch. That, together
     /// with a `biased` select that polls the supersede branch first, guarantees
     /// a superseded consumer stops WITHOUT pulling a further chunk (no split,
     /// no loss, no duplication at the swap).
-    pub fn claim_radio_consumer(&self) -> u64 {
+    pub fn claim_channel_consumer(&self) -> u64 {
         use std::sync::atomic::Ordering::SeqCst;
         let epoch = self.consumer_epoch.fetch_add(1, SeqCst) + 1;
         // Wake any older consumer currently parked so it re-checks its epoch.
@@ -193,9 +207,9 @@ impl StreamSession {
         epoch
     }
 
-    /// True while `epoch` (from `claim_radio_consumer`) is still the current
+    /// True while `epoch` (from `claim_channel_consumer`) is still the current
     /// channel owner. Becomes false once a newer consumer claims the channel.
-    pub fn is_current_radio_consumer(&self, epoch: u64) -> bool {
+    pub fn is_current_channel_consumer(&self, epoch: u64) -> bool {
         self.consumer_epoch
             .load(std::sync::atomic::Ordering::SeqCst)
             == epoch
@@ -977,15 +991,15 @@ mod tests {
         };
         let (_id, _tx, _dr, session) = streamer.create_radio_session(info, 256).await;
 
-        let e1 = session.claim_radio_consumer();
-        assert!(session.is_current_radio_consumer(e1));
-        let e2 = session.claim_radio_consumer();
+        let e1 = session.claim_channel_consumer();
+        assert!(session.is_current_channel_consumer(e1));
+        let e2 = session.claim_channel_consumer();
         assert_ne!(e1, e2);
         assert!(
-            !session.is_current_radio_consumer(e1),
+            !session.is_current_channel_consumer(e1),
             "the first consumer is superseded once a second claims the channel"
         );
-        assert!(session.is_current_radio_consumer(e2));
+        assert!(session.is_current_channel_consumer(e2));
     }
 
     // End-to-end hand-off: when a 2nd connection claims the channel, the 1st
@@ -1015,14 +1029,14 @@ mod tests {
             claimed: tokio::sync::oneshot::Sender<()>,
             out: mpsc::UnboundedSender<Vec<u8>>,
         ) -> Vec<Vec<u8>> {
-            let my_epoch = session.claim_radio_consumer();
+            let my_epoch = session.claim_channel_consumer();
             let _ = claimed.send(()); // establish happens-before for the test
             let mut got = Vec::new();
             loop {
                 let superseded = session.consumer_supersede.notified();
                 tokio::pin!(superseded);
                 superseded.as_mut().enable();
-                if !session.is_current_radio_consumer(my_epoch) {
+                if !session.is_current_channel_consumer(my_epoch) {
                     break;
                 }
                 tokio::select! {
