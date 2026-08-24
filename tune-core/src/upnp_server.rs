@@ -348,7 +348,14 @@ pub fn parse_soap_action(soap_xml: &str) -> Option<String> {
     let mut in_body = false;
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
+            // `Empty` autant que `Start` : une action SANS argument s'ecrit
+            // legitimement `<u:GetSearchCapabilities/>`, et quick-xml la rend
+            // comme `Event::Empty`. Ne lire que `Start` faisait rendre `None`,
+            // donc — par le repli historique — une BrowseResponse a la place
+            // des capacites. Verifie en direct sur .18 en 0.9.103 : la forme
+            // auto-fermante ramenait la racine du serveur, la forme ouverte
+            // `<SearchCaps>upnp:class</SearchCaps>`.
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let local = name.rsplit(':').next().unwrap_or(&name).to_string();
                 if in_body {
@@ -457,7 +464,11 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
 /// entre autres) s'en servent pour recuperer toutes les pistes en une passe
 /// paginee, bien plus vite qu'un parcours recursif : ils echouaient donc a
 /// synchroniser, sans que rien ne dise pourquoi (Patatorz, fil forum #1516).
-const SEARCH_CAPS: &str = "upnp:class";
+/// `dc:title` s'y ajoute depuis que `Search` sait reellement filtrer sur le
+/// titre : la regle reste celle de #2312 — n'annoncer QUE ce qu'on evalue,
+/// jamais l'inverse. Le test `les_capacites_annoncees_sont_toutes_evaluees`
+/// tient l'invariant dans les deux sens.
+const SEARCH_CAPS: &str = "upnp:class,dc:title";
 
 /// L'action `Search` de ContentDirectory.
 ///
@@ -478,8 +489,8 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     if !sort_criteria.trim().is_empty() {
         return soap_fault(709, "Unsupported or invalid sort criteria");
     }
-    let class_matches = match evaluate_supported_class_criteria(&criteria) {
-        Ok(matches) => matches,
+    let criteres = match evaluer_criteres(&criteria) {
+        Ok(c) => c,
         Err(()) => {
             debug!(criteria = %criteria, "upnp_search_criteria_non_supporte");
             return soap_fault(708, "Unsupported or invalid search criteria");
@@ -487,8 +498,15 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     };
     let base_url = state.base_url();
 
-    let didl = if class_matches {
-        match search_tracks_in_container(state, &container_id, start, count, &base_url) {
+    let didl = if criteres.classe_correspond {
+        match search_tracks_in_container(
+            state,
+            &container_id,
+            start,
+            count,
+            &base_url,
+            &criteres.titres,
+        ) {
             Some(result) => result,
             None => return soap_fault(710, "No such container"),
         }
@@ -549,6 +567,193 @@ fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
     }
 }
 
+/// Un predicat sur `dc:title`.
+///
+/// La comparaison est celle de la base : `LIKE` insensible a la casse ET aux
+/// accents (`LOWER(unaccent(...))`, `search_by_title`). On la reproduit a
+/// l'identique en memoire, sinon un meme critere rendrait deux resultats
+/// differents selon le conteneur interroge.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PredicatTitre {
+    op: OpTitre,
+    valeur: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OpTitre {
+    Contient,
+    NeContientPas,
+    Egal,
+    Different,
+}
+
+impl PredicatTitre {
+    fn satisfait(&self, titre: &str) -> bool {
+        let t = sans_accents_minuscule(titre);
+        let v = sans_accents_minuscule(&self.valeur);
+        match self.op {
+            OpTitre::Contient => t.contains(&v),
+            OpTitre::NeContientPas => !t.contains(&v),
+            OpTitre::Egal => t == v,
+            OpTitre::Different => t != v,
+        }
+    }
+
+    /// La valeur a pousser dans le `LIKE` de la base, quand ce predicat peut
+    /// servir de pre-filtre. Un predicat NEGATIF n'en est pas un : il ne
+    /// reduit rien.
+    fn valeur_prefiltrante(&self) -> Option<&str> {
+        match self.op {
+            OpTitre::Contient | OpTitre::Egal => Some(&self.valeur),
+            OpTitre::NeContientPas | OpTitre::Different => None,
+        }
+    }
+}
+
+/// Repli le titre comme le fait `unaccent` cote base, pour les diacritiques
+/// latins courants. Ce n'est pas une normalisation Unicode complete — c'est
+/// ce que la base applique, et les deux doivent dire la meme chose.
+fn sans_accents_minuscule(s: &str) -> String {
+    s.chars()
+        // `to_ascii_lowercase` laisse « É » intact : il faut la minuscule
+        // Unicode AVANT de replier, sinon « Élégie » ne repond pas a
+        // « elegie » — le cas exact que le test tient.
+        .flat_map(|c| c.to_lowercase())
+        .flat_map(|c| {
+            let remplace = match c {
+                'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => Some('a'),
+                'ç' => Some('c'),
+                'è' | 'é' | 'ê' | 'ë' => Some('e'),
+                'ì' | 'í' | 'î' | 'ï' => Some('i'),
+                'ñ' => Some('n'),
+                'ò' | 'ó' | 'ô' | 'õ' | 'ö' => Some('o'),
+                'ù' | 'ú' | 'û' | 'ü' => Some('u'),
+                'ý' | 'ÿ' => Some('y'),
+                _ => None,
+            };
+            std::iter::once(remplace.unwrap_or(c))
+        })
+        .collect()
+}
+
+/// Ce qu'un `SearchCriteria` demande, une fois reduit a ce qu'on sait faire.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CriteresRecherche {
+    /// La classe fixe de nos elements satisfait-elle les predicats de classe ?
+    pub(crate) classe_correspond: bool,
+    pub(crate) titres: Vec<PredicatTitre>,
+}
+
+/// Analyse le `SearchCriteria` et le reduit aux champs ANNONCES.
+///
+/// Portee, volontairement etroite et alignee sur `SEARCH_CAPS` :
+/// - `*`, le raccourci d'indexation historique ;
+/// - des predicats sur `upnp:class` et `dc:title` ;
+/// - leur conjonction par `and`.
+///
+/// Tout le reste — `or`, parentheses, autre champ, `exists` — rend `Err`, donc
+/// un SOAP 708. C'est la lecon de #2312 : mieux vaut refuser explicitement que
+/// rendre la bibliotheque entiere en faisant croire qu'on a cherche.
+pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> {
+    let c = criteria.trim();
+    if c == "*" {
+        return Ok(CriteresRecherche {
+            classe_correspond: true,
+            titres: Vec::new(),
+        });
+    }
+    if c.contains('(') || c.contains(')') {
+        return Err(());
+    }
+
+    let mut classe_correspond = true;
+    let mut titres = Vec::new();
+    for predicat in decouper_conjonction(c)? {
+        let (champ, op, valeur) = decouper_predicat(&predicat)?;
+        if champ.eq_ignore_ascii_case("upnp:class") {
+            classe_correspond &=
+                evaluate_supported_class_criteria(&format!("{champ} {op} \"{valeur}\""))?;
+        } else if champ.eq_ignore_ascii_case("dc:title") {
+            let op = match op.to_ascii_lowercase().as_str() {
+                "contains" => OpTitre::Contient,
+                "doesnotcontain" => OpTitre::NeContientPas,
+                "=" => OpTitre::Egal,
+                "!=" => OpTitre::Different,
+                _ => return Err(()),
+            };
+            titres.push(PredicatTitre { op, valeur });
+        } else {
+            return Err(());
+        }
+    }
+    Ok(CriteresRecherche {
+        classe_correspond,
+        titres,
+    })
+}
+
+/// Coupe sur les `and` de premier niveau, en respectant les guillemets — un
+/// titre peut contenir « and », et le couper la ferait chercher n'importe quoi.
+fn decouper_conjonction(c: &str) -> Result<Vec<String>, ()> {
+    let mut parties = Vec::new();
+    let mut courant = String::new();
+    let mut dans_guillemets = false;
+    let mut mots = Vec::new();
+    for ch in c.chars() {
+        if ch == '"' {
+            dans_guillemets = !dans_guillemets;
+            courant.push(ch);
+        } else if ch.is_whitespace() && !dans_guillemets {
+            if !courant.is_empty() {
+                mots.push(std::mem::take(&mut courant));
+            }
+        } else {
+            courant.push(ch);
+        }
+    }
+    if dans_guillemets {
+        return Err(());
+    }
+    if !courant.is_empty() {
+        mots.push(courant);
+    }
+
+    let mut bloc: Vec<String> = Vec::new();
+    for mot in mots {
+        if mot.eq_ignore_ascii_case("or") {
+            return Err(());
+        }
+        if mot.eq_ignore_ascii_case("and") {
+            if bloc.is_empty() {
+                return Err(());
+            }
+            parties.push(bloc.join(" "));
+            bloc = Vec::new();
+        } else {
+            bloc.push(mot);
+        }
+    }
+    if bloc.is_empty() {
+        return Err(());
+    }
+    parties.push(bloc.join(" "));
+    Ok(parties)
+}
+
+/// `champ op "valeur"` — la valeur garde ses espaces.
+fn decouper_predicat(p: &str) -> Result<(String, String, String), ()> {
+    let mut it = p.splitn(3, ' ');
+    let champ = it.next().ok_or(())?.to_string();
+    let op = it.next().ok_or(())?.to_string();
+    let brut = it.next().ok_or(())?.trim().to_string();
+    let valeur = brut
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .ok_or(())?
+        .to_string();
+    Ok((champ, op, valeur))
+}
+
 /// Pistes situées sous le conteneur demandé, avec pagination et total filtré.
 ///
 /// Les conteneurs synthétiques racine mènent tous à la même bibliothèque à
@@ -561,10 +766,19 @@ fn search_tracks_in_container(
     start: u64,
     count: u64,
     base_url: &str,
+    titres: &[PredicatTitre],
 ) -> Option<DidlResult> {
     match container_id {
         "0" | "tracks" | "artists" | "albums" | "genres" => {
-            Some(browse_all_tracks(state, start, count, base_url))
+            if titres.is_empty() {
+                // Sans predicat de titre, c'est le parcours d'indexation :
+                // la pagination reste celle de la base, pas de la memoire.
+                return Some(browse_all_tracks(state, start, count, base_url));
+            }
+            let tracks = candidats_par_titre(state, titres)?;
+            Some(paginate_track_results(
+                tracks, "tracks", start, count, base_url,
+            ))
         }
         "radios" => Some(empty_didl()),
         id if id.starts_with("album/") => {
@@ -572,17 +786,55 @@ fn search_tracks_in_container(
             let tracks = TrackRepo::with_backend(state.backend.clone())
                 .list_by_album(album_id)
                 .ok()?;
-            Some(paginate_track_results(tracks, id, start, count, base_url))
+            Some(paginate_track_results(
+                filtrer_par_titre(tracks, titres),
+                id,
+                start,
+                count,
+                base_url,
+            ))
         }
         id if id.starts_with("artist/") => {
             let artist_id = id.strip_prefix("artist/")?.parse().ok()?;
             let tracks = TrackRepo::with_backend(state.backend.clone())
                 .list_by_artist(artist_id)
                 .ok()?;
-            Some(paginate_track_results(tracks, id, start, count, base_url))
+            Some(paginate_track_results(
+                filtrer_par_titre(tracks, titres),
+                id,
+                start,
+                count,
+                base_url,
+            ))
         }
         _ => None,
     }
+}
+
+/// Toute la bibliotheque ne passe pas en memoire : on demande d'abord a la
+/// base les titres qui PEUVENT convenir, puis on applique les predicats
+/// exacts. Un critere qui n'a aucun predicat positif ne reduit rien — il
+/// faudrait lire la table entiere pour le satisfaire, ce qu'on refuse (708).
+fn candidats_par_titre(state: &UpnpState, titres: &[PredicatTitre]) -> Option<Vec<Track>> {
+    /// Assez large pour une bibliotheque reelle, assez borne pour qu'un
+    /// critere d'un seul caractere ne batisse pas un DIDL de plusieurs
+    /// megaoctets. `TotalMatches` reflete ce qui a ete retenu.
+    const MAX_CANDIDATS: i64 = 10_000;
+    let prefiltre = titres.iter().find_map(|p| p.valeur_prefiltrante())?;
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .search_by_title(prefiltre, MAX_CANDIDATS)
+        .ok()?;
+    Some(filtrer_par_titre(tracks, titres))
+}
+
+fn filtrer_par_titre(tracks: Vec<Track>, titres: &[PredicatTitre]) -> Vec<Track> {
+    if titres.is_empty() {
+        return tracks;
+    }
+    tracks
+        .into_iter()
+        .filter(|t| titres.iter().all(|p| p.satisfait(&t.title)))
+        .collect()
 }
 
 fn paginate_track_results(
@@ -2532,12 +2784,16 @@ mod ssdp_msearch_tests {
 
     #[test]
     fn un_predicat_non_annonce_est_refuse_au_lieu_de_tout_rendre() {
+        // `dc:title` est desormais annonce ET evalue : ce n'est plus lui
+        // l'exemple du champ inconnu. L'intention du test — refuser plutot
+        // que rendre toute la bibliotheque — est reportee sur `upnp:artist`,
+        // qui reste hors de SEARCH_CAPS.
         for c in [
-            "dc:title contains \"Introuvable\"",
-            "upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"Introuvable\"",
+            "upnp:artist contains \"Introuvable\"",
+            "upnp:class derivedfrom \"object.item.audioItem\" and upnp:artist contains \"Introuvable\"",
             "",
         ] {
-            assert_eq!(evaluate_supported_class_criteria(c), Err(()), "{c}");
+            assert_eq!(evaluer_criteres(c).err(), Some(()), "{c}");
         }
 
         let state = search_test_state();
@@ -2545,7 +2801,7 @@ mod ssdp_msearch_tests {
             &state,
             &soap_search(
                 "0",
-                "upnp:class derivedfrom &quot;object.item.audioItem&quot; and dc:title contains &quot;Introuvable&quot;",
+                "upnp:class derivedfrom &quot;object.item.audioItem&quot; and upnp:artist contains &quot;Introuvable&quot;",
                 0,
                 100,
             ),
@@ -2626,6 +2882,7 @@ mod ssdp_msearch_tests {
             0,
             100,
             "http://127.0.0.1:8888",
+            &[],
         )
         .unwrap();
         assert_eq!(result.total, 1);
@@ -2634,15 +2891,201 @@ mod ssdp_msearch_tests {
         assert!(!result.xml.contains("Money"), "{}", result.xml);
     }
 
+    /// Une action sans argument s'ecrit legitimement en element vide. Le
+    /// dispatcher ne lisait que `Event::Start` : il rendait alors `None`, et
+    /// le repli historique repondait une BrowseResponse — la racine du
+    /// serveur, presentee comme des capacites de recherche. Constate en direct
+    /// sur .18 en 0.9.103.
+    #[test]
+    fn une_action_auto_fermante_est_reconnue() {
+        let corps = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body><u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"/></s:Body>
+</s:Envelope>"#;
+        assert_eq!(
+            parse_soap_action(corps).as_deref(),
+            Some("GetSearchCapabilities")
+        );
+
+        let ouverte = corps.replace(
+            r#"<u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"/>"#,
+            r#"<u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"></u:GetSearchCapabilities>"#,
+        );
+        assert_eq!(
+            parse_soap_action(&ouverte).as_deref(),
+            Some("GetSearchCapabilities"),
+            "les deux formes doivent dire la meme action"
+        );
+    }
+
     #[test]
     fn les_capacites_annoncees_ne_sont_plus_vides() {
         // Un SearchCaps VIDE dit « je ne sais rien chercher » — tout en
         // repondant 401 a Search. C'etait le double message qui laissait les
         // clients d'indexation sans recours.
         assert!(!SEARCH_CAPS.is_empty());
-        assert_eq!(SEARCH_CAPS, "upnp:class");
-        assert!(!SEARCH_CAPS.contains("dc:title"));
-        assert!(!SEARCH_CAPS.contains("upnp:artist"));
-        assert!(!SEARCH_CAPS.contains("upnp:album"));
+    }
+
+    /// L'invariant de #2312, tenu dans LES DEUX SENS.
+    ///
+    /// Sens 1 — ne pas annoncer ce qu'on n'evalue pas : chaque champ de
+    /// `SEARCH_CAPS` doit etre accepte par l'evaluateur.
+    /// Sens 2 — ne pas evaluer en silence ce qu'on n'annonce pas : un champ
+    /// absent de `SEARCH_CAPS` doit etre refuse.
+    #[test]
+    fn les_capacites_annoncees_sont_toutes_evaluees() {
+        for champ in SEARCH_CAPS.split(',') {
+            let critere = if champ == "upnp:class" {
+                format!("{champ} = \"object.item.audioItem.musicTrack\"")
+            } else {
+                format!("{champ} contains \"x\"")
+            };
+            assert!(
+                evaluer_criteres(&critere).is_ok(),
+                "{champ} est annonce dans SEARCH_CAPS mais l'evaluateur le refuse"
+            );
+        }
+        for champ in ["upnp:artist", "upnp:album", "dc:creator", "upnp:genre"] {
+            assert!(
+                !SEARCH_CAPS.contains(champ),
+                "{champ} est annonce sans etre evalue"
+            );
+            assert!(
+                evaluer_criteres(&format!("{champ} contains \"x\"")).is_err(),
+                "{champ} n'est pas annonce, il doit etre refuse (708)"
+            );
+        }
+    }
+
+    #[test]
+    fn un_predicat_de_titre_est_reconnu() {
+        let c = evaluer_criteres("dc:title contains \"Kind of Blue\"").unwrap();
+        assert!(c.classe_correspond);
+        assert_eq!(
+            c.titres,
+            vec![PredicatTitre {
+                op: OpTitre::Contient,
+                valeur: "Kind of Blue".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn la_conjonction_classe_et_titre_est_reconnue() {
+        let c = evaluer_criteres(
+            "upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"So What\"",
+        )
+        .unwrap();
+        assert!(c.classe_correspond);
+        assert_eq!(c.titres.len(), 1);
+        assert_eq!(c.titres[0].valeur, "So What");
+    }
+
+    /// Un titre peut contenir « and ». Couper dessus ferait chercher un
+    /// morceau de phrase, sans que rien ne le signale.
+    #[test]
+    fn le_and_a_l_interieur_des_guillemets_n_est_pas_un_separateur() {
+        let c = evaluer_criteres("dc:title contains \"Peaches and Cream\"").unwrap();
+        assert_eq!(c.titres.len(), 1);
+        assert_eq!(c.titres[0].valeur, "Peaches and Cream");
+    }
+
+    /// Ce qu'on ne sait pas evaluer doit etre REFUSE, pas approxime : c'est
+    /// tout l'objet de #2312.
+    #[test]
+    fn ce_qui_n_est_pas_evalue_est_refuse() {
+        for critere in [
+            "dc:title contains \"a\" or dc:title contains \"b\"",
+            "(dc:title contains \"a\")",
+            "upnp:artist = \"Miles Davis\"",
+            "dc:title exists true",
+            "dc:title contains \"pas de guillemet fermant",
+            "and dc:title contains \"a\"",
+        ] {
+            assert!(
+                evaluer_criteres(critere).is_err(),
+                "ce critere devait etre refuse : {critere}"
+            );
+        }
+    }
+
+    #[test]
+    fn le_filtre_de_titre_ignore_casse_et_accents() {
+        let p = PredicatTitre {
+            op: OpTitre::Contient,
+            valeur: "ELEGIE".into(),
+        };
+        assert!(p.satisfait("Élégie pour un ami"));
+        assert!(!p.satisfait("Nocturne"));
+
+        let negatif = PredicatTitre {
+            op: OpTitre::NeContientPas,
+            valeur: "live".into(),
+        };
+        assert!(negatif.satisfait("So What"));
+        assert!(!negatif.satisfait("So What (Live)"));
+    }
+
+    /// Un predicat negatif ne reduit rien : il ne peut pas servir de
+    /// pre-filtre SQL, sans quoi on lirait la table entiere en memoire.
+    #[test]
+    fn un_predicat_negatif_ne_prefiltre_pas() {
+        assert_eq!(
+            PredicatTitre {
+                op: OpTitre::Contient,
+                valeur: "blue".into()
+            }
+            .valeur_prefiltrante(),
+            Some("blue")
+        );
+        assert_eq!(
+            PredicatTitre {
+                op: OpTitre::NeContientPas,
+                valeur: "live".into()
+            }
+            .valeur_prefiltrante(),
+            None
+        );
+    }
+
+    #[test]
+    fn la_recherche_par_titre_restreint_dans_un_album() {
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        let track_repo = TrackRepo::with_backend(backend.clone());
+        let blue_id = album_repo
+            .create(&crate::db::models::Album::new("Kind of Blue".into()))
+            .unwrap();
+
+        for titre in ["So What", "So What (Live)", "Blue in Green"] {
+            let mut t = Track::new(titre.into());
+            t.album_id = Some(blue_id);
+            t.album_title = Some("Kind of Blue".into());
+            t.file_path = Some(format!("/music/{titre}.flac"));
+            track_repo.create(&t).unwrap();
+        }
+
+        let state = UpnpState::new(backend, 8888, None);
+        let criteres =
+            evaluer_criteres("dc:title contains \"So What\" and dc:title doesNotContain \"Live\"")
+                .unwrap();
+        let result = search_tracks_in_container(
+            &state,
+            &format!("album/{blue_id}"),
+            0,
+            100,
+            "http://127.0.0.1:8888",
+            &criteres.titres,
+        )
+        .unwrap();
+
+        assert_eq!(result.total, 1, "{}", result.xml);
+        assert!(result.xml.contains("So What"), "{}", result.xml);
+        assert!(!result.xml.contains("Live"), "{}", result.xml);
+        assert!(!result.xml.contains("Blue in Green"), "{}", result.xml);
     }
 }
