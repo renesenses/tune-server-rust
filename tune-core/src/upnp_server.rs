@@ -457,7 +457,7 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
 /// entre autres) s'en servent pour recuperer toutes les pistes en une passe
 /// paginee, bien plus vite qu'un parcours recursif : ils echouaient donc a
 /// synchroniser, sans que rien ne dise pourquoi (Patatorz, fil forum #1516).
-const SEARCH_CAPS: &str = "upnp:class,dc:title,upnp:artist,upnp:album";
+const SEARCH_CAPS: &str = "upnp:class";
 
 /// L'action `Search` de ContentDirectory.
 ///
@@ -474,13 +474,25 @@ const SEARCH_CAPS: &str = "upnp:class,dc:title,upnp:artist,upnp:album";
 /// La pagination est celle de `browse_all_tracks`, deja eprouvee — le client
 /// redemande par tranches, exactement comme sur le conteneur « All Tracks ».
 fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
-    let (_container_id, criteria, start, count) = parse_search_request(soap_body);
+    let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
+    if !sort_criteria.trim().is_empty() {
+        return soap_fault(709, "Unsupported or invalid sort criteria");
+    }
+    let class_matches = match evaluate_supported_class_criteria(&criteria) {
+        Ok(matches) => matches,
+        Err(()) => {
+            debug!(criteria = %criteria, "upnp_search_criteria_non_supporte");
+            return soap_fault(708, "Unsupported or invalid search criteria");
+        }
+    };
     let base_url = state.base_url();
 
-    let didl = if criteria_vise_des_pistes(&criteria) {
-        browse_all_tracks(state, start, count, &base_url)
+    let didl = if class_matches {
+        match search_tracks_in_container(state, &container_id, start, count, &base_url) {
+            Some(result) => result,
+            None => return soap_fault(710, "No such container"),
+        }
     } else {
-        debug!(criteria = %criteria, "upnp_search_criteria_hors_portee");
         empty_didl()
     };
 
@@ -502,36 +514,109 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     )
 }
 
-/// Le critere vise-t-il des pistes audio ?
+/// Évalue le sous-ensemble de SearchCriteria réellement annoncé.
 ///
-/// On ne construit PAS un evaluateur d'expressions : on reconnait les formes
-/// que les clients d'indexation emploient reellement, et on refuse le reste
-/// par une liste vide.
+/// Tune annonce uniquement `upnp:class`. Toute expression qui mentionne un
+/// autre champ ou combine plusieurs prédicats reçoit le SOAP 708 prévu par
+/// ContentDirectory, au lieu de rendre mensongèrement toute la bibliothèque.
 ///
-/// `*` est la recherche universelle (« tout ce que tu as ») : pour un serveur
-/// qui n'expose que de la musique, cela veut dire les pistes.
-fn criteria_vise_des_pistes(criteria: &str) -> bool {
+/// Le booléen indique si la classe fixe de nos éléments
+/// (`object.item.audioItem.musicTrack`) satisfait le prédicat. `*` reste le
+/// raccourci d'indexation historique vers toutes les pistes.
+fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
     let c = criteria.trim();
-    if c.is_empty() || c == "*" {
-        return true;
+    if c == "*" {
+        return Ok(true);
     }
-    let bas = c.to_lowercase();
-    // Une recherche d'IMAGE ou de VIDEO ne doit rien rendre, meme si elle
-    // mentionne `object.item` : sans ce garde, un client recevrait nos pistes
-    // en reponse a une demande de photos.
-    if bas.contains("imageitem") || bas.contains("videoitem") {
-        return false;
+    let parts: Vec<&str> = c.split_whitespace().collect();
+    if parts.len() != 3 || !parts[0].eq_ignore_ascii_case("upnp:class") {
+        return Err(());
     }
-    bas.contains("audioitem") || bas.contains("musictrack") || bas.contains("object.item")
+    let value = parts[2]
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .ok_or(())?
+        .to_ascii_lowercase();
+    let track_class = "object.item.audioitem.musictrack";
+    match parts[1].to_ascii_lowercase().as_str() {
+        "=" => Ok(track_class == value),
+        "!=" => Ok(track_class != value),
+        "contains" => Ok(track_class.contains(&value)),
+        "doesnotcontain" => Ok(!track_class.contains(&value)),
+        "derivedfrom" => Ok((value == "object.item.audioitem" || value == track_class)
+            && (track_class == value || track_class.starts_with(&(value + ".")))),
+        _ => Err(()),
+    }
+}
+
+/// Pistes situées sous le conteneur demandé, avec pagination et total filtré.
+///
+/// Les conteneurs synthétiques racine mènent tous à la même bibliothèque à
+/// plat. Les conteneurs album/artiste restreignent réellement les résultats ;
+/// auparavant leur identifiant était lu puis ignoré et une recherche dans un
+/// album pouvait ressortir toute la discothèque (#2312).
+fn search_tracks_in_container(
+    state: &UpnpState,
+    container_id: &str,
+    start: u64,
+    count: u64,
+    base_url: &str,
+) -> Option<DidlResult> {
+    match container_id {
+        "0" | "tracks" | "artists" | "albums" | "genres" => {
+            Some(browse_all_tracks(state, start, count, base_url))
+        }
+        "radios" => Some(empty_didl()),
+        id if id.starts_with("album/") => {
+            let album_id = id.strip_prefix("album/")?.parse().ok()?;
+            let tracks = TrackRepo::with_backend(state.backend.clone())
+                .list_by_album(album_id)
+                .ok()?;
+            Some(paginate_track_results(tracks, id, start, count, base_url))
+        }
+        id if id.starts_with("artist/") => {
+            let artist_id = id.strip_prefix("artist/")?.parse().ok()?;
+            let tracks = TrackRepo::with_backend(state.backend.clone())
+                .list_by_artist(artist_id)
+                .ok()?;
+            Some(paginate_track_results(tracks, id, start, count, base_url))
+        }
+        _ => None,
+    }
+}
+
+fn paginate_track_results(
+    tracks: Vec<Track>,
+    parent_id: &str,
+    start: u64,
+    count: u64,
+    base_url: &str,
+) -> DidlResult {
+    const MAX_PAGE: usize = 500;
+    let total = tracks.len();
+    let start = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+    let requested = usize::try_from(count).unwrap_or(usize::MAX).min(MAX_PAGE);
+    let end = start.saturating_add(requested).min(total);
+    let page = &tracks[start..end];
+    let mut inner = String::new();
+    for track in page {
+        inner.push_str(&didl_track_item(track, parent_id, base_url));
+    }
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total: total as u64,
+        returned: page.len() as u64,
+    }
 }
 
 /// Les arguments de `Search` : meme forme que `Browse`, avec `ContainerID` et
 /// `SearchCriteria` a la place d'`ObjectID` et `BrowseFlag`.
-fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64) {
+fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64, String) {
     let mut container_id = "0".to_string();
     let mut criteria = String::new();
     let mut start: u64 = 0;
     let mut count: u64 = 100;
+    let mut sort_criteria = String::new();
 
     let mut reader = quick_xml::Reader::from_str(soap_xml);
     reader.config_mut().trim_text(true);
@@ -542,13 +627,28 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64) {
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 current_tag = name.rsplit(':').next().unwrap_or(&name).to_string();
+                if current_tag == "SearchCriteria" {
+                    // `read_text` conserve le contenu brut entier, entites
+                    // comprises. Le lire d'un bloc evite que `&quot;` soit
+                    // emis comme GeneralRef et coupe le critere en morceaux.
+                    criteria = match reader.read_text(e.name()) {
+                        Ok(raw) => {
+                            let decoded = raw.decode().unwrap_or_default().into_owned();
+                            match quick_xml::escape::unescape(&decoded) {
+                                Ok(unescaped) => unescaped.into_owned(),
+                                Err(_) => decoded,
+                            }
+                        }
+                        Err(_) => String::new(),
+                    };
+                    current_tag.clear();
+                }
             }
             Ok(Event::End(_)) => current_tag.clear(),
             Ok(Event::Text(e)) => {
                 let v = e.decode().unwrap_or_default().to_string();
                 match current_tag.as_str() {
                     "ContainerID" => container_id = v,
-                    "SearchCriteria" => criteria = v,
                     "StartingIndex" => start = v.parse().unwrap_or(0),
                     // `RequestedCount = 0` veut dire « tout », comme pour
                     // Browse : le rendre litteralement donnerait zero piste et
@@ -557,6 +657,7 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64) {
                         let n: u64 = v.parse().unwrap_or(100);
                         count = if n == 0 { u64::MAX } else { n };
                     }
+                    "SortCriteria" => sort_criteria = v,
                     _ => {}
                 }
             }
@@ -565,7 +666,7 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64) {
         }
         buf.clear();
     }
-    (container_id, criteria, start, count)
+    (container_id, criteria, start, count, sort_criteria)
 }
 
 fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
@@ -2022,7 +2123,21 @@ mod tests {
         // servie. Ce test attendait un 401 — il encodait l'ancien
         // comportement comme voulu, et c'est justement lui qui laissait les
         // clients d'indexation (JPlay) sans recours.
-        let search_resp = build_browse_response(&state, &soap_body("Search", urn));
+        // `Search` exige ses arguments. Un corps sans `SearchCriteria` doit
+        // désormais recevoir 708 : l'ancien test appelait donc lui-même une
+        // action invalide et masquait le contrat strict que nous annonçons.
+        let search_body = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:Search xmlns:u="{urn}">
+    <ContainerID>0</ContainerID>
+    <SearchCriteria>upnp:class derivedfrom &quot;object.item.audioItem&quot;</SearchCriteria>
+    <Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>1</RequestedCount>
+    <SortCriteria></SortCriteria>
+  </u:Search></s:Body>
+</s:Envelope>"#
+        );
+        let search_resp = build_browse_response(&state, &search_body);
         assert!(search_resp.contains("<u:SearchResponse"), "{search_resp}");
         assert!(!is_soap_fault(&search_resp));
 
@@ -2296,6 +2411,13 @@ mod ssdp_msearch_tests {
 
     const UUID: &str = "uuid:1234";
 
+    fn search_test_state() -> UpnpState {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        UpnpState::new(Arc::new(db), 8888, None)
+    }
+
     #[test]
     fn ssdp_all_recoit_les_trois_identites() {
         let t = msearch_reply_targets("ssdp:all", UUID);
@@ -2351,16 +2473,20 @@ mod ssdp_msearch_tests {
 
     #[test]
     fn les_arguments_de_search_sont_lus() {
-        let (c, crit, start, count) = parse_search_request(&soap_search(
+        let (c, crit, start, count, sort) = parse_search_request(&soap_search(
             "0",
             "upnp:class derivedfrom &quot;object.item.audioItem&quot;",
             50,
             25,
         ));
         assert_eq!(c, "0");
-        assert!(crit.contains("audioItem"), "{crit}");
+        assert_eq!(
+            crit, "upnp:class derivedfrom \"object.item.audioItem\"",
+            "les entites XML doivent etre resolues avant l'evaluation"
+        );
         assert_eq!(start, 50);
         assert_eq!(count, 25);
+        assert!(sort.is_empty());
     }
 
     /// Meme regle que pour Browse : `RequestedCount = 0` veut dire « tout ».
@@ -2369,7 +2495,7 @@ mod ssdp_msearch_tests {
     /// corrige.
     #[test]
     fn requested_count_zero_veut_dire_tout() {
-        let (_, _, _, count) = parse_search_request(&soap_search("0", "*", 0, 0));
+        let (_, _, _, count, _) = parse_search_request(&soap_search("0", "*", 0, 0));
         assert_eq!(count, u64::MAX);
     }
 
@@ -2378,12 +2504,10 @@ mod ssdp_msearch_tests {
         for c in [
             "upnp:class derivedfrom \"object.item.audioItem\"",
             "upnp:class = \"object.item.audioItem.musicTrack\"",
-            "upnp:class derivedfrom \"object.item\"",
             "*",
-            "",
         ] {
             assert!(
-                criteria_vise_des_pistes(c),
+                evaluate_supported_class_criteria(c).unwrap(),
                 "devrait viser des pistes : {c}"
             );
         }
@@ -2398,8 +2522,116 @@ mod ssdp_msearch_tests {
             "upnp:class derivedfrom \"object.item.imageItem\"",
             "upnp:class derivedfrom \"object.item.videoItem.movie\"",
         ] {
-            assert!(!criteria_vise_des_pistes(c), "ne doit rien rendre : {c}");
+            assert_eq!(
+                evaluate_supported_class_criteria(c),
+                Ok(false),
+                "ne doit rien rendre : {c}"
+            );
         }
+    }
+
+    #[test]
+    fn un_predicat_non_annonce_est_refuse_au_lieu_de_tout_rendre() {
+        for c in [
+            "dc:title contains \"Introuvable\"",
+            "upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"Introuvable\"",
+            "",
+        ] {
+            assert_eq!(evaluate_supported_class_criteria(c), Err(()), "{c}");
+        }
+
+        let state = search_test_state();
+        let response = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                "upnp:class derivedfrom &quot;object.item.audioItem&quot; and dc:title contains &quot;Introuvable&quot;",
+                0,
+                100,
+            ),
+        );
+        assert!(
+            response.contains("<errorCode>708</errorCode>"),
+            "{response}"
+        );
+        assert!(!response.contains("<u:SearchResponse"), "{response}");
+    }
+
+    #[test]
+    fn un_tri_non_annonce_est_refuse() {
+        let state = search_test_state();
+        let soap = soap_search(
+            "0",
+            "upnp:class derivedfrom &quot;object.item.audioItem&quot;",
+            0,
+            100,
+        )
+        .replace(
+            "</u:Search>",
+            "<SortCriteria>+dc:title</SortCriteria></u:Search>",
+        );
+        let response = search_action_response(&state, &soap);
+        assert!(
+            response.contains("<errorCode>709</errorCode>"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn search_respecte_le_conteneur_album_et_son_total() {
+        use crate::db::models::Artist;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let artist_repo = ArtistRepo::with_backend(backend.clone());
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        let track_repo = TrackRepo::with_backend(backend.clone());
+
+        let artist_id = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let mut blue = crate::db::models::Album::new("Kind of Blue".into());
+        blue.genre = Some("Jazz".into());
+        blue.artist_id = Some(artist_id);
+        blue.artist_name = Some("Miles Davis".into());
+        let blue_id = album_repo.create(&blue).unwrap();
+        let mut wall = crate::db::models::Album::new("The Wall".into());
+        wall.genre = Some("Rock".into());
+        wall.artist_id = Some(artist_id);
+        wall.artist_name = Some("Miles Davis".into());
+        let wall_id = album_repo.create(&wall).unwrap();
+
+        let mut so_what = Track::new("So What".into());
+        so_what.album_id = Some(blue_id);
+        so_what.album_title = Some("Kind of Blue".into());
+        so_what.artist_id = Some(artist_id);
+        so_what.artist_name = Some("Miles Davis".into());
+        so_what.file_path = Some("/music/so-what.flac".into());
+        track_repo.create(&so_what).unwrap();
+
+        let mut money = Track::new("Money".into());
+        money.album_id = Some(wall_id);
+        money.album_title = Some("The Wall".into());
+        money.artist_id = Some(artist_id);
+        money.artist_name = Some("Miles Davis".into());
+        money.file_path = Some("/music/money.flac".into());
+        track_repo.create(&money).unwrap();
+
+        let state = UpnpState::new(backend, 8888, None);
+        let result = search_tracks_in_container(
+            &state,
+            &format!("album/{blue_id}"),
+            0,
+            100,
+            "http://127.0.0.1:8888",
+        )
+        .unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.returned, 1);
+        assert!(result.xml.contains("So What"), "{}", result.xml);
+        assert!(!result.xml.contains("Money"), "{}", result.xml);
     }
 
     #[test]
@@ -2408,6 +2640,9 @@ mod ssdp_msearch_tests {
         // repondant 401 a Search. C'etait le double message qui laissait les
         // clients d'indexation sans recours.
         assert!(!SEARCH_CAPS.is_empty());
-        assert!(SEARCH_CAPS.contains("upnp:class"));
+        assert_eq!(SEARCH_CAPS, "upnp:class");
+        assert!(!SEARCH_CAPS.contains("dc:title"));
+        assert!(!SEARCH_CAPS.contains("upnp:artist"));
+        assert!(!SEARCH_CAPS.contains("upnp:album"));
     }
 }

@@ -727,9 +727,36 @@ jobs:
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
           notarize_failed() {
-            echo "::error::Notarisation refusée par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
+            echo "::error::Notarisation REFUSÉE par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
             rm -f "$DMG_NAME"
             exit 1
+          }
+          # Le ticket n'existe pas à l'instant où Apple répond « Accepted » :
+          # il apparaît sur son CDN quelques secondes plus tard. D'ici là
+          # `stapler` rend « could not find ticket » — et comme cette étape
+          # tourne sous `bash -e`, elle mourait là, en emportant un DMG
+          # PARFAITEMENT notarisé.
+          #
+          # Vécu sur v0.9.102 : soumission créée à 21:50:07, acceptée par
+          # Apple, étape morte à 21:50:15. Onze secondes en tout — ni un refus
+          # (Apple a dit oui), ni le plafond de 600 s (il n'a pas eu le temps
+          # de s'écouler). Le DMG Intel a été supprimé pour rien.
+          #
+          # Cinq essais, 10 s puis 20, 30, 40 : cent secondes d'attente au
+          # pire, dans un job plafonné à 75 minutes.
+          staple_avec_reprises() {
+            local essai
+            for essai in 1 2 3 4 5; do
+              if xcrun stapler staple "$DMG_NAME"; then
+                echo "Ticket agrafé (essai $essai/5)."
+                return 0
+              fi
+              if [ "$essai" -lt 5 ]; then
+                echo "Ticket pas encore publié par Apple — nouvel essai dans ${essai}0 s ($essai/5)."
+                sleep "${essai}0"
+              fi
+            done
+            return 1
           }
           if [ -n "$ASC_API_KEY_P8" ]; then
             KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
@@ -752,7 +779,14 @@ jobs:
             echo "No notarization credentials, skipping notarization"
             exit 0
           fi
-          xcrun stapler staple "$DMG_NAME"
+          # Un DMG non tamponné ne doit JAMAIS sortir : Gatekeeper le refuserait
+          # chez l'utilisateur, ce qui est pire qu'un fichier absent. Mais on
+          # ne le jette qu'après avoir vraiment essayé.
+          if ! staple_avec_reprises; then
+            echo "::error::Notarisation ACCEPTÉE par Apple, mais ticket non agrafé après 5 essais — le DMG ne sera pas publié. Relancer ce job sur le tag suffit : la soumission est déjà acceptée côté Apple."
+            rm -f "$DMG_NAME"
+            exit 1
+          fi
 
       # `always()` : les artefacts déjà construits partent même si la
       # notarisation a échoué. Le DMG a été supprimé juste au-dessus dans ce

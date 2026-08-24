@@ -30,6 +30,11 @@ pub fn router() -> Router<AppState> {
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
         .route("/new-in-library", get(new_in_library))
+        .route("/other-versions", get(other_versions))
+        .route(
+            "/artist-releases",
+            get(super::artist_releases::artist_releases),
+        )
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
 }
@@ -461,6 +466,118 @@ async fn new_in_library(
         })
         .collect();
     Ok(Json(json!(items)))
+}
+
+/// `GET /home/other-versions` — les autres versions, DANS LA BIBLIOTHEQUE, des
+/// morceaux ecoutes RECEMMENT.
+///
+/// ## Pourquoi les N dernieres ecoutes, et non « aujourd'hui »
+///
+/// La premiere version bornait sur le jour CIVIL, en UTC. Deux defauts, vus
+/// des la mise en service :
+///
+/// 1. **Minuit UTC coupe la soiree.** A 10 h du matin en France, tout ce qui
+///    a ete ecoute la veille apres 2 h — donc toute la soiree — etait deja
+///    hors fenetre. Le jour civil de l'utilisateur ne commence pas a la meme
+///    heure que celui du serveur, et le fuseau du navigateur n'arrive pas
+///    jusqu'ici.
+/// 2. **Un jour ordinaire ne contient pas assez de matiere.** Mesure sur une
+///    bibliotheque reelle : UNE ecoute dans la fenetre, et donc une section
+///    vide la plupart du temps.
+///
+/// J'avais justifie l'UTC en invoquant le correctif des horaires de favoris
+/// radio (#2179). C'etait un mauvais raisonnement : ce defaut-la portait sur
+/// l'AFFICHAGE d'un horodatage, pas sur la definition d'une journee.
+///
+/// Les N dernieres ecoutes n'ont ni fuseau ni bord de journee. La fenetre ne
+/// glisse pas, ne depend d'aucune horloge, et contient toujours de la matiere.
+///
+/// Le cas concret : on ecoute « Ordinary World » depuis The Wedding Album, et
+/// on possede aussi la version acoustique sur une compilation. Rien ne le dit
+/// aujourd'hui — il faut chercher le titre a la main pour s'en apercevoir.
+///
+/// ## Ce que cette route fait, et ce qu'elle ne fait PAS
+///
+/// Elle rapproche **titre + artiste**, et ne retient que les pistes d'un
+/// **autre album** que celui ecoute. C'est volontairement etroit :
+///
+/// - pas de reprises par un autre interprete (« Comme d'habitude » / « My Way ») :
+///   cela demande les relations d'oeuvre de MusicBrainz, donc un MBID, et la
+///   couverture MBID de la bibliotheque est encore trop faible pour que le
+///   resultat soit autre chose qu'un hasard ;
+/// - pas de versions Qobuz : il faudrait une recherche par morceau ecoute,
+///   donc autant d'appels au service, avec le plafond de requetes que cela
+///   suppose. A brancher quand la section aura fait ses preuves en local.
+///
+/// Le rapprochement est insensible a la casse mais **exact** sur le titre. Un
+/// « (Live) » colle au titre ne sera pas rapproche : mieux vaut ne rien
+/// proposer qu'un rapprochement faux.
+async fn other_versions(
+    State(state): State<AppState>,
+    Query(p): Query<HomeParams>,
+) -> Result<Json<Value>, AppError> {
+    // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
+    // venir tel quel de l'URL.
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    // Le vivier d'ecoutes examine. Large devant `limit` : beaucoup de morceaux
+    // n'ont aucune autre version, il en faut donc bien plus que de groupes
+    // souhaites pour en remplir quelques-uns.
+    const ECOUTES_EXAMINEES: usize = 200;
+
+    // `listened_at` est ordonne comme chaine (ISO-8601), donc `ORDER BY` suffit
+    // pour prendre les dernieres : aucun cast de date, donc aucun ecart entre
+    // SQLite et PostgreSQL.
+    let sql = format!(
+        "SELECT DISTINCT lh.title, lh.artist_name, lh.album_title, \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms \
+        FROM (SELECT title, artist_name, album_title, listened_at \
+              FROM listen_history \
+              WHERE artist_name IS NOT NULL \
+              ORDER BY listened_at DESC \
+              LIMIT {ECOUTES_EXAMINEES}) lh \
+        JOIN tracks t ON LOWER(t.title) = LOWER(lh.title) \
+        JOIN albums al ON t.album_id = al.id \
+        LEFT JOIN artists ar ON al.artist_id = ar.id \
+        WHERE LOWER(COALESCE(ar.name, '')) = LOWER(lh.artist_name) \
+          AND LOWER(COALESCE(al.title, '')) <> LOWER(COALESCE(lh.album_title, '')) \
+        ORDER BY lh.listened_at DESC \
+        LIMIT {limit}"
+    );
+
+    // Une piste ecoutee, ses autres versions : on regroupe cote serveur pour
+    // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
+    // chacun des trois clients).
+    let mut groupes: Vec<Value> = Vec::new();
+    for cols in state.backend.query_many(&sql, &[]).unwrap_or_default() {
+        let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+        let joue = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+        let version = json!({
+            "track_id": cols.get(3).and_then(|v| v.as_i64()),
+            "album_id": cols.get(4).and_then(|v| v.as_i64()),
+            "album_title": cols.get(5).and_then(|v| v.as_string()),
+            "cover_path": cols.get(6).and_then(|v| v.as_string()),
+            "duration_ms": cols.get(7).and_then(|v| v.as_i64()),
+        });
+        match groupes.iter_mut().find(|g| {
+            g["title"].as_str() == Some(titre.as_str())
+                && g["artist_name"].as_str() == Some(artiste.as_str())
+        }) {
+            Some(g) => {
+                if let Some(arr) = g["versions"].as_array_mut() {
+                    arr.push(version);
+                }
+            }
+            None => groupes.push(json!({
+                "title": titre,
+                "artist_name": artiste,
+                "played_album": joue,
+                "versions": [version],
+            })),
+        }
+    }
+
+    Ok(Json(json!(groupes)))
 }
 
 /// Favorite radios + recently played radios.

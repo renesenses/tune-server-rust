@@ -163,3 +163,50 @@ fn le_plafond_de_letape_apt_laisse_passer_les_trois_essais() {
         }
     }
 }
+
+/// Le tamponnage du DMG macOS doit REESSAYER.
+///
+/// Apple repond « Accepted » avant que le ticket ne soit publie sur son CDN.
+/// Pendant ces quelques secondes, `xcrun stapler staple` rend « could not find
+/// ticket ». L'etape tournant sous `bash -e`, un unique appel la faisait mourir
+/// — et le garde-fou supprimait alors un DMG PARFAITEMENT notarise.
+///
+/// Vecu sur v0.9.102 : soumission acceptee par Apple a 21:50:07, etape morte a
+/// 21:50:15. Onze secondes : ni un refus, ni le plafond de 600 s.
+///
+/// Ce test verrouille la boucle. Retirer les reprises le rend ROUGE.
+#[test]
+fn le_tamponnage_du_dmg_reessaie() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(racine.join("../.github/workflows/release.yml"))
+        .expect("release.yml lisible");
+
+    let debut = source
+        .find("- name: Notarize DMG (macOS)")
+        .expect("l'etape « Notarize DMG (macOS) » a disparu de release.yml");
+    // L'etape s'arrete au prochain element de la liste, au meme niveau.
+    let reste = &source[debut + 1..];
+    let fin = reste
+        .find("\n      - ")
+        .map(|i| debut + 1 + i)
+        .unwrap_or(source.len());
+    let etape = &source[debut..fin];
+
+    assert!(
+        etape.contains("stapler staple"),
+        "l'etape de notarisation ne tamponne plus le DMG"
+    );
+    assert!(
+        etape.contains("for essai in"),
+        "`stapler staple` n'est plus dans une boucle de reprises : une course \
+         de quelques secondes chez Apple recommencera a couter le DMG macOS a \
+         chaque release.\n\
+         L'etape lue :\n{etape}"
+    );
+    // Une boucle qui n'attend pas entre deux essais ne sert a rien : le ticket
+    // met quelques secondes a apparaitre, pas quelques microsecondes.
+    assert!(
+        etape.contains("sleep"),
+        "la boucle de reprises n'attend pas entre deux essais"
+    );
+}
