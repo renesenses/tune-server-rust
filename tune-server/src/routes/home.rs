@@ -469,7 +469,28 @@ async fn new_in_library(
 }
 
 /// `GET /home/other-versions` — les autres versions, DANS LA BIBLIOTHEQUE, des
-/// morceaux ecoutes aujourd'hui.
+/// morceaux ecoutes RECEMMENT.
+///
+/// ## Pourquoi les N dernieres ecoutes, et non « aujourd'hui »
+///
+/// La premiere version bornait sur le jour CIVIL, en UTC. Deux defauts, vus
+/// des la mise en service :
+///
+/// 1. **Minuit UTC coupe la soiree.** A 10 h du matin en France, tout ce qui
+///    a ete ecoute la veille apres 2 h — donc toute la soiree — etait deja
+///    hors fenetre. Le jour civil de l'utilisateur ne commence pas a la meme
+///    heure que celui du serveur, et le fuseau du navigateur n'arrive pas
+///    jusqu'ici.
+/// 2. **Un jour ordinaire ne contient pas assez de matiere.** Mesure sur une
+///    bibliotheque reelle : UNE ecoute dans la fenetre, et donc une section
+///    vide la plupart du temps.
+///
+/// J'avais justifie l'UTC en invoquant le correctif des horaires de favoris
+/// radio (#2179). C'etait un mauvais raisonnement : ce defaut-la portait sur
+/// l'AFFICHAGE d'un horodatage, pas sur la definition d'une journee.
+///
+/// Les N dernieres ecoutes n'ont ni fuseau ni bord de journee. La fenetre ne
+/// glisse pas, ne depend d'aucune horloge, et contient toujours de la matiere.
 ///
 /// Le cas concret : on ecoute « Ordinary World » depuis The Wedding Album, et
 /// on possede aussi la version acoustique sur une compilation. Rien ne le dit
@@ -498,23 +519,28 @@ async fn other_versions(
     // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
     // venir tel quel de l'URL.
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
-    let depuis = debut_de_journee();
+    // Le vivier d'ecoutes examine. Large devant `limit` : beaucoup de morceaux
+    // n'ont aucune autre version, il en faut donc bien plus que de groupes
+    // souhaites pour en remplir quelques-uns.
+    const ECOUTES_EXAMINEES: usize = 200;
 
-    // `listened_at` est stocke en ISO-8601 UTC (« 2026-08-23T18:00:00Z ») :
-    // une comparaison de chaines suffit et reste ordonnee, ce qui evite un
-    // cast de date different entre SQLite et PostgreSQL.
+    // `listened_at` est ordonne comme chaine (ISO-8601), donc `ORDER BY` suffit
+    // pour prendre les dernieres : aucun cast de date, donc aucun ecart entre
+    // SQLite et PostgreSQL.
     let sql = format!(
         "SELECT DISTINCT lh.title, lh.artist_name, lh.album_title, \
                 t.id, al.id, al.title, al.cover_path, t.duration_ms \
-        FROM listen_history lh \
+        FROM (SELECT title, artist_name, album_title, listened_at \
+              FROM listen_history \
+              WHERE artist_name IS NOT NULL \
+              ORDER BY listened_at DESC \
+              LIMIT {ECOUTES_EXAMINEES}) lh \
         JOIN tracks t ON LOWER(t.title) = LOWER(lh.title) \
         JOIN albums al ON t.album_id = al.id \
         LEFT JOIN artists ar ON al.artist_id = ar.id \
-        WHERE lh.listened_at >= '{depuis}' \
-          AND lh.artist_name IS NOT NULL \
-          AND LOWER(COALESCE(ar.name, '')) = LOWER(lh.artist_name) \
+        WHERE LOWER(COALESCE(ar.name, '')) = LOWER(lh.artist_name) \
           AND LOWER(COALESCE(al.title, '')) <> LOWER(COALESCE(lh.album_title, '')) \
-        ORDER BY lh.title \
+        ORDER BY lh.listened_at DESC \
         LIMIT {limit}"
     );
 
@@ -552,42 +578,6 @@ async fn other_versions(
     }
 
     Ok(Json(json!(groupes)))
-}
-
-/// Minuit UTC du jour courant, au format de `listen_history.listened_at`.
-///
-/// Volontairement en UTC, comme la colonne : passer par l'heure locale ferait
-/// glisser la fenetre d'une ou deux heures selon la saison, et c'est
-/// exactement le defaut corrige sur les horaires des favoris radio (#2179).
-fn debut_de_journee() -> String {
-    let secondes = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let jour = secondes - (secondes % 86_400);
-    horodatage_iso(jour)
-}
-
-/// `YYYY-MM-DDT00:00:00Z` a partir d'un nombre de secondes depuis l'epoque.
-///
-/// Ecrit a la main plutot qu'avec `chrono` : la conversion se limite a une
-/// date a minuit, et l'algorithme des jours civils est celui de Howard
-/// Hinnant, verifie par les tests plus bas sur des annees bissextiles et des
-/// bascules de siecle.
-fn horodatage_iso(secondes: u64) -> String {
-    let jours = (secondes / 86_400) as i64 + 719_468;
-    let ere = if jours >= 0 { jours } else { jours - 146_096 } / 146_097;
-    let jour_de_lere = jours - ere * 146_097;
-    let annee_de_lere =
-        (jour_de_lere - jour_de_lere / 1460 + jour_de_lere / 36_524 - jour_de_lere / 146_096) / 365;
-    let annee = annee_de_lere + ere * 400;
-    let jour_de_lannee =
-        jour_de_lere - (365 * annee_de_lere + annee_de_lere / 4 - annee_de_lere / 100);
-    let mp = (5 * jour_de_lannee + 2) / 153;
-    let jour = jour_de_lannee - (153 * mp + 2) / 5 + 1;
-    let mois = if mp < 10 { mp + 3 } else { mp - 9 };
-    let annee = if mois <= 2 { annee + 1 } else { annee };
-    format!("{annee:04}-{mois:02}-{jour:02}T00:00:00Z")
 }
 
 /// Favorite radios + recently played radios.
@@ -694,48 +684,4 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
         "services": highlights,
         "preferred_service": preferred_service,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::horodatage_iso;
-
-    /// L'epoque elle-meme : le cas ou une erreur de constante se voit tout de
-    /// suite.
-    #[test]
-    fn lepoque_est_le_1er_janvier_1970() {
-        assert_eq!(horodatage_iso(0), "1970-01-01T00:00:00Z");
-    }
-
-    /// Le 29 fevrier d'une annee bissextile ordinaire.
-    #[test]
-    fn une_annee_bissextile_a_bien_un_29_fevrier() {
-        // 2024-02-29T00:00:00Z
-        assert_eq!(horodatage_iso(1_709_164_800), "2024-02-29T00:00:00Z");
-    }
-
-    /// 2000 est bissextile (divisible par 400) alors que 1900 ne l'est pas :
-    /// c'est la regle que les conversions ecrites a la main ratent.
-    #[test]
-    fn lan_2000_est_bissextile() {
-        // 2000-02-29T00:00:00Z
-        assert_eq!(horodatage_iso(951_782_400), "2000-02-29T00:00:00Z");
-    }
-
-    /// Un jour quelconque, pour verrouiller le decalage general.
-    #[test]
-    fn un_jour_courant_tombe_juste() {
-        // 2026-08-23T00:00:00Z
-        assert_eq!(horodatage_iso(1_787_443_200), "2026-08-23T00:00:00Z");
-    }
-
-    /// Toute seconde de la journee doit rendre LE MEME jour : c'est ce qui
-    /// fait que la fenetre « aujourd'hui » ne glisse pas d'une requete a
-    /// l'autre.
-    #[test]
-    fn toutes_les_secondes_dun_jour_rendent_le_meme_jour() {
-        let minuit = 1_787_443_200u64;
-        assert_eq!(horodatage_iso(minuit), horodatage_iso(minuit + 86_399));
-        assert_ne!(horodatage_iso(minuit), horodatage_iso(minuit + 86_400));
-    }
 }
