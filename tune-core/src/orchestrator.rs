@@ -2172,8 +2172,20 @@ impl PlaybackOrchestrator {
             // `dop` n'est pas du passthrough : le renderer doit recevoir le DSD
             // emballe en trames PCM, pas le .dsf brut.
             "dop" => false,
-            // Choix explicite : on ne le renverse que sur un NON explicite.
-            "native" => annonce != Some(false),
+            // Choix explicite : la parole de l'utilisateur, TOUJOURS.
+            //
+            // La version precedente cedait devant un « non » du Sink
+            // (`annonce != Some(false)`, #2122). Le terrain l'a dementie :
+            // l'Eversolo DMP-A8 annonce 392 formats dans son GetProtocolInfo,
+            // AUCUN DSD — et joue le .dsf brut qu'on lui envoie. Un Sink qui
+            // omet un format n'est pas un refus, meme quand il a l'air
+            // exhaustif : une absence n'est pas une preuve.
+            //
+            // `native` n'est pas un reglage d'usine : quelqu'un l'a choisi,
+            // pour CE renderer. Si la zone reste muette, c'est ce reglage
+            // qu'il faut changer — et le journal le dit — pas le serveur qui
+            // decide en silence de convertir.
+            "native" => true,
             // `auto` : sans reponse claire, on prend le chemin sur.
             _ => annonce.unwrap_or(false),
         }
@@ -2200,13 +2212,14 @@ impl PlaybackOrchestrator {
             "dsd_passthrough_decide"
         );
         if dsd_mode == "native" && annonce == Some(false) {
-            tracing::warn!(
+            tracing::info!(
                 zone_id,
                 device_id,
-                "dsd_native_demande_mais_le_renderer_ne_l_annonce_pas — repli sur \
-                 une conversion PCM. Sans ce repli, le flux DSD brut partirait vers \
-                 un appareil incapable de le lire, et la zone resterait \
-                 silencieuse (#2122)."
+                "dsd_natif_sans_annonce_du_renderer — le Sink n'annonce pas de \
+                 DSD, on envoie le flux brut QUAND MEME : « natif » est un \
+                 reglage explicite, et des renderers lisent le DSD sans \
+                 l'annoncer (Eversolo DMP-A8). Si la zone reste muette, passer \
+                 le mode DSD de la zone en « auto » ou « pcm »."
             );
         }
         passthrough
@@ -9286,12 +9299,15 @@ mod transcode_budget_tests {
 mod dsd_passthrough_tests {
     use super::PlaybackOrchestrator as O;
 
-    /// Le defaut qui a rendu la zone muette : `native` reglé a la main, un
-    /// renderer qui repond noir sur blanc qu'il ne lit pas de DSD, et le flux
-    /// brut qui partait quand meme. Le repli PCM prime desormais.
+    /// La parole de l'utilisateur prime sur le Sink — le terrain l'a exige.
+    ///
+    /// L'Eversolo DMP-A8 annonce 392 formats dans son GetProtocolInfo, aucun
+    /// DSD — et JOUE le .dsf brut. La version precedente de cette regle cedait
+    /// devant ce « non » apparent et convertissait en PCM un flux que le
+    /// renderer savait lire. Un Sink qui omet un format n'est pas un refus.
     #[test]
-    fn native_cede_devant_un_refus_explicite() {
-        assert!(!O::decider_passthrough_dsd("native", Some(false)));
+    fn la_parole_de_lutilisateur_prime_sur_le_sink() {
+        assert!(O::decider_passthrough_dsd("native", Some(false)));
     }
 
     /// La faute symetrique, celle qu'on ne veut PAS commettre en corrigeant :
