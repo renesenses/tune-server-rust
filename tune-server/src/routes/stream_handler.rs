@@ -463,18 +463,18 @@ pub async fn handle_stream(
             // below (subscribe-then-check + biased select) guarantees the older
             // one stops without pulling a further chunk, so no chunk is split,
             // lost, or duplicated at the hand-off.
-            let my_epoch = session.claim_radio_consumer();
+            let my_epoch = session.claim_channel_consumer();
             loop {
                 // Subscribe to the supersede signal and register the waiter
                 // BEFORE checking the epoch. The epoch bump in
-                // claim_radio_consumer happens-before its notify, so a newer
+                // claim_channel_consumer happens-before its notify, so a newer
                 // consumer is observed either as a wake here or as a stale epoch
-                // in the check below — never lost. See claim_radio_consumer.
+                // in the check below — never lost. See claim_channel_consumer.
                 let superseded = session.consumer_supersede.notified();
                 tokio::pin!(superseded);
                 superseded.as_mut().enable();
 
-                if !session.is_current_radio_consumer(my_epoch) {
+                if !session.is_current_channel_consumer(my_epoch) {
                     // A newer connection took over. Hand off WITHOUT consuming
                     // another chunk (biased select never let recv win a race
                     // against this check either).
@@ -525,16 +525,99 @@ pub async fn handle_stream(
             // chance of buffer underrun.
             const MIN_HTTP_CHUNK: usize = 65536;
             let mut coalesce_buf = Vec::with_capacity(MIN_HTTP_CHUNK * 2);
-            while let Some(chunk) = session.recv_chunk().await {
-                coalesce_buf.extend_from_slice(&chunk);
-                while coalesce_buf.len() >= MIN_HTTP_CHUNK {
-                    let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
-                    yield Ok(bytes::Bytes::from(flushed));
-                }
+
+            // ── Une seule connexion possède le canal — comme pour les radios ──
+            //
+            // Le canal PCM ne se lit qu'UNE fois. Un renderer qui sonde avant de
+            // jouer (DMP-A8 : `bytes=0-`, `bytes=44-`, `bytes=0-` en 40 ms)
+            // laissait plusieurs connexions tirer dessus EN MÊME TEMPS : chaque
+            // chunk partait vers l'une OU l'autre, et la connexion de lecture ne
+            // recevait qu'une fraction du signal. Affamé, le renderer rejouait
+            // son tampon interne — la « boucle de 4-7 secondes » entendue sur
+            // tout DSD converti (le DSF servi brut passait par `serve_file`,
+            // avec Range, et n'a jamais eu ce défaut ; c'est le repli PCM de
+            // #2152 qui a mis les DSD sur ce chemin-ci).
+            //
+            // Même mécanisme d'époque que les radios : la DERNIÈRE connexion
+            // prend le canal, les précédentes s'arrêtent sans consommer un
+            // chunk de plus.
+            let my_epoch = session.claim_channel_consumer();
+
+            // ── L'en-tête WAV doit survivre aux connexions de sonde ──
+            //
+            // Sur une conversion, l'en-tête est le premier chunk DU CANAL : la
+            // connexion de sonde le consomme et la connexion de lecture ne voit
+            // que du PCM nu — injouable. Celui qui le voit passer le met de
+            // côté ; toute connexion suivante partant de l'octet 0 le reçoit
+            // d'abord. `bytes=44-` dit explicitement « je l'ai déjà » : on ne
+            // le renvoie pas.
+            let saute_entete = req_headers
+                .get("Range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_range_start)
+                .is_some_and(|s| s >= 44);
+            if is_wav
+                && wav_header_included
+                && !saute_entete
+                && let Some(entete) = session.wav_header_stash.get()
+            {
+                yield Ok(bytes::Bytes::from(entete.clone()));
             }
-            // Flush any remaining bytes at end of stream
-            if !coalesce_buf.is_empty() {
-                yield Ok(bytes::Bytes::from(coalesce_buf));
+
+            loop {
+                let superseded = session.consumer_supersede.notified();
+                tokio::pin!(superseded);
+                superseded.as_mut().enable();
+
+                if !session.is_current_channel_consumer(my_epoch) {
+                    info!(
+                        stream_id = %session.id,
+                        "finite_stream_superseded — le canal passe à une connexion plus récente"
+                    );
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+                    _ = &mut superseded => continue,
+                    maybe_chunk = session.recv_chunk() => {
+                        let Some(chunk) = maybe_chunk else {
+                            // Canal fermé : fin de piste. Vider ce qui reste.
+                            if !coalesce_buf.is_empty() {
+                                let restant = std::mem::take(&mut coalesce_buf);
+                                yield Ok(bytes::Bytes::from(restant));
+                            }
+                            break;
+                        };
+                        // Mettre l'en-tête de côté au passage, pour les
+                        // connexions suivantes. `set` n'écrit qu'une fois.
+                        if is_wav
+                            && wav_header_included
+                            && chunk.len() >= 44
+                            && chunk.starts_with(b"RIFF")
+                            && session.wav_header_stash.get().is_none()
+                        {
+                            let _ = session.wav_header_stash.set(chunk[..44].to_vec());
+                            // La connexion qui a demandé `bytes=44-` ne veut
+                            // PAS l'en-tête : on ne transmet que la suite.
+                            if saute_entete {
+                                if chunk.len() > 44 {
+                                    coalesce_buf.extend_from_slice(&chunk[44..]);
+                                }
+                                while coalesce_buf.len() >= MIN_HTTP_CHUNK {
+                                    let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
+                                    yield Ok(bytes::Bytes::from(flushed));
+                                }
+                                continue;
+                            }
+                        }
+                        coalesce_buf.extend_from_slice(&chunk);
+                        while coalesce_buf.len() >= MIN_HTTP_CHUNK {
+                            let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
+                            yield Ok(bytes::Bytes::from(flushed));
+                        }
+                    }
+                }
             }
         }
     };
@@ -1163,6 +1246,146 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::{accepts_chunked_live_stream, corps_compte, parse_range_start};
+
+    /// La sonde du DMP-A8, en modèle réduit : une connexion ouvre le flux
+    /// d'une conversion (DSD→WAV), puis une seconde arrive pendant que la
+    /// première lit encore.
+    ///
+    /// Avant ce correctif, les deux tiraient sur le même canal mono-
+    /// consommateur : chaque chunk partait vers l'une OU l'autre, la lecture
+    /// ne recevait qu'une fraction du signal, et le renderer affamé rejouait
+    /// son tampon — la « boucle de 4-7 s » entendue sur tout DSD converti.
+    ///
+    /// Le test vérifie les trois clauses du contrat :
+    /// 1. la SECONDE connexion reçoit l'en-tête WAV — rejoué, puisque le
+    ///    premier exemplaire est parti dans la première connexion ;
+    /// 2. ses chunks sont CONTIGUS — un vol lui ferait des trous ;
+    /// 3. elle reçoit la FIN du flux — c'est elle qui joue.
+    #[tokio::test]
+    async fn une_connexion_de_sonde_ne_vole_plus_une_conversion() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("dsd".into(), info, false, 64));
+        session.wav_header_included.store(true, SeqCst);
+
+        let tx = session.tx.lock().await.clone().expect("tx");
+        // Retirer les émetteurs de la session : la fin du canal sera la chute
+        // de NOTRE clone, comme quand le décodeur termine.
+        session.close_sender().await;
+
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("dsd".to_string(), session.clone())].into_iter().collect(),
+        ));
+
+        // Le décodeur : un en-tête RIFF de 44 octets, puis 40 chunks de
+        // 1 000 octets numérotés en tête (comme le vrai premier chunk DSD,
+        // l'en-tête part DANS le canal).
+        let producteur = tokio::spawn(async move {
+            let mut entete = b"RIFF".to_vec();
+            entete.resize(44, 0);
+            tx.send(entete).await.expect("entete");
+            for i in 0..40u32 {
+                let mut c = i.to_be_bytes().to_vec();
+                c.resize(1_000, 0xAB);
+                tx.send(c).await.expect("chunk");
+                tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+            }
+            // la chute de tx ferme le canal
+        });
+
+        // Connexion 1 — la sonde : elle lit ce qu'on lui donne.
+        let sonde_sessions = sessions.clone();
+        let sonde = tokio::spawn(async move {
+            let rep = super::handle_stream(
+                Path("dsd.wav".into()),
+                State(sonde_sessions),
+                axum::http::HeaderMap::new(),
+            )
+            .await;
+            let mut corps = rep.into_body().into_data_stream();
+            let mut octets = Vec::new();
+            while let Some(Ok(b)) = corps.next().await {
+                octets.extend_from_slice(&b);
+            }
+            octets
+        });
+
+        // La sonde a le temps de consommer l'en-tête et quelques chunks.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Connexion 2 — la lecture.
+        let rep = super::handle_stream(
+            Path("dsd.wav".into()),
+            State(sessions.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+        let mut lecture = Vec::new();
+        while let Some(Ok(b)) = corps.next().await {
+            lecture.extend_from_slice(&b);
+        }
+
+        // 1. L'en-tête est là, rejoué depuis la réserve.
+        assert!(
+            lecture.starts_with(b"RIFF"),
+            "la connexion de lecture n'a pas reçu l'en-tête WAV (longueur {})",
+            lecture.len()
+        );
+        let charge = &lecture[44..];
+        assert!(
+            charge.len() % 1_000 == 0 && !charge.is_empty(),
+            "charge inattendue : {} octets après l'en-tête",
+            charge.len()
+        );
+
+        // 2. Contiguïté : chaque numéro suit le précédent. Un vol par la
+        //    sonde ferait sauter des numéros.
+        let numeros: Vec<u32> = charge
+            .chunks(1_000)
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for paire in numeros.windows(2) {
+            assert_eq!(
+                paire[1],
+                paire[0] + 1,
+                "trou dans le flux de lecture : {} puis {} — une autre connexion a volé les chunks manquants",
+                paire[0],
+                paire[1]
+            );
+        }
+
+        // 3. La fin du flux appartient à la lecture.
+        assert_eq!(
+            numeros.last().copied(),
+            Some(39),
+            "la lecture n'a pas reçu la fin du flux"
+        );
+
+        // La sonde s'est arrêtée d'elle-même (supersédée), sans bloquer.
+        let octets_sonde = tokio::time::timeout(std::time::Duration::from_secs(5), sonde)
+            .await
+            .expect("la sonde aurait dû se terminer une fois supersédée")
+            .expect("join");
+        // La sonde peut n'avoir RIEN émis : ses octets attendaient encore dans
+        // le tampon de coalescence de 64 Ko quand elle a été supersédée, et on
+        // ne vide pas ce tampon vers une connexion qu'on abandonne. Ce qui
+        // compte : si elle a émis, ça commençait par l'en-tête.
+        assert!(
+            octets_sonde.is_empty() || octets_sonde.starts_with(b"RIFF"),
+            "la sonde a émis {} octets qui ne commencent pas par RIFF",
+            octets_sonde.len()
+        );
+        producteur.await.expect("producteur");
+    }
     use tune_core::http::streamer::{
         LIVE_BOUNDED_TOTAL_LEN, StreamInfo, StreamSession, build_wav_header_bounded_live,
         build_wav_header_streaming,
