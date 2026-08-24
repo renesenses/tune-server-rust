@@ -265,6 +265,7 @@ impl DlnaOutput {
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
+            .byte_seekable(media.byte_seekable)
             .dlna_art_profile(true)
             .include_upnp_artist(true)
             .item_id(item_id)

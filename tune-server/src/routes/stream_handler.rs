@@ -173,6 +173,24 @@ pub async fn handle_head(
                 HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
             );
         }
+    } else if session.is_channel().await {
+        // Conversion à la volée : le canal ne rejoue aucun octet passé. Le HEAD
+        // doit dire la même vérité que la DIDL (DLNA.ORG_OP=00) — annoncer
+        // Accept-Ranges ici invite le renderer à seeker un tuyau (DMP-A8,
+        // gel à 0:00 en boucle sur tout DSD converti, 24/08).
+        headers.insert(
+            "transferMode.dlna.org",
+            HeaderValue::from_static("Streaming"),
+        );
+        headers.insert(
+            "contentFeatures.dlna.org",
+            HeaderValue::from_static(
+                "DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            ),
+        );
+        if let Some(size) = file_size {
+            headers.insert("Content-Length", HeaderValue::from(size));
+        }
     } else {
         headers.insert(
             "transferMode.dlna.org",
@@ -297,8 +315,18 @@ pub async fn handle_stream(
         .filter(|s| wav_length.is_none_or(|len| *s < len));
     let use_partial = finite_range_start.is_some() && wav_length.is_some();
 
+    // Pas d'`Accept-Ranges` sur une conversion : ce serait inviter le renderer
+    // à seeker un tuyau. Le contrat annoncé est celui de la DIDL et du HEAD :
+    // DLNA.ORG_OP=00, streaming séquentiel. Les 206 ci-dessous restent pour les
+    // renderers qui sondent (`bytes=0-`, Marantz) ou reprennent une tranche
+    // exacte malgré tout — mieux qu'un 200 menteur, jamais une invitation.
     if let Some(len) = wav_length {
-        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        headers.insert(
+            "contentFeatures.dlna.org",
+            HeaderValue::from_static(
+                "DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            ),
+        );
         match finite_range_start {
             Some(start) => {
                 headers.insert("Content-Length", HeaderValue::from(len - start));
@@ -1454,6 +1482,19 @@ mod tests {
             "la longueur doit être ce qui reste après l'offset"
         );
 
+        // Le contrat annoncé reste honnête : pas d'invitation à seeker.
+        assert!(
+            entetes.get("Accept-Ranges").is_none(),
+            "une conversion ne doit pas annoncer Accept-Ranges"
+        );
+        assert_eq!(
+            entetes
+                .get("contentFeatures.dlna.org")
+                .and_then(|v| v.to_str().ok()),
+            Some("DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000"),
+            "le GET doit dire OP=00 comme la DIDL"
+        );
+
         // La reprise a dit « j'ai déjà l'en-tête » : on ne le rejoue pas.
         let mut corps = rep.into_body().into_data_stream();
         let mut octets = Vec::new();
@@ -1463,6 +1504,60 @@ mod tests {
         assert!(
             !octets.starts_with(b"RIFF"),
             "l'en-tête WAV a été rejoué sur une reprise bytes=100-"
+        );
+    }
+
+    /// Le HEAD d'une conversion doit annoncer le même contrat que la DIDL et
+    /// le GET : OP=00, pas d'Accept-Ranges. Un HEAD qui promet la seekabilité
+    /// invite le renderer à seeker un tuyau — le gel à 0:00 du DMP-A8.
+    #[tokio::test]
+    async fn le_head_d_une_conversion_n_annonce_pas_la_seekabilite() {
+        use axum::extract::{Path, State};
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 100,
+            channels: 1,
+            bit_depth: 8,
+            duration_ms: Some(1_000),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("dsd".into(), info, false, 64));
+        session.wav_header_included.store(true, SeqCst);
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("dsd".to_string(), session)].into_iter().collect(),
+        ));
+
+        let rep = super::handle_head(
+            Path("dsd.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let entetes = rep.headers();
+        assert!(
+            entetes.get("Accept-Ranges").is_none(),
+            "le HEAD d'une conversion ne doit pas annoncer Accept-Ranges"
+        );
+        assert_eq!(
+            entetes
+                .get("contentFeatures.dlna.org")
+                .and_then(|v| v.to_str().ok()),
+            Some("DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000"),
+        );
+        assert_eq!(
+            entetes
+                .get("transferMode.dlna.org")
+                .and_then(|v| v.to_str().ok()),
+            Some("Streaming"),
+        );
+        assert_eq!(
+            entetes.get("Content-Length").and_then(|v| v.to_str().ok()),
+            Some("144"),
+            "la longueur WAV calculée reste annoncée"
         );
     }
 
