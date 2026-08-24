@@ -397,6 +397,13 @@ struct Id3v2Tags {
     text_frames: Vec<(String, String)>,
     /// TXXX user-defined text frames: description -> value
     txxx_frames: Vec<(String, String)>,
+    /// UFID frames : proprietaire -> identifiant.
+    ///
+    /// C'est LA ou MusicBrainz Picard ecrit l'identifiant d'enregistrement en
+    /// ID3 — proprietaire `http://musicbrainz.org` —, pas dans un TXXX. Les
+    /// frames qui ne commencent pas par `T` etaient toutes ignorees ici : sur
+    /// un DSD etiquete avec Picard, l'identifiant n'arrivait donc jamais.
+    ufid_frames: Vec<(String, String)>,
     /// Whether an APIC (picture) frame was found
     has_picture: bool,
     /// First embedded picture found, as `(mime_type, image_bytes)`.
@@ -413,6 +420,22 @@ impl Id3v2Tags {
     }
 
     /// Get a TXXX frame by description (case-insensitive).
+    /// L'identifiant d'enregistrement MusicBrainz, quelle que soit la facon
+    /// dont l'etiqueteur l'a ecrit.
+    ///
+    /// Ordre delibere : `UFID` d'abord, parce que c'est la convention de
+    /// Picard en ID3 et donc la source la plus fiable ; les deux descriptions
+    /// TXXX ensuite, pour les etiqueteurs qui s'en ecartent.
+    fn musicbrainz_recording_id(&self) -> Option<&str> {
+        self.ufid_frames
+            .iter()
+            .find(|(owner, _)| owner.eq_ignore_ascii_case("http://musicbrainz.org"))
+            .map(|(_, id)| id.as_str())
+            .or_else(|| self.get_txxx("MusicBrainz Recording Id"))
+            .or_else(|| self.get_txxx("MusicBrainz Track Id"))
+            .filter(|v| !v.is_empty())
+    }
+
     fn get_txxx(&self, description: &str) -> Option<&str> {
         self.txxx_frames
             .iter()
@@ -684,6 +707,25 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
             tags.has_picture = true;
             if tags.picture.is_none() {
                 tags.picture = extract_apic_picture(frame_data, major_version);
+            }
+            continue;
+        }
+
+        // UFID : proprietaire en ISO-8859-1 termine par un octet nul, puis
+        // l'identifiant binaire — pour MusicBrainz, l'UUID en ASCII. Lu AVANT
+        // le filtre ci-dessous, qui ne laisse passer que les frames de texte.
+        if frame_id == "UFID" {
+            if let Some(nul) = frame_data.iter().position(|b| *b == 0) {
+                let owner = String::from_utf8_lossy(&frame_data[..nul])
+                    .trim()
+                    .to_string();
+                let id = String::from_utf8_lossy(&frame_data[nul + 1..])
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_string();
+                if !owner.is_empty() && !id.is_empty() {
+                    tags.ufid_frames.push((owner, id));
+                }
             }
             continue;
         }
@@ -1157,8 +1199,7 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         catalog_number,
     ) = if let Some(ref tags) = id3_tags {
         (
-            tags.get_txxx("MusicBrainz Recording Id")
-                .map(|s| s.to_string()),
+            tags.musicbrainz_recording_id().map(|s| s.to_string()),
             tags.get_txxx("MusicBrainz Album Id").map(|s| s.to_string()),
             tags.get_txxx("MusicBrainz Artist Id")
                 .map(|s| s.to_string()),
@@ -3612,6 +3653,98 @@ mod tests {
     fn split_genre_normalizes_case() {
         let genres = split_genre_tag("classique; ROCK; jazz");
         assert_eq!(genres, vec!["Classique", "Rock", "Jazz"]);
+    }
+
+    /// Picard ecrit l'identifiant d'ENREGISTREMENT en ID3 dans une frame
+    /// `UFID`, proprietaire `http://musicbrainz.org` — pas dans un TXXX.
+    ///
+    /// Le lecteur DSD ignorait toute frame ne commencant pas par `T` : sur un
+    /// DSD etiquete avec Picard, l'identifiant n'arrivait donc JAMAIS. C'est
+    /// la cle dont depend tout rapprochement par oeuvre (#2374), et le DSD est
+    /// au coeur du public de Tune.
+    #[test]
+    fn un_ufid_musicbrainz_donne_l_identifiant_d_enregistrement() {
+        const MBID: &str = "b1a9c0e8-1111-4c2b-9f3d-2c4e5a6b7c8d";
+        let mut corps = Vec::new();
+        corps.extend_from_slice(b"http://musicbrainz.org");
+        corps.push(0);
+        corps.extend_from_slice(MBID.as_bytes());
+
+        let mut frames = Vec::new();
+        frames.extend_from_slice(b"UFID");
+        let n = corps.len() as u32;
+        frames.extend_from_slice(&[
+            (n >> 21) as u8 & 0x7f,
+            (n >> 14) as u8 & 0x7f,
+            (n >> 7) as u8 & 0x7f,
+            n as u8 & 0x7f,
+        ]);
+        frames.extend_from_slice(&[0, 0]); // drapeaux
+        frames.extend_from_slice(&corps);
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[0x04, 0x00, 0x00]); // v2.4.0
+        let size = frames.len();
+        tag.extend_from_slice(&[
+            (size >> 21) as u8 & 0x7f,
+            (size >> 14) as u8 & 0x7f,
+            (size >> 7) as u8 & 0x7f,
+            size as u8 & 0x7f,
+        ]);
+        tag.extend_from_slice(&frames);
+
+        let tags = parse_id3v2_tag(&tag).expect("le tag doit s'analyser");
+        assert_eq!(
+            tags.musicbrainz_recording_id(),
+            Some(MBID),
+            "l'UFID de MusicBrainz doit rendre l'identifiant d'enregistrement"
+        );
+    }
+
+    /// Un UFID d'un AUTRE proprietaire n'est pas un identifiant MusicBrainz.
+    #[test]
+    fn un_ufid_etranger_n_est_pas_pris_pour_un_mbid() {
+        let mut corps = Vec::new();
+        corps.extend_from_slice(b"http://exemple.invalide");
+        corps.push(0);
+        corps.extend_from_slice(b"quelque-chose");
+
+        let mut frames = Vec::new();
+        frames.extend_from_slice(b"UFID");
+        let n = corps.len() as u32;
+        frames.extend_from_slice(&[
+            (n >> 21) as u8 & 0x7f,
+            (n >> 14) as u8 & 0x7f,
+            (n >> 7) as u8 & 0x7f,
+            n as u8 & 0x7f,
+        ]);
+        frames.extend_from_slice(&[0, 0]);
+        frames.extend_from_slice(&corps);
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[0x04, 0x00, 0x00]);
+        let size = frames.len();
+        tag.extend_from_slice(&[
+            (size >> 21) as u8 & 0x7f,
+            (size >> 14) as u8 & 0x7f,
+            (size >> 7) as u8 & 0x7f,
+            size as u8 & 0x7f,
+        ]);
+        tag.extend_from_slice(&frames);
+
+        let tags = parse_id3v2_tag(&tag).expect("le tag doit s'analyser");
+        assert_eq!(tags.musicbrainz_recording_id(), None);
+    }
+
+    /// Le repli TXXX reste accepte : certains etiqueteurs s'ecartent de la
+    /// convention de Picard.
+    #[test]
+    fn un_txxx_reste_un_repli_accepte() {
+        let tag_bytes = build_id3v2_tag(&[("TXXX", "MusicBrainz Track Id\0abc-123")]);
+        let tags = parse_id3v2_tag(&tag_bytes).unwrap();
+        assert_eq!(tags.musicbrainz_recording_id(), Some("abc-123"));
     }
 
     #[test]
