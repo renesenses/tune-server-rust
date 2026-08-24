@@ -53,6 +53,7 @@ pub fn router() -> Router<AppState> {
         .route("/smb/mounts", get(list_smb_mounts))
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
+        .route("/media-servers/{id}/search", get(search_media_server))
         .route(
             "/media-servers/{id}/item/{item_id}/stream-url",
             get(media_server_stream_url),
@@ -953,6 +954,258 @@ async fn browse_media_server(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    /// Le texte cherché.
+    q: String,
+    /// Le conteneur où chercher. Absent = tout le serveur (`0`).
+    container: Option<String>,
+}
+
+/// Cherche DANS un serveur de médias, par son action ContentDirectory `Search`.
+///
+/// Pourquoi ce n'est pas un simple `Browse` filtré : parcourir une
+/// arborescence de plusieurs milliers d'entrées côté client pour y chercher un
+/// titre est intenable, et c'est précisément ce que `Search` évite — le
+/// serveur cherche dans SON index.
+///
+/// La règle du chantier, symétrique de celle qu'on s'applique à nous-mêmes
+/// (#2312) : **ne demander que ce que le serveur distant annonce**. On lit donc
+/// d'abord ses `SearchCapabilities`. S'il n'annonce pas `dc:title`, on ne lui
+/// envoie pas de critère qu'il ne sait pas évaluer — beaucoup répondent alors
+/// par toute la bibliothèque, ce qui ressemble à un résultat et n'en est pas.
+/// La réponse porte `supported: false` et le client se rabat sur un filtrage
+/// du dossier courant, en le disant à l'écran.
+async fn search_media_server(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SearchQuery>,
+) -> Json<Value> {
+    let container = q.container.as_deref().unwrap_or("0");
+    let vide = |supported: bool, raison: &str| {
+        Json(json!({
+            "container": container,
+            "query": q.q,
+            "supported": supported,
+            "reason": raison,
+            "containers": [],
+            "items": [],
+            "total_matches": 0,
+            "number_returned": 0,
+        }))
+    };
+
+    let servers = state.media_servers.lock().await;
+    let ms = match servers.get(&id) {
+        Some(ms) => ms.clone(),
+        None => return vide(false, "serveur inconnu"),
+    };
+    drop(servers);
+
+    if q.q.trim().is_empty() {
+        return vide(true, "");
+    }
+
+    let caps = capacites_de_recherche(&ms.content_directory_url).await;
+    let criteria = match critere_de_recherche(&caps, &q.q) {
+        Some(c) => c,
+        None => return vide(false, "ce serveur n'annonce pas la recherche par titre"),
+    };
+
+    const PAGE_SIZE: u32 = 200;
+    const MAX_PAGES: u32 = 50;
+    let client = tune_core::http::client::shared();
+    let mut containers: Vec<Value> = Vec::new();
+    let mut items: Vec<Value> = Vec::new();
+    let mut starting_index: u32 = 0;
+    let mut total_matches: u32 = 0;
+
+    for _page in 0..MAX_PAGES {
+        let soap_body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ContainerID>{container}</ContainerID>
+<SearchCriteria>{criteria}</SearchCriteria>
+<Filter>*</Filter>
+<StartingIndex>{starting_index}</StartingIndex>
+<RequestedCount>{PAGE_SIZE}</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Search>
+</s:Body>
+</s:Envelope>"#,
+            criteria = xml_escape(&criteria),
+        );
+
+        let resp = match client
+            .post(&ms.content_directory_url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .header(
+                "SOAPAction",
+                "\"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"",
+            )
+            .body(soap_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "search_media_server soap_error server={} start={starting_index} err={e}",
+                    ms.name
+                );
+                break;
+            }
+        };
+
+        let body = resp.text().await.unwrap_or_default();
+        // Un 708 (« critère non supporté ») n'est pas une panne : c'est un
+        // serveur qui annonce plus qu'il n'évalue. On le dit, plutôt que de
+        // rendre une liste vide qui se lirait « aucun résultat ».
+        if body.contains("<errorCode>") {
+            let code = extract_xml_tag(&body, "errorCode").unwrap_or_default();
+            tracing::info!(
+                "search_media_server refus server={} code={code} criteria={criteria}",
+                ms.name
+            );
+            return vide(false, "ce serveur a refusé le critère de recherche");
+        }
+
+        let (mut page_containers, mut page_items) = parse_didl_browse_response(&body);
+        let parsed = (page_containers.len() + page_items.len()) as u32;
+        let number_returned: u32 = extract_xml_tag(&body, "NumberReturned")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(parsed);
+        if let Some(tm) = extract_xml_tag(&body, "TotalMatches").and_then(|s| s.trim().parse().ok())
+        {
+            total_matches = tm;
+        }
+
+        containers.append(&mut page_containers);
+        items.append(&mut page_items);
+
+        if number_returned == 0 || parsed == 0 {
+            break;
+        }
+        starting_index += number_returned.max(parsed);
+        if total_matches != 0 && starting_index >= total_matches {
+            break;
+        }
+    }
+
+    let fetched = containers.len() + items.len();
+    Json(json!({
+        "container": container,
+        "query": q.q,
+        "supported": true,
+        "reason": "",
+        "containers": containers,
+        "items": items,
+        "total_matches": (total_matches as usize).max(fetched),
+        "number_returned": fetched,
+    }))
+}
+
+/// Ce que le serveur distant DIT savoir chercher.
+///
+/// Mis en cache dix minutes : une zone de recherche interroge à chaque frappe,
+/// et cette capacité ne change pas d'une seconde à l'autre. Une panne réseau
+/// n'est pas mise en cache — on réessaiera.
+async fn capacites_de_recherche(content_directory_url: &str) -> String {
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+    type Cache = std::sync::Mutex<std::collections::HashMap<String, (Instant, String)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(600);
+
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some((pose, caps)) = map.get(content_directory_url) {
+            if pose.elapsed() < TTL {
+                return caps.clone();
+            }
+        }
+    }
+
+    let soap = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body><u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"/></s:Body>
+</s:Envelope>"#;
+    let caps = match tune_core::http::client::shared()
+        .post(content_directory_url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header(
+            "SOAPAction",
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#GetSearchCapabilities\"",
+        )
+        .body(soap)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            extract_xml_tag(&r.text().await.unwrap_or_default(), "SearchCaps").unwrap_or_default()
+        }
+        Err(e) => {
+            tracing::debug!("get_search_capabilities err={e}");
+            return String::new();
+        }
+    };
+
+    if let Ok(mut map) = cache.lock() {
+        map.insert(
+            content_directory_url.to_string(),
+            (Instant::now(), caps.clone()),
+        );
+    }
+    caps
+}
+
+/// Le critère à envoyer, construit UNIQUEMENT avec les champs annoncés.
+///
+/// `*` est la façon dont beaucoup de serveurs disent « tout m'est
+/// interrogeable ». Sans `dc:title` — ni `*` —, on rend `None` : mieux vaut
+/// dire au client qu'on ne sait pas chercher que lui rendre la bibliothèque
+/// entière sous le nom de « résultats ».
+///
+/// La restriction de classe n'est ajoutée que si `upnp:class` est annoncé :
+/// c'est un champ de plus à évaluer, et un serveur qui ne le connaît pas
+/// refuserait tout le critère.
+fn critere_de_recherche(caps: &str, texte: &str) -> Option<String> {
+    let annonce = |champ: &str| {
+        caps.split(',')
+            .any(|c| c.trim() == "*" || c.trim().eq_ignore_ascii_case(champ))
+    };
+    if !annonce("dc:title") {
+        return None;
+    }
+    let valeur = echapper_valeur_critere(texte);
+    let titre = format!("dc:title contains \"{valeur}\"");
+    Some(if annonce("upnp:class") {
+        format!("upnp:class derivedfrom \"object.item.audioItem\" and {titre}")
+    } else {
+        titre
+    })
+}
+
+/// Dans un `SearchCriteria`, une valeur est entre guillemets : la barre
+/// oblique inverse et le guillemet doivent y être échappés, sinon un titre
+/// contenant `"` casse le critère — ou, pire, en injecte un autre.
+fn echapper_valeur_critere(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Le critère voyage dans du XML : `&`, `<` et les guillemets doivent y être
+/// écrits en entités, sinon le SOAP est invalide.
+fn xml_escape(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
     let result_start = xml.find("<Result>").or_else(|| xml.find("<Result "));
     let result_end = xml.find("</Result>");
@@ -1318,8 +1571,45 @@ async fn get_share_detail(
 
 #[cfg(test)]
 mod tests {
+
+    /// La regle du chantier : ne demander QUE ce que le serveur annonce.
+    ///
+    /// Un serveur qui n'annonce pas `dc:title` ne doit pas recevoir de critere
+    /// de titre. Beaucoup repondent alors par toute la bibliotheque, ce qui
+    /// ressemble a un resultat et n'en est pas.
+    #[test]
+    fn on_ne_demande_que_ce_que_le_serveur_annonce() {
+        assert_eq!(critere_de_recherche("upnp:class", "blue"), None);
+        assert_eq!(critere_de_recherche("", "blue"), None);
+        assert_eq!(
+            critere_de_recherche("upnp:class,dc:title", "blue").as_deref(),
+            Some("upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"blue\"")
+        );
+        // Sans `upnp:class` annonce, la restriction de classe est retiree :
+        // l'ajouter ferait refuser tout le critere.
+        assert_eq!(
+            critere_de_recherche("dc:title", "blue").as_deref(),
+            Some("dc:title contains \"blue\"")
+        );
+        // `*` est la facon dont beaucoup de serveurs disent « tout ».
+        assert!(critere_de_recherche("*", "blue").is_some());
+        // La casse annoncee varie d'un serveur a l'autre.
+        assert!(critere_de_recherche("DC:TITLE", "blue").is_some());
+    }
+
+    /// Un titre contenant un guillemet ne doit pas pouvoir fermer la valeur du
+    /// critere — ni casser le SOAP, ni y injecter un predicat.
+    #[test]
+    fn un_guillemet_dans_le_texte_cherche_est_echappe() {
+        let c = critere_de_recherche("dc:title", r#"say "hello""#).unwrap();
+        assert!(c.contains(r#"\"hello\""#), "{c}");
+        assert_eq!(echapper_valeur_critere(r#"a\b"c"#), r#"a\\b\"c"#);
+        assert_eq!(xml_escape(r#"a&b<c>"d""#), "a&amp;b&lt;c&gt;&quot;d&quot;");
+    }
+
     use super::{
-        obstacle_de_montage, parse_didl_browse_response, parse_res_elements, select_best_res,
+        critere_de_recherche, echapper_valeur_critere, obstacle_de_montage,
+        parse_didl_browse_response, parse_res_elements, select_best_res, xml_escape,
     };
 
     /// Build a SOAP Browse response whose escaped DIDL contains one item with
