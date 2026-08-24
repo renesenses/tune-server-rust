@@ -625,7 +625,7 @@ pub struct PlaybackOrchestrator {
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
     /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
-    last_net_play: Mutex<HashMap<i64, (String, Option<String>, std::time::Instant)>>,
+    last_net_play: Mutex<HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>>,
 }
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
@@ -1090,20 +1090,44 @@ impl PlaybackOrchestrator {
     /// `DUPLICATE_NET_PLAY_WINDOW` of `now` (⇒ a redundant re-send to coalesce);
     /// otherwise records it as the new last play and returns `false`. Pure map
     /// logic split out of `play_inner` for unit testing.
+    /// La cle doit identifier la PISTE, pas seulement sa source.
+    ///
+    /// `source_id` ne suffit pas : une piste de la bibliotheque locale se joue
+    /// par `track_id`, et `play_from_queue` laisse alors `source` et
+    /// `source_id` a `None`. La cle valait donc `("local", None)` pour TOUTES
+    /// les pistes locales d'une zone, si bien que deux morceaux DIFFERENTS
+    /// envoyes au meme renderer reseau a moins de douze secondes d'intervalle
+    /// se ressemblaient parfaitement.
+    ///
+    /// Consequence pour l'utilisateur : sur Chromecast, DLNA ou AirPlay, appuyer
+    /// sur « piste suivante » pendant les douze premieres secondes faisait
+    /// avancer le serveur SANS rien envoyer au renderer, qui continuait le
+    /// morceau precedent. Le bouton paraissait mort (FabienM, v0.9.102, zone
+    /// Enfants en Chromecast : quinze `api_next_requested` d'affilee, tous
+    /// suivis d'un `orchestrator_play_coalesced_duplicate_net_send` sur des
+    /// titres pourtant differents).
+    ///
+    /// Le test d'origine n'exercait que `tidal` et `qobuz` — des sources qui
+    /// portent TOUJOURS un `source_id`. Il ne pouvait pas voir le cas local.
     fn record_or_detect_duplicate_net_play(
-        map: &mut HashMap<i64, (String, Option<String>, std::time::Instant)>,
+        map: &mut HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>,
         zone_id: i64,
         source: &str,
         source_id: &Option<String>,
+        track_id: Option<i64>,
         now: std::time::Instant,
     ) -> bool {
-        let dup = map.get(&zone_id).is_some_and(|(src, sid, when)| {
+        let dup = map.get(&zone_id).is_some_and(|(src, sid, tid, when)| {
             src == source
                 && sid == source_id
+                && *tid == track_id
                 && now.duration_since(*when) < DUPLICATE_NET_PLAY_WINDOW
         });
         if !dup {
-            map.insert(zone_id, (source.to_string(), source_id.clone(), now));
+            map.insert(
+                zone_id,
+                (source.to_string(), source_id.clone(), track_id, now),
+            );
         }
         dup
     }
@@ -1563,6 +1587,7 @@ impl PlaybackOrchestrator {
                     req.zone_id,
                     &resolved.source,
                     &req.source_id,
+                    req.track_id,
                     std::time::Instant::now(),
                 )
             };
@@ -9905,16 +9930,23 @@ mod tests {
     fn duplicate_net_play_coalesces_same_track_within_window() {
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
-        type Map = HashMap<i64, (String, Option<String>, Instant)>;
+        type Map = HashMap<i64, (String, Option<String>, Option<i64>, Instant)>;
         let f = PlaybackOrchestrator::record_or_detect_duplicate_net_play;
         let t0 = Instant::now();
         let sid = Some("tidal-123".to_string());
 
         let mut map: Map = HashMap::new();
         // First play of the track → recorded, NOT a duplicate.
-        assert!(!f(&mut map, 5, "tidal", &sid, t0));
+        assert!(!f(&mut map, 5, "tidal", &sid, None, t0));
         // Same (source, source_id) a few seconds later → duplicate (coalesce).
-        assert!(f(&mut map, 5, "tidal", &sid, t0 + Duration::from_secs(4)));
+        assert!(f(
+            &mut map,
+            5,
+            "tidal",
+            &sid,
+            None,
+            t0 + Duration::from_secs(4)
+        ));
         // A DIFFERENT track (real advance) → NOT a duplicate.
         let other = Some("tidal-999".to_string());
         assert!(!f(
@@ -9922,22 +9954,93 @@ mod tests {
             5,
             "tidal",
             &other,
+            None,
             t0 + Duration::from_secs(4)
         ));
         // Different source, same id → NOT a duplicate.
-        assert!(!f(&mut map, 5, "qobuz", &sid, t0 + Duration::from_secs(4)));
+        assert!(!f(
+            &mut map,
+            5,
+            "qobuz",
+            &sid,
+            None,
+            t0 + Duration::from_secs(4)
+        ));
 
         // Same track but OUTSIDE the window (repeat-one / dup-in-queue, minutes
         // later) → NOT a duplicate.
         let mut map2: Map = HashMap::new();
-        assert!(!f(&mut map2, 7, "tidal", &sid, t0));
+        assert!(!f(&mut map2, 7, "tidal", &sid, None, t0));
         let far = t0 + super::DUPLICATE_NET_PLAY_WINDOW + Duration::from_secs(1);
-        assert!(!f(&mut map2, 7, "tidal", &sid, far));
+        assert!(!f(&mut map2, 7, "tidal", &sid, None, far));
 
         // Different zones never collide.
         let mut map3: Map = HashMap::new();
-        assert!(!f(&mut map3, 1, "tidal", &sid, t0));
-        assert!(!f(&mut map3, 2, "tidal", &sid, t0));
+        assert!(!f(&mut map3, 1, "tidal", &sid, None, t0));
+        assert!(!f(&mut map3, 2, "tidal", &sid, None, t0));
+    }
+
+    /// Deux pistes LOCALES differentes ne sont pas un doublon.
+    ///
+    /// La bibliotheque locale se joue par `track_id` : `play_from_queue` laisse
+    /// `source` et `source_id` a `None`. La cle valait donc `("local", None)`
+    /// pour toutes les pistes de la zone, et « piste suivante » sur un renderer
+    /// reseau ne poussait plus rien pendant douze secondes — le serveur
+    /// avancait, le Chromecast rejouait le meme morceau (FabienM, v0.9.102).
+    ///
+    /// Le test d'origine n'exercait que `tidal` et `qobuz`, qui portent
+    /// TOUJOURS un `source_id` : il ne pouvait pas voir ce cas.
+    #[test]
+    fn deux_pistes_locales_differentes_ne_sont_pas_un_doublon() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        type Map = HashMap<i64, (String, Option<String>, Option<i64>, Instant)>;
+        let f = PlaybackOrchestrator::record_or_detect_duplicate_net_play;
+        let t0 = Instant::now();
+        let mut map: Map = HashMap::new();
+
+        // Piste 101 : premier envoi.
+        assert!(!f(&mut map, 1, "local", &None, Some(101), t0));
+
+        // « Piste suivante » deux secondes plus tard, piste 102 : c'est une
+        // AUTRE piste, elle doit partir au renderer.
+        assert!(
+            !f(
+                &mut map,
+                1,
+                "local",
+                &None,
+                Some(102),
+                t0 + Duration::from_secs(2)
+            ),
+            "deux pistes locales differentes ne sont pas un doublon : le \
+             renderer resterait sur le morceau precedent"
+        );
+
+        // Enchainement rapide : encore une autre.
+        assert!(!f(
+            &mut map,
+            1,
+            "local",
+            &None,
+            Some(103),
+            t0 + Duration::from_secs(4)
+        ));
+
+        // La MEME piste relancee dans la fenetre reste un doublon : c'est la
+        // course que le garde-fou existe pour absorber (#1146, Philippe Vella).
+        assert!(f(
+            &mut map,
+            1,
+            "local",
+            &None,
+            Some(103),
+            t0 + Duration::from_secs(6)
+        ));
+
+        // Et hors fenetre, elle repart (repeat-one, doublon dans la file).
+        let loin = t0 + Duration::from_secs(6) + super::DUPLICATE_NET_PLAY_WINDOW;
+        assert!(!f(&mut map, 1, "local", &None, Some(103), loin));
     }
 
     #[test]

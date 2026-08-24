@@ -91,6 +91,36 @@ pub(super) fn nom_normalise(nom: &str) -> String {
     mots.join(" ")
 }
 
+/// Les libelles qui ne designent PAS un artiste.
+///
+/// « Various Artists » est le fourre-tout des compilations. Sur une
+/// bibliotheque reelle il portait **121 albums** — et les services publient des
+/// parutions sous ce meme libelle. Il se hissait donc EN TETE de la section,
+/// devant John Coltrane et Lambchop, qui sont eux de vrais resultats.
+///
+/// Ces libelles sont ecartes des DEUX cotes du rapprochement : ni comme artiste
+/// connu, ni comme artiste d'une parution. Les ecarter d'un seul cote ne
+/// servirait a rien — c'est leur rencontre qui produit le faux positif.
+///
+/// La liste est volontairement courte et litterale. Elle ne contient que des
+/// libelles qu'aucun artiste ne porterait : y ajouter « soundtrack » ou
+/// « orchestra », par exemple, ecarterait de vrais noms.
+const LIBELLES_FOURRE_TOUT: [&str; 8] = [
+    "various artists",
+    "various",
+    "va",
+    "unknown artist",
+    "unknown",
+    "divers",
+    "artistes divers",
+    "compilation",
+];
+
+/// Vrai si ce nom, une fois normalise, ne designe pas un artiste.
+pub(super) fn est_un_fourre_tout(nom_normalise_: &str) -> bool {
+    LIBELLES_FOURRE_TOUT.contains(&nom_normalise_)
+}
+
 /// `GET /home/artist-releases` — les parutions récentes des artistes connus.
 pub(super) async fn artist_releases(
     State(state): State<AppState>,
@@ -107,7 +137,10 @@ pub(super) async fn artist_releases(
     ] {
         for cols in state.backend.query_many(sql, &[]).unwrap_or_default() {
             if let Some(n) = cols.first().and_then(|v| v.as_string()) {
-                aimes.insert(nom_normalise(&n));
+                let cle = nom_normalise(&n);
+                if !est_un_fourre_tout(&cle) {
+                    aimes.insert(cle);
+                }
             }
         }
     }
@@ -126,8 +159,12 @@ pub(super) async fn artist_releases(
         .unwrap_or_default()
     {
         if let Some(nom) = cols.first().and_then(|v| v.as_string()) {
+            let cle = nom_normalise(&nom);
+            if est_un_fourre_tout(&cle) {
+                continue;
+            }
             let albums = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-            connus.insert(nom_normalise(&nom), (nom, albums));
+            connus.insert(cle, (nom, albums));
         }
     }
 
@@ -157,6 +194,12 @@ pub(super) async fn artist_releases(
 
         for album in albums {
             let cle = nom_normalise(&album.artist);
+            // La meme garde de ce cote-ci : une parution publiee sous
+            // « Various Artists » ne doit rencontrer personne, meme si un
+            // libelle avait echappe aux deux collectes ci-dessus.
+            if est_un_fourre_tout(&cle) {
+                continue;
+            }
             let aime = aimes.contains(&cle);
             let Some((affiche, albums_possedes)) = connus.get(&cle).cloned().or_else(|| {
                 // Un favori peut ne rien avoir en local (artiste suivi sur un
@@ -212,7 +255,7 @@ pub(super) async fn artist_releases(
 
 #[cfg(test)]
 mod tests {
-    use super::nom_normalise;
+    use super::{est_un_fourre_tout, nom_normalise};
 
     #[test]
     fn la_casse_et_les_espaces_ne_comptent_pas() {
@@ -273,6 +316,41 @@ mod tests {
         );
         assert_ne!(nom_normalise("Miles Davis"), nom_normalise("Miles"));
         assert_ne!(nom_normalise("John Williams"), nom_normalise("John Adams"));
+    }
+
+    /// « Various Artists » n'est pas un artiste, et il etait EN TETE.
+    #[test]
+    fn les_libelles_fourre_tout_sont_ecartes() {
+        for libelle in [
+            "Various Artists",
+            "various artists",
+            "VA",
+            "Unknown Artist",
+            "Divers",
+            "Compilation",
+        ] {
+            assert!(
+                est_un_fourre_tout(&nom_normalise(libelle)),
+                "« {libelle} » devrait etre ecarte"
+            );
+        }
+    }
+
+    /// La borne : la liste ne doit pas mordre sur de vrais noms.
+    #[test]
+    fn de_vrais_artistes_ne_sont_pas_ecartes() {
+        for nom in [
+            "John Coltrane",
+            "Lambchop",
+            "The Divine Comedy",  // contient « divine », pas « divers »
+            "Various Production", // un vrai groupe, et il commence par « various »
+            "Unknown Mortal Orchestra",
+        ] {
+            assert!(
+                !est_un_fourre_tout(&nom_normalise(nom)),
+                "« {nom} » ne devrait PAS etre ecarte"
+            );
+        }
     }
 
     #[test]
