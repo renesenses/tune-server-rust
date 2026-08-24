@@ -1366,6 +1366,11 @@ fn spawn_audio_embedding(state: &AppState) {
 
 fn spawn_concert_alerts(state: &AppState) {
     tune_core::cloud::concert_alerts::spawn(state.backend.clone());
+
+    // Veille Bandcamp : un appel reseau par artiste, donc en arriere-plan et
+    // sur les seuls favoris. Sans le plugin, la fonction n'existe pas.
+    #[cfg(feature = "bandcamp")]
+    crate::bandcamp_sweep::spawn(state.backend.clone());
 }
 
 fn spawn_cloud_library_sync(state: &AppState) {

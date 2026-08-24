@@ -1453,3 +1453,74 @@ mod tests {
         assert_eq!(decoder_entites("a &lt;b&gt; c"), "a <b> c");
     }
 }
+
+/// L'adresse de la page d'un artiste Bandcamp, cherchée par son nom.
+///
+/// Rend `None` quand la recherche ne trouve rien, ou quand le premier résultat
+/// n'est pas un artiste (`type == "b"`). On ne prend QUE le premier : au-delà,
+/// on choisirait un homonyme, et une nouveauté attribuée au mauvais artiste est
+/// pire qu'une nouveauté manquée.
+pub async fn adresse_artiste(nom: &str) -> Option<String> {
+    let client = tune_core::http::client::shared();
+    let brut: Value = client
+        .post(BC_SEARCH_API)
+        .json(&json!({
+            "search_text": nom,
+            // Ne demander QUE des artistes : sans ce filtre, un album portant
+            // le nom cherché passerait devant et on suivrait son adresse.
+            "search_filter": "b",
+            "full_page": false,
+            "fan_id": null,
+        }))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let premier = brut
+        .get("auto")?
+        .get("results")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("type").and_then(|t| t.as_str()) == Some("b"))?;
+
+    // Le nom doit correspondre : la recherche Bandcamp est floue, et rend
+    // volontiers un artiste voisin quand le nom exact n'existe pas.
+    let trouve = premier.get("name").and_then(|n| n.as_str())?;
+    if !trouve.eq_ignore_ascii_case(nom.trim()) {
+        return None;
+    }
+
+    let url = premier
+        .get("item_url_path")
+        .or_else(|| premier.get("item_url_root"))
+        .and_then(|u| u.as_str())?;
+    Some(url.trim_end_matches('/').to_string())
+}
+
+/// Les parutions publiques d'un artiste, la plus récente d'abord.
+///
+/// Chaque entrée porte `titre`, `url`, `pochette` et `type`. C'est l'**url**
+/// qui sert d'identité à la veille — un titre peut changer, l'adresse non —
+/// mais le titre et la pochette sont nécessaires pour montrer la nouveauté à
+/// l'écran, d'où le rendu complet plutôt qu'une simple liste d'adresses.
+///
+/// C'est la matière de la veille : Bandcamp ne datant pas sa discographie, ce
+/// sont ces adresses qu'on compare d'un passage à l'autre
+/// (`tune_core::bandcamp_veille`).
+pub async fn parutions_discographie(racine: &str) -> Vec<Value> {
+    let client = tune_core::http::client::shared();
+    let cible = format!("{}/music", racine.trim_end_matches('/'));
+    let Ok(reponse) = client.get(&cible).send().await else {
+        return Vec::new();
+    };
+    if !reponse.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(page) = reponse.text().await else {
+        return Vec::new();
+    };
+    extraire_discographie(&page, racine)
+}

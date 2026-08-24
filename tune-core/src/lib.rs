@@ -7,6 +7,7 @@ pub mod ai;
 pub mod alarms;
 pub mod api_analytics;
 pub mod audio;
+pub mod bandcamp_veille;
 pub mod bug_report;
 pub mod cloud;
 pub mod collaborative;

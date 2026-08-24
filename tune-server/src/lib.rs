@@ -5,6 +5,8 @@ pub mod auto_resume;
 pub mod auto_scan;
 pub mod background;
 pub mod background_tasks;
+#[cfg(feature = "bandcamp")]
+pub mod bandcamp_sweep;
 pub mod boot_status;
 pub mod bootstrap;
 /// Pourquoi un dossier configuré est-il injoignable, et que peut y faire
