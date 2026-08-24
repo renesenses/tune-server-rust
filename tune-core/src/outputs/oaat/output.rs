@@ -1896,6 +1896,10 @@ impl OutputTarget for OaatOutput {
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
             let stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
+            // Position VRAIE d'un flux FLAC, lue dans ses en-têtes de trames.
+            // Le calcul par octets reste JUSTE pour le DSD (débit constant) —
+            // il était faux pour le FLAC, à débit variable (#2214).
+            let mut trames_flac = super::helpers::CompteurDeTramesFlac::new();
             let mut start = std::time::Instant::now();
             let mut pause_offset = std::time::Duration::ZERO;
             let mut reconnect_attempts: u32 = 0;
@@ -2195,7 +2199,16 @@ impl OutputTarget for OaatOutput {
                                 // Flush remaining buffer
                                 while buf.len() >= packet_size && playing.load(Ordering::Relaxed) {
                                     let payload: Vec<u8> = buf.drain(..packet_size).collect();
-                                    let pts_ns = if uses_byte_offset {
+                                    if is_flac {
+                                        // La position du paquet est celle de la
+                                        // dernière trame FLAC qui y commence —
+                                        // pas un prorata d'octets (#2214).
+                                        trames_flac.avaler(&payload);
+                                        if trames_flac.est_synchronise() {
+                                            sample_offset = trames_flac.position_samples();
+                                        }
+                                    }
+                                    let pts_ns = if is_dsd {
                                         stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                                     } else {
                                         stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
@@ -2204,8 +2217,8 @@ impl OutputTarget for OaatOutput {
                                     if uses_byte_offset { byte_offset += payload.len() as u64; }
                                     else { sample_offset += PCM_SAMPLES_PER_PACKET as u64; }
                                     position_ms.store(
-                                        if uses_byte_offset { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
-                                        else { sample_offset * 1000 / cur_sample_rate as u64 },
+                                        if is_dsd { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
+                                        else { sample_offset * 1000 / cur_sample_rate.max(1) as u64 },
                                         Ordering::Relaxed,
                                     );
                                 }
@@ -2319,7 +2332,16 @@ impl OutputTarget for OaatOutput {
                             && !paused.load(Ordering::Relaxed)
                         {
                             let payload: Vec<u8> = buf.drain(..packet_size).collect();
-                            let pts_ns = if uses_byte_offset {
+                            if is_flac {
+                                // Position réelle depuis les en-têtes de trames
+                                // (#2214) — et `sample_offset` cesse d'être figé
+                                // à zéro sur ce chemin.
+                                trames_flac.avaler(&payload);
+                                if trames_flac.est_synchronise() {
+                                    sample_offset = trames_flac.position_samples();
+                                }
+                            }
+                            let pts_ns = if is_dsd {
                                 stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                             } else {
                                 stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
@@ -2389,8 +2411,8 @@ impl OutputTarget for OaatOutput {
                                 sample_offset += PCM_SAMPLES_PER_PACKET as u64;
                             }
                             position_ms.store(
-                                if uses_byte_offset { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
-                                else { sample_offset * 1000 / cur_sample_rate as u64 },
+                                if is_dsd { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
+                                else { sample_offset * 1000 / cur_sample_rate.max(1) as u64 },
                                 Ordering::Relaxed,
                             );
 
@@ -2401,7 +2423,12 @@ impl OutputTarget for OaatOutput {
                                 sample_offset / PCM_SAMPLES_PER_PACKET as u64
                             };
                             if packet_num > 50 {
-                                let expected = if uses_byte_offset {
+                                // Le cadencement aussi : caler l'envoi FLAC sur
+                                // les octets compressés envoyait un morceau très
+                                // compressé trop vite, et un peu compressé trop
+                                // lentement (#2214). Les samples réels cadencent ;
+                                // le DSD garde les octets, son débit est constant.
+                                let expected = if is_dsd {
                                     let audio_bytes_per_sec = cur_sample_rate as f64 * bytes_per_frame as f64;
                                     std::time::Duration::from_nanos(
                                         (byte_offset as f64 / audio_bytes_per_sec * 1e9) as u64,
