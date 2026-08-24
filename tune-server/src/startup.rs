@@ -989,8 +989,9 @@ pub async fn register_local_outputs(state: &AppState) {
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
-            let local_out = tune_core::outputs::local::LocalOutput::with_options(
+            let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
+                (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 exclusive_mode,
                 audio_backend,
             );

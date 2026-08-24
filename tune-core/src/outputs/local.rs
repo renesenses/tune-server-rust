@@ -408,6 +408,10 @@ pub struct AsioDeviceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioDevice {
     pub name: String,
+    /// Stable backend endpoint identifier (for example the IMMDevice ID on
+    /// WASAPI), captured during discovery and reused when playback opens.
+    #[serde(default)]
+    pub endpoint_id: String,
     pub is_default: bool,
     pub max_channels: u16,
     pub sample_rates: Vec<u32>,
@@ -493,6 +497,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
+                let endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
 
                 // Skip ALSA null/dummy sinks that produce no audio
                 if raw_name.contains("Discard all samples") || raw_name.contains("Dummy") {
@@ -605,6 +610,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
                 info!(
                     device = %name,
+                    endpoint_id = %endpoint_id,
                     is_default,
                     max_channels,
                     sample_rates = ?sample_rates,
@@ -613,6 +619,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
                 devices.push(AudioDevice {
                     name,
+                    endpoint_id,
                     is_default,
                     max_channels,
                     sample_rates,
@@ -745,6 +752,11 @@ struct PendingNextMedia {
 pub struct LocalOutput {
     device_name: String,
     device_id: String,
+    /// Stable backend endpoint captured at discovery. The public registry ID
+    /// remains compatible (`local:<display name>`), while exclusive WASAPI
+    /// opens this exact IMMDevice instead of resolving the name again.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    endpoint_id: Option<String>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     /// What the playback callbacks actually multiply by: the user volume
@@ -993,10 +1005,22 @@ impl LocalOutput {
     /// Create a new `LocalOutput` with full control over exclusive mode and
     /// audio backend selection.
     pub fn with_options(device_name: String, exclusive_mode: bool, audio_backend: &str) -> Self {
+        Self::with_options_and_endpoint(device_name, None, exclusive_mode, audio_backend)
+    }
+
+    /// Create a local output bound to the stable backend endpoint discovered
+    /// alongside its display name.
+    pub fn with_options_and_endpoint(
+        device_name: String,
+        endpoint_id: Option<String>,
+        exclusive_mode: bool,
+        audio_backend: &str,
+    ) -> Self {
         let device_id = format!("local:{device_name}");
         Self {
             device_name,
             device_id,
+            endpoint_id,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
@@ -1355,6 +1379,67 @@ impl NativePcmRing {
         self.read.store(r + n as u64, Ordering::Release);
         n
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasapiEndpoint {
+    pub(crate) id: String,
+    pub(crate) name: String,
+}
+
+/// Resolve the exact endpoint requested by a zone. Display names are
+/// disambiguated with the same `(2)`, `(3)` convention as discovery, while a
+/// stable endpoint ID bypasses name matching entirely.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn select_wasapi_endpoint(
+    requested: &str,
+    default_id: Option<&str>,
+    candidates: &[WasapiEndpoint],
+) -> Result<WasapiEndpoint, String> {
+    if requested.eq_ignore_ascii_case("default") {
+        let id =
+            default_id.ok_or_else(|| "WASAPI ne signale aucun endpoint par défaut".to_string())?;
+        return candidates
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned()
+            .ok_or_else(|| format!("L'endpoint WASAPI par défaut « {id} » n'est plus présent"));
+    }
+
+    let requested_id = requested
+        .strip_prefix("WASAPI:")
+        .or_else(|| requested.strip_prefix("wasapi:"))
+        .unwrap_or(requested);
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.id == requested_id)
+    {
+        return Ok(candidate.clone());
+    }
+
+    let mut occurrences = std::collections::HashMap::<&str, usize>::new();
+    for candidate in candidates {
+        let occurrence = occurrences.entry(candidate.name.as_str()).or_default();
+        *occurrence += 1;
+        let display_name = if *occurrence == 1 {
+            candidate.name.clone()
+        } else {
+            format!("{} ({})", candidate.name, *occurrence)
+        };
+        if display_name.eq_ignore_ascii_case(requested) {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let available = candidates
+        .iter()
+        .map(|candidate| format!("{} [{}]", candidate.name, candidate.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Endpoint WASAPI demandé introuvable : « {requested} ». Disponibles : {available}"
+    ))
 }
 
 // SAFETY: SPSC strict. Un seul producteur appelle `push`/`clear`, un seul
@@ -1901,6 +1986,23 @@ fn record_windows_exclusive_pcm_refusal(
     );
     if let Ok(mut slot) = failure_slot.lock() {
         *slot = Some(error.user_message(backend, device));
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn record_wasapi_exclusive_open_failure(
+    requested_device: &str,
+    error: &str,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        requested_device,
+        error, "wasapi_exclusive_open_failed_without_fallback"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "Sortie « {requested_device} » : l'ouverture WASAPI exclusive a échoué ({error}). Aucun repli vers un autre endpoint ou vers le mode partagé n'a été effectué"
+        ));
     }
 }
 
@@ -2668,6 +2770,8 @@ impl OutputTarget for LocalOutput {
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
+        #[cfg(target_os = "windows")]
+        let endpoint_id = self.endpoint_id.clone();
         let url = url.to_string();
         let playing = self.playing.clone();
         let paused = self.paused.clone();
@@ -3868,6 +3972,7 @@ impl OutputTarget for LocalOutput {
 
                 match WasapiExclusiveOutput::new(
                     &device_name,
+                    endpoint_id.as_deref(),
                     sample_rate,
                     bit_depth as u32,
                     channels as u32,
@@ -3876,10 +3981,14 @@ impl OutputTarget for LocalOutput {
                 ) {
                     Ok(mut wasapi) => {
                         if let Err(e) = wasapi.start() {
-                            warn!(error = %e, "wasapi_exclusive_start_failed_falling_back");
+                            record_wasapi_exclusive_open_failure(&device_name, &e, &open_failure);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
                         } else {
                             info!(
-                                device = %device_name,
+                                requested_device = %device_name,
+                                device = %wasapi.opened_device_name(),
+                                endpoint_id = %wasapi.opened_device_id(),
                                 info = %wasapi.format_info(),
                                 "wasapi_exclusive_playing"
                             );
@@ -4122,10 +4231,9 @@ impl OutputTarget for LocalOutput {
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "wasapi_exclusive_init_failed_falling_back_to_shared"
-                        );
+                        record_wasapi_exclusive_open_failure(&device_name, &e, &open_failure);
+                        playing.store(false, Ordering::SeqCst);
+                        return;
                     }
                 }
             }
@@ -6493,6 +6601,86 @@ mod tests {
             bytes.extend_from_slice(&word.to_le_bytes()[..bytes_per_sample]);
         }
         bytes
+    }
+
+    fn wasapi_endpoint_fixture() -> Vec<WasapiEndpoint> {
+        vec![
+            WasapiEndpoint {
+                id: "{speaker-a}".into(),
+                name: "Haut-parleurs".into(),
+            },
+            WasapiEndpoint {
+                id: "{speaker-b}".into(),
+                name: "Haut-parleurs".into(),
+            },
+            WasapiEndpoint {
+                id: "{usb-dac}".into(),
+                name: "DAC USB".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn wasapi_duplicate_names_resolve_to_distinct_stable_endpoints() {
+        let endpoints = wasapi_endpoint_fixture();
+        assert_eq!(
+            select_wasapi_endpoint("Haut-parleurs", Some("{speaker-a}"), &endpoints)
+                .unwrap()
+                .id,
+            "{speaker-a}"
+        );
+        assert_eq!(
+            select_wasapi_endpoint("Haut-parleurs (2)", Some("{speaker-a}"), &endpoints)
+                .unwrap()
+                .id,
+            "{speaker-b}"
+        );
+        assert_eq!(
+            select_wasapi_endpoint("WASAPI:{usb-dac}", Some("{speaker-a}"), &endpoints)
+                .unwrap()
+                .name,
+            "DAC USB"
+        );
+    }
+
+    #[test]
+    fn wasapi_default_change_only_affects_an_explicit_default_request() {
+        let endpoints = wasapi_endpoint_fixture();
+        let first_default =
+            select_wasapi_endpoint("default", Some("{speaker-a}"), &endpoints).unwrap();
+        let changed_default =
+            select_wasapi_endpoint("default", Some("{usb-dac}"), &endpoints).unwrap();
+        assert_eq!(first_default.id, "{speaker-a}");
+        assert_eq!(changed_default.id, "{usb-dac}");
+
+        let explicit_before =
+            select_wasapi_endpoint("Haut-parleurs", Some("{speaker-a}"), &endpoints).unwrap();
+        let explicit_after =
+            select_wasapi_endpoint("Haut-parleurs", Some("{usb-dac}"), &endpoints).unwrap();
+        assert_eq!(explicit_before.id, "{speaker-a}");
+        assert_eq!(explicit_after.id, "{speaker-a}");
+    }
+
+    #[test]
+    fn wasapi_missing_endpoint_fails_instead_of_selecting_default() {
+        let error = select_wasapi_endpoint(
+            "DAC disparu",
+            Some("{speaker-a}"),
+            &wasapi_endpoint_fixture(),
+        )
+        .expect_err("un endpoint absent doit échouer");
+        assert!(error.contains("DAC disparu"));
+        assert!(error.contains("{speaker-a}"));
+    }
+
+    #[test]
+    fn wasapi_open_failure_is_returned_without_authorising_a_fallback() {
+        let slot = std::sync::Mutex::new(None);
+        record_wasapi_exclusive_open_failure("DAC USB", "endpoint {usb-dac} absent", &slot);
+        let message = slot.lock().unwrap().clone().expect("erreur remontée");
+        assert!(message.contains("DAC USB"));
+        assert!(message.contains("{usb-dac}"));
+        assert!(message.contains("Aucun repli"));
     }
 
     #[test]

@@ -1594,8 +1594,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             }
 
             // New device found — register it
-            let local_out = tune_core::outputs::local::LocalOutput::with_options(
+            let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
+                (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 state.effective_exclusive_mode(),
                 &configured_backend,
             );

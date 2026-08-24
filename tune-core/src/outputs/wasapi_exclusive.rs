@@ -11,9 +11,39 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use cpal::traits::{DeviceTrait, HostTrait};
 use tracing::{debug, info};
 
-use super::local::{NativePcmRing, native_i32_to_pcm_bytes};
+use super::local::{
+    NativePcmRing, WasapiEndpoint, native_i32_to_pcm_bytes, select_wasapi_endpoint,
+};
+
+#[cfg(target_os = "windows")]
+fn resolve_wasapi_endpoint(requested: &str) -> Result<WasapiEndpoint, String> {
+    let host = cpal::host_from_id(cpal::HostId::Wasapi)
+        .map_err(|error| format!("Hôte WASAPI indisponible : {error}"))?;
+    let default_id = host
+        .default_output_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.1);
+    let devices = host
+        .output_devices()
+        .map_err(|error| format!("Énumération des endpoints WASAPI impossible : {error}"))?;
+    let mut candidates = Vec::new();
+    for device in devices {
+        let id = device
+            .id()
+            .map_err(|error| format!("ID endpoint WASAPI illisible : {error}"))?
+            .1;
+        let name = device
+            .description()
+            .map_err(|error| format!("Nom endpoint WASAPI illisible pour {id} : {error}"))?
+            .name()
+            .to_string();
+        candidates.push(WasapiEndpoint { id, name });
+    }
+    select_wasapi_endpoint(requested, default_id.as_deref(), &candidates)
+}
 
 // ---------------------------------------------------------------------------
 // Windows COM/WASAPI FFI declarations
@@ -44,10 +74,6 @@ mod ffi {
     pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
     pub const INFINITE: u32 = 0xFFFFFFFF;
     pub const WAIT_OBJECT_0: u32 = 0;
-
-    // Render endpoint
-    pub const E_DATA_FLOW_RENDER: u32 = 0;
-    pub const E_ROLE_MULTIMEDIA: u32 = 1;
 
     // KSDATAFORMAT_SUBTYPE_PCM {00000001-0000-0010-8000-00AA00389B71}
     pub const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID {
@@ -177,6 +203,7 @@ mod ffi {
 
 pub struct WasapiExclusiveOutput {
     device_name: String,
+    device_id: String,
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
@@ -195,11 +222,12 @@ pub struct WasapiExclusiveOutput {
 }
 
 impl WasapiExclusiveOutput {
-    /// Try to open the default audio device in WASAPI Exclusive mode
-    /// at the given sample rate and bit depth.
+    /// Open exactly the WASAPI endpoint requested by the zone in exclusive
+    /// mode at the given sample rate and bit depth.
     #[cfg(target_os = "windows")]
     pub fn new(
         device_name: &str,
+        endpoint_id: Option<&str>,
         sample_rate: u32,
         bit_depth: u32,
         channels: u32,
@@ -212,6 +240,8 @@ impl WasapiExclusiveOutput {
 
         unsafe {
             CoInitializeEx(ptr::null(), COINIT_MULTITHREADED);
+
+            let resolved = resolve_wasapi_endpoint(endpoint_id.unwrap_or(device_name))?;
 
             // 1. Create MMDeviceEnumerator
             let mut enumerator: *mut c_void = ptr::null_mut();
@@ -228,22 +258,28 @@ impl WasapiExclusiveOutput {
                 ));
             }
 
-            // 2. GetDefaultAudioEndpoint(eRender, eMultimedia)
+            // 2. Re-open the stable endpoint ID selected above. `default` was
+            // resolved exactly once to Windows' current default ID; an
+            // explicit endpoint can therefore never drift with a later change
+            // of default device.
             let mut device: *mut c_void = ptr::null_mut();
             {
-                type GetDefaultFn =
-                    unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT;
+                type GetDeviceFn =
+                    unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> HRESULT;
                 let vtable = *(enumerator as *const *const *const c_void);
-                let get_default: GetDefaultFn = std::mem::transmute(*vtable.add(4));
-                let hr = get_default(
-                    enumerator,
-                    E_DATA_FLOW_RENDER,
-                    E_ROLE_MULTIMEDIA,
-                    &mut device,
-                );
+                let get_device: GetDeviceFn = std::mem::transmute(*vtable.add(5));
+                let endpoint_wide: Vec<u16> = resolved
+                    .id
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let hr = get_device(enumerator, endpoint_wide.as_ptr(), &mut device);
                 if hr != S_OK {
                     release(enumerator);
-                    return Err(format!("GetDefaultAudioEndpoint failed: 0x{hr:08X}"));
+                    return Err(format!(
+                        "IMMDeviceEnumerator::GetDevice a refusé {} [{}] : 0x{hr:08X}",
+                        resolved.name, resolved.id
+                    ));
                 }
             }
 
@@ -423,7 +459,9 @@ impl WasapiExclusiveOutput {
             }
 
             info!(
-                device = %device_name,
+                requested_device = %device_name,
+                device = %resolved.name,
+                endpoint_id = %resolved.id,
                 sample_rate,
                 bit_depth,
                 channels,
@@ -433,7 +471,8 @@ impl WasapiExclusiveOutput {
             );
 
             Ok(Self {
-                device_name: device_name.to_string(),
+                device_name: resolved.name,
+                device_id: resolved.id,
                 sample_rate,
                 bit_depth,
                 channels,
@@ -606,9 +645,22 @@ impl WasapiExclusiveOutput {
 
     pub fn format_info(&self) -> String {
         format!(
-            "WASAPI Exclusive {}ch {}bit {}Hz (buffer: {} frames)",
-            self.channels, self.bit_depth, self.sample_rate, self.buffer_frame_count
+            "WASAPI Exclusive {} [{}] {}ch {}bit {}Hz (buffer: {} frames)",
+            self.device_name,
+            self.device_id,
+            self.channels,
+            self.bit_depth,
+            self.sample_rate,
+            self.buffer_frame_count
         )
+    }
+
+    pub fn opened_device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn opened_device_id(&self) -> &str {
+        &self.device_id
     }
 }
 
@@ -626,6 +678,7 @@ impl Drop for WasapiExclusiveOutput {
 impl WasapiExclusiveOutput {
     pub fn new(
         _device_name: &str,
+        _endpoint_id: Option<&str>,
         _sample_rate: u32,
         _bit_depth: u32,
         _channels: u32,
