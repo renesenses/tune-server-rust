@@ -233,6 +233,67 @@ impl Convolver {
         Self::read_wav_ir(path)
     }
 
+    /// Combiner deux reponses impulsionnelles MONO — gauche et droite — en un
+    /// seul WAV stereo, et rendre sa cadence.
+    ///
+    /// Le moteur sait deja convoluer un canal par reponse : `Convolver::new`
+    /// prend un `&[Vec<f32>]`, et un WAV stereo donne bien deux corrections
+    /// differentes. Ce qui manquait, c'est le CHEMIN D'ENTREE : les outils de
+    /// correction de piece — REW, Acourate, Audiolense — exportent DEUX
+    /// fichiers mono, `filter_L.wav` et `filter_R.wav`, jamais un stereo.
+    /// L'utilisateur devait donc les fusionner lui-meme dans un editeur audio
+    /// (Daniel, 24/08/2026).
+    ///
+    /// On ecrit le resultat au chemin que les consommateurs lisent DEJA, plutot
+    /// que d'ajouter un second reglage : la sortie locale, le chemin de
+    /// transcodage vers les renderers reseau et la visualisation
+    /// `/convolver/response` continuent de ne connaitre qu'un fichier.
+    ///
+    /// Les deux reponses doivent partager leur cadence — convoluer a des
+    /// cadences differentes decalerait un canal par rapport a l'autre. La plus
+    /// courte est completee de zeros : c'est neutre pour une convolution.
+    pub fn combiner_en_stereo(
+        chemin_gauche: &str,
+        chemin_droite: &str,
+        chemin_sortie: &str,
+    ) -> Result<u32, String> {
+        let (ir_g, sr_g) = Self::read_wav_ir(chemin_gauche)?;
+        let (ir_d, sr_d) = Self::read_wav_ir(chemin_droite)?;
+        if sr_g != sr_d {
+            return Err(format!(
+                "les deux filtres doivent partager leur cadence : {sr_g} Hz a gauche, {sr_d} Hz a droite"
+            ));
+        }
+        // Un fichier stereo passe aussi : on prend son canal correspondant, ce
+        // qui evite un refus incomprehensible si l'outil a exporte deux stereo.
+        let gauche = ir_g.first().ok_or("le filtre gauche est vide")?;
+        let droite = ir_d
+            .get(1)
+            .or_else(|| ir_d.first())
+            .ok_or("le filtre droit est vide")?;
+        if gauche.is_empty() || droite.is_empty() {
+            return Err("un des deux filtres ne contient aucun echantillon".into());
+        }
+
+        let n = gauche.len().max(droite.len());
+        let mut entrelace = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            entrelace.push(gauche.get(i).copied().unwrap_or(0.0));
+            entrelace.push(droite.get(i).copied().unwrap_or(0.0));
+        }
+        ecrire_wav_float32(chemin_sortie, &entrelace, 2, sr_g)?;
+        tracing::info!(
+            gauche = chemin_gauche,
+            droite = chemin_droite,
+            sortie = chemin_sortie,
+            sample_rate = sr_g,
+            taps_gauche = gauche.len(),
+            taps_droite = droite.len(),
+            "convolver_ir_stereo_combinee"
+        );
+        Ok(sr_g)
+    }
+
     /// Load an IR for a specific stream rate + channel count. Requires the IR's
     /// sample rate to match (resampling is a follow-up); a mono IR is duplicated
     /// to the stream's channel count. Used by the transcode path so the FIR can
@@ -523,6 +584,43 @@ pub fn log_freq_grid(n: usize, f_lo: f64, f_hi: f64) -> Vec<f64> {
 ///
 /// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
 /// which JSON can't carry); phase is the principal atan2 value in degrees.
+/// Ecrire un WAV flottant 32 bits — le format que `read_wav_ir` relit sans
+/// perte (`format_tag = 3`).
+///
+/// Volontairement minimal : un `fmt ` et un `data`, rien d'autre. Une reponse
+/// impulsionnelle n'a que faire d'un `LIST/INFO`, et moins il y a de chunks,
+/// moins il y a de facons de se tromper en les relisant.
+fn ecrire_wav_float32(
+    chemin: &str,
+    entrelace: &[f32],
+    canaux: u16,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let bits: u16 = 32;
+    let bloc = canaux * bits / 8;
+    let octets_par_seconde = sample_rate * bloc as u32;
+    let taille_data = (entrelace.len() * 4) as u32;
+
+    let mut w = Vec::with_capacity(44 + taille_data as usize);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + taille_data).to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    w.extend_from_slice(&canaux.to_le_bytes());
+    w.extend_from_slice(&sample_rate.to_le_bytes());
+    w.extend_from_slice(&octets_par_seconde.to_le_bytes());
+    w.extend_from_slice(&bloc.to_le_bytes());
+    w.extend_from_slice(&bits.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&taille_data.to_le_bytes());
+    for e in entrelace {
+        w.extend_from_slice(&e.to_le_bytes());
+    }
+    std::fs::write(chemin, &w).map_err(|e| format!("ecriture du filtre combine : {e}"))
+}
+
 pub fn fir_frequency_response(
     taps: &[f32],
     sample_rate: u32,
@@ -878,5 +976,125 @@ mod tests {
             "near fs/2: {} dB",
             pts[1].magnitude_db
         );
+    }
+
+    /// Ecrire un WAV mono flottant pour les tests de combinaison.
+    fn ecrire_ir_mono(chemin: &std::path::Path, taps: &[f32], sr: u32) {
+        super::ecrire_wav_float32(chemin.to_str().unwrap(), taps, 1, sr).unwrap();
+    }
+
+    /// Deux filtres MONO, gauche et droite, deviennent un WAV stereo dont
+    /// chaque canal porte SON filtre.
+    ///
+    /// C'est le chemin d'entree qui manquait : le moteur savait deja convoluer
+    /// un canal par reponse, mais REW, Acourate et Audiolense exportent deux
+    /// fichiers mono, jamais un stereo (Daniel, 24/08/2026).
+    #[test]
+    fn deux_filtres_mono_deviennent_un_stereo_par_canal() {
+        let dir = std::env::temp_dir().join(format!("tune-fir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = dir.join("gauche.wav");
+        let d = dir.join("droite.wav");
+        let out = dir.join("combine.wav");
+
+        // Deux filtres RECONNAISSABLES et de longueurs differentes.
+        ecrire_ir_mono(&g, &[1.0, 0.5, 0.25], 48_000);
+        ecrire_ir_mono(&d, &[-1.0, -0.5], 48_000);
+
+        let sr = Convolver::combiner_en_stereo(
+            g.to_str().unwrap(),
+            d.to_str().unwrap(),
+            out.to_str().unwrap(),
+        )
+        .expect("la combinaison doit reussir");
+        assert_eq!(sr, 48_000);
+
+        let (ir, sr_relu) = Convolver::read_ir_taps(out.to_str().unwrap()).unwrap();
+        assert_eq!(sr_relu, 48_000);
+        assert_eq!(ir.len(), 2, "le fichier combine doit etre STEREO");
+        assert_eq!(
+            ir[0],
+            vec![1.0, 0.5, 0.25],
+            "le canal gauche doit porter le filtre gauche, intact"
+        );
+        assert_eq!(
+            ir[1],
+            vec![-1.0, -0.5, 0.0],
+            "le canal droit doit porter le filtre droit, complete de zeros — un \
+             zero est neutre pour une convolution, contrairement a une repetition"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Des cadences differentes sont un refus, pas un rattrapage silencieux :
+    /// convoluer a deux cadences decalerait un canal par rapport a l'autre.
+    #[test]
+    fn deux_cadences_differentes_sont_refusees() {
+        let dir = std::env::temp_dir().join(format!("tune-fir-sr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = dir.join("g.wav");
+        let d = dir.join("d.wav");
+        let out = dir.join("o.wav");
+        ecrire_ir_mono(&g, &[1.0, 0.0], 48_000);
+        ecrire_ir_mono(&d, &[1.0, 0.0], 44_100);
+
+        let e = Convolver::combiner_en_stereo(
+            g.to_str().unwrap(),
+            d.to_str().unwrap(),
+            out.to_str().unwrap(),
+        )
+        .expect_err("deux cadences differentes doivent etre refusees");
+        assert!(
+            e.contains("48000") && e.contains("44100"),
+            "le refus doit NOMMER les deux cadences, sinon l'utilisateur ne sait \
+             pas lequel de ses deux fichiers reexporter — recu : {e}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Le fichier combine doit vraiment traverser le convolveur : deux
+    /// impulsions de signes opposes doivent ressortir de signes opposes.
+    #[test]
+    fn le_stereo_combine_convolue_chaque_canal_avec_son_filtre() {
+        let dir = std::env::temp_dir().join(format!("tune-fir-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = dir.join("g.wav");
+        let d = dir.join("d.wav");
+        let out = dir.join("o.wav");
+        // Gauche : gain 1. Droite : gain -1 (phase inversee).
+        ecrire_ir_mono(&g, &[1.0], 48_000);
+        ecrire_ir_mono(&d, &[-1.0], 48_000);
+        Convolver::combiner_en_stereo(
+            g.to_str().unwrap(),
+            d.to_str().unwrap(),
+            out.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut conv = Convolver::from_wav(out.to_str().unwrap(), 4).unwrap();
+        let latence = conv.latency_frames();
+        // Une impulsion identique sur les deux canaux, entrelacee.
+        let mut sortie = vec![0.0f32; (latence + 4) * 2];
+        sortie[0] = 1.0;
+        sortie[1] = 1.0;
+        // Traitement EN PLACE : la tranche porte l'entree puis la sortie.
+        conv.process_interleaved(&mut sortie);
+
+        let i = latence * 2;
+        assert!(
+            (sortie[i] - 1.0).abs() < 1e-4,
+            "le canal gauche doit sortir en phase : {}",
+            sortie[i]
+        );
+        assert!(
+            (sortie[i + 1] + 1.0).abs() < 1e-4,
+            "le canal droit doit sortir en phase INVERSEE — s'il sort comme le \
+             gauche, les deux canaux partagent le meme filtre : {}",
+            sortie[i + 1]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
