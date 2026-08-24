@@ -176,6 +176,12 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             "bit_depth": np.bit_depth,
             "genre": np.genre,
             "year": np.year,
+            // ⚠️ Ce JSON est ecrit A LA MAIN : ajouter un champ a `NowPlaying`
+            // ne suffit PAS a le faire sortir ici. Sans ces deux lignes, le
+            // client continuerait de deviner l'album depuis son titre — et
+            // « Entreat » retomberait sur la page de The Cure (FabienM).
+            "album_id": np.album_id,
+            "artist_id": np.artist_id,
         })),
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,
@@ -2141,6 +2147,20 @@ async fn get_sleep(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> 
     }))
 }
 
+/// Quel prereglage appliquer, s'il y en a un.
+///
+/// Trois cas, et c'est la seule logique de decision de `set_eq` :
+///
+/// - des **bandes explicites** l'emportent : un client qui envoie les deux
+///   sait ce qu'il veut, et c'est ce que fait l'ecran Egaliseur ;
+/// - **« custom »** n'est pas un prereglage, c'est le nom que porte un reglage
+///   fait a la main — le resoudre ecraserait justement ce reglage ;
+/// - un **nom seul** doit agir. C'est ce que l'ecran « En cours de lecture »
+///   envoie, et c'est ce qui ne faisait rien.
+fn prereglage_a_appliquer(preset: Option<&str>, bandes_fournies: bool) -> Option<&str> {
+    preset.filter(|nom| !bandes_fournies && *nom != "custom")
+}
+
 #[derive(Deserialize)]
 struct EqSettings {
     enabled: Option<bool>,
@@ -2208,6 +2228,36 @@ async fn set_eq(
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+
+    // Un prereglage NOMME doit agir. Il ne le faisait pas : ce champ etait
+    // seulement recopie dans la reponse, et l'ecran « En cours de lecture »
+    // n'envoie QUE lui — donc choisir « Rock » repondait 200 sans rien
+    // changer au son. Les bandes explicites restent prioritaires : un client
+    // qui envoie les deux sait ce qu'il veut.
+    let prereglage_demande = prereglage_a_appliquer(body.preset.as_deref(), body.bands.is_some());
+    if let Some(nom) = prereglage_demande {
+        match tune_core::audio::eq_presets::bandes(nom) {
+            Some(bandes) => {
+                profile.bands = bandes;
+                // Choisir un prereglage l'allume : sans cela il faudrait deux
+                // gestes pour entendre quoi que ce soit, et le premier
+                // semblerait sans effet — le defaut qu'on repare.
+                profile.enabled = true;
+            }
+            None => {
+                // Un nom inconnu doit se VOIR. Repondre 200 sur un nom qu'on
+                // ne sait pas resoudre, c'est reproduire le silence d'origine.
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("prereglage inconnu : {nom}"),
+                        "known": tune_core::audio::eq_presets::noms(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     if let Some(bands) = &body.bands {
         profile.bands = bands
@@ -3338,5 +3388,40 @@ mod save_queue_decision {
     #[test]
     fn une_file_vide_ne_compte_rien() {
         assert_eq!(distantes_de(0, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_prereglage {
+    use super::prereglage_a_appliquer;
+
+    /// Le defaut repare : un nom SEUL doit agir.
+    ///
+    /// C'est exactement ce que `setEqualizer()` envoie depuis l'ecran « En
+    /// cours de lecture » — `{ "preset": "rock" }`, sans bandes. Le serveur
+    /// repondait 200 et ne changeait rien.
+    #[test]
+    fn un_nom_seul_doit_agir() {
+        assert_eq!(prereglage_a_appliquer(Some("rock"), false), Some("rock"));
+    }
+
+    /// Des bandes explicites l'emportent : l'ecran Egaliseur envoie les deux,
+    /// et c'est SA courbe qui doit s'appliquer, pas la table du prereglage.
+    #[test]
+    fn des_bandes_explicites_lemportent() {
+        assert_eq!(prereglage_a_appliquer(Some("rock"), true), None);
+    }
+
+    /// « custom » n'est pas un prereglage : c'est le nom d'un reglage fait a
+    /// la main. Le resoudre ecraserait ce reglage par une table.
+    #[test]
+    fn custom_ne_declenche_rien() {
+        assert_eq!(prereglage_a_appliquer(Some("custom"), false), None);
+    }
+
+    #[test]
+    fn sans_prereglage_il_ny_a_rien_a_appliquer() {
+        assert_eq!(prereglage_a_appliquer(None, false), None);
+        assert_eq!(prereglage_a_appliquer(None, true), None);
     }
 }

@@ -36,6 +36,21 @@ pub struct NowPlaying {
     pub bit_depth: Option<u32>,
     pub genre: Option<String>,
     pub year: Option<i32>,
+    /// L'album et l'artiste de la piste, par IDENTIFIANT.
+    ///
+    /// Ils manquaient. Le client web devait donc DEVINER l'album depuis son
+    /// titre : cliquer sur « Entreat (2010) » dans la lecture en cours lancait
+    /// une recherche sur « Entreat » et atterrissait sur la page de The Cure,
+    /// pas sur celle de l'album (FabienM, v0.9.102). `Track` les porte tous
+    /// deux, `from_track` les jetait.
+    ///
+    /// `Option`, et `#[serde(default)]` : une piste en streaming ou une radio
+    /// n'a pas d'entree en bibliotheque, et un client plus ancien ne les envoie
+    /// pas.
+    #[serde(default)]
+    pub album_id: Option<i64>,
+    #[serde(default)]
+    pub artist_id: Option<i64>,
 }
 
 impl NowPlaying {
@@ -70,6 +85,8 @@ impl NowPlaying {
             bit_depth: track.bit_depth.map(|v| v as u32),
             genre: track.genre.clone(),
             year: track.year,
+            album_id: track.album_id,
+            artist_id: track.artist_id,
         }
     }
 }
