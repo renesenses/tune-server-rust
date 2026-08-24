@@ -643,6 +643,50 @@ pub(super) async fn remove_music_dir(
     Ok(Json(json!({ "dirs": dirs })))
 }
 
+/// `POST /system/shutdown` — arrete le serveur Tune. Il ne redemarre pas.
+///
+/// ## Ce que ce bouton fait, et ce qu'il ne fait PAS
+///
+/// Il arrete **le processus Tune**, pas la machine. C'est ce que « Arreter le
+/// serveur » doit vouloir dire partout : sur un Mac, un PC ou un NAS, Tune est
+/// une application parmi d'autres, et eteindre l'hote parce qu'on quitte un
+/// lecteur de musique serait une surprise couteuse.
+///
+/// Eteindre la MACHINE est une operation d'appliance. Elle vit dans le module
+/// `appliance`, qui rend 404 sur une installation ordinaire.
+///
+/// ## Le piege du superviseur, et pourquoi on l'assume
+///
+/// Sous `systemd` avec `Restart=always` — c'est le cas du service Tune sur
+/// Linux — le processus sera **relance**. L'arret n'est donc definitif que
+/// pour une installation non supervisee.
+///
+/// On ne cherche pas a desactiver le service : cela demanderait les droits
+/// systeme, et surtout cela laisserait Tune eteint apres un redemarrage de la
+/// machine, ce que personne n'a demande. La reponse dit donc franchement ce
+/// qui va se passer, et l'ecran le repete a l'utilisateur AVANT qu'il ne
+/// clique.
+pub(super) async fn shutdown(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+    let supervise = std::path::Path::new("/run/systemd/system").exists();
+
+    tokio::spawn(async {
+        // Laisser la reponse HTTP partir avant de fermer le processus : sans
+        // ce delai, l'ecran ne recevrait jamais la confirmation et afficherait
+        // une erreur reseau pour un arret qui a parfaitement fonctionne.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tracing::info!("shutdown_requested — arret du serveur a la demande de l'utilisateur");
+        std::process::exit(0);
+    });
+
+    Json(json!({
+        "stopping": true,
+        // `true` = un superviseur va relancer Tune. L'ecran le dit avant de
+        // laisser cliquer : promettre un arret qui n'en est pas un serait le
+        // meme defaut que le prereglage qui repondait 200 sans rien faire.
+        "supervised": supervise,
+    }))
+}
+
 pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
     tokio::spawn(async {
         // Let the HTTP response flush before we swap the process image.

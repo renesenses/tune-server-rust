@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/wifi/scan", get(wifi_scan))
         .route("/wifi/connect", post(wifi_connect))
         .route("/wifi/forget", post(wifi_forget))
+        .route("/poweroff", post(poweroff))
         .route("/shutdown", post(shutdown))
 }
 
@@ -305,6 +306,52 @@ async fn wifi_forget(
     )
     .await?;
     Ok(Json(json!({ "forgotten": true })))
+}
+
+/// `POST /appliance/poweroff` — eteint la MACHINE. Appliance uniquement.
+///
+/// Sur une installation ordinaire cette route rend 404, comme le reste du
+/// module : Tune y est une application parmi d'autres, et eteindre l'hote
+/// parce qu'on quitte un lecteur de musique serait une surprise couteuse.
+/// « Arreter le serveur » (`POST /system/shutdown`) est la pour cela.
+///
+/// Sur une appliance, en revanche, il n'y a rien d'autre sur la machine : le
+/// geste attendu quand on a fini d'ecouter, c'est de l'eteindre — et le faire
+/// proprement vaut mieux que couper l'alimentation, qui laisse la base dans un
+/// etat incertain.
+///
+/// ## Les droits
+///
+/// Le serveur ne tourne pas en root. `systemctl poweroff` passe par polkit, et
+/// l'image d'appliance doit porter la regle qui l'autorise pour l'utilisateur
+/// du service. Sans elle, la commande echoue — et cette route le DIT, avec la
+/// sortie d'erreur, plutot que de repondre « ok » a un arret qui n'a pas eu
+/// lieu.
+async fn poweroff(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+
+    let binaire = std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into());
+
+    // Lancee AVANT de repondre, contrairement au redemarrage du serveur : si
+    // la commande echoue faute de droits, l'utilisateur doit le savoir tout de
+    // suite. Une extinction qu'on annonce sans l'avoir obtenue est pire qu'un
+    // refus franc.
+    let sortie = Command::new(&binaire)
+        .arg("poweroff")
+        .output()
+        .await
+        .map_err(|e| AppError::internal(format!("systemctl introuvable : {e}")))?;
+
+    if !sortie.status.success() {
+        let details = String::from_utf8_lossy(&sortie.stderr).trim().to_string();
+        tracing::error!(details = %details, "appliance_poweroff_refuse");
+        return Err(AppError::internal(format!(
+            "extinction refusee par le systeme : {details}"
+        )));
+    }
+
+    tracing::info!("appliance_poweroff — extinction demandee par l'utilisateur");
+    Ok(Json(json!({ "powering_off": true })))
 }
 
 #[cfg(test)]
