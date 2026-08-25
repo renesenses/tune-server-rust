@@ -98,7 +98,6 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         preparation_windows_native.contains("apply_local_dsp("),
         "la préparation Windows entière ne traite plus le PCM non bit-perfect"
     );
-
     let asio = prod
         .split("// ------- Exclusive mode path (Windows ASIO) -------")
         .nth(1)

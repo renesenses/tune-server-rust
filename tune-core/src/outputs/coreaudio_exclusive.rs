@@ -15,6 +15,17 @@
 //!    hardware.
 //!
 //! On drop, the original sample rate is restored and hog mode is released.
+//!
+//! ⚠️ **Ces garanties sont FAIL-CLOSED** (#2235, JP Robbe). Elles échouaient
+//! toutes en fail-open : périphérique absent → repli silencieux sur la sortie
+//! système, hog refusé → simple warning, cadence refusée → conversion interne
+//! acceptée — et le chemin du signal annonçait bit-perfect quand même. Le
+//! verdict bit-perfect étant calculé statiquement (`zones.rs`), il ne peut pas
+//! connaître l'état d'exécution : la SEULE façon de le rendre vrai est que
+//! l'ouverture n'aboutisse que si toutes les garanties tiennent. Si `new()`
+//! rend `Ok`, le périphérique demandé est hoggé, à la cadence demandée, au
+//! format demandé — sinon c'est une `Err` qui dit quoi faire. Même doctrine
+//! que le WASAPI fail-closed de #2233/#2379.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +61,13 @@ pub struct ExclusiveOutput {
 }
 
 /// Information about the currently-configured exclusive format.
+///
+/// Elle decrit l'etat REEL, pas l'intention. Le module s'annoncait
+/// « exclusive/bit-perfect » alors que presque toutes ses garanties
+/// echouaient en fail-open : peripherique de repli silencieux, hog mode
+/// refuse mais poursuivi, cadence materielle refusee mais conversion interne
+/// acceptee (JP Robbe, #2235). Le chemin du signal affichait alors
+/// bit-perfect a tort.
 #[derive(Debug, Clone)]
 pub struct ExclusiveFormatInfo {
     pub sample_rate: u32,
@@ -84,29 +102,20 @@ impl ExclusiveOutput {
             match macos_helpers::get_device_id_from_name(device_name, false) {
                 Some(id) => id,
                 None => {
-                    // Device name not found — fall back to default output.
-                    // This handles USB DACs that change names after re-plug or
-                    // macOS audio device renaming after system updates.
-                    match macos_helpers::get_default_device_id(false) {
-                        Some(default_id) => {
-                            let default_name = macos_helpers::get_device_name(default_id)
-                                .unwrap_or_else(|_| "unknown".to_string());
-                            warn!(
-                                requested = %device_name,
-                                fallback = %default_name,
-                                fallback_id = default_id,
-                                "coreaudio_exclusive_device_not_found_falling_back_to_default — \
-                                 the configured device is unavailable; using the system default \
-                                 output device for exclusive mode"
-                            );
-                            default_id
-                        }
-                        None => {
-                            return Err(format!(
-                                "Audio device not found: {device_name} (and no default device available)"
-                            ));
-                        }
-                    }
+                    // FAIL-CLOSED. Ce chemin basculait en silence sur la sortie
+                    // systeme par defaut — pratique pour un DAC USB renomme,
+                    // mais un MENSONGE en mode exclusif : l'utilisateur a
+                    // choisi CE peripherique pour du bit-perfect, et le son
+                    // partait ailleurs, chemin du signal affichant toujours
+                    // « exclusif » (JP Robbe, #2235). Meme doctrine que le
+                    // WASAPI de #2233 : le peripherique demande ou rien.
+                    // Le repli reste possible — en le CHOISISSANT : regler la
+                    // zone sur « default ».
+                    return Err(format!(
+                        "peripherique introuvable en mode exclusif : {device_name} — \
+                         aucun repli silencieux ; choisissez « default » pour viser \
+                         la sortie systeme"
+                    ));
                 }
             }
         };
@@ -145,21 +154,25 @@ impl ExclusiveOutput {
                     info!(pid, device = %resolved_name, "coreaudio_exclusive_hog_acquired");
                 }
                 Ok(pid) => {
-                    warn!(
-                        pid,
-                        device = %resolved_name,
-                        "coreaudio_exclusive_hog_unexpected_pid"
-                    );
-                    // We'll still try to continue without hog mode
+                    // FAIL-CLOSED. « Exclusif sans exclusivite » est une
+                    // contradiction : sans hog, le mixeur HAL reste actif et
+                    // macOS peut melanger les sons systeme au flux — les
+                    // samples livres ne sont plus ceux du fichier, et le
+                    // chemin du signal annoncait pourtant bit-perfect
+                    // (JP Robbe, #2235). Doctrine de #2233 : la garantie, ou
+                    // une erreur qui dit quoi faire.
+                    return Err(format!(
+                        "hog mode detenu par le PID {pid} sur {resolved_name} — \
+                         mode exclusif impossible ; fermez l'application qui \
+                         tient le peripherique, ou passez la zone en mode partage"
+                    ));
                 }
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        device = %resolved_name,
-                        "coreaudio_exclusive_hog_failed"
-                    );
-                    // Continue without hog mode -- user will get a warning but
-                    // bit-perfect format switching may still work on some DACs.
+                    return Err(format!(
+                        "hog mode refuse sur {resolved_name} : {e} — mode exclusif \
+                         impossible ; passez la zone en mode partage pour laisser \
+                         macOS gerer le peripherique"
+                    ));
                 }
             }
         } else {
@@ -170,19 +183,26 @@ impl ExclusiveOutput {
         // -- 4. Set hardware sample rate ---------------------------------
         if (original_sample_rate as u32) != sample_rate {
             if let Err(e) = macos_helpers::set_device_sample_rate(device_id, sample_rate as f64) {
-                warn!(
-                    error = %e,
-                    wanted = sample_rate,
-                    "coreaudio_exclusive_set_sample_rate_failed"
-                );
-                // Non-fatal: the AudioUnit may still resample internally
-            } else {
-                info!(
-                    from = original_sample_rate as u32,
-                    to = sample_rate,
-                    "coreaudio_exclusive_sample_rate_changed"
-                );
+                // FAIL-CLOSED. « L'AudioUnit peut reechantillonner en interne »
+                // est l'inverse exact du bit-perfect promis par ce module : les
+                // samples livres ne seraient plus ceux du fichier, et le chemin
+                // du signal l'annoncerait quand meme (JP Robbe, #2235). On rend
+                // le hog avant de sortir — sinon le peripherique reste confisque.
+                if is_hogged {
+                    let _ = macos_helpers::toggle_hog_mode(device_id);
+                }
+                return Err(format!(
+                    "le peripherique refuse {sample_rate} Hz (il est a {} Hz) : {e} — \
+                     en mode exclusif on ne reechantillonne pas en silence ; \
+                     utilisez le mode partage pour laisser macOS convertir",
+                    original_sample_rate as u32
+                ));
             }
+            info!(
+                from = original_sample_rate as u32,
+                to = sample_rate,
+                "coreaudio_exclusive_sample_rate_changed"
+            );
         }
 
         // -- 5. Set physical stream format (bit-perfect) -----------------
