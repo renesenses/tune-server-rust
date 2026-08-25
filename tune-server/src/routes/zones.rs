@@ -2555,7 +2555,73 @@ async fn renderer_capabilities(
         }
     };
 
+    // Une sonde reussie est un fait d'interet communautaire : quel format cet
+    // appareil annonce-t-il vraiment ? Remontee anonyme, apres la reponse a
+    // l'UI (spawn best-effort), jamais pour une sonde vide (`probed: false`,
+    // qui ne dit rien de l'appareil).
+    if caps.probed {
+        push_device_caps(&state, id, &caps).await;
+    }
+
     Json(json!(caps)).into_response()
+}
+
+/// Partage le resultat du « Verifier le renderer » avec le catalogue
+/// communautaire. La sonde GetProtocolInfo tourne sur le LAN de l'utilisateur
+/// — le site ne peut pas interroger un appareil derriere une box ; seul le
+/// RESULTAT peut voyager. Agrege par appareil cote site, c'est le rapport de
+/// verification consolide sur le parc. Memes principes que
+/// push_device_preset : anonyme, gate telemetrie, best-effort en tache de
+/// fond, et ne part que si marque ET modele sont connus.
+async fn push_device_caps(
+    state: &AppState,
+    zone_id: i64,
+    caps: &tune_core::outputs::dlna::RendererCapabilities,
+) {
+    if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+        return;
+    }
+    let Some((brand, model)) = zone_identity_for_catalog(state, zone_id).await else {
+        return;
+    };
+    let zone = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten();
+    // Les drapeaux seulement : `probed` est un etat de la sonde (garanti true
+    // ici) et `sink` du debogage local qui n'a pas a voyager.
+    let payload = json!({
+        "brand": brand,
+        "model": model,
+        "output_type": zone.and_then(|z| z.output_type),
+        "caps": {
+            "flac": caps.flac,
+            "wav": caps.wav,
+            "lpcm16": caps.lpcm16,
+            "lpcm24": caps.lpcm24,
+            "alac": caps.alac,
+            "aac": caps.aac,
+            "mp3": caps.mp3,
+            "dsd": caps.dsd,
+        },
+    });
+    tokio::spawn(async move {
+        let Ok(client) = tune_core::http::client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return;
+        };
+        match client
+            .post("https://mozaiklabs.fr/api/v1/community/devices/caps")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::debug!(status = %r.status(), "device_caps_pushed"),
+            Err(e) => tracing::debug!(error = %e, "device_caps_push_failed"),
+        }
+    });
 }
 
 /// Register a DLNA output from a discovered device.
