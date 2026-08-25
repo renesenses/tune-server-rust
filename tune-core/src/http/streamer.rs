@@ -144,6 +144,16 @@ pub struct StreamSession {
 }
 
 impl StreamSession {
+    /// Une session-CANAL : la conversion à la volée (DSD→WAV), dont les octets
+    /// ne se lisent qu'une fois. Ni fichier sur disque (Range réel), ni
+    /// mandataire (Range relayé en amont), ni radio (déjà annoncée live).
+    /// C'est le cas où annoncer la seekabilité est un mensonge.
+    pub async fn is_channel(&self) -> bool {
+        !self.is_radio
+            && self.file_path.lock().await.is_none()
+            && self.proxy_url.lock().await.is_none()
+    }
+
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
         let keep_alive = tx.clone();
