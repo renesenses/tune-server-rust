@@ -145,6 +145,35 @@ pub(super) async fn artist_releases(
         }
     }
 
+    // 1 bis. Les favoris STREAMING comptent autant que les favoris locaux :
+    //    un artiste suivi sur Tidal ou Qobuz n'a souvent AUCUNE trace dans la
+    //    table `favorites` (Bertrand, 25/08 : compte Tidal fraichement relie,
+    //    section muette sur ses artistes suivis). Un appel par service
+    //    connecte — le meme budget que les fils de nouveautes plus bas.
+    for nom_service in SERVICES {
+        let arc = {
+            let registre = state.services.lock().await;
+            registre.get(nom_service)
+            // le verrou du registre tombe ici, comme plus bas
+        };
+        let Some(arc) = arc else { continue };
+        let svc = arc.read().await;
+        if !svc.enabled() || !svc.auth_status().await.authenticated {
+            continue;
+        }
+        // Un service en echec n'emporte ni les autres ni la section.
+        let Ok(artistes) = svc.get_user_artists().await else {
+            continue;
+        };
+        drop(svc);
+        for artiste in artistes {
+            let cle = nom_normalise(&artiste.name);
+            if !est_un_fourre_tout(&cle) {
+                aimes.insert(cle);
+            }
+        }
+    }
+
     // 2. Les artistes de la bibliotheque, avec le nombre d'albums possedes —
     //    c'est ce qui permet de dire « 5 albums dans votre bibliotheque ».
     let mut connus: std::collections::HashMap<String, (String, i64)> =
