@@ -97,6 +97,12 @@ const GAPLESS_WINDOW_MS: u64 = 30_000;
 /// Confortablement sous les 300 s : repreparer coute un transcodage, se
 /// tromper coute un blanc et une zone arretee.
 const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
+
+/// Fenêtre minimale entre deux relances automatiques « démarrage mort »
+/// (#2394) sur une même zone. Assez longue pour qu'un second échec dans la
+/// foulée signifie « l'appareil est vraiment planté, on coupe » ; assez
+/// courte pour redonner sa chance à l'album suivant.
+const DEAD_START_RETRY_COOLDOWN_SECS: u64 = 180;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -264,9 +270,9 @@ pub(crate) mod decisions {
     }
 
     use super::{
-        GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS,
-        MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS, MIN_WALL_FRACTION_FOR_NATURAL_END,
-        POLL_FAIL_END_MIN_ERRORS,
+        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS,
+        MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS,
     };
 
     /// Margin (ms) added to the track duration before position-based
@@ -350,6 +356,22 @@ pub(crate) mod decisions {
             wall_elapsed as f64 * 1000.0
                 >= track_duration_ms as f64 * MIN_WALL_FRACTION_FOR_NATURAL_END
         }
+    }
+
+    /// « Démarrage mort » (#2394) : l'échec de lecture DLNA où la piste n'a
+    /// JAMAIS été tirée (0 octet servi). C'est le profil du pipeline Eversolo
+    /// coincé — SOAP et HTTP vivants, lecture morte — que la relance guérit.
+    /// Un décrochage en cours de lecture (octets déjà servis) n'en est pas un.
+    pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
+        output_type == "dlna" && bytes_sent == 0
+    }
+
+    /// Une relance automatique après démarrage mort est-elle permise ?
+    /// Au plus une par fenêtre : si la précédente date de moins de
+    /// DEAD_START_RETRY_COOLDOWN_SECS, l'échec suivant coupe la zone comme
+    /// avant — on ne martèle pas un appareil réellement planté ou éteint.
+    pub fn relance_demarrage_mort_autorisee(derniere_il_y_a_secs: Option<u64>) -> bool {
+        derniere_il_y_a_secs.is_none_or(|s| s > DEAD_START_RETRY_COOLDOWN_SECS)
     }
 
     /// Le verrou « suivant DSD sur DLNA » (#2394) tient-il encore ? Il ne
@@ -1895,6 +1917,12 @@ pub struct PositionPoller {
     db: Arc<dyn crate::db::backend::DbBackend>,
     shared_metrics: PollerMetricsMap,
     event_bus: Option<Arc<crate::event_bus::EventBus>>,
+    /// Horodatage de la dernière relance automatique après « démarrage mort »
+    /// par zone (#2394). Vit HORS de ZonePollState : la relance recrée l'état
+    /// de sondage, un drapeau dedans repartirait à zéro et bouclerait. Une
+    /// relance au plus par fenêtre de DEAD_START_RETRY_COOLDOWN_SECS ; si la
+    /// relance échoue à son tour, la zone est coupée comme avant.
+    relances_demarrage_mort: Mutex<std::collections::HashMap<i64, Instant>>,
 }
 
 impl PositionPoller {
@@ -1912,6 +1940,7 @@ impl PositionPoller {
             db,
             shared_metrics,
             event_bus: None,
+            relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3142,6 +3171,7 @@ impl PositionPoller {
 
             let mut track_ended = false;
             let mut force_stop = false;
+            let mut force_stop_demarrage_mort = false;
 
             // Guard: if Tune's own playback state for this zone is Stopped
             // (or has no now_playing), ignore device state changes entirely.
@@ -3524,6 +3554,24 @@ impl PositionPoller {
                                     );
                                     track_ended = false;
                                     force_stop = true;
+                                    // « Démarrage mort » (#2394) : la piste n'a
+                                    // JAMAIS été tirée (0 octet servi) sur un
+                                    // renderer DLNA — le profil du pipeline
+                                    // Eversolo coincé, qui acquitte le Play et
+                                    // ouvre ses connexions sans rien lire. Une
+                                    // relance (précédée de Pause→Stop, son
+                                    // libérateur connu) passe alors presque
+                                    // toujours à la main. Distinct d'un
+                                    // décrochage EN COURS de lecture
+                                    // (bytes_sent > 0), qu'on ne rejoue pas.
+                                    force_stop_demarrage_mort = decisions::demarrage_mort(
+                                        all_zones
+                                            .iter()
+                                            .find(|z| z.id == Some(zone_id))
+                                            .and_then(|z| z.output_type.as_deref())
+                                            .unwrap_or(""),
+                                        current_bytes,
+                                    );
                                 }
                             } else {
                                 debug!(
@@ -3951,9 +3999,44 @@ impl PositionPoller {
             if force_stop {
                 poll_states.remove(&zone_id);
                 let device_id_ref = self.get_zone_device_id(zone_id);
-                self.orchestrator
-                    .stop(zone_id, device_id_ref.as_deref())
-                    .await;
+                let relance = force_stop_demarrage_mort && {
+                    let mut relances = self.relances_demarrage_mort.lock().await;
+                    let autorisee = decisions::relance_demarrage_mort_autorisee(
+                        relances.get(&zone_id).map(|t| t.elapsed().as_secs()),
+                    );
+                    if autorisee {
+                        relances.insert(zone_id, Instant::now());
+                    }
+                    autorisee
+                };
+                if relance {
+                    // Pause→Stop d'abord : le pipeline Eversolo coincé ACQUITTE
+                    // les Stop sans les exécuter, seul Pause→Stop le libère
+                    // (constaté par SOAP direct sur le DMP-A8). Best-effort :
+                    // un appareil sain n'en souffre pas.
+                    self.orchestrator
+                        .pause(zone_id, device_id_ref.as_deref())
+                        .await;
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                    let position = zone_state.queue_position;
+                    match self.orchestrator.play_from_queue(zone_id, position).await {
+                        Ok(_) => {
+                            warn!(zone_id, position, "demarrage_mort_relance_automatique");
+                        }
+                        Err(e) => {
+                            warn!(zone_id, position, error = %e, "demarrage_mort_relance_echouee");
+                            self.orchestrator
+                                .stop(zone_id, device_id_ref.as_deref())
+                                .await;
+                        }
+                    }
+                } else {
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                }
             } else if track_ended {
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
@@ -5934,6 +6017,32 @@ mod tests {
         assert!(!decisions::position_confirms_transition(
             false, 2_000, 300_000
         ));
+    }
+
+    #[test]
+    fn un_demarrage_mort_est_un_echec_dlna_sans_aucun_octet_servi() {
+        // Le profil du pipeline Eversolo coincé : DLNA, zéro octet tiré.
+        assert!(super::decisions::demarrage_mort("dlna", 0));
+        // Un décrochage EN COURS de lecture n'en est pas un.
+        assert!(!super::decisions::demarrage_mort("dlna", 1_234_567));
+        // Et seul le DLNA est concerné (le zombie est un renderer réseau).
+        assert!(!super::decisions::demarrage_mort("chromecast", 0));
+        assert!(!super::decisions::demarrage_mort("local", 0));
+    }
+
+    #[test]
+    fn une_seule_relance_demarrage_mort_par_fenetre() {
+        // Jamais relancé : autorisé.
+        assert!(super::decisions::relance_demarrage_mort_autorisee(None));
+        // Relancé il y a longtemps : autorisé de nouveau.
+        assert!(super::decisions::relance_demarrage_mort_autorisee(Some(
+            181
+        )));
+        // Relancé dans la fenêtre : on coupe, on ne martèle pas.
+        assert!(!super::decisions::relance_demarrage_mort_autorisee(Some(
+            180
+        )));
+        assert!(!super::decisions::relance_demarrage_mort_autorisee(Some(0)));
     }
 
     #[test]
