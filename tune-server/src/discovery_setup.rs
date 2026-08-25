@@ -416,6 +416,21 @@ async fn handle_ssdp_discovered(
             .or_else(|| svc_urls.get("ConnectionManager"))
             .map(|p| resolve_control_url(&dev.host, dev.port, p));
         if let (Some(av), Some(rc)) = (av_url, rc_url) {
+            // Garde-fou : un appareil PHYSIQUE dont l'URL de contrôle pointe
+            // vers la façade UPnP d'un serveur Tune (`/upnp/renderer/`) est un
+            // enregistrement croisé — les commandes de transport partiraient
+            // dans un miroir qui acquitte tout sans rien faire (saga DMP-A8,
+            // 25/08 : Stop/SetURI/Play « acquittés » par personne). On
+            // journalise fort ; le comportement ne change pas encore, le
+            // mécanisme exact de la greffe restant à établir.
+            if av.contains("/upnp/renderer/") && !dev.id.contains("-tune-") {
+                warn!(
+                    name = %dev.name,
+                    id = %dev.id,
+                    ctrl = %av,
+                    "dlna_output_ctrl_vers_facade_tune — enregistrement suspect"
+                );
+            }
             let delay = crate::config::resolve_play_delay(db, config, &dev.id, &dev.name);
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                 dev.name.clone(),
