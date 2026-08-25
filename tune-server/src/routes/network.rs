@@ -1250,6 +1250,12 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "id": id,
                         "parent_id": parent_id,
                         "title": title,
+                        // Le serveur envoie dc:creator sur les conteneurs album
+                        // depuis toujours — c'est ICI qu'il se perdait : extrait
+                        // quatre lignes plus haut, jamais posé dans le JSON.
+                        // Une grille d'albums sans artiste n'est pas une
+                        // bibliothèque (jeu des sept erreurs, 25/08).
+                        "artist": artist,
                         "child_count": child_count,
                         "album_art_uri": album_art_uri,
                     }));
@@ -1653,6 +1659,29 @@ mod tests {
         assert_eq!(
             best.protocol_info.as_deref(),
             Some("http-get:*:audio/x-flac:*")
+        );
+    }
+
+    /// Jeu des sept erreurs (25/08) : le serveur envoie dc:creator sur les
+    /// conteneurs album depuis toujours — extrait par le parseur, jamais posé
+    /// dans le JSON. Une grille d'albums sans artiste n'est pas une
+    /// bibliothèque. Contre-épreuve faite : fix neutralisé → FAILED.
+    #[test]
+    fn le_createur_d_un_conteneur_atterrit_dans_le_json() {
+        let soap = format!(
+            "<Envelope><Body><BrowseResponse><Result>{}</Result></BrowseResponse></Body></Envelope>",
+            xml_escape(
+                r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><container id="album/18" parentID="albums" restricted="1" childCount="10"><dc:title>18</dc:title><dc:creator>Moby</dc:creator><upnp:class>object.container.album.musicAlbum</upnp:class></container></DIDL-Lite>"#
+            )
+        );
+        let (containers, items) = parse_didl_browse_response(&soap);
+        assert!(items.is_empty());
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0]["title"].as_str(), Some("18"));
+        assert_eq!(
+            containers[0]["artist"].as_str(),
+            Some("Moby"),
+            "dc:creator doit survivre jusqu'au JSON du conteneur"
         );
     }
 
