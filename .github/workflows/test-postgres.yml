@@ -10,7 +10,7 @@ name: Tests (PostgreSQL)
 
 on:
   push:
-    branches: [main, "feature/postgres-support"]
+    branches: [main, release/v0.9, "feature/postgres-support"]
     paths:
       - "tune-core/**"
       - "Cargo.toml"
@@ -24,9 +24,15 @@ on:
       - ".github/workflows/test-postgres.yml"
   workflow_dispatch:
 
+concurrency:
+  group: postgres-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-postgres:
+    name: Test (PostgreSQL)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -44,7 +50,6 @@ jobs:
           --health-retries 10
 
     env:
-      TEST_DATABASE_URL: postgresql://tune:tune@localhost:5432/tune_test
       CARGO_TERM_COLOR: always
 
     steps:
@@ -56,14 +61,12 @@ jobs:
         with:
           shared-key: tune-core-postgres
 
-      # `--no-default-features` drops `local-audio` (which pulls
-      # alsa-sys via cpal). We don't need it to exercise the engine +
-      # postgres modules, so skip it here to keep this job fast.
-      - name: Engine module tests (no DB needed)
-        run: cargo test -p tune-core --no-default-features --features postgres db::engine
-
-      - name: PostgresDb smoke tests
-        run: cargo test -p tune-core --no-default-features --features postgres db::postgres
+      # Suite unique et superset des anciens jobs : elle couvre engine,
+      # PostgresDb et tout tune-core avec le meme jeu postgres+oaat que le job
+      # retire de ci.yml. On ne compile donc plus deux fois le crate pour deux
+      # filtres qui etaient deja inclus dans cette execution.
+      - name: Tests tune-core avec PostgreSQL
+        run: cargo test -p tune-core --no-default-features --features postgres,oaat
 
       # Real-schema regression for #1706: the self-healing DDL in
       # `ensure_schema` and migration 026 can only be proven against an actual
