@@ -1,5 +1,6 @@
 pub mod artwork;
 pub mod artwork_cache;
+pub mod audit;
 pub mod cover_fetcher;
 pub mod duplicate_detector;
 pub mod export;
