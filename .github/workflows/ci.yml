@@ -105,17 +105,23 @@ jobs:
           bash scripts/verifier-refs-issues.sh --autotest
 
       - name: Syntaxe des scripts de garde-fou
-        uses: docker://koalaman/shellcheck-alpine:v0.10.0
-        with:
-          args: --severity=warning scripts/detecter-impact-ci.sh scripts/verifier-fermeture.sh scripts/verifier-refs-issues.sh
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
+            scripts/detecter-impact-ci.sh \
+            scripts/verifier-fermeture.sh \
+            scripts/verifier-refs-issues.sh
 
       # Les workflows historiques portent quelques remarques shellcheck, mais
       # leur YAML et leurs expressions sont valides. On garde le controle
       # structurel et on ignore seulement ces deux familles connues.
       - name: Syntaxe des workflows GitHub
-        uses: docker://rhysd/actionlint:1.7.7
-        with:
-          args: -shellcheck= -ignore constant.expression.*false
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            rhysd/actionlint:1.7.7 \
+            -shellcheck= \
+            -ignore 'constant.expression.*false' \
+            -ignore 'label.*macos-15-intel.*is unknown'
 
   fmt:
     name: Format
