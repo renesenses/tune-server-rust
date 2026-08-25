@@ -27,6 +27,10 @@ pub struct PisteBdd {
     pub format: String,
     pub taille: u64,
     pub mtime: u64,
+    /// Empreinte audio du scan (64 Ko à 25 % du fichier) ; vide si jamais
+    /// calculée. Sert à reconnaître un fichier DÉPLACÉ : même audio,
+    /// nouveau chemin.
+    pub hash: String,
 }
 
 /// Statut d'une ligne du comparatif.
@@ -39,6 +43,9 @@ pub enum Statut {
     Fantome,
     /// Sur le disque mais jamais ingérée : le scan l'a ratée.
     HorsBibliotheque,
+    /// Même audio qu'une piste « fantôme » : le fichier a été déplacé ou
+    /// renommé. Réparable d'une mise à jour de chemin, sans re-scan.
+    Deplacee,
     /// Présente des deux côtés mais taille ou date divergent : le fichier a
     /// changé depuis le scan, les métadonnées en base sont périmées.
     Desynchronisee,
@@ -51,6 +58,7 @@ impl Statut {
         match self {
             Statut::Fantome => "fantôme (en base, absent du disque)",
             Statut::HorsBibliotheque => "hors bibliothèque (sur disque, jamais ingéré)",
+            Statut::Deplacee => "déplacée (même audio qu'une piste fantôme)",
             Statut::Desynchronisee => "désynchronisée (fichier modifié depuis le scan)",
             Statut::Indexee => "indexée",
         }
@@ -124,6 +132,77 @@ pub fn classer(disque: Vec<FichierDisque>, bdd: Vec<PisteBdd>) -> Vec<Ligne> {
     lignes
 }
 
+/// Réconcilie les DÉPLACÉS : un fichier « hors bibliothèque » dont
+/// l'empreinte audio correspond à celle d'une piste « fantôme » est le même
+/// fichier, ailleurs. Les deux lignes fusionnent en une ligne « déplacée »
+/// (chemin = le nouveau, base = l'ancienne piste, dont le chemin devient
+/// `ancien_chemin` dans le CSV).
+///
+/// L'appariement n'a lieu que si l'empreinte est UNIQUE de chaque côté :
+/// deux copies du même album partagent la même empreinte, et deviner
+/// laquelle a bougé fabriquerait une fausse réparation. Dans le doute, les
+/// lignes restent fantôme + hors bibliothèque.
+///
+/// `hashes_disque` : empreintes des seuls fichiers hors bibliothèque —
+/// l'appelant ne hache que les candidats, jamais toute la bibliothèque.
+pub fn apparier_deplaces(
+    lignes: Vec<Ligne>,
+    hashes_disque: &HashMap<String, String>,
+) -> Vec<Ligne> {
+    // Empreinte → indices candidats, de chaque côté.
+    let mut fantomes_par_hash: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut candidats_par_hash: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, l) in lignes.iter().enumerate() {
+        match l.statut {
+            Statut::Fantome => {
+                if let Some(p) = &l.bdd
+                    && !p.hash.is_empty()
+                {
+                    fantomes_par_hash.entry(p.hash.clone()).or_default().push(i);
+                }
+            }
+            Statut::HorsBibliotheque => {
+                if let Some(h) = hashes_disque.get(&l.chemin)
+                    && !h.is_empty()
+                {
+                    candidats_par_hash.entry(h.clone()).or_default().push(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // (candidat, fantôme) — uniquement les correspondances 1↔1.
+    let mut promotions: Vec<(usize, usize)> = Vec::new();
+    for (hash, fantomes) in &fantomes_par_hash {
+        if let Some(cands) = candidats_par_hash.get(hash)
+            && fantomes.len() == 1
+            && cands.len() == 1
+        {
+            promotions.push((cands[0], fantomes[0]));
+        }
+    }
+
+    let mut slots: Vec<Option<Ligne>> = lignes.into_iter().map(Some).collect();
+    for (cand_i, fant_i) in promotions {
+        let Some(fantome) = slots[fant_i].take() else {
+            continue;
+        };
+        if let Some(cand) = slots[cand_i].as_mut() {
+            cand.statut = Statut::Deplacee;
+            cand.bdd = fantome.bdd; // l'ancienne piste — son chemin = ancien_chemin
+        }
+    }
+
+    let mut out: Vec<Ligne> = slots.into_iter().flatten().collect();
+    out.sort_by(|a, b| {
+        a.statut
+            .cmp(&b.statut)
+            .then_with(|| a.chemin.cmp(&b.chemin))
+    });
+    out
+}
+
 fn date_iso(epoch: u64) -> String {
     if epoch == 0 {
         return String::new();
@@ -148,6 +227,7 @@ pub fn rendre_csv(lignes: &[Ligne], avertissements: &[String]) -> String {
     let _ = wtr.write_record([
         "statut",
         "chemin",
+        "ancien_chemin",
         "taille_disque",
         "modifie_disque",
         "track_id",
@@ -162,6 +242,7 @@ pub fn rendre_csv(lignes: &[Ligne], avertissements: &[String]) -> String {
         let _ = wtr.write_record([
             "avertissement",
             a.as_str(),
+            "",
             "",
             "",
             "",
@@ -203,9 +284,16 @@ pub fn rendre_csv(lignes: &[Ligne], avertissements: &[String]) -> String {
                 vide.clone(),
                 vide,
             ));
+        // L'ancien chemin n'a de sens que pour une piste déplacée : ailleurs,
+        // le chemin de la base EST celui de la colonne « chemin ».
+        let ancien = match (l.statut, l.bdd.as_ref()) {
+            (Statut::Deplacee, Some(p)) => p.chemin.clone(),
+            _ => String::new(),
+        };
         let _ = wtr.write_record([
             l.statut.libelle(),
             &l.chemin,
+            &ancien,
             &td,
             &md,
             &id,
@@ -235,6 +323,10 @@ mod tests {
     }
 
     fn pb(chemin: &str, taille: u64, mtime: u64) -> PisteBdd {
+        pbh(chemin, taille, mtime, "")
+    }
+
+    fn pbh(chemin: &str, taille: u64, mtime: u64, hash: &str) -> PisteBdd {
         PisteBdd {
             id: 7,
             chemin: chemin.into(),
@@ -244,6 +336,7 @@ mod tests {
             format: "flac".into(),
             taille,
             mtime,
+            hash: hash.into(),
         }
     }
 
@@ -287,6 +380,60 @@ mod tests {
         // ou pas.
         let lignes = classer(vec![fd("/m/a.flac", 99, 100)], vec![pb("/m/a.flac", 10, 0)]);
         assert_eq!(lignes[0].statut, Statut::Desynchronisee);
+    }
+
+    #[test]
+    fn un_fichier_deplace_fusionne_fantome_et_hors_bibliotheque() {
+        let lignes = classer(
+            vec![fd("/m/nouveau/x.flac", 10, 100)],
+            vec![pbh("/m/ancien/x.flac", 10, 100, "abc123")],
+        );
+        let hashes: HashMap<String, String> =
+            [("/m/nouveau/x.flac".to_string(), "abc123".to_string())].into();
+        let lignes = apparier_deplaces(lignes, &hashes);
+        assert_eq!(lignes.len(), 1);
+        assert_eq!(lignes[0].statut, Statut::Deplacee);
+        assert_eq!(lignes[0].chemin, "/m/nouveau/x.flac");
+        assert_eq!(
+            lignes[0].bdd.as_ref().unwrap().chemin,
+            "/m/ancien/x.flac",
+            "la ligne déplacée garde l'ancienne piste pour la colonne ancien_chemin"
+        );
+        // Et le CSV rend l'ancien chemin dans sa colonne.
+        let csv = rendre_csv(&lignes, &[]);
+        assert!(csv.contains("/m/nouveau/x.flac;/m/ancien/x.flac"));
+    }
+
+    #[test]
+    fn une_empreinte_ambigue_ne_fabrique_pas_de_deplacement() {
+        // Deux copies du même album : même empreinte des deux côtés. Deviner
+        // laquelle a bougé serait une fausse réparation — on ne touche à rien.
+        let lignes = classer(
+            vec![fd("/m/a.flac", 10, 100), fd("/m/b.flac", 10, 100)],
+            vec![pbh("/m/vieux.flac", 10, 100, "dup")],
+        );
+        let hashes: HashMap<String, String> = [
+            ("/m/a.flac".to_string(), "dup".to_string()),
+            ("/m/b.flac".to_string(), "dup".to_string()),
+        ]
+        .into();
+        let lignes = apparier_deplaces(lignes, &hashes);
+        assert!(lignes.iter().all(|l| l.statut != Statut::Deplacee));
+        assert_eq!(
+            lignes
+                .iter()
+                .filter(|l| l.statut == Statut::Fantome)
+                .count(),
+            1
+        );
+        // Une empreinte de base VIDE ne s'apparie jamais non plus.
+        let lignes = classer(
+            vec![fd("/m/c.flac", 10, 100)],
+            vec![pbh("/m/vieux2.flac", 10, 100, "")],
+        );
+        let hashes: HashMap<String, String> = [("/m/c.flac".to_string(), "".to_string())].into();
+        let lignes = apparier_deplaces(lignes, &hashes);
+        assert!(lignes.iter().all(|l| l.statut != Statut::Deplacee));
     }
 
     #[test]
