@@ -21,6 +21,19 @@ mod tests {
         volume_count: Arc<AtomicU32>,
         transport_state: Arc<Mutex<String>>,
         last_seek_target: Arc<Mutex<String>>,
+        /// Simule Platinum/1.0.5.13 : tout SetAVTransportURI/SetNext dont le
+        /// corps dépasse cette taille reçoit `500` au corps VIDE — le serveur
+        /// n'a « pas su lire » la requête.
+        set_uri_max_corps: Arc<Mutex<Option<usize>>>,
+        /// Simule l'Eversolo coincé : Stop est acquitté mais IGNORÉ tant
+        /// qu'un Pause n'est pas passé d'abord.
+        stop_exige_pause: Arc<Mutex<bool>>,
+        /// Ce que GetMediaInfo rapporte comme CurrentURI. Mis à jour par un
+        /// SetAVTransportURI accepté, sauf si `media_info_fige` est vrai.
+        current_uri: Arc<Mutex<String>>,
+        media_info_fige: Arc<Mutex<bool>>,
+        /// Corps des SetAVTransportURI reçus, dans l'ordre.
+        set_uri_corps: Arc<Mutex<Vec<String>>>,
     }
 
     impl Default for MockState {
@@ -34,6 +47,11 @@ mod tests {
                 volume_count: Arc::new(AtomicU32::new(0)),
                 transport_state: Arc::new(Mutex::new("STOPPED".into())),
                 last_seek_target: Arc::new(Mutex::new(String::new())),
+                set_uri_max_corps: Arc::new(Mutex::new(None)),
+                stop_exige_pause: Arc::new(Mutex::new(false)),
+                current_uri: Arc::new(Mutex::new(String::new())),
+                media_info_fige: Arc::new(Mutex::new(false)),
+                set_uri_corps: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -67,33 +85,59 @@ mod tests {
         )
     }
 
-    async fn av_handler(State(state): State<MockState>, body: String) -> String {
+    async fn av_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
+        use axum::response::IntoResponse;
         let action = extract_action(&body);
         match action.as_str() {
-            "SetAVTransportURI" => soap_ok("SetAVTransportURI", ""),
+            "SetAVTransportURI" => {
+                state.set_uri_corps.lock().await.push(body.clone());
+                if let Some(max) = *state.set_uri_max_corps.lock().await
+                    && body.len() > max
+                {
+                    // Platinum : statut d'échec, corps vide, requête jetée.
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, String::new())
+                        .into_response();
+                }
+                let uri = extract_tag(&body, "CurrentURI");
+                if !*state.media_info_fige.lock().await {
+                    *state.current_uri.lock().await = uri;
+                }
+                soap_ok("SetAVTransportURI", "").into_response()
+            }
             "Play" => {
                 state.play_count.fetch_add(1, Ordering::Relaxed);
                 *state.transport_state.lock().await = "PLAYING".into();
-                soap_ok("Play", "")
+                soap_ok("Play", "").into_response()
             }
             "Pause" => {
                 state.pause_count.fetch_add(1, Ordering::Relaxed);
                 *state.transport_state.lock().await = "PAUSED_PLAYBACK".into();
-                soap_ok("Pause", "")
+                // Le Pause libère le Stop (simulation du zombie Eversolo).
+                *state.stop_exige_pause.lock().await = false;
+                soap_ok("Pause", "").into_response()
             }
             "Stop" => {
                 state.stop_count.fetch_add(1, Ordering::Relaxed);
-                *state.transport_state.lock().await = "STOPPED".into();
-                soap_ok("Stop", "")
+                if !*state.stop_exige_pause.lock().await {
+                    *state.transport_state.lock().await = "STOPPED".into();
+                }
+                // Acquitté dans TOUS les cas — c'est le comportement observé.
+                soap_ok("Stop", "").into_response()
             }
             "Seek" => {
                 state.seek_count.fetch_add(1, Ordering::Relaxed);
                 *state.last_seek_target.lock().await = extract_tag(&body, "Target");
-                soap_ok("Seek", "")
+                soap_ok("Seek", "").into_response()
             }
             "SetNextAVTransportURI" => {
                 state.set_next_count.fetch_add(1, Ordering::Relaxed);
-                soap_ok("SetNextAVTransportURI", "")
+                if let Some(max) = *state.set_uri_max_corps.lock().await
+                    && body.len() > max
+                {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, String::new())
+                        .into_response();
+                }
+                soap_ok("SetNextAVTransportURI", "").into_response()
             }
             "GetTransportInfo" => {
                 let ts = state.transport_state.lock().await.clone();
@@ -103,12 +147,22 @@ mod tests {
                         "<CurrentTransportState>{ts}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>"
                     ),
                 )
+                .into_response()
+            }
+            "GetMediaInfo" => {
+                let uri = state.current_uri.lock().await.clone();
+                soap_ok(
+                    "GetMediaInfo",
+                    &format!("<NrTracks>1</NrTracks><CurrentURI>{uri}</CurrentURI>"),
+                )
+                .into_response()
             }
             "GetPositionInfo" => soap_ok(
                 "GetPositionInfo",
                 "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>0:01:30</RelTime><AbsTime>0:01:30</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>",
-            ),
-            _ => soap_ok(&action, ""),
+            )
+            .into_response(),
+            _ => soap_ok(&action, "").into_response(),
         }
     }
 
@@ -152,6 +206,176 @@ mod tests {
             format!("{base}/RenderingControl"),
             None,
         )
+    }
+
+    /// Un média « réel » : les champs du Locatelli DSD128 du terrain, BOM
+    /// U+FEFF dans l'artiste compris. Le DIDL COMPLET de ce média dépasse un
+    /// segment TCP ; c'est lui qui déclenchait le `500 Error Parsing XML Body`
+    /// de Platinum/1.0.5.13.
+    fn media_locatelli(url: &str) -> PlayMedia<'_> {
+        PlayMedia {
+            url,
+            mime_type: "application/x-dsd",
+            title: Some("1. Andante: Locatelli Violin Concerto No. 2 in C Minor, Op. 3, No. 2"),
+            artist: Some("Jacobs, Lisa\u{feff}The String Soloists"),
+            album: Some(
+                "2016 L'Arte del Violino (Locatelli Violin Concertos) (DSD128 Binaural) - Lisa Jacobs, The String Soloists",
+            ),
+            cover_url: Some(
+                "http://192.168.1.18:8888/api/v1/library/artwork/4db36f948b9122ce30c05249450e1b3e",
+            ),
+            duration_ms: Some(487_560),
+            file_size: Some(688_779_678),
+            ..Default::default()
+        }
+    }
+
+    /// LA contre-épreuve du 500 avalé (saga DMP-A8, 25/08).
+    ///
+    /// Le mock joue Platinum : tout SetAVTransportURI dont le corps dépasse
+    /// 1200 octets reçoit `500` au corps VIDE. L'ancien code prenait ce 500
+    /// pour un acquittement (il ne lisait que le corps), envoyait Play, et la
+    /// zone « jouait » une piste jamais transmise. Le nouveau code doit :
+    /// 1. voir l'échec de lecture ;
+    /// 2. descendre l'échelle de DIDL jusqu'à un corps qui passe ;
+    /// 3. finir avec l'URI réellement APPLIQUÉE chez le renderer.
+    #[tokio::test]
+    async fn un_500_sans_corps_fait_descendre_l_echelle_didl() {
+        let state = MockState::default();
+        *state.set_uri_max_corps.lock().await = Some(1200);
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let url = "http://192.168.1.18:8888/stream/echelle-didl.dsf";
+        output.play_media(&media_locatelli(url)).await.unwrap();
+
+        let corps = state.set_uri_corps.lock().await.clone();
+        assert!(
+            corps.len() >= 2,
+            "le DIDL complet devait échouer puis être réduit, {} envoi(s)",
+            corps.len()
+        );
+        assert!(
+            corps[0].len() > 1200,
+            "le premier envoi devait porter le DIDL complet ({} octets)",
+            corps[0].len()
+        );
+        assert!(
+            corps.last().unwrap().len() <= 1200,
+            "le dernier envoi devait tenir sous la limite de lecture"
+        );
+        assert_eq!(
+            *state.current_uri.lock().await,
+            url,
+            "l'URI doit être réellement appliquée après la descente d'échelle"
+        );
+        handle.abort();
+    }
+
+    /// Le DIDL minimal doit VRAIMENT tenir sous un segment TCP (~1448 octets
+    /// pour l'enveloppe SOAP complète, en-têtes HTTP en sus) — sinon l'échelle
+    /// ne résout rien. Mesuré sur le média réel le plus verbeux du terrain.
+    #[tokio::test]
+    async fn le_didl_minimal_tient_sous_un_segment() {
+        let media = media_locatelli(
+            "http://192.168.1.18:8888/stream/aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000.dsf",
+        );
+        let minimal =
+            DlnaOutput::didl_metadata_minimale_pour_test(&media, "1", "application/x-dsd");
+        // L'enveloppe SOAP ajoute ~330 octets autour du DIDL échappé.
+        assert!(
+            minimal.len() + 330 + media.url.len() < 1200,
+            "DIDL minimal trop gros : {} octets échappés",
+            minimal.len()
+        );
+        let complet = DlnaOutput::didl_metadata_pour_test(&media, "1", "application/x-dsd");
+        assert!(
+            complet.len() > minimal.len(),
+            "le complet doit être plus riche que le minimal"
+        );
+    }
+
+    /// Le zombie Eversolo : Stop ACQUITTÉ mais IGNORÉ tant qu'un Pause n'est
+    /// pas passé. La prise de contrôle doit escalader Pause→Stop au lieu de
+    /// marteler des Stop sourds pendant 2 s.
+    #[tokio::test]
+    async fn un_stop_ignore_est_debloque_par_pause() {
+        let state = MockState::default();
+        *state.transport_state.lock().await = "PLAYING".into();
+        *state.stop_exige_pause.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let url = "http://192.168.1.18:8888/stream/zombie.dsf";
+        output.play_media(&media_locatelli(url)).await.unwrap();
+
+        assert!(
+            state.pause_count.load(Ordering::Relaxed) >= 1,
+            "l'escalade Pause devait être tentée face au Stop ignoré"
+        );
+        assert_eq!(*state.current_uri.lock().await, url);
+        handle.abort();
+    }
+
+    /// L'échec définitif doit NOMMER l'URI que le renderer tient, et vider le
+    /// média quand ce flux est le NÔTRE — il va mourir avec la session, et le
+    /// DMP-A8 ressasse une URI morte jusqu'à bloquer toute prise de contrôle.
+    #[tokio::test]
+    async fn l_echec_nomme_l_uri_tenue_et_vide_notre_media_mort() {
+        let state = MockState::default();
+        // GetMediaInfo fige une AUTRE URI de NOTRE serveur : la vérification
+        // doit échouer, l'erreur la nommer, et le vidage partir.
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await =
+            "http://192.168.1.18:8888/stream/vieux-flux-mort.flac".into();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let err = output
+            .play_media(&media_locatelli(
+                "http://192.168.1.18:8888/stream/nouveau.dsf",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("vieux-flux-mort"),
+            "l'erreur doit nommer l'URI tenue : {err}"
+        );
+        let corps = state.set_uri_corps.lock().await.clone();
+        let dernier = corps.last().unwrap();
+        assert!(
+            dernier.contains("<CurrentURI></CurrentURI>"),
+            "le média mort (notre hôte) devait être vidé, dernier envoi : {}",
+            &dernier[..dernier.len().min(200)]
+        );
+        handle.abort();
+    }
+
+    /// Un flux ÉTRANGER (autre serveur) n'est PAS vidé : c'est peut-être une
+    /// lecture légitime pilotée ailleurs.
+    #[tokio::test]
+    async fn un_flux_etranger_n_est_pas_vide() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await =
+            "http://192.168.1.42:8888/stream/lecture-d-un-autre-serveur.flac".into();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let err = output
+            .play_media(&media_locatelli(
+                "http://192.168.1.18:8888/stream/nouveau.dsf",
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.contains("lecture-d-un-autre-serveur"));
+        let corps = state.set_uri_corps.lock().await.clone();
+        assert!(
+            !corps.last().unwrap().contains("<CurrentURI></CurrentURI>"),
+            "un flux étranger ne doit jamais être vidé"
+        );
+        handle.abort();
     }
 
     #[tokio::test]
