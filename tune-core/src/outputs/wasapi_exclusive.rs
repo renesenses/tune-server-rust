@@ -9,11 +9,11 @@
 //! third-party ASIO driver.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, info};
 
-use super::local::RingBuf;
+use super::local::{NativePcmRing, native_i32_to_pcm_bytes};
 
 // ---------------------------------------------------------------------------
 // Windows COM/WASAPI FFI declarations
@@ -180,8 +180,7 @@ pub struct WasapiExclusiveOutput {
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
-    ring: Arc<RingBuf>,
-    volume: Arc<AtomicU32>,
+    ring: Arc<NativePcmRing>,
     paused: Arc<AtomicBool>,
     #[cfg(target_os = "windows")]
     audio_client: *mut std::ffi::c_void,
@@ -204,8 +203,7 @@ impl WasapiExclusiveOutput {
         sample_rate: u32,
         bit_depth: u32,
         channels: u32,
-        ring: Arc<RingBuf>,
-        volume: Arc<AtomicU32>,
+        ring: Arc<NativePcmRing>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         use ffi::*;
@@ -440,7 +438,6 @@ impl WasapiExclusiveOutput {
                 bit_depth,
                 channels,
                 ring,
-                volume,
                 paused,
                 audio_client,
                 render_client,
@@ -472,7 +469,6 @@ impl WasapiExclusiveOutput {
         }
 
         let ring = self.ring.clone();
-        let volume = self.volume.clone();
         let paused = self.paused.clone();
         let running = self.running.clone();
         let render_client = self.render_client as usize; // Send as usize (pointer)
@@ -546,68 +542,21 @@ impl WasapiExclusiveOutput {
                         continue;
                     }
 
-                    // Read from ring buffer (f32 samples)
-                    let mut samples = vec![0.0f32; needed_samples];
+                    // Native words are already left-aligned and volume/DSP
+                    // have already been resolved by the producer. The
+                    // callback performs serialization only: no float, scale,
+                    // rounding or truncation can alter a bit-perfect word.
+                    let mut samples = vec![0i32; needed_samples];
                     let read = ring.pop(&mut samples);
+                    samples[read..].fill(0);
 
-                    // Apply volume
-                    let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-                    if vol < 0.999 {
-                        for s in &mut samples[..read] {
-                            *s *= vol;
-                        }
-                    }
-                    // Zero any unread samples
-                    for s in &mut samples[read..] {
-                        *s = 0.0;
-                    }
-
-                    // Convert f32 to the target bit depth and write to WASAPI buffer
                     let out_slice = std::slice::from_raw_parts_mut(
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    match bytes_per_sample {
-                        2 => {
-                            for (i, &s) in samples.iter().enumerate() {
-                                let val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                                let bytes = val.to_le_bytes();
-                                let off = i * 2;
-                                if off + 1 < out_slice.len() {
-                                    out_slice[off] = bytes[0];
-                                    out_slice[off + 1] = bytes[1];
-                                }
-                            }
-                        }
-                        3 => {
-                            for (i, &s) in samples.iter().enumerate() {
-                                let val = (s.clamp(-1.0, 1.0) * 8388607.0) as i32;
-                                let bytes = val.to_le_bytes();
-                                let off = i * 3;
-                                if off + 2 < out_slice.len() {
-                                    out_slice[off] = bytes[0];
-                                    out_slice[off + 1] = bytes[1];
-                                    out_slice[off + 2] = bytes[2];
-                                }
-                            }
-                        }
-                        4 => {
-                            for (i, &s) in samples.iter().enumerate() {
-                                let val = (s.clamp(-1.0, 1.0) * 2147483647.0) as i32;
-                                let bytes = val.to_le_bytes();
-                                let off = i * 4;
-                                if off + 3 < out_slice.len() {
-                                    out_slice[off] = bytes[0];
-                                    out_slice[off + 1] = bytes[1];
-                                    out_slice[off + 2] = bytes[2];
-                                    out_slice[off + 3] = bytes[3];
-                                }
-                            }
-                        }
-                        _ => {
-                            std::ptr::write_bytes(buf, 0, out_slice.len());
-                        }
-                    }
+                    let written =
+                        native_i32_to_pcm_bytes(&samples, (bytes_per_sample * 8) as u16, out_slice);
+                    out_slice[written..].fill(0);
 
                     type RelBufFn =
                         unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
@@ -680,8 +629,7 @@ impl WasapiExclusiveOutput {
         _sample_rate: u32,
         _bit_depth: u32,
         _channels: u32,
-        _ring: Arc<RingBuf>,
-        _volume: Arc<AtomicU32>,
+        _ring: Arc<NativePcmRing>,
         _paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         Err("WASAPI Exclusive is only available on Windows".into())
