@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use reqwest::Client;
 use tokio::io::AsyncWriteExt;
@@ -65,6 +65,15 @@ pub struct DlnaOutput {
     /// next track causes the renderer to display stale metadata (wrong
     /// duration, format) on every other track.
     next_item_id_flip: AtomicBool,
+    /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
+    /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
+    /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
+    /// minimal passe — mais l'échelle re-payait l'aller-retour raté À CHAQUE
+    /// piste (un warn + ~200 ms par SetURI/SetNext, constaté sur DMP-A8,
+    /// #2394). Une fois le niveau qui passe constaté, on démarre là. Jamais
+    /// remonté en cours de vie du process : la pile du renderer ne change pas ;
+    /// un redémarrage de Tune repart du complet.
+    didl_niveau_appris: AtomicU8,
     /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
     micromega_ip: Option<String>,
     /// URL for the ConnectionManager service (used to query GetProtocolInfo).
@@ -116,6 +125,7 @@ impl DlnaOutput {
                 .unwrap_or_default(),
             play_delay_ms: AtomicU64::new(0),
             next_item_id_flip: AtomicBool::new(false),
+            didl_niveau_appris: AtomicU8::new(0),
             micromega_ip,
             connection_manager_url,
         }
@@ -490,7 +500,10 @@ impl OutputTarget for DlnaOutput {
         // Échelle de métadonnées : DIDL complet → minimal → vide. On ne
         // descend que sur un échec de LECTURE de la requête (500 sans corps,
         // Platinum) — jamais sur un défaut SOAP, qui a sa propre reprise 714.
-        let mut niveau_didl: u8 = 0;
+        // On démarre au niveau APPRIS pour cet appareil : re-payer l'échec du
+        // complet à chaque piste coûtait un aller-retour et un warn par SetURI
+        // (DMP-A8, #2394) pour finir au même DIDL minimal de toute façon.
+        let mut niveau_didl: u8 = self.didl_niveau_appris.load(Ordering::Relaxed);
         loop {
             let metadata = match niveau_didl {
                 0 => Self::didl_metadata_mime(media, item_id, &attempt_mime),
@@ -517,6 +530,8 @@ impl OutputTarget for DlnaOutput {
             };
 
             if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
+                self.didl_niveau_appris
+                    .store(niveau_didl, Ordering::Relaxed);
                 break;
             }
 
@@ -936,7 +951,9 @@ impl OutputTarget for DlnaOutput {
         // Platinum — et un gapless silencieusement perdu, c'est une file qui
         // s'arrête entre deux pistes.
         let mut resp = None;
-        for niveau in 0u8..=2 {
+        // Même départ au niveau appris que le play : l'échec du DIDL complet
+        // est une propriété de l'appareil, pas de la piste (#2394).
+        for niveau in self.didl_niveau_appris.load(Ordering::Relaxed)..=2 {
             let metadata = match niveau {
                 0 => Self::didl_metadata(media, item_id),
                 1 => Self::didl_metadata_minimale(media, item_id, media.mime_type),
@@ -947,6 +964,7 @@ impl OutputTarget for DlnaOutput {
                 media.url
             )).await {
                 Ok(r) => {
+                    self.didl_niveau_appris.store(niveau, Ordering::Relaxed);
                     resp = Some(r);
                     break;
                 }

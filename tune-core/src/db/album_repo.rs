@@ -1214,19 +1214,24 @@ impl AlbumRepo {
         } else {
             "ASC"
         };
+        // `a.id` en DERNIER départage de chaque tri : sans clé unique finale,
+        // l'ordre des égalités peut changer d'une requête à l'autre, et toute
+        // pagination (le Browse UPnP page par 200) SAUTE des albums et en
+        // double d'autres — six albums absents de la grille d'un serveur Tune
+        // distant (jeu des sept erreurs, 25/08).
         let order_clause = match sort {
-            "title" => format!("LOWER(a.title) {dir}"),
+            "title" => format!("LOWER(a.title) {dir}, a.id ASC"),
             "release_date" => format!(
-                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC"
+                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC, a.id ASC"
             ),
             // The web client's sort dropdown labels this option "original_year"
             // (LibraryView AlbumSortKey); accept it as an alias for "year" so an
             // unknown key doesn't silently fall through to the `a.id` default.
             "year" | "original_year" => {
-                format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC")
+                format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC, a.id ASC")
             }
             "artist" => {
-                format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
+                format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC, a.id ASC")
             }
             // "Date added" must survive a full rescan. A full rescan does
             // `DELETE FROM albums` + reinsert (track_repo::delete_all), so
