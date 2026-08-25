@@ -411,6 +411,9 @@ impl OutputTarget for OaatMultiroomOutput {
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
             let stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
+            // La position VRAIE d'un flux FLAC : lue dans les en-têtes de
+            // trames, pas déduite des octets compressés (#2214).
+            let mut trames_flac = super::helpers::CompteurDeTramesFlac::new();
             let start = std::time::Instant::now();
             let mut health_check_interval =
                 tokio::time::interval(std::time::Duration::from_secs(10));
@@ -446,11 +449,19 @@ impl OutputTarget for OaatMultiroomOutput {
                             && !paused.load(Ordering::Relaxed)
                         {
                             let payload: Vec<u8> = buf.drain(..packet_size).collect();
-                            let pts_ns = if is_flac {
-                                stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
-                            } else {
-                                stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
-                            };
+                            if is_flac {
+                                // La position du paquet est celle de la
+                                // dernière trame FLAC qui y commence — pas un
+                                // prorata d'octets compressés (#2214). Au
+                                // passage, `sample_offset` cesse d'être figé à
+                                // zéro sur ce chemin.
+                                trames_flac.avaler(&payload);
+                                if trames_flac.est_synchronise() {
+                                    sample_offset = trames_flac.position_samples();
+                                }
+                            }
+                            let pts_ns =
+                                stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
                             let flags = if sample_offset == 0 && byte_offset == 0 {
                                 PacketFlags::FIRST_PACKET
                             } else {
@@ -473,8 +484,7 @@ impl OutputTarget for OaatMultiroomOutput {
                             else { sample_offset += PCM_SAMPLES_PER_PACKET as u64; }
 
                             position_ms.store(
-                                if is_flac { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
-                                else { sample_offset * 1000 / cur_sample_rate as u64 },
+                                sample_offset * 1000 / cur_sample_rate.max(1) as u64,
                                 Ordering::Relaxed,
                             );
 
