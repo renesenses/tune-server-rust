@@ -645,7 +645,7 @@ async fn diffuser_pcm<S: SortieRtp>(
     // canal consommable ne se deduit pas deux fois : on le retient.
     let mut interrompu = false;
 
-    while offset + BYTES_PER_PACKET <= pcm_be.len() {
+    'paquets: while offset + BYTES_PER_PACKET <= pcm_be.len() {
         // Check for stop signal (non-blocking)
         if stop_rx.try_recv().is_ok() {
             interrompu = true;
@@ -659,8 +659,13 @@ async fn diffuser_pcm<S: SortieRtp>(
 
         while paused.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if stop_rx.try_recv().is_ok() {
+                interrompu = true;
+                break 'paquets;
+            }
             if !playing.load(Ordering::Relaxed) {
-                return;
+                interrompu = true;
+                break 'paquets;
             }
         }
 
@@ -858,6 +863,36 @@ mod tests {
             Vec::<usize>::new(),
             "en pause puis arret, aucun paquet ne doit partir (#2310)"
         );
+    }
+
+    /// Le signal Stop est le premier geste de `AirPlayOutput::stop`, avant le
+    /// TEARDOWN RTSP et avant la bascule de `playing`. La boucle RTP doit donc
+    /// le consommer même quand elle attend dans Pause : sinon sa tâche reste
+    /// suspendue jusqu'à la fin du TEARDOWN ou jusqu'à une reprise qui ne
+    /// viendra jamais.
+    #[tokio::test]
+    async fn stop_pendant_pause_termine_sans_attendre_reprise() {
+        let pcm = piste(200, 0);
+        let sortie = SortieDeTest::default();
+        let playing = AtomicBool::new(true);
+        let paused = AtomicBool::new(true);
+        let position = AtomicU64::new(0);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stop_tx.send(()).ok();
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1),
+        )
+        .await
+        .expect("Stop doit sortir de Pause sans attendre Resume ni playing=false");
+
+        assert_eq!(sortie.charges(), Vec::<usize>::new());
+        assert_eq!(position.load(Ordering::Relaxed), 0);
     }
 
     /// L'acquis de #2237 ne doit pas etre perdu : une fin NATURELLE emet bien

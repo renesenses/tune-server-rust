@@ -362,6 +362,14 @@ struct QueueAddRequest {
     #[serde(default)]
     track_ids: Vec<i64>,
     track_id: Option<i64>,
+    /// Enfiler un ALBUM entier.
+    ///
+    /// Il manquait : le client devait résoudre les pistes lui-même puis envoyer
+    /// `track_ids`, ce que le commentaire de `addToQueue` documentait comme un
+    /// contournement. Le défaut de ce contournement n'est pas son coût en
+    /// requêtes, c'est qu'il ignore le rattrapage de la ligne sœur — l'album
+    /// s'ajoutait donc VIDE là où « lire » fonctionne.
+    album_id: Option<i64>,
     position: Option<i64>,
     // Streaming track fields (single)
     source: Option<String>,
@@ -1019,41 +1027,7 @@ async fn play(
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
-        let mut ids: Vec<i64> = track_repo
-            .list_by_album(album_id)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|t| t.id)
-            .collect();
-        if ids.is_empty() {
-            // The clicked album row has no tracks. This happens when the flat
-            // Albums/Genres/Years grids surface a stale/duplicate album row whose
-            // tracks actually live under a sibling row of the same title+artist —
-            // the row the Artists view reaches. That mismatch is exactly why the
-            // same album played from Artists but returned 400 "no tracks to play"
-            // from those grids (Pascal, Totaldac, v0.9.21). Recover by resolving
-            // the populated sibling instead of hard-failing.
-            if let Some(sibling) =
-                tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
-                    .find_populated_sibling(album_id)
-                    .ok()
-                    .flatten()
-            {
-                ids = track_repo
-                    .list_by_album(sibling)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|t| t.id)
-                    .collect();
-                if !ids.is_empty() {
-                    info!(
-                        zone_id,
-                        album_id, sibling, "album_play_recovered_via_populated_sibling"
-                    );
-                }
-            }
-        }
-        ids
+        resoudre_pistes_d_album(&state, &track_repo, album_id, zone_id)
     } else if let Some(playlist_id) = body.playlist_id {
         tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
             .get_track_ids(playlist_id)
@@ -1724,6 +1698,58 @@ async fn resolve_streaming_queue_meta(
     }
 }
 
+/// Les pistes d'un album, avec le rattrapage de la ligne sœur.
+///
+/// ⚠️ Cette résolution ne doit exister QU'ICI. Elle était enfermée dans le
+/// handler de lecture, si bien qu'ajouter un album à la file — qui résolvait
+/// ses pistes autrement — aurait échoué exactement sur les albums où « lire »
+/// réussit : ceux dont la ligne cliquée est vide et dont les pistes vivent sous
+/// une ligne sœur de même titre et même artiste (Pascal, Totaldac, v0.9.21).
+///
+/// Deux résolutions parallèles, c'est le montage qui a déjà fait perdre le
+/// canal des bandes d'égaliseur (#2313) et les identifiants de la lecture en
+/// cours. Une seule, partagée.
+fn resoudre_pistes_d_album(
+    state: &AppState,
+    track_repo: &tune_core::db::track_repo::TrackRepo,
+    album_id: i64,
+    zone_id: i64,
+) -> Vec<i64> {
+    let mut ids: Vec<i64> = track_repo
+        .list_by_album(album_id)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.id)
+        .collect();
+    if ids.is_empty() {
+        // La ligne cliquée n'a pas de pistes : les grilles Albums/Genres/Années
+        // exposent parfois une ligne périmée dont les pistes vivent sous une
+        // sœur — celle que la vue Artistes atteint. Le même album se jouait donc
+        // depuis Artistes et rendait 400 « no tracks to play » depuis ces
+        // grilles (Pascal, Totaldac, v0.9.21).
+        if let Some(sibling) =
+            tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+                .find_populated_sibling(album_id)
+                .ok()
+                .flatten()
+        {
+            ids = track_repo
+                .list_by_album(sibling)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| t.id)
+                .collect();
+            if !ids.is_empty() {
+                info!(
+                    zone_id,
+                    album_id, sibling, "album_recovered_via_populated_sibling"
+                );
+            }
+        }
+    }
+    ids
+}
+
 async fn queue_add(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -1737,6 +1763,29 @@ async fn queue_add(
     // streaming track added "next" while a local album plays now lands right
     // after the current track instead of at the end of the album (Sandro S1).
     let mut inputs: Vec<QueueInput> = Vec::new();
+
+    // Album entier : résolu par la MÊME fonction que la lecture, rattrapage de
+    // la ligne sœur compris. On ne fait qu'obtenir les identifiants ici — ils
+    // rejoignent `local_ids` plus bas, là où TOUTES les pistes locales
+    // deviennent des entrées de file. Un second endroit qui fabriquerait des
+    // `QueueInput::Local` finirait par diverger de celui-ci.
+    let pistes_album: Vec<i64> = match body.album_id {
+        Some(album_id) => {
+            let track_repo =
+                tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+            let ids = resoudre_pistes_d_album(&state, &track_repo, album_id, zone_id);
+            if ids.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("album {album_id} : aucune piste à enfiler")})),
+                )
+                    .into_response();
+            }
+            info!(zone_id, album_id, pistes = ids.len(), "queue_add_album");
+            ids
+        }
+        None => Vec::new(),
+    };
 
     // Single streaming track.
     if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
@@ -1795,7 +1844,8 @@ async fn queue_add(
     }
 
     // Local tracks.
-    let mut local_ids = body.track_ids.clone();
+    let mut local_ids = pistes_album;
+    local_ids.extend_from_slice(&body.track_ids);
     if let Some(single) = body.track_id {
         local_ids.push(single);
     }
