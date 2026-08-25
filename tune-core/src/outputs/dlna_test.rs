@@ -272,6 +272,48 @@ mod tests {
         handle.abort();
     }
 
+    /// L'échec du DIDL complet est une propriété de l'APPAREIL, pas de la
+    /// piste (#2394) : une fois le niveau qui passe constaté, les lectures
+    /// suivantes doivent démarrer là, sans re-payer l'aller-retour raté (un
+    /// warn + ~une requête perdue par piste, constaté sur DMP-A8).
+    #[tokio::test]
+    async fn le_niveau_didl_qui_passe_est_appris_pour_l_appareil() {
+        let state = MockState::default();
+        *state.set_uri_max_corps.lock().await = Some(1200);
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        output
+            .play_media(&media_locatelli(
+                "http://192.168.1.18:8888/stream/apprentissage-a.dsf",
+            ))
+            .await
+            .unwrap();
+        let envois_premier = state.set_uri_corps.lock().await.len();
+        assert!(
+            envois_premier >= 2,
+            "le premier play devait échouer au complet puis réduire ({envois_premier} envoi(s))"
+        );
+
+        output
+            .play_media(&media_locatelli(
+                "http://192.168.1.18:8888/stream/apprentissage-b.dsf",
+            ))
+            .await
+            .unwrap();
+        let corps = state.set_uri_corps.lock().await.clone();
+        assert_eq!(
+            corps.len(),
+            envois_premier + 1,
+            "le second play doit envoyer UN seul SetAVTransportURI, au niveau appris"
+        );
+        assert!(
+            corps.last().unwrap().len() <= 1200,
+            "l'envoi appris doit tenir d'emblée sous la limite de lecture"
+        );
+        handle.abort();
+    }
+
     /// Le DIDL minimal doit VRAIMENT tenir sous un segment TCP (~1448 octets
     /// pour l'enveloppe SOAP complète, en-têtes HTTP en sus) — sinon l'échelle
     /// ne résout rien. Mesuré sur le média réel le plus verbeux du terrain.
