@@ -21,7 +21,6 @@ impact_non_rust() {
       .github/workflows/fermeture-issues.yml \
         | .github/workflows/refs-issues.yml \
         | docs/* | *.md | LICENSE | LICENSE.* \
-        | scripts/detecter-impact-ci.sh \
         | scripts/verifier-fermeture.sh \
         | scripts/verifier-refs-issues.sh)
         ;;
@@ -69,8 +68,6 @@ autotest() {
     '.github/workflows/fermeture-issues.yml' \
     'scripts/verifier-fermeture.sh'
   attendu 'documentation seule' 0 'docs/ARCHITECTURE.md' 'README.md'
-  attendu 'le classifieur se teste lui-meme' 0 'scripts/detecter-impact-ci.sh'
-
   # Chaque chemin potentiellement embarque ou compile doit garder la CI Rust.
   attendu 'source Rust' 1 'tune-core/src/audio/decode.rs'
   attendu 'dependances verrouillees' 1 'Cargo.lock'
@@ -79,6 +76,7 @@ autotest() {
   attendu 'la CI elle-meme exige une passe complete' 1 '.github/workflows/ci.yml'
   attendu 'le workflow de release exige une passe complete' 1 '.github/workflows/release.yml'
   attendu 'un script GitHub inconnu exige une passe complete' 1 '.github/scripts/forum-watch.py'
+  attendu 'le classifieur exige sa propre passe complete' 1 'scripts/detecter-impact-ci.sh'
   attendu 'melange doc et code' 1 'README.md' 'tune-server/src/main.rs'
   attendu 'renommage Rust vers documentation' 1 'tune-core/src/ancien.rs' 'docs/ancien.md'
   attendu 'diff vide fail-closed' 1
