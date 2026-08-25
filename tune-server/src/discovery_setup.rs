@@ -305,6 +305,23 @@ fn est_notre_propre_renderer(
     !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
 }
 
+/// Les UDN de nos propres façades (`upnp_renderer_udn_<zone>`), tels que
+/// `renderer_udn` les persiste à la première annonce. Contrairement aux
+/// adresses, ils ne dépendent d'aucune énumération d'interfaces.
+fn nos_udn_de_facade(db: &Arc<dyn DbBackend>) -> Vec<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("upnp_renderer_udn_"))
+        .map(|(_, v)| v)
+        .collect()
+}
+
+fn est_un_de_nos_udn_de_facade(db: &Arc<dyn DbBackend>, device_id: &str) -> bool {
+    !device_id.is_empty() && nos_udn_de_facade(db).iter().any(|u| u == device_id)
+}
+
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
@@ -363,6 +380,22 @@ async fn handle_ssdp_discovered(
             name = %dev.name,
             location = %loc,
             "ssdp_notre_propre_renderer_ignore"
+        );
+        return;
+    }
+
+    // Deuxième rideau : l'UDN. L'exclusion par adresse ci-dessus echoue des
+    // que l'annonce revient par un chemin que `nos_adresses()` n'enumere pas
+    // (interface manquante, nom d'hote dans LOCATION, vieux build) — c'est la
+    // greffe du 25/08 : .18 a enregistre sa propre facade de la zone 10 comme
+    // zone « Eversolo DMP-A8 (Tune) », UDN identique a `upnp_renderer_udn_10`.
+    // Un UDN de facade est tire au sort par NOUS et persiste : s'il revient
+    // par SSDP, c'est forcement notre reflet.
+    if est_un_de_nos_udn_de_facade(db, &dev.id) {
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            "ssdp_notre_facade_reconnue_par_udn_ignoree"
         );
         return;
     }
@@ -1848,6 +1881,59 @@ mod tests {
             assert!(charge.get("zone").is_none());
             assert_eq!(charge.get("zone_id").and_then(|v| v.as_i64()), Some(4242));
             assert_eq!(charge.get("id").and_then(|v| v.as_i64()), Some(4242));
+        }
+    }
+
+    mod auto_exclusion_par_udn {
+        use super::super::est_un_de_nos_udn_de_facade;
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+
+        fn memory_backend() -> Arc<dyn DbBackend> {
+            let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            tune_core::db::migrations::run_migrations(&db).unwrap();
+            Arc::new(db)
+        }
+
+        // La greffe du 25/08 sur .18 : la façade de la zone 10 revient par
+        // SSDP avec l'UDN que nous avons nous-mêmes persisté, et devient la
+        // zone fantôme « Eversolo DMP-A8 (Tune) ». L'annonce doit être
+        // reconnue comme notre reflet — et l'appareil physique, lui, passer.
+        #[test]
+        fn notre_udn_persiste_est_reconnu_l_appareil_physique_passe() {
+            let backend = memory_backend();
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            settings
+                .set(
+                    "upnp_renderer_udn_10",
+                    "uuid:558dcf82-5868-4126-951a-570149376da6",
+                )
+                .unwrap();
+
+            assert!(est_un_de_nos_udn_de_facade(
+                &backend,
+                "uuid:558dcf82-5868-4126-951a-570149376da6"
+            ));
+            assert!(!est_un_de_nos_udn_de_facade(
+                &backend,
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE"
+            ));
+        }
+
+        // Un réglage voisin (`upnp_renderer_10`, opt-in booléen) ne doit pas
+        // faire écarter un appareil, et un device_id vide non plus.
+        #[test]
+        fn un_reglage_voisin_ou_un_id_vide_n_excluent_rien() {
+            let backend = memory_backend();
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            settings.set("upnp_renderer_10", "true").unwrap();
+            settings.set("upnp_renderer_udn_10", "").unwrap();
+
+            assert!(!est_un_de_nos_udn_de_facade(&backend, "true"));
+            assert!(!est_un_de_nos_udn_de_facade(&backend, ""));
         }
     }
 
