@@ -10,7 +10,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use super::dsd_to_pcm::choose_output_rate;
 
@@ -437,7 +437,7 @@ fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
             // info!, pas debug! : cette copie retarde la première note du
             // fichier ENTIER. Invisible, elle a fait chercher les « lenteurs
             // au chargement » partout ailleurs (chantier du 24/08).
-            info!(src = %src, staged = %dst.display(), bytes, "decode_source_staged_locally");
+            tracing::info!(src = %src, staged = %dst.display(), bytes, "decode_source_staged_locally");
             Some(StagedFile { path: dst })
         }
         Err(e) => {
