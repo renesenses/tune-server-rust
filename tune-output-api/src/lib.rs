@@ -148,6 +148,13 @@ pub struct PlayMedia<'a> {
     /// boundary, leaving outputs to invent a counter of their own.
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    /// False when `url` is a one-shot conversion channel (DSD→WAV à la volée) :
+    /// aucun octet passé ne peut être rejoué, la DIDL doit annoncer
+    /// `DLNA.ORG_OP=00` pour que le renderer streame séquentiellement au lieu
+    /// de chercher par tranches (l'Eversolo DMP-A8 seeke parce qu'on lui a dit
+    /// qu'il pouvait — et gèle à 0:00). True pour tout ce qui est servi depuis
+    /// un fichier, avec un vrai support des Range.
+    pub byte_seekable: bool,
 }
 
 impl Default for PlayMedia<'_> {
@@ -171,6 +178,7 @@ impl Default for PlayMedia<'_> {
             source_id: None,
             track_number: None,
             disc_number: None,
+            byte_seekable: true,
         }
     }
 }

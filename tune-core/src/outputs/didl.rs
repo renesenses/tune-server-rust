@@ -170,6 +170,7 @@ pub struct DidlBuilder {
     /// True for infinite live streams (internet radio): emit live/senderPaced
     /// protocolInfo flags and never emit `size=`/`duration=` in `<res>`.
     live_stream: bool,
+    byte_seekable: bool,
 }
 
 impl DidlBuilder {
@@ -194,6 +195,7 @@ impl DidlBuilder {
             item_id: "0".to_string(),
             parent_id: "0".to_string(),
             live_stream: false,
+            byte_seekable: true,
         }
     }
 
@@ -204,6 +206,16 @@ impl DidlBuilder {
     /// `size=`/`duration=` attributes regardless of any values set.
     pub fn live_stream(mut self, yes: bool) -> Self {
         self.live_stream = yes;
+        self
+    }
+
+    /// Une source FINIE mais non-seekable : la conversion à la volée
+    /// (DSD→WAV). La durée et la taille restent annoncées, mais le
+    /// protocolInfo passe à `DLNA.ORG_OP=00` — sans quoi le renderer
+    /// seeke par tranches un tuyau qui ne sait pas rejouer un octet passé
+    /// (Eversolo DMP-A8 : gel à 0:00 en boucle, .42, 24/08).
+    pub fn byte_seekable(mut self, yes: bool) -> Self {
+        self.byte_seekable = yes;
         self
     }
 
@@ -385,9 +397,20 @@ impl DidlBuilder {
         let protocol_info = match self.protocol_style {
             ProtocolStyle::Dlna => {
                 let flags = if self.live_stream {
-                    dlna_flags_for_mime_live(&self.mime_type)
+                    dlna_flags_for_mime_live(&self.mime_type).to_string()
                 } else {
-                    dlna_flags_for_mime_bd_sr(&self.mime_type, self.bit_depth, self.sample_rate)
+                    let f = dlna_flags_for_mime_bd_sr(
+                        &self.mime_type,
+                        self.bit_depth,
+                        self.sample_rate,
+                    );
+                    if self.byte_seekable {
+                        f.to_string()
+                    } else {
+                        // Conversion à la volée : mêmes profils, mais on dit la
+                        // vérité sur la seekabilité.
+                        f.replace("DLNA.ORG_OP=01", "DLNA.ORG_OP=00")
+                    }
                 };
                 format!("http-get:*:{}:{}", self.mime_type, flags)
             }
@@ -735,6 +758,37 @@ mod tests {
         );
         assert!(!xml.contains("size="), "no size on live stream");
         assert!(!xml.contains("duration="), "no duration on live stream");
+    }
+
+    /// Une conversion à la volée (DSD→WAV) est FINIE mais non-seekable : le
+    /// protocolInfo doit dire OP=00 (sinon l'Eversolo seeke le tuyau et gèle
+    /// à 0:00), mais la durée et la taille restent annoncées — le renderer
+    /// affiche une piste normale, il ne doit juste pas chercher dedans.
+    #[test]
+    fn conversion_didl_dit_op00_mais_garde_la_duree() {
+        let xml = DidlBuilder::new("Abacab", "http://s/stream/x.wav", "audio/wav")
+            .protocol_style(ProtocolStyle::Dlna)
+            .byte_seekable(false)
+            .duration_ms(390_000)
+            .file_size(1_300_000_000)
+            .bit_depth(24)
+            .sample_rate(176_400)
+            .build();
+        assert!(
+            xml.contains("DLNA.ORG_OP=00"),
+            "conversion non-seekable, got: {xml}"
+        );
+        assert!(
+            !xml.contains("DLNA.ORG_OP=01"),
+            "plus aucune annonce de seek, got: {xml}"
+        );
+        assert!(xml.contains("duration="), "la durée reste annoncée");
+        assert!(xml.contains("size="), "la taille reste annoncée");
+        // Pas les drapeaux senderPaced d'un direct : c'est une piste finie.
+        assert!(
+            xml.contains("DLNA.ORG_FLAGS=01700000"),
+            "drapeaux interactifs d'une piste finie, got: {xml}"
+        );
     }
 
     #[test]

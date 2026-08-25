@@ -1760,6 +1760,23 @@ impl PlaybackOrchestrator {
                     .filter(|n| *n > 0)
                     .map(|n| n as u32)
             });
+            // Une session-canal (conversion à la volée) ne sait pas rejouer un
+            // octet passé : la DIDL doit annoncer DLNA.ORG_OP=00, sans quoi le
+            // renderer seeke par tranches et gèle à 0:00 (DMP-A8, DSD, 24/08).
+            let byte_seekable = match resolved.stream_id.as_deref() {
+                Some(sid) => {
+                    let session = {
+                        let sessions = self.streamer.sessions_state();
+                        let guard = sessions.lock().await;
+                        guard.get(sid).cloned()
+                    };
+                    match session {
+                        Some(s) => !s.is_channel().await,
+                        None => true,
+                    }
+                }
+                None => true,
+            };
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -1777,6 +1794,7 @@ impl PlaybackOrchestrator {
                 // DLNA DIDL advertises live/senderPaced semantics instead of a
                 // seekable file (Yamaha R-N2000A stays silent otherwise).
                 live_stream: resolved.source == "radio",
+                byte_seekable,
                 origin_url: resolved.origin_url.as_deref(),
                 source: Some(&resolved.source),
                 source_id: media_source_id.as_deref(),

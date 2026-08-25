@@ -203,6 +203,66 @@ const VOLUME_GRACE_SECS: u64 = 5;
 /// faithful and seeds the future poller state machine (Axe 2): the FSM
 /// `transition` will call exactly these functions.
 pub(crate) mod decisions {
+    /// Qui tient réellement le renderer, d'après l'URI qu'il rapporte.
+    ///
+    /// Le terrain (24/08, DMP-A8 de Bertrand) : DEUX serveurs Tune avaient
+    /// chacun une zone sur le même appareil, et le lecteur interne de
+    /// l'Eversolo s'y ajoutait après un redémarrage. Chaque perdant échouait
+    /// EN SILENCE — l'interface relançait la lecture toutes les quinze
+    /// secondes, et un conflit d'appareil s'est déguisé en « bug DSD ».
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TenueDuRenderer {
+        /// Il joue notre flux — ou ne rapporte rien d'exploitable.
+        LeNotre,
+        /// Il joue le flux d'un AUTRE serveur Tune (l'hôte extrait de l'URI).
+        AutreServeurTune(String),
+        /// Il joue autre chose (BubbleUPnP, une autre application…).
+        AutreApplication,
+        /// URI vide mais transport actif : son propre lecteur interne
+        /// (l'Eversolo restaure sa lecture locale après un redémarrage).
+        LecteurInterne,
+    }
+
+    /// Décide qui tient le renderer.
+    ///
+    /// - `current_uri = None` → [`TenueDuRenderer::LeNotre`] : beaucoup de
+    ///   renderers ne rapportent pas `TrackURI` — l'absence de signal n'est
+    ///   pas une preuve, on ne crie pas sans preuve ;
+    /// - URI vide → lecteur interne (ne se juge que transport actif, c'est à
+    ///   l'appelant de ne demander qu'alors) ;
+    /// - URI portant NOTRE `stream_id` → à nous ;
+    /// - URI au motif `/stream/…` d'un flux Tune, sans notre id → un autre
+    ///   serveur Tune, dont on extrait l'hôte pour le NOMMER à l'écran ;
+    /// - toute autre URI → une autre application.
+    pub fn qui_tient_le_renderer(
+        current_uri: Option<&str>,
+        notre_stream_id: Option<&str>,
+    ) -> TenueDuRenderer {
+        let Some(uri) = current_uri else {
+            return TenueDuRenderer::LeNotre;
+        };
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return TenueDuRenderer::LecteurInterne;
+        }
+        if let Some(sid) = notre_stream_id
+            && !sid.is_empty()
+            && uri.contains(sid)
+        {
+            return TenueDuRenderer::LeNotre;
+        }
+        if uri.contains("/stream/") {
+            let hote = uri
+                .strip_prefix("http://")
+                .or_else(|| uri.strip_prefix("https://"))
+                .and_then(|r| r.split('/').next())
+                .unwrap_or("?")
+                .to_string();
+            return TenueDuRenderer::AutreServeurTune(hote);
+        }
+        TenueDuRenderer::AutreApplication
+    }
+
     use super::{
         GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS,
         MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS, MIN_WALL_FRACTION_FOR_NATURAL_END,
@@ -1647,6 +1707,13 @@ impl IdlePollBackoff {
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
+    /// Ticks consecutifs ou le renderer rapporte une URI qui n'est pas la
+    /// notre. Trois d'affilee avant de parler : une transition de piste peut
+    /// montrer un instant l'URI precedente.
+    tenue_etrangere_ticks: u8,
+    /// Le conflit a deja ete signale pour cette generation de piste : on ne
+    /// harcele pas l'utilisateur a chaque tick.
+    tenue_signalee: bool,
     /// Ticks to ignore Stopped state after a gapless advance, so the
     /// poller doesn't re-send play_from_queue to a renderer that already
     /// transitioned via SetNextAVTransportURI.
@@ -1758,6 +1825,8 @@ impl ZonePollState {
         Self {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -2120,6 +2189,76 @@ impl PositionPoller {
             let already_playing = fresh_states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
+
+            // ── Le renderer nous appartient-il encore ? ──
+            //
+            // Deux serveurs Tune sur le même appareil, ou son lecteur interne
+            // qui reprend la main après un redémarrage : chaque perdant
+            // échouait EN SILENCE, l'interface relançait toutes les quinze
+            // secondes, et un conflit d'appareil s'est déguisé en « bug DSD »
+            // (DMP-A8, 24/08). On regarde l'URI que le renderer rapporte, et
+            // on DIT à l'utilisateur qui tient l'appareil — une fois par
+            // piste, après trois ticks concordants (une transition peut
+            // montrer un instant l'URI précédente).
+            if already_playing {
+                let notre_stream_id = fresh_states
+                    .iter()
+                    .find(|s| s.zone_id == zone_id)
+                    .and_then(|s| s.now_playing.as_ref())
+                    .and_then(|np| np.stream_id.clone());
+                if let Some(ps) = poll_states.get_mut(&zone_id) {
+                    use decisions::TenueDuRenderer;
+                    let verdict = decisions::qui_tient_le_renderer(
+                        status.current_uri.as_deref(),
+                        notre_stream_id.as_deref(),
+                    );
+                    // L'URI vide ne dit « lecteur interne » que si le
+                    // transport est actif : un renderer arrêté a le droit de
+                    // n'avoir rien chargé.
+                    let etrangere = match &verdict {
+                        TenueDuRenderer::LeNotre => false,
+                        TenueDuRenderer::LecteurInterne => status.state == TransportState::Playing,
+                        _ => true,
+                    };
+                    if etrangere {
+                        ps.tenue_etrangere_ticks = ps.tenue_etrangere_ticks.saturating_add(1);
+                        if ps.tenue_etrangere_ticks >= 3 && !ps.tenue_signalee {
+                            ps.tenue_signalee = true;
+                            let message = match &verdict {
+                                TenueDuRenderer::AutreServeurTune(hote) => format!(
+                                    "Cet appareil est tenu par un autre serveur Tune ({hote}).                                      Arrêtez la lecture sur ce serveur-là, ou choisissez un autre appareil."
+                                ),
+                                TenueDuRenderer::LecteurInterne => "L'appareil joue depuis sa propre                                      interface. Arrêtez la lecture sur l'appareil lui-même, puis relancez."
+                                    .to_string(),
+                                _ => "Cet appareil est tenu par une autre application.                                      Arrêtez-y la lecture, puis relancez."
+                                    .to_string(),
+                            };
+                            warn!(
+                                zone_id,
+                                device = %device_id,
+                                verdict = ?verdict,
+                                uri = ?status.current_uri,
+                                "renderer_tenu_par_un_tiers — la lecture demandée ne sortira pas"
+                            );
+                            if let Some(ref bus) = self.event_bus {
+                                bus.emit(
+                                    "zone.playback_error",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "error": message,
+                                        // `fatal` : rien ne se rétablira tout
+                                        // seul, l'utilisateur doit agir — le
+                                        // message le lui dit.
+                                        "fatal": true,
+                                    }),
+                                );
+                            }
+                        }
+                    } else {
+                        ps.tenue_etrangere_ticks = 0;
+                    }
+                }
+            }
             if status.state == TransportState::Playing && !already_playing && !in_startup_grace {
                 let last_state =
                     ZoneRepo::with_backend(self.db.clone()).get_last_play_state(zone_id);
@@ -2286,6 +2425,8 @@ impl PositionPoller {
                 ps.gapless_cooldown = 0;
                 ps.stopped_ticks = 0;
                 ps.track_generation = zone_state.track_generation;
+                ps.tenue_etrangere_ticks = 0;
+                ps.tenue_signalee = false;
                 ps.track_loaded_at = Instant::now();
                 ps.past_end_ticks = 0;
                 ps.gapless_advance_pending = false;
@@ -4278,6 +4419,7 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        byte_seekable: true,
                         origin_url: None,
                         source: resolved.source.as_deref(),
                         source_id: resolved.source_id.as_deref(),
@@ -4392,6 +4534,7 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        byte_seekable: true,
                         origin_url: None,
                         source: resolved.source.as_deref(),
                         source_id: resolved.source_id.as_deref(),
@@ -4630,6 +4773,76 @@ impl PositionPoller {
 
 #[cfg(test)]
 mod tests {
+
+    mod tenue_du_renderer {
+        use crate::poller::decisions::{TenueDuRenderer, qui_tient_le_renderer};
+
+        /// Le cas du 24/08 : le DMP-A8 rapportait l'URI d'un flux du .18
+        /// pendant que le .42 croyait jouer. L'hôte est extrait pour être
+        /// NOMMÉ à l'écran.
+        #[test]
+        fn le_flux_dun_autre_serveur_tune_est_reconnu_et_nomme() {
+            let v = qui_tient_le_renderer(
+                Some("http://192.168.1.18:8888/stream/fe226f5d-abcd.flac"),
+                Some("20dd4336-813d"),
+            );
+            assert_eq!(
+                v,
+                TenueDuRenderer::AutreServeurTune("192.168.1.18:8888".into())
+            );
+        }
+
+        /// Notre propre flux ne déclenche RIEN — c'est le cas nominal.
+        #[test]
+        fn notre_propre_flux_est_le_notre() {
+            let v = qui_tient_le_renderer(
+                Some("http://192.168.1.42:8888/stream/20dd4336-813d.wav"),
+                Some("20dd4336-813d"),
+            );
+            assert_eq!(v, TenueDuRenderer::LeNotre);
+        }
+
+        /// L'Eversolo après redémarrage : transport actif, URI VIDE — c'est
+        /// son lecteur interne qui a restauré sa lecture locale.
+        #[test]
+        fn une_uri_vide_designe_le_lecteur_interne() {
+            assert_eq!(
+                qui_tient_le_renderer(Some(""), Some("x")),
+                TenueDuRenderer::LecteurInterne
+            );
+        }
+
+        /// Pas de TrackURI du tout : beaucoup de renderers n'en rapportent
+        /// pas. L'absence de signal n'est pas une preuve — on ne crie pas.
+        #[test]
+        fn labsence_de_signal_ne_declenche_rien() {
+            assert_eq!(
+                qui_tient_le_renderer(None, Some("x")),
+                TenueDuRenderer::LeNotre
+            );
+        }
+
+        #[test]
+        fn une_autre_application_est_reconnue() {
+            let v = qui_tient_le_renderer(
+                Some("http://192.168.1.30:57645/song/42.mp3"),
+                Some("20dd4336"),
+            );
+            assert_eq!(v, TenueDuRenderer::AutreApplication);
+        }
+
+        /// Sans stream_id à nous (rien en lecture de notre côté), un flux au
+        /// motif Tune reste celui d'un autre serveur.
+        #[test]
+        fn sans_notre_id_un_flux_tune_reste_etranger() {
+            let v = qui_tient_le_renderer(Some("https://tune.local:8888/stream/abc.wav"), None);
+            assert_eq!(
+                v,
+                TenueDuRenderer::AutreServeurTune("tune.local:8888".into())
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -4807,6 +5020,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 4,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -4860,6 +5075,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: true,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 3,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -5158,6 +5375,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -5805,6 +6024,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -6007,6 +6228,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,

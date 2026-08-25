@@ -2280,7 +2280,6 @@ fn feed_selected_windows_exclusive_tail(
         }
     }
 }
-
 /// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
 /// in place, at the three playback-loop feed sites.
 ///
@@ -2687,6 +2686,13 @@ impl OutputTarget for LocalOutput {
         title: Option<&str>,
         artist: Option<&str>,
     ) -> Result<(), String> {
+        // Chronomètre du « temps avant la première note » : play_url couvre
+        // TOUT ce que l'utilisateur perçoit comme le chargement — arrêt de la
+        // piste précédente, remise à zéro du DSP, ouverture du flux, décodage,
+        // pré-remplissage, ouverture du périphérique. `playback_timing` de
+        // l'orchestrateur s'arrête à l'envoi de l'ordre : il ne voyait rien de
+        // tout ça (chantier lenteurs, 24/08).
+        let chrono_demarrage = std::time::Instant::now();
         self.stop().await.ok();
 
         // Frontière de piste : le convolveur vit aussi longtemps que la sortie,
@@ -3109,6 +3115,8 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
                 info!(
+                    demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
+
                     device = %device_name,
                     prefill_samples = initial_written,
                     "local_audio_compressed_playing_after_prefill"
@@ -3582,6 +3590,10 @@ impl OutputTarget for LocalOutput {
                         }
                         return;
                     }
+                }
+                if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
+                    info!(dop = false, "local_audio_dop_stream_state_changed");
+                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
                 }
 
                 let mut http_eof_asio = false;
@@ -4059,8 +4071,18 @@ impl OutputTarget for LocalOutput {
                                     );
                                 }
                             }
+                            if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
+                                info!(dop = false, "local_audio_dop_stream_state_changed");
+                                sync_volume_to_dop(
+                                    &volume,
+                                    &user_volume_ref,
+                                    &rg_factor_ref,
+                                    false,
+                                );
+                            }
 
                             let mut http_eof_wasapi = false;
+                            let mut pcm_refusal = None;
                             loop {
                                 if stop_rx.try_recv().is_ok() {
                                     break;
@@ -4795,6 +4817,8 @@ impl OutputTarget for LocalOutput {
                 }
                 stream_started = true;
                 info!(
+                    demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
+
                     device = %device_name,
                     prefill_samples = ring.available(),
                     "local_audio_playing_after_prefill"
@@ -4976,6 +5000,8 @@ impl OutputTarget for LocalOutput {
                     }
                     stream_started = true;
                     info!(
+                    demarrage_ms = chrono_demarrage.elapsed().as_millis() as u64,
+
                         device = %device_name,
                         prefill_samples = ring.available(),
                         total_bytes_read,
@@ -6822,7 +6848,6 @@ mod tests {
         assert!(!prepared.dop);
         assert!(!prepared.bit_perfect);
     }
-
     #[test]
     fn windows_float_exclusive_rejects_dop_before_the_ring() {
         let fixture = versioned_dop_fixture();
