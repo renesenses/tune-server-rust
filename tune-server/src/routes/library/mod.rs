@@ -3,6 +3,7 @@ mod albums_detailed;
 mod ambiances;
 mod artists;
 mod artwork;
+mod better_quality;
 mod browse;
 mod collections;
 mod credits;
@@ -316,6 +317,14 @@ pub fn router() -> Router<AppState> {
             get(artwork::batch_enrich_artist_artwork_status),
         )
         .route("/duplicates", get(duplicates::list_duplicates))
+        .route(
+            "/tracks/{id}/better-quality",
+            get(better_quality::track_better_quality),
+        )
+        .route(
+            "/albums/{id}/better-quality",
+            get(better_quality::album_better_quality),
+        )
         .route("/duplicates/scan", post(duplicates::scan_duplicates))
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
         .route("/activity", get(stats::library_activity))
