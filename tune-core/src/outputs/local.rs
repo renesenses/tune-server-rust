@@ -3973,7 +3973,6 @@ impl OutputTarget for LocalOutput {
                             }
 
                             let mut http_eof_wasapi = false;
-                            let mut pcm_refusal = None;
                             loop {
                                 if stop_rx.try_recv().is_ok() {
                                     break;
