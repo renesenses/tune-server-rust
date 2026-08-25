@@ -221,7 +221,8 @@ async fn export_library_audit_csv(
             .backend
             .query_many(
                 "SELECT t.id, t.file_path, t.title, COALESCE(ar.name, ''), COALESCE(al.title, ''), \
-                 COALESCE(t.format, ''), COALESCE(t.file_size, 0), COALESCE(t.file_mtime, 0) \
+                 COALESCE(t.format, ''), COALESCE(t.file_size, 0), COALESCE(t.file_mtime, 0), \
+                 COALESCE(t.audio_hash, '') \
                  FROM tracks t \
                  LEFT JOIN artists ar ON t.artist_id = ar.id \
                  LEFT JOIN albums al ON t.album_id = al.id \
@@ -244,11 +245,41 @@ async fn export_library_audit_csv(
                 format: r.get(5).and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 taille: r.get(6).and_then(|v| v.as_i64()).unwrap_or(0) as u64,
                 mtime: r.get(7).and_then(|v| v.as_i64()).unwrap_or(0) as u64,
+                hash: r.get(8).and_then(|v| v.as_str()).unwrap_or("").to_string(),
             });
         }
     }
 
     let lignes = tune_core::library::audit::classer(disque, bdd);
+
+    // Réconciliation des déplacés : on ne hache QUE les fichiers hors
+    // bibliothèque (64 Ko chacun, à 25 % du fichier — le hash du scan), et
+    // seulement s'il existe au moins un fantôme à qui les comparer.
+    let a_des_fantomes = lignes
+        .iter()
+        .any(|l| l.statut == tune_core::library::audit::Statut::Fantome);
+    let candidats: Vec<String> = lignes
+        .iter()
+        .filter(|l| l.statut == tune_core::library::audit::Statut::HorsBibliotheque)
+        .map(|l| l.chemin.clone())
+        .collect();
+    let hashes: std::collections::HashMap<String, String> =
+        if a_des_fantomes && !candidats.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                candidats
+                    .into_iter()
+                    .filter_map(|c| {
+                        tune_core::scanner::hasher::compute_audio_hash_str(&c).map(|h| (c, h))
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+    let lignes = tune_core::library::audit::apparier_deplaces(lignes, &hashes);
+
     let csv = tune_core::library::audit::rendre_csv(&lignes, &avertissements);
     match csv_response(csv, "audit-bibliotheque.csv") {
         Ok(r) => r.into_response(),
