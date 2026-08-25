@@ -97,6 +97,12 @@ const GAPLESS_WINDOW_MS: u64 = 30_000;
 /// Confortablement sous les 300 s : repreparer coute un transcodage, se
 /// tromper coute un blanc et une zone arretee.
 const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
+
+/// Fenêtre minimale entre deux relances automatiques « démarrage mort »
+/// (#2394) sur une même zone. Assez longue pour qu'un second échec dans la
+/// foulée signifie « l'appareil est vraiment planté, on coupe » ; assez
+/// courte pour redonner sa chance à l'album suivant.
+const DEAD_START_RETRY_COOLDOWN_SECS: u64 = 180;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -264,9 +270,9 @@ pub(crate) mod decisions {
     }
 
     use super::{
-        GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS,
-        MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS, MIN_WALL_FRACTION_FOR_NATURAL_END,
-        POLL_FAIL_END_MIN_ERRORS,
+        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS,
+        MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS,
     };
 
     /// Margin (ms) added to the track duration before position-based
@@ -350,6 +356,30 @@ pub(crate) mod decisions {
             wall_elapsed as f64 * 1000.0
                 >= track_duration_ms as f64 * MIN_WALL_FRACTION_FOR_NATURAL_END
         }
+    }
+
+    /// « Démarrage mort » (#2394) : l'échec de lecture DLNA où la piste n'a
+    /// JAMAIS été tirée (0 octet servi). C'est le profil du pipeline Eversolo
+    /// coincé — SOAP et HTTP vivants, lecture morte — que la relance guérit.
+    /// Un décrochage en cours de lecture (octets déjà servis) n'en est pas un.
+    pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
+        output_type == "dlna" && bytes_sent == 0
+    }
+
+    /// Une relance automatique après démarrage mort est-elle permise ?
+    /// Au plus une par fenêtre : si la précédente date de moins de
+    /// DEAD_START_RETRY_COOLDOWN_SECS, l'échec suivant coupe la zone comme
+    /// avant — on ne martèle pas un appareil réellement planté ou éteint.
+    pub fn relance_demarrage_mort_autorisee(derniere_il_y_a_secs: Option<u64>) -> bool {
+        derniere_il_y_a_secs.is_none_or(|s| s > DEAD_START_RETRY_COOLDOWN_SECS)
+    }
+
+    /// Le verrou « suivant DSD sur DLNA » (#2394) tient-il encore ? Il ne
+    /// tient que pour LA position de file constatée : si la file bouge (ajout,
+    /// saut, avance), la position suivante change et on re-résout — au pire on
+    /// perd UNE occasion d'armer le gapless (petit blanc), jamais une lecture.
+    pub fn dsd_skip_latched(latch: Option<i64>, next_pos: Option<i64>) -> bool {
+        latch.is_some() && latch == next_pos
     }
 
     /// Position dropped from `>30s` to `<5s` while a gapless transition was
@@ -1812,6 +1842,17 @@ struct ZonePollState {
     /// `None` on a fresh track forces one line per track — so it never spams at
     /// the ~1 s tick rate. Read-only diagnostic; drives no playback decision.
     gapless_arm_logged: Option<bool>,
+    /// Verrou par piste (#2394) : la position de file pour laquelle
+    /// `prepare_gapless` a constaté « suivant DSD sur DLNA, gapless refusé ».
+    /// Sans lui, la fenêtre d'armement re-résout la piste suivante À CHAQUE
+    /// tick — création puis destruction d'une session fichier par seconde
+    /// pendant toute la fin d'une piste DSD (constaté sur DMP-A8, 96
+    /// occurrences en 2 h). On ne peut PAS poser `gapless_sent = true` comme
+    /// pour la sortie exclusive : sur DLNA, ce drapeau active les détecteurs
+    /// de transition (durée/position) et le DMP-A8 rapporte des durées
+    /// inexactes — fausse transition garantie. Cleared au changement de
+    /// génération et à chaque transition, comme `gapless_arm_logged`.
+    gapless_dsd_skip_pos: Option<i64>,
 }
 
 impl ZonePollState {
@@ -1854,8 +1895,19 @@ impl ZonePollState {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         }
     }
+}
+
+/// Issue de `prepare_gapless` : distinguer « rien à armer / échec (re-tenter
+/// au prochain tick) » de « suivant DSD sur DLNA (inutile de re-tenter pour
+/// cette position — verrou `gapless_dsd_skip_pos`, #2394) ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaplessPrep {
+    Armed,
+    DsdNextSkipped,
+    NotArmed,
 }
 
 pub struct PositionPoller {
@@ -1865,6 +1917,12 @@ pub struct PositionPoller {
     db: Arc<dyn crate::db::backend::DbBackend>,
     shared_metrics: PollerMetricsMap,
     event_bus: Option<Arc<crate::event_bus::EventBus>>,
+    /// Horodatage de la dernière relance automatique après « démarrage mort »
+    /// par zone (#2394). Vit HORS de ZonePollState : la relance recrée l'état
+    /// de sondage, un drapeau dedans repartirait à zéro et bouclerait. Une
+    /// relance au plus par fenêtre de DEAD_START_RETRY_COOLDOWN_SECS ; si la
+    /// relance échoue à son tour, la zone est coupée comme avant.
+    relances_demarrage_mort: Mutex<std::collections::HashMap<i64, Instant>>,
 }
 
 impl PositionPoller {
@@ -1882,6 +1940,7 @@ impl PositionPoller {
             db,
             shared_metrics,
             event_bus: None,
+            relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2435,6 +2494,7 @@ impl PositionPoller {
                 ps.wall_clock_end_fired = false;
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
+                ps.gapless_dsd_skip_pos = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -3111,6 +3171,7 @@ impl PositionPoller {
 
             let mut track_ended = false;
             let mut force_stop = false;
+            let mut force_stop_demarrage_mort = false;
 
             // Guard: if Tune's own playback state for this zone is Stopped
             // (or has no now_playing), ignore device state changes entirely.
@@ -3493,6 +3554,24 @@ impl PositionPoller {
                                     );
                                     track_ended = false;
                                     force_stop = true;
+                                    // « Démarrage mort » (#2394) : la piste n'a
+                                    // JAMAIS été tirée (0 octet servi) sur un
+                                    // renderer DLNA — le profil du pipeline
+                                    // Eversolo coincé, qui acquitte le Play et
+                                    // ouvre ses connexions sans rien lire. Une
+                                    // relance (précédée de Pause→Stop, son
+                                    // libérateur connu) passe alors presque
+                                    // toujours à la main. Distinct d'un
+                                    // décrochage EN COURS de lecture
+                                    // (bytes_sent > 0), qu'on ne rejoue pas.
+                                    force_stop_demarrage_mort = decisions::demarrage_mort(
+                                        all_zones
+                                            .iter()
+                                            .find(|z| z.id == Some(zone_id))
+                                            .and_then(|z| z.output_type.as_deref())
+                                            .unwrap_or(""),
+                                        current_bytes,
+                                    );
                                 }
                             } else {
                                 debug!(
@@ -3672,6 +3751,7 @@ impl PositionPoller {
                         // New track after a gapless advance (no generation bump):
                         // re-arm the once-per-track gapless_arm_trace line.
                         ps.gapless_arm_logged = None;
+                        ps.gapless_dsd_skip_pos = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -3747,12 +3827,25 @@ impl PositionPoller {
                             if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                            } else if decisions::dsd_skip_latched(
+                                ps.gapless_dsd_skip_pos,
+                                Self::next_position(zone_state),
+                            ) {
+                                // Suivant DSD sur DLNA, déjà constaté pour cette
+                                // position : ne pas re-résoudre (donc re-créer puis
+                                // détruire une session fichier) à chaque tick
+                                // (spin 1 Hz, #2394). handle_track_end jouera la
+                                // piste explicitement en fin de morceau.
                             } else {
-                                let ok =
-                                    self.prepare_gapless(zone_id, zone_state, &device_id).await;
-                                if ok {
-                                    ps.gapless_sent_at = Some(Instant::now());
-                                    ps.gapless_sent = true;
+                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                    GaplessPrep::Armed => {
+                                        ps.gapless_sent_at = Some(Instant::now());
+                                        ps.gapless_sent = true;
+                                    }
+                                    GaplessPrep::DsdNextSkipped => {
+                                        ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
+                                    }
+                                    GaplessPrep::NotArmed => {}
                                 }
                             }
                         } else {
@@ -3906,9 +3999,44 @@ impl PositionPoller {
             if force_stop {
                 poll_states.remove(&zone_id);
                 let device_id_ref = self.get_zone_device_id(zone_id);
-                self.orchestrator
-                    .stop(zone_id, device_id_ref.as_deref())
-                    .await;
+                let relance = force_stop_demarrage_mort && {
+                    let mut relances = self.relances_demarrage_mort.lock().await;
+                    let autorisee = decisions::relance_demarrage_mort_autorisee(
+                        relances.get(&zone_id).map(|t| t.elapsed().as_secs()),
+                    );
+                    if autorisee {
+                        relances.insert(zone_id, Instant::now());
+                    }
+                    autorisee
+                };
+                if relance {
+                    // Pause→Stop d'abord : le pipeline Eversolo coincé ACQUITTE
+                    // les Stop sans les exécuter, seul Pause→Stop le libère
+                    // (constaté par SOAP direct sur le DMP-A8). Best-effort :
+                    // un appareil sain n'en souffre pas.
+                    self.orchestrator
+                        .pause(zone_id, device_id_ref.as_deref())
+                        .await;
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                    let position = zone_state.queue_position;
+                    match self.orchestrator.play_from_queue(zone_id, position).await {
+                        Ok(_) => {
+                            warn!(zone_id, position, "demarrage_mort_relance_automatique");
+                        }
+                        Err(e) => {
+                            warn!(zone_id, position, error = %e, "demarrage_mort_relance_echouee");
+                            self.orchestrator
+                                .stop(zone_id, device_id_ref.as_deref())
+                                .await;
+                        }
+                    }
+                } else {
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                }
             } else if track_ended {
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
@@ -4371,9 +4499,9 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
-    ) -> bool {
+    ) -> GaplessPrep {
         let Some(next_pos) = Self::next_position(zone_state) else {
-            return false;
+            return GaplessPrep::NotArmed;
         };
 
         // Local-file gapless (OAAT native DSD): the output reads the next
@@ -4402,7 +4530,7 @@ impl PositionPoller {
                         outputs.get(device_id).map(|a| a.clone())
                     };
                     let Some(output_arc) = output_arc else {
-                        return false;
+                        return GaplessPrep::NotArmed;
                     };
                     let output = output_arc.lock().await;
                     let media = crate::outputs::PlayMedia {
@@ -4434,21 +4562,21 @@ impl PositionPoller {
                                 resolve_ms = t0.elapsed().as_millis() as u64,
                                 "gapless_next_set_local_file"
                             );
-                            true
+                            GaplessPrep::Armed
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
-                            false
+                            GaplessPrep::NotArmed
                         }
                     };
                 }
                 Ok(_) => {
                     info!(zone_id, "gapless_local_file_skipped_no_local_next");
-                    return false;
+                    return GaplessPrep::NotArmed;
                 }
                 Err(e) => {
                     warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
-                    return false;
+                    return GaplessPrep::NotArmed;
                 }
             }
         }
@@ -4494,7 +4622,7 @@ impl PositionPoller {
                     // fallback advances the queue (a small gap, never a stall).
                     if !output.supports_internal_gapless() {
                         info!(zone_id, "gapless_skipped_exclusive_output");
-                        return false;
+                        return GaplessPrep::NotArmed;
                     }
                     // DSD gapless guard for DLNA renderers (HiFi Rose RS130,
                     // Benjithom). They accept SetNextAVTransportURI for a DSD
@@ -4517,7 +4645,7 @@ impl PositionPoller {
                                 mime = %resolved.mime_type,
                                 "gapless_skipped_dsd_next_dlna"
                             );
-                            return false;
+                            return GaplessPrep::DsdNextSkipped;
                         }
                     }
                     let media = crate::outputs::PlayMedia {
@@ -4543,7 +4671,7 @@ impl PositionPoller {
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
-                        false
+                        GaplessPrep::NotArmed
                     } else {
                         info!(
                             zone_id,
@@ -4552,10 +4680,10 @@ impl PositionPoller {
                             streaming = is_streaming,
                             "gapless_next_set"
                         );
-                        true
+                        GaplessPrep::Armed
                     }
                 } else {
-                    false
+                    GaplessPrep::NotArmed
                 }
             }
             Err(e) => {
@@ -4565,7 +4693,7 @@ impl PositionPoller {
                     resolve_ms = t0.elapsed().as_millis() as u64,
                     "gapless_resolve_failed"
                 );
-                false
+                GaplessPrep::NotArmed
             }
         }
     }
@@ -5049,6 +5177,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -5104,6 +5233,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulates entering Playing state
@@ -5404,6 +5534,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -5889,6 +6020,44 @@ mod tests {
     }
 
     #[test]
+    fn un_demarrage_mort_est_un_echec_dlna_sans_aucun_octet_servi() {
+        // Le profil du pipeline Eversolo coincé : DLNA, zéro octet tiré.
+        assert!(super::decisions::demarrage_mort("dlna", 0));
+        // Un décrochage EN COURS de lecture n'en est pas un.
+        assert!(!super::decisions::demarrage_mort("dlna", 1_234_567));
+        // Et seul le DLNA est concerné (le zombie est un renderer réseau).
+        assert!(!super::decisions::demarrage_mort("chromecast", 0));
+        assert!(!super::decisions::demarrage_mort("local", 0));
+    }
+
+    #[test]
+    fn une_seule_relance_demarrage_mort_par_fenetre() {
+        // Jamais relancé : autorisé.
+        assert!(super::decisions::relance_demarrage_mort_autorisee(None));
+        // Relancé il y a longtemps : autorisé de nouveau.
+        assert!(super::decisions::relance_demarrage_mort_autorisee(Some(
+            181
+        )));
+        // Relancé dans la fenêtre : on coupe, on ne martèle pas.
+        assert!(!super::decisions::relance_demarrage_mort_autorisee(Some(
+            180
+        )));
+        assert!(!super::decisions::relance_demarrage_mort_autorisee(Some(0)));
+    }
+
+    #[test]
+    fn dsd_skip_latch_holds_only_for_the_same_queue_position() {
+        // Verrou posé pour la position 3 : tient tant que le « suivant » est 3…
+        assert!(super::decisions::dsd_skip_latched(Some(3), Some(3)));
+        // …et lâche dès que la file bouge (autre position, ou plus de suivant).
+        assert!(!super::decisions::dsd_skip_latched(Some(3), Some(4)));
+        assert!(!super::decisions::dsd_skip_latched(Some(3), None));
+        // Jamais verrouillé sans constat préalable.
+        assert!(!super::decisions::dsd_skip_latched(None, Some(3)));
+        assert!(!super::decisions::dsd_skip_latched(None, None));
+    }
+
+    #[test]
     fn should_arm_gapless_in_final_window() {
         // Entered the final GAPLESS_WINDOW_MS, not yet armed → arm.
         assert!(decisions::should_arm_gapless(
@@ -6053,6 +6222,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -6257,6 +6427,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
