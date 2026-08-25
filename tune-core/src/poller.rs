@@ -352,6 +352,14 @@ pub(crate) mod decisions {
         }
     }
 
+    /// Le verrou « suivant DSD sur DLNA » (#2394) tient-il encore ? Il ne
+    /// tient que pour LA position de file constatée : si la file bouge (ajout,
+    /// saut, avance), la position suivante change et on re-résout — au pire on
+    /// perd UNE occasion d'armer le gapless (petit blanc), jamais une lecture.
+    pub fn dsd_skip_latched(latch: Option<i64>, next_pos: Option<i64>) -> bool {
+        latch.is_some() && latch == next_pos
+    }
+
     /// Position dropped from `>30s` to `<5s` while a gapless transition was
     /// armed — a strong signal the renderer auto-advanced to the next track.
     pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
@@ -1812,6 +1820,17 @@ struct ZonePollState {
     /// `None` on a fresh track forces one line per track — so it never spams at
     /// the ~1 s tick rate. Read-only diagnostic; drives no playback decision.
     gapless_arm_logged: Option<bool>,
+    /// Verrou par piste (#2394) : la position de file pour laquelle
+    /// `prepare_gapless` a constaté « suivant DSD sur DLNA, gapless refusé ».
+    /// Sans lui, la fenêtre d'armement re-résout la piste suivante À CHAQUE
+    /// tick — création puis destruction d'une session fichier par seconde
+    /// pendant toute la fin d'une piste DSD (constaté sur DMP-A8, 96
+    /// occurrences en 2 h). On ne peut PAS poser `gapless_sent = true` comme
+    /// pour la sortie exclusive : sur DLNA, ce drapeau active les détecteurs
+    /// de transition (durée/position) et le DMP-A8 rapporte des durées
+    /// inexactes — fausse transition garantie. Cleared au changement de
+    /// génération et à chaque transition, comme `gapless_arm_logged`.
+    gapless_dsd_skip_pos: Option<i64>,
 }
 
 impl ZonePollState {
@@ -1854,8 +1873,19 @@ impl ZonePollState {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         }
     }
+}
+
+/// Issue de `prepare_gapless` : distinguer « rien à armer / échec (re-tenter
+/// au prochain tick) » de « suivant DSD sur DLNA (inutile de re-tenter pour
+/// cette position — verrou `gapless_dsd_skip_pos`, #2394) ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaplessPrep {
+    Armed,
+    DsdNextSkipped,
+    NotArmed,
 }
 
 pub struct PositionPoller {
@@ -2435,6 +2465,7 @@ impl PositionPoller {
                 ps.wall_clock_end_fired = false;
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
+                ps.gapless_dsd_skip_pos = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -3672,6 +3703,7 @@ impl PositionPoller {
                         // New track after a gapless advance (no generation bump):
                         // re-arm the once-per-track gapless_arm_trace line.
                         ps.gapless_arm_logged = None;
+                        ps.gapless_dsd_skip_pos = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -3747,12 +3779,25 @@ impl PositionPoller {
                             if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                            } else if decisions::dsd_skip_latched(
+                                ps.gapless_dsd_skip_pos,
+                                Self::next_position(zone_state),
+                            ) {
+                                // Suivant DSD sur DLNA, déjà constaté pour cette
+                                // position : ne pas re-résoudre (donc re-créer puis
+                                // détruire une session fichier) à chaque tick
+                                // (spin 1 Hz, #2394). handle_track_end jouera la
+                                // piste explicitement en fin de morceau.
                             } else {
-                                let ok =
-                                    self.prepare_gapless(zone_id, zone_state, &device_id).await;
-                                if ok {
-                                    ps.gapless_sent_at = Some(Instant::now());
-                                    ps.gapless_sent = true;
+                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                    GaplessPrep::Armed => {
+                                        ps.gapless_sent_at = Some(Instant::now());
+                                        ps.gapless_sent = true;
+                                    }
+                                    GaplessPrep::DsdNextSkipped => {
+                                        ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
+                                    }
+                                    GaplessPrep::NotArmed => {}
                                 }
                             }
                         } else {
@@ -4371,9 +4416,9 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
-    ) -> bool {
+    ) -> GaplessPrep {
         let Some(next_pos) = Self::next_position(zone_state) else {
-            return false;
+            return GaplessPrep::NotArmed;
         };
 
         // Local-file gapless (OAAT native DSD): the output reads the next
@@ -4402,7 +4447,7 @@ impl PositionPoller {
                         outputs.get(device_id).map(|a| a.clone())
                     };
                     let Some(output_arc) = output_arc else {
-                        return false;
+                        return GaplessPrep::NotArmed;
                     };
                     let output = output_arc.lock().await;
                     let media = crate::outputs::PlayMedia {
@@ -4434,21 +4479,21 @@ impl PositionPoller {
                                 resolve_ms = t0.elapsed().as_millis() as u64,
                                 "gapless_next_set_local_file"
                             );
-                            true
+                            GaplessPrep::Armed
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
-                            false
+                            GaplessPrep::NotArmed
                         }
                     };
                 }
                 Ok(_) => {
                     info!(zone_id, "gapless_local_file_skipped_no_local_next");
-                    return false;
+                    return GaplessPrep::NotArmed;
                 }
                 Err(e) => {
                     warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
-                    return false;
+                    return GaplessPrep::NotArmed;
                 }
             }
         }
@@ -4494,7 +4539,7 @@ impl PositionPoller {
                     // fallback advances the queue (a small gap, never a stall).
                     if !output.supports_internal_gapless() {
                         info!(zone_id, "gapless_skipped_exclusive_output");
-                        return false;
+                        return GaplessPrep::NotArmed;
                     }
                     // DSD gapless guard for DLNA renderers (HiFi Rose RS130,
                     // Benjithom). They accept SetNextAVTransportURI for a DSD
@@ -4517,7 +4562,7 @@ impl PositionPoller {
                                 mime = %resolved.mime_type,
                                 "gapless_skipped_dsd_next_dlna"
                             );
-                            return false;
+                            return GaplessPrep::DsdNextSkipped;
                         }
                     }
                     let media = crate::outputs::PlayMedia {
@@ -4543,7 +4588,7 @@ impl PositionPoller {
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
-                        false
+                        GaplessPrep::NotArmed
                     } else {
                         info!(
                             zone_id,
@@ -4552,10 +4597,10 @@ impl PositionPoller {
                             streaming = is_streaming,
                             "gapless_next_set"
                         );
-                        true
+                        GaplessPrep::Armed
                     }
                 } else {
-                    false
+                    GaplessPrep::NotArmed
                 }
             }
             Err(e) => {
@@ -4565,7 +4610,7 @@ impl PositionPoller {
                     resolve_ms = t0.elapsed().as_millis() as u64,
                     "gapless_resolve_failed"
                 );
-                false
+                GaplessPrep::NotArmed
             }
         }
     }
@@ -5049,6 +5094,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -5104,6 +5150,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulates entering Playing state
@@ -5404,6 +5451,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -5889,6 +5937,18 @@ mod tests {
     }
 
     #[test]
+    fn dsd_skip_latch_holds_only_for_the_same_queue_position() {
+        // Verrou posé pour la position 3 : tient tant que le « suivant » est 3…
+        assert!(super::decisions::dsd_skip_latched(Some(3), Some(3)));
+        // …et lâche dès que la file bouge (autre position, ou plus de suivant).
+        assert!(!super::decisions::dsd_skip_latched(Some(3), Some(4)));
+        assert!(!super::decisions::dsd_skip_latched(Some(3), None));
+        // Jamais verrouillé sans constat préalable.
+        assert!(!super::decisions::dsd_skip_latched(None, Some(3)));
+        assert!(!super::decisions::dsd_skip_latched(None, None));
+    }
+
+    #[test]
     fn should_arm_gapless_in_final_window() {
         // Entered the final GAPLESS_WINDOW_MS, not yet armed → arm.
         assert!(decisions::should_arm_gapless(
@@ -6053,6 +6113,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -6257,6 +6318,7 @@ mod tests {
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
