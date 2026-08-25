@@ -281,6 +281,50 @@ fn normaliser_decouverte(brut: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Recherche de PISTES, pour l'hôte (« Autres versions » de l'accueil).
+///
+/// Même point d'entrée que [`bc_search`], restreint aux pistes
+/// (`search_filter: "t"`), rendu à plat : titre, artiste, pochette, lien.
+/// Une erreur réseau rend une liste vide — la section de l'accueil vaut
+/// mieux incomplète que muette.
+pub async fn rechercher_pistes(titre: &str) -> Vec<serde_json::Value> {
+    let client = tune_core::http::client::shared();
+    let Ok(resp) = client
+        .post(BC_SEARCH_API)
+        .json(&json!({
+            "search_text": titre,
+            "search_filter": "t",
+            "full_page": false,
+            "fan_id": null,
+        }))
+        .send()
+        .await
+    else {
+        return vec![];
+    };
+    let Ok(brut) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
+    brut.get("auto")
+        .and_then(|a| a.get("results"))
+        .and_then(|r| r.as_array())
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("t"))
+                .map(|r| {
+                    json!({
+                        "title": r.get("name"),
+                        "artist_name": r.get("band_name"),
+                        "album_title": r.get("album_name"),
+                        "cover_url": pochette_de_resultat(r),
+                        "url": r.get("item_url_path").or_else(|| r.get("item_url_root")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,

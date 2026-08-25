@@ -468,6 +468,64 @@ async fn new_in_library(
     Ok(Json(json!(items)))
 }
 
+/// Classement d'un resultat de recherche par rapport au morceau ecoute.
+///
+/// Le rapprochement reste EXACT sur le titre (insensible a la casse) — la
+/// doctrine de la section : mieux vaut rien qu'un rapprochement faux. La
+/// nouveaute est d'assumer la REPRISE : meme titre, autre artiste. Pour un
+/// titre banal (« Angel ») cela produira des homonymes — c'est le prix
+/// explicite de la demande (« des reprises de Billie Jean, il y en a
+/// plein », Bertrand, 25/08), et l'ecran les range sous un libelle
+/// « Reprises » qui assume l'incertitude.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClasseVersion {
+    /// Le meme enregistrement (meme artiste, meme album) : rien a proposer.
+    MemeEnregistrement,
+    /// Meme artiste, autre album : une autre version au sens strict.
+    AutreVersion,
+    /// Meme titre, autre artiste : une reprise possible.
+    Reprise,
+    /// Titre different : hors sujet.
+    SansRapport,
+}
+
+pub(crate) fn classer_version(
+    titre_ecoute: &str,
+    artiste_ecoute: &str,
+    album_ecoute: &str,
+    titre_trouve: &str,
+    artiste_trouve: &str,
+    album_trouve: &str,
+) -> ClasseVersion {
+    let meme = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    if !meme(titre_ecoute, titre_trouve) {
+        return ClasseVersion::SansRapport;
+    }
+    if meme(artiste_ecoute, artiste_trouve) {
+        if meme(album_ecoute, album_trouve) {
+            ClasseVersion::MemeEnregistrement
+        } else {
+            ClasseVersion::AutreVersion
+        }
+    } else {
+        ClasseVersion::Reprise
+    }
+}
+
+/// Cache des recherches de versions : une entree par (service, titre), six
+/// heures. Sans lui, chaque ouverture de l'accueil relancerait jusqu'a une
+/// trentaine de recherches — le plafond de requetes des services n'y
+/// survivrait pas.
+static CACHE_VERSIONS: std::sync::LazyLock<
+    tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+const CACHE_VERSIONS_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Les ecoutes recentes examinees pour la recherche STREAMING. Chacune coute
+/// une recherche par service connecte (moins le cache) : ce nombre est le
+/// budget reseau de la section, pas un choix d'affichage.
+const ECOUTES_STREAMING: usize = 6;
+
 /// `GET /home/other-versions` — les autres versions, DANS LA BIBLIOTHEQUE, des
 /// morceaux ecoutes RECEMMENT.
 ///
@@ -573,6 +631,160 @@ async fn other_versions(
                 "artist_name": artiste,
                 "played_album": joue,
                 "versions": [version],
+            })),
+        }
+    }
+
+    // ── Les versions et reprises DISPONIBLES EN STREAMING ──
+    //
+    // La doc de cette route promettait ce branchement « quand la section
+    // aurait fait ses preuves en local » : c'est demande explicitement
+    // maintenant. Budget borne : les ECOUTES_STREAMING dernieres ecoutes
+    // distinctes, UNE recherche par service et par titre, cache six heures.
+    let sql_recentes = format!(
+        "SELECT DISTINCT title, artist_name, COALESCE(album_title, '')          FROM (SELECT title, artist_name, album_title, listened_at                FROM listen_history WHERE artist_name IS NOT NULL                ORDER BY listened_at DESC LIMIT {ECOUTES_STREAMING})"
+    );
+    let recentes: Vec<(String, String, String)> = state
+        .backend
+        .query_many(&sql_recentes, &[])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cols| {
+            Some((
+                cols.first().and_then(|v| v.as_string())?,
+                cols.get(1).and_then(|v| v.as_string())?,
+                cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+            ))
+        })
+        .collect();
+
+    for (titre, artiste, album) in recentes {
+        let mut trouvees: Vec<Value> = Vec::new();
+        for nom_service in ["qobuz", "tidal", "deezer", "spotify"] {
+            let cle_cache = format!("{nom_service}:{}", titre.to_lowercase());
+            let en_cache = {
+                let cache = CACHE_VERSIONS.lock().await;
+                cache.get(&cle_cache).and_then(|(quand, v)| {
+                    (quand.elapsed() < CACHE_VERSIONS_TTL).then(|| v.clone())
+                })
+            };
+            let pistes: Value = if let Some(v) = en_cache {
+                v
+            } else {
+                let arc = {
+                    let registre = state.services.lock().await;
+                    registre.get(nom_service)
+                };
+                let Some(arc) = arc else { continue };
+                let svc = arc.read().await;
+                if !svc.enabled() || !svc.auth_status().await.authenticated {
+                    continue;
+                }
+                let Ok(resultats) = svc.search(&titre, 10).await else {
+                    continue;
+                };
+                drop(svc);
+                let v = json!(resultats.tracks);
+                CACHE_VERSIONS
+                    .lock()
+                    .await
+                    .insert(cle_cache, (std::time::Instant::now(), v.clone()));
+                v
+            };
+            let Some(pistes) = pistes.as_array() else {
+                continue;
+            };
+            for piste in pistes {
+                let t = piste["title"].as_str().unwrap_or_default();
+                let a = piste["artist_name"].as_str().unwrap_or_default();
+                let al = piste["album_title"].as_str().unwrap_or_default();
+                let classe = classer_version(&titre, &artiste, &album, t, a, al);
+                let genre = match classe {
+                    ClasseVersion::AutreVersion => "version",
+                    ClasseVersion::Reprise => "reprise",
+                    _ => continue,
+                };
+                trouvees.push(json!({
+                    "service": nom_service,
+                    "source_id": piste["source_id"],
+                    "title": t,
+                    "artist_name": a,
+                    "album_title": al,
+                    "album_id": piste["album_id"],
+                    "cover_path": piste["cover_path"],
+                    "kind": genre,
+                }));
+            }
+        }
+
+        #[cfg(feature = "bandcamp")]
+        {
+            let cle_cache = format!("bandcamp:{}", titre.to_lowercase());
+            let en_cache = {
+                let cache = CACHE_VERSIONS.lock().await;
+                cache.get(&cle_cache).and_then(|(quand, v)| {
+                    (quand.elapsed() < CACHE_VERSIONS_TTL).then(|| v.clone())
+                })
+            };
+            let pistes: Value = if let Some(v) = en_cache {
+                v
+            } else {
+                {
+                    let v = json!(tune_bandcamp::rechercher_pistes(&titre).await);
+                    CACHE_VERSIONS
+                        .lock()
+                        .await
+                        .insert(cle_cache, (std::time::Instant::now(), v.clone()));
+                    v
+                }
+            };
+            if let Some(pistes) = pistes.as_array() {
+                for piste in pistes {
+                    let t = piste["title"].as_str().unwrap_or_default();
+                    let a = piste["artist_name"].as_str().unwrap_or_default();
+                    let al = piste["album_title"].as_str().unwrap_or_default();
+                    let classe = classer_version(&titre, &artiste, &album, t, a, al);
+                    let genre = match classe {
+                        ClasseVersion::AutreVersion => "version",
+                        ClasseVersion::Reprise => "reprise",
+                        _ => continue,
+                    };
+                    trouvees.push(json!({
+                        "service": "bandcamp",
+                        "source_id": piste["url"],
+                        "title": t,
+                        "artist_name": a,
+                        "album_title": piste["album_title"],
+                        "album_id": Value::Null,
+                        "cover_path": piste["cover_url"],
+                        "kind": genre,
+                        "url": piste["url"],
+                    }));
+                }
+            }
+        }
+
+        if trouvees.is_empty() {
+            continue;
+        }
+        match groupes.iter_mut().find(|g| {
+            g["title"]
+                .as_str()
+                .is_some_and(|t| t.eq_ignore_ascii_case(&titre))
+                && g["artist_name"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(&artiste))
+        }) {
+            Some(g) => g["streaming"] = json!(trouvees),
+            // Un morceau sans autre version LOCALE forme quand meme un groupe
+            // si le streaming en a : c'est le cas « Billie Jean » — aucune
+            // autre version possedee, des dizaines disponibles.
+            None => groupes.push(json!({
+                "title": titre,
+                "artist_name": artiste,
+                "played_album": album,
+                "versions": [],
+                "streaming": trouvees,
             })),
         }
     }
@@ -684,4 +896,74 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
         "services": highlights,
         "preferred_service": preferred_service,
     }))
+}
+
+#[cfg(test)]
+mod tests_versions {
+    use super::{ClasseVersion, classer_version};
+
+    /// « Billie Jean » par Michael Jackson sur un AUTRE album : une version.
+    #[test]
+    fn meme_artiste_autre_album_est_une_version() {
+        assert_eq!(
+            classer_version(
+                "Billie Jean",
+                "Michael Jackson",
+                "Thriller",
+                "billie jean",
+                "MICHAEL JACKSON",
+                "Number Ones"
+            ),
+            ClasseVersion::AutreVersion
+        );
+    }
+
+    /// « Billie Jean » par quelqu'un d'autre : une reprise.
+    #[test]
+    fn autre_artiste_est_une_reprise() {
+        assert_eq!(
+            classer_version(
+                "Billie Jean",
+                "Michael Jackson",
+                "Thriller",
+                "Billie Jean",
+                "Chris Cornell",
+                "Unplugged in Sweden"
+            ),
+            ClasseVersion::Reprise
+        );
+    }
+
+    /// Le même enregistrement ne doit RIEN proposer.
+    #[test]
+    fn meme_enregistrement_est_ecarte() {
+        assert_eq!(
+            classer_version(
+                "Billie Jean",
+                "Michael Jackson",
+                "Thriller",
+                "Billie Jean",
+                "Michael Jackson",
+                "Thriller"
+            ),
+            ClasseVersion::MemeEnregistrement
+        );
+    }
+
+    /// Le titre reste EXACT : « Billie Jean (Live) » est hors sujet — la
+    /// doctrine de la section, inchangée.
+    #[test]
+    fn titre_different_est_sans_rapport() {
+        assert_eq!(
+            classer_version(
+                "Billie Jean",
+                "Michael Jackson",
+                "Thriller",
+                "Billie Jean (Live)",
+                "Michael Jackson",
+                "This Is It"
+            ),
+            ClasseVersion::SansRapport
+        );
+    }
 }
