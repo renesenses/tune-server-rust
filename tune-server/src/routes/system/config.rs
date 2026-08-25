@@ -643,6 +643,25 @@ pub(super) async fn remove_music_dir(
     Ok(Json(json!({ "dirs": dirs })))
 }
 
+/// `POST /system/stop` — arrêter le PROCESSUS serveur, sans toucher à la
+/// machine. C'est le geste qui manquait sur un poste de bureau : « Éteindre »
+/// est réservé aux appliances (il coupe toute la machine), « Redémarrer »
+/// revient toujours — il n'y avait aucun moyen d'ARRÊTER Tune depuis
+/// l'interface (Bertrand, 25/08, confirmé absent en Expert aussi).
+///
+/// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
+/// service Windows), le superviseur peut relancer le processus aussitôt —
+/// l'écran le dit dans la confirmation.
+pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+    tokio::spawn(async {
+        // Laisser la réponse HTTP partir avant de mourir.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tracing::info!("server_stop_requested_from_ui");
+        std::process::exit(0);
+    });
+    Json(json!({ "stopping": true }))
+}
+
 pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
     tokio::spawn(async {
         // Let the HTTP response flush before we swap the process image.
