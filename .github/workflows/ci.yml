@@ -156,7 +156,10 @@ jobs:
           rustflags: ""
       - uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-pc-windows-msvc-pr
+          # Meme partition que le build de livraison : la PR restaure ses
+          # dependances deja compilees, mais `save-if: false` l'empeche de
+          # remplacer ce cache de confiance.
+          key: x86_64-pc-windows-msvc
           save-if: false
       - name: Windows livré sans ASIO
         run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
@@ -185,7 +188,7 @@ jobs:
           rustflags: ""
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-pr
+          key: x86_64-apple-darwin
           save-if: false
       - run: cargo check --package tune-server --features dj,karaoke,bandcamp,plugins-wasm
 
