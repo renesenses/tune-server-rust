@@ -368,6 +368,35 @@ impl OutputTarget for DlnaOutput {
             }
         }
 
+        // Un Stop ACQUITTÉ n'est pas un Stop APPLIQUÉ. L'Eversolo répond OK
+        // puis met ~1-2 s à s'arrêter ; un SetAVTransportURI envoyé 5 ms plus
+        // tard est acquitté… et ignoré — il continue son flux précédent (la
+        // course des 5 ms, .42, 24/08 ; la même séquence espacée de 2 s est
+        // acceptée). On attend l'arrêt réel, borné à ~2 s, et on continue quoi
+        // qu'il arrive : c'est une politesse, jamais une barrière. Le renderer
+        // déjà arrêté — le cas nominal — coûte UN GetTransportInfo.
+        for attente in 0..8u32 {
+            match self
+                .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                .await
+            {
+                Ok(resp) if arret_effectif(&resp) => {
+                    if attente > 0 {
+                        debug!(device = %self.name, polls = attente + 1, "dlna_pre_stop_arret_confirme");
+                    }
+                    break;
+                }
+                // Un renderer sans GetTransportInfo ne doit rien bloquer.
+                Err(_) => break,
+                Ok(_) if attente == 7 => {
+                    warn!(device = %self.name, "dlna_pre_stop_jamais_applique_on_continue");
+                }
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+
         let item_id = self.next_item_id();
 
         // First attempt: announce `media.mime_type` UNCHANGED — exactly the
@@ -514,6 +543,54 @@ impl OutputTarget for DlnaOutput {
         }
         if !last_err.is_empty() {
             return Err(last_err);
+        }
+
+        // Le Play est acquitté — est-il APPLIQUÉ ? Dans la course des 5 ms,
+        // l'Eversolo répond OK à toute la séquence et garde l'URI précédente :
+        // la zone affichait « playing » sur la position de l'ancienne piste,
+        // et l'utilisateur relançait à la main. On relit l'URI courante ; en
+        // cas d'écart, UNE relance complète, puis un échec VISIBLE plutôt
+        // qu'un état menteur. Une URI qu'on ne sait pas interpréter (renderer
+        // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
+        let mut applique = UriVerdict::Indeterminee;
+        'verif: for relance in 0..2u32 {
+            for essai in 0..3u32 {
+                let resp = self
+                    .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+                    .await;
+                let uri = match &resp {
+                    Ok(xml) => extract_tag(xml, "CurrentURI"),
+                    // Un renderer sans GetMediaInfo ne doit rien bloquer.
+                    Err(_) => break 'verif,
+                };
+                applique = verdict_uri_appliquee(uri.as_deref(), media.url);
+                match applique {
+                    UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'verif,
+                    UriVerdict::PasAppliquee if essai < 2 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    }
+                    UriVerdict::PasAppliquee => {}
+                }
+            }
+            if relance == 0 {
+                warn!(device = %self.name, url = media.url, "dlna_play_acquitte_mais_pas_applique_relance");
+                let metadata = Self::didl_metadata_mime(media, item_id, &attempt_mime);
+                let _ = self.av_action("SetAVTransportURI", &format!(
+                    "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
+                    media.url
+                )).await;
+                let _ = self
+                    .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                    .await;
+            }
+        }
+        if applique == UriVerdict::PasAppliquee {
+            warn!(device = %self.name, url = media.url, "dlna_play_jamais_applique");
+            return Err(
+                "Le renderer a acquitté Play mais joue toujours une autre source \
+                 (URI non appliquée après relance)"
+                    .to_string(),
+            );
         }
 
         info!(device = %self.name, url = media.url, delay_ms = play_delay, "dlna_play");
@@ -1046,6 +1123,57 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
+/// Le renderer a-t-il réellement cessé de jouer, d'après sa réponse
+/// `GetTransportInfo` ? Un Stop acquitté n'est pas un Stop appliqué :
+/// l'Eversolo répond OK puis met ~1-2 s à s'arrêter, et un
+/// SetAVTransportURI envoyé dans cette fenêtre est acquitté… et ignoré
+/// (la course des 5 ms, .42, 24/08).
+fn arret_effectif(transport_resp: &str) -> bool {
+    !transport_resp.contains("PLAYING") && !transport_resp.contains("TRANSITIONING")
+}
+
+/// Verdict sur l'URI que le renderer dit tenir après notre Play.
+#[derive(Debug, PartialEq, Eq)]
+enum UriVerdict {
+    /// C'est bien la nôtre : le Play est appliqué.
+    Appliquee,
+    /// Vide, ou un flux Tune qui n'est pas le nôtre : le renderer a acquitté
+    /// toute la séquence et joue toujours autre chose.
+    PasAppliquee,
+    /// Une URI étrangère qu'on ne sait pas interpréter (un renderer qui
+    /// réécrit, un GetMediaInfo exotique) : on ne conclut rien.
+    Indeterminee,
+}
+
+/// La partie discriminante de l'URL d'un flux : son chemin (`/stream/…`).
+/// L'hôte peut différer entre ce qu'on envoie et ce que le renderer
+/// rapporte (résolution DNS, réécriture d'IP) — le chemin, lui, est unique.
+fn chemin_du_flux(url: &str) -> &str {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|reste| reste.find('/').map(|i| &reste[i..]))
+        .unwrap_or(url)
+}
+
+fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVerdict {
+    let Some(uri) = current_uri else {
+        return UriVerdict::Indeterminee;
+    };
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return UriVerdict::PasAppliquee;
+    }
+    if uri.contains(chemin_du_flux(url_attendue)) {
+        return UriVerdict::Appliquee;
+    }
+    if uri.contains("/stream/") {
+        // Un flux Tune — le périmé d'avant notre Play, ou celui d'un autre
+        // serveur : dans les deux cas, PAS ce qu'on vient d'envoyer.
+        return UriVerdict::PasAppliquee;
+    }
+    UriVerdict::Indeterminee
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,6 +1343,69 @@ mod tests {
     fn format_time_works() {
         assert_eq!(DlnaOutput::format_time(225_000), "0:03:45");
         assert_eq!(DlnaOutput::format_time(3_600_000), "1:00:00");
+    }
+
+    /// La course des 5 ms (.42, 24/08) : un Stop acquitté n'est pas appliqué.
+    #[test]
+    fn arret_effectif_lit_l_etat_du_transport() {
+        assert!(!arret_effectif(
+            "<CurrentTransportState>PLAYING</CurrentTransportState>"
+        ));
+        assert!(!arret_effectif(
+            "<CurrentTransportState>TRANSITIONING</CurrentTransportState>"
+        ));
+        assert!(arret_effectif(
+            "<CurrentTransportState>STOPPED</CurrentTransportState>"
+        ));
+        assert!(arret_effectif(
+            "<CurrentTransportState>NO_MEDIA_PRESENT</CurrentTransportState>"
+        ));
+        // PAUSED_PLAYBACK : le transport n'avance plus, l'URI peut changer.
+        assert!(arret_effectif(
+            "<CurrentTransportState>PAUSED_PLAYBACK</CurrentTransportState>"
+        ));
+    }
+
+    #[test]
+    fn verdict_uri_notre_flux_est_applique() {
+        let url = "http://192.168.1.42:8888/stream/abc-123.wav";
+        assert_eq!(verdict_uri_appliquee(Some(url), url), UriVerdict::Appliquee);
+        // L'hôte peut différer (IP réécrite) — le chemin suffit.
+        assert_eq!(
+            verdict_uri_appliquee(Some("http://tune.local:8888/stream/abc-123.wav"), url),
+            UriVerdict::Appliquee
+        );
+    }
+
+    #[test]
+    fn verdict_uri_vide_ou_flux_perime_n_est_pas_applique() {
+        let url = "http://192.168.1.42:8888/stream/abc-123.wav";
+        // L'Eversolo qui garde l'URI d'avant : vide, ou un autre flux Tune.
+        assert_eq!(
+            verdict_uri_appliquee(Some(""), url),
+            UriVerdict::PasAppliquee
+        );
+        assert_eq!(
+            verdict_uri_appliquee(Some("http://192.168.1.42:8888/stream/vieux-flux.flac"), url),
+            UriVerdict::PasAppliquee
+        );
+        // Le flux d'un AUTRE serveur Tune : pas le nôtre non plus.
+        assert_eq!(
+            verdict_uri_appliquee(Some("http://192.168.1.18:8888/stream/xyz.wav"), url),
+            UriVerdict::PasAppliquee
+        );
+    }
+
+    #[test]
+    fn verdict_uri_etrangere_ou_absente_ne_conclut_rien() {
+        let url = "http://192.168.1.42:8888/stream/abc-123.wav";
+        // Un renderer qui réécrit (Sonos et ses URI propriétaires) ne doit
+        // JAMAIS être déclaré en échec sur cette seule base.
+        assert_eq!(
+            verdict_uri_appliquee(Some("x-rincon-queue:RINCON_123#0"), url),
+            UriVerdict::Indeterminee
+        );
+        assert_eq!(verdict_uri_appliquee(None, url), UriVerdict::Indeterminee);
     }
 
     #[test]
