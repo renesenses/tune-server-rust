@@ -11,9 +11,9 @@
 //! pend, un `gh api` sans reponse. Un plafond ne peut que faire echouer plus
 //! TOT — il ne change aucune logique de build.
 //!
-//! Ce test relit les deux fichiers qui comptent. `ci.yml` garde les fusions
-//! ouvertes ; `release.yml` produit ce qui est LIVRE. Les confondre a deja
-//! donne un faux vert (#1768) — d'ou la verification des deux.
+//! Ce test relit les workflows qui peuvent occuper les runners. `ci.yml` garde
+//! les fusions ouvertes ; `release.yml` produit ce qui est LIVRE. Les confondre
+//! a deja donne un faux vert (#1768) — d'ou la verification des deux.
 
 use std::fs;
 use std::path::Path;
@@ -81,9 +81,8 @@ fn verifier(fichier: &str) {
 
     let jobs = jobs(&source);
     assert!(
-        jobs.len() >= 5,
-        "{fichier} : {} jobs trouves — l'analyse est cassee, pas le fichier",
-        jobs.len()
+        !jobs.is_empty(),
+        "{fichier} : aucun job trouve — l'analyse est cassee, pas le fichier"
     );
 
     let fautifs: Vec<&str> = jobs
@@ -120,7 +119,126 @@ fn tout_job_de_release_a_un_plafond() {
 
 #[test]
 fn tout_job_de_ci_a_un_plafond() {
-    verifier("ci.yml");
+    for fichier in [
+        "ci.yml",
+        "test-postgres.yml",
+        "refs-issues.yml",
+        "widget-ci.yml",
+    ] {
+        verifier(fichier);
+    }
+}
+
+fn workflow(fichier: &str) -> String {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::read_to_string(racine.join("../.github/workflows").join(fichier))
+        .unwrap_or_else(|e| panic!("{fichier} illisible : {e}"))
+}
+
+#[test]
+fn les_runs_obsoletes_de_pr_sont_annules() {
+    for fichier in [
+        "ci.yml",
+        "test-postgres.yml",
+        "refs-issues.yml",
+        "widget-ci.yml",
+    ] {
+        let source = workflow(fichier);
+        assert!(
+            source.contains("github.event.pull_request.number || github.ref"),
+            "{fichier} ne groupe pas les runs d'une meme PR"
+        );
+        assert!(
+            source.contains("cancel-in-progress: true"),
+            "{fichier} laisse tourner les SHA devenus obsoletes"
+        );
+    }
+}
+
+#[test]
+fn les_pr_empilees_declenchent_la_ci_rapide() {
+    let source = workflow("ci.yml");
+    let declencheurs = source
+        .split_once("env:")
+        .map(|(avant, _)| avant)
+        .expect("ci.yml garde un bloc env apres ses declencheurs");
+
+    assert!(declencheurs.contains("  pull_request:\n"));
+    assert!(
+        !declencheurs.contains("  pull_request:\n    branches:"),
+        "la CI principale exclut encore les PR dont la base est une branche de travail"
+    );
+}
+
+#[test]
+fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
+    let source = workflow("ci.yml");
+    let jobs = jobs(&source);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de ci.yml"))
+    };
+
+    let windows = corps("windows-pr");
+    assert!(windows.contains("if: github.event_name == 'pull_request'"));
+    assert!(windows.contains("--features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm"));
+    assert!(
+        windows
+            .contains("--features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
+    );
+
+    let macos = corps("macos-pr");
+    assert!(macos.contains("if: github.event_name == 'pull_request'"));
+    assert!(macos.contains("cargo check --package tune-server"));
+
+    let livraison = corps("build");
+    assert!(livraison.contains("if: github.event_name != 'pull_request'"));
+    assert!(
+        !livraison.lines().any(|ligne| cle_de_job(ligne, "needs:")),
+        "la matrice de livraison attend encore la fin de toute la CI Linux"
+    );
+    for cible in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+    ] {
+        assert!(
+            livraison.contains(cible),
+            "cible de livraison perdue : {cible}"
+        );
+    }
+}
+
+#[test]
+fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
+    let ci = workflow("ci.yml");
+    let noms: Vec<String> = jobs(&ci).into_iter().map(|(nom, _)| nom).collect();
+    assert!(!noms.iter().any(|nom| nom == "test-postgres"));
+    assert!(!noms.iter().any(|nom| nom == "widget"));
+
+    let postgres = workflow("test-postgres.yml");
+    assert_eq!(
+        postgres
+            .lines()
+            .filter(|ligne| {
+                ligne.trim()
+                    == "run: cargo test -p tune-core --no-default-features --features postgres,oaat"
+            })
+            .count(),
+        1,
+        "la suite generale PostgreSQL doit compiler une seule fois"
+    );
+    assert!(postgres.contains("pg_1706 -- --nocapture"));
+    assert!(postgres.contains("pg_schema_parity -- --nocapture"));
+
+    let widget = workflow("widget-ci.yml");
+    assert!(widget.contains("      - \"tune-widget/**\""));
+    assert!(widget.contains("cargo check --release"));
+    assert!(widget.contains("cargo test"));
 }
 
 /// Le plafond de l'etape apt doit laisser passer ses TROIS essais.

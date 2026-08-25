@@ -408,6 +408,10 @@ pub struct AsioDeviceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioDevice {
     pub name: String,
+    /// Stable backend endpoint identifier (for example the IMMDevice ID on
+    /// WASAPI), captured during discovery and reused when playback opens.
+    #[serde(default)]
+    pub endpoint_id: String,
     pub is_default: bool,
     pub max_channels: u16,
     pub sample_rates: Vec<u32>,
@@ -493,6 +497,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
+                let endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
 
                 // Skip ALSA null/dummy sinks that produce no audio
                 if raw_name.contains("Discard all samples") || raw_name.contains("Dummy") {
@@ -605,6 +610,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
                 info!(
                     device = %name,
+                    endpoint_id = %endpoint_id,
                     is_default,
                     max_channels,
                     sample_rates = ?sample_rates,
@@ -613,6 +619,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
                 devices.push(AudioDevice {
                     name,
+                    endpoint_id,
                     is_default,
                     max_channels,
                     sample_rates,
@@ -745,6 +752,11 @@ struct PendingNextMedia {
 pub struct LocalOutput {
     device_name: String,
     device_id: String,
+    /// Stable backend endpoint captured at discovery. The public registry ID
+    /// remains compatible (`local:<display name>`), while exclusive WASAPI
+    /// opens this exact IMMDevice instead of resolving the name again.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    endpoint_id: Option<String>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     /// What the playback callbacks actually multiply by: the user volume
@@ -993,10 +1005,22 @@ impl LocalOutput {
     /// Create a new `LocalOutput` with full control over exclusive mode and
     /// audio backend selection.
     pub fn with_options(device_name: String, exclusive_mode: bool, audio_backend: &str) -> Self {
+        Self::with_options_and_endpoint(device_name, None, exclusive_mode, audio_backend)
+    }
+
+    /// Create a local output bound to the stable backend endpoint discovered
+    /// alongside its display name.
+    pub fn with_options_and_endpoint(
+        device_name: String,
+        endpoint_id: Option<String>,
+        exclusive_mode: bool,
+        audio_backend: &str,
+    ) -> Self {
         let device_id = format!("local:{device_name}");
         Self {
             device_name,
             device_id,
+            endpoint_id,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
@@ -1268,6 +1292,154 @@ pub struct RingBuf {
     write: AtomicU64,
     /// Read position (audio callback reads here)
     read: AtomicU64,
+}
+
+/// Integer SPSC ring used by Windows exclusive backends when the source must
+/// cross the callback boundary without touching floating point.
+///
+/// Every sample is left-aligned in an `i32`: 16-bit words occupy bits 31..16,
+/// 24-bit words bits 31..8, and 32-bit words use the whole value. This is the
+/// representation expected by an ASIO I32 callback and lets WASAPI recover
+/// the original little-endian word by copying the high 2/3/4 bytes.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) struct NativePcmRing {
+    buf: Box<[UnsafeCell<i32>]>,
+    write: AtomicU64,
+    read: AtomicU64,
+}
+
+// SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
+// `RingBuf`; the only difference is the `i32` cell payload.
+#[cfg(any(target_os = "windows", test))]
+unsafe impl Send for NativePcmRing {}
+#[cfg(any(target_os = "windows", test))]
+unsafe impl Sync for NativePcmRing {}
+
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl NativePcmRing {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            buf: (0..capacity)
+                .map(|_| UnsafeCell::new(0i32))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            write: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub(crate) fn available(&self) -> usize {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        w.wrapping_sub(r) as usize
+    }
+
+    pub(crate) fn clear(&self) {
+        self.read.store(0, Ordering::SeqCst);
+        self.write.store(0, Ordering::SeqCst);
+        for cell in self.buf.iter() {
+            // SAFETY: producer-only reset before a callback can consume this
+            // freshly-created ring.
+            unsafe { *cell.get() = 0 };
+        }
+    }
+
+    pub(crate) fn push(&self, samples: &[i32]) -> usize {
+        let cap = self.capacity();
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let free = cap - w.wrapping_sub(r) as usize;
+        let n = samples.len().min(free);
+        for (i, sample) in samples[..n].iter().enumerate() {
+            let idx = (w as usize + i) % cap;
+            // SAFETY: unique producer, and `i < free` selects a cell the
+            // consumer has already released.
+            unsafe { *self.buf[idx].get() = *sample };
+        }
+        self.write.store(w + n as u64, Ordering::Release);
+        n
+    }
+
+    pub(crate) fn pop(&self, out: &mut [i32]) -> usize {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let n = out.len().min(w.wrapping_sub(r) as usize);
+        let cap = self.capacity();
+        for (i, sample) in out[..n].iter_mut().enumerate() {
+            let idx = (r as usize + i) % cap;
+            // SAFETY: unique consumer, and the producer published this cell
+            // before advancing `write` with Release.
+            *sample = unsafe { *self.buf[idx].get() };
+        }
+        self.read.store(r + n as u64, Ordering::Release);
+        n
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasapiEndpoint {
+    pub(crate) id: String,
+    pub(crate) name: String,
+}
+
+/// Resolve the exact endpoint requested by a zone. Display names are
+/// disambiguated with the same `(2)`, `(3)` convention as discovery, while a
+/// stable endpoint ID bypasses name matching entirely.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn select_wasapi_endpoint(
+    requested: &str,
+    default_id: Option<&str>,
+    candidates: &[WasapiEndpoint],
+) -> Result<WasapiEndpoint, String> {
+    if requested.eq_ignore_ascii_case("default") {
+        let id =
+            default_id.ok_or_else(|| "WASAPI ne signale aucun endpoint par défaut".to_string())?;
+        return candidates
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned()
+            .ok_or_else(|| format!("L'endpoint WASAPI par défaut « {id} » n'est plus présent"));
+    }
+
+    let requested_id = requested
+        .strip_prefix("WASAPI:")
+        .or_else(|| requested.strip_prefix("wasapi:"))
+        .unwrap_or(requested);
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.id == requested_id)
+    {
+        return Ok(candidate.clone());
+    }
+
+    let mut occurrences = std::collections::HashMap::<&str, usize>::new();
+    for candidate in candidates {
+        let occurrence = occurrences.entry(candidate.name.as_str()).or_default();
+        *occurrence += 1;
+        let display_name = if *occurrence == 1 {
+            candidate.name.clone()
+        } else {
+            format!("{} ({})", candidate.name, *occurrence)
+        };
+        if display_name.eq_ignore_ascii_case(requested) {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let available = candidates
+        .iter()
+        .map(|candidate| format!("{} [{}]", candidate.name, candidate.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Endpoint WASAPI demandé introuvable : « {requested} ». Disponibles : {available}"
+    ))
 }
 
 // SAFETY: SPSC strict. Un seul producteur appelle `push`/`clear`, un seul
@@ -1817,6 +1989,23 @@ fn record_windows_exclusive_pcm_refusal(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn record_wasapi_exclusive_open_failure(
+    requested_device: &str,
+    error: &str,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        requested_device,
+        error, "wasapi_exclusive_open_failed_without_fallback"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "Sortie « {requested_device} » : l'ouverture WASAPI exclusive a échoué ({error}). Aucun repli vers un autre endpoint ou vers le mode partagé n'a été effectué"
+        ));
+    }
+}
+
 /// Last preparation step before the f32 ring used by Windows exclusive
 /// backends.
 ///
@@ -1918,6 +2107,179 @@ fn feed_windows_exclusive_leftover(
     Ok((aligned_len / frame_bytes) as u64)
 }
 
+#[cfg(target_os = "windows")]
+struct NativeFeedOutcome {
+    frames: u64,
+    dop: bool,
+    bit_perfect: bool,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum WindowsExclusiveRingRef<'a> {
+    Float(&'a RingBuf),
+    Native(&'a NativePcmRing),
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsExclusiveRingRef<'_> {
+    fn capacity(self) -> usize {
+        match self {
+            Self::Float(ring) => ring.capacity(),
+            Self::Native(ring) => ring.capacity(),
+        }
+    }
+
+    fn available(self) -> usize {
+        match self {
+            Self::Float(ring) => ring.available(),
+            Self::Native(ring) => ring.available(),
+        }
+    }
+}
+
+/// Integer twin of [`feed_windows_exclusive_leftover`]. The producer resolves
+/// DoP, DSP and volume before it publishes left-aligned words; the backend
+/// callback can therefore remain a pure native serializer.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn feed_windows_native_exclusive_leftover(
+    leftover: &mut Vec<u8>,
+    frame_bytes: usize,
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: &mut bool,
+    dop_latched: &mut bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    ring: &NativePcmRing,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    force_silent: &AtomicBool,
+) -> Option<NativeFeedOutcome> {
+    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
+    if aligned_len == 0 {
+        return None;
+    }
+    let prepared = prepare_windows_native_pcm(
+        &leftover[..aligned_len],
+        bit_depth,
+        channels,
+        *must_classify_24_bit,
+        *dop_latched,
+        volume_units,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+    )?;
+
+    *must_classify_24_bit = false;
+    *dop_latched = prepared.dop;
+    feed_native_ring_abortable(ring, &prepared.samples, stop_rx, paused, Some(force_silent));
+    leftover.drain(..aligned_len);
+    Some(NativeFeedOutcome {
+        frames: (aligned_len / frame_bytes) as u64,
+        dop: prepared.dop,
+        bit_perfect: prepared.bit_perfect,
+    })
+}
+
+/// Route staged bytes to the callback representation selected from the
+/// driver's advertised native format. The legacy float route remains
+/// fail-closed for DoP; the native route carries DoP and identity PCM exactly.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn feed_selected_windows_exclusive_leftover(
+    leftover: &mut Vec<u8>,
+    frame_bytes: usize,
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: &mut bool,
+    dop_latched: &mut bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    ring: WindowsExclusiveRingRef<'_>,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    force_silent: &AtomicBool,
+) -> Result<Option<NativeFeedOutcome>, WindowsExclusivePcmError> {
+    match ring {
+        WindowsExclusiveRingRef::Native(ring) => Ok(feed_windows_native_exclusive_leftover(
+            leftover,
+            frame_bytes,
+            bit_depth,
+            channels,
+            must_classify_24_bit,
+            dop_latched,
+            volume_units,
+            eq,
+            convolver,
+            crossfeed,
+            pure_bypass,
+            ring,
+            stop_rx,
+            paused,
+            force_silent,
+        )),
+        WindowsExclusiveRingRef::Float(ring) => {
+            let frames = feed_windows_exclusive_leftover(
+                leftover,
+                frame_bytes,
+                bit_depth,
+                channels,
+                must_classify_24_bit,
+                eq,
+                convolver,
+                crossfeed,
+                pure_bypass,
+                ring,
+                stop_rx,
+                paused,
+                force_silent,
+            )?;
+            Ok((frames > 0).then_some(NativeFeedOutcome {
+                frames,
+                dop: false,
+                bit_perfect: false,
+            }))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn feed_selected_windows_exclusive_tail(
+    ring: WindowsExclusiveRingRef<'_>,
+    mut samples: Vec<f32>,
+    bit_depth: u16,
+    volume_units: u32,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    force_silent: &AtomicBool,
+) {
+    match ring {
+        WindowsExclusiveRingRef::Float(ring) => {
+            feed_ring_abortable(ring, &samples, stop_rx, paused, Some(force_silent));
+        }
+        WindowsExclusiveRingRef::Native(ring) => {
+            let volume = volume_units as f32 / 1000.0;
+            if volume != 1.0 {
+                for sample in &mut samples {
+                    *sample *= volume;
+                }
+            }
+            let native = f32_to_native_i32(&samples, bit_depth);
+            feed_native_ring_abortable(ring, &native, stop_rx, paused, Some(force_silent));
+        }
+    }
+}
 /// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
 /// in place, at the three playback-loop feed sites.
 ///
@@ -2077,6 +2439,169 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
                 .collect()
         }
     }
+}
+
+/// Decode little-endian signed PCM into the left-aligned integer words used by
+/// [`NativePcmRing`]. No arithmetic is performed: every source bit keeps the
+/// same relative position and the unused low bits are zero.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn pcm_bytes_to_native_i32(bytes: &[u8], bit_depth: u16) -> Vec<i32> {
+    match bit_depth {
+        16 => bytes
+            .chunks_exact(2)
+            .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])) << 16)
+            .collect(),
+        24 => bytes
+            .chunks_exact(3)
+            .map(|c| {
+                let word = ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
+                word << 8
+            })
+            .collect(),
+        32 => bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Write left-aligned native words back to their exact 16/24/32-bit PCM byte
+/// representation. This is the WASAPI callback's final serialization step and
+/// also the inverse used by the backend-boundary countertests.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut [u8]) -> usize {
+    let bytes_per_sample = usize::from(bit_depth / 8);
+    if !matches!(bit_depth, 16 | 24 | 32) {
+        return 0;
+    }
+    let count = samples.len().min(out.len() / bytes_per_sample);
+    for (i, sample) in samples[..count].iter().enumerate() {
+        let native = sample.to_le_bytes();
+        let source = &native[4 - bytes_per_sample..];
+        let offset = i * bytes_per_sample;
+        out[offset..offset + bytes_per_sample].copy_from_slice(source);
+    }
+    count * bytes_per_sample
+}
+
+/// Copy left-aligned 16-bit source words into an ASIO I16 callback without
+/// scaling or rounding. Callers only use this for a 16-bit source contract.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn native_i32_to_asio_i16(samples: &[i32], out: &mut [i16]) -> usize {
+    let count = samples.len().min(out.len());
+    for (target, sample) in out[..count].iter_mut().zip(&samples[..count]) {
+        *target = (*sample >> 16) as i16;
+    }
+    count
+}
+
+/// Copy left-aligned source words into an ASIO I24 callback. A 16-bit source
+/// remains left-aligned inside the 24-bit word; a 24-bit source is unchanged.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn native_i32_to_asio_i24(samples: &[i32], out: &mut [cpal::I24]) -> usize {
+    let count = samples.len().min(out.len());
+    for (target, sample) in out[..count].iter_mut().zip(&samples[..count]) {
+        *target = cpal::I24::new(*sample >> 8).expect("un mot natif décalé tient sur 24 bits");
+    }
+    count
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
+    let (scale, max, shift) = match bit_depth {
+        16 => (32_768.0, i16::MAX as f64, 16),
+        24 => (8_388_608.0, 8_388_607.0, 8),
+        32 => (2_147_483_648.0, i32::MAX as f64, 0),
+        _ => return Vec::new(),
+    };
+    let min = -scale;
+    samples
+        .iter()
+        .map(|sample| {
+            let word = (f64::from(*sample) * scale).round().clamp(min, max) as i64;
+            (word << shift) as i32
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn local_dsp_is_identity(
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> bool {
+    if pure_bypass.load(Ordering::Relaxed) {
+        return true;
+    }
+    eq.lock().is_ok_and(|guard| guard.is_none())
+        && convolver.lock().is_ok_and(|guard| guard.is_none())
+        && crossfeed.lock().is_ok_and(|guard| guard.is_none())
+}
+
+#[cfg(any(target_os = "windows", test))]
+struct PreparedNativePcm {
+    samples: Vec<i32>,
+    dop: bool,
+    bit_perfect: bool,
+}
+
+/// Prepare PCM for an integer backend ring.
+///
+/// DoP and identity PCM take the raw branch and never become floats. Ordinary
+/// PCM that actually requests volume or DSP is processed in sample space and
+/// quantized once, before the integer ring; it is explicitly marked as not
+/// bit-perfect so the callback never has to guess which contract it received.
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn prepare_windows_native_pcm(
+    bytes: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: bool,
+    dop_latched: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> Option<PreparedNativePcm> {
+    let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
+    if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
+        return None;
+    }
+
+    let dop = dop_latched || (bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels));
+    let bit_perfect = dop
+        || (volume_units == 1000 && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass));
+    let samples = if bit_perfect {
+        pcm_bytes_to_native_i32(bytes, bit_depth)
+    } else {
+        let mut float = pcm_bytes_to_f32(bytes, bit_depth);
+        apply_local_dsp(
+            &mut float,
+            eq,
+            convolver,
+            crossfeed,
+            pure_bypass,
+            channels,
+            false,
+        );
+        let volume = volume_units as f32 / 1000.0;
+        if volume != 1.0 {
+            for sample in &mut float {
+                *sample *= volume;
+            }
+        }
+        f32_to_native_i32(&float, bit_depth)
+    };
+
+    Some(PreparedNativePcm {
+        samples,
+        dop,
+        bit_perfect,
+    })
 }
 
 #[async_trait::async_trait]
@@ -2251,6 +2776,8 @@ impl OutputTarget for LocalOutput {
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
+        #[cfg(target_os = "windows")]
+        let endpoint_id = self.endpoint_id.clone();
         let url = url.to_string();
         let playing = self.playing.clone();
         let paused = self.paused.clone();
@@ -2924,15 +3451,18 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
-                ring.clear(); // Defensive: zero-fill before callback reads
+                let float_ring = Arc::new(RingBuf::new(ring_cap));
+                let native_ring = Arc::new(NativePcmRing::new(ring_cap));
+                float_ring.clear();
+                native_ring.clear();
 
                 let exclusive = match AsioExclusiveOutput::new(
                     &device_name,
                     sample_rate,
                     bit_depth as u32,
                     channels as u32,
-                    ring.clone(),
+                    float_ring.clone(),
+                    native_ring.clone(),
                     volume.clone(),
                     paused.clone(),
                 ) {
@@ -2943,6 +3473,21 @@ impl OutputTarget for LocalOutput {
                         return;
                     }
                 };
+
+                let selected_ring = if exclusive.uses_native_transport() {
+                    WindowsExclusiveRingRef::Native(&native_ring)
+                } else {
+                    WindowsExclusiveRingRef::Float(&float_ring)
+                };
+                if let Some(reason) = exclusive.bit_perfect_unavailable_reason() {
+                    info!(
+                        backend = "ASIO",
+                        device = %device_name,
+                        bit_perfect = false,
+                        reason,
+                        "windows_exclusive_signal_contract"
+                    );
+                }
 
                 info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
 
@@ -2972,6 +3517,14 @@ impl OutputTarget for LocalOutput {
                 // may reach the f32 ring until 32 frames have ruled DoP out.
                 let mut leftover: Vec<u8> = Vec::new();
                 let mut must_classify_24_bit = bit_depth == 24;
+                let mut dop_latched = false;
+                let mut bit_perfect_state = None;
+
+                // Track-local contract: never inherit the prior stream's DoP
+                // state while the first 24-bit probe is still quarantined.
+                if dop_active.swap(false, Ordering::SeqCst) {
+                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
+                }
 
                 if !pcm_data.is_empty() {
                     let discard = if skip_bytes_asio > skipped_bytes_asio {
@@ -2983,22 +3536,44 @@ impl OutputTarget for LocalOutput {
                     leftover.extend_from_slice(&pcm_data[discard..]);
                 }
 
-                match feed_windows_exclusive_leftover(
+                match feed_selected_windows_exclusive_leftover(
                     &mut leftover,
                     frame_bytes,
                     bit_depth,
                     channels,
                     &mut must_classify_24_bit,
+                    &mut dop_latched,
+                    volume.load(Ordering::SeqCst),
                     &eq,
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
-                    &ring,
+                    selected_ring,
                     &stop_rx,
                     &paused,
                     &force_silent,
                 ) {
-                    Ok(frames) => total_frames_fed += frames,
+                    Ok(Some(outcome)) => {
+                        total_frames_fed += outcome.frames;
+                        if dop_active.swap(outcome.dop, Ordering::SeqCst) != outcome.dop {
+                            info!(dop = outcome.dop, "local_audio_dop_stream_state_changed");
+                            sync_volume_to_dop(
+                                &volume,
+                                &user_volume_ref,
+                                &rg_factor_ref,
+                                outcome.dop,
+                            );
+                        }
+                        bit_perfect_state = Some(outcome.bit_perfect);
+                        info!(
+                            backend = "ASIO",
+                            bit_perfect = outcome.bit_perfect,
+                            dop = outcome.dop,
+                            volume_units = volume.load(Ordering::SeqCst),
+                            "windows_exclusive_signal_contract"
+                        );
+                    }
+                    Ok(None) => {}
                     Err(error) => {
                         record_windows_exclusive_pcm_refusal(
                             error,
@@ -3101,8 +3676,8 @@ impl OutputTarget for LocalOutput {
                     // never latched (bug-22 / #789).
                     if last_stats_at.elapsed() >= std::time::Duration::from_millis(500) {
                         debug!(
-                            ring_available = ring.available(),
-                            ring_capacity = ring.capacity(),
+                            ring_available = selected_ring.available(),
+                            ring_capacity = selected_ring.capacity(),
                             total_frames_fed,
                             pump_depth = pump_depth.load(Ordering::Relaxed),
                             leftover_bytes = leftover.len(),
@@ -3140,7 +3715,7 @@ impl OutputTarget for LocalOutput {
                             // never fired on a clean playthrough).
                             if total_frames_fed > 0
                                 && leftover.is_empty()
-                                && ring.available() == 0
+                                && selected_ring.available() == 0
                                 && last_data_at.elapsed() > std::time::Duration::from_secs(5)
                             {
                                 info!("local_audio_asio_exclusive_stream_idle_eof");
@@ -3154,7 +3729,7 @@ impl OutputTarget for LocalOutput {
                             // transient-read-error arm above.
                             if total_frames_fed > 0
                                 && leftover.is_empty()
-                                && ring.available() == 0
+                                && selected_ring.available() == 0
                                 && last_data_at.elapsed() > std::time::Duration::from_secs(5)
                             {
                                 info!("local_audio_asio_exclusive_stream_idle_eof");
@@ -3187,22 +3762,46 @@ impl OutputTarget for LocalOutput {
                         leftover.extend_from_slice(&chunk);
                     }
 
-                    match feed_windows_exclusive_leftover(
+                    match feed_selected_windows_exclusive_leftover(
                         &mut leftover,
                         frame_bytes,
                         bit_depth,
                         channels,
                         &mut must_classify_24_bit,
+                        &mut dop_latched,
+                        volume.load(Ordering::SeqCst),
                         &eq,
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
-                        &ring,
+                        selected_ring,
                         &stop_rx,
                         &paused,
                         &force_silent,
                     ) {
-                        Ok(frames) => total_frames_fed += frames,
+                        Ok(Some(outcome)) => {
+                            total_frames_fed += outcome.frames;
+                            if dop_active.swap(outcome.dop, Ordering::SeqCst) != outcome.dop {
+                                info!(dop = outcome.dop, "local_audio_dop_stream_state_changed");
+                                sync_volume_to_dop(
+                                    &volume,
+                                    &user_volume_ref,
+                                    &rg_factor_ref,
+                                    outcome.dop,
+                                );
+                            }
+                            if bit_perfect_state != Some(outcome.bit_perfect) {
+                                bit_perfect_state = Some(outcome.bit_perfect);
+                                info!(
+                                    backend = "ASIO",
+                                    bit_perfect = outcome.bit_perfect,
+                                    dop = outcome.dop,
+                                    volume_units = volume.load(Ordering::SeqCst),
+                                    "windows_exclusive_signal_contract"
+                                );
+                            }
+                        }
+                        Ok(None) => {}
                         Err(error) => {
                             pcm_refusal = Some(error);
                             break;
@@ -3214,15 +3813,40 @@ impl OutputTarget for LocalOutput {
                     position_ms.store(pos, Ordering::Relaxed);
                 }
 
-                if pcm_refusal.is_none()
-                    && http_eof_asio
-                    && let Err(error) = finish_windows_exclusive_probe(
-                        bit_depth,
-                        must_classify_24_bit,
-                        leftover.len(),
-                    )
-                {
-                    pcm_refusal = Some(error);
+                if pcm_refusal.is_none() && http_eof_asio {
+                    match selected_ring {
+                        WindowsExclusiveRingRef::Float(_) => {
+                            if let Err(error) = finish_windows_exclusive_probe(
+                                bit_depth,
+                                must_classify_24_bit,
+                                leftover.len(),
+                            ) {
+                                pcm_refusal = Some(error);
+                            }
+                        }
+                        WindowsExclusiveRingRef::Native(ring)
+                            if must_classify_24_bit && !leftover.is_empty() =>
+                        {
+                            let aligned = (leftover.len() / frame_bytes) * frame_bytes;
+                            let native = pcm_bytes_to_native_i32(&leftover[..aligned], bit_depth);
+                            feed_native_ring_abortable(
+                                ring,
+                                &native,
+                                &stop_rx,
+                                &paused,
+                                Some(&force_silent),
+                            );
+                            leftover.drain(..aligned);
+                            total_frames_fed += (aligned / frame_bytes) as u64;
+                            info!(
+                                backend = "ASIO",
+                                bytes = aligned,
+                                bit_perfect = true,
+                                "windows_exclusive_short_24bit_stream_forced_raw"
+                            );
+                        }
+                        WindowsExclusiveRingRef::Native(_) => {}
+                    }
                 }
                 if let Some(error) = pcm_refusal {
                     record_windows_exclusive_pcm_refusal(
@@ -3250,7 +3874,15 @@ impl OutputTarget for LocalOutput {
                     dop_active.load(Ordering::Relaxed),
                 );
                 if !queue.is_empty() {
-                    feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
+                    feed_selected_windows_exclusive_tail(
+                        selected_ring,
+                        queue,
+                        bit_depth,
+                        volume.load(Ordering::SeqCst),
+                        &stop_rx,
+                        &paused,
+                        &force_silent,
+                    );
                 }
 
                 // Signal natural track end BEFORE draining when the HTTP
@@ -3272,14 +3904,15 @@ impl OutputTarget for LocalOutput {
                 // ~2× the ring's time-capacity, and a stall detector that bails if
                 // `available()` has not decreased for ~1.5s.
                 let ring_capacity_ms = if sample_rate > 0 && channels > 0 {
-                    (ring.capacity() as u64 * 1000) / (sample_rate as u64 * channels as u64)
+                    (selected_ring.capacity() as u64 * 1000)
+                        / (sample_rate as u64 * channels as u64)
                 } else {
                     0
                 };
                 let drain_deadline =
                     std::time::Duration::from_millis((ring_capacity_ms * 2).max(1000));
                 let drain_started = std::time::Instant::now();
-                let mut last_avail = ring.available();
+                let mut last_avail = selected_ring.available();
                 let mut last_progress_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -3288,7 +3921,7 @@ impl OutputTarget for LocalOutput {
                     if force_silent.load(Ordering::Relaxed) {
                         break;
                     }
-                    let avail = ring.available();
+                    let avail = selected_ring.available();
                     if avail == 0 {
                         break;
                     }
@@ -3346,24 +3979,28 @@ impl OutputTarget for LocalOutput {
                 );
 
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                let ring = Arc::new(NativePcmRing::new(ring_cap));
                 ring.clear();
 
                 match WasapiExclusiveOutput::new(
                     &device_name,
+                    endpoint_id.as_deref(),
                     sample_rate,
                     bit_depth as u32,
                     channels as u32,
                     ring.clone(),
-                    volume.clone(),
                     paused.clone(),
                 ) {
                     Ok(mut wasapi) => {
                         if let Err(e) = wasapi.start() {
-                            warn!(error = %e, "wasapi_exclusive_start_failed_falling_back");
+                            record_wasapi_exclusive_open_failure(&device_name, &e, &open_failure);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
                         } else {
                             info!(
-                                device = %device_name,
+                                requested_device = %device_name,
+                                device = %wasapi.opened_device_name(),
+                                endpoint_id = %wasapi.opened_device_id(),
                                 info = %wasapi.format_info(),
                                 "wasapi_exclusive_playing"
                             );
@@ -3378,13 +4015,29 @@ impl OutputTarget for LocalOutput {
                             let mut read_buf = vec![0u8; 65536];
                             let mut leftover = pcm_data;
                             let mut must_classify_24_bit = bit_depth == 24;
+                            let mut dop_latched = false;
+                            let mut bit_perfect_state = None;
 
-                            match feed_windows_exclusive_leftover(
+                            // A new track never inherits the DoP/volume state
+                            // of the previous one while its first 24-bit probe
+                            // is still quarantined.
+                            if dop_active.swap(false, Ordering::SeqCst) {
+                                sync_volume_to_dop(
+                                    &volume,
+                                    &user_volume_ref,
+                                    &rg_factor_ref,
+                                    false,
+                                );
+                            }
+
+                            if let Some(outcome) = feed_windows_native_exclusive_leftover(
                                 &mut leftover,
                                 frame_bytes,
                                 bit_depth,
                                 channels,
                                 &mut must_classify_24_bit,
+                                &mut dop_latched,
+                                volume.load(Ordering::SeqCst),
                                 &eq,
                                 &convolver,
                                 &crossfeed,
@@ -3394,27 +4047,28 @@ impl OutputTarget for LocalOutput {
                                 &paused,
                                 &force_silent,
                             ) {
-                                Ok(frames) => total_frames_fed += frames,
-                                Err(error) => {
-                                    record_windows_exclusive_pcm_refusal(
-                                        error,
-                                        "WASAPI",
-                                        &device_name,
-                                        &open_failure,
+                                total_frames_fed += outcome.frames;
+                                if dop_active.swap(outcome.dop, Ordering::SeqCst) != outcome.dop {
+                                    info!(
+                                        dop = outcome.dop,
+                                        "local_audio_dop_stream_state_changed"
                                     );
-                                    force_silent.store(true, Ordering::SeqCst);
-                                    dop_active.store(false, Ordering::SeqCst);
                                     sync_volume_to_dop(
                                         &volume,
                                         &user_volume_ref,
                                         &rg_factor_ref,
-                                        false,
+                                        outcome.dop,
                                     );
-                                    wasapi.stop();
-                                    if play_generation.load(Ordering::SeqCst) == my_generation {
-                                        playing.store(false, Ordering::SeqCst);
-                                    }
-                                    return;
+                                }
+                                if bit_perfect_state != Some(outcome.bit_perfect) {
+                                    bit_perfect_state = Some(outcome.bit_perfect);
+                                    info!(
+                                        backend = "WASAPI",
+                                        bit_perfect = outcome.bit_perfect,
+                                        dop = outcome.dop,
+                                        volume_units = volume.load(Ordering::SeqCst),
+                                        "windows_exclusive_signal_contract"
+                                    );
                                 }
                             }
                             if !must_classify_24_bit && dop_active.swap(false, Ordering::SeqCst) {
@@ -3428,7 +4082,6 @@ impl OutputTarget for LocalOutput {
                             }
 
                             let mut http_eof_wasapi = false;
-                            let mut pcm_refusal = None;
                             loop {
                                 if stop_rx.try_recv().is_ok() {
                                     break;
@@ -3445,25 +4098,49 @@ impl OutputTarget for LocalOutput {
                                     }
                                     Ok(n) => {
                                         leftover.extend_from_slice(&read_buf[..n]);
-                                        match feed_windows_exclusive_leftover(
-                                            &mut leftover,
-                                            frame_bytes,
-                                            bit_depth,
-                                            channels,
-                                            &mut must_classify_24_bit,
-                                            &eq,
-                                            &convolver,
-                                            &crossfeed,
-                                            &pure_bypass,
-                                            &ring,
-                                            &stop_rx,
-                                            &paused,
-                                            &force_silent,
-                                        ) {
-                                            Ok(frames) => total_frames_fed += frames,
-                                            Err(error) => {
-                                                pcm_refusal = Some(error);
-                                                break;
+                                        if let Some(outcome) =
+                                            feed_windows_native_exclusive_leftover(
+                                                &mut leftover,
+                                                frame_bytes,
+                                                bit_depth,
+                                                channels,
+                                                &mut must_classify_24_bit,
+                                                &mut dop_latched,
+                                                volume.load(Ordering::SeqCst),
+                                                &eq,
+                                                &convolver,
+                                                &crossfeed,
+                                                &pure_bypass,
+                                                &ring,
+                                                &stop_rx,
+                                                &paused,
+                                                &force_silent,
+                                            )
+                                        {
+                                            total_frames_fed += outcome.frames;
+                                            if dop_active.swap(outcome.dop, Ordering::SeqCst)
+                                                != outcome.dop
+                                            {
+                                                info!(
+                                                    dop = outcome.dop,
+                                                    "local_audio_dop_stream_state_changed"
+                                                );
+                                                sync_volume_to_dop(
+                                                    &volume,
+                                                    &user_volume_ref,
+                                                    &rg_factor_ref,
+                                                    outcome.dop,
+                                                );
+                                            }
+                                            if bit_perfect_state != Some(outcome.bit_perfect) {
+                                                bit_perfect_state = Some(outcome.bit_perfect);
+                                                info!(
+                                                    backend = "WASAPI",
+                                                    bit_perfect = outcome.bit_perfect,
+                                                    dop = outcome.dop,
+                                                    volume_units = volume.load(Ordering::SeqCst),
+                                                    "windows_exclusive_signal_contract"
+                                                );
                                             }
                                         }
 
@@ -3487,36 +4164,28 @@ impl OutputTarget for LocalOutput {
                                 }
                             }
 
-                            if pcm_refusal.is_none()
-                                && http_eof_wasapi
-                                && let Err(error) = finish_windows_exclusive_probe(
-                                    bit_depth,
-                                    must_classify_24_bit,
-                                    leftover.len(),
-                                )
-                            {
-                                pcm_refusal = Some(error);
-                            }
-                            if let Some(error) = pcm_refusal {
-                                record_windows_exclusive_pcm_refusal(
-                                    error,
-                                    "WASAPI",
-                                    &device_name,
-                                    &open_failure,
+                            // Less than 32 initial 24-bit frames cannot be
+                            // classified, but the integer ring can still carry
+                            // them safely. Keep them raw and at unity rather
+                            // than guessing PCM and applying sample arithmetic.
+                            if http_eof_wasapi && must_classify_24_bit && !leftover.is_empty() {
+                                let aligned = (leftover.len() / frame_bytes) * frame_bytes;
+                                let native =
+                                    pcm_bytes_to_native_i32(&leftover[..aligned], bit_depth);
+                                feed_native_ring_abortable(
+                                    &ring,
+                                    &native,
+                                    &stop_rx,
+                                    &paused,
+                                    Some(&force_silent),
                                 );
-                                force_silent.store(true, Ordering::SeqCst);
-                                dop_active.store(false, Ordering::SeqCst);
-                                sync_volume_to_dop(
-                                    &volume,
-                                    &user_volume_ref,
-                                    &rg_factor_ref,
-                                    false,
+                                leftover.drain(..aligned);
+                                total_frames_fed += (aligned / frame_bytes) as u64;
+                                info!(
+                                    backend = "WASAPI",
+                                    bytes = aligned,
+                                    "windows_exclusive_short_24bit_stream_forced_raw"
                                 );
-                                wasapi.stop();
-                                if play_generation.load(Ordering::SeqCst) == my_generation {
-                                    playing.store(false, Ordering::SeqCst);
-                                }
-                                return;
                             }
 
                             // WASAPI exclusive now follows the same DSP tail
@@ -3529,9 +4198,17 @@ impl OutputTarget for LocalOutput {
                                 false,
                             );
                             if !queue.is_empty() {
-                                feed_ring_abortable(
+                                let volume_factor = volume.load(Ordering::SeqCst) as f32 / 1000.0;
+                                let mut queue = queue;
+                                if volume_factor != 1.0 {
+                                    for sample in &mut queue {
+                                        *sample *= volume_factor;
+                                    }
+                                }
+                                let native = f32_to_native_i32(&queue, bit_depth);
+                                feed_native_ring_abortable(
                                     &ring,
-                                    &queue,
+                                    &native,
                                     &stop_rx,
                                     &paused,
                                     Some(&force_silent),
@@ -3575,10 +4252,9 @@ impl OutputTarget for LocalOutput {
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "wasapi_exclusive_init_failed_falling_back_to_shared"
-                        );
+                        record_wasapi_exclusive_open_failure(&device_name, &e, &open_failure);
+                        playing.store(false, Ordering::SeqCst);
+                        return;
                     }
                 }
             }
@@ -5258,6 +5934,45 @@ fn feed_ring_abortable(
     true
 }
 
+#[cfg(target_os = "windows")]
+fn feed_native_ring_abortable(
+    ring: &NativePcmRing,
+    samples: &[i32],
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    abort: Option<&AtomicBool>,
+) -> bool {
+    let mut offset = 0;
+    let mut last_progress_at = std::time::Instant::now();
+    while offset < samples.len() {
+        if stop_rx.try_recv().is_ok() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
+            return true;
+        }
+        while paused.load(Ordering::Relaxed) {
+            if stop_rx.try_recv().is_ok() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            last_progress_at = std::time::Instant::now();
+        }
+        let written = ring.push(&samples[offset..]);
+        offset += written;
+        if written == 0 {
+            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
+                warn!(
+                    remaining_samples = samples.len() - offset,
+                    "windows_native_feed_ring_stall_timeout"
+                );
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        } else {
+            last_progress_at = std::time::Instant::now();
+        }
+    }
+    true
+}
+
 /// Find an audio output device by name, falling back to the default device if
 /// the requested device is not found.
 ///
@@ -5876,6 +6591,262 @@ mod tests {
         assert_eq!(fixture, real_dop_bytes(64, 2));
     }
 
+    fn integer_pcm_fixture(bit_depth: u16) -> Vec<u8> {
+        let bytes_per_sample = usize::from(bit_depth / 8);
+        let fixture_line = match bit_depth {
+            16 => 0,
+            24 => 1,
+            32 => 2,
+            _ => panic!("profondeur de test non prise en charge"),
+        };
+        let mut bytes: Vec<u8> =
+            include_str!("../../tests/fixtures/windows_pcm_integer_boundaries.hex")
+                .lines()
+                .nth(fixture_line)
+                .expect("ligne de profondeur présente dans le témoin versionné")
+                .split_ascii_whitespace()
+                .map(|octet| u8::from_str_radix(octet, 16).expect("fixture PCM hex valide"))
+                .collect();
+        assert_eq!(bytes.len() % bytes_per_sample, 0);
+
+        // Deterministic pseudo-random bit patterns, including both signs and
+        // every low-bit position. We keep the raw two's-complement word rather
+        // than generating floats, because the contract is byte identity.
+        let mask = if bit_depth == 32 {
+            u64::from(u32::MAX)
+        } else {
+            (1u64 << bit_depth) - 1
+        };
+        let mut state = 0xD050_05FA_2205_u64;
+        for _ in 0..2048 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let word = state & mask;
+            bytes.extend_from_slice(&word.to_le_bytes()[..bytes_per_sample]);
+        }
+        bytes
+    }
+
+    fn wasapi_endpoint_fixture() -> Vec<WasapiEndpoint> {
+        vec![
+            WasapiEndpoint {
+                id: "{speaker-a}".into(),
+                name: "Haut-parleurs".into(),
+            },
+            WasapiEndpoint {
+                id: "{speaker-b}".into(),
+                name: "Haut-parleurs".into(),
+            },
+            WasapiEndpoint {
+                id: "{usb-dac}".into(),
+                name: "DAC USB".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn wasapi_duplicate_names_resolve_to_distinct_stable_endpoints() {
+        let endpoints = wasapi_endpoint_fixture();
+        assert_eq!(
+            select_wasapi_endpoint("Haut-parleurs", Some("{speaker-a}"), &endpoints)
+                .unwrap()
+                .id,
+            "{speaker-a}"
+        );
+        assert_eq!(
+            select_wasapi_endpoint("Haut-parleurs (2)", Some("{speaker-a}"), &endpoints)
+                .unwrap()
+                .id,
+            "{speaker-b}"
+        );
+        assert_eq!(
+            select_wasapi_endpoint("WASAPI:{usb-dac}", Some("{speaker-a}"), &endpoints)
+                .unwrap()
+                .name,
+            "DAC USB"
+        );
+    }
+
+    #[test]
+    fn wasapi_default_change_only_affects_an_explicit_default_request() {
+        let endpoints = wasapi_endpoint_fixture();
+        let first_default =
+            select_wasapi_endpoint("default", Some("{speaker-a}"), &endpoints).unwrap();
+        let changed_default =
+            select_wasapi_endpoint("default", Some("{usb-dac}"), &endpoints).unwrap();
+        assert_eq!(first_default.id, "{speaker-a}");
+        assert_eq!(changed_default.id, "{usb-dac}");
+
+        let explicit_before =
+            select_wasapi_endpoint("Haut-parleurs", Some("{speaker-a}"), &endpoints).unwrap();
+        let explicit_after =
+            select_wasapi_endpoint("Haut-parleurs", Some("{usb-dac}"), &endpoints).unwrap();
+        assert_eq!(explicit_before.id, "{speaker-a}");
+        assert_eq!(explicit_after.id, "{speaker-a}");
+    }
+
+    #[test]
+    fn wasapi_missing_endpoint_fails_instead_of_selecting_default() {
+        let error = select_wasapi_endpoint(
+            "DAC disparu",
+            Some("{speaker-a}"),
+            &wasapi_endpoint_fixture(),
+        )
+        .expect_err("un endpoint absent doit échouer");
+        assert!(error.contains("DAC disparu"));
+        assert!(error.contains("{speaker-a}"));
+    }
+
+    #[test]
+    fn wasapi_open_failure_is_returned_without_authorising_a_fallback() {
+        let slot = std::sync::Mutex::new(None);
+        record_wasapi_exclusive_open_failure("DAC USB", "endpoint {usb-dac} absent", &slot);
+        let message = slot.lock().unwrap().clone().expect("erreur remontée");
+        assert!(message.contains("DAC USB"));
+        assert!(message.contains("{usb-dac}"));
+        assert!(message.contains("Aucun repli"));
+    }
+
+    #[test]
+    fn native_windows_ring_is_byte_exact_for_16_24_and_32_bit_pcm() {
+        for bit_depth in [16u16, 24, 32] {
+            let source = integer_pcm_fixture(bit_depth);
+            let native = pcm_bytes_to_native_i32(&source, bit_depth);
+            let ring = NativePcmRing::new(native.len());
+            assert_eq!(ring.push(&native), native.len());
+
+            let mut callback_words = vec![0i32; native.len()];
+            assert_eq!(ring.pop(&mut callback_words), native.len());
+            let mut observed = vec![0u8; source.len()];
+            assert_eq!(
+                native_i32_to_pcm_bytes(&callback_words, bit_depth, &mut observed),
+                source.len()
+            );
+            assert_eq!(
+                observed, source,
+                "le dernier callback backend a modifié un mot {bit_depth} bits"
+            );
+        }
+    }
+
+    #[test]
+    fn native_windows_ring_is_exact_at_asio_i16_and_i24_callback_boundaries() {
+        let source_16 = integer_pcm_fixture(16);
+        let native_16 = pcm_bytes_to_native_i32(&source_16, 16);
+        let ring_16 = NativePcmRing::new(native_16.len());
+        assert_eq!(ring_16.push(&native_16), native_16.len());
+        let mut callback_words_16 = vec![0i32; native_16.len()];
+        assert_eq!(ring_16.pop(&mut callback_words_16), native_16.len());
+        let mut asio_16 = vec![0i16; native_16.len()];
+        assert_eq!(
+            native_i32_to_asio_i16(&callback_words_16, &mut asio_16),
+            native_16.len()
+        );
+        let observed_16: Vec<u8> = asio_16.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert_eq!(observed_16, source_16);
+
+        let source_24 = integer_pcm_fixture(24);
+        let native_24 = pcm_bytes_to_native_i32(&source_24, 24);
+        let ring_24 = NativePcmRing::new(native_24.len());
+        assert_eq!(ring_24.push(&native_24), native_24.len());
+        let mut callback_words_24 = vec![0i32; native_24.len()];
+        assert_eq!(ring_24.pop(&mut callback_words_24), native_24.len());
+        let zero = cpal::I24::new(0).expect("zero tient sur 24 bits");
+        let mut asio_24 = vec![zero; native_24.len()];
+        assert_eq!(
+            native_i32_to_asio_i24(&callback_words_24, &mut asio_24),
+            native_24.len()
+        );
+        let observed_24: Vec<u8> = asio_24
+            .iter()
+            .flat_map(|word| word.inner().to_le_bytes()[..3].to_vec())
+            .collect();
+        assert_eq!(observed_24, source_24);
+    }
+
+    #[test]
+    fn native_windows_ring_preserves_every_dop_marker_and_payload_byte() {
+        let source = versioned_dop_fixture();
+        let native = pcm_bytes_to_native_i32(&source, 24);
+        let ring = NativePcmRing::new(native.len());
+        assert_eq!(ring.push(&native), native.len());
+        // Deliberately request a callback larger than the remaining stream:
+        // this is the final backend callback, including its silence suffix.
+        let mut callback_words = vec![i32::MAX; native.len() + 16];
+        assert_eq!(ring.pop(&mut callback_words), native.len());
+        callback_words[native.len()..].fill(0);
+
+        let mut observed = vec![0u8; callback_words.len() * 3];
+        native_i32_to_pcm_bytes(&callback_words, 24, &mut observed);
+        assert_eq!(&observed[..source.len()], source);
+        assert!(observed[source.len()..].iter().all(|octet| *octet == 0));
+        for (frame, pair) in observed[..source.len()].chunks_exact(6).enumerate() {
+            let marker = if frame % 2 == 0 { 0x05 } else { 0xFA };
+            assert_eq!(pair[2], marker);
+            assert_eq!(pair[5], marker);
+        }
+    }
+
+    #[test]
+    fn native_windows_preparation_keeps_identity_pcm_out_of_float() {
+        for bit_depth in [16u16, 24, 32] {
+            let source = integer_pcm_fixture(bit_depth);
+            let eq = std::sync::Mutex::new(None);
+            let convolver = std::sync::Mutex::new(None);
+            let crossfeed = std::sync::Mutex::new(None);
+            let pure = AtomicBool::new(false);
+            let prepared = prepare_windows_native_pcm(
+                &source, bit_depth, 2, true, false, 1000, &eq, &convolver, &crossfeed, &pure,
+            )
+            .expect("fenêtre PCM complète");
+            assert!(prepared.bit_perfect);
+            assert!(!prepared.dop);
+
+            let mut observed = vec![0u8; source.len()];
+            native_i32_to_pcm_bytes(&prepared.samples, bit_depth, &mut observed);
+            assert_eq!(observed, source, "identité perdue en {bit_depth} bits");
+        }
+    }
+
+    #[test]
+    fn native_windows_preparation_forces_dop_onto_the_raw_branch() {
+        let source = versioned_dop_fixture();
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(Some(
+            crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
+        ));
+        let pure = AtomicBool::new(false);
+        let prepared = prepare_windows_native_pcm(
+            &source, 24, 2, true, false, 250, &eq, &convolver, &crossfeed, &pure,
+        )
+        .expect("DoP complet");
+        assert!(prepared.dop);
+        assert!(prepared.bit_perfect);
+
+        let mut observed = vec![0u8; source.len()];
+        native_i32_to_pcm_bytes(&prepared.samples, 24, &mut observed);
+        assert_eq!(
+            observed, source,
+            "volume et DSP ne doivent jamais toucher DoP"
+        );
+    }
+
+    #[test]
+    fn native_windows_preparation_marks_processed_pcm_as_not_bitperfect() {
+        let source = integer_pcm_fixture(24);
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+        let prepared = prepare_windows_native_pcm(
+            &source, 24, 2, true, false, 500, &eq, &convolver, &crossfeed, &pure,
+        )
+        .expect("PCM complet");
+        assert!(!prepared.dop);
+        assert!(!prepared.bit_perfect);
+    }
     #[test]
     fn windows_float_exclusive_rejects_dop_before_the_ring() {
         let fixture = versioned_dop_fixture();

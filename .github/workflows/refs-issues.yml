@@ -28,6 +28,10 @@ on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
 
+concurrency:
+  group: refs-issues-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

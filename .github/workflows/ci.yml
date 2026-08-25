@@ -11,9 +11,17 @@ on:
     # test OAAT instable (#1358), une migration PG non declaree (#1364), et
     # l'incident #875 en juillet avait deja le meme mecanisme.
     branches: [main, release/v0.9]
+  # Toutes les PR, y compris les PR empilees dont la base est une branche de
+  # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
-    branches: [main, release/v0.9]
   workflow_dispatch:
+
+concurrency:
+  # Un nouveau SHA rend tous les resultats de l'ancien SHA inutiles. Sans
+  # annulation, trois matrices completes de la meme PR occupaient les runners
+  # simultanement et la bonne execution attendait derriere les obsoletes.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -131,9 +139,66 @@ jobs:
       - run: cargo check -p tune-server --features audio-embedding
       - run: cargo test -p tune-core --features audio-embedding
 
+  # Signal Windows rapide pour une PR : les deux configurations qui ont deja
+  # casse uniquement sur cet OS sont compilees immediatement, sans attendre la
+  # suite Linux ni produire un binaire release jetable. La matrice complete
+  # rejoue les memes contrats sur le push de la branche de livraison.
+  windows-pr:
+    name: Windows + ASIO (compilation PR)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Meme partition que le build de livraison : la PR restaure ses
+          # dependances deja compilees, mais `save-if: false` l'empeche de
+          # remplacer ce cache de confiance.
+          key: x86_64-pc-windows-msvc
+          save-if: false
+      - name: Windows livré sans ASIO
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+      - name: Download ASIO SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.steinberg.net/asiosdk" -OutFile asiosdk.zip
+          Expand-Archive -Path asiosdk.zip -DestinationPath asiosdk -Force
+          $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
+          echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
+      - name: ASIO
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
+
+  # Un seul ABI/configuration macOS suffit sur une PR : les deux architectures
+  # partagent le meme cfg Rust. Les deux vrais binaires restent construits sur
+  # le push de release, puis par le workflow qui fabrique la release taguee.
+  macos-pr:
+    name: macOS (compilation PR)
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-apple-darwin
+          save-if: false
+      - run: cargo check --package tune-server --features dj,karaoke,bandcamp,plugins-wasm
+
+  # Matrice de LIVRAISON : elle ne fabrique plus cinq artefacts jetables sur
+  # chaque SHA de PR. Elle tourne sur chaque push de main/release (et en lancement
+  # manuel), et demarre sans attendre le test Linux. Le workflow `release.yml`
+  # reconstruit ensuite ses propres artefacts a partir du tag.
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -249,57 +314,6 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
-  test-postgres:
-    name: Test (PostgreSQL)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30  # test-postgres — 4 min observe
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: tune
-          POSTGRES_PASSWORD: tune
-          POSTGRES_DB: tune_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U tune -d tune_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      TEST_DATABASE_URL: postgresql://tune:tune@localhost:5432/tune_test
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: tune-core-postgres
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run tests with postgres feature
-        run: cargo test -p tune-core --no-default-features --features postgres,oaat
-
-      # Parite des DEUX ecritures du schema PG (#2111).
-      #
-      # Ce job faisait tourner un PostgreSQL 16 que RIEN ne consommait :
-      # `TEST_DATABASE_URL` ci-dessus n'est lu par aucun test, et les tests PG
-      # cherchent `TUNE_TEST_PG_URL`. Le conteneur montait donc pour rien.
-      #
-      # Le test monte lui-meme ses deux bases jetables — les scripts numerotes
-      # d'un cote, PG_FULL_SCHEMA de l'autre — donc il ne lui faut qu'un serveur
-      # joignable. La variable est posee sur CETTE etape uniquement : la porter
-      # sur le job entier de-sauterait les tests E2E de `postgres_e2e.rs`, qui
-      # restent volontairement optionnels (scripts/pg-e2e.sh).
-      - name: Parité du schéma PG (#2111)
-        env:
-          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres,oaat pg_schema_parity -- --nocapture
-
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -329,37 +343,6 @@ jobs:
           # ignored (paste, instant — transitive, no runtime path). Kept in sync
           # with deny.toml. Every vulnerability, wasmtime included, now blocks.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
-
-  widget:
-    name: Widget (compilation)
-    # tune-widget echappait a TOUT filet : le Cargo.toml racine l'exclut du
-    # workspace (exclusion voulue — sans elle, cargo fmt --all remonte les deps
-    # GUI/webkit et casse la CI Linux headless), et widget.yml ne se declenche
-    # que sur un tag widget-v*. Aucun tag de ce genre n'ayant jamais existe, ce
-    # workflow n'avait jamais tourne : au premier tag, le 12 aout 2026, il a
-    # echoue des l'installation du CLI Tauri sur une rouille invisible depuis
-    # des mois. Ce job compile le widget a chaque PR pour que le prochain tag
-    # ne soit plus le premier essai.
-    #
-    # macOS et pas ubuntu : le widget ne livre que des DMG (cf la matrice de
-    # widget.yml), et Tauri y compile sans les paquets webkit d'apt.
-    runs-on: macos-latest
-    timeout-minutes: 30  # widget — 4 min observe
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tune-widget/src-tauri
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --release
-        working-directory: tune-widget/src-tauri
-      # Le widget porte des tests unitaires depuis le seuil de disposition mini
-      # (`parse_version`), mais personne ne les executait : `cargo test` a la
-      # racine ne voit pas une crate exclue du workspace. Ils passaient donc
-      # pour verifies sans l'avoir jamais ete.
-      - run: cargo test
-        working-directory: tune-widget/src-tauri
 
   ffi:
     name: FFI mobile (compilation)
