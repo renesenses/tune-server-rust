@@ -130,6 +130,102 @@ fn running_in_docker() -> bool {
     false
 }
 
+const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade tune-server";
+const HOMEBREW_UPDATE_HINT: &str = "This Tune installation is managed by Homebrew. Update it with `brew update && brew upgrade tune-server`. If the renesenses tap stays stale, run `brew untap renesenses/tap && brew tap renesenses/tap` first.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomebrewInstallation {
+    executable: std::path::PathBuf,
+    cellar_version: String,
+}
+
+/// Extract the formula version only from Tune's own Homebrew Cellar layout.
+/// Merely seeing a `Cellar` component is not enough: another formula could
+/// contain or invoke a binary named `tune-server` without owning this install.
+fn homebrew_cellar_version(executable: &std::path::Path) -> Option<String> {
+    let components: Vec<_> = executable.components().map(|c| c.as_os_str()).collect();
+    components.windows(3).find_map(|parts| {
+        if parts[0] != std::ffi::OsStr::new("Cellar")
+            || parts[1] != std::ffi::OsStr::new("tune-server")
+        {
+            return None;
+        }
+        parts[2]
+            .to_str()
+            .filter(|version| !version.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Homebrew appends `_N` for formula revisions without changing the upstream
+/// binary version. Treat `0.9.113_1` and binary `v0.9.113` as coherent.
+fn homebrew_version_matches(cellar_version: &str, binary_version: &str) -> bool {
+    fn normalize_binary(version: &str) -> &str {
+        version.trim().trim_start_matches('v')
+    }
+
+    let cellar = normalize_binary(cellar_version);
+    let cellar_upstream = cellar
+        .split_once('_')
+        .map_or(cellar, |(upstream, _)| upstream);
+    cellar_upstream == normalize_binary(binary_version)
+}
+
+fn homebrew_installation(executable: &std::path::Path) -> Option<HomebrewInstallation> {
+    // `current_exe` is usually already resolved, but Homebrew launches through
+    // `opt/tune-server`. Canonicalising here makes the guard independent of the
+    // platform's current_exe symlink semantics. A missing/unresolvable path is
+    // still parsed as given so diagnostics never turn an I/O hiccup into a
+    // silent permission to self-update.
+    let resolved = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let cellar_version = homebrew_cellar_version(&resolved)?;
+    Some(HomebrewInstallation {
+        executable: resolved,
+        cellar_version,
+    })
+}
+
+fn current_homebrew_installation() -> Option<HomebrewInstallation> {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(homebrew_installation)
+}
+
+fn homebrew_update_refusal(installation: &HomebrewInstallation, current: &str) -> Value {
+    json!({
+        "status": "managed_installation",
+        "reason": "homebrew_managed_installation",
+        "manager": "homebrew",
+        "message": HOMEBREW_UPDATE_HINT,
+        "detail": HOMEBREW_UPDATE_HINT,
+        "command": HOMEBREW_UPDATE_COMMAND,
+        "installation_version": installation.cellar_version,
+        "current_version": current,
+        "installation_version_mismatch": !homebrew_version_matches(
+            &installation.cellar_version,
+            current,
+        ),
+    })
+}
+
+fn homebrew_mismatch_result(installation: &HomebrewInstallation, current: &str) -> Option<Value> {
+    if homebrew_version_matches(&installation.cellar_version, current) {
+        return None;
+    }
+    Some(json!({
+        "status": "warning",
+        "reason": "homebrew_version_mismatch",
+        "detail": format!(
+            "Tune binary {current} is running from Homebrew Cellar {}, so the binary and web assets may come from different releases. {HOMEBREW_UPDATE_HINT}",
+            installation.cellar_version
+        ),
+        "command": HOMEBREW_UPDATE_COMMAND,
+        "current_version": current,
+        "installation_version": installation.cellar_version,
+    }))
+}
+
 /// Find the extractable archive asset (tar.gz or zip) for the current platform.
 /// Excludes .dmg and .exe installers — we want the raw archive containing the binary + web/.
 fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
@@ -168,8 +264,14 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
 /// exact OS/architecture can install. GitHub can expose a release before every
 /// platform asset has finished uploading; such a release is newer, but it is
 /// not an available update for this server yet (#1575).
-fn update_release_payload(current: &str, release: &ReleaseInfo) -> Value {
+fn update_release_payload(
+    current: &str,
+    release: &ReleaseInfo,
+    homebrew: Option<&HomebrewInstallation>,
+) -> Value {
     let asset = find_archive_asset(release);
+    let installation_version_mismatch =
+        homebrew.is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
     json!({
         "current": current,
         "latest": &release.version,
@@ -181,12 +283,18 @@ fn update_release_payload(current: &str, release: &ReleaseInfo) -> Value {
         "html_url": &release.html_url,
         "published_at": &release.published_at,
         "unavailable_reason": asset.is_none().then_some("no_compatible_asset"),
+        "installable": homebrew.is_none(),
+        "install_hint": homebrew.map(|_| HOMEBREW_UPDATE_HINT),
+        "installation_manager": homebrew.map(|_| "homebrew"),
+        "installation_version": homebrew.map(|install| &install.cellar_version),
+        "installation_version_mismatch": installation_version_mismatch,
     })
 }
 
 #[cfg(test)]
 mod update_availability_tests {
-    use super::update_release_payload;
+    use super::{HomebrewInstallation, update_release_payload};
+    use std::path::PathBuf;
     use tune_core::updater::{ReleaseAsset, ReleaseInfo};
 
     fn release_with(asset_name: &str) -> ReleaseInfo {
@@ -208,8 +316,11 @@ mod update_availability_tests {
 
     #[test]
     fn une_release_sans_archive_compatible_n_est_pas_proposee() {
-        let payload =
-            update_release_payload("0.9.113", &release_with("tune-server-plan9-mips64.tar.gz"));
+        let payload = update_release_payload(
+            "0.9.113",
+            &release_with("tune-server-plan9-mips64.tar.gz"),
+            None,
+        );
 
         assert_eq!(payload["update_available"], false);
         assert_eq!(payload["download_url"], serde_json::Value::Null);
@@ -230,11 +341,36 @@ mod update_availability_tests {
             std::env::consts::ARCH,
             extension
         );
-        let payload = update_release_payload("0.9.113", &release_with(&name));
+        let payload = update_release_payload("0.9.113", &release_with(&name), None);
 
         assert_eq!(payload["update_available"], true);
         assert_eq!(payload["asset_name"], name);
         assert_eq!(payload["unavailable_reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn le_filtre_d_asset_conserve_le_contrat_homebrew() {
+        let installation = HomebrewInstallation {
+            executable: PathBuf::from("/opt/homebrew/Cellar/tune-server/0.9.112/bin/tune-server"),
+            cellar_version: "0.9.112".into(),
+        };
+        let payload = update_release_payload(
+            "0.9.113",
+            &release_with("tune-server-plan9-mips64.tar.gz"),
+            Some(&installation),
+        );
+
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
+        assert_eq!(payload["installable"], false);
+        assert_eq!(payload["installation_manager"], "homebrew");
+        assert_eq!(payload["installation_version"], "0.9.112");
+        assert_eq!(payload["installation_version_mismatch"], true);
+        assert!(
+            payload["install_hint"]
+                .as_str()
+                .is_some_and(|hint| { hint.contains("brew update && brew upgrade tune-server") })
+        );
     }
 }
 
@@ -556,9 +692,13 @@ kwD8rrpp1dpGuBsy+q0AByW/UZ9CjNSAOJH5bivNcpTQDNkE1aB073ruWxcwOeuJXwpWeh/XVMnkDIoV
 pub(super) async fn update_check() -> Json<Value> {
     let checker = UpdateChecker::new();
     let current = tune_core::version();
+    let homebrew = current_homebrew_installation();
+    let installation_version_mismatch = homebrew
+        .as_ref()
+        .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
     match checker.check().await {
-        Ok(Some(release)) => Json(update_release_payload(current, &release)),
+        Ok(Some(release)) => Json(update_release_payload(current, &release, homebrew.as_ref())),
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
@@ -566,6 +706,11 @@ pub(super) async fn update_check() -> Json<Value> {
             "download_url": null,
             "release_notes": null,
             "size_bytes": 0,
+            "installable": homebrew.is_none(),
+            "install_hint": homebrew.as_ref().map(|_| HOMEBREW_UPDATE_HINT),
+            "installation_manager": homebrew.as_ref().map(|_| "homebrew"),
+            "installation_version": homebrew.as_ref().map(|install| &install.cellar_version),
+            "installation_version_mismatch": installation_version_mismatch,
         })),
         Err(e) => {
             warn!(error = %e, "update_check_failed");
@@ -629,10 +774,29 @@ pub(super) async fn update_install(
             .into_response();
     }
 
+    let current_exe = std::env::current_exe().ok();
+
+    // A Cellar is one Homebrew-owned unit: binary, receipt and web assets.
+    // Replacing only Tune's executable leaves Homebrew believing the old
+    // formula is installed and can pair a new server with an old web client
+    // (#2448). Never mutate any part of that unit behind the package manager's
+    // back; tell both current and older clients how to take the supported path.
+    if let Some(installation) = current_exe.as_deref().and_then(homebrew_installation) {
+        let refusal = homebrew_update_refusal(&installation, tune_core::version());
+        info!(
+            executable = %installation.executable.display(),
+            cellar_version = %installation.cellar_version,
+            binary_version = tune_core::version(),
+            mismatch = refusal["installation_version_mismatch"].as_bool().unwrap_or(false),
+            "update_skipped_homebrew"
+        );
+        let _ = SettingsRepo::with_backend(state.backend.clone())
+            .set("last_update_result", &refusal.to_string());
+        return (StatusCode::OK, Json(refusal)).into_response();
+    }
+
     // Guard: refuse update if .no-auto-update flag file exists
-    let working_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let working_dir = current_exe.and_then(|p| p.parent().map(|d| d.to_path_buf()));
     if let Some(ref dir) = working_dir {
         if dir.join(".no-auto-update").exists() {
             warn!("update_blocked_no_auto_update_flag");
@@ -1611,6 +1775,37 @@ pub fn record_post_update_result(state: &AppState) {
         }
         let _ = std::fs::remove_file(&expected_marker);
     }
+
+    match homebrew_installation(&exe)
+        .as_ref()
+        .and_then(|installation| homebrew_mismatch_result(installation, current))
+    {
+        Some(result) => {
+            warn!(
+                executable = %exe.display(),
+                cellar_version = result["installation_version"].as_str().unwrap_or("unknown"),
+                binary_version = current,
+                "homebrew_installation_version_mismatch"
+            );
+            let _ = settings.set("last_update_result", &result.to_string());
+        }
+        _ => {
+            // Do not leave the warning behind after `brew upgrade` has made
+            // the Cellar coherent again (or after moving to a standalone
+            // install). Preserve unrelated update results.
+            let stale_homebrew_warning = settings
+                .get("last_update_result")
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .and_then(|value| value["reason"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("homebrew_version_mismatch");
+            if stale_homebrew_warning {
+                let _ = settings.delete("last_update_result");
+            }
+        }
+    }
 }
 
 /// POST /system/update/apply — kept for backward compatibility.
@@ -2294,6 +2489,116 @@ mod swap_result_tests {
         // No pending update (empty marker) → nothing to compare.
         assert_eq!(swap_took("", "0.9.48"), None);
         assert_eq!(swap_took("   ", "0.9.48"), None);
+    }
+}
+
+#[cfg(test)]
+mod homebrew_guard_tests {
+    use std::path::Path;
+
+    use super::{
+        HOMEBREW_UPDATE_COMMAND, HomebrewInstallation, homebrew_cellar_version,
+        homebrew_installation, homebrew_mismatch_result, homebrew_update_refusal,
+        homebrew_version_matches,
+    };
+
+    #[test]
+    fn reconnait_les_cellars_apple_silicon_intel_et_linuxbrew() {
+        for (path, version) in [
+            (
+                "/opt/homebrew/Cellar/tune-server/0.9.110/bin/tune-server",
+                "0.9.110",
+            ),
+            (
+                "/usr/local/Cellar/tune-server/0.9.71/bin/tune-server",
+                "0.9.71",
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/tune-server/0.9.113_1/bin/tune-server",
+                "0.9.113_1",
+            ),
+        ] {
+            assert_eq!(
+                homebrew_cellar_version(Path::new(path)).as_deref(),
+                Some(version),
+                "installation Homebrew non reconnue : {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ne_confond_pas_une_installation_autonome_ou_une_autre_formule() {
+        assert_eq!(
+            homebrew_cellar_version(Path::new("/Applications/Tune/tune-server")),
+            None
+        );
+        assert_eq!(
+            homebrew_cellar_version(Path::new("/opt/homebrew/Cellar/ffmpeg/8.0/bin/tune-server")),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_la_version_du_cellar_au_binaire() {
+        assert!(homebrew_version_matches("0.9.113", "0.9.113"));
+        assert!(homebrew_version_matches("0.9.113_1", "v0.9.113"));
+        assert!(!homebrew_version_matches("0.9.71", "0.9.110"));
+    }
+
+    #[test]
+    fn le_refus_est_actionnable_et_nomme_la_divergence() {
+        let installation = HomebrewInstallation {
+            executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
+            cellar_version: "0.9.71".into(),
+        };
+        let response = homebrew_update_refusal(&installation, "0.9.110");
+
+        assert_eq!(response["status"], "managed_installation");
+        assert_eq!(response["reason"], "homebrew_managed_installation");
+        assert_eq!(response["command"], HOMEBREW_UPDATE_COMMAND);
+        assert_eq!(response["installation_version"], "0.9.71");
+        assert_eq!(response["current_version"], "0.9.110");
+        assert_eq!(response["installation_version_mismatch"], true);
+    }
+
+    #[test]
+    fn le_demarrage_ne_signale_que_les_cellars_incoherents() {
+        let mut installation = HomebrewInstallation {
+            executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
+            cellar_version: "0.9.71".into(),
+        };
+
+        let warning = homebrew_mismatch_result(&installation, "0.9.110").unwrap();
+        assert_eq!(warning["status"], "warning");
+        assert_eq!(warning["reason"], "homebrew_version_mismatch");
+        assert_eq!(warning["command"], HOMEBREW_UPDATE_COMMAND);
+
+        installation.cellar_version = "0.9.110_1".into();
+        assert!(homebrew_mismatch_result(&installation, "v0.9.110").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resout_le_lien_opt_vers_le_vrai_cellar() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp
+            .path()
+            .join("Cellar/tune-server/0.9.113/bin/tune-server");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"fixture").unwrap();
+
+        let linked = tmp.path().join("opt/tune-server/bin/tune-server");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        symlink(&real, &linked).unwrap();
+
+        let installation = homebrew_installation(&linked).expect("lien Homebrew non resolu");
+        assert_eq!(
+            installation.executable,
+            std::fs::canonicalize(real).unwrap()
+        );
+        assert_eq!(installation.cellar_version, "0.9.113");
     }
 }
 
