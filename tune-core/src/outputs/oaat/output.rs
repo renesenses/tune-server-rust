@@ -36,6 +36,60 @@ enum OaatCommand {
     },
 }
 
+/// Horloge locale de la pause pour le chemin HTTP OAAT.
+///
+/// L'atome `paused` expose l'etat au reste du serveur, mais il est modifie par
+/// l'appelant avant que la commande arrive dans la boucle de lecture. Cette
+/// machine d'etat garde donc aussi l'etat effectivement applique par la boucle :
+/// une reprise ne peut ni rouvrir la source HTTP ni envoyer un paquet avant que
+/// son ancre PTS ait ete decalee (#1634).
+#[cfg(feature = "oaat")]
+#[derive(Debug, Default)]
+struct HorlogePauseHttpOaat {
+    debut: Option<std::time::Instant>,
+    temps_media: std::time::Duration,
+}
+
+#[cfg(feature = "oaat")]
+impl HorlogePauseHttpOaat {
+    fn entrer(
+        &mut self,
+        maintenant: std::time::Instant,
+        debut_lecture: std::time::Instant,
+    ) -> bool {
+        if self.debut.is_some() {
+            return false;
+        }
+        self.temps_media = maintenant.saturating_duration_since(debut_lecture);
+        self.debut = Some(maintenant);
+        true
+    }
+
+    fn sortir(
+        &mut self,
+        maintenant: std::time::Instant,
+        debut_lecture: &mut std::time::Instant,
+        debut_pts_ns: &mut u64,
+    ) -> Option<std::time::Duration> {
+        let debut_pause = self.debut.take()?;
+        let duree = maintenant.saturating_duration_since(debut_pause);
+        *debut_lecture = maintenant
+            .checked_sub(self.temps_media)
+            .unwrap_or(maintenant);
+        let duree_ns = u64::try_from(duree.as_nanos()).unwrap_or(u64::MAX);
+        *debut_pts_ns = debut_pts_ns.saturating_add(duree_ns);
+        Some(duree)
+    }
+
+    fn recaler_temps_media(&mut self, temps_media: std::time::Duration) {
+        self.temps_media = temps_media;
+    }
+
+    fn autorise_lecture_amont(&self, pause_demandee: bool) -> bool {
+        !pause_demandee && self.debut.is_none()
+    }
+}
+
 /// A native-DSD next track pre-opened during playback of the current track, so
 /// the loop can swap to it at EOF with no gap (Xavier / Zicmu native DSD album).
 #[cfg(feature = "oaat")]
@@ -1981,7 +2035,7 @@ impl OutputTarget for OaatOutput {
             // il était faux pour le FLAC, à débit variable (#2214).
             let mut trames_flac = super::helpers::CompteurDeTramesFlac::new();
             let mut start = std::time::Instant::now();
-            let mut pause_offset = std::time::Duration::ZERO;
+            let mut horloge_pause = HorlogePauseHttpOaat::default();
             let mut reconnect_attempts: u32 = 0;
             // Mid-stream HTTP body-read errors (reqwest "error decoding response
             // body") on Tune's own /stream endpoint were treated as end-of-track:
@@ -2077,17 +2131,23 @@ impl OutputTarget for OaatOutput {
                         match cmd {
                             OaatCommand::Pause => {
                                 paused.store(true, Ordering::SeqCst);
-                                pause_offset = start.elapsed();
-                                endpoint.send_message(&oaat_core::Message::Pause(oaat_core::message::Pause {
-                                    stream_id: stream_id.clone(),
-                                })).await.ok();
-                                info!(device = %device_name, "oaat: paused");
+                                if horloge_pause.entrer(std::time::Instant::now(), start) {
+                                    endpoint.send_message(&oaat_core::Message::Pause(oaat_core::message::Pause {
+                                        stream_id: stream_id.clone(),
+                                    })).await.ok();
+                                    info!(device = %device_name, "oaat: paused");
+                                }
                             }
                             OaatCommand::Resume => {
-                                paused.store(false, Ordering::SeqCst);
-                                start = std::time::Instant::now() - pause_offset;
-                                endpoint.send_play(&stream_id).await.ok();
-                                info!(device = %device_name, "oaat: resumed");
+                                if let Some(duree_pause) = horloge_pause.sortir(
+                                    std::time::Instant::now(),
+                                    &mut start,
+                                    &mut stream_start_ns,
+                                ) {
+                                    paused.store(false, Ordering::SeqCst);
+                                    endpoint.send_play(&stream_id).await.ok();
+                                    info!(device = %device_name, pause_ms = duree_pause.as_millis(), "oaat: resumed");
+                                }
                             }
                             OaatCommand::SetVolume(level) => { endpoint.send_volume(level).await.ok(); }
                             OaatCommand::Mute(muted) => { endpoint.send_mute(muted).await.ok(); }
@@ -2144,7 +2204,7 @@ impl OutputTarget for OaatOutput {
                                                 / 1000;
                                             let elapsed_eq = std::time::Duration::from_millis(seek_pos);
                                             start = std::time::Instant::now() - elapsed_eq;
-                                            pause_offset = std::time::Duration::ZERO;
+                                            horloge_pause.recaler_temps_media(elapsed_eq);
                                             position_ms.store(seek_pos, Ordering::SeqCst);
                                             info!(device = %device_name, seek_pos, file_offset, "oaat: seek complete");
                                         }
@@ -2169,7 +2229,9 @@ impl OutputTarget for OaatOutput {
                         }
                     }
 
-                    chunk = stream.next() => {
+                    chunk = stream.next(), if horloge_pause.autorise_lecture_amont(
+                        paused.load(Ordering::Relaxed),
+                    ) => {
                         match chunk {
                             Some(Ok(data)) => {
                                 // Fresh data flowing again: clear the per-track
@@ -2560,7 +2622,9 @@ impl OutputTarget for OaatOutput {
                         // Send buffered packets
                         while buf.len() >= packet_size
                             && playing.load(Ordering::Relaxed)
-                            && !paused.load(Ordering::Relaxed)
+                            && horloge_pause.autorise_lecture_amont(
+                                paused.load(Ordering::Relaxed),
+                            )
                         {
                             let payload: Vec<u8> = buf.drain(..packet_size).collect();
                             if is_flac {
@@ -3419,4 +3483,84 @@ async fn prefetch_next_track(
         duration_ms,
         same_format,
     })
+}
+
+#[cfg(all(test, feature = "oaat"))]
+mod tests_horloge_pause_http_oaat {
+    use super::HorlogePauseHttpOaat;
+
+    #[test]
+    fn une_pause_ferme_la_source_jusqu_a_la_reprise_effective() {
+        let origine = std::time::Instant::now();
+        let mut horloge = HorlogePauseHttpOaat::default();
+
+        assert!(horloge.autorise_lecture_amont(false));
+        assert!(horloge.entrer(origine + std::time::Duration::from_secs(12), origine));
+        assert!(!horloge.autorise_lecture_amont(false));
+        assert!(!horloge.autorise_lecture_amont(true));
+        assert!(
+            !horloge.entrer(origine + std::time::Duration::from_secs(30), origine),
+            "une seconde commande Pause ne doit pas perdre l instant initial"
+        );
+
+        let mut debut_lecture = origine;
+        let mut debut_pts_ns = 4_000_000_000;
+        assert_eq!(
+            horloge.sortir(
+                origine + std::time::Duration::from_secs(12 + 19 * 60),
+                &mut debut_lecture,
+                &mut debut_pts_ns,
+            ),
+            Some(std::time::Duration::from_secs(19 * 60))
+        );
+        assert!(horloge.autorise_lecture_amont(false));
+    }
+
+    #[test]
+    fn la_reprise_decale_pts_et_conserve_le_temps_media() {
+        let origine = std::time::Instant::now();
+        let pause = origine + std::time::Duration::from_secs(12);
+        let reprise = pause + std::time::Duration::from_secs(19 * 60);
+        let mut horloge = HorlogePauseHttpOaat::default();
+        let mut debut_lecture = origine;
+        let mut debut_pts_ns = 4_000_000_000;
+
+        assert!(horloge.entrer(pause, debut_lecture));
+        assert_eq!(
+            horloge.sortir(reprise, &mut debut_lecture, &mut debut_pts_ns),
+            Some(std::time::Duration::from_secs(19 * 60))
+        );
+        assert_eq!(debut_pts_ns, 1_144_000_000_000);
+        assert_eq!(
+            reprise.duration_since(debut_lecture),
+            std::time::Duration::from_secs(12)
+        );
+
+        assert_eq!(
+            horloge.sortir(
+                reprise + std::time::Duration::from_secs(1),
+                &mut debut_lecture,
+                &mut debut_pts_ns,
+            ),
+            None,
+            "un Resume duplique ne doit pas decaler deux fois l ancre PTS"
+        );
+        assert_eq!(debut_pts_ns, 1_144_000_000_000);
+    }
+
+    #[test]
+    fn le_decalage_pts_sature_sans_deborder() {
+        let origine = std::time::Instant::now();
+        let mut horloge = HorlogePauseHttpOaat::default();
+        let mut debut_lecture = origine;
+        let mut debut_pts_ns = u64::MAX - 5;
+
+        assert!(horloge.entrer(origine, debut_lecture));
+        horloge.sortir(
+            origine + std::time::Duration::from_nanos(10),
+            &mut debut_lecture,
+            &mut debut_pts_ns,
+        );
+        assert_eq!(debut_pts_ns, u64::MAX);
+    }
 }
