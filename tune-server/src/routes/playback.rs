@@ -2838,24 +2838,51 @@ async fn get_audiophile(State(state): State<AppState>, Path(zone_id): Path<i64>)
     Json(val)
 }
 
+#[derive(Debug, Deserialize)]
+struct AudiophileChange {
+    enabled: bool,
+    #[serde(default)]
+    confirm_full_volume: bool,
+}
+
+/// L'activation de PURE avec le verrou armé est une commande de volume à
+/// 100 %, pas un simple changement d'affichage. Le serveur impose donc la
+/// confirmation à tous les clients, y compris une télécommande ou un appel
+/// direct qui contournerait le client web (#2445).
+fn full_volume_confirmation_required(lock_enabled: bool, body: &AudiophileChange) -> bool {
+    lock_enabled && body.enabled && !body.confirm_full_volume
+}
+
 async fn set_audiophile(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+    Json(body): Json<AudiophileChange>,
+) -> axum::response::Response {
+    let lock_enabled = tune_core::audio::audiophile::volume_lock_enabled(&state.backend);
+    if full_volume_confirmation_required(lock_enabled, &body) {
+        warn!(zone_id, "audiophile_full_volume_confirmation_required");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "full_volume_confirmation_required",
+                "message": "Activating PURE with the volume lock enabled sets the device volume to 100%. Explicit confirmation is required.",
+            })),
+        )
+            .into_response();
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
-    settings.set(&key, &body.to_string()).ok();
+    // Le témoin de confirmation autorise cette seule requête : il ne devient
+    // jamais un réglage persistant qui pourrait autoriser un saut ultérieur.
+    settings
+        .set(&key, &json!({ "enabled": body.enabled }).to_string())
+        .ok();
 
     // Verrou armé : passer en PURE remonte le volume tout de suite. Sans ça,
     // la zone resterait à 20 % avec un curseur gelé sur 20 % — le pire des
     // deux mondes, ni bit-perfect ni réglable.
-    if tune_core::audio::audiophile::volume_lock_enabled(&state.backend)
-        && body
-            .get("enabled")
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false)
-    {
+    if lock_enabled && body.enabled {
         let device_id = get_zone_device_id(&state, zone_id);
         state
             .orchestrator
@@ -2875,21 +2902,19 @@ async fn set_audiophile(
     let applique_a_chaud = state.orchestrator.apply_audiophile_change(zone_id).await;
     info!(
         zone_id,
-        enabled = body
-            .get("enabled")
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false),
+        enabled = body.enabled,
         applique_a_chaud,
         "audiophile_mode_set"
     );
 
-    let mut reponse = body;
     // `applied_live` dit la vérité que la réponse taisait : la bascule est-elle
-    // audible MAINTENANT, ou seulement au prochain flux ?
-    if let Some(obj) = reponse.as_object_mut() {
-        obj.insert("applied_live".into(), json!(applique_a_chaud));
-    }
-    Json(reponse)
+    // audible MAINTENANT, ou seulement au prochain flux ? Le témoin de
+    // confirmation n'est volontairement jamais renvoyé ni persisté.
+    Json(json!({
+        "enabled": body.enabled,
+        "applied_live": applique_a_chaud,
+    }))
+    .into_response()
 }
 
 async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
@@ -3196,12 +3221,47 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
 
 #[cfg(test)]
 mod tests {
+    use super::AudiophileChange;
     use super::client_title_is_usable;
     use super::eq_bands_json;
+    use super::full_volume_confirmation_required;
     use super::play_error_response;
     use super::precedent_doit_relancer;
     use super::{PlayRequest, QueueAddRequest};
     use axum::http::StatusCode;
+
+    #[test]
+    fn pure_avec_verrou_refuse_toute_activation_non_confirmee() {
+        let activation = AudiophileChange {
+            enabled: true,
+            confirm_full_volume: false,
+        };
+        assert!(full_volume_confirmation_required(true, &activation));
+
+        let confirmation = AudiophileChange {
+            enabled: true,
+            confirm_full_volume: true,
+        };
+        assert!(!full_volume_confirmation_required(true, &confirmation));
+    }
+
+    #[test]
+    fn aucune_confirmation_n_est_demandee_sans_montee_de_volume() {
+        let activation_sans_verrou = AudiophileChange {
+            enabled: true,
+            confirm_full_volume: false,
+        };
+        assert!(!full_volume_confirmation_required(
+            false,
+            &activation_sans_verrou
+        ));
+
+        let desactivation = AudiophileChange {
+            enabled: false,
+            confirm_full_volume: false,
+        };
+        assert!(!full_volume_confirmation_required(true, &desactivation));
+    }
 
     #[test]
     fn le_json_eq_preserve_le_canal_cible() {

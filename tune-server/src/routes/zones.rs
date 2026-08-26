@@ -75,6 +75,11 @@ struct PatchZone {
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
+    /// Accord ponctuel de l'utilisateur pour une activation qui peut envoyer
+    /// immédiatement 100 % à une sortie réseau. Ce jeton appartient à la
+    /// requête et n'est jamais persisté avec la zone (#2395).
+    #[serde(default)]
+    confirm_full_volume: bool,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
     autoplay_enabled: Option<bool>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
@@ -126,6 +131,24 @@ struct PatchZone {
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
+}
+
+/// Une transition vers le volume fixe est une commande de volume à 100 %, pas
+/// un simple réglage. Le serveur l'impose à tous les clients réseau, y compris
+/// aux anciennes interfaces et aux appels directs qui contournent le Web.
+///
+/// Le type envoyé dans le PATCH prime sur celui qui est déjà stocké : changer
+/// une zone locale en DLNA et armer le volume fixe dans la même requête doit
+/// rester protégé. Un type absent ou inconnu est traité comme distant jusqu'à
+/// preuve du contraire (fail-closed).
+fn fixed_volume_confirmation_required(zone: &Zone, body: &PatchZone) -> bool {
+    let effective_output_type = body.output_type.as_deref().or(zone.output_type.as_deref());
+    let local_or_browser = matches!(effective_output_type, Some("local" | "browser"));
+
+    body.fixed_volume == Some(true)
+        && !zone.fixed_volume
+        && !local_or_browser
+        && !body.confirm_full_volume
 }
 
 /// Injecte l'identité appareil d'une zone dans son JSON de sortie :
@@ -1776,14 +1799,14 @@ async fn patch_zone(
     // réussissent — avant que `get_zone` ne rende 404 tout à la fin. Le 404
     // était juste, mais il arrivait après trente écritures inutiles et ne
     // disait pas laquelle avait échoué en cas de vrai problème.
-    match repo.get(id) {
-        Ok(Some(_)) => {}
+    let zone_before = match repo.get(id) {
+        Ok(Some(zone)) => zone,
         Ok(None) => {
             warn!(zone_id = id, "zone_patch_unknown_zone");
             return (StatusCode::NOT_FOUND, format!("zone {id} inconnue")).into_response();
         }
         Err(e) => return echec_ecriture(id, "zone", &id.to_string(), e),
-    }
+    };
 
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
     // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
@@ -1832,6 +1855,20 @@ async fn patch_zone(
         && name.trim().is_empty()
     {
         return refus_de_valeur(id, "name", name, "vide");
+    }
+
+    // Ce refus précède strictement la première écriture : un PATCH qui porte
+    // d'autres champs ne doit rien modifier si l'accord manque.
+    if fixed_volume_confirmation_required(&zone_before, &body) {
+        warn!(zone_id = id, "fixed_volume_confirmation_required");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "full_volume_confirmation_required",
+                "message": "Enabling fixed volume on a network output sets the device volume to 100%. Explicit confirmation is required.",
+            })),
+        )
+            .into_response();
     }
 
     /// Écrit un champ, ou s'arrête en journalisant la cause.
@@ -4059,7 +4096,30 @@ mod output_reach_tests {
 
 #[cfg(test)]
 mod patch_zone_deserialize_tests {
-    use super::PatchZone;
+    use super::{PatchZone, fixed_volume_confirmation_required};
+    use tune_core::db::zone_repo::Zone;
+
+    fn zone(output_type: Option<&str>, fixed_volume: bool) -> Zone {
+        Zone {
+            id: Some(7),
+            name: "Salon".into(),
+            output_type: output_type.map(str::to_string),
+            output_device_id: Some("renderer-1".into()),
+            volume: 37,
+            muted: false,
+            online: true,
+            gapless_enabled: false,
+            group_id: None,
+            sync_delay_ms: 0,
+            last_position_ms: 0,
+            last_track_id: None,
+            last_track_source: None,
+            last_track_source_id: None,
+            max_sample_rate: None,
+            fixed_volume,
+            autoplay_enabled: false,
+        }
+    }
 
     // #1320 (Cyrille) — « Aucune » ne persistait jamais : un `null` explicite
     // sur `max_sample_rate` se désérialisait en `None` extérieur, donc le
@@ -4087,6 +4147,51 @@ mod patch_zone_deserialize_tests {
     fn value_means_set_the_cap() {
         let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": 705600}"#).unwrap();
         assert_eq!(p.max_sample_rate, Some(Some(705_600)));
+    }
+
+    #[test]
+    fn sortie_reseau_refuse_l_armement_sans_accord() {
+        let p: PatchZone = serde_json::from_str(r#"{"fixed_volume": true}"#).unwrap();
+        assert!(
+            fixed_volume_confirmation_required(&zone(Some("dlna"), false), &p),
+            "avant le correctif, ce chemin envoyait immédiatement 100 % sans accord"
+        );
+    }
+
+    #[test]
+    fn accord_explicite_autorise_l_armement_reseau() {
+        let p: PatchZone =
+            serde_json::from_str(r#"{"fixed_volume": true, "confirm_full_volume": true}"#).unwrap();
+        assert!(!fixed_volume_confirmation_required(
+            &zone(Some("dlna"), false),
+            &p
+        ));
+    }
+
+    #[test]
+    fn passage_local_vers_reseau_dans_le_meme_patch_reste_protege() {
+        let p: PatchZone =
+            serde_json::from_str(r#"{"output_type": "airplay", "fixed_volume": true}"#).unwrap();
+        assert!(fixed_volume_confirmation_required(
+            &zone(Some("local"), false),
+            &p
+        ));
+    }
+
+    #[test]
+    fn chemins_sans_montee_de_volume_restent_immediats() {
+        for (stored_type, stored_fixed, payload) in [
+            (Some("local"), false, r#"{"fixed_volume": true}"#),
+            (Some("browser"), false, r#"{"fixed_volume": true}"#),
+            (Some("dlna"), true, r#"{"fixed_volume": true}"#),
+            (Some("dlna"), true, r#"{"fixed_volume": false}"#),
+        ] {
+            let p: PatchZone = serde_json::from_str(payload).unwrap();
+            assert!(
+                !fixed_volume_confirmation_required(&zone(stored_type, stored_fixed), &p),
+                "le chemin {stored_type:?}/{stored_fixed}/{payload} ne monte pas une sortie réseau nouvellement armée à 100 %"
+            );
+        }
     }
 }
 
@@ -4364,6 +4469,22 @@ mod patch_zone_error_guard {
             premier_refus < premiere_ecriture,
             "une validation arrive APRÈS une écriture : un PATCH refusé aurait \
              déjà modifié la zone"
+        );
+    }
+
+    #[test]
+    fn full_volume_refusal_comes_before_any_write() {
+        let corps = corps_du_handler();
+        let refus = corps
+            .find("fixed_volume_confirmation_required(&zone_before, &body)")
+            .expect("le PATCH ne protège plus l'armement du volume fixe");
+        let premiere_ecriture = corps
+            .find("ecrire!(")
+            .expect("aucune écriture dans `patch_zone`");
+        assert!(
+            refus < premiere_ecriture,
+            "la confirmation du volume fixe est vérifiée APRÈS une écriture : \
+             un PATCH refusé aurait déjà modifié la zone"
         );
     }
 }
