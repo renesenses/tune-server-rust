@@ -10,7 +10,8 @@ name: Preflight
 # Checks performed (each independently pass/fail):
 # - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
 # - version_bump: tag > Cargo.toml workspace version
-# - no_p0_issues: no GitHub issues with label P0 open
+# - no_p0_issues: no blocking P0 issue open; merged fixes awaiting release
+#   verification are reported but do not create a release/closure deadlock
 # - no_release_todos: no TODO(release) markers in source code (excl. docs/)
 # - cahier_de_recette: a cahier-recette-v{major}.{minor}*.md file exists
 # - cargo_audit: no high-severity CVE in the dependency tree
@@ -91,6 +92,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
+          python3 scripts/preflight-check.py --self-test
           ARGS="--version ${{ steps.resolve.outputs.version }}"
           if [ "${{ steps.resolve.outputs.skip_ci }}" = "true" ]; then
             ARGS="$ARGS --no-ci-check"

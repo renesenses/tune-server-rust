@@ -250,6 +250,7 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     assert!(impact.contains("bash scripts/detecter-impact-ci.sh --autotest"));
     assert!(impact.contains("bash scripts/verifier-fermeture.sh --autotest"));
     assert!(impact.contains("bash scripts/verifier-refs-issues.sh --autotest"));
+    assert!(impact.contains("python3 scripts/preflight-check.py --self-test"));
 }
 
 #[test]

@@ -40,7 +40,11 @@ manual dispatch). It blocks if any of the following fails:
 
 - Tag is not valid semver (`vMAJOR.MINOR.PATCH[-PRE]`)
 - Tag is not strictly greater than the version in `Cargo.toml`
-- Any GitHub issue with label `P0` is open
+- Any blocking GitHub issue with label `P0` is open. A P0 whose fix is already
+  merged may carry `release:verification-pending`: it stays open until the
+  published release is verified, but no longer prevents that release from
+  being built. `keep-open`, `en-cours`, assignment and work-lock labels never
+  exempt a P0.
 - Any `TODO(release)` marker is present in source code (docs/ excluded)
 - No `cahier-recette-v{major}.{minor}*.md` exists under `docs/`
 - `cargo audit` reports a CVE in the dependency tree
@@ -51,6 +55,13 @@ The workflow surfaces a failed status check on the commit; the release
 pipeline does NOT automatically halt — that decision is yours. If the
 preflight is red the right move is almost always to fix the underlying
 issue first.
+
+`release:verification-pending` has a deliberately narrow lifecycle: add it
+only after the correcting commit is merged into the release branch and its
+counter-example is green there; remove it if the release proof fails; close
+the issue (which removes it from the preflight query) only after checking the
+published release. The preflight prints these pending issue numbers even when
+it passes, so the release operator retains an explicit verification list.
 
 To run a manual dry-run before tagging:
 

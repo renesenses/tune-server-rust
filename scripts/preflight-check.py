@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SEMVER_RE = re.compile(
     r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:-(?P<pre>[0-9A-Za-z.-]+))?$"
 )
+P0_VERIFICATION_PENDING_LABEL = "release:verification-pending"
 
 
 @dataclass
@@ -120,6 +121,39 @@ def check_version_bump(tag: str) -> CheckResult:
     )
 
 
+def classify_open_p0_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split actionable P0 issues into blockers and merged fixes to verify.
+
+    `keep-open`, `en-cours`, assignment and work locks deliberately have no
+    special meaning here. Only the exact verification label breaks the
+    release/closure circularity, and epics remain excluded as before.
+    """
+
+    def labels(issue: dict) -> set[str]:
+        return {
+            label.get("name", "")
+            for label in issue.get("labels", [])
+            if isinstance(label, dict)
+        }
+
+    actionable = [
+        issue
+        for issue in issues
+        if "pull_request" not in issue and "epic" not in labels(issue)
+    ]
+    awaiting_verification = [
+        issue
+        for issue in actionable
+        if P0_VERIFICATION_PENDING_LABEL in labels(issue)
+    ]
+    blocking = [
+        issue
+        for issue in actionable
+        if P0_VERIFICATION_PENDING_LABEL not in labels(issue)
+    ]
+    return blocking, awaiting_verification
+
+
 def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
     try:
         issues = github_api(
@@ -130,21 +164,71 @@ def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
         return CheckResult("no_p0_issues", False, f"GitHub API error: {e.code}")
     except Exception as e:
         return CheckResult("no_p0_issues", False, f"GitHub API error: {e}")
-    # Epics are tracking umbrellas, not single actionable blockers — an open
-    # P0 epic shouldn't gate every release. Its child P0 issues are counted
-    # individually and still block.
-    def is_epic(issue: dict) -> bool:
-        return any(lbl.get("name") == "epic" for lbl in issue.get("labels", []))
-
-    open_p0 = [i for i in issues if "pull_request" not in i and not is_epic(i)]
-    if open_p0:
-        nums = ", ".join(f"#{i['number']}" for i in open_p0[:10])
+    blocking, awaiting_verification = classify_open_p0_issues(issues)
+    pending_nums = ", ".join(
+        f"#{issue['number']}" for issue in awaiting_verification[:10]
+    )
+    if blocking:
+        nums = ", ".join(f"#{issue['number']}" for issue in blocking[:10])
+        pending_detail = (
+            f"; {len(awaiting_verification)} awaiting release verification: "
+            f"{pending_nums}"
+            if awaiting_verification
+            else ""
+        )
         return CheckResult(
             "no_p0_issues",
             False,
-            f"{len(open_p0)} P0 issues open: {nums}",
+            f"{len(blocking)} blocking P0 issues open: {nums}{pending_detail}",
         )
-    return CheckResult("no_p0_issues", True, "0 open P0 issues (epics excluded)")
+    if awaiting_verification:
+        return CheckResult(
+            "no_p0_issues",
+            True,
+            f"0 blocking P0 issues; {len(awaiting_verification)} awaiting "
+            f"release verification: {pending_nums}",
+        )
+    return CheckResult("no_p0_issues", True, "0 blocking P0 issues (epics excluded)")
+
+
+def self_test_p0_classification() -> None:
+    """Counter-examples for every label that could be mistaken as an escape."""
+
+    def issue(number: int, *label_names: str, pull_request: bool = False) -> dict:
+        value = {
+            "number": number,
+            "labels": [{"name": name} for name in label_names],
+        }
+        if pull_request:
+            value["pull_request"] = {"url": "https://example.invalid/pr"}
+        return value
+
+    examples = [
+        issue(1, "P0"),
+        issue(2, "P0", "keep-open"),
+        issue(3, "P0", "en-cours", "verrou:issue-3"),
+        issue(4, "P0", P0_VERIFICATION_PENDING_LABEL),
+        issue(5, "P0", "epic"),
+        issue(6, "P0", pull_request=True),
+    ]
+    blocking, awaiting = classify_open_p0_issues(examples)
+    assert [value["number"] for value in blocking] == [1, 2, 3]
+    assert [value["number"] for value in awaiting] == [4]
+
+    original_github_api = globals()["github_api"]
+    try:
+        globals()["github_api"] = lambda _path, _token=None: examples
+        mixed = check_no_p0_issues("owner/repo", None)
+        assert not mixed.passed
+        assert "3 blocking P0 issues open: #1, #2, #3" in mixed.detail
+        assert "1 awaiting release verification: #4" in mixed.detail
+
+        globals()["github_api"] = lambda _path, _token=None: [examples[3]]
+        pending_only = check_no_p0_issues("owner/repo", None)
+        assert pending_only.passed
+        assert pending_only.detail.endswith("awaiting release verification: #4")
+    finally:
+        globals()["github_api"] = original_github_api
 
 
 def check_no_release_todos() -> CheckResult:
@@ -360,7 +444,12 @@ def get_commit_sha() -> Optional[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--version", required=True, help="release tag, e.g. v0.8.30")
+    ap.add_argument("--version", help="release tag, e.g. v0.8.30")
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run local counter-examples without GitHub or cargo",
+    )
     ap.add_argument(
         "--skip",
         default="",
@@ -372,6 +461,13 @@ def main() -> int:
         help="skip the GitHub CI status check (useful for local dry-runs)",
     )
     args = ap.parse_args()
+
+    if args.self_test:
+        self_test_p0_classification()
+        print("preflight P0 classification self-test: PASS")
+        return 0
+    if not args.version:
+        ap.error("--version is required unless --self-test is used")
 
     tag = args.version
     if not tag.startswith("v"):
