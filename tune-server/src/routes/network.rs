@@ -87,12 +87,53 @@ async fn list_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppEr
     Ok(Json(json!(items)))
 }
 
+/// L'identite d'un montage : le quadruplet que l'index unique protege
+/// (migration 83). Rend l'id de la ligne existante, s'il y en a une.
+///
+/// GgB (fil 1562, #2453) : sans ce controle, une seconde validation du meme
+/// formulaire ajoutait une ligne jumelle que l'ecran Emplacements affichait
+/// indefiniment. Depuis l'index unique, elle echouerait a la place — une 500
+/// pour un geste anodin. On rend donc la ligne deja la.
+fn montage_existant(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    mount_type: &str,
+    server: &str,
+    share: &str,
+    mount_path: &str,
+) -> Option<i64> {
+    use tune_core::db::backend::ToSqlValue;
+    backend
+        .query_one(
+            "SELECT id FROM network_mounts \
+             WHERE mount_type = ? AND server = ? AND share = ? AND mount_path = ?",
+            &[
+                &mount_type as &dyn ToSqlValue,
+                &server as &dyn ToSqlValue,
+                &share as &dyn ToSqlValue,
+                &mount_path as &dyn ToSqlValue,
+            ],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+}
+
 async fn create_mount(
     State(state): State<AppState>,
     Json(body): Json<CreateMount>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
     let mount_type = body.mount_type.unwrap_or_else(|| "smb".into());
+    if let Some(id) = montage_existant(
+        &state.backend,
+        &mount_type,
+        &body.server,
+        &body.share,
+        &body.mount_path,
+    ) {
+        tracing::info!(id, server = %body.server, share = %body.share, "montage_reseau_deja_enregistre");
+        return (StatusCode::OK, Json(json!({ "id": id, "existant": true }))).into_response();
+    }
     match state.backend.execute_returning_id(
         "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password) VALUES (?, ?, ?, ?, ?, ?)",
         &[&mount_type as &dyn ToSqlValue, &body.server as &dyn ToSqlValue, &body.share as &dyn ToSqlValue, &body.mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue],
@@ -786,6 +827,42 @@ async fn mount_smb_share(
 
     // Persist to database
     use tune_core::db::backend::ToSqlValue;
+    // Remonter un partage deja enregistre passe souvent par cet ecran plutot
+    // que par le bouton de remontage : sans ce controle on ajoutait une ligne
+    // jumelle (#2453), et depuis l'index unique on echouerait. On rafraichit
+    // la ligne existante — le dialecte retenu et le constat de montage sont
+    // justement ce qui vient d'etre etabli.
+    if let Some(id) = montage_existant(
+        &state.backend,
+        "smb",
+        &body.host,
+        &body.share_name,
+        &mount_path,
+    ) {
+        let _ = state.backend.execute(
+            "UPDATE network_mounts SET username = ?, password = ?, smb_version = ?, \
+             mount_state = ?, active = 1 WHERE id = ?",
+            &[
+                &body.username as &dyn ToSqlValue,
+                &body.password as &dyn ToSqlValue,
+                &dialecte_retenu as &dyn ToSqlValue,
+                &"mounted" as &dyn ToSqlValue,
+                &id as &dyn ToSqlValue,
+            ],
+        );
+        tracing::info!(id, host = %body.host, share = %body.share_name, "montage_reseau_rafraichi");
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "id": id,
+                "mounted": mount_ok,
+                "mount_path": mount_path,
+                "smb_version": dialecte_retenu,
+                "existant": true,
+            })),
+        )
+            .into_response();
+    }
     match state.backend.execute_returning_id(
         // Le mot de passe est persiste AVEC le reste. Sans lui, le partage
         // enregistre est inexploitable au redemarrage : Tune connait l'adresse
