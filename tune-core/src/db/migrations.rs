@@ -1152,6 +1152,26 @@ UPDATE radio_favorites
     },
     Migration {
         version: 83,
+        name: "network_mounts_unicite",
+        // GgB (fil 1562, #2453) : la table ne portait aucune contrainte
+        // d'unicite et create_mount inserait sans regarder — deux validations
+        // du meme formulaire laissaient deux lignes que l'ecran Emplacements
+        // affichait indefiniment. Purger d'abord (garder le plus petit id de
+        // chaque identite), poser l'index ensuite : un index unique cree sur
+        // une table non purgee echouerait sur les bases qui portent deja le
+        // doublon.
+        up: "
+DELETE FROM network_mounts
+ WHERE id NOT IN (
+   SELECT MIN(id) FROM network_mounts
+    GROUP BY mount_type, server, share, mount_path
+ );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_network_mounts_identite
+    ON network_mounts(mount_type, server, share, mount_path);
+",
+    },
+    Migration {
+        version: 84,
         name: "listen_history_contexte_de_lecture",
         // Rendre a chaque ecoute la trace de CE QUE l'auditeur a demande.
         //
@@ -2256,7 +2276,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
     add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
     // Ce que l'auditeur a demande au moment du clic sur « Lire » (migration
-    // 83, #2441). TEXT pour les deux : l'identifiant peut etre un entier
+    // 84, #2441). TEXT pour les deux : l'identifiant peut etre un entier
     // local ou une chaine de service de streaming.
     add_column_if_missing(db, "listen_history", "context_type", "TEXT");
     add_column_if_missing(db, "listen_history", "context_id", "TEXT");
@@ -2590,23 +2610,31 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "podcast_source_id",
         include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
     ),
-    // Jumelle de la migration SQLite 83. `listen_history` n'a jamais su d'ou
+    // 034 était sur disque sans être enregistrée ici : les installations
+    // PostgreSQL n'ont donc JAMAIS reçu la conversion de
+    // `radio_favorites.saved_at` en TEXTE, alors que SQLite l'a eue
+    // (migration 82). Le test de contiguïté de PG_MIGRATIONS l'a révélé en
+    // refusant le trou entre 33 et 35 — on la répare donc ici, à la même
+    // occasion : elle est idempotente et sans perte (le `DO $$` ne convertit
+    // que si la colonne est encore numérique).
+    (
+        34,
+        "radio_favorites_saved_at_texte",
+        include_str!("../../migrations/postgres/034_radio_favorites_saved_at_texte.sql"),
+    ),
+    (
+        35,
+        "network_mounts_unicite",
+        include_str!("../../migrations/postgres/035_network_mounts_unicite.sql"),
+    ),
+    // Jumelle de la migration SQLite 84. `listen_history` n'a jamais su d'ou
     // venait une ecoute : sans ces deux colonnes, la meme piste jouee seule,
     // depuis une playlist ou dans un album donnent trois lignes identiques,
     // et aucune rubrique ne peut refleter l'intention de l'auditeur (#2441).
-    //
-    // La version 34 est SAUTEE volontairement. Le fichier
-    // `034_radio_favorites_saved_at_texte.sql` existe sur le disque depuis
-    // #2179 mais n'a JAMAIS ete inscrit ici : sa jumelle SQLite (migration
-    // 82) tourne, la PostgreSQL non. Prendre 34 ici masquerait ce trou ;
-    // le sauter le laisse visible. Qui inscrira ce fichier devra prendre la
-    // version LIBRE SUIVANTE (36), jamais 34 : `run_pg_migrations` ne
-    // rejoue que `version > current`, et une base deja passee en 35
-    // n'executerait jamais une 34 inscrite apres coup.
     (
-        35,
+        36,
         "listen_history_contexte_de_lecture",
-        include_str!("../../migrations/postgres/035_listen_history_contexte_de_lecture.sql"),
+        include_str!("../../migrations/postgres/036_listen_history_contexte_de_lecture.sql"),
     ),
 ];
 
@@ -2983,6 +3011,55 @@ mod tests {
             cols.iter().filter(|c| *c == "cover_path").count(),
             1,
             "cover_path should be added exactly once: {cols:?}"
+        );
+    }
+
+    /// GgB (fil 1562, #2453) : deux validations du meme formulaire creaient
+    /// deux lignes identiques que l'ecran Emplacements affichait sans fin — la
+    /// table ne portait aucune contrainte d'unicite. Ce test part d'une base
+    /// qui porte DEJA le doublon, rejoue les migrations, et exige la purge
+    /// puis le refus de tout nouveau doublon. Il ECHOUE contre le code d'avant.
+    #[test]
+    fn une_base_avec_doublon_de_montage_est_purgee_et_verrouillee() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE network_mounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mount_type TEXT NOT NULL DEFAULT 'smb',
+                server TEXT NOT NULL,
+                share TEXT NOT NULL,
+                mount_path TEXT NOT NULL,
+                username TEXT,
+                password TEXT,
+                active INTEGER DEFAULT 1
+            );
+            INSERT INTO network_mounts (server, share, mount_path) \
+             VALUES ('192.168.1.159', 'ROSEDISK', '/mnt/rose');
+            INSERT INTO network_mounts (server, share, mount_path) \
+             VALUES ('192.168.1.159', 'ROSEDISK', '/mnt/rose');
+            INSERT INTO network_mounts (server, share, mount_path) \
+             VALUES ('192.168.1.159', 'AUTRE', '/mnt/autre');",
+        )
+        .unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_mounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 2,
+            "le doublon doit etre purge, les identites distinctes gardees"
+        );
+        let doublon = conn.execute(
+            "INSERT INTO network_mounts (mount_type, server, share, mount_path) \
+             VALUES ('smb', '192.168.1.159', 'ROSEDISK', '/mnt/rose')",
+            [],
+        );
+        assert!(
+            doublon.is_err(),
+            "un nouveau doublon doit etre refuse par l'index unique"
         );
     }
 
@@ -3451,7 +3528,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 33, "latest PG migration must be 33");
+        assert_eq!(pg_latest_version(), 36, "latest PG migration must be 36");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

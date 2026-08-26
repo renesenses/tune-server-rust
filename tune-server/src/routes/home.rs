@@ -126,7 +126,7 @@ async fn continue_listening(
 // qu'un album de la bibliotheque locale, quelle que soit la nature de ce que
 // l'auditeur avait demande. C'est le defaut releve par FabienM (fil 1557).
 //
-// Depuis la migration 83, `listen_history` porte `context_type` /
+// Depuis la migration 84, `listen_history` porte `context_type` /
 // `context_id` : l'intention est desormais ECRITE. Ce qu'il faut en AFFICHER
 // — mettre une playlist a cote d'un album, un artiste, un titre isole ; le
 // devenir du `HAVING` qui fait disparaitre un album fini ; les badges par

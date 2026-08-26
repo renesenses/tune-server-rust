@@ -15,7 +15,7 @@
 -- identifiant numerique, un album Qobuz une chaine, et la colonne doit
 -- accueillir les deux sans convertir.
 --
--- Jumelle de la migration SQLite 83. Les deux listes sont SEPAREES —
+-- Jumelle de la migration SQLite 84. Les deux listes sont SEPAREES —
 -- `run_migrations` ne prend qu'un `SqliteDb` — donc une colonne posee d'un
 -- seul cote ne repare que la moitie du parc (#1612, #2111).
 --

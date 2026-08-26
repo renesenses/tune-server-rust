@@ -112,6 +112,63 @@ async fn pg_albums_round_trip() {
     assert_eq!(again.id, Some(id));
 }
 
+/// Preuve réelle sur le second dialecte pour #2458 : le MBID vide ne sert plus
+/// d'identité et la réparation fail-closed exécute sa sélection + son UPDATE
+/// dans une transaction PostgreSQL, pas seulement dans le fixture SQLite.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2458_empty_mbid_album_artist_repair() {
+    use crate::db::album_repo::AlbumRepo;
+    use crate::db::artist_repo::ArtistRepo;
+    use crate::db::models::{Artist, Track};
+    use crate::db::track_repo::TrackRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let artist_repo = ArtistRepo::with_backend(db.clone());
+
+    let first = artist_repo
+        .get_or_create("Classique - Saint-Saëns", Some(""), None)
+        .unwrap();
+    let second = artist_repo
+        .get_or_create("Anouar Brahem", Some(""), None)
+        .unwrap();
+    assert_ne!(first.id, second.id, "un MBID vide ne doit pas être partagé");
+
+    let wrong = artist_repo
+        .create(&Artist::new("Ancien artiste collé".into()))
+        .unwrap();
+    let right = artist_repo
+        .create(&Artist::new("Artiste unanime des pistes".into()))
+        .unwrap();
+    db.execute(
+        "UPDATE artists SET musicbrainz_id = '' WHERE id = $1",
+        &[&wrong],
+    )
+    .unwrap();
+
+    let album_repo = AlbumRepo::with_backend(db.clone());
+    let album = album_repo
+        .get_or_create_for_folder("/music/pg2458", "PG 2458", wrong, None, None)
+        .unwrap();
+    let album_id = album.id.unwrap();
+    let track_repo = TrackRepo::with_backend(db.clone());
+    for number in 1..=2 {
+        let mut track = Track::new(format!("Piste {number}"));
+        track.album_id = Some(album_id);
+        track.artist_id = Some(right);
+        track.track_number = number;
+        track.file_path = Some(format!("/music/pg2458/{number:02}.flac"));
+        track_repo.create(&track).unwrap();
+    }
+
+    assert_eq!(album_repo.repair_empty_mbid_artist_collapses().unwrap(), 1);
+    assert_eq!(
+        album_repo.get(album_id).unwrap().unwrap().artist_id,
+        Some(right)
+    );
+    reset_schema(&db);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_tracks_round_trip() {
     use crate::db::artist_repo::ArtistRepo;

@@ -786,7 +786,7 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
--- listen_history: ce que l'auditeur a demande (SQLite migration v83, #2441)
+-- listen_history: ce que l'auditeur a demande (SQLite migration v84, #2441)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
 
