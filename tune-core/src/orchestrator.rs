@@ -819,6 +819,19 @@ pub(crate) fn command_may_have_landed(err: &str) -> bool {
     err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
 }
 
+/// Le flux qui part sur le fil est-il du DSD BRUT ?
+///
+/// `application/x-dsd` par défaut, ou le MIME que le lecteur a lui-même
+/// annoncé pour le DSF/DFF (`audio/x-dsf`, `audio/dff`…) : le passthrough
+/// reprend celui-là quand il existe, parce que certains renderers n'acceptent
+/// que le MIME exact qu'ils publient. Aucun MIME PCM ne porte ces trois
+/// lettres, donc la reconnaissance ne peut pas mordre à côté — un FLAC servi à
+/// la même zone n'est jamais confondu avec un DSD.
+fn est_dsd_brut(mime_type: &str) -> bool {
+    let m = mime_type.to_ascii_lowercase();
+    m.contains("dsd") || m.contains("dsf") || m.contains("dff")
+}
+
 /// Should a network output be fed from a pre-transcoded temp file (blocking,
 /// Content-Length known) rather than a streaming session?
 ///
@@ -2207,6 +2220,70 @@ impl PlaybackOrchestrator {
             // `auto` : sans reponse claire, on prend le chemin sur.
             _ => annonce.unwrap_or(false),
         }
+    }
+
+    /// Le message d'échec de lecture, tel que l'utilisateur le lit.
+    ///
+    /// Un message d'échec doit permettre d'AGIR. Celui du DLNA — « Le renderer
+    /// a acquitté Play mais joue toujours une autre source » — décrit
+    /// fidèlement ce que l'appareil a fait, et c'est justement le problème :
+    /// il désigne le matériel. L'utilisateur cherche du côté du renderer, du
+    /// réseau, de son installation ; l'un d'eux a réinstallé son système
+    /// entier (#2396).
+    ///
+    /// Or dans un cas précis le serveur SAIT, avant même d'envoyer, pourquoi
+    /// cela ne marchera probablement pas : la zone est en DSD « natif », le
+    /// Sink du lecteur a répondu qu'il ne lit pas le DSD, et on lui envoie le
+    /// flux brut quand même. Ce choix-là n'est pas remis en cause — « natif »
+    /// est un réglage explicite et des renderers lisent le DSD sans l'annoncer
+    /// (Eversolo DMP-A8), cf. [`Self::decider_passthrough_dsd`]. Ce qui était
+    /// faux, c'est le message : il accusait l'appareil au lieu de nommer le
+    /// réglage et l'action qui le corrige.
+    ///
+    /// Hors de ce cas — le lecteur a dit oui, le sondage est resté muet, la
+    /// zone est en `auto`, la source n'est pas du DSD brut — le message ne
+    /// change pas d'un caractère. Accuser un réglage à tort serait la faute
+    /// symétrique de celle qu'on corrige.
+    ///
+    /// Le préfixe « Output device error » est conservé dans tous les cas : la
+    /// route de lecture s'en sert pour rendre un 503 « appareil indisponible »
+    /// plutôt qu'un 500 (`tune-server/src/routes/playback.rs`), et
+    /// [`command_may_have_landed`] cherche le marqueur de timeout SOAP à
+    /// l'intérieur.
+    pub(crate) fn message_echec_sortie(
+        erreur: &str,
+        dsd_mode: &str,
+        annonce: Option<bool>,
+        mime_type: &str,
+    ) -> String {
+        if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
+            return format!(
+                "Output device error: le mode DSD de cette zone est réglé sur « natif » \
+                 et ce lecteur annonce ne pas lire le DSD — le flux DSD brut lui a été \
+                 envoyé quand même, et il ne l'a pas appliqué. Passer le mode DSD de la \
+                 zone en « DoP » ou « PCM » pour lire ce fichier. \
+                 (réponse du lecteur : {erreur})"
+            );
+        }
+        format!("Output device error: {erreur}")
+    }
+
+    /// Le réglage DSD de la zone et ce que le lecteur en avait dit.
+    ///
+    /// Relu sur le chemin d'ERREUR seulement, et sans jamais resonder le
+    /// réseau : le sondage a déjà eu lieu avant l'envoi ([`Self::sonder_dsd`])
+    /// et seul un sondage CONCLUANT entre en cache. Un cache vide rend donc
+    /// `None` — « je ne sais pas », jamais « non ». C'est précisément ce qui
+    /// empêche d'imputer un échec à un réglage sur une absence de réponse.
+    async fn contexte_dsd(&self, zone_id: i64, device_id: &str) -> (String, Option<bool>) {
+        let mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
+        let annonce = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.supports_dsf || cap.supports_dff);
+        (mode, annonce)
     }
 
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
@@ -6389,7 +6466,21 @@ impl PlaybackOrchestrator {
                 Err(e) => {
                     drop(output);
                     warn!(device_id = %used_device_id, error = %e, "output_play_failed");
-                    (false, Some(format!("Output device error: {e}")))
+                    // Le message rendu à l'utilisateur nomme le RÉGLAGE quand
+                    // le serveur savait, avant d'envoyer, que la zone forçait
+                    // du DSD brut vers un lecteur qui annonce ne pas le lire
+                    // (#2396). Relecture sur le chemin d'erreur uniquement :
+                    // aucun coût sur une lecture qui démarre.
+                    let (dsd_mode, annonce) = self.contexte_dsd(zone_id, &used_device_id).await;
+                    (
+                        false,
+                        Some(Self::message_echec_sortie(
+                            &e,
+                            &dsd_mode,
+                            annonce,
+                            media.mime_type,
+                        )),
+                    )
                 }
             }
         } else if device_id.starts_with("local:") {
@@ -9351,6 +9442,80 @@ mod dsd_passthrough_tests {
             !O::decider_passthrough_dsd("Native", None),
             "la casse compte"
         );
+    }
+
+    // ── Le message d'échec doit nommer le RÉGLAGE (#2396) ─────────────────
+    //
+    // Le choix d'envoyer quand même n'est pas remis en cause : « natif » est un
+    // réglage explicite et des renderers lisent le DSD sans l'annoncer. C'est
+    // le message d'ÉCHEC qui était faux. Il disait « Le renderer a acquitté
+    // Play mais joue toujours une autre source » — il accusait l'appareil,
+    // alors que le serveur savait AVANT d'envoyer que le Sink annonçait
+    // `Some(false)` et que la zone était en « natif ». L'utilisateur cherchait
+    // du côté du matériel ; l'un d'eux a réinstallé son système entier.
+
+    /// Le message tel que le renderer le renvoie — celui de #2396, mot pour mot.
+    const ECHEC_DLNA: &str = "Le renderer a acquitté Play mais joue toujours une \
+         autre source (URI non appliquée après relance)";
+
+    #[test]
+    fn le_message_nomme_le_reglage_et_l_action_pas_l_appareil() {
+        let msg = O::message_echec_sortie(ECHEC_DLNA, "native", Some(false), "application/x-dsd");
+
+        assert!(
+            msg.contains("natif"),
+            "le message doit NOMMER le réglage en cause : {msg}"
+        );
+        assert!(
+            msg.contains("DoP") && msg.contains("PCM"),
+            "le message doit nommer l'action qui corrige (DoP ou PCM) : {msg}"
+        );
+        assert!(
+            msg.contains("Output device error"),
+            "le marqueur qui pilote le 503 côté route ne doit pas disparaître : {msg}"
+        );
+    }
+
+    /// Zéro régression : hors de ce cas précis, le message ne change pas d'un
+    /// caractère. Accuser un réglage à tort serait la faute symétrique.
+    #[test]
+    fn les_autres_echecs_gardent_leur_message_mot_pour_mot() {
+        let intact = format!("Output device error: {ECHEC_DLNA}");
+
+        // Le renderer a dit OUI : l'échec ne vient pas du réglage.
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "native", Some(true), "application/x-dsd"),
+            intact
+        );
+        // Sondage muet : une absence n'est pas une preuve, on n'accuse rien.
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "native", None, "application/x-dsd"),
+            intact
+        );
+        // `auto` n'a forcé personne : le passthrough a suivi le renderer.
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "auto", Some(false), "application/x-dsd"),
+            intact
+        );
+        // Même zone, même appareil, un FLAC : le DSD n'y est pour rien. C'est
+        // la preuve par contraste du ticket (FLAC OK / DSF muet à 3 min).
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "native", Some(false), "audio/flac"),
+            intact
+        );
+    }
+
+    /// Les MIME que prend un DSD brut sur le fil : `application/x-dsd` par
+    /// défaut, ou celui que le renderer a annoncé (`audio/x-dsf`, `audio/dff`).
+    #[test]
+    fn tous_les_mime_dsd_bruts_declenchent_l_explication() {
+        for mime in ["application/x-dsd", "audio/x-dsf", "audio/dff", "audio/dsf"] {
+            let msg = O::message_echec_sortie(ECHEC_DLNA, "native", Some(false), mime);
+            assert!(
+                msg.contains("natif"),
+                "le MIME {mime} est du DSD brut et n'a pas déclenché l'explication : {msg}"
+            );
+        }
     }
 }
 
