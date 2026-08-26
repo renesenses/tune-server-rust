@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use rubato::Resampler;
 use symphonia::core::codecs::CodecParameters;
@@ -619,9 +621,12 @@ fn is_wavpack(file_path: &str) -> bool {
 }
 
 /// A source file staged to a fast local temp so the decoder doesn't do
-/// seek-heavy reads over a slow network mount. Removes the temp on drop.
+/// seek-heavy reads over a slow network mount. Shared via `Arc` through the
+/// staging cache; the temp is removed when the LAST holder drops (an active
+/// decoder keeps it alive even after the cache evicts it).
 struct StagedFile {
-    path: std::path::PathBuf,
+    path: PathBuf,
+    bytes: u64,
 }
 
 impl Drop for StagedFile {
@@ -629,6 +634,86 @@ impl Drop for StagedFile {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+
+/// Identité d'un fichier source pour le cache de staging : chemin + date +
+/// taille. Un fichier modifié (mtime/taille différents) est une entrée neuve —
+/// on ne resert jamais une copie périmée.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StageKey {
+    src: String,
+    mtime: i64,
+    size: u64,
+}
+
+/// Cache de fichiers stagés, borné en octets, éviction LRU.
+///
+/// Copier un fichier réseau (NAS WiFi d'Yves : ALAC de 17 à 152 Mo) coûte de
+/// 3 à 42 s. Sans cache, chaque lecture — et même deux demandes concurrentes
+/// de la MÊME piste (double-staging observé, deux copies à 1 ms d'écart) —
+/// re-payait la copie : 1,3 Go de trafic réseau en une session. Le cache copie
+/// chaque fichier AU PLUS UNE FOIS ; le single-flight fait attendre les
+/// demandes concurrentes au lieu de recopier.
+struct StageCache {
+    map: HashMap<StageKey, Arc<StagedFile>>,
+    /// Ordre d'usage, du plus ancien (avant) au plus récent (arrière).
+    lru: Vec<StageKey>,
+    /// Total des octets DÉTENUS par le cache (approximatif après éviction d'une
+    /// entrée encore en cours de décodage : le fichier survit via l'Arc du
+    /// décodeur mais on cesse de le compter).
+    bytes: u64,
+    budget: u64,
+    /// Verrous par clé : un seul thread copie une clé donnée, les autres
+    /// attendent son résultat.
+    inflight: HashMap<StageKey, Arc<Mutex<()>>>,
+}
+
+impl StageCache {
+    fn new(budget: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            lru: Vec::new(),
+            bytes: 0,
+            budget,
+            inflight: HashMap::new(),
+        }
+    }
+
+    fn touch(&mut self, key: &StageKey) {
+        if let Some(pos) = self.lru.iter().position(|k| k == key) {
+            let k = self.lru.remove(pos);
+            self.lru.push(k);
+        }
+    }
+
+    /// Insère une entrée fraîchement copiée et évince les plus anciennes tant
+    /// que le budget est dépassé. Évincer ne supprime pas le fichier tout de
+    /// suite : on lâche seulement la référence du cache ; un décodeur qui tient
+    /// encore l'Arc garde le temp vivant jusqu'à la fin de sa lecture.
+    fn insert(&mut self, key: StageKey, entry: Arc<StagedFile>) {
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        self.map.insert(key.clone(), entry);
+        self.lru.push(key);
+        while self.bytes > self.budget && self.lru.len() > 1 {
+            let oldest = self.lru.remove(0);
+            if let Some(e) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(e.bytes);
+            }
+        }
+    }
+}
+
+/// Budget disque du cache de staging (octets). Assez pour une longue session
+/// d'écoute ALAC (celle d'Yves : 1,3 Go), borné pour ne pas saturer le disque
+/// système. Surchargeable par `TUNE_STAGE_CACHE_BYTES`.
+fn stage_cache_budget() -> u64 {
+    std::env::var("TUNE_STAGE_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3 * 1024 * 1024 * 1024) // 3 Go
+}
+
+static STAGE_CACHE: LazyLock<Mutex<StageCache>> =
+    LazyLock::new(|| Mutex::new(StageCache::new(stage_cache_budget())));
 
 /// If `src` lives on a different device than the OS temp dir (i.e. an external
 /// or network mount), copy it to a local temp file and return a guard.
@@ -731,7 +816,7 @@ fn chemin_sur_montage_reseau(chemin: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
+fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
     let src_path = Path::new(src);
     let tmp_dir = std::env::temp_dir();
     // ⚠️ Le critère est le TYPE de montage, pas le numéro de périphérique.
@@ -746,28 +831,96 @@ fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
     if !chemin_sur_montage_reseau(src_path) {
         return None; // stockage local : le décodeur lit sur place
     }
+
+    // Identité du fichier : chemin + date + taille. Une source dont on n'a pas
+    // les métadonnées ne peut pas être mise en cache sûrement — on la copie
+    // sans cache (comportement historique) plutôt que de risquer une copie
+    // périmée.
+    let key = match std::fs::metadata(src_path) {
+        Ok(m) => Some(StageKey {
+            src: src.to_string(),
+            mtime: mtime_secs(&m),
+            size: m.len(),
+        }),
+        Err(_) => None,
+    };
+
+    // Cache : déjà stagé ? On resert la copie, aucun octet réseau.
+    if let Some(ref k) = key {
+        let mut cache = STAGE_CACHE.lock().unwrap();
+        if let Some(entry) = cache.map.get(k).cloned() {
+            cache.touch(k);
+            tracing::debug!(src = %src, "decode_source_stage_cache_hit");
+            return Some(entry);
+        }
+    }
+
+    // Single-flight : un seul thread copie une clé donnée. Les demandes
+    // concurrentes de la MÊME piste (double-staging observé chez Yves) prennent
+    // ce verrou et récupèrent le résultat au lieu de recopier.
+    let flight = key.as_ref().map(|k| {
+        STAGE_CACHE
+            .lock()
+            .unwrap()
+            .inflight
+            .entry(k.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    });
+    let _flight_guard = flight.as_ref().map(|m| m.lock().unwrap());
+
+    // Le gagnant du verrou a pu remplir le cache pendant qu'on attendait.
+    if let Some(ref k) = key {
+        let mut cache = STAGE_CACHE.lock().unwrap();
+        if let Some(entry) = cache.map.get(k).cloned() {
+            cache.touch(k);
+            return Some(entry);
+        }
+    }
+
     let ext = src_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("bin");
     let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
-    match std::fs::copy(src_path, &dst) {
+    let resultat = match std::fs::copy(src_path, &dst) {
         Ok(bytes) => {
             // info!, pas debug! : cette copie retarde la première note du
             // fichier ENTIER. Invisible, elle a fait chercher les « lenteurs
             // au chargement » partout ailleurs (chantier du 24/08).
             tracing::info!(src = %src, staged = %dst.display(), bytes, "decode_source_staged_locally");
-            Some(StagedFile { path: dst })
+            let entry = Arc::new(StagedFile { path: dst, bytes });
+            if let Some(k) = key.clone() {
+                STAGE_CACHE.lock().unwrap().insert(k, entry.clone());
+            }
+            Some(entry)
         }
         Err(e) => {
             tracing::warn!(src = %src, error = %e, "decode_source_stage_failed_decoding_in_place");
             None
         }
+    };
+
+    // Libère le verrou single-flight de cette clé (le résultat vit dans le
+    // cache ; garder un inflight orphelin fuirait de la mémoire).
+    if let Some(k) = key {
+        STAGE_CACHE.lock().unwrap().inflight.remove(&k);
     }
+    resultat
+}
+
+/// Date de modification en secondes epoch, 0 si indisponible — juste une
+/// composante d'identité pour le cache, jamais une décision de lecture.
+fn mtime_secs(m: &std::fs::Metadata) -> i64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(not(unix))]
-fn stage_locally_for_decode(_src: &str) -> Option<StagedFile> {
+fn stage_locally_for_decode(_src: &str) -> Option<Arc<StagedFile>> {
     None
 }
 
@@ -2737,6 +2890,58 @@ fn decode_dsd_to_pcm(
 
 #[cfg(test)]
 mod decode_integration_tests {
+
+    // --- StageCache : budget + éviction LRU (chantier lenteurs Yves) -------
+
+    fn faux_stage(bytes: u64) -> std::sync::Arc<super::StagedFile> {
+        // Chemin bidon : StagedFile::drop appellera remove_file dessus, qui
+        // échoue sans conséquence (le fichier n'existe pas).
+        std::sync::Arc::new(super::StagedFile {
+            path: std::path::PathBuf::from(format!("/tmp/tune-test-inexistant-{bytes}")),
+            bytes,
+        })
+    }
+
+    fn cle(n: &str) -> super::StageKey {
+        super::StageKey {
+            src: n.to_string(),
+            mtime: 0,
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn le_cache_evince_le_plus_ancien_quand_le_budget_est_depasse() {
+        let mut c = super::StageCache::new(100);
+        c.insert(cle("a"), faux_stage(60));
+        c.insert(cle("b"), faux_stage(30)); // total 90, ok
+        assert_eq!(c.map.len(), 2);
+        c.insert(cle("c"), faux_stage(30)); // total 120 > 100 → évince "a"
+        assert!(!c.map.contains_key(&cle("a")), "le plus ancien doit partir");
+        assert!(c.map.contains_key(&cle("b")) && c.map.contains_key(&cle("c")));
+        assert_eq!(c.bytes, 60, "octets recomptés après éviction");
+    }
+
+    #[test]
+    fn touch_protege_l_entree_recemment_utilisee_de_l_eviction() {
+        let mut c = super::StageCache::new(100);
+        c.insert(cle("a"), faux_stage(50));
+        c.insert(cle("b"), faux_stage(50));
+        // "a" redevient la plus récente : c'est "b" qui doit tomber.
+        c.touch(&cle("a"));
+        c.insert(cle("c"), faux_stage(50)); // 150 > 100 → évince le plus ancien = "b"
+        assert!(c.map.contains_key(&cle("a")), "a, réutilisée, survit");
+        assert!(!c.map.contains_key(&cle("b")), "b, la plus ancienne, part");
+    }
+
+    #[test]
+    fn le_cache_garde_toujours_au_moins_la_derniere_entree() {
+        // Un fichier plus gros que le budget entier ne doit pas s'auto-évincer
+        // (sinon on l'aurait copié pour rien) : la boucle s'arrête à 1 entrée.
+        let mut c = super::StageCache::new(10);
+        c.insert(cle("enorme"), faux_stage(500));
+        assert_eq!(c.map.len(), 1, "la dernière entrée reste, budget ou pas");
+    }
 
     // --- montage_reseau_depuis_mounts (chantier lenteurs, 24/08) -----------
 

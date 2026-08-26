@@ -77,6 +77,35 @@ Or locally:
 python3 scripts/preflight-check.py --version v0.8.28 --no-ci-check
 ```
 
+## CI batches for bug fixes
+
+Bug-fix pull requests can be grouped on an explicit `batch/*` branch. A PR
+whose **base** is `batch/*` runs the fast Rust core only: format, the OAAT test
+suite, Clippy, the security audit and the FFI compile check. This is the only
+case where the specialized suites are skipped.
+
+When the fixes in the lot are ready, open one integration PR from `batch/*` to
+`release/v0.9`. That PR runs the complete battery: shipped features,
+audio-embedding, Windows + ASIO, macOS and PostgreSQL in addition to the core.
+Merging it also triggers the five-target delivery matrix on the release-branch
+push.
+
+Add the `ci:full` label to a bug-fix PR when its risk warrants the complete
+battery immediately. Direct PRs to `release/v0.9`, `main` or any non-`batch/*`
+branch are complete by default. Unknown events and classifier errors are also
+complete: a routing fault may consume extra runners, but cannot suppress a
+check.
+
+Typical flow:
+
+```bash
+git switch -c batch/v0.9-audio origin/release/v0.9
+git push -u origin batch/v0.9-audio
+
+# Open each fix PR with batch/v0.9-audio as its base, then integrate the lot:
+gh pr create --base release/v0.9 --head batch/v0.9-audio
+```
+
 ## 2. Bump
 
 `tune release bump <patch|minor|major>` rewrites `Cargo.toml` and

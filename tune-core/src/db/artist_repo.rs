@@ -176,6 +176,17 @@ pub struct ArtistRepo {
     db: Arc<dyn DbBackend>,
 }
 
+/// Un identifiant externe vide n'est pas une identité.
+///
+/// Le chemin instruit dans #2458 peut transmettre une clé MusicBrainz présente
+/// mais vide — sa présence dans la base du testeur reste à vérifier. La garder
+/// sous `Some("")` suffit néanmoins, code en main, à rechercher puis partager
+/// la même ligne artiste pour des noms distincts. Les espaces seuls sont
+/// équivalents à l'absence ; un identifiant réel est normalisé avant comparaison.
+fn usable_musicbrainz_id(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 impl ArtistRepo {
     pub fn new(db: SqliteDb) -> Self {
         Self { db: Arc::new(db) }
@@ -217,6 +228,9 @@ impl ArtistRepo {
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, TuneError> {
+        let Some(mbid) = usable_musicbrainz_id(Some(mbid)) else {
+            return Ok(None);
+        };
         let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
         let params: [&dyn ToSqlValue; 1] = [&mbid];
         Ok(self
@@ -228,10 +242,11 @@ impl ArtistRepo {
 
     pub fn create(&self, artist: &Artist) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::create, sql::create);
+        let musicbrainz_id = usable_musicbrainz_id(artist.musicbrainz_id.as_deref());
         let params: [&dyn ToSqlValue; 7] = [
             &artist.name,
             &artist.sort_name,
-            &artist.musicbrainz_id,
+            &musicbrainz_id,
             &artist.discogs_id,
             &artist.bio,
             &artist.image_path,
@@ -255,6 +270,7 @@ impl ArtistRepo {
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
     ) -> Result<Artist, TuneError> {
+        let musicbrainz_id = usable_musicbrainz_id(musicbrainz_id);
         if let Some(mbid) = musicbrainz_id {
             let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
             let params: [&dyn ToSqlValue; 1] = [&mbid];
@@ -287,10 +303,11 @@ impl ArtistRepo {
     pub fn update(&self, artist: &Artist) -> Result<(), TuneError> {
         let id = artist.id.ok_or("artist has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
+        let musicbrainz_id = usable_musicbrainz_id(artist.musicbrainz_id.as_deref());
         let params: [&dyn ToSqlValue; 8] = [
             &artist.name,
             &artist.sort_name,
-            &artist.musicbrainz_id,
+            &musicbrainz_id,
             &artist.discogs_id,
             &artist.bio,
             &artist.image_path,
@@ -598,6 +615,7 @@ impl ArtistRepo {
 
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
+        let mbid = usable_musicbrainz_id(Some(mbid));
         self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
         Ok(())
     }
@@ -816,6 +834,37 @@ mod tests {
             .unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    /// Reproduit la convergence proposée dans #2458 : une clé MBID présente
+    /// mais vide ne doit ni être recherchée ni relier deux noms distincts.
+    #[test]
+    fn un_mbid_vide_ne_colle_jamais_deux_artistes() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+
+        let saint_saens = repo
+            .get_or_create("Classique - Saint-Saëns", Some(""), None)
+            .unwrap();
+        let anouar = repo.get_or_create("Anouar Brahem", Some(""), None).unwrap();
+
+        assert_ne!(saint_saens.id, anouar.id);
+        assert_eq!(
+            repo.get(saint_saens.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .musicbrainz_id,
+            None
+        );
+        assert_eq!(
+            repo.get(anouar.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .musicbrainz_id,
+            None
+        );
+        assert!(repo.get_by_musicbrainz_id("").unwrap().is_none());
+        assert!(repo.get_by_musicbrainz_id("  ").unwrap().is_none());
     }
 
     #[test]
