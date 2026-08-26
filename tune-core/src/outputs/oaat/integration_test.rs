@@ -6,7 +6,7 @@ mod tests {
     use oaat_core::Message;
     use oaat_core::codec::FrameCodec;
     use oaat_core::message::*;
-    use oaat_core::wire::AUDIO_HEADER_SIZE;
+    use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader};
 
     use crate::outputs::oaat::OaatOutput;
     use crate::outputs::traits::{OutputTarget, PlayMedia};
@@ -193,6 +193,401 @@ mod tests {
         http_handle.abort();
     }
 
+    /// #2239 — le contrat négocié doit décrire les octets UDP, pas seulement
+    /// les variables de paquetisation.
+    ///
+    /// Le témoin contient 50 ms de vrai PCM 24-bit / 96 kHz / stéréo. Les
+    /// canaux sont opposés, donc le downmix 0,5 L + 0,5 R attendu est exactement
+    /// nul. L'endpoint contre-propose 16-bit / 48 kHz / mono ; on décode ensuite
+    /// chaque en-tête UDP et on vérifie format, frontières, PTS, offsets, durée
+    /// et payload byte-for-byte.
+    #[tokio::test]
+    async fn format_counter_convertit_reellement_le_payload_pcm() {
+        use oaat_core::format::{AudioFormat, ChannelLayout};
+        use oaat_core::wire::PacketFlags;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        let endpoint = tokio::spawn(async move {
+            let audio_rx = tokio::spawn(async move {
+                let mut packets = Vec::new();
+                let mut datagram = vec![0u8; 8192];
+                loop {
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        audio_udp.recv(&mut datagram),
+                    )
+                    .await
+                    .expect("audio UDP timeout")
+                    .expect("audio UDP receive");
+                    assert!(n >= AUDIO_HEADER_SIZE);
+                    let header_bytes: [u8; AUDIO_HEADER_SIZE] =
+                        datagram[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                    let header = AudioPacketHeader::decode(&header_bytes).unwrap();
+                    let payload = datagram[AUDIO_HEADER_SIZE..n].to_vec();
+                    assert_eq!(payload.len(), header.payload_len as usize);
+                    let last = header.flags.contains(PacketFlags::LAST_PACKET);
+                    packets.push((header, payload));
+                    if last {
+                        break;
+                    }
+                }
+                packets
+            });
+
+            let _clock = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while let Ok((n, peer)) = clock_udp.recv_from(&mut buf).await {
+                    if n >= 28 {
+                        let _ = clock_udp.send_to(&buf[..n], peer).await;
+                    }
+                }
+            });
+
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), tcp.accept())
+                    .await
+                    .expect("control accept timeout")
+                    .expect("control accept");
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let n = stream.read(&mut read_buf).await.unwrap();
+            codec.feed(&read_buf[..n]);
+            assert!(matches!(codec.decode_next(), Ok(Some(Message::Hello(_)))));
+            let ack = Message::HelloAck(HelloAck {
+                protocol_version: oaat_core::PROTOCOL_VERSION,
+                endpoint_id: "mock-counter-pcm".into(),
+                endpoint_name: "Mock Counter PCM".into(),
+                capabilities: EndpointCapabilities {
+                    pcm_max_rate: 96_000,
+                    pcm_max_bits: 24,
+                    dsd_max_rate: None,
+                    channels_max: 2,
+                    formats: vec![AudioFormat::PcmS16le, AudioFormat::PcmS24le],
+                    volume: None,
+                    gapless: true,
+                    seek: false,
+                },
+                audio_port,
+                clock_port,
+                buffer_size_ms: 100,
+            });
+            stream.write_all(&FrameCodec::encode(&ack)).await.unwrap();
+
+            let mut propositions = Vec::new();
+            let mut got_play = false;
+            let mut stopped = false;
+            loop {
+                let n = match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    stream.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(message)) = codec.decode_next() {
+                    match message {
+                        Message::FormatPropose(proposee) => {
+                            propositions.push(proposee.clone());
+                            let contre = Message::FormatCounter(FormatCounter {
+                                stream_id: proposee.stream_id,
+                                format: AudioFormat::PcmS16le,
+                                sample_rate: 48_000,
+                                channels: 1,
+                                channel_layout: ChannelLayout::Mono,
+                                bits_per_sample: 16,
+                                dsd_rate: None,
+                            });
+                            stream
+                                .write_all(&FrameCodec::encode(&contre))
+                                .await
+                                .unwrap();
+                        }
+                        Message::Play(_) => got_play = true,
+                        Message::Stop(_) => {
+                            stopped = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if stopped {
+                    break;
+                }
+            }
+            let packets = audio_rx.await.unwrap();
+            (propositions, got_play, packets)
+        });
+
+        let frames = 4_800u32;
+        let mut pcm = Vec::with_capacity(frames as usize * 6);
+        for frame in 0..frames {
+            let left =
+                (((frame as i32 * 997) & 0x7f_ffff) - 0x40_0000).clamp(-0x7f_ffff, 0x7f_ffff);
+            for sample in [left, -left] {
+                pcm.extend_from_slice(&sample.to_le_bytes()[..3]);
+            }
+        }
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&96_000u32.to_le_bytes());
+        wav.extend_from_slice(&(96_000u32 * 6).to_le_bytes());
+        wav.extend_from_slice(&6u16.to_le_bytes());
+        wav.extend_from_slice(&24u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&pcm);
+
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        let http_task = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                wav.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&wav).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let output = OaatOutput::new(
+            "Mock Counter PCM".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-counter-pcm".into(),
+        );
+        let url = format!("http://127.0.0.1:{http_port}/counter.wav");
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Counter contract"),
+                duration_ms: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (propositions, got_play, packets) =
+            tokio::time::timeout(std::time::Duration::from_secs(12), endpoint)
+                .await
+                .expect("endpoint did not finish")
+                .unwrap();
+        http_task.await.unwrap();
+
+        assert_eq!(propositions.len(), 1);
+        assert_eq!(propositions[0].format, AudioFormat::PcmS24le);
+        assert_eq!(propositions[0].sample_rate, 96_000);
+        assert_eq!(propositions[0].bits_per_sample, 24);
+        assert_eq!(propositions[0].channels, 2);
+        assert!(got_play, "la conversion doit être prête avant Play");
+
+        let audio: Vec<_> = packets
+            .iter()
+            .filter(|(_, payload)| !payload.is_empty())
+            .collect();
+        assert!(!audio.is_empty());
+        let first_pts = audio[0].0.pts_ns;
+        let mut payload = Vec::new();
+        for (header, bytes) in &audio {
+            assert_eq!(header.format, AudioFormat::PcmS16le);
+            assert_eq!(bytes.len() % 2, 0, "paquet mono 16-bit mal aligné");
+            let expected_delta = header.sample_offset * 1_000_000_000 / 48_000;
+            assert!(
+                header.pts_ns.abs_diff(first_pts + expected_delta) <= 1,
+                "PTS incohérent pour offset {}",
+                header.sample_offset
+            );
+            payload.extend_from_slice(bytes);
+        }
+        assert_eq!(payload.len(), 2_400 * 2, "50 ms à 48 kHz mono 16-bit");
+        assert!(
+            payload.iter().all(|byte| *byte == 0),
+            "L=-R doit donner un downmix mono nul byte-for-byte"
+        );
+        let last = &packets.last().unwrap().0;
+        assert!(last.flags.contains(PacketFlags::LAST_PACKET));
+        assert_eq!(last.sample_offset, 2_400);
+        output.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn format_counter_impossible_reste_fail_closed_jusqu_au_reseau() {
+        use oaat_core::format::{AudioFormat, ChannelLayout};
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        let endpoint = tokio::spawn(async move {
+            let audio_rx = tokio::spawn(async move {
+                let mut datagram = [0u8; 8192];
+                usize::from(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        audio_udp.recv(&mut datagram),
+                    )
+                    .await
+                    .is_ok(),
+                )
+            });
+            let _clock = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while let Ok((n, peer)) = clock_udp.recv_from(&mut buf).await {
+                    if n >= 28 {
+                        let _ = clock_udp.send_to(&buf[..n], peer).await;
+                    }
+                }
+            });
+
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let n = stream.read(&mut read_buf).await.unwrap();
+            codec.feed(&read_buf[..n]);
+            assert!(matches!(codec.decode_next(), Ok(Some(Message::Hello(_)))));
+            let ack = Message::HelloAck(HelloAck {
+                protocol_version: oaat_core::PROTOCOL_VERSION,
+                endpoint_id: "mock-impossible".into(),
+                endpoint_name: "Mock Impossible".into(),
+                capabilities: EndpointCapabilities {
+                    pcm_max_rate: 192_000,
+                    pcm_max_bits: 32,
+                    dsd_max_rate: None,
+                    channels_max: 2,
+                    formats: vec![AudioFormat::Flac],
+                    volume: None,
+                    gapless: false,
+                    seek: false,
+                },
+                audio_port,
+                clock_port,
+                buffer_size_ms: 100,
+            });
+            stream.write_all(&FrameCodec::encode(&ack)).await.unwrap();
+
+            let mut got_play = false;
+            loop {
+                let n = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    stream.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(message)) = codec.decode_next() {
+                    match message {
+                        Message::FormatPropose(proposee) => {
+                            let impossible = Message::FormatCounter(FormatCounter {
+                                stream_id: proposee.stream_id,
+                                format: AudioFormat::Flac,
+                                sample_rate: proposee.sample_rate,
+                                channels: proposee.channels,
+                                channel_layout: ChannelLayout::Stereo,
+                                bits_per_sample: proposee.bits_per_sample,
+                                dsd_rate: None,
+                            });
+                            stream
+                                .write_all(&FrameCodec::encode(&impossible))
+                                .await
+                                .unwrap();
+                        }
+                        Message::Play(_) => got_play = true,
+                        _ => {}
+                    }
+                }
+            }
+            (got_play, audio_rx.await.unwrap())
+        });
+
+        let wav = make_test_wav();
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        let http_task = tokio::spawn(async move {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                wav.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&wav).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let output = OaatOutput::new(
+            "Mock Impossible".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-impossible".into(),
+        );
+        let url = format!("http://127.0.0.1:{http_port}/impossible.wav");
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Impossible counter"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (got_play, audio_datagrams) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), endpoint)
+                .await
+                .expect("endpoint did not finish")
+                .unwrap();
+        http_task.await.unwrap();
+        assert!(
+            !got_play,
+            "un FormatCounter sans pipeline ne doit jamais atteindre Play"
+        );
+        assert_eq!(
+            audio_datagrams, 0,
+            "aucun octet audio ne doit partir après le refus"
+        );
+        let failure = output
+            .take_output_failure()
+            .expect("le refus doit remonter au poller/client");
+        assert!(failure.contains("ne passe pas par le convertisseur PCM entier"));
+        output.stop().await.ok();
+    }
+
     /// A gapless transition that CHANGES FORMAT must restart the stream.
     ///
     /// Proposing a format makes the endpoint tear its output down and clear its
@@ -247,26 +642,41 @@ mod tests {
 
         // Records the control messages in the order they arrive.
         let mock_handle = tokio::spawn(async move {
+            use oaat_core::format::AudioFormat;
+            use oaat_core::wire::PacketFlags;
+
             let mut seen: Vec<String> = Vec::new();
 
-            let audio_socket = std::sync::Arc::new(audio_udp);
-            let _audio_rx = {
-                let s = audio_socket.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    loop {
-                        if (tokio::time::timeout(
-                            std::time::Duration::from_secs(6),
-                            s.recv(&mut buf),
-                        )
-                        .await)
-                            .is_err()
-                        {
-                            break;
-                        }
+            let audio_rx = tokio::spawn(async move {
+                let mut datagram = vec![0u8; 8192];
+                let mut packets = Vec::new();
+                let mut last_count = 0;
+                loop {
+                    let Ok(Ok(n)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        audio_udp.recv(&mut datagram),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    if n < AUDIO_HEADER_SIZE {
+                        continue;
                     }
-                })
-            };
+                    let header_bytes: [u8; AUDIO_HEADER_SIZE] =
+                        datagram[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                    let header = AudioPacketHeader::decode(&header_bytes).unwrap();
+                    let payload = datagram[AUDIO_HEADER_SIZE..n].to_vec();
+                    if header.flags.contains(PacketFlags::LAST_PACKET) {
+                        last_count += 1;
+                    }
+                    packets.push((header, payload));
+                    if last_count == 2 {
+                        break;
+                    }
+                }
+                packets
+            });
 
             let _clock_handle = tokio::spawn(async move {
                 let mut buf = [0u8; 64];
@@ -315,6 +725,8 @@ mod tests {
                         });
                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
 
+                        let mut proposal_count = 0;
+                        let mut stopped = false;
                         loop {
                             let n = match tokio::time::timeout(
                                 std::time::Duration::from_secs(6),
@@ -330,21 +742,46 @@ mod tests {
                                 match msg {
                                     Message::FormatPropose(fp) => {
                                         seen.push("FormatPropose".into());
-                                        let accept = Message::FormatAccept(FormatAccept {
-                                            stream_id: fp.stream_id,
-                                        });
+                                        proposal_count += 1;
+                                        let response = if proposal_count == 1 {
+                                            Message::FormatAccept(FormatAccept {
+                                                stream_id: fp.stream_id,
+                                            })
+                                        } else {
+                                            // La seconde source est 24-bit. Le
+                                            // renderer garde le contrat 16-bit
+                                            // de la première piste : le chemin
+                                            // gapless doit convertir AVANT Play.
+                                            Message::FormatCounter(FormatCounter {
+                                                stream_id: fp.stream_id,
+                                                format: AudioFormat::PcmS16le,
+                                                sample_rate: fp.sample_rate,
+                                                channels: fp.channels,
+                                                channel_layout: fp.channel_layout,
+                                                bits_per_sample: 16,
+                                                dsd_rate: None,
+                                            })
+                                        };
                                         let _ =
-                                            stream.write_all(&FrameCodec::encode(&accept)).await;
+                                            stream.write_all(&FrameCodec::encode(&response)).await;
                                     }
                                     Message::Play(_) => seen.push("Play".into()),
+                                    Message::Stop(_) => {
+                                        stopped = true;
+                                        break;
+                                    }
                                     _ => {}
                                 }
+                            }
+                            if stopped {
+                                break;
                             }
                         }
                     }
                 }
             }
-            seen
+            let packets = audio_rx.await.unwrap();
+            (seen, packets)
         });
 
         // Track 1 is 16-bit; track 2 is 24-bit, so the transition must
@@ -422,7 +859,7 @@ mod tests {
             .await
             .ok();
 
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(12), mock_handle)
+        let (seen, packets) = tokio::time::timeout(std::time::Duration::from_secs(12), mock_handle)
             .await
             .expect("mock timed out")
             .expect("mock panicked");
@@ -442,6 +879,44 @@ mod tests {
             "a Play must follow the format renegotiation, or the endpoint drops \
              every packet and plays nothing — saw: {seen:?}"
         );
+
+        let first_last = packets
+            .iter()
+            .position(|(header, _)| {
+                header
+                    .flags
+                    .contains(oaat_core::wire::PacketFlags::LAST_PACKET)
+            })
+            .expect("la première piste doit se fermer");
+        let second_packets = &packets[first_last + 1..];
+        let second_audio: Vec<_> = second_packets
+            .iter()
+            .filter(|(_, payload)| !payload.is_empty())
+            .collect();
+        assert!(
+            !second_audio.is_empty(),
+            "la piste gapless doit émettre du PCM"
+        );
+        assert!(
+            second_audio.iter().all(|(header, payload)| {
+                header.format == oaat_core::format::AudioFormat::PcmS16le && payload.len() % 4 == 0
+            }),
+            "la seconde piste 24-bit doit être réellement paquetisée en 16-bit stéréo"
+        );
+        assert_eq!(second_audio[0].0.sample_offset, 0);
+        let second_payload_len: usize = second_audio.iter().map(|(_, payload)| payload.len()).sum();
+        assert_eq!(
+            second_payload_len, 88_200,
+            "500 ms à 44,1 kHz, 16-bit stéréo doivent produire exactement 88 200 octets"
+        );
+        assert!(
+            second_audio
+                .iter()
+                .all(|(_, payload)| payload.iter().all(|byte| *byte == 0)),
+            "le témoin silencieux doit rester nul byte-for-byte après conversion"
+        );
+        let second_last = &second_packets.last().expect("LAST piste 2").0;
+        assert_eq!(second_last.sample_offset, 22_050);
 
         output.stop().await.ok();
         http_handle.abort();
@@ -1466,7 +1941,9 @@ mod tests {
     #[test]
     #[cfg(feature = "oaat")]
     fn chaque_champ_negocie_suffit_a_rendre_une_contre_proposition_inacceptable() {
-        use crate::outputs::oaat::output::{ReponseNegociation, juger_reponse};
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, juger_reponse,
+        };
         use oaat_controller::EndpointResponse;
         use oaat_core::format::{AudioFormat, ChannelLayout};
 
@@ -1475,7 +1952,12 @@ mod tests {
         // Identique en TOUT point : il n'y a rien a faire, on peut jouer.
         let conforme = EndpointResponse::FormatCounter(contre_de(&contrat));
         assert!(
-            juger_reponse(&contrat, ReponseNegociation::Recue(&conforme)).is_ok(),
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&conforme),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_ok(),
             "une contre-proposition identique a la proposition n'a rien a refuser"
         );
 
@@ -1502,11 +1984,120 @@ mod tests {
             modifier(&mut contre);
             let reponse = EndpointResponse::FormatCounter(contre);
             assert!(
-                juger_reponse(&contrat, ReponseNegociation::Recue(&reponse)).is_err(),
+                juger_reponse(
+                    &contrat,
+                    ReponseNegociation::Recue(&reponse),
+                    PolitiqueAdaptation::ExacteSeulement,
+                )
+                .is_err(),
                 "un ecart de {nom} doit suffire a refuser : Tune enverrait des \
                  octets que l'etiquette ne decrit plus (#2283)"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn politique_pcm_n_accepte_que_les_contre_propositions_reellement_convertibles() {
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, juger_reponse,
+        };
+        use oaat_controller::EndpointResponse;
+        use oaat_core::format::{AudioFormat, ChannelLayout};
+
+        let contrat = contrat_pcm();
+        let mut pcm = contre_de(&contrat);
+        pcm.format = AudioFormat::PcmS16le;
+        pcm.sample_rate = 48_000;
+        pcm.channels = 1;
+        pcm.channel_layout = ChannelLayout::Mono;
+        pcm.bits_per_sample = 16;
+        let cible = juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&EndpointResponse::FormatCounter(pcm)),
+            PolitiqueAdaptation::PcmEntier,
+        )
+        .expect("24/96/stéréo vers 16/48/mono passe par le convertisseur PCM");
+        assert_eq!(cible.format, AudioFormat::PcmS16le);
+        assert_eq!(cible.sample_rate, 48_000);
+        assert_eq!(cible.channels, 1);
+        assert_eq!(cible.bits_per_sample, 16);
+
+        let mut compressee = contre_de(&contrat);
+        compressee.format = AudioFormat::Flac;
+        let refus = juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&EndpointResponse::FormatCounter(compressee)),
+            PolitiqueAdaptation::PcmEntier,
+        )
+        .expect_err("un encodeur FLAC ne doit pas être inventé dans le paquetiseur");
+        assert!(
+            refus
+                .raison
+                .contains("ne passe pas par le convertisseur PCM entier")
+        );
+
+        let mut disposition_mensongere = contre_de(&contrat);
+        disposition_mensongere.channels = 1;
+        disposition_mensongere.channel_layout = ChannelLayout::Stereo;
+        assert!(
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(
+                    &EndpointResponse::FormatCounter(disposition_mensongere,)
+                ),
+                PolitiqueAdaptation::PcmEntier,
+            )
+            .is_err(),
+            "mono annoncé avec une disposition stéréo doit rester fail-closed"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn piste_directe_gapless_est_preparee_dans_le_contrat_deja_negocie() {
+        use crate::outputs::oaat::helpers::StagedDirectTrack;
+        use crate::outputs::oaat::output::{ContratPropose, adapter_piste_directe_gapless};
+        use oaat_core::format::{AudioFormat, ChannelLayout};
+
+        let frames = 4_800usize;
+        let mut pcm = Vec::with_capacity(frames * 6);
+        for frame in 0..frames {
+            let left = ((frame as i32 * 997) & 0x7f_ffff) - 0x40_0000;
+            for sample in [left, -left] {
+                pcm.extend_from_slice(&sample.to_le_bytes()[..3]);
+            }
+        }
+        let piste = StagedDirectTrack {
+            pcm,
+            format: AudioFormat::PcmS24le,
+            sample_rate: 96_000,
+            bits_per_sample: 24,
+            channels: 2,
+            title: "suivante".into(),
+            artist: String::new(),
+            album: String::new(),
+            cover_url: None,
+            duration_ms: 50,
+        };
+        let cible = ContratPropose {
+            stream_id: "flux-direct".into(),
+            format: AudioFormat::PcmS16le,
+            sample_rate: 48_000,
+            channels: 1,
+            channel_layout: ChannelLayout::Mono,
+            bits_per_sample: 16,
+            dsd_rate: None,
+        };
+
+        let piste = adapter_piste_directe_gapless(piste, &cible)
+            .expect("la préparation se fait avant la frontière de piste");
+        assert_eq!(piste.format, AudioFormat::PcmS16le);
+        assert_eq!(piste.sample_rate, 48_000);
+        assert_eq!(piste.bits_per_sample, 16);
+        assert_eq!(piste.channels, 1);
+        assert_eq!(piste.pcm.len(), 2_400 * 2);
+        assert!(piste.pcm.iter().all(|byte| *byte == 0));
     }
 
     /// `dsd_rate` se COMPARE, il ne s'exige pas absent.
@@ -1518,7 +2109,9 @@ mod tests {
     #[test]
     #[cfg(feature = "oaat")]
     fn une_contre_proposition_dsd_identique_est_honorable() {
-        use crate::outputs::oaat::output::{ReponseNegociation, juger_reponse};
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, juger_reponse,
+        };
         use oaat_controller::EndpointResponse;
 
         let mut contrat = contrat_pcm();
@@ -1528,7 +2121,12 @@ mod tests {
 
         let identique = EndpointResponse::FormatCounter(contre_de(&contrat));
         assert!(
-            juger_reponse(&contrat, ReponseNegociation::Recue(&identique)).is_ok(),
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&identique),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_ok(),
             "une contre-proposition DSD64 identique a la proposition DSD64 \
              decrit exactement ce qu'on allait envoyer (#2283)"
         );
@@ -1538,7 +2136,12 @@ mod tests {
         autre.dsd_rate = Some(128);
         let autre = EndpointResponse::FormatCounter(autre);
         assert!(
-            juger_reponse(&contrat, ReponseNegociation::Recue(&autre)).is_err(),
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&autre),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_err(),
             "DSD128 contre DSD64 n'est pas le meme flux"
         );
     }
@@ -1552,7 +2155,9 @@ mod tests {
     #[test]
     #[cfg(feature = "oaat")]
     fn juger_reponse_decide_les_huit_issues() {
-        use crate::outputs::oaat::output::{ReponseNegociation, juger_reponse};
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, juger_reponse,
+        };
         use oaat_controller::EndpointResponse;
 
         let contrat = contrat_pcm();
@@ -1562,7 +2167,14 @@ mod tests {
         let accord = EndpointResponse::FormatAccept(oaat_core::message::FormatAccept {
             stream_id: flux.clone(),
         });
-        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&accord)).is_ok());
+        assert!(
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&accord),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_ok()
+        );
 
         // 2. accord sur un AUTRE flux -> refus. Une reponse en retard prise
         //    pour la bonne decale toute la suite (#2282).
@@ -1570,28 +2182,51 @@ mod tests {
             stream_id: "flux-precedent".into(),
         });
         assert!(
-            juger_reponse(&contrat, ReponseNegociation::Recue(&accord_etranger)).is_err(),
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&accord_etranger),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_err(),
             "un accord pour un autre flux n'est pas notre accord"
         );
 
         // 3. contre-proposition identique -> on joue.
         let conforme = EndpointResponse::FormatCounter(contre_de(&contrat));
-        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&conforme)).is_ok());
+        assert!(
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&conforme),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_ok()
+        );
 
         // 4. contre-proposition ecartee -> refus (couvert champ par champ
         //    ci-dessus, repris ici pour l'exhaustivite de l'enumeration).
         let mut ecartee = contre_de(&contrat);
         ecartee.sample_rate = 48_000;
         let ecartee = EndpointResponse::FormatCounter(ecartee);
-        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&ecartee)).is_err());
+        assert!(
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&ecartee),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_err()
+        );
 
         // 5. refus explicite -> refus, avec le motif de l'endpoint.
         let refus = EndpointResponse::FormatReject(oaat_core::message::FormatReject {
             stream_id: flux.clone(),
             reason: "cadence non supportee".into(),
         });
-        let r = juger_reponse(&contrat, ReponseNegociation::Recue(&refus))
-            .expect_err("un FormatReject interdit la lecture (#2282)");
+        let r = juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&refus),
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("un FormatReject interdit la lecture (#2282)");
         assert!(
             r.raison.contains("cadence non supportee"),
             "le motif de l'endpoint doit remonter tel quel, il finit sous les \
@@ -1605,14 +2240,32 @@ mod tests {
         let hors_sujet = EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
             stream_id: flux.clone(),
         });
-        assert!(juger_reponse(&contrat, ReponseNegociation::Recue(&hors_sujet)).is_err());
+        assert!(
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&hors_sujet),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_err()
+        );
 
         // 7. endpoint ferme.
-        assert!(juger_reponse(&contrat, ReponseNegociation::Fermee).is_err());
+        assert!(
+            juger_reponse(
+                &contrat,
+                ReponseNegociation::Fermee,
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .is_err()
+        );
 
         // 8. silence.
-        let r = juger_reponse(&contrat, ReponseNegociation::Timeout)
-            .expect_err("le silence n'est pas un accord");
+        let r = juger_reponse(
+            &contrat,
+            ReponseNegociation::Timeout,
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("le silence n'est pas un accord");
         assert!(!r.raison.is_empty(), "un refus sans motif ne sert a rien");
     }
 }

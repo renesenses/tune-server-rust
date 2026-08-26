@@ -1933,6 +1933,118 @@ pub(crate) fn is_dop_pcm(bytes: &[u8], bit_depth: u16, channels: u16) -> bool {
     true
 }
 
+/// Classification stable du porteur PCM pendant une piste.
+///
+/// Un flux 24 bits reste en quarantaine jusqu'a ce que 32 trames permettent
+/// de conclure. Une fois la decision prise, elle est conservee pour toute la
+/// piste : re-sonder chaque chunk faisait repasser un vrai DoP en PCM des qu'un
+/// tampon court arrivait, et remettait alors volume et DSP dans le trajet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPcmKind {
+    Awaiting24BitProbe,
+    Pcm,
+    Dop,
+}
+
+impl LocalPcmKind {
+    fn for_bit_depth(bit_depth: u16) -> Self {
+        if bit_depth == 24 {
+            Self::Awaiting24BitProbe
+        } else {
+            Self::Pcm
+        }
+    }
+
+    fn is_awaiting_probe(self) -> bool {
+        self == Self::Awaiting24BitProbe
+    }
+}
+
+struct ProcessedLocalPcm {
+    samples: Vec<f32>,
+    source_frames: u64,
+    dop: bool,
+}
+
+/// Frontiere unique entre les octets PCM recus et les rings flottants locaux.
+///
+/// Le tampon initial lu avec l'en-tete WAV et les lectures suivantes doivent
+/// passer ici sans exception. La fonction conserve les octets 24 bits tant
+/// que la sonde DoP n'est pas concluante, synchronise le volume avant de
+/// rendre le premier echantillon au caller, puis applique exactement la meme
+/// chaine DSP a tous les chunks PCM. L'adaptation de canaux et le resampling
+/// restent ensuite propres au backend.
+struct LocalPcmProcessor<'a> {
+    eq: &'a std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &'a AtomicBool,
+    dop_active: &'a AtomicBool,
+    volume: &'a AtomicU32,
+    user_volume: &'a AtomicU32,
+    rg_factor: &'a AtomicU32,
+}
+
+impl LocalPcmProcessor<'_> {
+    fn process_pcm_chunk(
+        &self,
+        staged: &mut Vec<u8>,
+        frame_bytes: usize,
+        bit_depth: u16,
+        channels: u16,
+        kind: &mut LocalPcmKind,
+    ) -> Option<ProcessedLocalPcm> {
+        let aligned_len = (staged.len() / frame_bytes) * frame_bytes;
+        if aligned_len == 0 {
+            return None;
+        }
+
+        if kind.is_awaiting_probe() {
+            let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
+            if aligned_len < probe_bytes {
+                // Ne rien convertir ni publier : l'octet marqueur n'existe
+                // plus comme tel une fois le mot 24 bits passe en f32.
+                return None;
+            }
+            *kind = if is_dop_pcm(&staged[..aligned_len], bit_depth, channels) {
+                LocalPcmKind::Dop
+            } else {
+                LocalPcmKind::Pcm
+            };
+        }
+
+        let dop = *kind == LocalPcmKind::Dop;
+        if self.dop_active.swap(dop, Ordering::SeqCst) != dop {
+            info!(dop, "local_audio_dop_stream_state_changed");
+            sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, dop);
+        }
+
+        let mut samples = pcm_bytes_to_f32(&staged[..aligned_len], bit_depth);
+        apply_local_dsp(
+            &mut samples,
+            self.eq,
+            self.convolver,
+            self.crossfeed,
+            self.pure_bypass,
+            channels,
+            dop,
+        );
+        staged.drain(..aligned_len);
+
+        Some(ProcessedLocalPcm {
+            samples,
+            source_frames: (aligned_len / frame_bytes) as u64,
+            dop,
+        })
+    }
+}
+
+fn report_incomplete_local_pcm_probe(kind: LocalPcmKind, pending_bytes: usize) {
+    if kind.is_awaiting_probe() && pending_bytes > 0 {
+        warn!(pending_bytes, "local_audio_24bit_dop_probe_incomplete");
+    }
+}
+
 /// Why a Windows exclusive backend that still crosses an `f32` ring refused
 /// a 24-bit stream.
 ///
@@ -3291,26 +3403,35 @@ impl OutputTarget for LocalOutput {
 
                 // Read and feed the rest of the stream
                 let mut read_buf = vec![0u8; 65536];
-                let mut leftover: Vec<u8> = Vec::new();
+                let mut leftover = pcm_data;
+                let mut pcm_kind = LocalPcmKind::for_bit_depth(bit_depth);
+                let pcm_processor = LocalPcmProcessor {
+                    eq: &eq,
+                    convolver: &convolver,
+                    crossfeed: &crossfeed,
+                    pure_bypass: &pure_bypass,
+                    dop_active: &dop_active,
+                    volume: &volume,
+                    user_volume: &user_volume_ref,
+                    rg_factor: &rg_factor_ref,
+                };
 
                 // Process leftover from header read
-                if !pcm_data.is_empty() {
-                    let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
-                    if aligned_len > 0 {
-                        let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
-                        feed_ring_abortable(
-                            &ring,
-                            &samples,
-                            &stop_rx,
-                            &paused,
-                            Some(&force_silent),
-                        );
-                        total_frames_fed += (aligned_len / frame_bytes) as u64;
-                    }
-                    // Carry over unaligned remainder bytes
-                    if aligned_len < pcm_data.len() {
-                        leftover.extend_from_slice(&pcm_data[aligned_len..]);
-                    }
+                if let Some(processed) = pcm_processor.process_pcm_chunk(
+                    &mut leftover,
+                    frame_bytes,
+                    bit_depth,
+                    channels,
+                    &mut pcm_kind,
+                ) {
+                    feed_ring_abortable(
+                        &ring,
+                        &processed.samples,
+                        &stop_rx,
+                        &paused,
+                        Some(&force_silent),
+                    );
+                    total_frames_fed += processed.source_frames;
                 }
 
                 let mut http_eof_excl = false;
@@ -3350,38 +3471,33 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
-                    // Detected on the raw bytes, BEFORE they become f32 and
-                    // before `leftover` is truncated: the marker only exists in
-                    // the 24-bit packing.
-                    let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
-                    if dop_active.swap(dop, Ordering::Relaxed) != dop {
-                        info!(dop, "local_audio_dop_stream_state_changed");
-                        // Le volume effectif dépend de cet état : en DoP il vaut
-                        // l'unité, sinon le produit volume × ReplayGain. C'est
-                        // le seul endroit où l'état bascule.
-                        sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
-                    }
-                    let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
-                    let remainder = leftover[aligned_len..].to_vec();
-                    leftover = remainder;
-
-                    apply_local_dsp(
-                        &mut samples,
-                        &eq,
-                        &convolver,
-                        &crossfeed,
-                        &pure_bypass,
+                    let Some(processed) = pcm_processor.process_pcm_chunk(
+                        &mut leftover,
+                        frame_bytes,
+                        bit_depth,
                         channels,
-                        dop,
+                        &mut pcm_kind,
+                    ) else {
+                        continue;
+                    };
+
+                    feed_ring_abortable(
+                        &ring,
+                        &processed.samples,
+                        &stop_rx,
+                        &paused,
+                        Some(&force_silent),
                     );
 
-                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
-
-                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+                    total_frames_fed += processed.source_frames;
 
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                if http_eof_excl {
+                    report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
                 }
 
                 // Fin de piste : rendre au périphérique ce que le convolveur
@@ -4749,54 +4865,65 @@ impl OutputTarget for LocalOutput {
             // Previously the remainder was silently dropped, causing every
             // subsequent 24-bit sample to be read from the wrong byte offset
             // (white noise).
-            let mut leftover: Vec<u8> = Vec::new();
+            let mut leftover = pcm_data;
+            let mut pcm_kind = LocalPcmKind::for_bit_depth(bit_depth);
+            let pcm_processor = LocalPcmProcessor {
+                eq: &eq,
+                convolver: &convolver,
+                crossfeed: &crossfeed,
+                pure_bypass: &pure_bypass,
+                dop_active: &dop_active,
+                volume: &volume,
+                user_volume: &user_volume_ref,
+                rg_factor: &rg_factor_ref,
+            };
 
             // Process leftover from header read
-            if !pcm_data.is_empty() {
-                let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
-                if aligned_len > 0 {
-                    let mut samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
+            if let Some(processed) = pcm_processor.process_pcm_chunk(
+                &mut leftover,
+                frame_bytes,
+                bit_depth,
+                channels,
+                &mut pcm_kind,
+            ) {
+                let mut samples = processed.samples;
 
-                    // Diagnostic: log first few f32 samples and detect anomalies.
-                    // White noise manifests as high-amplitude random values in
-                    // what should be a gentle attack.
-                    if !samples.is_empty() {
-                        let first_8: Vec<f32> = samples.iter().take(8).copied().collect();
-                        let max_abs = samples
-                            .iter()
-                            .take(200)
-                            .fold(0.0f32, |m, &s| m.max(s.abs()));
-                        let non_zero = samples.iter().take(200).filter(|&&s| s != 0.0).count();
-                        info!(
-                            first_samples = ?first_8,
-                            max_abs_200 = max_abs,
-                            non_zero_in_200 = non_zero,
-                            total_samples = samples.len(),
-                            bit_depth,
-                            frame_bytes,
-                            "local_audio_initial_samples_diagnostic"
-                        );
-                    }
+                // Diagnostic: log first few f32 samples and detect anomalies.
+                // White noise manifests as high-amplitude random values in
+                // what should be a gentle attack.
+                if !samples.is_empty() {
+                    let first_8: Vec<f32> = samples.iter().take(8).copied().collect();
+                    let max_abs = samples
+                        .iter()
+                        .take(200)
+                        .fold(0.0f32, |m, &s| m.max(s.abs()));
+                    let non_zero = samples.iter().take(200).filter(|&&s| s != 0.0).count();
+                    info!(
+                        first_samples = ?first_8,
+                        max_abs_200 = max_abs,
+                        non_zero_in_200 = non_zero,
+                        total_samples = samples.len(),
+                        bit_depth,
+                        frame_bytes,
+                        dop = processed.dop,
+                        "local_audio_initial_samples_diagnostic"
+                    );
+                }
 
-                    if needs_channel_adapt {
-                        samples = adapt_channels(&samples, channels, output_ch);
-                    }
-                    if needs_resample {
-                        samples = rubato_resample_chunk(
-                            &mut resampler,
-                            &samples,
-                            output_ch,
-                            false,
-                            &mut resample_leftover,
-                        );
-                    }
-                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
-                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+                if needs_channel_adapt {
+                    samples = adapt_channels(&samples, channels, output_ch);
                 }
-                // Carry over unaligned remainder bytes
-                if aligned_len < pcm_data.len() {
-                    leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                if needs_resample {
+                    samples = rubato_resample_chunk(
+                        &mut resampler,
+                        &samples,
+                        output_ch,
+                        false,
+                        &mut resample_leftover,
+                    );
                 }
+                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                total_frames_fed += processed.source_frames;
             }
             let mut total_bytes_read: u64 = 0;
             let mut first_data_logged = false;
@@ -4926,16 +5053,16 @@ impl OutputTarget for LocalOutput {
                     continue;
                 }
 
-                let dop = is_dop_pcm(&leftover[..aligned_len], bit_depth, channels);
-                if dop_active.swap(dop, Ordering::Relaxed) != dop {
-                    info!(dop, "local_audio_dop_stream_state_changed");
-                    // Voir la note au site jumeau : le volume effectif suit
-                    // l'état DoP, et c'est ici qu'il bascule.
-                    sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
-                }
-                let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
-                let remainder = leftover[aligned_len..].to_vec();
-                leftover = remainder;
+                let Some(processed) = pcm_processor.process_pcm_chunk(
+                    &mut leftover,
+                    frame_bytes,
+                    bit_depth,
+                    channels,
+                    &mut pcm_kind,
+                ) else {
+                    continue;
+                };
+                let mut samples = processed.samples;
 
                 // Detect all-zero samples (silence from decode failure)
                 if !first_data_logged || total_frames_fed == 0 {
@@ -4947,16 +5074,6 @@ impl OutputTarget for LocalOutput {
                         );
                     }
                 }
-
-                apply_local_dsp(
-                    &mut samples,
-                    &eq,
-                    &convolver,
-                    &crossfeed,
-                    &pure_bypass,
-                    channels,
-                    dop,
-                );
 
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
@@ -4986,7 +5103,7 @@ impl OutputTarget for LocalOutput {
                     break;
                 }
 
-                total_frames_fed += (aligned_len / frame_bytes) as u64;
+                total_frames_fed += processed.source_frames;
 
                 // Start the cpal stream once enough data has been pre-filled.
                 // This ensures the audio device never pulls from an empty/sparse
@@ -5013,6 +5130,10 @@ impl OutputTarget for LocalOutput {
                 let pos =
                     (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
                 position_ms.store(pos, Ordering::Relaxed);
+            }
+
+            if http_eof {
+                report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
             }
 
             // If the stream was never started (very short track or error),
@@ -5201,6 +5322,7 @@ impl OutputTarget for LocalOutput {
                 frame_bytes = new_ch as usize * new_bps;
                 needs_channel_adapt = output_ch != new_ch;
                 needs_resample = next_needs_resample;
+                pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
 
                 // Recreate the resampler if the source sample rate changed
                 if needs_resample && new_sr != prev_sr {
@@ -5282,42 +5404,32 @@ impl OutputTarget for LocalOutput {
                 } else {
                     Vec::new()
                 };
-                if !gapless_pcm.is_empty() {
-                    let aligned = (gapless_pcm.len() / frame_bytes) * frame_bytes;
-                    if aligned > 0 {
-                        let mut smp = pcm_bytes_to_f32(&gapless_pcm[..aligned], bit_depth);
-                        // Le DSP s'applique AUSSI aux pistes chainees. Sans ca,
-                        // seule la premiere piste d'un album passait par l'EQ,
-                        // la convolution et le crossfeed : toutes les suivantes
-                        // partaient seches (#2296, JP Robbe). Meme ordre que la
-                        // boucle principale : DSP, puis canaux, puis cadence.
-                        apply_local_dsp(
-                            &mut smp,
-                            &eq,
-                            &convolver,
-                            &crossfeed,
-                            &pure_bypass,
-                            channels,
-                            dop_active.load(Ordering::Relaxed),
+                leftover.extend_from_slice(&gapless_pcm);
+                if let Some(processed) = pcm_processor.process_pcm_chunk(
+                    &mut leftover,
+                    frame_bytes,
+                    bit_depth,
+                    channels,
+                    &mut pcm_kind,
+                ) {
+                    let mut smp = processed.samples;
+                    // Même frontière que la piste initiale : la piste chaînée
+                    // conserve l'état du DSP mais prend une nouvelle décision
+                    // PCM/DoP avant son premier échantillon (#2296/#2232).
+                    if needs_channel_adapt {
+                        smp = adapt_channels(&smp, channels, output_ch);
+                    }
+                    if needs_resample {
+                        smp = rubato_resample_chunk(
+                            &mut resampler,
+                            &smp,
+                            output_ch,
+                            false,
+                            &mut resample_leftover,
                         );
-                        if needs_channel_adapt {
-                            smp = adapt_channels(&smp, channels, output_ch);
-                        }
-                        if needs_resample {
-                            smp = rubato_resample_chunk(
-                                &mut resampler,
-                                &smp,
-                                output_ch,
-                                false,
-                                &mut resample_leftover,
-                            );
-                        }
-                        feed_ring_abortable(&ring, &smp, &stop_rx, &paused, Some(&force_silent));
-                        total_frames_fed += (aligned / frame_bytes) as u64;
                     }
-                    if aligned < gapless_pcm.len() {
-                        leftover.extend_from_slice(&gapless_pcm[aligned..]);
-                    }
+                    feed_ring_abortable(&ring, &smp, &stop_rx, &paused, Some(&force_silent));
+                    total_frames_fed += processed.source_frames;
                 }
 
                 // Main read loop for the gapless-chained track
@@ -5349,24 +5461,19 @@ impl OutputTarget for LocalOutput {
                         Ok(n) => {
                             total_bytes_read += n as u64;
                             leftover.extend_from_slice(&gapless_read_buf[..n]);
-                            let aligned = (leftover.len() / frame_bytes) * frame_bytes;
-                            if aligned == 0 {
+                            if (leftover.len() / frame_bytes) * frame_bytes == 0 {
                                 continue;
                             }
-                            let mut smp = pcm_bytes_to_f32(&leftover[..aligned], bit_depth);
-                            let rem = leftover[aligned..].to_vec();
-                            leftover = rem;
-                            // Meme raison qu'au premier bloc : la piste chainee
-                            // doit traverser le DSP (#2296).
-                            apply_local_dsp(
-                                &mut smp,
-                                &eq,
-                                &convolver,
-                                &crossfeed,
-                                &pure_bypass,
+                            let Some(processed) = pcm_processor.process_pcm_chunk(
+                                &mut leftover,
+                                frame_bytes,
+                                bit_depth,
                                 channels,
-                                dop_active.load(Ordering::Relaxed),
-                            );
+                                &mut pcm_kind,
+                            ) else {
+                                continue;
+                            };
+                            let mut smp = processed.samples;
                             if needs_channel_adapt {
                                 smp = adapt_channels(&smp, channels, output_ch);
                             }
@@ -5396,7 +5503,7 @@ impl OutputTarget for LocalOutput {
                                 http_eof = false;
                                 break;
                             }
-                            total_frames_fed += (aligned / frame_bytes) as u64;
+                            total_frames_fed += processed.source_frames;
                             let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0)
                                 as u64
                                 + seek_offset;
@@ -5414,6 +5521,10 @@ impl OutputTarget for LocalOutput {
                             break;
                         }
                     }
+                }
+
+                if http_eof {
+                    report_incomplete_local_pcm_probe(pcm_kind, leftover.len());
                 }
 
                 // If this track also reached clean EOF, loop back to check
@@ -7007,6 +7118,140 @@ mod tests {
         let bytes = real_dop_bytes(DOP_DETECT_FRAMES - 1, 2);
         assert!(!is_dop_pcm(&bytes, 24, 2));
         assert!(is_dop_pcm(&real_dop_bytes(DOP_DETECT_FRAMES, 2), 24, 2));
+    }
+
+    #[test]
+    fn local_pcm_processing_is_identical_across_the_header_boundary() {
+        // Contre-épreuve de #2232 : l'impulsion est dans le bloc déjà lu avec
+        // l'en-tête. Sa sortie doit être strictement la même que le flux de
+        // référence traité en un seul chunk normal, état IIR compris.
+        let mut bytes = Vec::new();
+        for frame in 0..2048 {
+            let left = if frame == 0 { 16_384i16 } else { 0 };
+            let right = if frame == 0 { -16_384i16 } else { 0 };
+            bytes.extend_from_slice(&left.to_le_bytes());
+            bytes.extend_from_slice(&right.to_le_bytes());
+        }
+
+        let baseline_eq = std::sync::Mutex::new(Some(test_eq()));
+        let baseline_convolver = std::sync::Mutex::new(None);
+        let baseline_crossfeed = std::sync::Mutex::new(None);
+        let baseline_pure = AtomicBool::new(false);
+        let baseline_dop = AtomicBool::new(false);
+        let baseline_volume = AtomicU32::new(500);
+        let baseline_user = AtomicU32::new(500);
+        let baseline_rg = AtomicU32::new(1000);
+        let baseline_processor = LocalPcmProcessor {
+            eq: &baseline_eq,
+            convolver: &baseline_convolver,
+            crossfeed: &baseline_crossfeed,
+            pure_bypass: &baseline_pure,
+            dop_active: &baseline_dop,
+            volume: &baseline_volume,
+            user_volume: &baseline_user,
+            rg_factor: &baseline_rg,
+        };
+        let mut baseline_staged = bytes.clone();
+        let mut baseline_kind = LocalPcmKind::for_bit_depth(16);
+        let baseline = baseline_processor
+            .process_pcm_chunk(&mut baseline_staged, 4, 16, 2, &mut baseline_kind)
+            .expect("chunk de référence");
+        assert!(baseline_staged.is_empty());
+
+        let split_eq = std::sync::Mutex::new(Some(test_eq()));
+        let split_convolver = std::sync::Mutex::new(None);
+        let split_crossfeed = std::sync::Mutex::new(None);
+        let split_pure = AtomicBool::new(false);
+        let split_dop = AtomicBool::new(false);
+        let split_volume = AtomicU32::new(500);
+        let split_user = AtomicU32::new(500);
+        let split_rg = AtomicU32::new(1000);
+        let split_processor = LocalPcmProcessor {
+            eq: &split_eq,
+            convolver: &split_convolver,
+            crossfeed: &split_crossfeed,
+            pure_bypass: &split_pure,
+            dop_active: &split_dop,
+            volume: &split_volume,
+            user_volume: &split_user,
+            rg_factor: &split_rg,
+        };
+        let header_bytes = 137 * 4;
+        let mut split_staged = bytes[..header_bytes].to_vec();
+        let mut split_kind = LocalPcmKind::for_bit_depth(16);
+        let first = split_processor
+            .process_pcm_chunk(&mut split_staged, 4, 16, 2, &mut split_kind)
+            .expect("bloc PCM de l'en-tête");
+        split_staged.extend_from_slice(&bytes[header_bytes..]);
+        let second = split_processor
+            .process_pcm_chunk(&mut split_staged, 4, 16, 2, &mut split_kind)
+            .expect("bloc PCM suivant");
+
+        let mut split_output = first.samples;
+        split_output.extend_from_slice(&second.samples);
+        assert_eq!(split_output, baseline.samples);
+        assert_ne!(split_output, pcm_bytes_to_f32(&bytes, 16));
+        assert!(split_staged.is_empty());
+    }
+
+    #[test]
+    fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
+        let fixture = real_dop_bytes(64, 2);
+        let eq = std::sync::Mutex::new(Some(test_eq()));
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(Some(
+            crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
+        ));
+        let pure = AtomicBool::new(false);
+        let dop_active = AtomicBool::new(false);
+        let volume = AtomicU32::new(400);
+        let user = AtomicU32::new(500);
+        let rg = AtomicU32::new(800);
+        let processor = LocalPcmProcessor {
+            eq: &eq,
+            convolver: &convolver,
+            crossfeed: &crossfeed,
+            pure_bypass: &pure,
+            dop_active: &dop_active,
+            volume: &volume,
+            user_volume: &user,
+            rg_factor: &rg,
+        };
+        let ring = RingBuf::new(fixture.len() / 3);
+        let first_31_frames = 31 * 2 * 3;
+        let mut staged = fixture[..first_31_frames].to_vec();
+        let mut kind = LocalPcmKind::for_bit_depth(24);
+
+        let pending = processor.process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind);
+        assert!(pending.is_none());
+        assert_eq!(staged.len(), first_31_frames);
+        assert_eq!(ring.available(), 0);
+        assert_eq!(volume.load(Ordering::SeqCst), 400);
+
+        staged.extend_from_slice(&fixture[first_31_frames..]);
+        let prepared = processor
+            .process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind)
+            .expect("sonde DoP devenue concluante");
+        assert!(prepared.dop);
+        assert_eq!(kind, LocalPcmKind::Dop);
+        assert!(dop_active.load(Ordering::SeqCst));
+        assert_eq!(volume.load(Ordering::SeqCst), 1000);
+        assert_eq!(prepared.samples, pcm_bytes_to_f32(&fixture, 24));
+        assert_eq!(ring.available(), 0, "le caller n'a encore rien publié");
+        assert_eq!(ring.push(&prepared.samples), prepared.samples.len());
+
+        // Une fois reconnue, la nature de la piste ne dépend plus de la taille
+        // des lectures suivantes : ce petit chunk resterait sinon sous le seuil
+        // de la sonde et réactiverait volume et DSP en plein DoP.
+        let continuation = real_dop_bytes(4, 2);
+        staged.extend_from_slice(&continuation);
+        let continued = processor
+            .process_pcm_chunk(&mut staged, 6, 24, 2, &mut kind)
+            .expect("classification DoP verrouillée pour la piste");
+        assert!(continued.dop);
+        assert_eq!(continued.samples, pcm_bytes_to_f32(&continuation, 24));
+        assert!(dop_active.load(Ordering::SeqCst));
+        assert_eq!(volume.load(Ordering::SeqCst), 1000);
     }
 
     #[test]
