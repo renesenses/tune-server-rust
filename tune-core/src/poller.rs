@@ -810,6 +810,33 @@ pub(crate) mod decisions {
                 >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// Fin de piste à l'horloge murale pour un renderer DLNA au poll SAIN qui
+    /// gèle sa position dans la zone de fin sans jamais la dépasser ni passer
+    /// STOPPED (Villerio, Eversolo DMP-A6, 25/08 : SetNext acquitté jamais
+    /// honoré, PLAYING éternel, position figée exactement à la durée).
+    /// `past_end_reached` exige la position AU-DELÀ de durée+marge,
+    /// `wall_clock_past_end` exige une durée rapportée nulle, et
+    /// `duration_changed` attend un changement qui ne vient pas : aucun ne
+    /// couvre ce gel. Garde-fous : pic ≥ 80 % (le trajet jusqu'à la fin fut
+    /// honnête), position ÉPINGLÉE en zone de fin (une vraie transition
+    /// gapless la ramène près de zéro — pas de double-play), et l'horloge de
+    /// Tune ayant réellement dépassé durée + marge à 1x. L'appelant exige
+    /// toujours `POSITION_PAST_END_TICKS` coups consécutifs.
+    pub fn dlna_frozen_at_end_wall_clock(
+        is_dlna: bool,
+        played_enough: bool,
+        track_duration_ms: u64,
+        position_ms: u64,
+        wall_elapsed_secs: u64,
+    ) -> bool {
+        is_dlna
+            && played_enough
+            && track_duration_ms > END_MARGIN_MS
+            && position_ms.saturating_add(2000) >= track_duration_ms
+            && wall_elapsed_secs.saturating_mul(1000)
+                >= track_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+
     /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
     /// outright — the LMS UPnP bridge's `GetPositionInfo` SOAP call errors, so
     /// `get_status` returns `Err` and Tune gets NO transport state, position, or
@@ -1106,6 +1133,13 @@ pub mod fsm {
                     i.is_dlna,
                     i.reported_duration_ms,
                     i.track_duration_ms,
+                    i.wall_elapsed_secs,
+                )
+                || decisions::dlna_frozen_at_end_wall_clock(
+                    i.is_dlna,
+                    i.played_enough,
+                    i.track_duration_ms,
+                    i.position_ms,
                     i.wall_elapsed_secs,
                 );
         let past_end_track_ended =
@@ -1589,6 +1623,58 @@ pub mod fsm {
             assert!(
                 !classify_playing(&PlayingInput {
                     past_end_ticks: 1,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+        }
+
+        #[test]
+        fn un_dmp_fige_a_la_duree_avance_par_horloge_murale() {
+            // Villerio, DMP-A6, 25/08 22:24 : SetNext acquitté mais jamais
+            // honoré ; le renderer reste PLAYING, position figée EXACTEMENT à
+            // la durée (373000 — les stale_start_position du journal), durée
+            // rapportée inchangée. past_end_reached exige position > durée+3s,
+            // wall_clock_past_end exige durée rapportée nulle : aucun ne tire,
+            // la piste ne finit jamais. L'horloge murale de Tune, elle, sait.
+            let i = PlayingInput {
+                track_duration_ms: 373_000,
+                reported_duration_ms: 373_000,
+                played_enough: true,
+                position_ms: 373_000,
+                past_end_ticks: 2,
+                gapless_sent: true,
+                is_dlna: true,
+                wall_elapsed_secs: 380,
+                ..pbase()
+            };
+            assert!(classify_playing(&i).past_end_track_ended);
+
+            // Une VRAIE transition gapless à durées voisines remet la position
+            // près de zéro : la position n'est plus épinglée en zone de fin,
+            // le filet ne doit pas tirer (sinon double-play).
+            assert!(
+                !classify_playing(&PlayingInput {
+                    position_ms: 3_000,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+            // Gel en PLEIN MILIEU de piste (vrai blocage réseau) : pic < 80 %,
+            // on ne conclut pas une fin.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    played_enough: false,
+                    position_ms: 180_000,
+                    wall_elapsed_secs: 380,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+            // L'horloge n'a pas encore dépassé durée + marge : on attend.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    wall_elapsed_secs: 370,
                     ..i
                 })
                 .past_end_track_ended
@@ -3942,10 +4028,22 @@ impl PositionPoller {
                             track_duration_ms,
                             wall_elapsed,
                         );
+                    // DMP-A6/A8 : PLAYING éternel, position gelée À la durée,
+                    // poll sain — seul filet possible : l'horloge de Tune
+                    // (même !in_seek_grace que ses deux voisins).
+                    let dlna_frozen_end = !in_seek_grace
+                        && decisions::dlna_frozen_at_end_wall_clock(
+                            is_dlna,
+                            played_enough,
+                            track_duration_ms,
+                            status.position_ms,
+                            wall_elapsed,
+                        );
                     if past_end
                         || reached_end_exclusive
                         || wall_clock_past_end
                         || chromecast_wall_clock_past_end
+                        || dlna_frozen_end
                     {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
@@ -3958,6 +4056,7 @@ impl PositionPoller {
                                 exclusive_end = reached_end_exclusive,
                                 wall_clock_end = wall_clock_past_end,
                                 cast_wall_clock_end = chromecast_wall_clock_past_end,
+                                dlna_frozen_end,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
