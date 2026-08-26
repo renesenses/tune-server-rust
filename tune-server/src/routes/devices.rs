@@ -66,16 +66,52 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     let all_output_info = outputs.info_all().await;
     drop(outputs);
 
+    Json(json!(build_device_list(
+        discovered,
+        &registered_ids,
+        &all_output_info
+    )))
+}
+
+/// Construit la liste renvoyée par `GET /devices` (et `/devices/list`).
+///
+/// Logique extraite du handler pour être testable sans `AppState`.
+fn build_device_list(
+    discovered: Vec<tune_core::discovery::device::DiscoveredDevice>,
+    registered_ids: &std::collections::HashSet<String>,
+    all_output_info: &[Value],
+) -> Vec<Value> {
+    // Même dédoublonnage que POST /devices/scan : un appareil qui s'annonce
+    // sous plusieurs identités (mDNS + SSDP, cf. #1880) est regroupé par hôte,
+    // les identités secondaires rabattues dans capabilities["alternatives"].
+    // Sans ce repli, GET /devices renvoyait chaque identité comme une entrée
+    // distincte et la barre latérale affichait l'appareil en double (#2452).
+    let deduped = dedup_devices(discovered);
+
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut items: Vec<Value> = discovered
+    let mut items: Vec<Value> = deduped
         .iter()
         .map(|d| {
             seen_ids.insert(d.id.clone());
+            let mut registered = registered_ids.contains(&d.id);
+            // Les identités secondaires comptent comme « vues » : la boucle de
+            // rattrapage ci-dessous ne doit pas les réintroduire. Et si l'une
+            // d'elles est enregistrée comme sortie, l'appareil l'est.
+            if let Some(alts) = d
+                .capabilities
+                .get("alternatives")
+                .and_then(|a| a.as_array())
+            {
+                for alt_id in alts.iter().filter_map(|a| a.get("id")?.as_str()) {
+                    seen_ids.insert(alt_id.to_string());
+                    registered = registered || registered_ids.contains(alt_id);
+                }
+            }
             let mut v = serde_json::to_value(d).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("available".into(), json!(true));
-                obj.insert("registered".into(), json!(registered_ids.contains(&d.id)));
+                obj.insert("registered".into(), json!(registered));
                 obj.insert("type".into(), json!(d.device_type.to_string()));
             }
             v
@@ -85,7 +121,7 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     // Add any registered outputs not already present from SSDP discovery.
     // This ensures DLNA/OpenHome devices appear even when the SSDP scanner's
     // internal device list is empty (e.g., between scan cycles or after restart).
-    for output_info in &all_output_info {
+    for output_info in all_output_info {
         if let Some(device_id) = output_info.get("device_id").and_then(|v| v.as_str()) {
             if seen_ids.contains(device_id) {
                 continue;
@@ -115,7 +151,7 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
-    Json(json!(items))
+    items
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,5 +1499,140 @@ mod dlna_reprobe_tests {
         assert_eq!(collapsed.len(), 1);
         // On garde la premiere entree, celle qui a ete decouverte en premier.
         assert_eq!(collapsed[0].uuid, "uuid:aios-0");
+    }
+}
+
+#[cfg(test)]
+mod list_devices_dedup_tests {
+    use super::*;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn marantz_deux_identites() -> Vec<DiscoveredDevice> {
+        // Cas documenté dans #1880 : le même appareil s'annonce en mDNS
+        // (identité AirPlay) puis en SSDP (identité UPnP), même hôte.
+        vec![
+            DiscoveredDevice::new(
+                "airplay-00:06:78:7C:2E:26".into(),
+                "Marantz ND8006".into(),
+                OutputType::Airplay,
+                "192.168.1.50".into(),
+                7000,
+            ),
+            DiscoveredDevice::new(
+                "uuid:56fcb4ae-8f52-4a80-9d1c-000000000000".into(),
+                "Marantz ND8006".into(),
+                OutputType::Openhome,
+                "192.168.1.50".into(),
+                1400,
+            ),
+        ]
+    }
+
+    #[test]
+    fn liste_replie_les_identites_multiples_d_un_meme_hote() {
+        // GET /devices doit replier les identités d'un même hôte comme
+        // POST /devices/scan le fait déjà (issue #2452).
+        let items = build_device_list(
+            marantz_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        assert_eq!(
+            items.len(),
+            1,
+            "un appareil à deux identités doit produire UNE entrée, obtenu : {items:?}"
+        );
+        // La priorité Openhome > Airplay choisit l'identité UPnP en primaire.
+        assert_eq!(
+            items[0].get("id").and_then(|v| v.as_str()),
+            Some("uuid:56fcb4ae-8f52-4a80-9d1c-000000000000")
+        );
+        // L'identité secondaire reste accessible dans capabilities.alternatives.
+        let alts = items[0]
+            .get("capabilities")
+            .and_then(|c| c.get("alternatives"))
+            .and_then(|a| a.as_array())
+            .expect("capabilities.alternatives doit exister");
+        assert_eq!(
+            alts[0].get("id").and_then(|v| v.as_str()),
+            Some("airplay-00:06:78:7C:2E:26")
+        );
+    }
+
+    #[test]
+    fn backfill_ne_ressuscite_pas_une_identite_secondaire_enregistree() {
+        // Si l'identité secondaire est enregistrée comme sortie, la boucle de
+        // rattrapage (outputs enregistrés absents de la découverte) ne doit
+        // pas la réintroduire comme une deuxième entrée.
+        let mut registered = std::collections::HashSet::new();
+        registered.insert("airplay-00:06:78:7C:2E:26".to_string());
+        let output_info = vec![json!({
+            "device_id": "airplay-00:06:78:7C:2E:26",
+            "name": "Marantz ND8006",
+            "type": "airplay",
+            "host": "192.168.1.50",
+        })];
+        let items = build_device_list(marantz_deux_identites(), &registered, &output_info);
+        assert_eq!(
+            items.len(),
+            1,
+            "l'identité secondaire enregistrée ne doit pas réapparaître, obtenu : {items:?}"
+        );
+        // L'appareil est bien marqué enregistré, via son identité secondaire.
+        assert_eq!(
+            items[0].get("registered").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn format_inchange_pour_des_appareils_distincts() {
+        // Deux hôtes distincts : aucune fusion, et le format de réponse
+        // (available / registered / type) est inchangé.
+        let devices = vec![
+            DiscoveredDevice::new(
+                "dlna-a".into(),
+                "Salon".into(),
+                OutputType::Dlna,
+                "192.168.1.10".into(),
+                1400,
+            ),
+            DiscoveredDevice::new(
+                "dlna-b".into(),
+                "Cuisine".into(),
+                OutputType::Dlna,
+                "192.168.1.11".into(),
+                1400,
+            ),
+        ];
+        let items = build_device_list(devices, &std::collections::HashSet::new(), &[]);
+        assert_eq!(items.len(), 2);
+        for it in &items {
+            assert_eq!(it.get("available").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(it.get("registered").and_then(|v| v.as_bool()), Some(false));
+            assert!(it.get("type").and_then(|v| v.as_str()).is_some());
+        }
+    }
+
+    #[test]
+    fn backfill_conserve_les_sorties_enregistrees_hors_decouverte() {
+        // Une sortie enregistrée absente de la découverte doit toujours
+        // apparaître (comportement historique, à ne pas régresser).
+        let output_info = vec![json!({
+            "device_id": "dlna-orphelin",
+            "name": "Chambre",
+            "type": "dlna",
+            "host": "192.168.1.77",
+        })];
+        let items = build_device_list(Vec::new(), &std::collections::HashSet::new(), &output_info);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("id").and_then(|v| v.as_str()),
+            Some("dlna-orphelin")
+        );
+        assert_eq!(
+            items[0].get("registered").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 }
