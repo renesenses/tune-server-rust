@@ -5340,48 +5340,32 @@ impl PlaybackOrchestrator {
                 // FLAC temp file so we serve with Content-Length (chunked WAV
                 // causes noise on many renderers).
                 let sr = stream_data.quality.sample_rate;
-                let bd = stream_data.quality.bit_depth.max(16).min(24);
+                let bd = stream_data.quality.bit_depth.max(16).min(24) as u16;
 
                 info!(
                     service = service_name,
                     codec = %codec_lower,
                     sample_rate = sr,
-                    bit_depth = bd,
-                    "streaming_aac_pre_transcode_to_wav_for_dlna"
+                    "streaming_aac_transcode_to_wav_channel"
                 );
 
-                // FLAC-rejecting DLNA renderers (Revox/Denon/Marantz) get WAV.
-                let aac_did = req.output_device_id.as_deref().unwrap_or("");
-                let aac_enc_format =
-                    if aac_did.is_empty() || self.dlna_supports_mime(aac_did, "audio/flac").await {
-                        "flac"
-                    } else {
-                        "wav"
-                    };
-
+                // ── Téléchargement court, puis CANAL streaming ──
+                //
+                // L'ancien chemin transcodait la PISTE ENTIÈRE en fichier avant
+                // de jouer : télécharger + tout décoder + tout encoder = 34 s
+                // mesurées entre la décision et le play (Tidal AAC → DMP-A8,
+                // .18, 25/08). Le canal WAV — le chemin des DSD et des radios,
+                // au contrat rendu honnête en 0.9.106 — démarre dès les
+                // premiers blocs décodés. Seul le téléchargement du fichier
+                // AAC reste devant le play : quelques secondes.
                 let upstream_url = stream_data.url.clone();
                 let codec = codec_lower.clone();
                 let tmp_dl = std::env::temp_dir()
                     .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
                     .to_string_lossy()
                     .to_string();
-                let tmp_flac = std::env::temp_dir()
-                    .join(format!(
-                        "tune-aac-transcode-{}.{}",
-                        uuid::Uuid::new_v4(),
-                        aac_enc_format
-                    ))
-                    .to_string_lossy()
-                    .to_string();
-
                 let tmp_dl_clone = tmp_dl.clone();
-                let tmp_flac_clone = tmp_flac.clone();
-                // VU-mètres : ce pré-transcode a le PCM décodé en main — il
-                // alimente aussi le forwarder de niveaux (YouTube/AAC sur
-                // DLNA restait aiguilles figées).
-                let aac_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
-                let transcode_result = tokio::task::spawn_blocking(move || {
-                    // 1. Download
+                let dl = tokio::task::spawn_blocking(move || {
                     let resp = crate::http::client::blocking_builder()
                         .timeout(std::time::Duration::from_secs(120))
                         .build()
@@ -5392,116 +5376,102 @@ impl PlaybackOrchestrator {
                     }
                     let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
                     std::fs::write(&tmp_dl_clone, &bytes).map_err(|e| format!("write dl: {e}"))?;
-
-                    // 2. Decode to PCM
-                    let decoded = crate::audio::decode::decode_to_pcm(
-                        &tmp_dl_clone,
-                        Some(sr),
-                        Some(2),
-                        0.0,
-                        0.0,
-                    )?;
-                    let mut pcm_bytes = decoded.pcm_bytes();
-                    let mut actual_bd = decoded.bit_depth;
-
-                    // WAV/LPCM fallback is a 16-bit-only DLNA profile
-                    // (DLNA.ORG_PN=LPCM); a >16-bit source served under it plays
-                    // silence on strict renderers (#1137). Cap to 16-bit for
-                    // WAV; FLAC keeps full depth.
-                    if aac_enc_format == "wav" && actual_bd > 16 {
-                        pcm_bytes =
-                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                        actual_bd = 16;
-                    }
-
-                    if let Some(ref ltx) = aac_levels_tx {
-                        crate::audio::tap::send_windowed_pcm(
-                            ltx,
-                            &pcm_bytes,
-                            actual_bd,
-                            decoded.channels as u16,
-                            decoded.sample_rate,
-                        );
-                    }
-
-                    // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
-                    //    FLAC-rejecting renderer (Revox/Denon/Marantz).
-                    //    Encoding is pure CPU work, so run it synchronously on
-                    //    this blocking thread. Previously this drove the async
-                    //    encoder via a nested `Handle::block_on`, which could
-                    //    deadlock the runtime and hang the transcode forever
-                    //    (no complete/failed log) — the "YouTube→DLNA does
-                    //    nothing" bug on small servers.
-                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                        aac_enc_format,
-                        decoded.sample_rate,
-                        actual_bd as u32,
-                        decoded.channels,
-                    );
-                    encoder.start_sync()?;
-                    encoder.write_sync(&pcm_bytes)?;
-                    let encoded_data = encoder.finish_sync()?;
-
-                    std::fs::write(&tmp_flac_clone, &encoded_data)
-                        .map_err(|e| format!("write flac: {e}"))?;
-
-                    let _ = std::fs::remove_file(&tmp_dl_clone);
-                    let file_size = encoded_data.len() as u64;
-                    Ok::<(u64, u16), String>((file_size, actual_bd))
+                    Ok::<(), String>(())
                 })
                 .await;
-
-                match transcode_result {
-                    Ok(Ok((file_size, actual_bd))) => {
-                        info!(
-                            tmp = %tmp_flac,
-                            file_size,
-                            bit_depth = actual_bd,
-                            "streaming_aac_pre_transcode_complete"
-                        );
-
-                        // Label consistently with what was actually encoded
-                        // (previously said audio/wav while emitting FLAC bytes).
-                        let aac_mime = if aac_enc_format == "flac" {
-                            "audio/flac"
-                        } else {
-                            "audio/wav"
-                        };
-                        let file_info = StreamInfo {
-                            format: aac_enc_format.into(),
-                            mime_type: aac_mime.into(),
-                            sample_rate: sr,
-                            // Encoded depth: WAV fallback is capped to 16-bit.
-                            bit_depth: actual_bd,
-                            channels: 2,
-                            file_size: Some(file_size),
-                            duration_ms: None,
-                            ..Default::default()
-                        };
-                        let session_id = self
-                            .streamer
-                            .create_file_session(file_info, tmp_flac, false)
-                            .await;
-
-                        let server_ip = self.server_ip();
-                        let url =
-                            self.streamer
-                                .get_stream_url(&session_id, &server_ip, aac_enc_format);
-                        (url, Some(session_id), aac_mime.to_string(), Some(file_size))
-                    }
+                match dl {
+                    Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        warn!(error = %e, "streaming_aac_pre_transcode_failed");
+                        warn!(error = %e, "streaming_aac_download_failed");
                         let _ = std::fs::remove_file(&tmp_dl);
-                        let _ = std::fs::remove_file(&tmp_flac);
-                        return Err(format!("AAC transcode failed: {e}"));
+                        return Err(format!("AAC download failed: {e}"));
                     }
                     Err(e) => {
-                        warn!(error = %e, "streaming_aac_pre_transcode_task_panic");
+                        warn!(error = %e, "streaming_aac_download_task_panic");
                         let _ = std::fs::remove_file(&tmp_dl);
-                        let _ = std::fs::remove_file(&tmp_flac);
-                        return Err(format!("AAC transcode task panic: {e}"));
+                        return Err(format!("AAC download task panic: {e}"));
                     }
                 }
+
+                let info = StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: sr,
+                    bit_depth: bd,
+                    channels: 2,
+                    ..Default::default()
+                };
+                let (session_id, tx, data_ready) =
+                    self.streamer.create_session(info, false, 256).await;
+                {
+                    let sessions = self.streamer.sessions_state();
+                    let sessions = sessions.lock().await;
+                    if let Some(session) = sessions.get(&session_id) {
+                        session
+                            .wav_header_included
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+
+                let ev_bus = self.event_bus.clone();
+                let playback = self.playback.clone();
+                let zone_id = req.zone_id;
+                let attach_levels = self.levels_attach_allowed(zone_id);
+                let fp = tmp_dl.clone();
+                tokio::spawn(async move {
+                    let err_bus = ev_bus.clone();
+                    let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                        Some(bus) => {
+                            let play_seq = playback.current_play_seq(zone_id).await;
+                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0)
+                        }
+                        None => {
+                            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
+                        }
+                    };
+                    let fp_clone = fp.clone();
+                    let tx_clone = tx.clone();
+                    drop(tx);
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming_seeked(
+                            &fp_clone,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_clone,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            0.0,
+                        )
+                    })
+                    .await;
+                    let _ = std::fs::remove_file(&fp);
+                    match result {
+                        Ok(Ok(_)) => {
+                            debug!("streaming_aac_channel_complete");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "streaming_aac_channel_decode_failed");
+                            if let Some(ref bus) = err_bus {
+                                bus.emit(
+                                    "zone.playback_error",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "error": format!("Impossible de décoder la piste : {e}"),
+                                    }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_aac_channel_task_panic");
+                        }
+                    }
+                });
+
+                let server_ip = self.server_ip();
+                let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+                (url, Some(session_id), "audio/wav".to_string(), None)
             } else {
                 // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
                 // actually supports this MIME type before proxying directly.
