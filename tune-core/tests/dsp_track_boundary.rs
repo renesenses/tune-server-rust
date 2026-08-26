@@ -48,11 +48,12 @@ fn play_url_remet_le_convolveur_a_zero() {
 /// revue de #2277). Un test qui appelle le helper directement ne peut pas voir
 /// ça : il faut tenir les points d'appel réels.
 ///
-/// ⚠️ L'invariant n'est PAS « autant de drainages que d'applications du DSP ».
-/// Les deux sites de la boucle gapless appliquent le DSP et ne doivent
-/// SURTOUT PAS drainer : une transition gapless est un flux continu, et vider
-/// le convolveur y insérerait la queue de la piste précédente (#2296). On
-/// compte donc les applications qui précèdent le point de chaînage.
+/// ⚠️ L'invariant n'est PAS « autant de drainages que d'appels textuels à
+/// `apply_local_dsp` ». La frontière PCM commune sert CoreAudio et cpal partagé,
+/// et les deux sites de la boucle gapless passent eux aussi par elle sans
+/// drainer : une transition gapless est un flux continu (#2296/#2232). Les
+/// assertions doivent donc suivre les consommateurs de cette frontière, pas
+/// recompter son implémentation.
 ///
 /// Les transports Windows ont deux préparations exclusives : f32 quand le
 /// format ASIO natif est incompatible, entière pour WASAPI et les formats
@@ -62,21 +63,35 @@ fn play_url_remet_le_convolveur_a_zero() {
 fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let src = source();
     let prod = production(&src);
-    let chainage = prod
-        .find("local_audio_gapless_chaining_next_track")
-        .unwrap_or(prod.len());
 
     let drainages = prod.matches("flush_local_dsp(").count() - 1; // moins la définition
-    let applications = prod[..chainage].matches("apply_local_dsp(").count() - 1; // idem
-
-    assert_eq!(
-        drainages, applications,
-        "{drainages} drainage(s) pour {applications} site(s) DSP avant le chaînage : \
-         chaque préparation de fin de piste doit avoir son drainage"
-    );
     assert!(
         drainages >= 5,
         "les cinq chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
+    );
+
+    let preparation_locale = prod
+        .split("impl LocalPcmProcessor<'_>")
+        .nth(1)
+        .and_then(|s| s.split("fn report_incomplete_local_pcm_probe(").next())
+        .expect("la frontière PCM locale commune doit rester identifiable");
+    assert!(
+        preparation_locale.contains("apply_local_dsp("),
+        "la frontière PCM commune ne passe plus par le DSP"
+    );
+
+    let coreaudio = prod
+        .split("// ------- Exclusive mode path (macOS only) -------")
+        .nth(1)
+        .and_then(|s| {
+            s.split("// ------- Exclusive mode path (Windows ASIO) -------")
+                .next()
+        })
+        .expect("le chemin CoreAudio exclusif doit rester identifiable");
+    assert!(
+        coreaudio.contains("pcm_processor.process_pcm_chunk(")
+            && coreaudio.contains("flush_local_dsp("),
+        "CoreAudio exclusif doit traverser la frontière PCM commune puis drainer sa fin de piste"
     );
 
     let preparation_windows = prod
@@ -125,6 +140,16 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
             && wasapi.contains("flush_local_dsp("),
         "WASAPI doit passer par la préparation entière puis drainer sa fin de piste"
     );
+
+    let partage = prod
+        .split("// ------- Open cpal device (shared mode) -------")
+        .nth(1)
+        .expect("le chemin cpal partagé doit rester identifiable");
+    assert!(
+        partage.contains("pcm_processor.process_pcm_chunk(")
+            && partage.contains("flush_local_dsp("),
+        "cpal partagé doit traverser la frontière PCM commune puis drainer la fin de chaîne"
+    );
 }
 
 /// Les pistes CHAÎNÉES en gapless doivent traverser le DSP elles aussi.
@@ -145,11 +170,14 @@ fn la_boucle_gapless_applique_le_dsp() {
         .expect("le point de chaînage gapless doit exister");
 
     assert_eq!(
-        prod[debut..].matches("apply_local_dsp(").count(),
+        prod[debut..]
+            .matches("pcm_processor.process_pcm_chunk(")
+            .count(),
         2,
         "les deux sites de la boucle gapless — premier bloc et boucle \
-         principale — doivent appliquer le DSP, sinon une correction de pièce \
-         cesse de s'appliquer après la première piste d'un album (#2296)"
+         principale — doivent traverser la frontière PCM qui applique le DSP, \
+         sinon une correction de pièce cesse de s'appliquer après la première \
+         piste d'un album (#2296/#2232)"
     );
 }
 
