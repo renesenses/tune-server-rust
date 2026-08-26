@@ -10,7 +10,10 @@ use tracing::{error, warn};
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 #[cfg(feature = "oaat")]
-use super::helpers::{BaseDeTempsOaat, detect_and_parse, duree_audio_envoyee, format_rate_display};
+use super::helpers::{
+    BaseDeTempsOaat, detect_and_parse, duree_audio_envoyee, extraire_payloads_fin_flux,
+    format_rate_display,
+};
 
 #[cfg(feature = "oaat")]
 const FLAC_CHUNK_SIZE: usize = 4096;
@@ -418,6 +421,7 @@ impl OutputTarget for OaatMultiroomOutput {
             let mut health_check_interval =
                 tokio::time::interval(std::time::Duration::from_secs(10));
             health_check_interval.tick().await; // skip immediate first tick
+            let mut eof_atteint = false;
 
             loop {
                 tokio::select! {
@@ -441,7 +445,10 @@ impl OutputTarget for OaatMultiroomOutput {
                                 error!(device = %device_name, error = %e, "oaat-multiroom: stream error");
                                 break;
                             }
-                            None => break,
+                            None => {
+                                eof_atteint = true;
+                                break;
+                            }
                         }
 
                         while buf.len() >= packet_size
@@ -504,6 +511,73 @@ impl OutputTarget for OaatMultiroomOutput {
                                 tokio::time::sleep(expected - elapsed).await;
                             }
                         }
+                    }
+                }
+            }
+
+            // Une pause peut coincider avec l'EOF : ne pas vider le dernier
+            // payload pendant la pause, mais continuer d'observer Stop.
+            while eof_atteint && paused.load(Ordering::Relaxed) && playing.load(Ordering::Relaxed) {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
+            }
+
+            if eof_atteint && playing.load(Ordering::Relaxed) {
+                let alignement = (!is_flac).then_some(bytes_per_frame);
+                match extraire_payloads_fin_flux(&mut buf, packet_size, alignement) {
+                    Ok(payloads_finaux) => {
+                        for paquet in payloads_finaux {
+                            let payload = paquet.bytes;
+                            if is_flac {
+                                trames_flac.avaler(&payload);
+                                if trames_flac.est_synchronise() {
+                                    sample_offset = trames_flac.position_samples();
+                                }
+                            }
+                            let pts_ns = stream_start_ns
+                                + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
+                            let mut flags = PacketFlags::empty();
+                            if !payload.is_empty() && sample_offset == 0 && byte_offset == 0 {
+                                flags |= PacketFlags::FIRST_PACKET;
+                            }
+                            if paquet.dernier {
+                                flags |= PacketFlags::LAST_PACKET;
+                            }
+
+                            let envoi = {
+                                let mut z = zone.lock().await;
+                                z.send_audio_all(
+                                    stream_num,
+                                    cur_format,
+                                    pts_ns,
+                                    sample_offset,
+                                    &payload,
+                                    flags,
+                                )
+                                .await
+                            };
+                            if let Err(e) = envoi {
+                                error!(device = %device_name, error = %e, "oaat-multiroom: final packet failed");
+                                break;
+                            }
+
+                            if is_flac {
+                                byte_offset += payload.len() as u64;
+                            } else {
+                                sample_offset += (payload.len() / bytes_per_frame) as u64;
+                            }
+                            position_ms.store(
+                                sample_offset * 1000 / cur_sample_rate.max(1) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    Err(raison) => {
+                        error!(device = %device_name, %raison, "oaat-multiroom: invalid final payload");
                     }
                 }
             }
