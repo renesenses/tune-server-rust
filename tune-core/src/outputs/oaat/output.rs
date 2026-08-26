@@ -9,7 +9,8 @@ use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportSta
 
 #[cfg(feature = "oaat")]
 use super::helpers::{
-    StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, format_rate_display,
+    BaseDeTempsOaat, StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, duree_audio_envoyee,
+    format_rate_display,
 };
 
 #[cfg(feature = "oaat")]
@@ -2658,16 +2659,18 @@ impl OutputTarget for OaatOutput {
                                 // compressé trop vite, et un peu compressé trop
                                 // lentement (#2214). Les samples réels cadencent ;
                                 // le DSD garde les octets, son débit est constant.
-                                let expected = if is_dsd {
-                                    let audio_bytes_per_sec = cur_sample_rate as f64 * bytes_per_frame as f64;
-                                    std::time::Duration::from_nanos(
-                                        (byte_offset as f64 / audio_bytes_per_sec * 1e9) as u64,
-                                    )
+                                let base_de_temps = if is_dsd {
+                                    BaseDeTempsOaat::OctetsADebitConstant
                                 } else {
-                                    std::time::Duration::from_nanos(
-                                        (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
-                                    )
+                                    BaseDeTempsOaat::Samples
                                 };
+                                let expected = duree_audio_envoyee(
+                                    base_de_temps,
+                                    sample_offset,
+                                    byte_offset,
+                                    cur_sample_rate,
+                                    bytes_per_frame,
+                                );
                                 let elapsed = start.elapsed();
                                 if expected > elapsed {
                                     tokio::time::sleep(expected - elapsed).await;
