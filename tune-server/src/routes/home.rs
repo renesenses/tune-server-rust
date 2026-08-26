@@ -641,8 +641,12 @@ async fn other_versions(
     // aurait fait ses preuves en local » : c'est demande explicitement
     // maintenant. Budget borne : les ECOUTES_STREAMING dernieres ecoutes
     // distinctes, UNE recherche par service et par titre, cache six heures.
+    // Les N derniers TITRES distincts — pas les N dernières lignes. Trois
+    // réécoutes du même morceau mangeaient tout le budget : sur un accueil
+    // réel, un seul groupe sur sept avait sa recherche streaming, et
+    // « Billie Jean » — écoutée juste avant — n'en avait aucune (25/08).
     let sql_recentes = format!(
-        "SELECT DISTINCT title, artist_name, COALESCE(album_title, '')          FROM (SELECT title, artist_name, album_title, listened_at                FROM listen_history WHERE artist_name IS NOT NULL                ORDER BY listened_at DESC LIMIT {ECOUTES_STREAMING})"
+        "SELECT title, artist_name, MAX(COALESCE(album_title, '')) FROM (SELECT title, artist_name, album_title, listened_at FROM listen_history WHERE artist_name IS NOT NULL ORDER BY listened_at DESC LIMIT 200) le GROUP BY title, artist_name ORDER BY MAX(listened_at) DESC LIMIT {ECOUTES_STREAMING}"
     );
     let recentes: Vec<(String, String, String)> = state
         .backend
