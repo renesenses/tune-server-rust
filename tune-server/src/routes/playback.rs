@@ -306,7 +306,7 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
     zone
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct PlayRequest {
     track_id: Option<i64>,
     track_ids: Option<Vec<i64>>,
@@ -335,6 +335,79 @@ struct PlayRequest {
     sample_rate: Option<u32>,
     bit_depth: Option<u16>,
     media_format: Option<String>,
+    // #2441 — ce que l'auditeur a demande, DIT par l'appelant.
+    //
+    // Le corps porte deja de quoi reconnaitre un album ou une playlist
+    // (`album_id`, `playlist_id`, `streaming_*_id`) : `contexte_de_lecture`
+    // s'en sert. Mais « Toutes les pistes » depuis une page artiste, ou la
+    // lecture d'un label, arrivent comme une simple liste de `track_ids` —
+    // rien dans le corps ne dit d'ou venait le clic. Ces deux champs laissent
+    // le client l'ENONCER ; ils priment sur toute deduction.
+    context_type: Option<String>,
+    context_id: Option<String>,
+}
+
+/// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
+/// les a enumerees (fil forum 1557, 26/08/2026) : « titre, album, playlist,
+/// artiste, label ».
+///
+/// La liste est ici pour que le serveur refuse une valeur inventee plutot que
+/// de laisser n'importe quelle chaine entrer en base : une colonne libre se
+/// remplirait de variantes ("Album", "albums", "PLAYLIST") et le jour ou une
+/// regle d'affichage sera arbitree, elle porterait sur du sable.
+const CONTEXTES_CONNUS: [&str; 5] = ["track", "album", "playlist", "artist", "label"];
+
+/// Ce que l'auditeur a demande, lu dans le corps de `POST /zones/:id/play`.
+///
+/// FabienM pose la regle au point de clic : « le type pris en compte dans ces
+/// rubriques depend de l'endroit ou l'utilisateur a clique sur "Lire" ». Cette
+/// fonction ne fait que la transcrire — elle ne decide RIEN de ce qui sera
+/// affiche ensuite, ce point n'etant pas arbitre (#2441).
+///
+/// L'ordre suit celui du gestionnaire lui-meme, ou les conteneurs priment sur
+/// la piste : un `POST` qui porte a la fois `album_id` et `track_id` met tout
+/// l'album en file, donc c'est bien l'album qui a ete demande.
+///
+/// `(None, None)` quand rien ne permet de trancher — notamment une liste de
+/// `track_ids` nue, qui peut aussi bien venir d'une page artiste que d'une
+/// selection manuelle. On ecrit alors NULL : une intention devinee est pire
+/// qu'une intention absente.
+fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>) {
+    // 1. L'appelant l'a dit explicitement : sa parole prime sur toute
+    //    deduction. C'est la seule voie pour `artist` et `label`.
+    if let Some(t) = body
+        .context_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| CONTEXTES_CONNUS.contains(t))
+    {
+        return (Some(t.to_string()), body.context_id.clone());
+    }
+
+    // 2. Sinon, ce que le corps trahit deja de lui-meme. Les deux premiers cas
+    //    exigent `source` comme le gestionnaire lui-meme : sans service
+    //    nomme, il ne prend pas la branche streaming, et le contexte doit
+    //    decrire ce qui joue vraiment.
+    if let (Some(_), Some(id)) = (&body.source, &body.streaming_album_id) {
+        return ("album".to_string().into(), Some(id.clone()));
+    }
+    if let (Some(_), Some(id)) = (&body.source, &body.streaming_playlist_id) {
+        return ("playlist".to_string().into(), Some(id.clone()));
+    }
+    if let Some(id) = body.album_id {
+        return ("album".to_string().into(), Some(id.to_string()));
+    }
+    if let Some(id) = body.playlist_id {
+        return ("playlist".to_string().into(), Some(id.to_string()));
+    }
+    if let Some(id) = body.track_id {
+        return ("track".to_string().into(), Some(id.to_string()));
+    }
+    // Piste unique en streaming : `source` + `source_id`, sans track_id.
+    if body.source.is_some() && body.source_id.is_some() && body.track_ids.is_none() {
+        return ("track".to_string().into(), body.source_id.clone());
+    }
+    (None, None)
 }
 
 #[derive(Deserialize)]
@@ -708,6 +781,24 @@ async fn play(
                 .into_response();
         }
     };
+
+    // #2441 — poser CE QUE l'auditeur vient de demander sur la session de la
+    // zone, avant toute branche : les huit chemins de lecture ci-dessous
+    // construisent chacun leur `PlayRequest`, et l'orchestrateur relira le
+    // contexte depuis l'etat de zone au moment d'ecrire `listen_history` —
+    // exactement comme il le fait deja pour le profil proprietaire.
+    //
+    // Toujours ecraser, meme avec `(None, None)` : ce geste-ci remplace le
+    // precedent. Sinon une piste jouee seule apres une playlist heriterait de
+    // la playlist.
+    //
+    // Le corps VIDE (retour au-dessus) ne passe pas ici : une reprise apres
+    // Stop n'est pas un nouveau geste, elle garde le contexte en cours.
+    let (contexte_type, contexte_id) = contexte_de_lecture(&body);
+    state
+        .playback
+        .set_session_context(zone_id, contexte_type, contexte_id)
+        .await;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
@@ -3473,5 +3564,122 @@ mod tests_prereglage {
     fn sans_prereglage_il_ny_a_rien_a_appliquer() {
         assert_eq!(prereglage_a_appliquer(None, false), None);
         assert_eq!(prereglage_a_appliquer(None, true), None);
+    }
+}
+
+#[cfg(test)]
+mod tests_contexte_de_lecture {
+    use super::{PlayRequest, contexte_de_lecture};
+
+    /// #2441 — FabienM, fil 1557 : « si je choisis de jouer une playlist
+    /// complete, je m'attends a voir cette playlist ». Aujourd'hui le serveur
+    /// recoit bien `playlist_id` et n'en garde RIEN : l'ecoute est ecrite dans
+    /// `listen_history` sans la moindre trace de son origine.
+    #[test]
+    fn une_playlist_locale_est_reconnue() {
+        let body = PlayRequest {
+            playlist_id: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("playlist".into()), Some("12".into())),
+            "le corps portait `playlist_id` et l'intention s'est perdue (#2441)"
+        );
+    }
+
+    /// « si je choisis de jouer un album complet, je m'attends a voir cet
+    /// album ». Le conteneur prime sur la piste : un corps qui porte les deux
+    /// met tout l'album en file, c'est donc l'album qui a ete demande — la
+    /// meme priorite que le gestionnaire applique pour construire la file.
+    #[test]
+    fn un_album_prime_sur_la_piste_du_meme_corps() {
+        let body = PlayRequest {
+            album_id: Some(7),
+            track_id: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("7".into()))
+        );
+    }
+
+    /// « si je choisis d'ecouter un titre alors je m'attends a voir ce titre ».
+    #[test]
+    fn une_piste_seule_dit_track() {
+        let body = PlayRequest {
+            track_id: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("track".into()), Some("99".into()))
+        );
+    }
+
+    /// Un album de streaming garde l'identifiant du service, pas un entier :
+    /// c'est pour cela que la colonne est TEXT.
+    #[test]
+    fn un_album_de_streaming_garde_son_identifiant_texte() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            streaming_album_id: Some("0060254735822".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("0060254735822".into()))
+        );
+    }
+
+    /// « Toutes les pistes » depuis une page artiste arrive comme une liste de
+    /// `track_ids` nue — indiscernable d'une selection manuelle. On n'invente
+    /// pas : NULL. Le client devra ENONCER `context_type` pour ce cas, ce que
+    /// le champ explicite permet.
+    #[test]
+    fn une_liste_de_pistes_nue_ne_se_devine_pas() {
+        let body = PlayRequest {
+            track_ids: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (None, None),
+            "une intention devinee est pire qu'une intention absente"
+        );
+    }
+
+    /// La parole de l'appelant prime : c'est la seule voie pour `artist` et
+    /// `label`, les deux types que le corps ne trahit jamais tout seul.
+    #[test]
+    fn le_type_annonce_prime_sur_la_deduction() {
+        let body = PlayRequest {
+            context_type: Some("artist".into()),
+            context_id: Some("451".into()),
+            track_ids: Some(vec![1, 2, 3]),
+            album_id: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("artist".into()), Some("451".into()))
+        );
+    }
+
+    /// Une valeur hors des cinq types enumeres par le testeur est ignoree, pas
+    /// stockee : sinon la colonne se remplirait de variantes et toute regle
+    /// d'affichage future porterait sur du sable. On retombe sur la deduction.
+    #[test]
+    fn un_type_inconnu_est_ignore() {
+        let body = PlayRequest {
+            context_type: Some("Playlist".into()),
+            album_id: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("7".into()))
+        );
     }
 }

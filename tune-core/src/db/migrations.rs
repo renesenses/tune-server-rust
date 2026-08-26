@@ -1150,6 +1150,29 @@ UPDATE radio_favorites
    AND saved_at NOT LIKE '%Z';
 ",
     },
+    Migration {
+        version: 83,
+        name: "listen_history_contexte_de_lecture",
+        // Rendre a chaque ecoute la trace de CE QUE l'auditeur a demande.
+        //
+        // `listen_history` ne conservait rien de l'intention : une piste jouee
+        // seule, la meme depuis une playlist et la meme dans un album complet
+        // produisaient trois lignes rigoureusement identiques. Toute rubrique
+        // voulant « refleter la realite de ce qu'a voulu faire l'auditeur »
+        // (FabienM, fil forum 1557) devait donc repartir de la table `albums`
+        // — ce que fait `fetch_continue_listening`, d'ou « Continuer l'ecoute »
+        // qui ne peut structurellement montrer qu'un album (#2441).
+        //
+        // `context_type` : `track`, `album`, `playlist`, `artist`, `label`.
+        // `context_id` : l'identifiant de cet objet, en TEXT — une playlist
+        // locale a un id numerique, un album Qobuz une chaine.
+        //
+        // Colonnes posees par add_column_if_missing dans le bloc de version,
+        // PAS par un ALTER TABLE ici : c'est la meme regle qu'a la migration
+        // 79, et l'ALTER planterait tout le runner en « duplicate column
+        // name » sur une base qui les a deja.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2232,6 +2255,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
     add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
+    // Ce que l'auditeur a demande au moment du clic sur « Lire » (migration
+    // 83, #2441). TEXT pour les deux : l'identifiant peut etre un entier
+    // local ou une chaine de service de streaming.
+    add_column_if_missing(db, "listen_history", "context_type", "TEXT");
+    add_column_if_missing(db, "listen_history", "context_id", "TEXT");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -2561,6 +2589,24 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         33,
         "podcast_source_id",
         include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
+    ),
+    // Jumelle de la migration SQLite 83. `listen_history` n'a jamais su d'ou
+    // venait une ecoute : sans ces deux colonnes, la meme piste jouee seule,
+    // depuis une playlist ou dans un album donnent trois lignes identiques,
+    // et aucune rubrique ne peut refleter l'intention de l'auditeur (#2441).
+    //
+    // La version 34 est SAUTEE volontairement. Le fichier
+    // `034_radio_favorites_saved_at_texte.sql` existe sur le disque depuis
+    // #2179 mais n'a JAMAIS ete inscrit ici : sa jumelle SQLite (migration
+    // 82) tourne, la PostgreSQL non. Prendre 34 ici masquerait ce trou ;
+    // le sauter le laisse visible. Qui inscrira ce fichier devra prendre la
+    // version LIBRE SUIVANTE (36), jamais 34 : `run_pg_migrations` ne
+    // rejoue que `version > current`, et une base deja passee en 35
+    // n'executerait jamais une 34 inscrite apres coup.
+    (
+        35,
+        "listen_history_contexte_de_lecture",
+        include_str!("../../migrations/postgres/035_listen_history_contexte_de_lecture.sql"),
     ),
 ];
 

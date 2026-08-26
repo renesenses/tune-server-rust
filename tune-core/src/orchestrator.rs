@@ -1993,11 +1993,14 @@ impl PlaybackOrchestrator {
             // handler from X-Profile-Id and inherited by autoplay / gapless
             // advances (which reuse the zone without touching it). Resolved here
             // in async context so record_listen itself stays sync.
-            let session_profile_id = self
-                .playback
-                .get_state(req.zone_id)
-                .await
-                .session_profile_id;
+            // Meme lecture, meme raison que le profil : l'etat de zone porte
+            // aussi CE QUE l'auditeur a demande (piste, album, playlist,
+            // artiste, label), pose par le gestionnaire de `play` a partir du
+            // corps de la requete. Une avance automatique herite du contexte
+            // sans y toucher.
+            let etat = self.playback.get_state(req.zone_id).await;
+            let session_profile_id = etat.session_profile_id;
+            let context = (etat.session_context_type, etat.session_context_id);
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -2015,6 +2018,8 @@ impl PlaybackOrchestrator {
                 req.zone_id,
                 cover_path.as_deref(),
                 session_profile_id,
+                context.0.as_deref(),
+                context.1.as_deref(),
             );
         }
 
@@ -7291,6 +7296,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
         session_profile_id: Option<i64>,
+        context_type: Option<&str>,
+        context_id: Option<&str>,
     ) {
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
@@ -7312,6 +7319,13 @@ impl PlaybackOrchestrator {
             zone_id: Some(zone_id),
             cover_url: cover_url.map(Into::into),
             profile_id: session_profile_id,
+            // Ce que l'auditeur a demande. Ecrit tel qu'il l'a dit : rien
+            // n'est deduit ici de ce qui a fini par jouer. Le ticket #2441
+            // etablit que cette information n'etait ecrite NULLE PART — la
+            // section « Continuer l'ecoute » ne pouvait donc que repartir de
+            // la table `albums`.
+            context_type: context_type.map(Into::into),
+            context_id: context_id.map(Into::into),
         })
         .ok();
 
@@ -11200,6 +11214,8 @@ mod tests {
             zone_id,
             None,
             Some(7),
+            Some("playlist"),
+            Some("12"),
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -11218,6 +11234,12 @@ mod tests {
             .flatten()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
         assert_eq!(stored_profile, Some(7));
+        // #2441 — l'intention passee par l'appelant est ecrite telle quelle.
+        // Sans elle, cette ligne est indiscernable de la meme piste jouee
+        // seule, et aucune rubrique ne peut « refleter la realite de ce qu'a
+        // voulu faire l'auditeur ».
+        assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
+        assert_eq!(history[0].context_id.as_deref(), Some("12"));
         assert_eq!(history[0].source, "local");
     }
 

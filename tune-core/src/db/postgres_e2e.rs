@@ -215,6 +215,8 @@ async fn pg_history_round_trip() {
         zone_id: None,
         cover_url: None,
         profile_id: None,
+        context_type: None,
+        context_id: None,
     };
     repo.record(&rec).unwrap();
     repo.record(&rec).unwrap();
