@@ -174,6 +174,42 @@ pub mod sql {
         )
     }
 
+    /// Albums qui portent la signature étroite du collage #2458.
+    ///
+    /// On ne répare PAS tout désaccord album/pistes : un album classique peut
+    /// légitimement porter un artiste d'album différent de ses interprètes. Il
+    /// faut ici, simultanément :
+    /// - un artiste d'album dont le MBID est présent mais vide (valeur invalide
+    ///   que l'ancien `ArtistRepo::get_or_create` utilisait comme identité) ;
+    /// - un album local non compilation ;
+    /// - toutes les pistes rattachées au même autre `artist_id` ;
+    /// - aucun tag ALBUMARTIST non vide qui contredise cet artiste unanime.
+    pub fn empty_mbid_artist_collapse_candidates() -> &'static str {
+        "SELECT a.id, a.title, a.artist_id, unanimous.artist_id, target.name \
+         FROM albums a \
+         JOIN artists current_artist ON current_artist.id = a.artist_id \
+         JOIN ( \
+             SELECT album_id, MIN(artist_id) AS artist_id \
+             FROM tracks \
+             GROUP BY album_id \
+             HAVING COUNT(*) > 0 \
+                AND COUNT(artist_id) = COUNT(*) \
+                AND COUNT(DISTINCT artist_id) = 1 \
+         ) unanimous ON unanimous.album_id = a.id \
+         JOIN artists target ON target.id = unanimous.artist_id \
+         WHERE a.source = 'local' \
+           AND COALESCE(a.is_compilation, 0) = 0 \
+           AND current_artist.musicbrainz_id IS NOT NULL \
+           AND TRIM(current_artist.musicbrainz_id) = '' \
+           AND a.artist_id <> unanimous.artist_id \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM tracks tagged \
+               WHERE tagged.album_id = a.id \
+                 AND NULLIF(TRIM(tagged.album_artist), '') IS NOT NULL \
+                 AND LOWER(TRIM(tagged.album_artist)) <> LOWER(TRIM(target.name)) \
+           )"
+    }
+
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {}, release_date = {}, original_date = {} WHERE id = {}",
@@ -741,6 +777,61 @@ impl AlbumRepo {
         album.artist_id = Some(requested_artist_id);
         album.artist_name = Some(requested_name);
         Ok(())
+    }
+
+    /// Répare les albums déjà figés sur un artiste partagé par MBID vide.
+    ///
+    /// Cette passe est destinée à la fin d'un scan complet et sain. Sa requête
+    /// est volontairement fail-closed : au moindre artiste de piste divergent,
+    /// drapeau compilation ou ALBUMARTIST contradictoire, aucune ligne n'est
+    /// candidate. Le retour est le nombre d'albums effectivement réattribués.
+    pub fn repair_empty_mbid_artist_collapses(&self) -> Result<usize, TuneError> {
+        let candidate_sql = sql::empty_mbid_artist_collapse_candidates();
+        let update_sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+        let mut repaired = 0usize;
+
+        self.db.write_tx(&mut |tx| {
+            let candidates = tx.query_many(candidate_sql, &[])?;
+            for row in candidates {
+                let Some(album_id) = row.first().and_then(|value| value.as_i64()) else {
+                    continue;
+                };
+                let title = row
+                    .get(1)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                let previous_artist_id = row.get(2).and_then(|value| value.as_i64());
+                let Some(target_artist_id) = row.get(3).and_then(|value| value.as_i64()) else {
+                    continue;
+                };
+                let target_name = row
+                    .get(4)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                if target_name
+                    .trim()
+                    .eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+                {
+                    continue;
+                }
+
+                let params: [&dyn ToSqlValue; 2] = [&target_artist_id, &album_id];
+                if tx.execute(&update_sql, &params)? > 0 {
+                    repaired += 1;
+                    tracing::warn!(
+                        album_id,
+                        album = %title,
+                        previous_artist_id = ?previous_artist_id,
+                        target_artist_id,
+                        target_artist = %target_name,
+                        "album_artist_repaired_empty_mbid_collapse"
+                    );
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(repaired)
     }
 
     /// The id of the album a folder holds, if one is recorded.
@@ -1619,11 +1710,23 @@ mod tests {
 
     /// Pose une piste numérotée sur un album, comme le fait le scan.
     fn seed_track(db: &SqliteDb, album_id: i64, artist_id: i64, n: i32, path: &str) {
+        seed_track_with_album_artist(db, album_id, artist_id, n, path, None);
+    }
+
+    fn seed_track_with_album_artist(
+        db: &SqliteDb,
+        album_id: i64,
+        artist_id: i64,
+        n: i32,
+        path: &str,
+        album_artist: Option<&str>,
+    ) {
         use crate::db::models::Track;
         use crate::db::track_repo::TrackRepo;
         let mut t = Track::new(format!("piste {n}"));
         t.album_id = Some(album_id);
         t.artist_id = Some(artist_id);
+        t.album_artist = album_artist.map(str::to_string);
         t.track_number = n;
         t.file_path = Some(path.into());
         TrackRepo::new(db.clone()).create(&t).unwrap();
@@ -3125,6 +3228,141 @@ mod tests {
             .unwrap();
         assert_eq!(after.id, created.id);
         assert_eq!(after.artist_id, Some(first));
+    }
+
+    /// Cas réduit de Philippe : l'album est figé sur l'artiste qui avait reçu
+    /// le MBID vide, tandis que toutes ses pistes portent le bon artiste.
+    #[test]
+    fn a_healthy_rescan_repairs_an_empty_mbid_artist_collapse() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let wrong = artist_repo
+            .create(&Artist::new("Classique - Saint-Saëns".into()))
+            .unwrap();
+        let right = artist_repo
+            .create(&Artist::new("Anouar Brahem".into()))
+            .unwrap();
+        DbBackend::execute(
+            &db,
+            "UPDATE artists SET musicbrainz_id = '' WHERE id = ?",
+            &[&wrong as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        let album = album_repo
+            .get_or_create_for_folder(
+                "/music/Anouar Brahem/After the Last Sky",
+                "After the Last Sky",
+                wrong,
+                Some(2025),
+                None,
+            )
+            .unwrap();
+        let album_id = album.id.unwrap();
+        seed_track(&db, album_id, right, 1, "/music/Anouar/01.flac");
+        seed_track(&db, album_id, right, 2, "/music/Anouar/02.flac");
+
+        assert_eq!(album_repo.repair_empty_mbid_artist_collapses().unwrap(), 1);
+        assert_eq!(
+            album_repo.get(album_id).unwrap().unwrap().artist_id,
+            Some(right)
+        );
+        assert_eq!(
+            album_repo.repair_empty_mbid_artist_collapses().unwrap(),
+            0,
+            "la réparation doit être idempotente"
+        );
+    }
+
+    /// Les quatre gardes qui empêchent une réattribution spéculative : absence
+    /// de la signature MBID vide, compilation, artistes de pistes divergents et
+    /// tag ALBUMARTIST explicite qui confirme l'attribution actuelle.
+    #[test]
+    fn ambiguous_album_artist_mismatches_are_never_repaired() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let current = artist_repo
+            .create(&Artist::new("Album Artist".into()))
+            .unwrap();
+        let invalid_current = artist_repo
+            .create(&Artist::new("Invalid Empty MBID Artist".into()))
+            .unwrap();
+        let track_a = artist_repo
+            .create(&Artist::new("Track Artist A".into()))
+            .unwrap();
+        let track_b = artist_repo
+            .create(&Artist::new("Track Artist B".into()))
+            .unwrap();
+        DbBackend::execute(
+            &db,
+            "UPDATE artists SET musicbrainz_id = '   ' WHERE id = ?",
+            &[&invalid_current as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        // MBID NULL : désaccord ordinaire, sans signature du collage #2458.
+        let ordinary = album_repo
+            .get_or_create_for_folder("/m/ordinary", "Ordinary", current, None, None)
+            .unwrap();
+        seed_track(&db, ordinary.id.unwrap(), track_a, 1, "/m/ordinary/01.flac");
+
+        // Compilation : plusieurs artistes sont attendus par construction.
+        let compilation = album_repo
+            .get_or_create_for_folder("/m/compilation", "Compilation", invalid_current, None, None)
+            .unwrap();
+        album_repo
+            .mark_compilation(compilation.id.unwrap())
+            .unwrap();
+        seed_track(
+            &db,
+            compilation.id.unwrap(),
+            track_a,
+            1,
+            "/m/compilation/01.flac",
+        );
+
+        // Deux artistes de pistes : aucun consensus à utiliser comme preuve.
+        let mixed = album_repo
+            .get_or_create_for_folder("/m/mixed", "Mixed", invalid_current, None, None)
+            .unwrap();
+        seed_track(&db, mixed.id.unwrap(), track_a, 1, "/m/mixed/01.flac");
+        seed_track(&db, mixed.id.unwrap(), track_b, 2, "/m/mixed/02.flac");
+
+        // Le tag ALBUMARTIST confirme l'artiste d'album distinct de celui des
+        // pistes : cas classique légitime, même si son vieux MBID est vide.
+        let tagged = album_repo
+            .get_or_create_for_folder("/m/tagged", "Tagged", invalid_current, None, None)
+            .unwrap();
+        seed_track_with_album_artist(
+            &db,
+            tagged.id.unwrap(),
+            track_a,
+            1,
+            "/m/tagged/01.flac",
+            Some("Invalid Empty MBID Artist"),
+        );
+
+        assert_eq!(album_repo.repair_empty_mbid_artist_collapses().unwrap(), 0);
+        assert_eq!(
+            album_repo
+                .get(ordinary.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .artist_id,
+            Some(current)
+        );
+        for album_id in [
+            compilation.id.unwrap(),
+            mixed.id.unwrap(),
+            tagged.id.unwrap(),
+        ] {
+            assert_eq!(
+                album_repo.get(album_id).unwrap().unwrap().artist_id,
+                Some(invalid_current)
+            );
+        }
     }
 
     /// Même réparation sur le chemin MusicBrainz : un album retrouvé par son
