@@ -318,6 +318,23 @@ pub trait OutputProvider: Send + Sync {
     /// Short provider name for logs (e.g. "diretta").
     fn provider_name(&self) -> &str;
 
+    /// The paid module id this provider needs (e.g. `"diretta"`), or `None`
+    /// for a free provider. **Declare it if you are a paid SKU.**
+    ///
+    /// Returning an empty list from [`discover`](Self::discover) when the
+    /// module is not owned is correct, but it is indistinguishable from a
+    /// provider that is absent, mis-compiled, or on a network that does not
+    /// answer — and a beta tester of the Diretta module reinstalled his whole
+    /// system over exactly that ambiguity (#2392). Declaring the module here
+    /// lets the SERVER say, in the logs and in `/system/diagnostics`, that the
+    /// provider is idle *because a paid entitlement is missing* and which one.
+    ///
+    /// Default `None`, so an existing out-of-tree provider keeps compiling and
+    /// behaving exactly as before; opting in is a one-line change.
+    fn required_module(&self) -> Option<&str> {
+        None
+    }
+
     /// Discover the devices reachable right now and build one [`OutputTarget`]
     /// per device. Return every visible device on each call — the server skips
     /// device_ids that are already registered.
