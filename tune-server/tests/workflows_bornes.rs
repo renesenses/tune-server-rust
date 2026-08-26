@@ -269,7 +269,8 @@ fn la_ci_n_utilise_qu_un_cache_rust_et_la_release_peut_le_renouveler() {
     };
     let setup = "uses: actions-rust-lang/setup-rust-toolchain@v1";
     let cache = "uses: Swatinem/rust-cache@v2";
-    let branches_de_confiance = "save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}";
+    let condition_de_confiance =
+        "github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9'";
 
     for nom in [
         "fmt",
@@ -288,51 +289,75 @@ fn la_ci_n_utilise_qu_un_cache_rust_et_la_release_peut_le_renouveler() {
             1,
             "job {nom} : installation Rust absente ou dupliquee"
         );
-        let configuration = job
+    }
+
+    let configuration_setup = |nom: &str| {
+        corps(nom)
             .split(setup)
             .nth(1)
             .and_then(|suite| suite.split("\n      - ").next())
-            .expect("le bloc setup-rust-toolchain doit rester identifiable");
-        assert!(
-            configuration.contains("cache: false"),
-            "job {nom} : le cache implicite restaure encore target/ avant le cache explicite"
-        );
-    }
+            .unwrap_or_else(|| panic!("job {nom} : bloc setup-rust-toolchain illisible"))
+    };
 
+    let fmt = corps("fmt");
     assert!(
-        !corps("fmt").contains(cache),
+        configuration_setup("fmt").contains("cache: false"),
+        "rustfmt doit desactiver le cache Cargo implicite"
+    );
+    assert!(
+        !fmt.contains(cache),
         "rustfmt ne compile rien : lui ajouter un cache Cargo ne fait que payer son transfert"
     );
+
+    // Ces jobs n'ont rien a partager avec un AUTRE nom de job : le cache
+    // integre possede deja la bonne partition. En ajouter un explicite apres
+    // lui est exactement le double chargement observe. La condition d'ecriture
+    // reste cependant bornee aux deux branches de confiance.
     for nom in [
         "test",
         "test-shipped-features",
         "audio-embedding",
-        "windows-pr",
-        "macos-pr",
-        "build",
         "clippy",
         "ffi",
     ] {
-        assert_eq!(
-            corps(nom).matches(cache).count(),
-            1,
-            "job {nom} : il faut exactement un cache Rust explicite"
+        let job = corps(nom);
+        let configuration = configuration_setup(nom);
+        assert!(
+            configuration.contains("cache-save-if:")
+                && configuration.contains(condition_de_confiance),
+            "job {nom} : son cache integre doit etre renouvelable depuis main et release/v0.9"
+        );
+        assert!(
+            !configuration.contains("cache: false"),
+            "job {nom} : son unique cache integre est desactive"
+        );
+        assert!(
+            !job.contains(cache),
+            "job {nom} : un second cache explicite recharge encore target/"
         );
     }
 
-    for nom in [
-        "test",
-        "test-shipped-features",
-        "audio-embedding",
-        "build",
-        "clippy",
-        "ffi",
-    ] {
+    // Ces trois jobs partagent volontairement la MEME partition par cible,
+    // malgre des noms de jobs differents. Eux gardent donc le cache explicite
+    // et coupent celui de setup-rust-toolchain.
+    for nom in ["windows-pr", "macos-pr", "build"] {
+        let job = corps(nom);
         assert!(
-            corps(nom).contains(branches_de_confiance),
-            "job {nom} : main ET release/v0.9 doivent pouvoir renouveler le cache"
+            configuration_setup(nom).contains("cache: false"),
+            "job {nom} : le cache implicite double encore la partition partagee"
+        );
+        assert_eq!(
+            job.matches(cache).count(),
+            1,
+            "job {nom} : il faut exactement un cache explicite partage par cible"
         );
     }
+
+    let livraison = corps("build");
+    assert!(
+        livraison.contains("save-if:") && livraison.contains(condition_de_confiance),
+        "la matrice doit renouveler le cache partage depuis main et release/v0.9"
+    );
     for nom in ["windows-pr", "macos-pr"] {
         let job = corps(nom);
         assert!(
@@ -340,13 +365,14 @@ fn la_ci_n_utilise_qu_un_cache_rust_et_la_release_peut_le_renouveler() {
             "job {nom} : une PR ne doit jamais ecrire le cache de livraison"
         );
         assert!(
-            !job.contains(branches_de_confiance),
-            "job {nom} : la politique d'ecriture des branches ne doit pas remplacer le veto PR"
+            !job.contains(condition_de_confiance),
+            "job {nom} : la politique d'ecriture des branches remplace le veto PR"
         );
     }
 
     assert!(
-        !source.contains("save-if: ${{ github.ref == 'refs/heads/main' }}"),
+        !source.contains("save-if: ${{ github.ref == 'refs/heads/main' }}")
+            && !source.contains("cache-save-if: ${{ github.ref == 'refs/heads/main' }}"),
         "un cache de ci.yml exclut encore la vraie branche de livraison release/v0.9"
     );
 }
