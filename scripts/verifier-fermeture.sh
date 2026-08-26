@@ -21,7 +21,8 @@
 # Pire encore : #1654 et #1657 citaient un commit dont le CORPS dit, en toutes
 # lettres, « Ne ferme aucune des deux issues : les reponses des testeurs
 # manquent toujours ». La justification invoquait un commit qui INTERDISAIT la
-# fermeture qu'elle operait.
+# fermeture qu'elle operait. Le 2026-08-25, #2230 et #2156 ont reproduit le
+# meme defaut ; #2296 a en plus ete fermee avec l'etiquette `keep-open`.
 #
 # ⚠️ CE QUE CE SCRIPT NE FAIT PAS.
 #
@@ -34,7 +35,7 @@
 # c'est elle qui desarme la relecture.
 #
 # Usage :
-#   verifier-fermeture.sh <corps-du-commentaire>   analyse, ecrit sur STDOUT
+#   NUMERO_ISSUE=123 KEEP_OPEN=false verifier-fermeture.sh <commentaire>
 #   verifier-fermeture.sh --autotest               joue les cas de preuve
 #
 # Sortie : 0 si la justification tient (ou s'il n'y a rien a verifier),
@@ -51,13 +52,38 @@ readonly EXT_SANS_PREUVE='\.(md|txt|adoc|rst)$'
 #
 # Volontairement litteraux : ce sont des tournures qu'on ecrit exprès, pour
 # etre lues. « Ne ferme aucune des deux issues » a ete ecrit, puis ignore.
-readonly REFUS='ne ferme (pas|aucune|ni)|ne pretend (pas|PAS)|ne resout pas|reste ouverte|restent ouvertes|ne cloture pas'
+readonly REFUS='ne ferme (pas|aucune|ni)|ne pr[eé]tend pas|ne r[eé]sout pas|ne corrige (pas|rien)|ne cl[oô]ture pas|reste(nt)? ouverte?s?|non fait|ce que (ça|ca) ne fait pas|cause .*reste inconnue'
 
 # Extrait la valeur d'un champ « clef : valeur » du commentaire, insensible aux
 # accents et a la casse. Rend une chaine vide si absent.
 champ() {
   local corps="$1" motif="$2"
   printf '%s\n' "$corps" | grep -iEo "$motif" | head -1
+}
+
+# Rend les commits a relire avant de fermer :
+#
+# - TOUS les SHA cites dans le commentaire, pas seulement le premier ;
+# - TOUS les commits de l'historique qui mentionnent explicitement l'issue.
+#
+# Le deuxieme point est ce qui attrape #2230 : la justification citait le
+# commit de renommage, tandis que le commit fonctionnel 7c16924a disait
+# explicitement « Ce correctif ne resout PAS #2230 ».
+commits_candidats() {
+  local corps="$1" depot="$2" numero="${NUMERO_ISSUE:-}"
+
+  [ "$depot" != "-" ] || return 0
+
+  {
+    printf '%s\n' "$corps" | grep -oE '\b[0-9a-f]{7,40}\b' || true
+    if printf '%s\n' "$numero" | grep -qE '^[0-9]+$'; then
+      git -C "$depot" log --all --format='%H' --extended-regexp \
+        --grep="(^|[^0-9])#${numero}([^0-9]|$)" 2>/dev/null || true
+    fi
+  } | while IFS= read -r candidat; do
+    [ -n "$candidat" ] || continue
+    git -C "$depot" rev-parse --verify "$candidat^{commit}" 2>/dev/null || true
+  done | sort -u
 }
 
 # Analyse un commentaire de fermeture. Ecrit son rapport sur STDOUT.
@@ -67,6 +93,15 @@ champ() {
 analyser() {
   local corps="$1" depot="${2:-.}"
   local problemes=0
+
+  # `keep-open` n'est pas un ornement. Tant qu'elle est posee, elle interdit
+  # la fermeture automatique ou distraite ; il faut la retirer par une
+  # decision explicite avant de fermer.
+  if [ "${KEEP_OPEN:-false}" = "true" ]; then
+    printf "FERMETURE INTERDITE  l'issue porte encore l'etiquette \`keep-open\`.\n"
+    printf '                    retirez-la explicitement apres arbitrage, ou laissez ouverte.\n'
+    problemes=$((problemes + 1))
+  fi
 
   # ── La preuve par contenu : « <marqueur> — <fichier>[:ligne] » ────────────
   #
@@ -111,23 +146,32 @@ analyser() {
     fi
   fi
 
-  # ── Le commit invoque se refusait-il le droit de fermer ? ─────────────────
+  # ── Un commit candidat se refusait-il le droit de fermer ? ────────────────
   #
   # C'est le controle le plus rentable : a lui seul il aurait arrete les
-  # fermetures de #1654 et #1657.
-  local sha
-  sha=$(printf '%s\n' "$corps" | grep -oE '\b[0-9a-f]{7,40}\b' | head -1)
-  if [ -n "$sha" ] && [ "$depot" != "-" ] && git -C "$depot" cat-file -e "$sha^{commit}" 2>/dev/null; then
-    local message
+  # fermetures de #1654, #1657, #2156, #2230 et #2239.
+  local sha message shas extraits empreinte empreintes_vues=""
+  shas=$(commits_candidats "$corps" "$depot")
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
     message=$(git -C "$depot" log -1 --format='%B' "$sha" 2>/dev/null)
     if printf '%s\n' "$message" | grep -qiE "$REFUS"; then
+      # Une PR peut laisser dans l'historique le commit original et sa copie
+      # rejouee avec un sujet suffixe par le numero de PR. Les lignes de refus
+      # sont identiques : c'est un seul signal, pas deux.
+      extraits=$(printf '%s\n' "$message" | grep -iE "$REFUS" | head -2)
+      empreinte=$(printf '%s' "$extraits" | git -C "$depot" hash-object --stdin)
+      if printf '%s\n' "$empreintes_vues" | grep -qxF "$empreinte"; then
+        continue
+      fi
+      empreintes_vues="${empreintes_vues}${empreinte}"$'\n'
       printf 'COMMIT REFUSANT  %s dit lui-meme ne pas fermer :\n' "${sha:0:8}"
-      printf '%s\n' "$message" | grep -iE "$REFUS" | head -2 | sed 's/^/                 > /'
+      printf '%s\n' "$extraits" | sed 's/^/                 > /'
       printf '                 une PR qui se refuse le droit de fermer sait quelque chose que le\n'
       printf '                 verificateur ignore.\n'
       problemes=$((problemes + 1))
     fi
-  fi
+  done <<< "$shas"
 
   if [ "$problemes" -eq 0 ]; then
     printf 'ok — rien ne contredit cette fermeture.\n'
@@ -182,10 +226,50 @@ autotest() {
   # Un commentaire vide ne doit rien declencher.
   attendu 'commentaire vide' 0 ''
 
-  # ⚠️ Le cas qui compte le plus : sans depot, le controle du commit refusant
-  # ne peut PAS s'exercer. Ce cas le dit, pour qu'on ne croie pas le
-  # contre-epreuve plus large qu'elle n'est.
-  printf '  note  le controle « commit refusant » exige un depot ; il est verifie en CI, pas ici.\n'
+  # Les refus de fermeture doivent etre testes sur un VRAI depot Git. Le
+  # commentaire ne cite volontairement aucun SHA : le garde-fou doit retrouver
+  # le commit par le numero de l'issue, sinon #2230 lui echappe encore.
+  local depot_test
+  depot_test=$(mktemp -d "${TMPDIR:-/tmp}/verifier-fermeture.XXXXXX")
+  git -C "$depot_test" init -q
+  git -C "$depot_test" config user.name 'Contre-epreuve'
+  git -C "$depot_test" config user.email 'contre-epreuve@example.invalid'
+  git -C "$depot_test" commit -q --allow-empty \
+    -m 'fix: adaptation partielle (#9991)' \
+    -m 'Ce correctif ne resout PAS #9991.'
+
+  NUMERO_ISSUE=9991 analyser 'Corrigé par une PR.' "$depot_test" >/dev/null 2>&1
+  local code=$?
+  if [ "$code" -eq 1 ]; then
+    printf '  ok    commit refusant retrouve par numero d issue\n'
+  else
+    printf '  ECHEC commit refusant retrouve par numero d issue (attendu 1, obtenu %d)\n' "$code"
+    echecs=$((echecs + 1))
+  fi
+
+  KEEP_OPEN=true analyser 'Correction livrée.' - >/dev/null 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then
+    printf '  ok    etiquette keep-open encore posee\n'
+  else
+    printf '  ECHEC etiquette keep-open encore posee (attendu 1, obtenu %d)\n' "$code"
+    echecs=$((echecs + 1))
+  fi
+
+  # Un message sans refus ne doit pas devenir suspect parce qu'il est lie a
+  # une issue : la recherche large sert a LIRE, pas a condamner par defaut.
+  git -C "$depot_test" commit -q --allow-empty \
+    -m 'fix: correction complete avec contre-epreuve (#9992)'
+  NUMERO_ISSUE=9992 analyser 'Corrigé et vérifié.' "$depot_test" >/dev/null 2>&1
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    printf '  ok    commit complet lie a l issue\n'
+  else
+    printf '  ECHEC commit complet lie a l issue (attendu 0, obtenu %d)\n' "$code"
+    echecs=$((echecs + 1))
+  fi
+
+  rm -rf "$depot_test"
 
   if [ "$echecs" -gt 0 ]; then
     printf '\n%d cas de preuve en echec.\n' "$echecs"
