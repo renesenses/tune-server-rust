@@ -243,13 +243,13 @@ mod tests {
             // Seek dans la zone copiée : immédiat.
             src.seek(SeekFrom::Start(2)).unwrap();
             let mut b = [0u8; 2];
-            src.read(&mut b).unwrap();
+            src.read_exact(&mut b).unwrap();
             assert_eq!(&b, b"23");
             // Seek depuis la FIN (moov-at-end) : au-delà de la frontière, bloque
             // jusqu'à ce que la copie atteigne l'octet visé.
             src.seek(SeekFrom::End(-2)).unwrap(); // octet 8, pas encore dispo
             let mut e = [0u8; 2];
-            src.read(&mut e).unwrap();
+            src.read_exact(&mut e).unwrap();
             e
         });
 
