@@ -500,7 +500,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 let endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
 
                 // Skip ALSA null/dummy sinks that produce no audio
-                if raw_name.contains("Discard all samples") || raw_name.contains("Dummy") {
+                if is_null_sink(&raw_name) {
                     debug!(device = %raw_name, "local_audio_device_skipped_null_sink");
                     continue;
                 }
@@ -594,19 +594,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
                 // Disambiguate duplicate device names (common on Windows WASAPI
                 // where multiple USB DACs all show as "Haut-Parleurs").
-                let name = if seen_names.contains(&raw_name) {
-                    let mut n = 2;
-                    loop {
-                        let candidate = format!("{raw_name} ({n})");
-                        if !seen_names.contains(&candidate) {
-                            break candidate;
-                        }
-                        n += 1;
-                    }
-                } else {
-                    raw_name.clone()
-                };
-                seen_names.insert(name.clone());
+                let name = disambiguate_display_name(&raw_name, &mut seen_names);
 
                 info!(
                     device = %name,
@@ -755,7 +743,10 @@ pub struct LocalOutput {
     /// Stable backend endpoint captured at discovery. The public registry ID
     /// remains compatible (`local:<display name>`), while exclusive WASAPI
     /// opens this exact IMMDevice instead of resolving the name again.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    ///
+    /// Toutes plateformes désormais : `find_device_with_fallback` le consulte
+    /// **avant** le nom, seule façon de survivre à un renommage (#2269) et de
+    /// ne pas confondre deux périphériques homonymes (#2272).
     endpoint_id: Option<String>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -2888,7 +2879,9 @@ impl OutputTarget for LocalOutput {
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
-        #[cfg(target_os = "windows")]
+        // Plus seulement pour WASAPI exclusif (#2207) : le chemin CPAL partagé
+        // s'en sert désormais pour retrouver un périphérique renommé (#2269) et
+        // pour ne pas confondre deux homonymes (#2272).
         let endpoint_id = self.endpoint_id.clone();
         let url = url.to_string();
         let playing = self.playing.clone();
@@ -3056,7 +3049,8 @@ impl OutputTarget for LocalOutput {
                 let decoded_len = decoded_samples.len();
 
                 let host = select_host(&audio_backend);
-                let Some((device, fell_back)) = find_device_with_fallback(&host, &device_name)
+                let Some((device, fell_back)) =
+                    find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
                 else {
                     warn!(name = %device_name, "audio_device_not_found_compressed");
                     playing.store(false, Ordering::SeqCst);
@@ -4379,7 +4373,9 @@ impl OutputTarget for LocalOutput {
 
             // ------- Open cpal device (shared mode) -------
             let host = select_host(&audio_backend);
-            let Some((device, fell_back)) = find_device_with_fallback(&host, &device_name) else {
+            let Some((device, fell_back)) =
+                find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
+            else {
                 warn!(
                     requested = %device_name,
                     "audio_device_not_found_no_fallback"
@@ -6084,6 +6080,152 @@ fn feed_native_ring_abortable(
     true
 }
 
+/// Ce qu'une zone connaît d'un périphérique de sortie, tel que la découverte
+/// CPAL l'a vu : l'identifiant d'endpoint stable du backend (vide sur les
+/// hôtes qui n'en exposent aucun) et le nom **brut** rendu par le pilote,
+/// avant toute désambiguïsation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceIdentity {
+    pub(crate) endpoint_id: String,
+    pub(crate) raw_name: String,
+}
+
+/// Par quoi une zone a été rattachée à son périphérique. Le rang porté par
+/// chaque variante est l'indice dans la liste énumérée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceMatch {
+    /// Retrouvé par identifiant d'endpoint stable. C'est le seul appariement
+    /// qui survive à un renommage.
+    ByEndpointId(usize),
+    /// Retrouvé par nom d'affichage, avec la convention `(n)` de la
+    /// découverte — donc en distinguant les homonymes.
+    ByDisplayName(usize),
+    /// Retrouvé par sous-chaîne, et par une seule candidate.
+    BySubstring(usize),
+}
+
+impl DeviceMatch {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::ByEndpointId(i) | Self::ByDisplayName(i) | Self::BySubstring(i) => i,
+        }
+    }
+}
+
+/// Résoudre le périphérique qu'une zone désigne.
+///
+/// Le nom d'affichage n'est **pas** une identité : il n'est ni unique (deux
+/// DAC USB s'annoncent tous deux « Haut-Parleurs », #2272) ni stable (Windows
+/// renomme l'endpoint au changement de taux d'échantillonnage, #2269).
+/// L'ordre ci-dessous met donc l'identifiant d'endpoint stable capturé à la
+/// découverte (#2207) devant le nom :
+///
+/// 1. **identifiant d'endpoint** — insensible au renommage comme à l'ordre
+///    d'énumération ;
+/// 2. **nom d'affichage** reconstruit avec la convention `(n)` **exacte** de
+///    la découverte, si bien que « Haut-Parleurs (2) » atteint le second
+///    homonyme et non le premier ;
+/// 3. **sous-chaîne**, tolérance héritée pour les hôtes aux noms verbeux
+///    (CoreAudio, PipeWire) — mais seulement si elle désigne **une seule**
+///    candidate, et jamais pour un nom que Tune a lui-même suffixé d'un
+///    `(n)` : ce suffixe vient de nous, pas du pilote, et le laisser glisser
+///    par sous-chaîne est précisément ce qui envoyait le son sur le mauvais
+///    DAC en silence.
+///
+/// `None` veut dire « je ne sais pas », et non « prends le premier venu » :
+/// l'appelant retombe alors sur la sortie par défaut, mais en le **disant**.
+pub(crate) fn resolve_device(
+    requested: &str,
+    requested_endpoint_id: Option<&str>,
+    candidates: &[DeviceIdentity],
+) -> Option<DeviceMatch> {
+    // 1. L'identifiant d'endpoint stable, quand la zone en connaît un. C'est
+    //    le seul appariement qui traverse un renommage ou un réordonnancement.
+    if let Some(endpoint_id) = requested_endpoint_id.filter(|id| !id.is_empty())
+        && let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate.endpoint_id == endpoint_id)
+    {
+        return Some(DeviceMatch::ByEndpointId(index));
+    }
+
+    let search = requested.to_lowercase();
+
+    // 2. Le nom d'affichage, reconstruit avec la convention de la découverte —
+    //    c'est ce nom-là, suffixe compris, qui a été stocké dans la zone.
+    let mut seen_names = std::collections::HashSet::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let display_name = disambiguate_display_name(&candidate.raw_name, &mut seen_names);
+        if display_name.to_lowercase() == search {
+            return Some(DeviceMatch::ByDisplayName(index));
+        }
+    }
+
+    // 3. Sous-chaîne. Un `(n)` qui n'a trouvé personne à l'étape 2 ne se
+    //    rattrape pas ici : ce suffixe vient de nous, pas du pilote, et le
+    //    laisser glisser renvoyait « Haut-Parleurs (2) » sur le premier
+    //    « Haut-Parleurs » — le mauvais DAC, en silence (#2272).
+    if looks_disambiguated(requested) {
+        return None;
+    }
+    let mut ambigus = candidates.iter().enumerate().filter(|(_, candidate)| {
+        let lower = candidate.raw_name.to_lowercase();
+        lower.contains(&search) || search.contains(&lower)
+    });
+    match (ambigus.next(), ambigus.next()) {
+        (Some((index, _)), None) => Some(DeviceMatch::BySubstring(index)),
+        // Deux candidates : choisir la première, c'est rejouer le même défaut
+        // sous un autre nom. On préfère l'aveu d'ignorance.
+        _ => None,
+    }
+}
+
+/// La convention de désambiguïsation des noms d'affichage, en **un seul**
+/// endroit.
+///
+/// Plusieurs DAC USB s'annoncent souvent sous le même nom (« Haut-Parleurs »)
+/// sous WASAPI. La découverte suffixe le second « (2) », le troisième « (3) »,
+/// en sautant les rangs qu'un pilote occupe déjà de lui-même. La résolution
+/// doit rejouer **exactement** ce calcul, puisque c'est son résultat qui a été
+/// stocké dans la zone : un simple compteur d'occurrences, plus court à
+/// écrire, diverge dès `["A", "A (2)", "A"]` — il donnerait « A (2) » au
+/// troisième, qui volerait alors la zone du deuxième.
+fn disambiguate_display_name(
+    raw_name: &str,
+    seen_names: &mut std::collections::HashSet<String>,
+) -> String {
+    let name = if seen_names.contains(raw_name) {
+        let mut n = 2;
+        loop {
+            let candidate = format!("{raw_name} ({n})");
+            if !seen_names.contains(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        }
+    } else {
+        raw_name.to_string()
+    };
+    seen_names.insert(name.clone());
+    name
+}
+
+/// Puits nuls d'ALSA, qui ne produisent aucun son. Écartés à la découverte
+/// **et** à la résolution : les deux doivent voir exactement la même liste,
+/// faute de quoi les rangs `(n)` qu'elles calculent peuvent diverger.
+fn is_null_sink(raw_name: &str) -> bool {
+    raw_name.contains("Discard all samples") || raw_name.contains("Dummy")
+}
+
+/// Le nom demandé porte-t-il un suffixe de rang `(n)` posé par la découverte ?
+fn looks_disambiguated(requested: &str) -> bool {
+    requested
+        .rsplit_once(" (")
+        .and_then(|(_, tail)| tail.strip_suffix(')'))
+        .and_then(|rank| rank.parse::<u32>().ok())
+        .is_some_and(|rank| rank >= 2)
+}
+
 /// Find an audio output device by name, falling back to the default device if
 /// the requested device is not found.
 ///
@@ -6095,37 +6237,55 @@ fn feed_native_ring_abortable(
 ///
 /// Returns `(device, fell_back)` where `fell_back` is `true` if the default
 /// device was used instead of the requested one.
-fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cpal::Device, bool)> {
+fn find_device_with_fallback(
+    host: &cpal::Host,
+    device_name: &str,
+    endpoint_id: Option<&str>,
+) -> Option<(cpal::Device, bool)> {
     if device_name == "default" {
         return host.default_output_device().map(|d| (d, false));
     }
 
-    // Try exact or substring match first (case-insensitive, bidirectional)
-    let search = device_name.to_lowercase();
-    let found = host.output_devices().ok().and_then(|mut devs| {
-        devs.find(|d| {
-            d.description()
-                .map(|desc| {
-                    let n = desc.name().to_string();
-                    let lower = n.to_lowercase();
-                    lower == search || lower.contains(&search) || search.contains(&lower)
-                })
-                .unwrap_or(false)
+    // La même liste que la découverte, puits nuls écartés compris : c'est la
+    // condition pour que les rangs `(n)` reconstruits ici soient ceux qui ont
+    // été stockés dans la zone.
+    let (devices, identities): (Vec<cpal::Device>, Vec<DeviceIdentity>) = host
+        .output_devices()
+        .map(|devs| devs.collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|device| {
+            let identity = DeviceIdentity {
+                endpoint_id: device.id().map(|id| id.to_string()).unwrap_or_default(),
+                raw_name: device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".into()),
+            };
+            (device, identity)
         })
-    });
+        .filter(|(_, identity)| !is_null_sink(&identity.raw_name))
+        .unzip();
 
-    if let Some(device) = found {
-        return Some((device, false));
+    if let Some(matched) = resolve_device(device_name, endpoint_id, &identities) {
+        let index = matched.index();
+        debug!(
+            requested = %device_name,
+            resolved = %identities[index].raw_name,
+            endpoint_id = %identities[index].endpoint_id,
+            matched_by = ?matched,
+            "audio_device_resolved"
+        );
+        // `nth` plutôt qu'un clone : `cpal::Device` n'est pas clonable sur tous
+        // les hôtes, et on n'a plus besoin des autres.
+        return devices.into_iter().nth(index).map(|device| (device, false));
     }
 
     // Device not found — log available devices and fall back to default
-    let available: Vec<String> = host
-        .output_devices()
-        .map(|devs| {
-            devs.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let available: Vec<String> = identities
+        .iter()
+        .map(|identity| format!("{} [{}]", identity.raw_name, identity.endpoint_id))
+        .collect();
 
     if let Some(default_device) = host.default_output_device() {
         let default_name = default_device
@@ -6134,6 +6294,7 @@ fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cp
             .unwrap_or_else(|_| "unknown".into());
         warn!(
             requested = %device_name,
+            requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
             fallback = %default_name,
             available = ?available,
             "audio_device_not_found_falling_back_to_default — \
@@ -6145,6 +6306,7 @@ fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cp
     } else {
         warn!(
             requested = %device_name,
+            requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
             available = ?available,
             "audio_device_not_found_no_default_available"
         );
@@ -6737,6 +6899,163 @@ mod tests {
             bytes.extend_from_slice(&word.to_le_bytes()[..bytes_per_sample]);
         }
         bytes
+    }
+
+    /// Deux DAC USB qui s'annoncent tous deux « Haut-Parleurs », plus une
+    /// sortie HDMI. C'est la configuration d'Alain (#1084) et celle de Marco
+    /// Polo (#2272).
+    fn homonymes_fixture() -> Vec<DeviceIdentity> {
+        vec![
+            DeviceIdentity {
+                endpoint_id: "{ugreen}".into(),
+                raw_name: "Haut-Parleurs".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{topping}".into(),
+                raw_name: "Haut-Parleurs".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{hdmi}".into(),
+                raw_name: "Téléviseur".into(),
+            },
+        ]
+    }
+
+    /// Le nom d'affichage n'est pas une identité. Ce test tient les deux bouts
+    /// du même défaut : deux homonymes doivent rester **distincts** (#2272), et
+    /// une zone doit continuer de désigner **le bon** après un redémarrage ou
+    /// un rebranchement qui renomme le périphérique (#2269).
+    #[test]
+    fn deux_homonymes_restent_distincts_et_la_zone_survit_au_renommage() {
+        let enumeres = homonymes_fixture();
+
+        // 1. Les homonymes ne se confondent pas. Le suffixe « (2) » que la
+        //    découverte a posé désigne le SECOND, jamais le premier.
+        assert_eq!(
+            resolve_device("Haut-Parleurs", None, &enumeres),
+            Some(DeviceMatch::ByDisplayName(0)),
+            "« Haut-Parleurs » doit désigner le premier homonyme"
+        );
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", None, &enumeres),
+            Some(DeviceMatch::ByDisplayName(1)),
+            "« Haut-Parleurs (2) » doit désigner le SECOND homonyme, \
+             pas retomber sur le premier par sous-chaîne"
+        );
+
+        // 2. Redémarrage : Windows n'énumère pas dans le même ordre. Le rang
+        //    « (2) » ment désormais ; l'identifiant stable, lui, dit vrai.
+        let apres_redemarrage = vec![
+            enumeres[1].clone(),
+            enumeres[0].clone(),
+            enumeres[2].clone(),
+        ];
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_redemarrage),
+            Some(DeviceMatch::ByEndpointId(0)),
+            "après réordonnancement, l'identifiant stable doit primer sur le rang"
+        );
+
+        // 3. Rebranchement : le pilote renomme l'endpoint au changement de
+        //    taux d'échantillonnage (DEvir, #2269). Plus aucun nom ne
+        //    correspond — l'identifiant le retrouve quand même.
+        let apres_rebranchement = vec![
+            DeviceIdentity {
+                endpoint_id: "{ugreen}".into(),
+                raw_name: "Haut-Parleurs".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{topping}".into(),
+                raw_name: "Topping D10s (96 kHz)".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_rebranchement),
+            Some(DeviceMatch::ByEndpointId(1)),
+            "un renommage ne doit pas casser une zone qui connaît son endpoint"
+        );
+
+        // 4. Même scène, mais sans identifiant stable (hôte qui n'en expose
+        //    pas, ou zone créée avant #2207). On préfère l'aveu d'ignorance —
+        //    donc un repli SIGNALÉ — au premier « Haut-Parleurs » venu choisi
+        //    en silence.
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", None, &apres_rebranchement),
+            None,
+            "sans identifiant, un « (2) » orphelin ne doit PAS glisser sur le (1)"
+        );
+
+        // 5. La tolérance par sous-chaîne reste acquise aux hôtes verbeux,
+        //    tant qu'elle ne désigne qu'une seule candidate.
+        let coreaudio = vec![
+            DeviceIdentity {
+                endpoint_id: "{builtin}".into(),
+                raw_name: "MacBook Pro Speakers".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{hdmi}".into(),
+                raw_name: "Téléviseur".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_device("MacBook Pro Speakers (2)", None, &coreaudio),
+            None,
+            "un suffixe posé par Tune ne se rattrape pas par sous-chaîne"
+        );
+        assert_eq!(
+            resolve_device("MacBook Pro", None, &coreaudio),
+            Some(DeviceMatch::BySubstring(0)),
+            "un nom tronqué sans ambiguïté reste résolu"
+        );
+    }
+
+    /// Une sous-chaîne qui désigne deux candidates ne désigne rien : choisir
+    /// la première, c'est rejouer le bug de #2272 sous un autre nom.
+    #[test]
+    fn une_sous_chaine_ambigue_ne_choisit_pas_a_notre_place() {
+        let ambigus = vec![
+            DeviceIdentity {
+                endpoint_id: "{a}".into(),
+                raw_name: "Realtek Digital Output".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{b}".into(),
+                raw_name: "Realtek Digital Output (Optical)".into(),
+            },
+        ];
+        assert_eq!(resolve_device("Realtek", None, &ambigus), None);
+    }
+
+    /// L'appariement par nom doit employer la convention `(n)` **exacte** de
+    /// la découverte, pas un compteur d'occurrences : sur `["A", "A (2)", "A"]`
+    /// les deux algorithmes divergent, et un troisième périphérique volerait
+    /// la zone du deuxième.
+    #[test]
+    fn la_convention_de_suffixe_est_celle_de_la_decouverte() {
+        let colision = vec![
+            DeviceIdentity {
+                endpoint_id: "{a1}".into(),
+                raw_name: "A".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{a2}".into(),
+                raw_name: "A (2)".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{a3}".into(),
+                raw_name: "A".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_device("A (2)", None, &colision),
+            Some(DeviceMatch::ByDisplayName(1)),
+            "« A (2) » est le nom BRUT du deuxième, il lui appartient"
+        );
+        assert_eq!(
+            resolve_device("A (3)", None, &colision),
+            Some(DeviceMatch::ByDisplayName(2)),
+            "le troisième reçoit « A (3) », comme à la découverte"
+        );
     }
 
     fn wasapi_endpoint_fixture() -> Vec<WasapiEndpoint> {
