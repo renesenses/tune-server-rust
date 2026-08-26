@@ -14,6 +14,8 @@ on:
   # Toutes les PR, y compris les PR empilees dont la base est une branche de
   # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
+    # Poser `ci:full` sur une PR de lot doit relancer immediatement le routage.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -41,6 +43,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
+      full: ${{ steps.classer.outputs.full }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,11 +53,29 @@ jobs:
         id: classer
         env:
           EVENEMENT: ${{ github.event_name }}
+          BASE_REF_CI: ${{ github.base_ref }}
+          FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           AVANT_SHA: ${{ github.event.before }}
           SHA_COURANT: ${{ github.sha }}
         run: |
+          # Le seul verdict qui ouvre la voie rapide est la sortie exacte
+          # `rapide`. Script absent, erreur ou sortie inconnue => complet.
+          PROFIL_CI="$(
+            EVENEMENT="$EVENEMENT" \
+            BASE_REF="$BASE_REF_CI" \
+            FORCER_COMPLET="$FORCER_COMPLET" \
+            bash scripts/determiner-profil-ci.sh
+          )" || PROFIL_CI=complet
+          if [ "$PROFIL_CI" = rapide ]; then
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            echo "PR de correctif vers $BASE_REF_CI : noyau CI rapide"
+          else
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "profil complet : $EVENEMENT vers ${BASE_REF_CI:-sans-base}"
+          fi
+
           case "$EVENEMENT" in
             pull_request)
               DEBUT="$BASE_SHA"
@@ -97,7 +118,9 @@ jobs:
           fi
 
       - name: Contre-épreuves du classifieur
-        run: bash scripts/detecter-impact-ci.sh --autotest
+        run: |
+          bash scripts/detecter-impact-ci.sh --autotest
+          bash scripts/determiner-profil-ci.sh --autotest
 
       - name: Contre-épreuves des garde-fous d issues
         run: |
@@ -110,6 +133,7 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
             scripts/detecter-impact-ci.sh \
+            scripts/determiner-profil-ci.sh \
             scripts/verifier-fermeture.sh \
             scripts/verifier-refs-issues.sh
 
@@ -163,7 +187,7 @@ jobs:
   test-shipped-features:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
-    if: needs.impact.outputs.rust == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # test-shipped-features — ~5 min observe
     steps:
@@ -211,7 +235,7 @@ jobs:
   audio-embedding:
     name: Audio embedding feature
     needs: impact
-    if: needs.impact.outputs.rust == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
@@ -239,14 +263,13 @@ jobs:
       - run: cargo check -p tune-server --features audio-embedding
       - run: cargo test -p tune-core --features audio-embedding
 
-  # Signal Windows rapide pour une PR : les deux configurations qui ont deja
-  # casse uniquement sur cet OS sont compilees immediatement, sans attendre la
-  # suite Linux ni produire un binaire release jetable. La matrice complete
-  # rejoue les memes contrats sur le push de la branche de livraison.
+  # Signal Windows sur une PR complete : les deux configurations qui ont deja
+  # casse uniquement sur cet OS sont compilees sur l'integration du lot, ou
+  # immediatement avec `ci:full`. La matrice de livraison les rejoue au push.
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -275,13 +298,13 @@ jobs:
       - name: ASIO
         run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
-  # Un seul ABI/configuration macOS suffit sur une PR : les deux architectures
-  # partagent le meme cfg Rust. Les deux vrais binaires restent construits sur
-  # le push de release, puis par le workflow qui fabrique la release taguee.
+  # Un seul ABI/configuration macOS suffit sur une PR complete : les deux
+  # architectures partagent le meme cfg Rust. Les deux vrais binaires restent
+  # construits au push, puis par le workflow qui fabrique la release taguee.
   macos-pr:
     name: macOS (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
