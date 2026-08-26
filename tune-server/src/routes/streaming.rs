@@ -43,6 +43,7 @@ enum TypeFavori {
     Tracks,
     Albums,
     Artists,
+    Playlists,
 }
 
 impl TypeFavori {
@@ -53,6 +54,7 @@ impl TypeFavori {
             "tracks" => Some(Self::Tracks),
             "albums" => Some(Self::Albums),
             "artists" => Some(Self::Artists),
+            "playlists" => Some(Self::Playlists),
             _ => None,
         }
     }
@@ -63,6 +65,7 @@ impl TypeFavori {
             Self::Tracks => "tracks",
             Self::Albums => "albums",
             Self::Artists => "artists",
+            Self::Playlists => "playlists",
         }
     }
 }
@@ -819,6 +822,14 @@ async fn service_favorites(
             .get_user_artists()
             .await
             .map(|a| json!({ "artists": a })),
+        // `get_user_playlists` est une methode REQUISE du trait, deja
+        // implementee par tous les connecteurs (Qobuz lit
+        // `/playlist/getUserPlaylists`). Rien a inventer ici : le type
+        // manquait au dispatch, pas au service.
+        Some(TypeFavori::Playlists) => svc
+            .get_user_playlists()
+            .await
+            .map(|p| json!({ "playlists": p })),
         None => Err(format!("unknown favorite type: {fav_type}").into()),
     };
     match result {
@@ -849,6 +860,10 @@ async fn service_favorites(
                         .get_user_artists()
                         .await
                         .map(|a| json!({ "artists": a })),
+                    Some(TypeFavori::Playlists) => svc
+                        .get_user_playlists()
+                        .await
+                        .map(|p| json!({ "playlists": p })),
                     None => Err("unknown favorite type".into()),
                 };
                 match retry {

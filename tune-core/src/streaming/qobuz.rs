@@ -133,14 +133,32 @@ fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
 
 /// Traduit le type de favori du client (pluriel) en paramètre attendu par
 /// l'API Qobuz.
+///
+/// `playlists` est traité à part : le type est parfaitement connu du
+/// connecteur — il lit `/playlist/getUserPlaylists`, `/playlist/get`,
+/// `/playlist/getFeatured` — mais **aucun appel de souscription à une
+/// playlist tierce n'est établi dans ce dépôt**. `/favorite/create` n'accepte,
+/// pour ce que le code démontre, que `track_ids`, `album_ids` et `artist_ids`.
+/// Rendre « unknown favorite type » ferait chercher une faute de frappe là où il
+/// y a une fonction à écrire (#2370).
 fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
     match fav_type {
         "tracks" => Ok("track_ids"),
         "albums" => Ok("album_ids"),
         "artists" => Ok("artist_ids"),
+        "playlists" => Err(MOTIF_PLAYLIST_NON_SOUSCRIPTIBLE.into()),
         _ => Err(format!("unknown favorite type: {fav_type}").into()),
     }
 }
+
+/// Motif de refus d'un favori de playlist Qobuz.
+///
+/// Il nomme ce qui manque plutôt que de déclarer le type inconnu : l'appel de
+/// souscription à une playlist qui n'appartient pas à l'utilisateur n'est
+/// documenté nulle part dans ce dépôt, et on n'invente pas un endpoint Qobuz.
+const MOTIF_PLAYLIST_NON_SOUSCRIPTIBLE: &str = "qobuz: favori de playlist non pris en charge — l'appel de souscription à une \
+     playlist tierce n'est pas établi contre l'API Qobuz (#2370). La LECTURE des \
+     playlists de l'utilisateur reste disponible via /playlist/getUserPlaylists.";
 
 /// Offsets des pages restant à charger après la première page d'un endpoint
 /// paginé Qobuz.
