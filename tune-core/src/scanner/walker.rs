@@ -432,27 +432,52 @@ pub fn list_audio_files_with_excludes(
         // Probe with read_dir instead of a bare exists(): on Windows a NAS path
         // fails for several distinct reasons that exists() collapses to `false`
         // (silent skip → "scan finds nothing", Alain Bonnel). read_dir surfaces
-        // the actual io::Error kind so the user learns WHY: NotFound = bad UNC /
-        // NAS unmounted, PermissionDenied = no SMB credentials for this session,
-        // and — the common Windows case — a mapped drive (Z:\) is invisible to
-        // an elevated / service token even though it works in Explorer.
+        // the actual error so the user learns WHY: bad UNC / NAS unmounted, no
+        // SMB credentials for this session, and — the common Windows case — a
+        // mapped drive (Z:\) invisible to an elevated / service token even
+        // though it works in Explorer. La traduction de cette erreur en cause
+        // lisible est le seul travail de `scanner::obstacle`.
         if let Err(e) = std::fs::read_dir(dir_path) {
+            // La raison est NOMMÉE ici et pas ailleurs : `missing_dir_reasons`
+            // est rendu VERBATIM par le client web (SettingsView.svelte). Le
+            // `format!("{}: {:?} — {}", …, e.kind(), e)` d'avant y déposait le
+            // `Debug` d'un `ErrorKind` — donc `Uncategorized` pour tout errno
+            // que Rust ne mappe pas, dont ENODEV. C'est le message que JeromeQ
+            // a recopié du fil 1539 sans pouvoir en rien faire (#2357).
+            let (motif, message) = crate::scanner::obstacle::obstacle_de_lecture(&normalized, &e);
             warn!(
                 dir = %normalized,
                 original = %dir,
                 error = %e,
                 kind = ?e.kind(),
+                // L'errno numérique n'était journalisé nulle part : sans lui,
+                // un `Uncategorized` dans les journaux reste indéchiffrable
+                // même pour nous.
+                errno = ?e.raw_os_error(),
+                motif = %motif,
                 "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
-            missing_dir_reasons.push(format!("{}: {:?} — {}", normalized, e.kind(), e));
+            missing_dir_reasons.push(message);
             missing_dirs.push(normalized);
             continue;
         }
         if !dir_path.is_dir() {
+            // Ce chemin n'est atteignable qu'en course (la racine a été
+            // remplacée entre la sonde `read_dir` et ce test) : `read_dir`
+            // rend déjà ENOTDIR sur un fichier. Il n'en poussait pas moins la
+            // racine dans le néant — un `warn!` et un `continue`, rien dans
+            // `missing_dirs`. Or `missing_dirs` n'est pas qu'un rapport :
+            // c'est ce qui déclenche `VerdictPurge::ProtegeIllisible`. Une
+            // racine écartée hors de cette liste voyait donc ses pistes
+            // supprimées comme si les fichiers avaient disparu (#2356).
+            let (motif, message) = crate::scanner::obstacle::pas_un_dossier(&normalized);
             warn!(
                 dir = %normalized,
+                motif = %motif,
                 "scan_dir_not_a_directory — path is not a directory, skipping"
             );
+            missing_dir_reasons.push(message);
+            missing_dirs.push(normalized);
             continue;
         }
 
@@ -1096,12 +1121,68 @@ mod tests {
         assert!(result.files.is_empty());
         assert_eq!(result.missing_dirs.len(), 1);
         assert_eq!(result.missing_dir_reasons.len(), 1);
-        assert!(
-            result.missing_dir_reasons[0].contains("NotFound"),
-            "reason = {:?}",
-            result.missing_dir_reasons[0]
-        );
         assert!(result.error_dirs.is_empty());
+    }
+
+    /// La ligne que voit l'utilisateur — celle que `SettingsView.svelte` rend
+    /// verbatim — ne doit contenir aucun nom de variante de `std::io::ErrorKind`
+    /// ni de `os error N`. C'est tout le sujet de #2357 : JeromeQ a recopié
+    /// `Uncategorized — No such device (os error 19)` sans pouvoir en rien
+    /// faire. Ici, sur une racine simplement absente, le rendu partait déjà en
+    /// `NotFound`.
+    #[test]
+    fn la_raison_rendue_a_l_ecran_est_une_phrase_pas_un_errno() {
+        let result = list_audio_files(&["/tmp/nonexistent_tune_test_dir".into()]);
+        let raison = &result.missing_dir_reasons[0];
+        for mot in ["NotFound", "Uncategorized", "os error"] {
+            assert!(
+                !raison.contains(mot),
+                "jargon « {mot} » rendu à l'écran : {raison:?}"
+            );
+        }
+        assert!(
+            raison.contains("/tmp/nonexistent_tune_test_dir"),
+            "le chemin fautif doit être nommé : {raison:?}"
+        );
+        let bas = raison.to_lowercase();
+        assert!(
+            bas.contains("n'existe pas") || bas.contains("introuvable") || bas.contains("absent"),
+            "la cause doit être dite en français : {raison:?}"
+        );
+    }
+
+    /// #2356, seconde face : une racine écartée ne doit JAMAIS l'être en
+    /// silence. Un chemin configuré qui n'est pas un dossier était sauté avec
+    /// un simple `warn!` : absent de `missing_dirs`, il n'apparaissait ni dans
+    /// le rapport de scan, ni dans le garde-fou de purge — ses pistes étaient
+    /// donc supprimées comme si les fichiers avaient disparu.
+    #[test]
+    fn une_racine_qui_n_est_pas_un_dossier_est_signalee_et_non_sautee() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_racine_fichier_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fichier = base.join("ceci_est_un_fichier.txt");
+        std::fs::write(&fichier, b"x").unwrap();
+
+        let result = list_audio_files(&[fichier.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.missing_dirs.len(),
+            1,
+            "racine sautée en silence : missing_dirs = {:?}",
+            result.missing_dirs
+        );
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+        let raison = &result.missing_dir_reasons[0];
+        for mot in ["NotFound", "Uncategorized", "NotADirectory", "os error"] {
+            assert!(!raison.contains(mot), "jargon rendu à l'écran : {raison:?}");
+        }
+        assert!(
+            raison.to_lowercase().contains("dossier"),
+            "la cause doit être dite : {raison:?}"
+        );
     }
 
     #[cfg(unix)]
