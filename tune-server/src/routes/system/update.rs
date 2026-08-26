@@ -164,6 +164,80 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
     })
 }
 
+/// Build the public update contract only after resolving an archive that this
+/// exact OS/architecture can install. GitHub can expose a release before every
+/// platform asset has finished uploading; such a release is newer, but it is
+/// not an available update for this server yet (#1575).
+fn update_release_payload(current: &str, release: &ReleaseInfo) -> Value {
+    let asset = find_archive_asset(release);
+    json!({
+        "current": current,
+        "latest": &release.version,
+        "update_available": asset.is_some(),
+        "download_url": asset.map(|a| &a.browser_download_url),
+        "asset_name": asset.map(|a| &a.name),
+        "release_notes": &release.body,
+        "size_bytes": asset.map(|a| a.size).unwrap_or(0),
+        "html_url": &release.html_url,
+        "published_at": &release.published_at,
+        "unavailable_reason": asset.is_none().then_some("no_compatible_asset"),
+    })
+}
+
+#[cfg(test)]
+mod update_availability_tests {
+    use super::update_release_payload;
+    use tune_core::updater::{ReleaseAsset, ReleaseInfo};
+
+    fn release_with(asset_name: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: "v9.9.9".into(),
+            version: "9.9.9".into(),
+            name: "fixture".into(),
+            body: "notes".into(),
+            published_at: "2026-08-26T00:00:00Z".into(),
+            html_url: "https://example.invalid/release".into(),
+            assets: vec![ReleaseAsset {
+                name: asset_name.into(),
+                browser_download_url: "https://example.invalid/archive".into(),
+                size: 42,
+                content_type: "application/octet-stream".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn une_release_sans_archive_compatible_n_est_pas_proposee() {
+        let payload =
+            update_release_payload("0.9.113", &release_with("tune-server-plan9-mips64.tar.gz"));
+
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["download_url"], serde_json::Value::Null);
+        assert_eq!(payload["asset_name"], serde_json::Value::Null);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
+    }
+
+    #[test]
+    fn une_release_avec_l_archive_de_la_plateforme_est_proposee() {
+        let extension = if std::env::consts::OS == "windows" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let name = format!(
+            "tune-server-{}-{}.{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            extension
+        );
+        let payload = update_release_payload("0.9.113", &release_with(&name));
+
+        assert_eq!(payload["update_available"], true);
+        assert_eq!(payload["asset_name"], name);
+        assert_eq!(payload["unavailable_reason"], serde_json::Value::Null);
+    }
+}
+
 /// Trusted **minisign** public key for release signatures (audit item 8). The
 /// matching secret key lives only in the release CI (a GitHub Actions secret);
 /// this is the verify-only half, safe to embed.
@@ -484,20 +558,7 @@ pub(super) async fn update_check() -> Json<Value> {
     let current = tune_core::version();
 
     match checker.check().await {
-        Ok(Some(release)) => {
-            let asset = find_archive_asset(&release);
-            Json(json!({
-                "current": current,
-                "latest": release.version,
-                "update_available": true,
-                "download_url": asset.map(|a| &a.browser_download_url),
-                "asset_name": asset.map(|a| &a.name),
-                "release_notes": release.body,
-                "size_bytes": asset.map(|a| a.size).unwrap_or(0),
-                "html_url": release.html_url,
-                "published_at": release.published_at,
-            }))
-        }
+        Ok(Some(release)) => Json(update_release_payload(current, &release)),
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
