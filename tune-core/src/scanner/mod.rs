@@ -2,6 +2,7 @@ pub mod album_folder;
 pub mod compilation;
 pub mod cue;
 pub mod hasher;
+pub mod obstacle;
 pub mod quality;
 pub mod walker;
 pub mod watcher;
