@@ -14,6 +14,9 @@ use tune_core::db::zone_repo::{Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
+use tune_core::outputs::traits::{
+    OutputDspState, OutputSignalPathStatus, OutputSignalReason, OutputVolumeState,
+};
 use tune_core::playback::{PlayState, ZoneState};
 
 use crate::error::AppError;
@@ -823,6 +826,20 @@ fn wav_wire_bit_perfect(
     is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
 }
 
+fn runtime_signal_reason_detail(status: &OutputSignalPathStatus) -> Option<String> {
+    let details: Vec<&str> = status
+        .reasons
+        .iter()
+        .map(|reason| match reason {
+            OutputSignalReason::FloatTransport => "Transport flottant imposé par le callback",
+            OutputSignalReason::DspApplied => "DSP appliqué",
+            OutputSignalReason::DspStateUnknown => "État DSP indéterminé",
+            OutputSignalReason::SoftwareVolume => "Volume logiciel appliqué",
+        })
+        .collect();
+    (!details.is_empty()).then(|| details.join(" ; "))
+}
+
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
@@ -943,6 +960,13 @@ fn build_signal_path(
         .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
+    // Pour une sortie locale qui sait observer son dernier callback, le réel
+    // prime sur toute déduction depuis les réglages. Les autres sorties
+    // conservent le calcul historique jusqu'à ce qu'elles publient leur propre
+    // sonde via le contrat additif d'OutputTarget.
+    let runtime_signal_path = (output_type == "local")
+        .then(|| ps.output_signal_path.as_ref())
+        .flatten();
 
     // Determine if DSP is active.
     //
@@ -957,11 +981,14 @@ fn build_signal_path(
     // l'argument central, promettre une pureté qu'on ne tient pas est le pire
     // des deux sens possibles de l'erreur (signalement Bilou).
     let zid = zone.id.unwrap_or(0);
-    let dsp_enabled = ZoneRepo::with_backend(backend.clone())
+    let configured_dsp_enabled = ZoneRepo::with_backend(backend.clone())
         .get_dsp_config(zid)
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
         .unwrap_or(false)
         || zone_eq_alters_signal(&backend, zid);
+    let dsp_enabled = runtime_signal_path
+        .map(|status| status.dsp == OutputDspState::Applied)
+        .unwrap_or(configured_dsp_enabled);
 
     // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
     // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
@@ -1146,7 +1173,13 @@ fn build_signal_path(
                 "ALSA" => "ALSA",
                 other => other,
             };
-            (true, transport, format_name)
+            (
+                runtime_signal_path
+                    .map(|status| status.bit_perfect)
+                    .unwrap_or(true),
+                transport,
+                format_name,
+            )
         }
         other => (false, other, format_name),
     };
@@ -1286,8 +1319,24 @@ fn build_signal_path(
         }));
     }
 
-    // Volume step (informational — does not affect bit-perfect status)
-    if !volume_full {
+    // La sonde locale tranche si le gain a réellement été appliqué. Pour les
+    // sorties sans sonde, conserver l'affichage historique fondé sur le
+    // réglage de zone.
+    if let Some(runtime) = runtime_signal_path {
+        match runtime.volume {
+            OutputVolumeState::Applied => steps.push(json!({
+                "name": "Volume",
+                "description": format!("Volume logiciel {}%", (ui_volume * 100.0).round() as i32),
+                "bit_perfect": false,
+            })),
+            OutputVolumeState::BypassedDop => steps.push(json!({
+                "name": "Volume",
+                "description": "Volume contourné pour DoP",
+                "bit_perfect": true,
+            })),
+            OutputVolumeState::Unity => {}
+        }
+    } else if !volume_full {
         steps.push(json!({
             "name": "Volume",
             "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
@@ -1295,8 +1344,25 @@ fn build_signal_path(
         }));
     }
 
-    // DSP step
-    if dsp_enabled {
+    // L'état d'exécution distingue traitement et contournement. C'est le
+    // reliquat commun de #2205/#2233 : un réglage enregistré ne disait pas ce
+    // qui avait effectivement atteint le ring Windows.
+    if let Some(runtime) = runtime_signal_path {
+        let dsp_step = match runtime.dsp {
+            OutputDspState::Applied => Some(("DSP appliqué", false)),
+            OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
+            OutputDspState::BypassedDop => Some(("DSP contourné pour DoP", true)),
+            OutputDspState::Unknown => Some(("État DSP indéterminé", false)),
+            OutputDspState::Inactive => None,
+        };
+        if let Some((description, intact)) = dsp_step {
+            steps.push(json!({
+                "name": "DSP",
+                "description": description,
+                "bit_perfect": intact,
+            }));
+        }
+    } else if dsp_enabled {
         steps.push(json!({
             "name": "DSP",
             "description": "EQ/DSP active",
@@ -1309,6 +1375,7 @@ fn build_signal_path(
         "name": "Transport",
         "description": transport_desc,
         "bit_perfect": transport_bit_perfect,
+        "detail": runtime_signal_path.and_then(runtime_signal_reason_detail),
     }));
 
     let renderer_name = renderer_label
@@ -1339,6 +1406,8 @@ fn build_signal_path(
         "lossless": is_lossless,
         "summary": summary,
         "steps": steps,
+        "runtime_observed": runtime_signal_path.is_some(),
+        "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
     }))
 }
 
@@ -3396,6 +3465,63 @@ mod signal_path_tests {
             .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
             .and_then(|s| s.get("description").and_then(|d| d.as_str()))
             .map(String::from)
+    }
+
+    fn step_detail(v: &Value, name: &str) -> Option<String> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|s| s.get("detail").and_then(|d| d.as_str()))
+            .map(String::from)
+    }
+
+    /// #2205/#2233 : le backend Windows connaît déjà le verdict exact à la
+    /// frontière du callback. Le chemin public doit le croire plutôt que de
+    /// continuer à déclarer statiquement toute sortie locale bit-perfect.
+    #[test]
+    fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
+        use tune_core::outputs::traits::{
+            OutputDspState, OutputSampleTransport, OutputSignalPathStatus, OutputSignalReason,
+            OutputVolumeState,
+        };
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo
+            .create("DAC", Some("local"), Some("local:dac"))
+            .unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        let mut ps = wav24_playing();
+        ps.output_signal_path = Some(OutputSignalPathStatus {
+            bit_perfect: false,
+            sample_transport: OutputSampleTransport::Float,
+            dsp: OutputDspState::Applied,
+            volume: OutputVolumeState::Unity,
+            reasons: vec![
+                OutputSignalReason::FloatTransport,
+                OutputSignalReason::DspApplied,
+            ],
+        });
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "ASIO", None).unwrap();
+
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            sp.get("runtime_observed").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sp.get("runtime_reasons"),
+            Some(&json!(["float_transport", "dsp_applied"]))
+        );
+        assert_eq!(
+            step_detail(&sp, "Transport").as_deref(),
+            Some("Transport flottant imposé par le callback ; DSP appliqué")
+        );
+        assert_eq!(step_desc(&sp, "DSP").as_deref(), Some("DSP appliqué"));
     }
 
     // ------------------------------------------------------------------
