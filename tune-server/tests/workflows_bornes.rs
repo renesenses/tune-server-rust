@@ -252,6 +252,105 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     assert!(impact.contains("bash scripts/verifier-refs-issues.sh --autotest"));
 }
 
+/// `setup-rust-toolchain` active son propre `Swatinem/rust-cache` par defaut.
+/// En poser un second juste apres restaure deux fois `target/` ; le second peut
+/// meme remplacer un cache exact par un ancien match partiel. Le run
+/// 32935964507 l'a fait sur macOS (618 Mio puis 508 Mio) avant de recompiler
+/// 32 min 32, sans pouvoir sauvegarder depuis `release/v0.9` (#2439).
+#[test]
+fn la_ci_n_utilise_qu_un_cache_rust_et_la_release_peut_le_renouveler() {
+    let source = workflow("ci.yml");
+    let jobs = jobs(&source);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de ci.yml"))
+    };
+    let setup = "uses: actions-rust-lang/setup-rust-toolchain@v1";
+    let cache = "uses: Swatinem/rust-cache@v2";
+    let branches_de_confiance = "save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}";
+
+    for nom in [
+        "fmt",
+        "test",
+        "test-shipped-features",
+        "audio-embedding",
+        "windows-pr",
+        "macos-pr",
+        "build",
+        "clippy",
+        "ffi",
+    ] {
+        let job = corps(nom);
+        assert_eq!(
+            job.matches(setup).count(),
+            1,
+            "job {nom} : installation Rust absente ou dupliquee"
+        );
+        let configuration = job
+            .split(setup)
+            .nth(1)
+            .and_then(|suite| suite.split("\n      - ").next())
+            .expect("le bloc setup-rust-toolchain doit rester identifiable");
+        assert!(
+            configuration.contains("cache: false"),
+            "job {nom} : le cache implicite restaure encore target/ avant le cache explicite"
+        );
+    }
+
+    assert!(
+        !corps("fmt").contains(cache),
+        "rustfmt ne compile rien : lui ajouter un cache Cargo ne fait que payer son transfert"
+    );
+    for nom in [
+        "test",
+        "test-shipped-features",
+        "audio-embedding",
+        "windows-pr",
+        "macos-pr",
+        "build",
+        "clippy",
+        "ffi",
+    ] {
+        assert_eq!(
+            corps(nom).matches(cache).count(),
+            1,
+            "job {nom} : il faut exactement un cache Rust explicite"
+        );
+    }
+
+    for nom in [
+        "test",
+        "test-shipped-features",
+        "audio-embedding",
+        "build",
+        "clippy",
+        "ffi",
+    ] {
+        assert!(
+            corps(nom).contains(branches_de_confiance),
+            "job {nom} : main ET release/v0.9 doivent pouvoir renouveler le cache"
+        );
+    }
+    for nom in ["windows-pr", "macos-pr"] {
+        let job = corps(nom);
+        assert!(
+            job.contains("save-if: false"),
+            "job {nom} : une PR ne doit jamais ecrire le cache de livraison"
+        );
+        assert!(
+            !job.contains(branches_de_confiance),
+            "job {nom} : la politique d'ecriture des branches ne doit pas remplacer le veto PR"
+        );
+    }
+
+    assert!(
+        !source.contains("save-if: ${{ github.ref == 'refs/heads/main' }}"),
+        "un cache de ci.yml exclut encore la vraie branche de livraison release/v0.9"
+    );
+}
+
 #[test]
 fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
     let ci = workflow("ci.yml");
