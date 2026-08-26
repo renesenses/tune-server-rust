@@ -195,9 +195,16 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
 
     let livraison = corps("build");
     assert!(livraison.contains("if: github.event_name != 'pull_request'"));
-    assert!(
-        !livraison.lines().any(|ligne| cle_de_job(ligne, "needs:")),
-        "la matrice de livraison attend encore la fin de toute la CI Linux"
+    let dependances_livraison: Vec<&str> = livraison
+        .lines()
+        .filter(|ligne| cle_de_job(ligne, "needs:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        dependances_livraison,
+        ["needs: impact"],
+        "la matrice de livraison ne doit attendre que le classifieur leger, \
+         jamais les compilations ou tests Linux"
     );
     for cible in [
         "x86_64-unknown-linux-gnu",
@@ -211,6 +218,38 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
             "cible de livraison perdue : {cible}"
         );
     }
+
+    // La voie rapide doit etre un PREALABLE commun, pas une suppression locale
+    // oubliee sur un des dix jobs couteux. Le moindre job sans cette condition
+    // ferait encore payer un runner sur une PR de documentation.
+    for nom in [
+        "fmt",
+        "test",
+        "test-shipped-features",
+        "audio-embedding",
+        "windows-pr",
+        "macos-pr",
+        "build",
+        "clippy",
+        "audit",
+        "ffi",
+    ] {
+        let job = corps(nom);
+        assert!(
+            job.lines()
+                .any(|ligne| cle_de_job(ligne, "needs:") && ligne.trim() == "needs: impact"),
+            "job {nom} non relie au classifieur d impact"
+        );
+        assert!(
+            job.contains("needs.impact.outputs.rust == 'true'"),
+            "job {nom} ignore encore le verdict d impact"
+        );
+    }
+
+    let impact = corps("impact");
+    assert!(impact.contains("bash scripts/detecter-impact-ci.sh --autotest"));
+    assert!(impact.contains("bash scripts/verifier-fermeture.sh --autotest"));
+    assert!(impact.contains("bash scripts/verifier-refs-issues.sh --autotest"));
 }
 
 #[test]

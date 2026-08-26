@@ -13,6 +13,46 @@ use tracing::{info, warn};
 
 use super::simple_resample;
 
+/// Build the stateful sinc resampler used by progressive PCM pipelines.
+///
+/// Callers that promise an exact output rate must propagate this error: using
+/// source-rate samples after announcing `to_sr` would corrupt speed and pitch.
+pub fn new_streaming_resampler(
+    from_sr: u32,
+    to_sr: u32,
+    channels: u16,
+) -> Result<Async<f32>, String> {
+    if from_sr == 0 || to_sr == 0 || channels == 0 {
+        return Err(format!(
+            "invalid resampler format: {from_sr} Hz -> {to_sr} Hz, {channels} channels"
+        ));
+    }
+    let ratio = to_sr as f64 / from_sr as f64;
+    let inv_ratio = 1.0 / ratio;
+    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
+        (32_usize, 64_usize)
+    } else {
+        (64_usize, 128_usize)
+    };
+    let window = WindowFunction::BlackmanHarris2;
+    let params = SincInterpolationParameters {
+        sinc_len,
+        f_cutoff: calculate_cutoff(sinc_len, window),
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor,
+        window,
+    };
+    Async::<f32>::new_sinc(
+        ratio,
+        1.1,
+        &params,
+        1024,
+        channels as usize,
+        FixedAsync::Input,
+    )
+    .map_err(|e| format!("create sinc resampler {from_sr} -> {to_sr} Hz: {e}"))
+}
+
 /// Resample a complete buffer of interleaved f32 samples using rubato sinc.
 ///
 /// Used for compressed streams where all decoded data is available at once.
@@ -57,33 +97,13 @@ fn rubato_batch_inner(
     }
 
     let ratio = to_sr as f64 / from_sr as f64;
-    // Adaptive resampler params based on conversion ratio:
-    //   ratio ≤ 2.0 (e.g. 96kHz→48kHz): quality params, plenty of CPU budget
-    //   ratio > 2.0 (e.g. 176.4kHz→48kHz, 192kHz→48kHz): lighter params
-    //     to avoid real-time stuttering on Windows (still ~90dB SNR)
-    let inv_ratio = 1.0 / ratio; // > 1.0 when downsampling
-    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
-        (32_usize, 64_usize) // lighter: 176.4/192kHz → 48kHz
-    } else {
-        (64_usize, 128_usize) // standard: 96kHz → 48kHz
+    let mut resampler = match new_streaming_resampler(from_sr, to_sr, channels) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!(error = %e, "rubato_batch_resampler_creation_failed_using_linear");
+            return simple_resample(samples, from_sr, to_sr, channels);
+        }
     };
-    let window = WindowFunction::BlackmanHarris2;
-    let f_cutoff = calculate_cutoff(sinc_len, window);
-    let params = SincInterpolationParameters {
-        sinc_len,
-        f_cutoff,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor,
-        window,
-    };
-    let mut resampler =
-        match Async::<f32>::new_sinc(ratio, 1.1, &params, 1024, ch, FixedAsync::Input) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warn!(error = %e, "rubato_batch_resampler_creation_failed_using_linear");
-                return simple_resample(samples, from_sr, to_sr, channels);
-            }
-        };
     let delay_frames = resampler
         .as_ref()
         .map(|r| r.output_delay())

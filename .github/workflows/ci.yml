@@ -27,8 +27,106 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Une PR qui ne touche que la documentation ou les garde-fous GitHub ne
+  # gagne rien a compiler Rust sur Linux, macOS et Windows. #2428 l'a mesure :
+  # 29 min 44 de runners et 9 min 38 de mur pour deux fichiers shell/YAML.
+  #
+  # La classification est fail-closed : seul un petit ensemble explicite prend
+  # la voie rapide. Tout chemin inconnu garde la batterie complete. Un push
+  # non-Rust peut lui aussi reutiliser la validation du PR ; un lancement
+  # manuel reste toujours complet.
+  impact:
+    name: Impact et garde-fous légers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.classer.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classer le diff
+        id: classer
+        env:
+          EVENEMENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AVANT_SHA: ${{ github.event.before }}
+          SHA_COURANT: ${{ github.sha }}
+        run: |
+          case "$EVENEMENT" in
+            pull_request)
+              DEBUT="$BASE_SHA"
+              FIN="$HEAD_SHA"
+              ;;
+            push)
+              # Un premier push (SHA avant rempli de zeros) n'a pas de base
+              # fiable : fail-closed, comme un chemin inconnu.
+              if printf '%s\n' "$AVANT_SHA" | grep -qE '^0{40}$'; then
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+                echo "premier push sans base : batterie complete"
+                exit 0
+              fi
+              DEBUT="$AVANT_SHA"
+              FIN="$SHA_COURANT"
+              ;;
+            *)
+              echo "rust=true" >> "$GITHUB_OUTPUT"
+              echo "lancement manuel : batterie complete"
+              exit 0
+              ;;
+          esac
+
+          if ! git cat-file -e "$DEBUT^{commit}" || ! git cat-file -e "$FIN^{commit}"; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "base du diff introuvable : batterie complete"
+            exit 0
+          fi
+          # `--no-renames` rend les deux noms : renommer du Rust en .md ne doit
+          # pas cacher le chemin Rust d'origine au classifieur.
+          if ! git diff --no-renames --name-only -z "$DEBUT" "$FIN" > /tmp/chemins-ci; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "diff impossible : batterie complete"
+            exit 0
+          fi
+          if bash scripts/detecter-impact-ci.sh < /tmp/chemins-ci; then
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Contre-épreuves du classifieur
+        run: bash scripts/detecter-impact-ci.sh --autotest
+
+      - name: Contre-épreuves des garde-fous d issues
+        run: |
+          bash scripts/verifier-fermeture.sh --autotest
+          bash scripts/verifier-refs-issues.sh --autotest
+
+      - name: Syntaxe des scripts de garde-fou
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
+            scripts/detecter-impact-ci.sh \
+            scripts/verifier-fermeture.sh \
+            scripts/verifier-refs-issues.sh
+
+      # Les workflows historiques portent quelques remarques shellcheck, mais
+      # leur YAML et leurs expressions sont valides. On garde le controle
+      # structurel et on ignore seulement ces deux familles connues.
+      - name: Syntaxe des workflows GitHub
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            rhysd/actionlint:1.7.7 \
+            -shellcheck= \
+            -ignore 'constant.expression.*false' \
+            -ignore 'label.*macos-15-intel.*is unknown'
+
   fmt:
     name: Format
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15  # fmt — 27 s observe
     steps:
@@ -40,6 +138,8 @@ jobs:
 
   test:
     name: Test
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # test — 4 min observe
     steps:
@@ -62,6 +162,8 @@ jobs:
   # redeviennent invisibles a la premiere occasion.
   test-shipped-features:
     name: Test (jeu de fonctionnalites livre)
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # test-shipped-features — ~5 min observe
     steps:
@@ -110,6 +212,8 @@ jobs:
   # hors de cette execution, comme avant.
   audio-embedding:
     name: Audio embedding feature
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
@@ -145,7 +249,8 @@ jobs:
   # rejoue les memes contrats sur le push de la branche de livraison.
   windows-pr:
     name: Windows + ASIO (compilation PR)
-    if: github.event_name == 'pull_request'
+    needs: impact
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -178,7 +283,8 @@ jobs:
   # le push de release, puis par le workflow qui fabrique la release taguee.
   macos-pr:
     name: macOS (compilation PR)
-    if: github.event_name == 'pull_request'
+    needs: impact
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -198,7 +304,8 @@ jobs:
   # reconstruit ensuite ses propres artefacts a partir du tag.
   build:
     name: Build ${{ matrix.target }}
-    if: github.event_name != 'pull_request'
+    needs: impact
+    if: github.event_name != 'pull_request' && needs.impact.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -316,6 +423,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30  # clippy — 2 min observe
     steps:
@@ -331,6 +440,8 @@ jobs:
 
   audit:
     name: Security Audit
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
@@ -346,6 +457,8 @@ jobs:
 
   ffi:
     name: FFI mobile (compilation)
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     # `tune-ffi` prend `tune-server` en `default-features = false` : c'est la
     # SEULE configuration du depot ou la feature `oaat` est absente. Les sept
     # cibles de release.yml l'activent toutes, `cargo test --workspace` aussi.
