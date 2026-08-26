@@ -537,40 +537,129 @@ async fn sync_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Durée minimale d'observation avant d'oser annoncer un débit.
+///
+/// Les premiers blocs partent en rafale — préchargement du tampon, en-tête
+/// WAV, réponse au `Range` initial. Rapportés à quelques dizaines de
+/// millisecondes, ils donnent un débit à cinq chiffres qui ne décrit rien.
+/// Une seconde suffit à lisser l'amorçage sans faire attendre l'appelant.
+const FENETRE_MINIMALE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Le débit réellement observé sur le flux d'une zone, ou `None`.
+///
+/// `None` n'est pas `0.0`. Les deux s'affichent, et ils ne disent pas la même
+/// chose : `0.0` affirme que rien ne circule, `None` dit qu'on n'a pas encore
+/// de quoi mesurer. Le champ rendait `0.0` dans les deux cas — un flux qui
+/// démarre était donc annoncé muet.
+///
+/// Le calcul se fait en flottant de bout en bout. L'ancien
+/// `octets * 8 / 1000` était une division ENTIÈRE, faite avant celle par le
+/// temps : les décimales étaient jetées à ce moment-là, et l'arrondi final à
+/// la décimale près ne rattrapait qu'un chiffre déjà faux.
+fn debit_observe_kbps(octets_envoyes: u64, fenetre: std::time::Duration) -> Option<f64> {
+    if octets_envoyes == 0 || fenetre < FENETRE_MINIMALE {
+        return None;
+    }
+    let kbps = octets_envoyes as f64 * 8.0 / 1000.0 / fenetre.as_secs_f64();
+    Some((kbps * 10.0).round() / 10.0)
+}
+
 async fn network_health(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let metrics = state.poller_metrics.lock().await;
     let poller = metrics.get(&id).cloned().unwrap_or_default();
     let ps = state.playback.get_state(id).await;
 
-    let stream_bytes: u64 = if let Some(ref np) = ps.now_playing
+    // Les DEUX faits viennent de la même session : les octets partis, et
+    // depuis combien de temps. Les lire séparément est ce qui a produit le
+    // défaut — le débit se calculait sur l'âge du SERVEUR.
+    let mesure: Option<(u64, std::time::Duration)> = if let Some(ref np) = ps.now_playing
         && let Some(ref sid) = np.stream_id
     {
         let sessions = state.streamer.sessions_state();
         let sessions = sessions.lock().await;
-        sessions
-            .get(sid.as_str())
-            .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
+        sessions.get(sid.as_str()).map(|s| {
+            (
+                s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+                s.created_at.elapsed(),
+            )
+        })
     } else {
-        0
+        None
     };
 
-    let uptime_s = state.started_at.elapsed().as_secs();
-    let bitrate_kbps = if uptime_s > 0 && stream_bytes > 0 {
-        (stream_bytes * 8 / 1000) as f64 / uptime_s as f64
-    } else {
-        0.0
-    };
+    let stream_bytes = mesure.map(|(octets, _)| octets).unwrap_or(0);
+
+    // Le débit d'un flux se mesure sur la vie de ce flux. Il se divisait par
+    // `state.started_at.elapsed()` — l'ancienneté du SERVEUR — deux horloges
+    // sans rapport : la même piste s'annonçait à 1 000 kbit/s sur un serveur
+    // fraîchement démarré et à 4 kbit/s sur un serveur allumé depuis six
+    // heures. Le chiffre était plausible et n'avait jamais été mesuré.
+    let bitrate_kbps = mesure.and_then(|(octets, age)| debit_observe_kbps(octets, age));
 
     Json(json!({
         "zone_id": id,
         "bytes_sent": stream_bytes,
-        "bitrate_kbps": (bitrate_kbps * 10.0).round() / 10.0,
+        "bitrate_kbps": bitrate_kbps,
         "poll_latency_ms": poller.last_latency_ms,
         "max_latency_ms": poller.max_latency_ms,
         "poll_errors": poller.total_errors,
         "total_polls": poller.total_polls,
     }))
+}
+
+#[cfg(test)]
+mod debit_observe_tests {
+    use super::debit_observe_kbps;
+    use std::time::Duration;
+
+    /// Un débit qu'on n'a pas mesuré ne s'annonce pas.
+    ///
+    /// `0.0` n'est pas une absence de mesure : c'est l'affirmation que rien ne
+    /// circule. Les deux se lisent pareil à l'écran et ne veulent pas dire la
+    /// même chose — l'un dit « je ne sais pas », l'autre « le flux est muet ».
+    #[test]
+    fn aucun_octet_ne_permet_aucune_annonce() {
+        assert_eq!(
+            debit_observe_kbps(0, Duration::from_secs(30)),
+            None,
+            "pas un octet envoyé : il n'y a rien à mesurer, donc rien à annoncer"
+        );
+    }
+
+    /// Trop tôt pour mesurer : le premier bloc part en rafale depuis le tampon
+    /// et donnerait un débit délirant rapporté à quelques millisecondes.
+    #[test]
+    fn une_fenetre_trop_courte_ne_permet_aucune_annonce() {
+        assert_eq!(
+            debit_observe_kbps(200_000, Duration::from_millis(120)),
+            None,
+            "120 ms de session : la rafale d'amorçage n'est pas un débit"
+        );
+    }
+
+    /// Le débit annoncé est celui qu'on a compté, pas un entier arrondi en
+    /// chemin. `octets * 8 / 1000` en arithmétique entière jette les décimales
+    /// AVANT la division par le temps : l'erreur est déjà commise quand on
+    /// arrondit à la décimale près, et le chiffre affiché n'est plus la mesure.
+    #[test]
+    fn le_debit_annonce_est_la_mesure_pas_une_troncature() {
+        assert_eq!(
+            debit_observe_kbps(12_345, Duration::from_secs(1)),
+            Some(98.8),
+            "12 345 octets en 1 s = 98,76 kbit/s, arrondi à 98,8 — pas 98,0"
+        );
+    }
+
+    /// Le cas nominal, celui que le pont d'écoute distante relaie : un FLAC
+    /// stéréo 16/44,1 tourne autour de 1 000 kbit/s.
+    #[test]
+    fn un_flac_relaye_s_annonce_a_son_vrai_debit() {
+        assert_eq!(
+            debit_observe_kbps(1_000_000, Duration::from_secs(8)),
+            Some(1000.0),
+            "1 Mo en 8 s = 1 000 kbit/s"
+        );
+    }
 }
 
 pub async fn create_zone_handler(
