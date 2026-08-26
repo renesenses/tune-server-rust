@@ -11,27 +11,214 @@ use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cooperative cancellation flag for the running library scan.
+const SCAN_ACTIVE: u64 = 1;
+const SCAN_CANCELLED: u64 = 2;
+const SCAN_FLAGS: u64 = SCAN_ACTIVE | SCAN_CANCELLED;
+
+/// Porte unique partagée par les scans manuel, planifié et de démarrage.
 ///
-/// Set to `true` by `scan_cancel` (POST /system/scan/cancel) and polled by the
-/// batch loop before each batch, so "Arrêter le scan / Stop scan" actually
-/// stops the scan instead of being a no-op that only flipped `scan_status` to
-/// "idle" while the batch loop kept inserting for minutes (bug #1129). Reset to
-/// `false` at the start of every scan.
-static SCAN_CANCEL: AtomicBool = AtomicBool::new(false);
+/// L'état tient dans un seul atomique afin que l'acquisition d'un nouveau scan
+/// et la remise à zéro de son annulation soient UNE opération. Deux atomiques
+/// séparés laisseraient cette course : le scan A se termine, B démarre et remet
+/// l'annulation à zéro, puis une requête Stop destinée à A annule B. Le numéro
+/// de génération empêche cette fuite entre propriétaires successifs.
+struct ScanGate {
+    state: AtomicU64,
+}
 
-/// Clear the cancel flag at the start of a scan. Shared with the startup
-/// (auto) scan so "Arrêter le scan" works there too (#1197/#1196).
-pub(crate) fn reset_scan_cancel() {
-    SCAN_CANCEL.store(false, Ordering::SeqCst);
+impl ScanGate {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+        }
+    }
+
+    /// Acquiert l'unique droit de scanner. Un refus ne modifie aucun bit : en
+    /// particulier il ne désarme jamais l'annulation du propriétaire actif.
+    fn try_acquire(&self) -> Option<ScanLease<'_>> {
+        let mut observed = self.state.load(Ordering::SeqCst);
+        loop {
+            if observed & SCAN_ACTIVE != 0 {
+                return None;
+            }
+            let mut generation = (observed & !SCAN_FLAGS).wrapping_add(SCAN_FLAGS + 1);
+            if generation == 0 {
+                // Théorique après 2^62 scans : zéro reste réservé à l'état
+                // initial pour garder les diagnostics lisibles.
+                generation = SCAN_FLAGS + 1;
+            }
+            let acquired = generation | SCAN_ACTIVE;
+            match self.state.compare_exchange(
+                observed,
+                acquired,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ScanLease {
+                        gate: self,
+                        generation,
+                    });
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    /// Attache Stop à la génération active au moment de la requête.
+    fn request_cancel(&self) -> bool {
+        let mut observed = self.state.load(Ordering::SeqCst);
+        if observed & SCAN_ACTIVE == 0 {
+            return false;
+        }
+        let generation = observed & !SCAN_FLAGS;
+        loop {
+            if observed & !SCAN_FLAGS != generation || observed & SCAN_ACTIVE == 0 {
+                return false;
+            }
+            if observed & SCAN_CANCELLED != 0 {
+                return true;
+            }
+            match self.state.compare_exchange(
+                observed,
+                observed | SCAN_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & (SCAN_ACTIVE | SCAN_CANCELLED)
+            == (SCAN_ACTIVE | SCAN_CANCELLED)
+    }
+
+    fn release(&self, generation: u64) {
+        let mut observed = self.state.load(Ordering::SeqCst);
+        loop {
+            if observed & !SCAN_FLAGS != generation || observed & SCAN_ACTIVE == 0 {
+                return;
+            }
+            match self.state.compare_exchange(
+                observed,
+                generation,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
+            }
+        }
+    }
+}
+
+/// Jeton non clonable gardé jusqu'à la terminaison réelle de la tâche.
+pub(crate) struct ScanLease<'a> {
+    gate: &'a ScanGate,
+    generation: u64,
+}
+
+impl Drop for ScanLease<'_> {
+    fn drop(&mut self) {
+        self.gate.release(self.generation);
+    }
+}
+
+static SCAN_GATE: ScanGate = ScanGate::new();
+
+pub(crate) fn try_begin_scan() -> Option<ScanLease<'static>> {
+    SCAN_GATE.try_acquire()
 }
 
 /// Whether "Stop scan" was requested. Polled by both the manual and the startup
 /// scan batch loops so either can be cancelled cooperatively.
 pub(crate) fn scan_cancel_requested() -> bool {
-    SCAN_CANCEL.load(Ordering::SeqCst)
+    SCAN_GATE.cancel_requested()
+}
+
+#[cfg(test)]
+mod scan_gate_tests {
+    use super::ScanGate;
+
+    /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde
+    /// requête tente de démarrer B. Le refus de B ne doit jamais remettre le
+    /// bit d'annulation de A à zéro.
+    #[test]
+    fn un_second_depart_refuse_ne_desarme_pas_stop() {
+        let gate = ScanGate::new();
+        let scan_a = gate.try_acquire().expect("le premier scan doit demarrer");
+
+        assert!(gate.request_cancel());
+        assert!(gate.cancel_requested());
+        assert!(gate.try_acquire().is_none(), "le scan B doit etre refuse");
+        assert!(
+            gate.cancel_requested(),
+            "le refus de B ne doit pas desarmer l'annulation de A"
+        );
+
+        drop(scan_a);
+        let _scan_c = gate
+            .try_acquire()
+            .expect("la terminaison reelle de A doit liberer la porte");
+        assert!(
+            !gate.cancel_requested(),
+            "une nouvelle generation ne doit pas heriter de Stop"
+        );
+    }
+
+    /// Une requête Stop sans propriétaire ne doit pas empoisonner le prochain
+    /// scan. C'est l'autre moitié de l'attachement à une génération précise.
+    #[test]
+    fn stop_sans_scan_actif_ne_fuit_pas_vers_le_suivant() {
+        let gate = ScanGate::new();
+        assert!(!gate.request_cancel());
+        let _scan = gate.try_acquire().expect("le scan doit demarrer");
+        assert!(!gate.cancel_requested());
+    }
+
+    /// Deux requêtes libérées au même instant ne peuvent obtenir qu'un seul
+    /// droit d'écriture. Le gagnant garde son jeton jusqu'à ce que les deux
+    /// résultats aient été observés, ce qui rend le test déterministe.
+    #[test]
+    fn deux_departs_concurrents_n_ont_qu_un_proprietaire() {
+        use std::sync::{Arc, Barrier, mpsc};
+
+        let gate = ScanGate::new();
+        let depart = Arc::new(Barrier::new(3));
+        let maintien = Arc::new(Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let depart = depart.clone();
+                let maintien = maintien.clone();
+                let tx = tx.clone();
+                let gate = &gate;
+                scope.spawn(move || {
+                    depart.wait();
+                    let lease = gate.try_acquire();
+                    tx.send(lease.is_some()).unwrap();
+                    maintien.wait();
+                    drop(lease);
+                });
+            }
+
+            depart.wait();
+            let resultats = [rx.recv().unwrap(), rx.recv().unwrap()];
+            assert_eq!(resultats.into_iter().filter(|gagne| *gagne).count(), 1);
+            maintien.wait();
+        });
+
+        assert!(
+            gate.try_acquire().is_some(),
+            "le jeton gagnant doit liberer la porte en fin de tache"
+        );
+    }
 }
 
 /// Racines qui CONTENAIENT des pistes et n'en découvrent plus AUCUNE.
@@ -378,8 +565,17 @@ pub(super) async fn trigger_scan(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| tune_core::scanner::walker::normalize_path(s));
-    spawn_library_scan_confirmee(state, force, q.confirm_purge, targeted_req).await;
-    (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
+    if spawn_library_scan_confirmee(state, force, q.confirm_purge, targeted_req).await {
+        (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "already_scanning",
+                "scanning": true,
+            })),
+        )
+    }
 }
 
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
@@ -392,7 +588,11 @@ pub(super) async fn trigger_scan(
 /// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
 /// une suppression de masse. Seul `trigger_scan`, qui porte une intention
 /// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
-pub(crate) async fn spawn_library_scan(state: AppState, force: bool, targeted_req: Option<String>) {
+pub(crate) async fn spawn_library_scan(
+    state: AppState,
+    force: bool,
+    targeted_req: Option<String>,
+) -> bool {
     spawn_library_scan_confirmee(state, force, None, targeted_req).await
 }
 
@@ -404,12 +604,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
     force: bool,
     purge_confirmee: Option<u64>,
     targeted_req: Option<String>,
-) {
+) -> bool {
+    let Some(scan_lease) = try_begin_scan() else {
+        tracing::warn!("scan_start_rejected_already_running");
+        return false;
+    };
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
-    // Clear any leftover cancel request from a previous scan before starting.
-    SCAN_CANCEL.store(false, Ordering::SeqCst);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "scanning") {
         tracing::warn!(error = %e, "scan_status_set_failed");
@@ -438,6 +640,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
             .check_feature(tune_core::license::Feature::AutoEnrichment)
             .await;
     tokio::spawn(async move {
+        // Le droit reste détenu jusqu'à la fin RÉELLE de la tâche, y compris si
+        // spawn_blocking panique. Le Drop du jeton libère alors la génération.
+        let _scan_lease = scan_lease;
         let db_for_panic = db.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
@@ -635,7 +840,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let files_to_scan: Vec<std::path::PathBuf> = files
             .into_par_iter()
             .filter(|path| {
-                if SCAN_CANCEL.load(Ordering::SeqCst) {
+                if scan_cancel_requested() {
                     return false;
                 }
                 // Force mode: re-process everything so album_id is re-resolved.
@@ -731,7 +936,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // the batch loop kept inserting). Files for the remaining
                 // batches were already read by the walker, but no DB work is
                 // done for them.
-                if SCAN_CANCEL.load(Ordering::SeqCst) {
+                if scan_cancel_requested() {
                     return;
                 }
                 // Collect tracks to batch-insert and batch-update
@@ -980,7 +1185,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // > 0 quand le plafond a refusé : c'est le nombre à renvoyer dans
         // `?confirm_purge=` pour sortir de l'impasse. 0 = aucun refus.
         let mut purge_refusee_candidats = 0i64;
-        if SCAN_CANCEL.load(Ordering::SeqCst) {
+        if scan_cancel_requested() {
             tracing::info!("post_scan_prune_skipped_cancelled");
         } else {
             // Racines devenues vides : un partage non monté est LISIBLE et
@@ -1280,6 +1485,26 @@ pub(crate) async fn spawn_library_scan_confirmee(
             tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
         }
 
+        // Une réparation d'attribution ne se fonde que sur une vue complète et
+        // saine de la bibliothèque. Un scan ciblé, annulé ou privé d'une racine
+        // n'a pas assez d'information pour conclure sans risque (#2458).
+        let full_scan_ok = !scan_cancel_requested()
+            && targeted.is_none()
+            && missing_dirs.is_empty()
+            && error_dirs.is_empty()
+            && racines_videes.is_empty();
+        if full_scan_ok {
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .repair_empty_mbid_artist_collapses()
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "post_scan_album_artists_repaired")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_album_artist_repair_failed"),
+            }
+        }
+
         // Clean up orphan artists left behind after tag corrections
         let orphan_artists = ArtistRepo::with_backend(db.clone()).cleanup_orphans().unwrap_or(0);
         if orphan_artists > 0 {
@@ -1301,11 +1526,6 @@ pub(crate) async fn spawn_library_scan_confirmee(
             // laissait `full_scan_ok = true`, et la réconciliation supprimait
             // DÉFINITIVEMENT les favoris des pistes conservées. Une purge de
             // pistes se répare par un rescan ; une perte de favoris, non.
-            let full_scan_ok = !SCAN_CANCEL.load(Ordering::SeqCst)
-                && targeted.is_none()
-                && missing_dirs.is_empty()
-                && error_dirs.is_empty()
-                && racines_videes.is_empty();
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
@@ -1556,6 +1776,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         }
     });
+    true
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
@@ -1585,8 +1806,11 @@ pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoRespo
     // completion path, which resets scan_status to "idle" and emits
     // library.scan.completed. Without this flag the endpoint only flipped the
     // status string while the scan kept inserting for minutes (bug #1129).
-    SCAN_CANCEL.store(true, Ordering::SeqCst);
-    tracing::info!("scan_cancel_requested");
+    if SCAN_GATE.request_cancel() {
+        tracing::info!("scan_cancel_requested");
+    } else {
+        tracing::info!("scan_cancel_ignored_no_active_scan");
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "idle") {
         tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
@@ -1655,14 +1879,11 @@ pub(crate) fn spawn_scan_scheduler(state: AppState) {
                 continue;
             }
             last_fired = Some(stamp);
-            let scanning =
-                settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
-            if scanning {
+            if !spawn_library_scan(state.clone(), false, None).await {
                 tracing::info!("scheduled_scan_skipped_already_scanning");
                 continue;
             }
             tracing::info!(time = %sched, "scheduled_scan_triggered");
-            spawn_library_scan(state.clone(), false, None).await;
         }
     });
 }
