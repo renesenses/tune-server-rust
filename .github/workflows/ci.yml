@@ -134,6 +134,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
+          cache: false
       - run: cargo fmt --all -- --check
 
   test:
@@ -147,9 +148,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
@@ -171,9 +170,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       # Meme dependance systeme que le job de build : sans elle, la compilation
       # s'arrete sur « Package alsa was not found in the pkg-config ».
       - name: Install ALSA dev (retry — voir release.yml)
@@ -221,9 +218,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       # `audio-embedding` pulls audio crates (via ort/cpal deps) that link ALSA;
       # install it like the main build job does, or the compile-check fails on
       # `Package alsa was not found in the pkg-config`.
@@ -259,6 +254,7 @@ jobs:
         with:
           target: x86_64-pc-windows-msvc
           rustflags: ""
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           # Meme partition que le build de livraison : la PR restaure ses
@@ -292,6 +288,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: x86_64-apple-darwin
@@ -335,10 +332,11 @@ jobs:
         with:
           target: ${{ matrix.target }}
           rustflags: ""
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
 
       - name: Install cross
         if: matrix.cross
@@ -433,9 +431,7 @@ jobs:
         with:
           components: clippy
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
@@ -479,9 +475,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       # 16 et pas 6 : la boucle fait au pire 3 x (100 + 200) + 2 x 20 = 940 s.
       # A 6 min la marche se fait tuer PENDANT le deuxieme essai — on paie le
       # cout de la reprise sans en avoir le benefice, et le message d'erreur
