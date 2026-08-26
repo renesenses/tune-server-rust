@@ -14,7 +14,7 @@
 //! pour le genre, le format ou l'année sans nouvelle migration.
 //!
 //! Ids liés en i64 : `profile_id` est INTEGER côté SQLite et BIGINT côté
-//! PostgreSQL (migration 035, qui répare aussi le cas de la bascule
+//! PostgreSQL (migration 036, qui répare aussi le cas de la bascule
 //! SQLite→PG où `PG_FULL_SCHEMA` l'avait créée en TEXT).
 
 use std::sync::Arc;

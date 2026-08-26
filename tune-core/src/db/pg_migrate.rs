@@ -483,7 +483,7 @@ CREATE TABLE IF NOT EXISTS profiles (
 
 -- Favoris de VALEUR de facette (label…), #2442. Pas de colonne `id` : la clé
 -- naturelle est la clé primaire. `profile_id` en TEXT comme partout ici (la
--- copie lie tout en texte) ; la migration 035 la ramène en BIGINT après coup.
+-- copie lie tout en texte) ; la migration 036 la ramène en BIGINT après coup.
 CREATE TABLE IF NOT EXISTS favorite_facets (
     profile_id TEXT NOT NULL DEFAULT '1',
     facet TEXT NOT NULL,

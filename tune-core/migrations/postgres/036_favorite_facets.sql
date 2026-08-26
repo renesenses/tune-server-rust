@@ -1,7 +1,7 @@
 -- favorite_facets : mettre en favori une VALEUR de facette (label, et demain
 -- genre / format / annee) — #2442, FabienM fil 1557.
 --
--- Pendant SQLite (migration 83). Pourquoi une table separee plutot qu'un
+-- Pendant SQLite (migration 84). Pourquoi une table separee plutot qu'un
 -- quatrieme `item_type` dans `favorites` : `favorites.item_id` est un entier
 -- NOT NULL, et un label N'A PAS D'IDENTITE dans ce depot. Il n'existe ni table
 -- `labels`, ni route bibliotheque : l'onglet Labels lit une FACETTE et

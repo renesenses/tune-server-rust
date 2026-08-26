@@ -279,13 +279,49 @@ pub(super) async fn get_settings(
 #[derive(Deserialize)]
 pub(super) struct ConfigPatch(pub(super) serde_json::Map<String, Value>);
 
+const FULL_VOLUME_CONFIRMATION_FIELD: &str = "_confirm_full_volume";
+
+fn enables_volume_lock(body: &serde_json::Map<String, Value>) -> bool {
+    body.get("audiophile_lock_volume")
+        .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true"))
+}
+
+fn take_full_volume_confirmation(body: &mut serde_json::Map<String, Value>) -> bool {
+    body.remove(FULL_VOLUME_CONFIRMATION_FIELD)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn volume_lock_confirmation_required(
+    body: &serde_json::Map<String, Value>,
+    already_enabled: bool,
+    confirmed: bool,
+) -> bool {
+    enables_volume_lock(body) && !already_enabled && !confirmed
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
+    let mut values = body.0;
+    let full_volume_confirmed = take_full_volume_confirmation(&mut values);
+    let volume_lock_was_enabled = tune_core::audio::audiophile::volume_lock_enabled(&state.backend);
+    if volume_lock_confirmation_required(&values, volume_lock_was_enabled, full_volume_confirmed) {
+        tracing::warn!("audiophile_volume_lock_confirmation_required");
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "full_volume_confirmation_required",
+                "message": "Enabling the PURE volume lock can set a device volume to 100%. Explicit confirmation is required.",
+            })),
+        )
+            .into_response());
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    for (key, value) in body.0 {
+    for (key, value) in values {
         let str_val = if value.is_string() {
             value
                 .as_str()
@@ -299,6 +335,45 @@ pub(super) async fn update_config(
         }
     }
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+#[cfg(test)]
+mod volume_lock_confirmation_tests {
+    use super::{
+        FULL_VOLUME_CONFIRMATION_FIELD, enables_volume_lock, take_full_volume_confirmation,
+        volume_lock_confirmation_required,
+    };
+    use serde_json::{Map, json};
+
+    #[test]
+    fn detecte_uniquement_l_armement_du_verrou() {
+        let mut enable = Map::new();
+        enable.insert("audiophile_lock_volume".into(), json!(true));
+        assert!(enables_volume_lock(&enable));
+        assert!(volume_lock_confirmation_required(&enable, false, false));
+        assert!(!volume_lock_confirmation_required(&enable, false, true));
+        assert!(!volume_lock_confirmation_required(&enable, true, false));
+
+        enable.insert("audiophile_lock_volume".into(), json!("true"));
+        assert!(enables_volume_lock(&enable));
+
+        let mut disable = Map::new();
+        disable.insert("audiophile_lock_volume".into(), json!(false));
+        assert!(!enables_volume_lock(&disable));
+        assert!(!volume_lock_confirmation_required(&disable, true, false));
+
+        let mut unrelated = Map::new();
+        unrelated.insert("theme".into(), json!("dark"));
+        assert!(!enables_volume_lock(&unrelated));
+    }
+
+    #[test]
+    fn le_temoin_de_confirmation_est_reserve_et_non_persistable() {
+        let mut patch = Map::new();
+        patch.insert(FULL_VOLUME_CONFIRMATION_FIELD.into(), json!(true));
+        assert!(take_full_volume_confirmation(&mut patch));
+        assert!(!patch.contains_key(FULL_VOLUME_CONFIRMATION_FIELD));
+    }
 }
 
 #[derive(Deserialize)]
