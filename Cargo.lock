@@ -5305,6 +5305,7 @@ dependencies = [
  "oaat-controller",
  "oaat-core",
  "objc2-core-audio",
+ "objc2-core-audio-types",
  "ort",
  "quick-xml",
  "rand_core 0.6.4",

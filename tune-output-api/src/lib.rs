@@ -71,6 +71,56 @@ pub struct OutputStatus {
     pub dop_active: bool,
 }
 
+/// Runtime truth observed at the last boundary before an output backend.
+///
+/// This deliberately lives beside [`OutputTarget`] instead of adding fields to
+/// [`OutputStatus`]: out-of-tree plugins commonly construct `OutputStatus`
+/// with a struct literal, so extending that structure would be a source-level
+/// breaking change. The trait method returning this type has a default and is
+/// therefore additive for those plugins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputSignalPathStatus {
+    pub bit_perfect: bool,
+    pub sample_transport: OutputSampleTransport,
+    pub dsp: OutputDspState,
+    pub volume: OutputVolumeState,
+    pub reasons: Vec<OutputSignalReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputSampleTransport {
+    NativeInteger,
+    Float,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputDspState {
+    Inactive,
+    Applied,
+    BypassedPure,
+    BypassedDop,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVolumeState {
+    Unity,
+    Applied,
+    BypassedDop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputSignalReason {
+    FloatTransport,
+    DspApplied,
+    DspStateUnknown,
+    SoftwareVolume,
+}
+
 impl Default for OutputStatus {
     fn default() -> Self {
         Self {
@@ -299,6 +349,14 @@ pub trait OutputTarget: Send + Sync {
     }
 
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Actual signal contract observed by the output while rendering.
+    ///
+    /// `None` means that this output does not expose a runtime observation;
+    /// callers may retain their existing static description in that case.
+    fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
         None
     }
 }
