@@ -171,6 +171,27 @@ fn les_pr_empilees_declenchent_la_ci_rapide() {
 }
 
 #[test]
+fn la_voie_rapide_est_reservee_aux_bases_batch() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let profil = fs::read_to_string(racine.join("../scripts/determiner-profil-ci.sh"))
+        .expect("scripts/determiner-profil-ci.sh lisible");
+    assert!(profil.contains("batch/*) printf '%s\\n' rapide"));
+    assert!(profil.contains("*) printf '%s\\n' complet"));
+    assert!(profil.contains("FORCER_COMPLET"));
+
+    let ci = workflow("ci.yml");
+    assert!(ci.contains("bash scripts/determiner-profil-ci.sh --autotest"));
+    assert!(ci.contains("PROFIL_CI=complet"));
+    assert!(ci.contains(
+        "FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}"
+    ));
+
+    let postgres = workflow("test-postgres.yml");
+    assert!(postgres.contains("!startsWith(github.base_ref, 'batch/')"));
+    assert!(postgres.contains("contains(github.event.pull_request.labels.*.name, 'ci:full')"));
+}
+
+#[test]
 fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     let source = workflow("ci.yml");
     let jobs = jobs(&source);
@@ -192,6 +213,26 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     let macos = corps("macos-pr");
     assert!(macos.contains("if: github.event_name == 'pull_request'"));
     assert!(macos.contains("cargo check --package tune-server"));
+
+    // Le noyau reste execute sur chaque correctif Rust. Les suites longues et
+    // les deux plateformes ne sont differees que pour une base batch/*.
+    for nom in ["fmt", "test", "clippy", "audit", "ffi"] {
+        assert!(
+            !corps(nom).contains("needs.impact.outputs.full"),
+            "job du noyau {nom} differe a tort jusqu'a l'integration du lot"
+        );
+    }
+    for nom in [
+        "test-shipped-features",
+        "audio-embedding",
+        "windows-pr",
+        "macos-pr",
+    ] {
+        assert!(
+            corps(nom).contains("needs.impact.outputs.full == 'true'"),
+            "suite complete {nom} encore lancee sur chaque correctif du lot"
+        );
+    }
 
     let livraison = corps("build");
     assert!(livraison.contains("if: github.event_name != 'pull_request'"));
@@ -248,6 +289,8 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
 
     let impact = corps("impact");
     assert!(impact.contains("bash scripts/detecter-impact-ci.sh --autotest"));
+    assert!(impact.contains("bash scripts/determiner-profil-ci.sh --autotest"));
+    assert!(impact.contains("full: ${{ steps.classer.outputs.full }}"));
     assert!(impact.contains("bash scripts/verifier-fermeture.sh --autotest"));
     assert!(impact.contains("bash scripts/verifier-refs-issues.sh --autotest"));
     assert!(impact.contains("python3 scripts/preflight-check.py --self-test"));
