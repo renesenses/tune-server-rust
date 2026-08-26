@@ -17,6 +17,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/test-postgres.yml"
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "tune-core/**"
       - "Cargo.toml"
@@ -31,6 +32,10 @@ concurrency:
 jobs:
   test-postgres:
     name: Test (PostgreSQL)
+    # Une PR de correctif vers batch/* garde le noyau Rust de ci.yml. Cette
+    # suite revient sur l'integration du lot vers release/v0.9, sur toute PR
+    # directe, ou des que le label ci:full l'exige.
+    if: github.event_name != 'pull_request' || !startsWith(github.base_ref, 'batch/') || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
