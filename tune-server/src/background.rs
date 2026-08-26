@@ -1341,15 +1341,45 @@ fn spawn_bio_sync(state: &AppState) {
     });
 }
 
-/// Best-effort, once at boot: fill in missing station logos from the
-/// mozaiklabs.fr radio directory so the seeded default stations show a vignette
-/// instead of the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
+/// Delais avant de retenter le rattrapage des logos, quand l'annuaire est
+/// injoignable. Un serveur d'appliance demarre AVANT que le reseau soit la —
+/// la box negocie, le Wi-Fi s'associe, le VPN monte. La passe unique de
+/// demarrage tombait alors dans le vide et il fallait redemarrer pour
+/// retenter : aucune vignette de station jusque-la (#2421).
+///
+/// On s'arrete des que l'annuaire repond, meme s'il ne connait pas toutes les
+/// stations : une station absente de l'annuaire ne s'y trouvera pas davantage
+/// au dixieme essai.
+const RATTRAPAGE_LOGOS_DELAIS_SECS: [u64; 3] = [30, 120, 600];
+
+/// Best-effort, at boot: fill in missing station logos from the mozaiklabs.fr
+/// radio directory so the seeded default stations show a vignette instead of
+/// the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
 fn spawn_radio_logo_refresh(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
-        let n = crate::routes::radios::refresh_radio_logos(&state).await;
-        if n > 0 {
-            tracing::info!(updated = n, "radio_logos_backfilled_at_startup");
+        let mut delais = RATTRAPAGE_LOGOS_DELAIS_SECS.iter();
+        loop {
+            let bilan = crate::routes::radios::refresh_radio_logos(&state).await;
+            // Trace INCONDITIONNELLE. Elle ne s'ecrivait que si des logos
+            // avaient ete poses — c'est-a-dire jamais dans les deux cas ou
+            // elle aurait servi : annuaire injoignable, et stations absentes
+            // de l'annuaire. Le journal ne permettait donc pas de separer
+            // « je n'ai pas trouve » de « je n'ai pas pu chercher ».
+            tracing::info!(
+                updated = bilan.updated,
+                sans_logo = bilan.sans_logo,
+                annuaire_injoignable = bilan.annuaire_injoignable,
+                "radio_logos_backfilled_at_startup"
+            );
+            if !bilan.annuaire_injoignable {
+                return;
+            }
+            let Some(secs) = delais.next() else {
+                tracing::warn!("radio_logos_directory_unreachable_giving_up");
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(*secs)).await;
         }
     });
 }

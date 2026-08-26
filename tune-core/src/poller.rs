@@ -2005,23 +2005,42 @@ pub(crate) fn station_du_now_playing(
     repo: &crate::db::radio_repo::RadioRepo,
     source_id: &str,
 ) -> Option<crate::db::radio_repo::RadioStation> {
-    let id = source_id.parse::<i64>().ok()?;
-    repo.get(id).ok().flatten()
+    if let Ok(id) = source_id.parse::<i64>() {
+        if let Ok(Some(station)) = repo.get(id) {
+            return Some(station);
+        }
+    }
+    // Et par URL de flux, qui est ce que le chemin de lecture normal écrit :
+    // `POST /radios/{id}/play/{zone_id}` pose `source_id: Some(radio.url)`.
+    // Ne chercher que par identifiant numérique revenait à ne jamais chercher.
+    repo.get_by_url(source_id).ok().flatten()
 }
 
 /// Choisir la vignette d'un pas de radio.
 ///
 /// « Un pas » et non « un morceau » : entre deux chansons il y a des
 /// chroniques, des jingles, des flashs — des pas qui n'ont pas de pochette.
+///
+/// Deux pas, et deux seulement : la pochette du morceau quand la station la
+/// donne (Bertrand : « mettre la pochette de l'album et non le logo de la
+/// radio »), le logo de la station sinon. **Et rien après.** Se rabattre sur
+/// la pochette COURANTE serait recycler celle du pas précédent : dès qu'un
+/// titre en a posé une, `cover_path` la porte, et la chronique qui suit
+/// l'hériterait puis la garderait. On n'illustre pas le journal de 13 h avec
+/// la chanson d'avant : mieux vaut le micro générique qu'une pochette fausse.
+///
+/// Une chaîne vide ne compte pas pour une valeur — `Option::or` ne le voit
+/// pas, `Some("")` gagne contre `None` et l'on publie une URL vide.
 pub(crate) fn vignette_du_pas_radio(
     pochette_titre: Option<&str>,
     logo_station: Option<&str>,
-    pochette_courante: Option<&str>,
 ) -> Option<String> {
-    pochette_titre
-        .map(str::to_string)
-        .or_else(|| logo_station.map(str::to_string))
-        .or_else(|| pochette_courante.map(str::to_string))
+    let renseigne = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    renseigne(pochette_titre).or_else(|| renseigne(logo_station))
 }
 
 pub struct PositionPoller {
@@ -2137,7 +2156,6 @@ impl PositionPoller {
                         let pochette = vignette_du_pas_radio(
                             meta.cover_url.as_deref(),
                             logo_station.as_deref(),
-                            np.cover_path.as_deref(),
                         );
                         let title_changed = np.title != meta.title
                             || np.artist_name != meta.artist
@@ -7061,24 +7079,28 @@ mod repli_logo_station_tests {
     /// `.or_else(|| np.cover_path.clone())`. Mieux vaut le micro générique
     /// qu'une pochette fausse : on n'illustre pas le journal de 13 h avec la
     /// pochette de la chanson d'avant.
+    ///
+    /// La pochette courante n'est plus un argument du tout : le pas suivant ne
+    /// peut donc PLUS hériter de celle du précédent, et c'est le compilateur
+    /// qui le tient, pas ce test. Ce test-ci garde le résultat.
     #[test]
     fn un_pas_sans_pochette_ne_recycle_pas_celle_du_titre_precedent() {
         assert_eq!(
-            vignette_du_pas_radio(None, None, Some("/artwork/titre-precedent.jpg")),
+            vignette_du_pas_radio(None, None),
             None,
             "sans pochette de titre ni logo de station, il ne faut RIEN afficher"
         );
     }
 
     /// Un `logo_url` vide ou blanc en base — import, saisie à la main — n'est
-    /// pas un logo. `Option::or` ne le voit pas : `Some(\"\")` gagne contre
+    /// pas un logo. `Option::or` ne le voit pas : `Some("")` gagne contre
     /// `None` et l'on publie une URL vide.
     #[test]
     fn un_logo_vide_en_base_ne_compte_pas_pour_un_logo() {
-        assert_eq!(vignette_du_pas_radio(None, Some(""), None), None);
-        assert_eq!(vignette_du_pas_radio(None, Some("   "), None), None);
+        assert_eq!(vignette_du_pas_radio(None, Some("")), None);
+        assert_eq!(vignette_du_pas_radio(None, Some("   ")), None);
         assert_eq!(
-            vignette_du_pas_radio(Some(""), Some("https://x/logo.png"), None),
+            vignette_du_pas_radio(Some(""), Some("https://x/logo.png")),
             Some("https://x/logo.png".to_string()),
             "une pochette de titre vide doit laisser la main au logo"
         );
@@ -7093,16 +7115,11 @@ mod repli_logo_station_tests {
             vignette_du_pas_radio(
                 Some("https://api.radiofrance/visual.jpg"),
                 Some("https://mozaiklabs.fr/storage/radios/fip.png"),
-                None
             ),
             Some("https://api.radiofrance/visual.jpg".to_string())
         );
         assert_eq!(
-            vignette_du_pas_radio(
-                None,
-                Some("https://mozaiklabs.fr/storage/radios/fip.png"),
-                None
-            ),
+            vignette_du_pas_radio(None, Some("https://mozaiklabs.fr/storage/radios/fip.png")),
             Some("https://mozaiklabs.fr/storage/radios/fip.png".to_string())
         );
     }
