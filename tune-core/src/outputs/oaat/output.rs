@@ -10,7 +10,7 @@ use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportSta
 #[cfg(feature = "oaat")]
 use super::helpers::{
     BaseDeTempsOaat, StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, duree_audio_envoyee,
-    format_rate_display,
+    extraire_payloads_fin_flux, format_rate_display,
 };
 
 #[cfg(feature = "oaat")]
@@ -2414,12 +2414,31 @@ impl OutputTarget for OaatOutput {
                                     )
                                     .await;
                                 }
-                                // Flush remaining buffer
-                                while buf.len() >= bytes_per_frame && playing.load(Ordering::Relaxed) {
-                                    let chunk_bytes = packet_size.min(buf.len());
-                                    let chunk_bytes = chunk_bytes
-                                        - (chunk_bytes % bytes_per_frame);
-                                    let payload: Vec<u8> = buf.drain(..chunk_bytes).collect();
+                                // Flush remaining buffer. Le dernier payload
+                                // reel porte LAST ; seul un flux sans residu
+                                // utilise un LAST vide (#2240).
+                                let payloads_finaux = match extraire_payloads_fin_flux(
+                                    &mut buf,
+                                    packet_size,
+                                    Some(bytes_per_frame),
+                                ) {
+                                    Ok(payloads) => payloads,
+                                    Err(raison) => {
+                                        let refus = RefusNegociation {
+                                            stream_id: stream_id.clone(),
+                                            raison: format!("fin de flux PCM invalide : {raison}"),
+                                            reconnectable: false,
+                                        };
+                                        signaler_refus_negociation(&refus_negociation, &refus);
+                                        error!(device = %device_name, %raison, "oaat: residu final PCM invalide");
+                                        break;
+                                    }
+                                };
+                                for paquet in payloads_finaux {
+                                    if !playing.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    let payload = paquet.bytes;
                                     if is_flac {
                                         // La position du paquet est celle de la
                                         // dernière trame FLAC qui y commence —
@@ -2434,7 +2453,14 @@ impl OutputTarget for OaatOutput {
                                     } else {
                                         stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
                                     };
-                                    let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, PacketFlags::empty()).await;
+                                    let mut flags = PacketFlags::empty();
+                                    if !payload.is_empty() && sample_offset == 0 && byte_offset == 0 {
+                                        flags |= PacketFlags::FIRST_PACKET;
+                                    }
+                                    if paquet.dernier {
+                                        flags |= PacketFlags::LAST_PACKET;
+                                    }
+                                    let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await;
                                     if uses_byte_offset { byte_offset += payload.len() as u64; }
                                     else { sample_offset += (payload.len() / bytes_per_frame) as u64; }
                                     position_ms.store(
@@ -2443,9 +2469,6 @@ impl OutputTarget for OaatOutput {
                                         Ordering::Relaxed,
                                     );
                                 }
-
-                                // Signal end of current track
-                                endpoint.send_audio(stream_num, cur_format, 0, sample_offset, &[], PacketFlags::LAST_PACKET).await.ok();
 
                                 // Gapless transition
                                 if let Some(next) = next_track.take() {
