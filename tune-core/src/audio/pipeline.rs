@@ -86,6 +86,12 @@ async fn run_native_pipeline(
     cfg: &PipelineConfig,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), String> {
+    if !matches!(cfg.bit_depth, 16 | 24 | 32) {
+        return Err(format!(
+            "pipeline bit depth {} is unsupported (expected 16, 24 or 32)",
+            cfg.bit_depth
+        ));
+    }
     let seek_s = cfg.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
 
     // Decode to PCM (i16 samples, interleaved)
@@ -98,17 +104,22 @@ async fn run_native_pipeline(
     )
     .map_err(|e| format!("native decode failed: {e}"))?;
 
-    // Convert samples to raw PCM bytes using bit-depth-aware encoding
-    let pcm_bytes: Vec<u8> = decoded.pcm_bytes();
+    // The pipeline advertises cfg.bit_depth in StreamInfo, so the encoded
+    // payload must use that same depth even when the source is 24/32-bit.
+    let pcm_bytes = super::decode::convert_pcm_bit_depth(
+        &decoded.samples_i32,
+        decoded.bit_depth,
+        cfg.bit_depth,
+    );
 
     // Encode to the target format
-    let actual_bd = decoded.bit_depth as u32;
+    let output_bd = cfg.bit_depth as u32;
     let output_data = match cfg.output_format {
         AudioFormat::Wav | AudioFormat::Flac => {
             let mut encoder = super::encoder::AudioEncoder::new(
                 cfg.output_format.container_format(),
                 decoded.sample_rate,
-                actual_bd,
+                output_bd,
                 decoded.channels,
             );
             encoder.start().await?;
@@ -120,7 +131,7 @@ async fn run_native_pipeline(
             let mut encoder = super::encoder::AudioEncoder::new(
                 cfg.output_format.container_format(),
                 decoded.sample_rate,
-                actual_bd,
+                output_bd,
                 decoded.channels,
             );
             encoder.start().await?;
@@ -194,5 +205,47 @@ mod tests {
             total_bytes > 44,
             "should produce WAV output with header + data"
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_wav_payload_respecte_le_bit_depth_annonce() {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/test.wav"); // source 16-bit
+        let config = PipelineConfig {
+            file_path: path.to_string_lossy().to_string(),
+            output_format: AudioFormat::Wav,
+            sample_rate: 44_100,
+            bit_depth: 24,
+            channels: 1,
+            seek_ms: None,
+        };
+        let (mut pipeline, mut rx) = AudioPipeline::new(config, 64);
+        pipeline.start().await.unwrap();
+        drop(pipeline);
+
+        let mut wav = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            wav.extend_from_slice(&chunk);
+        }
+        assert!(wav.len() > 44);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[32], wav[33]]), 3);
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 24);
+        assert_eq!((wav.len() - 44) % 3, 0);
+    }
+
+    #[tokio::test]
+    async fn pipeline_refuse_un_bit_depth_non_serialisable() {
+        let config = PipelineConfig {
+            file_path: "unused.wav".into(),
+            output_format: AudioFormat::Wav,
+            sample_rate: 44_100,
+            bit_depth: 20,
+            channels: 2,
+            seek_ms: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let error = run_native_pipeline(&config, &tx).await.unwrap_err();
+        assert!(error.contains("20"));
     }
 }

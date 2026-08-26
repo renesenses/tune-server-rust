@@ -558,15 +558,10 @@ async fn stream_to_airplay(
         return Err("decoded audio is empty".into());
     }
 
-    // La session annonce un payload RTP L16 FIXE — 44,1 kHz, 16 bits, stéréo —
-    // mais `decode_to_pcm` ne remixe ni ne rééchantillonne : il rend la source
-    // telle quelle et le dit honnêtement depuis #1498. Les cibles passées
-    // ci-dessus ne sont donc pas honorées (#2230), et sans adaptation ici un
-    // 48/96/192 kHz partait horodaté à 44,1 — vitesse et hauteur fausses — et
-    // un mono ou multicanal partait entrelacé comme du stéréo (#2237).
-    //
-    // On adapte donc explicitement, dans cet ordre : les canaux d'abord (moins
-    // de données à rééchantillonner), la cadence ensuite.
+    // La session annonce un payload RTP L16 FIXE — 44,1 kHz, 16 bits, stéréo.
+    // `decode_to_pcm` garantit désormais cadence et canaux (#2230). Les gardes
+    // restent ici à la frontière RTP : si ce contrat régresse, AirPlay adapte
+    // encore les canaux puis la cadence au lieu d'émettre un payload mensonger.
     let mut echantillons = decoded.samples_i32;
     if decoded.channels != CHANNELS as u32 {
         info!(

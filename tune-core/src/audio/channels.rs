@@ -198,6 +198,12 @@ pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> 
     let mut matrix = vec![0.0f32; tgt * src];
 
     match (source_ch, target_ch) {
+        // Stereo -> mono: preserve both sides instead of silently keeping L.
+        (2, 1) => {
+            matrix[0] = 0.5;
+            matrix[1] = 0.5;
+        }
+
         // 5.1 (6ch) -> stereo (2ch): ITU-R BS.775
         // L_out = FL + 0.707*FC + 0.707*BL
         // R_out = FR + 0.707*FC + 0.707*BR
@@ -271,6 +277,64 @@ pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> 
     }
 
     Some(matrix)
+}
+
+/// Adapt interleaved, right-justified integer PCM to an exact channel count.
+///
+/// Downmixes use [`build_downmix_matrix`]. Upmixes preserve every source
+/// channel and duplicate the last one into the additional outputs, matching
+/// the local-output pipeline's established behaviour. The output always
+/// contains the same number of frames as the input.
+pub fn adapt_channels_i32(
+    samples: &[i32],
+    source_ch: u16,
+    target_ch: u16,
+    bit_depth: u16,
+) -> Result<Vec<i32>, String> {
+    if source_ch == 0 || target_ch == 0 {
+        return Err("channel count must be greater than zero".into());
+    }
+    if samples.len() % source_ch as usize != 0 {
+        return Err(format!(
+            "PCM sample count {} is not aligned to {source_ch} source channels",
+            samples.len()
+        ));
+    }
+    if source_ch == target_ch || samples.is_empty() {
+        return Ok(samples.to_vec());
+    }
+
+    let src = source_ch as usize;
+    let tgt = target_ch as usize;
+    let frames = samples.len() / src;
+    let mut output = Vec::with_capacity(frames.saturating_mul(tgt));
+
+    if source_ch < target_ch {
+        for frame in samples.chunks_exact(src) {
+            output.extend_from_slice(frame);
+            let last = *frame.last().unwrap_or(&0);
+            output.extend(std::iter::repeat_n(last, tgt - src));
+        }
+        return Ok(output);
+    }
+
+    let matrix = build_downmix_matrix(source_ch, target_ch)
+        .ok_or_else(|| format!("no downmix matrix for {source_ch} -> {target_ch} channels"))?;
+    let depth = bit_depth.clamp(8, 32);
+    let min = -(1i64 << (depth - 1));
+    let max = (1i64 << (depth - 1)) - 1;
+    for frame in samples.chunks_exact(src) {
+        for out_ch in 0..tgt {
+            let row = out_ch * src;
+            let sum = frame
+                .iter()
+                .enumerate()
+                .map(|(in_ch, &sample)| sample as f64 * matrix[row + in_ch] as f64)
+                .sum::<f64>();
+            output.push(sum.round().clamp(min as f64, max as f64) as i32);
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -439,11 +503,9 @@ mod tests {
 
 /// Ramener un flux entrelacé à la stéréo, en entiers.
 ///
-/// AirPlay négocie un payload RTP L16 **fixe** — 44,1 kHz, 16 bits, stéréo — et
-/// l'annonce dans sa session. Le décodeur, lui, rend la source telle quelle :
-/// `decode_to_pcm` ne remixe pas (#2230). Un fichier mono ou multicanal partait
-/// donc entrelacé comme s'il était stéréo, et l'appareil en tirait n'importe
-/// quoi (#2237).
+/// Créé pour la frontière AirPlay, qui négocie un payload RTP L16 **fixe** —
+/// 44,1 kHz, 16 bits, stéréo. Il reste une garde spécialisée en plus du contrat
+/// commun de `decode_to_pcm` (#2230, #2237).
 ///
 /// Le repli 5.1/7.1 reprend les coefficients de `adapt_channels`
 /// (`outputs/local.rs`), son jumeau en f32. Deux implémentations du même mixage
@@ -491,7 +553,7 @@ pub fn to_stereo_i32(samples: &[i32], from_ch: u16) -> Vec<i32> {
 
 #[cfg(test)]
 mod stereo_i32_tests {
-    use super::to_stereo_i32;
+    use super::{adapt_channels_i32, to_stereo_i32};
 
     #[test]
     fn la_stereo_passe_telle_quelle() {
@@ -530,5 +592,25 @@ mod stereo_i32_tests {
     #[test]
     fn trois_a_cinq_canaux_gardent_la_paire_avant() {
         assert_eq!(to_stereo_i32(&[7, 8, 9], 3), vec![7, 8]);
+    }
+
+    #[test]
+    fn stereo_vers_mono_melange_les_deux_cotes() {
+        assert_eq!(
+            adapt_channels_i32(&[10_000, -2_000, -4_000, 2_000], 2, 1, 16).unwrap(),
+            vec![4_000, -1_000]
+        );
+    }
+
+    #[test]
+    fn mono_vers_multicanal_conserve_le_nombre_de_trames() {
+        let out = adapt_channels_i32(&[1, 2], 1, 4, 16).unwrap();
+        assert_eq!(out, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+        assert_eq!(out.len() / 4, 2);
+    }
+
+    #[test]
+    fn adaptation_refuse_une_trame_incomplete() {
+        assert!(adapt_channels_i32(&[1, 2, 3], 2, 1, 16).is_err());
     }
 }

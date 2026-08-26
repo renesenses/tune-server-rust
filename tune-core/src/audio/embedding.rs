@@ -341,19 +341,16 @@ fn quantize_i16(x: f32) -> f32 {
 /// for the embedder. The full-scale rule is `sample / 2^(bits-1)` (matching the
 /// loudness pass; librosa normalises identically).
 ///
-/// CLAP expects mono. `decode_to_pcm` is asked for 1 channel, but some decoder
-/// paths ignore that and return **interleaved stereo** (#1108). Fed as if it were
-/// mono, L/R/L/R doubles the effective sample rate and smears the timbre — enough
-/// to preserve same-album structure (Phase 1) yet wreck cross-modal alignment
-/// (text↔audio, Phase 3). Averaging the channels per frame restores true mono.
-/// Cadence d'entrée du front-end mel de CLAP. `decode_to_pcm` la *demande*,
-/// mais le chemin symphonia ne rééchantillonne pas : depuis #1508 il dit la
-/// vérité (`d.sample_rate` = cadence source) au lieu de mentir, et c'est donc
-/// ici que la fenêtre doit être amenée réellement à 48 kHz.
+/// CLAP expects mono. `decode_to_pcm` now guarantees the requested channel count
+/// and rate (#2230); this helper still accepts arbitrary decoded buffers so its
+/// contract is explicit and independently testable. Averaging channels per
+/// frame prevents an accidental L/R/L/R stream from doubling the effective
+/// sample rate and smearing the timbre (#1108).
+/// Cadence d'entrée du front-end mel de CLAP.
 const CLAP_INPUT_RATE: u32 = 48_000;
 
 /// La fenêtre exactement comme le modèle l'attend : mono (vraie moyenne des
-/// canaux, #1108/#1508) puis VRAI 48 kHz (rubato). Avant ce correctif (#1498),
+/// canaux, #1108/#1508) puis VRAI 48 kHz (rubato). Avant #2230,
 /// un FLAC 44,1 stéréo arrivait au modèle en L/R entrelacé étiqueté mono
 /// 48 kHz : ~5,4 s de musique au lieu de 10, timbre brouillé, et des vecteurs
 /// dépendant de l'encodage — rédhibitoire pour toute mutualisation.

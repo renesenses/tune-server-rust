@@ -1146,8 +1146,8 @@ pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
 /// Decode a WavPack file to interleaved i16 PCM.
 pub fn decode_wavpack_to_pcm(
     path: &str,
-    target_sample_rate: Option<u32>,
-    target_channels: Option<u32>,
+    _target_sample_rate: Option<u32>,
+    _target_channels: Option<u32>,
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
@@ -1277,8 +1277,6 @@ pub fn decode_wavpack_to_pcm(
         return Err("wavpack: no samples decoded".into());
     }
 
-    let out_rate = target_sample_rate.unwrap_or(source_rate);
-    let out_channels = target_channels.unwrap_or(source_channels);
     let total_frames = all_samples.len() as f64 / source_channels as f64;
     let duration_s = total_frames / source_rate as f64;
 
@@ -1295,8 +1293,8 @@ pub fn decode_wavpack_to_pcm(
     Ok(DecodedAudio {
         samples_i32: all_samples,
         bit_depth: bits as u16,
-        sample_rate: out_rate,
-        channels: out_channels,
+        sample_rate: source_rate,
+        channels: source_channels,
         duration_s,
     })
 }
