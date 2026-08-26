@@ -951,7 +951,30 @@ async fn process_responses(
                 }
 
                 if failure_count <= 3 {
-                    warn!(id = %dev_id, error = %e, "ssdp_device_create_failed");
+                    // La LOCATION, et pas seulement l'UUID (#2417).
+                    //
+                    // Pour un échec RÉSEAU l'adresse survivait par accident,
+                    // parce que le message d'erreur l'embarque :
+                    // « HTTP fetch http://192.168.1.1:1900/rootDesc.xml: …
+                    // operation timed out ». Pour un échec de PARSING, non :
+                    // « XML parse error: ill-formed document: expected
+                    // `</meta>`, but `</head>` was found » ne porte aucune
+                    // URL. C'est exactement le cas qui en a besoin, et c'était
+                    // le seul qui ne l'avait pas.
+                    //
+                    // Cette erreur-là est la signature d'une page HTML — un
+                    // `<meta>` non refermé dans un `<head>`. Une adresse
+                    // annoncée en SSDP rend donc du HTML là où le scanner
+                    // attend une description UPnP, et sans l'URL on ne peut ni
+                    // l'ouvrir dans un navigateur, ni chercher qui l'annonce.
+                    // Le journal de FabienM (fil forum 1535) est resté
+                    // indiagnosticable pour cette seule raison.
+                    warn!(
+                        id = %dev_id,
+                        location = %resp.location,
+                        error = %e,
+                        "ssdp_device_create_failed"
+                    );
                 }
                 let mut st = state.lock().await;
                 if st.create_failures.len() > 200 {
@@ -1524,5 +1547,169 @@ mod tests {
         assert!(!is_virtual_interface("wlan0", real_ip));
         assert!(!is_virtual_interface("Wi-Fi", real_ip));
         assert!(!is_virtual_interface("Ethernet", real_ip));
+    }
+
+    // ── Un échec doit nommer l'adresse qui l'a causé (#2417) ──────────────
+    //
+    // Journal de FabienM (fil forum 1535) :
+    //
+    //   WARN ssdp_device_create_failed
+    //       id=uuid:129b92ad-…
+    //       error=XML parse error: ill-formed document: expected `</meta>`,
+    //             but `</head>` was found
+    //
+    // `expected </meta>, but </head>` est la signature d'une page HTML : une
+    // LOCATION annoncée en SSDP a rendu du HTML là où le scanner attendait une
+    // description UPnP. Et la trace ne dit PAS laquelle. Pour un échec réseau
+    // l'URL survit par accident — le message d'erreur l'embarque (« HTTP fetch
+    // http://… : timed out ») ; pour un échec de PARSING, non. C'est
+    // exactement le cas qui a besoin de l'URL, et le seul qui ne l'avait pas :
+    // on sait qu'une adresse rend du HTML, on ne sait pas laquelle, on ne peut
+    // rien chercher.
+
+    /// Page HTML type — un `<meta>` non refermé dans un `<head>`, ce qui
+    /// produit mot pour mot l'erreur du journal de FabienM.
+    const PAGE_HTML: &str = "<!doctype html><html><head>\
+<meta charset=\"utf-8\">\
+</head><body>Tune</body></html>";
+
+    /// Un serveur web ordinaire à l'adresse annoncée en LOCATION : il rend
+    /// `PAGE_HTML` sur `description_path`, et **404 partout ailleurs**.
+    ///
+    /// Le 404 n'est pas un détail de confort. À la première défaillance,
+    /// `process_responses` tente une sonde `MinimalDMR` sur `/AVTransport` et
+    /// `/RenderingControl` avant de journaliser, et ne journalise pas si elle
+    /// aboutit. Un bouchon qui répondrait 200 à tout la ferait aboutir sur du
+    /// HTML — le test passerait à côté du chemin qu'il prétend couvrir. Un
+    /// vrai serveur web, lui, ne connaît pas ces routes.
+    async fn spawn_html_server(description_path: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let tete = String::from_utf8_lossy(&req);
+                    let chemin = tete
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let resp = if chemin == description_path {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            PAGE_HTML.len(),
+                            PAGE_HTML
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Récupère la sortie `tracing` d'un futur, pour pouvoir affirmer ce que le
+    /// journal contient VRAIMENT — c'est le journal, et lui seul, que l'on aura
+    /// entre les mains la prochaine fois.
+    #[derive(Clone, Default)]
+    struct JournalCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn l_echec_de_creation_nomme_la_location_fautive() {
+        use tracing::instrument::WithSubscriber;
+
+        const CHEMIN: &str = "/upnp/description.xml";
+        let addr = spawn_html_server(CHEMIN).await;
+        // L'adresse exacte que l'on doit pouvoir relire dans le journal, puis
+        // coller dans un navigateur.
+        let location = format!("http://{addr}{CHEMIN}");
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        process_responses(
+            &state,
+            &tx,
+            vec![announcement(
+                &location,
+                "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c::urn:schemas-upnp-org:device:MediaServer:1",
+            )],
+        )
+        .with_subscriber(abonne)
+        .await;
+
+        // La sonde de repli ne doit pas avoir abouti : sinon on ne teste pas
+        // le chemin d'échec, on teste le repli.
+        assert!(
+            state.lock().await.devices.is_empty(),
+            "une page HTML ne doit produire aucun lecteur ; le test ne passerait \
+             plus par ssdp_device_create_failed"
+        );
+
+        let texte = journal.texte();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_create_failed"))
+            .unwrap_or_else(|| {
+                panic!("aucune trace ssdp_device_create_failed dans le journal :\n{texte}")
+            });
+
+        // Le contrat : la trace doit permettre d'AGIR. Sans l'URL, elle ne le
+        // permet pas — c'est précisément ce qui a laissé #2417 irrésolu.
+        assert!(
+            ligne.contains(&location),
+            "la trace d'échec ne nomme pas la LOCATION fautive ; \
+             sans elle on ne peut pas savoir quelle adresse rend du HTML.\n\
+             attendu quelque part dans la ligne : {location}\n\
+             ligne obtenue : {ligne}"
+        );
     }
 }
