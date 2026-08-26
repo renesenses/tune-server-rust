@@ -383,6 +383,7 @@ async fn connect_and_setup(
         &mut endpoint,
         device_name,
         &contrat,
+        PolitiqueAdaptation::ExacteSeulement,
         std::time::Duration::from_secs(3),
     )
     .await
@@ -729,6 +730,7 @@ impl OutputTarget for OaatOutput {
                             &mut endpoint,
                             &device_name,
                             &contrat,
+                            PolitiqueAdaptation::ExacteSeulement,
                             std::time::Duration::from_secs(5),
                         )
                         .await
@@ -1304,33 +1306,29 @@ impl OutputTarget for OaatOutput {
                         break 'direct false;
                     }
 
-                    let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = (
+                    let (source_pcm, source_format, source_sample_rate, source_bits, source_ch) = (
                         buf,
                         si.format,
                         si.sample_rate,
                         si.bits_per_sample,
                         si.channels.min(8) as u8,
                     );
-                    let layout = ChannelLayout::Stereo;
-
-                    let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
-                    let packet_size = PCM_SAMPLES_PER_PACKET * bytes_per_frame;
-
-                    if packet_size == 0 || bytes_per_frame == 0 {
-                        error!(device = %device_name, "oaat: zero packet size, cannot stream");
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    }
-
-                    let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
+                    let source_layout = match disposition_oaat(source_ch) {
+                        Ok(layout) => layout,
+                        Err(raison) => {
+                            error!(device = %device_name, %raison, "oaat: disposition PCM source invalide");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
                     if let Err(e) = endpoint
                         .propose_format(
                             &stream_id,
-                            cur_format,
-                            cur_sample_rate,
-                            ch,
-                            layout,
-                            cur_bits as u8,
+                            source_format,
+                            source_sample_rate,
+                            source_ch,
+                            source_layout,
+                            source_bits as u8,
                         )
                         .await
                     {
@@ -1344,27 +1342,75 @@ impl OutputTarget for OaatOutput {
                     // consulter.
                     let contrat = ContratPropose {
                         stream_id: stream_id.clone(),
-                        format: cur_format,
-                        sample_rate: cur_sample_rate,
-                        channels: ch,
-                        channel_layout: layout,
-                        bits_per_sample: cur_bits,
+                        format: source_format,
+                        sample_rate: source_sample_rate,
+                        channels: source_ch,
+                        channel_layout: source_layout,
+                        bits_per_sample: source_bits,
                         // `propose_format` n'envoie pas de `dsd_rate`.
                         dsd_rate: None,
                     };
-                    if let Err(refus) = attendre_accord_format(
+                    let contrat_negocie = match attendre_accord_format(
                         &mut endpoint,
                         &device_name,
                         &contrat,
+                        PolitiqueAdaptation::PcmEntier,
                         std::time::Duration::from_secs(5),
                     )
                     .await
                     {
-                        error!(device = %device_name, raison = %refus.raison, "oaat: format non accepte, on ne joue pas");
-                        signaler_refus_negociation(&refus_negociation, &refus);
+                        Ok(contrat) => contrat,
+                        Err(refus) => {
+                            error!(device = %device_name, raison = %refus.raison, "oaat: format non accepte, on ne joue pas");
+                            signaler_refus_negociation(&refus_negociation, &refus);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+
+                    let mut adaptateur = match construire_adaptateur_pcm(&contrat, &contrat_negocie)
+                    {
+                        Ok(adaptateur) => adaptateur,
+                        Err(raison) => {
+                            let refus = RefusNegociation {
+                                stream_id: stream_id.clone(),
+                                raison: format!("adaptation PCM négociée impossible : {raison}"),
+                                reconnectable: false,
+                            };
+                            signaler_refus_negociation(&refus_negociation, &refus);
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+                    let mut pcm_data = match adaptateur.push(&source_pcm) {
+                        Ok(pcm) => pcm,
+                        Err(raison) => {
+                            error!(device = %device_name, %raison, "oaat: adaptation PCM directe échouée");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+                    match adaptateur.finish() {
+                        Ok(fin) => pcm_data.extend(fin),
+                        Err(raison) => {
+                            error!(device = %device_name, %raison, "oaat: fin adaptation PCM directe invalide");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+
+                    let cur_format = contrat_negocie.format;
+                    let cur_sample_rate = contrat_negocie.sample_rate;
+                    let cur_bits = contrat_negocie.bits_per_sample;
+                    let ch = contrat_negocie.channels;
+                    let bytes_per_frame = (cur_bits as usize / 8) * ch as usize;
+                    let packet_size = PCM_SAMPLES_PER_PACKET * bytes_per_frame;
+                    if packet_size == 0 || bytes_per_frame == 0 {
+                        error!(device = %device_name, "oaat: zero packet size, cannot stream");
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
+                    let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
 
                     endpoint
                         .send_metadata(oaat_core::message::TrackMetadata {
@@ -1397,7 +1443,6 @@ impl OutputTarget for OaatOutput {
                     // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
                     let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
                     let mut start = std::time::Instant::now();
-                    let mut pcm_data = pcm_data;
                     let mut staged_next: Option<super::helpers::StagedDirectTrack> = None;
                     let mut staged_rx: Option<
                         tokio::sync::oneshot::Receiver<Option<super::helpers::StagedDirectTrack>>,
@@ -1529,6 +1574,7 @@ impl OutputTarget for OaatOutput {
                                         let (tx, rx) = tokio::sync::oneshot::channel();
                                         staged_rx = Some(rx);
                                         let dev = device_name.clone();
+                                        let cible = contrat_negocie.clone();
                                         tokio::task::spawn_blocking(move || {
                                             let staged = super::helpers::stage_direct_track(
                                                 &next_path,
@@ -1537,7 +1583,16 @@ impl OutputTarget for OaatOutput {
                                                 album,
                                                 cover_url,
                                                 duration_ms,
-                                            );
+                                            )
+                                            .and_then(|piste| {
+                                                match adapter_piste_directe_gapless(piste, &cible) {
+                                                    Ok(piste) => Some(piste),
+                                                    Err(raison) => {
+                                                        debug!(device = %dev, path = %next_path, %raison, "oaat: direct next track cannot satisfy negotiated format");
+                                                        None
+                                                    }
+                                                }
+                                            });
                                             if staged.is_none() {
                                                 debug!(device = %dev, path = %next_path, "oaat: direct next track not stageable");
                                             }
@@ -1693,7 +1748,7 @@ impl OutputTarget for OaatOutput {
                 }
             };
 
-            let mut is_flac = si.format == AudioFormat::Flac;
+            let source_is_flac = si.format == AudioFormat::Flac;
 
             // Un flux FLAC ne peut pas partir tel quel : le decoupage UDP
             // corrompt les frontieres de trame. Ce cas ne doit plus se
@@ -1705,7 +1760,7 @@ impl OutputTarget for OaatOutput {
             // On refuse explicitement plutot que d'emettre un flux qu'on sait
             // corrompu : une erreur nommee vaut mieux qu'un grésillement dont
             // personne ne trouvera la cause.
-            if is_flac {
+            if source_is_flac {
                 error!(
                     device = %device_name,
                     "oaat: flux FLAC inattendu sur le chemin HTTP, lecture abandonnee"
@@ -1713,33 +1768,25 @@ impl OutputTarget for OaatOutput {
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
+            if si.format.is_dsd() {
+                error!(device = %device_name, "oaat: flux DSD inattendu sur le chemin HTTP PCM");
+                playing.store(false, Ordering::SeqCst);
+                return;
+            }
 
-            // S24LE (3-byte packed) is sent as-is — the endpoint handles it
-            // natively. Previous S24→S32 conversion caused format mismatch
-            // when the endpoint counter-proposed 24-bit back.
-            let needs_s24_upconvert = false;
-
-            let is_dsd = si.format.is_dsd();
-            let uses_byte_offset = is_flac || is_dsd;
-            let was_flac = si.format == AudioFormat::Flac;
-            let mut cur_format = if (was_flac && !is_flac) || needs_s24_upconvert {
-                if si.bits_per_sample >= 24 {
-                    AudioFormat::PcmS32le
-                } else {
-                    AudioFormat::PcmS16le
+            let mut source_format = si.format;
+            let mut source_sample_rate = si.sample_rate;
+            let mut source_bits = si.bits_per_sample;
+            let mut source_channels = si.channels.min(8) as u8;
+            let mut source_layout = match disposition_oaat(source_channels) {
+                Ok(layout) => layout,
+                Err(raison) => {
+                    error!(device = %device_name, %raison, "oaat: disposition source invalide");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
                 }
-            } else {
-                si.format
             };
-            let mut cur_sample_rate = si.sample_rate;
-            let mut cur_bits = if (was_flac && !is_flac) || needs_s24_upconvert {
-                if si.bits_per_sample >= 24 { 32 } else { 16 }
-            } else {
-                si.bits_per_sample
-            };
-            let cur_channels = si.channels;
-            let ch = cur_channels.min(8) as u8;
-            let layout = ChannelLayout::Stereo;
+            let mut source_data_offset = si.data_offset;
 
             let track_duration_ms = if track_duration_ms > 0 {
                 track_duration_ms
@@ -1748,19 +1795,10 @@ impl OutputTarget for OaatOutput {
             };
             duration_ms_arc.store(track_duration_ms, Ordering::SeqCst);
 
-            let mut bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-            let mut packet_size = if is_dsd {
-                DSD_CHUNK_SIZE
-            } else if is_flac {
-                FLAC_CHUNK_SIZE
-            } else {
-                PCM_SAMPLES_PER_PACKET * bytes_per_frame
-            };
-
             info!(
                 device = %device_name,
-                sample_rate = cur_sample_rate, bits = cur_bits, channels = cur_channels,
-                format = %cur_format, is_flac,
+                sample_rate = source_sample_rate, bits = source_bits, channels = source_channels,
+                format = %source_format,
                 "oaat: audio format detected"
             );
 
@@ -1769,11 +1807,11 @@ impl OutputTarget for OaatOutput {
                 .send_message(&oaat_core::Message::FormatPropose(
                     oaat_core::message::FormatPropose {
                         stream_id: stream_id.clone(),
-                        format: cur_format,
-                        sample_rate: cur_sample_rate,
-                        channels: ch,
-                        channel_layout: layout,
-                        bits_per_sample: cur_bits as u8,
+                        format: source_format,
+                        sample_rate: source_sample_rate,
+                        channels: source_channels,
+                        channel_layout: source_layout,
+                        bits_per_sample: source_bits as u8,
                         dsd_rate: si.dsd_rate,
                     },
                 ))
@@ -1786,17 +1824,18 @@ impl OutputTarget for OaatOutput {
 
             let contrat = ContratPropose {
                 stream_id: stream_id.clone(),
-                format: cur_format,
-                sample_rate: cur_sample_rate,
-                channels: ch,
-                channel_layout: layout,
-                bits_per_sample: cur_bits,
+                format: source_format,
+                sample_rate: source_sample_rate,
+                channels: source_channels,
+                channel_layout: source_layout,
+                bits_per_sample: source_bits,
                 dsd_rate: si.dsd_rate,
             };
             let mut verdict = attendre_accord_format(
                 &mut endpoint,
                 &device_name,
                 &contrat,
+                PolitiqueAdaptation::PcmEntier,
                 std::time::Duration::from_secs(5),
             )
             .await;
@@ -1835,6 +1874,7 @@ impl OutputTarget for OaatOutput {
                             &mut endpoint,
                             &device_name,
                             &contrat,
+                            PolitiqueAdaptation::PcmEntier,
                             std::time::Duration::from_secs(5),
                         )
                         .await;
@@ -1847,11 +1887,49 @@ impl OutputTarget for OaatOutput {
                 }
             }
 
-            if let Err(refus) = verdict {
-                signaler_refus_negociation(&refus_negociation, &refus);
-                playing.store(false, Ordering::SeqCst);
-                return;
-            }
+            let contrat_negocie = match verdict {
+                Ok(contrat) => contrat,
+                Err(refus) => {
+                    signaler_refus_negociation(&refus_negociation, &refus);
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let mut adaptateur_pcm = match construire_adaptateur_pcm(&contrat, &contrat_negocie) {
+                Ok(adaptateur) => adaptateur,
+                Err(raison) => {
+                    let refus = RefusNegociation {
+                        stream_id: stream_id.clone(),
+                        raison: format!("adaptation PCM négociée impossible : {raison}"),
+                        reconnectable: false,
+                    };
+                    signaler_refus_negociation(&refus_negociation, &refus);
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            buf = match adaptateur_pcm.push(&buf) {
+                Ok(adaptee) => adaptee,
+                Err(raison) => {
+                    error!(device = %device_name, %raison, "oaat: premier bloc PCM invalide");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let mut cur_format = contrat_negocie.format;
+            let mut cur_sample_rate = contrat_negocie.sample_rate;
+            let mut cur_bits = contrat_negocie.bits_per_sample;
+            let mut cur_channels = contrat_negocie.channels;
+            let mut ch = cur_channels;
+            let mut layout = contrat_negocie.channel_layout;
+            let mut bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
+            let mut packet_size = PCM_SAMPLES_PER_PACKET * bytes_per_frame;
+            let mut source_bytes_per_frame = (source_bits as usize / 8) * source_channels as usize;
+            let mut is_flac = false;
+            let mut is_dsd = false;
+            let mut uses_byte_offset = false;
 
             // Metadata + Play
             let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
@@ -1881,20 +1959,21 @@ impl OutputTarget for OaatOutput {
             info!(device = %device_name, "oaat: streaming started");
 
             // Build StreamInfo for reconnection
-            let cur_stream_info = StreamInfo {
+            let mut cur_stream_info = StreamInfo {
                 sample_rate: cur_sample_rate,
-                channels: cur_channels,
+                channels: cur_channels as u16,
                 bits_per_sample: cur_bits,
                 format: cur_format,
                 duration_ms: track_duration_ms,
-                dsd_rate: dsd_rate_from_sample_rate(cur_sample_rate),
-                data_offset: 0,
+                dsd_rate: None,
+                // Les Range portent sur le flux SOURCE, avant adaptation.
+                data_offset: source_data_offset,
             };
 
             // Streaming loop
             let mut sample_offset: u64 = 0;
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
-            let stream_start_ns = super::helpers::now_ns() + 500_000_000;
+            let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
             // Position VRAIE d'un flux FLAC, lue dans ses en-têtes de trames.
             // Le calcul par octets reste JUSTE pour le DSD (débit constant) —
@@ -2019,23 +2098,49 @@ impl OutputTarget for OaatOutput {
                                 })).await.ok();
 
                                 {
-                                    // Calculate byte offset
-                                    let bytes_per_sec = if is_dsd {
-                                        cur_sample_rate as u64 * cur_channels as u64 / 8
-                                    } else {
-                                        cur_sample_rate as u64 * bytes_per_frame as u64
-                                    };
+                                    // Le Range vise les octets SOURCE. Utiliser
+                                    // cadence/profondeur CIBLES après un
+                                    // FormatCounter sauterait ou rejouerait une
+                                    // autre portion du morceau.
+                                    let bytes_per_sec = source_sample_rate as u64
+                                        * source_bytes_per_frame as u64;
                                     let data_byte = seek_pos * bytes_per_sec / 1000;
-                                    let frame_align = if is_dsd { 4096 * cur_channels as u64 } else { bytes_per_frame as u64 };
+                                    let frame_align = source_bytes_per_frame as u64;
                                     let aligned = (data_byte / frame_align) * frame_align;
-                                    let file_offset = aligned + cur_stream_info.data_offset as u64;
+                                    let file_offset = aligned + source_data_offset as u64;
 
                                     let range = format!("bytes={file_offset}-");
                                     match http_client.get(&url).header("Range", &range).send().await {
                                         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
+                                            let source = ContratPropose {
+                                                stream_id: stream_id.clone(),
+                                                format: source_format,
+                                                sample_rate: source_sample_rate,
+                                                channels: source_channels,
+                                                channel_layout: source_layout,
+                                                bits_per_sample: source_bits,
+                                                dsd_rate: None,
+                                            };
+                                            let cible = ContratPropose {
+                                                stream_id: stream_id.clone(),
+                                                format: cur_format,
+                                                sample_rate: cur_sample_rate,
+                                                channels: cur_channels,
+                                                channel_layout: layout,
+                                                bits_per_sample: cur_bits,
+                                                dsd_rate: None,
+                                            };
+                                            let Ok(nouvel_adaptateur) = construire_adaptateur_pcm(&source, &cible) else {
+                                                error!(device = %device_name, "oaat: impossible de réinitialiser l adaptation PCM après seek");
+                                                break;
+                                            };
+                                            adaptateur_pcm = nouvel_adaptateur;
                                             stream = Box::pin(resp.bytes_stream());
                                             buf.clear();
-                                            if uses_byte_offset { byte_offset = aligned; } else { sample_offset = aligned / bytes_per_frame as u64; }
+                                            byte_offset = 0;
+                                            sample_offset = seek_pos
+                                                .saturating_mul(cur_sample_rate as u64)
+                                                / 1000;
                                             let elapsed_eq = std::time::Duration::from_millis(seek_pos);
                                             start = std::time::Instant::now() - elapsed_eq;
                                             pause_offset = std::time::Duration::ZERO;
@@ -2053,10 +2158,11 @@ impl OutputTarget for OaatOutput {
                                 let cur_fmt = cur_format;
                                 let cur_rate = cur_sample_rate;
                                 let cur_bps = cur_bits;
+                                let cur_ch = cur_channels;
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 prefetch_rx = Some(rx);
                                 tokio::spawn(async move {
-                                    let _ = tx.send(prefetch_next_track(&client, &dev, &url, title, artist, album, cover_url, duration_ms, cur_fmt, cur_rate, cur_bps).await);
+                                    let _ = tx.send(prefetch_next_track(&client, &dev, &url, title, artist, album, cover_url, duration_ms, cur_fmt, cur_rate, cur_bps, cur_ch).await);
                                 });
                             }
                         }
@@ -2069,7 +2175,19 @@ impl OutputTarget for OaatOutput {
                                 // retry budget so isolated transient blips don't
                                 // accumulate toward the cap over a long track.
                                 stream_retry_attempts = 0;
-                                buf.extend_from_slice(&data);
+                                match adaptateur_pcm.push(&data) {
+                                    Ok(adaptee) => buf.extend(adaptee),
+                                    Err(raison) => {
+                                        let refus = RefusNegociation {
+                                            stream_id: stream_id.clone(),
+                                            raison: format!("payload PCM source invalide : {raison}"),
+                                            reconnectable: false,
+                                        };
+                                        signaler_refus_negociation(&refus_negociation, &refus);
+                                        error!(device = %device_name, %raison, "oaat: adaptation PCM interrompue");
+                                        break;
+                                    }
+                                }
                             }
                             Some(Err(e)) => {
                                 // First: is this the END of the track rather than
@@ -2144,18 +2262,42 @@ impl OutputTarget for OaatOutput {
                                 // Bytes already SENT define the resume point; drop
                                 // any received-but-unsent bytes (they'll be re-
                                 // fetched) so we neither duplicate nor lose audio.
-                                let data_bytes = if uses_byte_offset {
-                                    byte_offset
-                                } else {
-                                    sample_offset * bytes_per_frame as u64
-                                };
-                                let file_offset = data_bytes + cur_stream_info.data_offset as u64;
+                                let source_frames = ((sample_offset as u128
+                                    * source_sample_rate as u128)
+                                    / cur_sample_rate.max(1) as u128)
+                                    as u64;
+                                let data_bytes = source_frames
+                                    .saturating_mul(source_bytes_per_frame as u64);
+                                let file_offset = data_bytes + source_data_offset as u64;
                                 let range = format!("bytes={file_offset}-");
                                 warn!(device = %device_name, error = %e, attempt = stream_retry_attempts, file_offset, "oaat: stream error, resuming via Range");
                                 // Brief backoff to let a transient upstream hiccup clear.
                                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                 match http_client.get(&url).header("Range", &range).send().await {
                                     Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
+                                        let source = ContratPropose {
+                                            stream_id: stream_id.clone(),
+                                            format: source_format,
+                                            sample_rate: source_sample_rate,
+                                            channels: source_channels,
+                                            channel_layout: source_layout,
+                                            bits_per_sample: source_bits,
+                                            dsd_rate: None,
+                                        };
+                                        let cible = ContratPropose {
+                                            stream_id: stream_id.clone(),
+                                            format: cur_format,
+                                            sample_rate: cur_sample_rate,
+                                            channels: cur_channels,
+                                            channel_layout: layout,
+                                            bits_per_sample: cur_bits,
+                                            dsd_rate: None,
+                                        };
+                                        let Ok(nouvel_adaptateur) = construire_adaptateur_pcm(&source, &cible) else {
+                                            error!(device = %device_name, "oaat: impossible de réinitialiser l adaptation PCM après reprise HTTP");
+                                            break;
+                                        };
+                                        adaptateur_pcm = nouvel_adaptateur;
                                         stream = Box::pin(resp.bytes_stream());
                                         buf.clear();
                                         info!(device = %device_name, file_offset, "oaat: stream resumed after body error");
@@ -2171,6 +2313,19 @@ impl OutputTarget for OaatOutput {
                                 }
                             }
                             None => {
+                                match adaptateur_pcm.finish() {
+                                    Ok(fin) => buf.extend(fin),
+                                    Err(raison) => {
+                                        let refus = RefusNegociation {
+                                            stream_id: stream_id.clone(),
+                                            raison: format!("fin de payload PCM invalide : {raison}"),
+                                            reconnectable: false,
+                                        };
+                                        signaler_refus_negociation(&refus_negociation, &refus);
+                                        error!(device = %device_name, %raison, "oaat: adaptation PCM incomplète à l EOF");
+                                        break;
+                                    }
+                                }
                                 // L'EOF peut griller la politesse à un
                                 // préchargement encore en vol : la chaîne
                                 // PrepareNext → fetch → oneshot est asynchrone,
@@ -2197,8 +2352,11 @@ impl OutputTarget for OaatOutput {
                                     .await;
                                 }
                                 // Flush remaining buffer
-                                while buf.len() >= packet_size && playing.load(Ordering::Relaxed) {
-                                    let payload: Vec<u8> = buf.drain(..packet_size).collect();
+                                while buf.len() >= bytes_per_frame && playing.load(Ordering::Relaxed) {
+                                    let chunk_bytes = packet_size.min(buf.len());
+                                    let chunk_bytes = chunk_bytes
+                                        - (chunk_bytes % bytes_per_frame);
+                                    let payload: Vec<u8> = buf.drain(..chunk_bytes).collect();
                                     if is_flac {
                                         // La position du paquet est celle de la
                                         // dernière trame FLAC qui y commence —
@@ -2215,7 +2373,7 @@ impl OutputTarget for OaatOutput {
                                     };
                                     let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, PacketFlags::empty()).await;
                                     if uses_byte_offset { byte_offset += payload.len() as u64; }
-                                    else { sample_offset += PCM_SAMPLES_PER_PACKET as u64; }
+                                    else { sample_offset += (payload.len() / bytes_per_frame) as u64; }
                                     position_ms.store(
                                         if is_dsd { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
                                         else { sample_offset * 1000 / cur_sample_rate.max(1) as u64 },
@@ -2235,8 +2393,32 @@ impl OutputTarget for OaatOutput {
                                     // so the swapped-in track needs its own Play —
                                     // see below.
                                     let renegotiated = !next.same_format;
-                                    if !next.same_format {
-                                        if let Err(e) = endpoint.propose_format(&stream_id, next.info.format, next.info.sample_rate, ch, layout, next.info.bits_per_sample as u8).await {
+                                    let next_source_channels = next.info.channels.min(8) as u8;
+                                    let next_source_layout = match disposition_oaat(next_source_channels) {
+                                        Ok(layout) => layout,
+                                        Err(raison) => {
+                                            error!(device = %device_name, %raison, "oaat: disposition source gapless invalide");
+                                            break;
+                                        }
+                                    };
+                                    let next_source = ContratPropose {
+                                        stream_id: stream_id.clone(),
+                                        format: next.info.format,
+                                        sample_rate: next.info.sample_rate,
+                                        channels: next_source_channels,
+                                        channel_layout: next_source_layout,
+                                        bits_per_sample: next.info.bits_per_sample,
+                                        dsd_rate: None,
+                                    };
+                                    let next_target = if renegotiated {
+                                        if let Err(e) = endpoint.propose_format(
+                                            &stream_id,
+                                            next_source.format,
+                                            next_source.sample_rate,
+                                            next_source.channels,
+                                            next_source.channel_layout,
+                                            next_source.bits_per_sample as u8,
+                                        ).await {
                                             error!(device = %device_name, error = %e, "oaat: re-negotiate failed");
                                             break;
                                         }
@@ -2250,37 +2432,84 @@ impl OutputTarget for OaatOutput {
                                         // le contrat reellement propose ici n'en porte
                                         // donc pas, et une contre-proposition qui en
                                         // pose un ajoute bien une contrainte (#2283).
-                                        let contrat = ContratPropose {
-                                            stream_id: stream_id.clone(),
-                                            format: next.info.format,
-                                            sample_rate: next.info.sample_rate,
-                                            channels: ch,
-                                            channel_layout: layout,
-                                            bits_per_sample: next.info.bits_per_sample,
-                                            dsd_rate: None,
-                                        };
-                                        if let Err(refus) = attendre_accord_format(
+                                        match attendre_accord_format(
                                             &mut endpoint,
                                             &device_name,
-                                            &contrat,
+                                            &next_source,
+                                            PolitiqueAdaptation::PcmEntier,
                                             std::time::Duration::from_secs(5),
                                         )
                                         .await
                                         {
-                                            error!(
-                                                device = %device_name,
-                                                raison = %refus.raison,
-                                                "oaat: contre-proposition non honorable en gapless, fin de chaine"
-                                            );
+                                            Ok(cible) => cible,
+                                            Err(refus) => {
+                                                error!(
+                                                    device = %device_name,
+                                                    raison = %refus.raison,
+                                                    "oaat: contre-proposition non honorable en gapless, fin de chaine"
+                                                );
+                                                signaler_refus_negociation(&refus_negociation, &refus);
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        next_source.clone()
+                                    };
+
+                                    let mut next_adapter = match construire_adaptateur_pcm(
+                                        &next_source,
+                                        &next_target,
+                                    ) {
+                                        Ok(adapter) => adapter,
+                                        Err(raison) => {
+                                            let refus = RefusNegociation {
+                                                stream_id: stream_id.clone(),
+                                                raison: format!("adaptation gapless impossible : {raison}"),
+                                                reconnectable: false,
+                                            };
                                             signaler_refus_negociation(&refus_negociation, &refus);
+                                            error!(device = %device_name, %raison, "oaat: préparation gapless refusée");
                                             break;
                                         }
-                                        cur_format = next.info.format;
-                                        cur_bits = next.info.bits_per_sample;
-                                        cur_sample_rate = next.info.sample_rate;
-                                        bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-                                        packet_size = if cur_format == AudioFormat::Flac { FLAC_CHUNK_SIZE } else { PCM_SAMPLES_PER_PACKET * bytes_per_frame };
-                                    }
+                                    };
+                                    let next_buf = match next_adapter.push(&next.buf) {
+                                        Ok(buf) => buf,
+                                        Err(raison) => {
+                                            error!(device = %device_name, %raison, "oaat: premier bloc gapless PCM invalide");
+                                            break;
+                                        }
+                                    };
+
+                                    source_format = next_source.format;
+                                    source_sample_rate = next_source.sample_rate;
+                                    source_bits = next_source.bits_per_sample;
+                                    source_channels = next_source.channels;
+                                    source_layout = next_source.channel_layout;
+                                    source_data_offset = next.info.data_offset;
+                                    source_bytes_per_frame =
+                                        (source_bits as usize / 8) * source_channels as usize;
+                                    cur_format = next_target.format;
+                                    cur_sample_rate = next_target.sample_rate;
+                                    cur_bits = next_target.bits_per_sample;
+                                    cur_channels = next_target.channels;
+                                    ch = cur_channels;
+                                    layout = next_target.channel_layout;
+                                    bytes_per_frame =
+                                        (cur_bits as usize / 8) * cur_channels as usize;
+                                    packet_size = PCM_SAMPLES_PER_PACKET * bytes_per_frame;
+                                    is_flac = false;
+                                    is_dsd = false;
+                                    uses_byte_offset = false;
+                                    adaptateur_pcm = next_adapter;
+                                    cur_stream_info = StreamInfo {
+                                        sample_rate: cur_sample_rate,
+                                        channels: cur_channels as u16,
+                                        bits_per_sample: cur_bits,
+                                        format: cur_format,
+                                        duration_ms: next.duration_ms,
+                                        dsd_rate: None,
+                                        data_offset: source_data_offset,
+                                    };
 
                                     *current_title.lock().await = Some(next.title.clone());
                                     *current_artist.lock().await = Some(next.artist.clone());
@@ -2317,8 +2546,9 @@ impl OutputTarget for OaatOutput {
                                     sample_offset = 0;
                                     byte_offset = 0;
                                     position_ms.store(0, Ordering::SeqCst);
+                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
                                     start = std::time::Instant::now();
-                                    buf = next.buf;
+                                    buf = next_buf;
                                     stream = next.stream;
                                     continue;
                                 }
@@ -2709,17 +2939,13 @@ fn open_next_dsd(
 }
 
 #[cfg(feature = "oaat")]
-/// Arme une piste préchargée comme piste suivante : sur un format identique,
-/// négocie le gapless interne de l'endpoint (NextTrackPrepare) ; un
-/// NextTrackReformat rétrograde en changement de format. Partagé entre le bras
-/// `prefetch_rx` du select! et le rattrapage d'un préchargement en vol à l'EOF
-/// (#1358) — les deux chemins doivent traiter le résultat À L'IDENTIQUE.
-#[allow(clippy::too_many_arguments)]
 /// Le contrat de format effectivement PROPOSE a l'endpoint.
 ///
-/// Tune envoie les octets de la SOURCE : il ne sait pas convertir un flux en
-/// cours de negociation. Une reponse n'est donc acceptable que si elle decrit
-/// EXACTEMENT ce qu'on allait deja envoyer — auquel cas il n'y a rien a faire.
+/// Les chemins DSD et de reconnexion exigent toujours une réponse identique.
+/// Les chemins PCM initial, direct et gapless peuvent désormais rendre un
+/// contrat cible différent, mais seulement après avoir construit le pipeline
+/// qui produira réellement ses octets. Le contrat rendu par la négociation est
+/// donc celui du PAYLOAD, jamais une simple étiquette (#2239).
 ///
 /// Regrouper les champs en une structure n'est pas cosmetique. La comparaison
 /// porte sur TOUT ce qui se negocie ; tant qu'elle etait une liste d'arguments
@@ -2737,7 +2963,122 @@ pub(crate) struct ContratPropose {
     pub dsd_rate: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolitiqueAdaptation {
+    ExacteSeulement,
+    PcmEntier,
+}
+
+fn profondeur_pcm_entiere(contrat: &ContratPropose) -> Result<u16, String> {
+    use oaat_core::format::AudioFormat;
+
+    let attendue = match contrat.format {
+        AudioFormat::PcmS16le => 16,
+        AudioFormat::PcmS24le => 24,
+        AudioFormat::PcmS32le => 32,
+        autre => {
+            return Err(format!(
+                "le codec {autre:?} ne passe pas par le convertisseur PCM entier"
+            ));
+        }
+    };
+    if contrat.bits_per_sample != attendue {
+        return Err(format!(
+            "le codec {:?} exige {attendue} bits, pas {}",
+            contrat.format, contrat.bits_per_sample
+        ));
+    }
+    if contrat.sample_rate == 0 {
+        return Err("la cadence PCM vaut zéro".into());
+    }
+    if contrat.channels == 0 || contrat.channels > 8 {
+        return Err(format!(
+            "le nombre de canaux PCM {} est hors de la plage OAAT 1..=8",
+            contrat.channels
+        ));
+    }
+    if contrat.channel_layout.channel_count() != contrat.channels {
+        return Err(format!(
+            "la disposition {:?} décrit {} canaux, pas {}",
+            contrat.channel_layout,
+            contrat.channel_layout.channel_count(),
+            contrat.channels
+        ));
+    }
+    if contrat.dsd_rate.is_some() {
+        return Err("un contrat PCM ne peut pas porter de multiplicateur DSD".into());
+    }
+    Ok(attendue)
+}
+
+fn construire_adaptateur_pcm(
+    source: &ContratPropose,
+    cible: &ContratPropose,
+) -> Result<crate::audio::decode::StreamingPcmByteAdapter, String> {
+    let source_bits = profondeur_pcm_entiere(source)?;
+    let cible_bits = profondeur_pcm_entiere(cible)?;
+    crate::audio::decode::StreamingPcmByteAdapter::new(
+        source_bits,
+        source.channels as u32,
+        source.sample_rate,
+        cible_bits,
+        cible.channels as u32,
+        cible.sample_rate,
+    )
+}
+
+fn disposition_oaat(channels: u8) -> Result<oaat_core::format::ChannelLayout, String> {
+    use oaat_core::format::ChannelLayout;
+    match channels {
+        1 => Ok(ChannelLayout::Mono),
+        2 => Ok(ChannelLayout::Stereo),
+        3 => Ok(ChannelLayout::TwoPointOne),
+        4 => Ok(ChannelLayout::Quad),
+        6 => Ok(ChannelLayout::FivePointOne),
+        8 => Ok(ChannelLayout::SevenPointOne),
+        _ => Err(format!(
+            "aucune disposition OAAT non ambiguë pour {channels} canaux"
+        )),
+    }
+}
+
+pub(crate) fn adapter_piste_directe_gapless(
+    mut piste: super::helpers::StagedDirectTrack,
+    cible: &ContratPropose,
+) -> Result<super::helpers::StagedDirectTrack, String> {
+    let source = ContratPropose {
+        stream_id: cible.stream_id.clone(),
+        format: piste.format,
+        sample_rate: piste.sample_rate,
+        channels: piste.channels,
+        channel_layout: disposition_oaat(piste.channels)?,
+        bits_per_sample: piste.bits_per_sample,
+        dsd_rate: None,
+    };
+    let mut adaptateur = construire_adaptateur_pcm(&source, cible)?;
+    let mut pcm = adaptateur.push(&piste.pcm)?;
+    pcm.extend(adaptateur.finish()?);
+    piste.pcm = pcm;
+    piste.format = cible.format;
+    piste.sample_rate = cible.sample_rate;
+    piste.bits_per_sample = cible.bits_per_sample;
+    piste.channels = cible.channels;
+    Ok(piste)
+}
+
 impl ContratPropose {
+    fn depuis_contre_proposition(contre: &oaat_core::message::FormatCounter) -> Self {
+        Self {
+            stream_id: contre.stream_id.clone(),
+            format: contre.format,
+            sample_rate: contre.sample_rate,
+            channels: contre.channels,
+            channel_layout: contre.channel_layout,
+            bits_per_sample: contre.bits_per_sample as u16,
+            dsd_rate: contre.dsd_rate,
+        }
+    }
+
     /// Le premier champ par lequel une contre-proposition s'ecarte du contrat,
     /// nomme et chiffre — `None` si elle le decrit exactement.
     ///
@@ -2831,7 +3172,8 @@ impl std::fmt::Display for RefusNegociation {
 pub(crate) fn juger_reponse(
     contrat: &ContratPropose,
     reponse: ReponseNegociation<'_>,
-) -> Result<(), RefusNegociation> {
+    politique: PolitiqueAdaptation,
+) -> Result<ContratPropose, RefusNegociation> {
     let refus = |raison: String, reconnectable: bool| {
         Err(RefusNegociation {
             stream_id: contrat.stream_id.clone(),
@@ -2858,22 +3200,37 @@ pub(crate) fn juger_reponse(
                 if fa.stream_id != contrat.stream_id {
                     refus(flux_etranger(&fa.stream_id), false)
                 } else {
-                    Ok(())
+                    Ok(contrat.clone())
                 }
             }
             oaat_controller::EndpointResponse::FormatCounter(fc) => {
                 if fc.stream_id != contrat.stream_id {
                     refus(flux_etranger(&fc.stream_id), false)
-                } else if let Some(ecart) = contrat.premier_ecart(fc) {
-                    refus(
-                        format!(
-                            "l'endpoint demande un autre format et Tune ne sait pas \
-                         convertir le flux en cours : {ecart}"
-                        ),
-                        false,
-                    )
                 } else {
-                    Ok(())
+                    let cible = ContratPropose::depuis_contre_proposition(fc);
+                    let Some(ecart) = contrat.premier_ecart(fc) else {
+                        return Ok(cible);
+                    };
+                    match politique {
+                        PolitiqueAdaptation::ExacteSeulement => refus(
+                            format!(
+                                "l'endpoint demande un autre format sur un chemin sans \
+                                 convertisseur actif : {ecart}"
+                            ),
+                            false,
+                        ),
+                        PolitiqueAdaptation::PcmEntier => {
+                            match construire_adaptateur_pcm(contrat, &cible) {
+                                Ok(_) => Ok(cible),
+                                Err(cause) => refus(
+                                    format!(
+                                        "contre-proposition non produisible : {ecart} ; {cause}"
+                                    ),
+                                    false,
+                                ),
+                            }
+                        }
+                    }
                 }
             }
             oaat_controller::EndpointResponse::FormatReject(fr) => {
@@ -2916,14 +3273,15 @@ async fn attendre_accord_format(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     device_name: &str,
     contrat: &ContratPropose,
+    politique: PolitiqueAdaptation,
     delai: std::time::Duration,
-) -> Result<(), RefusNegociation> {
+) -> Result<ContratPropose, RefusNegociation> {
     let recue = tokio::time::timeout(delai, endpoint.response_rx.recv()).await;
 
     let verdict = match &recue {
-        Ok(Some(reponse)) => juger_reponse(contrat, ReponseNegociation::Recue(reponse)),
-        Ok(None) => juger_reponse(contrat, ReponseNegociation::Fermee),
-        Err(_) => juger_reponse(contrat, ReponseNegociation::Timeout),
+        Ok(Some(reponse)) => juger_reponse(contrat, ReponseNegociation::Recue(reponse), politique),
+        Ok(None) => juger_reponse(contrat, ReponseNegociation::Fermee, politique),
+        Err(_) => juger_reponse(contrat, ReponseNegociation::Timeout, politique),
     };
 
     if let Err(refus) = &verdict {
@@ -2994,6 +3352,7 @@ async fn prefetch_next_track(
     cur_format: oaat_core::format::AudioFormat,
     cur_sample_rate: u32,
     cur_bits: u16,
+    cur_channels: u8,
 ) -> Option<NextTrackPrefetch> {
     use futures_util::StreamExt;
 
@@ -3037,7 +3396,8 @@ async fn prefetch_next_track(
     };
     let same_format = si.format == cur_format
         && si.sample_rate == cur_sample_rate
-        && si.bits_per_sample == cur_bits;
+        && si.bits_per_sample == cur_bits
+        && si.channels.min(8) as u8 == cur_channels;
 
     info!(
         device = %device_name, title = %title,

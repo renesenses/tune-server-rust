@@ -2,6 +2,7 @@ use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
+use rubato::Resampler;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
@@ -257,8 +258,29 @@ struct StreamingPcmAdapter {
     bit_depth: u16,
     source_channels: u16,
     output_channels: u16,
+    source_rate: u32,
+    output_rate: u32,
     resampler: Option<rubato::Async<f32>>,
     resample_leftover: Vec<f32>,
+    resampled_pending: Vec<f32>,
+    resampler_delay_remaining: usize,
+    source_frames_seen: u64,
+    output_frames_emitted: u64,
+}
+
+/// Stateful adapter for progressively received interleaved integer PCM bytes.
+///
+/// Network chunks are not required to end on a sample or frame boundary.  The
+/// incomplete tail is therefore retained until the next call, while complete
+/// frames go through the same channel/rate adapter as file decoding.  A final
+/// partial frame is an invalid payload and is reported instead of silently
+/// truncating it.
+pub(crate) struct StreamingPcmByteAdapter {
+    pcm: StreamingPcmAdapter,
+    source_bit_depth: u16,
+    target_bit_depth: u16,
+    source_frame_bytes: usize,
+    source_leftover: Vec<u8>,
 }
 
 impl StreamingPcmAdapter {
@@ -280,12 +302,22 @@ impl StreamingPcmAdapter {
         } else {
             None
         };
+        let resampler_delay_remaining = resampler
+            .as_ref()
+            .map(Resampler::output_delay)
+            .unwrap_or_default();
         Ok(Self {
             bit_depth,
             source_channels,
             output_channels,
+            source_rate,
+            output_rate,
             resampler,
             resample_leftover: Vec::new(),
+            resampled_pending: Vec::new(),
+            resampler_delay_remaining,
+            source_frames_seen: 0,
+            output_frames_emitted: 0,
         })
     }
 
@@ -296,6 +328,7 @@ impl StreamingPcmAdapter {
             self.output_channels,
             self.bit_depth,
         )?;
+        self.source_frames_seen += (remixed.len() / self.output_channels as usize) as u64;
         self.resample(&remixed, false)
     }
 
@@ -310,19 +343,158 @@ impl StreamingPcmAdapter {
         let depth = self.bit_depth.clamp(8, 32);
         let full_scale = (1i64 << (depth - 1)) as f32;
         let normalized: Vec<f32> = samples.iter().map(|&s| s as f32 / full_scale).collect();
-        let output = super::resample::rubato_resample_chunk(
+        let mut output = super::resample::rubato_resample_chunk(
             &mut self.resampler,
             &normalized,
             self.output_channels,
             flush,
             &mut self.resample_leftover,
         );
+
+        // A sinc resampler emits its group delay at the head and a padded tail
+        // when flushed.  Those frames are latency, not programme material: if
+        // forwarded they lengthen every converted track and make OAAT PTS and
+        // duration disagree.  Drop the delay, then expose at most the exact
+        // number of frames justified by the source seen so far.
+        let channels = self.output_channels as usize;
+        let available_frames = output.len() / channels;
+        let skipped = self.resampler_delay_remaining.min(available_frames);
+        if skipped > 0 {
+            output.drain(..skipped * channels);
+            self.resampler_delay_remaining -= skipped;
+        }
+        self.resampled_pending.extend(output);
+
+        let ratio = self.output_rate as f64 / self.source_rate as f64;
+        let expected_total = if flush {
+            (self.source_frames_seen as f64 * ratio).round() as u64
+        } else {
+            (self.source_frames_seen as f64 * ratio).floor() as u64
+        };
+        let allowed = expected_total.saturating_sub(self.output_frames_emitted) as usize;
+        let emitted_frames = allowed.min(self.resampled_pending.len() / channels);
+        let emitted_samples = emitted_frames * channels;
+        let emitted: Vec<f32> = self.resampled_pending.drain(..emitted_samples).collect();
+        self.output_frames_emitted += emitted_frames as u64;
+
+        if flush {
+            if self.output_frames_emitted != expected_total {
+                return Err(format!(
+                    "streaming resampler emitted {} frame(s), expected {expected_total}",
+                    self.output_frames_emitted
+                ));
+            }
+            // Any remaining frames belong to the padded filter tail.
+            self.resampled_pending.clear();
+        }
+
         let max = full_scale - 1.0;
-        Ok(output
+        Ok(emitted
             .into_iter()
             .map(|sample| (sample * full_scale).clamp(-full_scale, max) as i32)
             .collect())
     }
+}
+
+impl StreamingPcmByteAdapter {
+    pub(crate) fn new(
+        source_bit_depth: u16,
+        source_channels: u32,
+        source_rate: u32,
+        target_bit_depth: u16,
+        target_channels: u32,
+        target_rate: u32,
+    ) -> Result<Self, String> {
+        if !matches!(source_bit_depth, 16 | 24 | 32) {
+            return Err(format!(
+                "PCM source bit depth {source_bit_depth} is unsupported (expected 16, 24 or 32)"
+            ));
+        }
+        if !matches!(target_bit_depth, 16 | 24 | 32) {
+            return Err(format!(
+                "PCM target bit depth {target_bit_depth} is unsupported (expected 16, 24 or 32)"
+            ));
+        }
+        if source_rate == 0 || target_rate == 0 {
+            return Err("PCM sample rates must be greater than zero".into());
+        }
+        let source_channels_checked = checked_channels(source_channels, "PCM byte source")?;
+        checked_channels(target_channels, "PCM byte target")?;
+        let source_frame_bytes = (source_bit_depth as usize / 8)
+            .checked_mul(source_channels_checked as usize)
+            .ok_or("PCM source frame size overflow")?;
+        let pcm = StreamingPcmAdapter::new(
+            source_bit_depth,
+            source_channels,
+            target_channels,
+            source_rate,
+            target_rate,
+        )?;
+        Ok(Self {
+            pcm,
+            source_bit_depth,
+            target_bit_depth,
+            source_frame_bytes,
+            source_leftover: Vec::new(),
+        })
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        self.source_leftover.extend_from_slice(bytes);
+        let complete_len =
+            self.source_leftover.len() - (self.source_leftover.len() % self.source_frame_bytes);
+        if complete_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let tail = self.source_leftover.split_off(complete_len);
+        let complete = std::mem::replace(&mut self.source_leftover, tail);
+        let samples = pcm_bytes_to_i32(&complete, self.source_bit_depth)?;
+        let adapted = self.pcm.push(&samples)?;
+        Ok(convert_pcm_bit_depth(
+            &adapted,
+            self.source_bit_depth,
+            self.target_bit_depth,
+        ))
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, String> {
+        if !self.source_leftover.is_empty() {
+            return Err(format!(
+                "PCM stream ended with {} byte(s) outside a complete {}-byte source frame",
+                self.source_leftover.len(),
+                self.source_frame_bytes
+            ));
+        }
+        let adapted = self.pcm.finish()?;
+        Ok(convert_pcm_bit_depth(
+            &adapted,
+            self.source_bit_depth,
+            self.target_bit_depth,
+        ))
+    }
+}
+
+fn pcm_bytes_to_i32(data: &[u8], bit_depth: u16) -> Result<Vec<i32>, String> {
+    let samples = match bit_depth {
+        16 => data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+            .collect(),
+        24 => data
+            .chunks_exact(3)
+            .map(|b| {
+                let value = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+                (value << 8) >> 8
+            })
+            .collect(),
+        32 => data
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        _ => return Err(format!("unsupported PCM bit depth: {bit_depth}")),
+    };
+    Ok(samples)
 }
 
 /// Convert right-justified i32 samples from one bit depth to another,
@@ -3278,6 +3450,62 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert_eq!(out, vec![0x34, 0x12, 0x00, 0x80]);
         // Output is exactly 2 bytes per sample (16-bit).
         assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn streaming_pcm_bytes_preserve_exact_frames_across_arbitrary_chunks() {
+        let source = vec![
+            0x01, 0x02, 0x03, 0x11, 0x12, 0x13, // frame 1, 24-bit stereo
+            0x21, 0x22, 0x23, 0x31, 0x32, 0x33, // frame 2
+        ];
+        let mut adapter = StreamingPcmByteAdapter::new(24, 2, 96_000, 24, 2, 96_000)
+            .expect("valid identity adapter");
+        let mut output = Vec::new();
+        for byte in &source {
+            output.extend(adapter.push(std::slice::from_ref(byte)).unwrap());
+        }
+        output.extend(adapter.finish().unwrap());
+        assert_eq!(output, source, "identity adaptation must be byte-for-byte");
+    }
+
+    #[test]
+    fn streaming_pcm_bytes_apply_rate_channels_and_depth_to_payload() {
+        let frames = 4_800usize; // 50 ms at 96 kHz -> 2 400 frames at 48 kHz.
+        let mut source = Vec::with_capacity(frames * 2 * 3);
+        for frame in 0..frames {
+            let left = ((frame as i32 * 997) & 0x7f_ffff) - 0x40_0000;
+            let right = -left;
+            for sample in [left, right] {
+                let bytes = sample.to_le_bytes();
+                source.extend_from_slice(&bytes[..3]);
+            }
+        }
+
+        let mut adapter = StreamingPcmByteAdapter::new(24, 2, 96_000, 16, 1, 48_000)
+            .expect("valid conversion adapter");
+        let mut output = Vec::new();
+        for chunk in source.chunks(137) {
+            output.extend(adapter.push(chunk).unwrap());
+        }
+        output.extend(adapter.finish().unwrap());
+
+        assert_eq!(output.len() % 2, 0, "16-bit mono frames must stay aligned");
+        assert_eq!(
+            output.len() / 2,
+            2_400,
+            "rate conversion must determine the emitted frame count"
+        );
+    }
+
+    #[test]
+    fn streaming_pcm_bytes_refuse_a_partial_final_frame() {
+        let mut adapter = StreamingPcmByteAdapter::new(24, 2, 96_000, 16, 1, 48_000)
+            .expect("valid conversion adapter");
+        assert!(adapter.push(&[0; 5]).unwrap().is_empty());
+        let error = adapter
+            .finish()
+            .expect_err("five bytes are not a stereo 24-bit frame");
+        assert!(error.contains("outside a complete 6-byte source frame"));
     }
 
     #[test]
