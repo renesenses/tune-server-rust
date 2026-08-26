@@ -1485,6 +1485,26 @@ pub(crate) async fn spawn_library_scan_confirmee(
             tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
         }
 
+        // Une réparation d'attribution ne se fonde que sur une vue complète et
+        // saine de la bibliothèque. Un scan ciblé, annulé ou privé d'une racine
+        // n'a pas assez d'information pour conclure sans risque (#2458).
+        let full_scan_ok = !scan_cancel_requested()
+            && targeted.is_none()
+            && missing_dirs.is_empty()
+            && error_dirs.is_empty()
+            && racines_videes.is_empty();
+        if full_scan_ok {
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .repair_empty_mbid_artist_collapses()
+            {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "post_scan_album_artists_repaired")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_album_artist_repair_failed"),
+            }
+        }
+
         // Clean up orphan artists left behind after tag corrections
         let orphan_artists = ArtistRepo::with_backend(db.clone()).cleanup_orphans().unwrap_or(0);
         if orphan_artists > 0 {
@@ -1506,11 +1526,6 @@ pub(crate) async fn spawn_library_scan_confirmee(
             // laissait `full_scan_ok = true`, et la réconciliation supprimait
             // DÉFINITIVEMENT les favoris des pistes conservées. Une purge de
             // pistes se répare par un rescan ; une perte de favoris, non.
-            let full_scan_ok = !scan_cancel_requested()
-                && targeted.is_none()
-                && missing_dirs.is_empty()
-                && error_dirs.is_empty()
-                && racines_videes.is_empty();
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {

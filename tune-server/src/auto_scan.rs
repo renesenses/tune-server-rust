@@ -682,6 +682,23 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             }
         }
 
+        // Comme la réconciliation des favoris, une réattribution d'album exige
+        // un scan complet et sain. Le démarrage avec montage absent, erreur de
+        // parcours ou annulation reste strictement en lecture seule ici.
+        let full_scan_ok = !crate::routes::system::scan::scan_cancel_requested()
+            && missing_dirs.is_empty()
+            && error_dirs.is_empty()
+            && racines_videes.is_empty();
+        if full_scan_ok {
+            match album_repo.repair_empty_mbid_artist_collapses() {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "auto_scan_album_artists_repaired")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto_scan_album_artist_repair_failed"),
+            }
+        }
+
         for album in album_repo.list(99999, 0).unwrap_or_default() {
             if let Some(id) = album.id {
                 album_repo.update_track_count(id).ok();
@@ -706,10 +723,6 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // `emptied_roots` inclus depuis #1943 : sans lui, une racine vidée
             // par un montage absent laissait passer la réconciliation, qui
             // supprimait définitivement les favoris. Irréversible.
-            let full_scan_ok = !crate::routes::system::scan::scan_cancel_requested()
-                && missing_dirs.is_empty()
-                && error_dirs.is_empty()
-                && racines_videes.is_empty();
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
