@@ -1150,6 +1150,44 @@ UPDATE radio_favorites
    AND saved_at NOT LIKE '%Z';
 ",
     },
+    Migration {
+        version: 83,
+        name: "favorite_facets",
+        // Mettre un LABEL en favori — et, demain, un genre, un format, une
+        // annee (#2442, FabienM fil 1557).
+        //
+        // Pourquoi une table separee plutot qu'un quatrieme `item_type` dans
+        // `favorites` : `favorites.item_id` est un INTEGER NOT NULL, et un
+        // label N'A PAS D'IDENTITE. Il n'existe ni table `labels`, ni route
+        // bibliotheque : l'onglet Labels lit une FACETTE et selectionne par
+        // CHAINE (`getLibraryFacets(['label'])`). Le faire entrer dans
+        // `favorites` supposerait de promouvoir le label en entite —
+        // normalisation d'un champ libre et sale, identifiants, jointures —
+        // ce qui est hors gabarit ici.
+        //
+        // On stocke donc la valeur telle que la facette la selectionne
+        // aujourd'hui. La colonne `facet` rend la table reutilisable sans
+        // nouvelle migration pour genre / format / annee.
+        //
+        // Pas de colonne `id` : la cle naturelle (profil, facette, valeur) EST
+        // la cle primaire. Cela evite aussi la divergence BIGSERIAL / TEXT que
+        // la bascule SQLite -> PostgreSQL impose a toute colonne `id` (cf. la
+        // migration PG 012 et l'incident #1706).
+        //
+        // `CREATE TABLE IF NOT EXISTS` : idempotent, et sans ALTER TABLE, donc
+        // sans le piege « duplicate column name » sur une base neuve.
+        up: "
+CREATE TABLE IF NOT EXISTS favorite_facets (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    facet TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, facet, value)
+);
+CREATE INDEX IF NOT EXISTS idx_favorite_facets_profile
+    ON favorite_facets(profile_id, facet);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2562,6 +2600,25 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "podcast_source_id",
         include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
     ),
+    // 034 etait sur le disque SANS etre inscrite ici : le fichier est arrive
+    // avec le correctif d'horodatage des favoris radio (#2179) et personne ne
+    // l'a enregistree. Aucune base PostgreSQL ne l'a donc jamais recue — le
+    // defaut exact que le test de contiguite existe pour attraper, et qu'il ne
+    // pouvait pas voir tant que 33 restait le dernier numero. On la repare ici
+    // parce qu'on ne peut pas inscrire 35 en laissant un trou.
+    (
+        34,
+        "radio_favorites_saved_at_texte",
+        include_str!("../../migrations/postgres/034_radio_favorites_saved_at_texte.sql"),
+    ),
+    // Favori d'une VALEUR de facette — le label d'abord (#2442). Table
+    // separee : `favorites.item_id` est un entier, un label n'a pas
+    // d'identite. Pendant de la migration SQLite 83.
+    (
+        35,
+        "favorite_facets",
+        include_str!("../../migrations/postgres/035_favorite_facets.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3405,7 +3462,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 33, "latest PG migration must be 33");
+        assert_eq!(pg_latest_version(), 35, "latest PG migration must be 35");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
