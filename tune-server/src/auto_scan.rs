@@ -250,6 +250,24 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             return;
         }
 
+        // Le scan de démarrage partage exactement la même porte que les scans
+        // manuels et planifiés. L'acquisition précède même l'énumération : deux
+        // walkers ne peuvent donc jamais converger ensuite vers des écritures
+        // et purges concurrentes.
+        let Some(scan_lease) = crate::routes::system::scan::try_begin_scan() else {
+            info!("auto_scan_skipped_already_scanning");
+            scan_done_clone.store(true, Ordering::Release);
+            return;
+        };
+        let _scan_lease = scan_lease;
+
+        // Make the startup scan first-class, exactly like the manual one:
+        // advertise it via `scan_status` and honour cooperative cancellation.
+        // The guards reset the persisted status before releasing the unique
+        // owner on every exit path, including panic unwind.
+        let _ = settings.set("scan_status", "scanning");
+        let _scan_status_guard = ScanStatusGuard(db.clone());
+
         let exclude_patterns = scan_exclude_patterns(&db);
         if !exclude_patterns.is_empty() {
             info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
@@ -264,17 +282,6 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
-
-        // Make the startup scan first-class, exactly like the manual one:
-        // advertise it via `scan_status` and honour the shared cancel flag.
-        // Previously the boot-time scan set neither, so on the desktop app it ran
-        // with no progress banner and no working "Arrêter le scan" button — the
-        // client's on-mount getScanStatus() saw "idle" and the cancel endpoint
-        // had nothing to stop (#1197 Benjithom / #1196). The guard resets to idle
-        // on every exit path (incl. panic unwind).
-        crate::routes::system::scan::reset_scan_cancel();
-        let _ = settings.set("scan_status", "scanning");
-        let _scan_status_guard = ScanStatusGuard(db.clone());
 
         // NFC-normalized set of every path found on disk this scan. Used after
         // the scan to prune tracks whose files were deleted while the server was

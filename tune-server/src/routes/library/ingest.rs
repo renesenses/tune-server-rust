@@ -671,13 +671,8 @@ async fn run_job(
     // when nothing landed, to avoid kicking off a scan for a no-op job.
     let scanned = if report.files_placed() > 0 {
         if let Some(ref dir) = report.album_dir {
-            crate::routes::system::scan::spawn_library_scan(
-                state.clone(),
-                false,
-                Some(dir.clone()),
-            )
-            .await;
-            true
+            crate::routes::system::scan::spawn_library_scan(state.clone(), false, Some(dir.clone()))
+                .await
         } else {
             false
         }
