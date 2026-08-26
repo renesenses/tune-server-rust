@@ -110,6 +110,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -124,7 +125,7 @@ harness = false
 
 [features]
 default = ["local-audio"]
-local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
+local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.
