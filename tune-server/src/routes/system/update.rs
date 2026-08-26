@@ -260,6 +260,120 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
     })
 }
 
+/// Build the public update contract only after resolving an archive that this
+/// exact OS/architecture can install. GitHub can expose a release before every
+/// platform asset has finished uploading; such a release is newer, but it is
+/// not an available update for this server yet (#1575).
+fn update_release_payload(
+    current: &str,
+    release: &ReleaseInfo,
+    homebrew: Option<&HomebrewInstallation>,
+) -> Value {
+    let asset = find_archive_asset(release);
+    let installation_version_mismatch =
+        homebrew.is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
+    json!({
+        "current": current,
+        "latest": &release.version,
+        "update_available": asset.is_some(),
+        "download_url": asset.map(|a| &a.browser_download_url),
+        "asset_name": asset.map(|a| &a.name),
+        "release_notes": &release.body,
+        "size_bytes": asset.map(|a| a.size).unwrap_or(0),
+        "html_url": &release.html_url,
+        "published_at": &release.published_at,
+        "unavailable_reason": asset.is_none().then_some("no_compatible_asset"),
+        "installable": homebrew.is_none(),
+        "install_hint": homebrew.map(|_| HOMEBREW_UPDATE_HINT),
+        "installation_manager": homebrew.map(|_| "homebrew"),
+        "installation_version": homebrew.map(|install| &install.cellar_version),
+        "installation_version_mismatch": installation_version_mismatch,
+    })
+}
+
+#[cfg(test)]
+mod update_availability_tests {
+    use super::{HomebrewInstallation, update_release_payload};
+    use std::path::PathBuf;
+    use tune_core::updater::{ReleaseAsset, ReleaseInfo};
+
+    fn release_with(asset_name: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: "v9.9.9".into(),
+            version: "9.9.9".into(),
+            name: "fixture".into(),
+            body: "notes".into(),
+            published_at: "2026-08-26T00:00:00Z".into(),
+            html_url: "https://example.invalid/release".into(),
+            assets: vec![ReleaseAsset {
+                name: asset_name.into(),
+                browser_download_url: "https://example.invalid/archive".into(),
+                size: 42,
+                content_type: "application/octet-stream".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn une_release_sans_archive_compatible_n_est_pas_proposee() {
+        let payload = update_release_payload(
+            "0.9.113",
+            &release_with("tune-server-plan9-mips64.tar.gz"),
+            None,
+        );
+
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["download_url"], serde_json::Value::Null);
+        assert_eq!(payload["asset_name"], serde_json::Value::Null);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
+    }
+
+    #[test]
+    fn une_release_avec_l_archive_de_la_plateforme_est_proposee() {
+        let extension = if std::env::consts::OS == "windows" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let name = format!(
+            "tune-server-{}-{}.{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            extension
+        );
+        let payload = update_release_payload("0.9.113", &release_with(&name), None);
+
+        assert_eq!(payload["update_available"], true);
+        assert_eq!(payload["asset_name"], name);
+        assert_eq!(payload["unavailable_reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn le_filtre_d_asset_conserve_le_contrat_homebrew() {
+        let installation = HomebrewInstallation {
+            executable: PathBuf::from("/opt/homebrew/Cellar/tune-server/0.9.112/bin/tune-server"),
+            cellar_version: "0.9.112".into(),
+        };
+        let payload = update_release_payload(
+            "0.9.113",
+            &release_with("tune-server-plan9-mips64.tar.gz"),
+            Some(&installation),
+        );
+
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
+        assert_eq!(payload["installable"], false);
+        assert_eq!(payload["installation_manager"], "homebrew");
+        assert_eq!(payload["installation_version"], "0.9.112");
+        assert_eq!(payload["installation_version_mismatch"], true);
+        assert!(
+            payload["install_hint"]
+                .as_str()
+                .is_some_and(|hint| { hint.contains("brew update && brew upgrade tune-server") })
+        );
+    }
+}
+
 /// Trusted **minisign** public key for release signatures (audit item 8). The
 /// matching secret key lives only in the release CI (a GitHub Actions secret);
 /// this is the verify-only half, safe to embed.
@@ -584,25 +698,7 @@ pub(super) async fn update_check() -> Json<Value> {
         .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
     match checker.check().await {
-        Ok(Some(release)) => {
-            let asset = find_archive_asset(&release);
-            Json(json!({
-                "current": current,
-                "latest": release.version,
-                "update_available": true,
-                "download_url": asset.map(|a| &a.browser_download_url),
-                "asset_name": asset.map(|a| &a.name),
-                "release_notes": release.body,
-                "size_bytes": asset.map(|a| a.size).unwrap_or(0),
-                "html_url": release.html_url,
-                "published_at": release.published_at,
-                "installable": homebrew.is_none(),
-                "install_hint": homebrew.as_ref().map(|_| HOMEBREW_UPDATE_HINT),
-                "installation_manager": homebrew.as_ref().map(|_| "homebrew"),
-                "installation_version": homebrew.as_ref().map(|install| &install.cellar_version),
-                "installation_version_mismatch": installation_version_mismatch,
-            }))
-        }
+        Ok(Some(release)) => Json(update_release_payload(current, &release, homebrew.as_ref())),
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
