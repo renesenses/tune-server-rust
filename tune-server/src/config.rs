@@ -311,20 +311,19 @@ impl TuneConfig {
                 }
             }
         }
-        if let Ok(v) = std::env::var("TUNE_LOCAL_AUDIO_BACKEND")
-            .or_else(|_| std::env::var("TUNE_AUDIO_BACKEND"))
-            && !v.is_empty()
-        {
-            config.local_audio_backend = v;
+        // Un seul réglage, deux noms : la résolution vit dans `tune-core` pour
+        // que les deux chemins de configuration ne puissent pas diverger
+        // (#2265). Le nom canonique gagne, l'ancien reste lu.
+        if let Some(backend) = tune_core::config::local_audio_backend_from_env() {
+            config.local_audio_backend = backend;
         }
         if let Ok(v) = std::env::var("TUNE_LOCAL_EXCLUSIVE_MODE") {
             config.local_exclusive_mode = matches!(v.to_lowercase().as_str(), "true" | "1" | "yes");
         }
-        // If ASIO backend is explicitly requested, enable exclusive mode
-        // automatically (ASIO is inherently exclusive).
-        if config.local_audio_backend.to_lowercase() == "asio" && !config.local_exclusive_mode {
-            config.local_exclusive_mode = true;
-        }
+        tune_core::config::asio_implies_exclusive(
+            &config.local_audio_backend,
+            &mut config.local_exclusive_mode,
+        );
         if let Ok(v) = std::env::var("TUNE_TIDAL_QUALITY")
             && !v.is_empty()
         {
