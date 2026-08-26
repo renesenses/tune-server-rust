@@ -2006,6 +2006,32 @@ mod tests {
         );
     }
 
+    /// #2370 — Gros Bidon (fil 1541). `favorite_key("playlists")` rend
+    /// aujourd'hui « unknown favorite type: playlists », ce qui est FAUX : le
+    /// type existe et le connecteur le manipule partout ailleurs
+    /// (`/playlist/getUserPlaylists`, `/playlist/get`…). Ce qui manque, c'est
+    /// l'appel de souscription a une playlist tierce, qui n'est etabli nulle
+    /// part dans ce depot. Le message doit dire cela, et pas mentir sur la
+    /// nature du blocage — sans quoi le prochain lecteur cherche une faute de
+    /// frappe la ou il y a une fonction a ecrire.
+    #[test]
+    fn le_type_playlists_n_est_pas_un_type_inconnu() {
+        let err = favorite_key("playlists")
+            .expect_err(
+                "l'appel de souscription Qobuz n'est pas etabli : ca doit rester une erreur",
+            )
+            .to_string();
+        assert!(
+            !err.contains("unknown favorite type"),
+            "le type playlist est connu du connecteur : le refus doit nommer \
+             l'appel manquant, pas pretendre que le type est inconnu. Message rendu : {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("playlist"),
+            "le message doit nommer la playlist. Message rendu : {err}"
+        );
+    }
+
     #[test]
     fn writing_a_favorite_without_a_user_token_is_refused_up_front() {
         // Sans jeton utilisateur, Qobuz accepte la requête sans rien
