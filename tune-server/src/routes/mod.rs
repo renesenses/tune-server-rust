@@ -81,6 +81,7 @@ pub mod tags;
 pub mod upnp;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
+pub mod versions;
 pub mod visualizer;
 pub mod voice;
 pub mod widget;
