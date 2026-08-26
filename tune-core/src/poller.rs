@@ -1996,6 +1996,34 @@ enum GaplessPrep {
     NotArmed,
 }
 
+/// Retrouver en base la station qui joue, a partir du `source_id` du
+/// now-playing.
+///
+/// Le `source_id` d'une radio n'a pas UNE forme mais deux, et c'est tout le
+/// probleme : l'identifiant numerique de la ligne, ou l'URL du flux.
+pub(crate) fn station_du_now_playing(
+    repo: &crate::db::radio_repo::RadioRepo,
+    source_id: &str,
+) -> Option<crate::db::radio_repo::RadioStation> {
+    let id = source_id.parse::<i64>().ok()?;
+    repo.get(id).ok().flatten()
+}
+
+/// Choisir la vignette d'un pas de radio.
+///
+/// « Un pas » et non « un morceau » : entre deux chansons il y a des
+/// chroniques, des jingles, des flashs — des pas qui n'ont pas de pochette.
+pub(crate) fn vignette_du_pas_radio(
+    pochette_titre: Option<&str>,
+    logo_station: Option<&str>,
+    pochette_courante: Option<&str>,
+) -> Option<String> {
+    pochette_titre
+        .map(str::to_string)
+        .or_else(|| logo_station.map(str::to_string))
+        .or_else(|| pochette_courante.map(str::to_string))
+}
+
 pub struct PositionPoller {
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
@@ -2066,6 +2094,10 @@ impl PositionPoller {
     /// Extrait de la boucle de sondage pour pouvoir servir DEUX appelants : la
     /// zone qui a un peripherique de sortie, et celle qui n'en a pas. La
     /// seconde n'etait servie par personne — voir l'appel dans `tick`.
+    ///
+    /// Le choix de la vignette et la recherche de la station vivent dans
+    /// [`vignette_du_pas_radio`] et [`station_du_now_playing`] : les deux se
+    /// prouvent hors reseau, ce que cette fonction-ci ne permet pas.
     async fn refresh_radio_metadata(&self, zone_id: i64, zone_state: &crate::playback::ZoneState) {
         // Radio metadata polling (title/artist from ICY or external)
         if let Some(ref np) = zone_state.now_playing {
@@ -2078,26 +2110,22 @@ impl PositionPoller {
                     // pochette, `cover_path` la porte, et le titre suivant —
                     // une chronique, un jingle — hériterait de la pochette du
                     // précédent au lieu de revenir au logo.
+                    let radio_repo =
+                        crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
                     let mut logo_station: Option<String> = None;
-                    let (station_name, stream_url) = if let Ok(sid) = source_id.parse::<i64>() {
-                        let radio_repo =
-                            crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
-                        if let Ok(Some(station)) = radio_repo.get(sid) {
+                    let (station_name, stream_url) =
+                        if let Some(station) = station_du_now_playing(&radio_repo, source_id) {
                             logo_station = station.logo_url.clone();
                             (station.name.clone(), station.url.clone())
                         } else {
-                            // Fallback: use album_title (holds station name)
-                            // instead of np.title (holds song title after first update)
+                            // Station introuvable en base : on retombe sur
+                            // `album_title`, qui porte le nom de la station et
+                            // survit aux mises a jour (`np.title`, lui, prend
+                            // le titre du morceau des le premier
+                            // rafraichissement).
                             let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
                             (name, source_id.clone())
-                        }
-                    } else {
-                        // source_id is a URL — use album_title which preserves
-                        // the station name across metadata updates (np.title
-                        // gets overwritten with the current song title)
-                        let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
-                        (name, source_id.clone())
-                    };
+                        };
 
                     if let Some(meta) =
                         crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
@@ -2106,11 +2134,11 @@ impl PositionPoller {
                         // La pochette du titre quand la station la donne, le
                         // logo sinon. Bertrand : « mettre la pochette de
                         // l'album et non le logo de la radio ».
-                        let pochette = meta
-                            .cover_url
-                            .clone()
-                            .or_else(|| logo_station.clone())
-                            .or_else(|| np.cover_path.clone());
+                        let pochette = vignette_du_pas_radio(
+                            meta.cover_url.as_deref(),
+                            logo_station.as_deref(),
+                            np.cover_path.as_deref(),
+                        );
                         let title_changed = np.title != meta.title
                             || np.artist_name != meta.artist
                             || np.cover_path != pochette;
@@ -6941,5 +6969,141 @@ mod bascule_des_niveaux_tests {
         }
         poller.annoncer_bascule_des_niveaux(&mut dernier).await;
         assert_eq!(compter(&mut recu), 1, "le retour en PCM doit s'annoncer");
+    }
+}
+
+/// Le repli sur le logo de la station — #2421, fil forum 1508.
+///
+/// Belkadi Yacine : « pas de jaquettes lors de l'écoute des radios ». La
+/// pochette du MORCEAU a été câblée depuis (74677e35, v0.9.97) ; ce qui
+/// n'avait jamais marché, c'est le repli sur le logo de la station quand la
+/// station ne donne rien — une chronique, un jingle, un flash info, ou une
+/// station qui n'expose aucune API de now-playing.
+#[cfg(test)]
+mod repli_logo_station_tests {
+    use super::{station_du_now_playing, vignette_du_pas_radio};
+    use crate::db::migrations;
+    use crate::db::radio_repo::RadioRepo;
+    use crate::db::sqlite::SqliteDb;
+
+    const FIP: &str = "https://icecast.radiofrance.fr/fip-hifi.aac";
+
+    fn repo_avec_fip(logo: Option<&str>) -> RadioRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let repo = RadioRepo::new(db);
+        // Les 24 stations semées le sont par la migration 33 : on ne récrit
+        // pas FIP, on lui pose le logo que le rattrapage mozaiklabs lui aurait
+        // donné.
+        let mut fip = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.url == FIP)
+            .expect("FIP est semée par la migration 33");
+        fip.logo_url = logo.map(str::to_string);
+        repo.update(&fip).unwrap();
+        repo
+    }
+
+    /// LE défaut. `POST /radios/{id}/play/{zone}` écrit dans `source_id`
+    /// **l'URL du flux**, jamais l'identifiant numérique de la ligne
+    /// (`tune-server/src/routes/radios.rs`, `play_radio` :
+    /// `source_id: Some(radio.url.clone())`). Le sondeur, lui, ne cherchait la
+    /// station que par `source_id.parse::<i64>()`. La branche qui lit
+    /// `station.logo_url` était donc MORTE sur le chemin de lecture normal :
+    /// `logo_station` restait `None` pour les 24 stations livrées — y compris
+    /// les 20 auxquelles le rattrapage mozaiklabs avait bel et bien posé un
+    /// logo. Le repli n'avait rien à replier parce qu'il ne lisait rien.
+    #[test]
+    fn la_station_se_retrouve_par_l_url_du_flux_que_pose_le_play() {
+        let repo = repo_avec_fip(Some("https://mozaiklabs.fr/storage/radios/fip.png"));
+        let station = station_du_now_playing(&repo, FIP)
+            .expect("le play pose l'URL du flux dans source_id : il faut savoir la relire");
+        assert_eq!(station.name, "FIP");
+        assert_eq!(
+            station.logo_url.as_deref(),
+            Some("https://mozaiklabs.fr/storage/radios/fip.png")
+        );
+    }
+
+    /// L'identifiant numérique reste servi : d'autres appelants peuvent
+    /// l'écrire, et une station supprimée ne doit pas ressusciter.
+    #[test]
+    fn l_identifiant_numerique_continue_de_marcher() {
+        let repo = repo_avec_fip(Some("https://mozaiklabs.fr/storage/radios/fip.png"));
+        let id = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.url == FIP)
+            .and_then(|s| s.id)
+            .unwrap();
+        let station = station_du_now_playing(&repo, &id.to_string()).unwrap();
+        assert_eq!(station.name, "FIP");
+        assert!(station_du_now_playing(&repo, "999999").is_none());
+    }
+
+    /// Une station absente de la base — flux collé à la main, import M3U —
+    /// ne trouve rien, et ce n'est pas une erreur.
+    #[test]
+    fn une_station_inconnue_ne_trouve_rien() {
+        let repo = repo_avec_fip(None);
+        assert!(station_du_now_playing(&repo, "https://stream.inconnu.example/x.mp3").is_none());
+    }
+
+    /// Le second défaut, et il est écrit noir sur blanc dans le commentaire
+    /// que le code se donnait à lui-même : « dès qu'un titre a posé sa
+    /// pochette, `cover_path` la porte, et le titre suivant — une chronique,
+    /// un jingle — hériterait de la pochette du précédent au lieu de revenir
+    /// au logo ». C'est exactement ce que faisait le troisième repli
+    /// `.or_else(|| np.cover_path.clone())`. Mieux vaut le micro générique
+    /// qu'une pochette fausse : on n'illustre pas le journal de 13 h avec la
+    /// pochette de la chanson d'avant.
+    #[test]
+    fn un_pas_sans_pochette_ne_recycle_pas_celle_du_titre_precedent() {
+        assert_eq!(
+            vignette_du_pas_radio(None, None, Some("/artwork/titre-precedent.jpg")),
+            None,
+            "sans pochette de titre ni logo de station, il ne faut RIEN afficher"
+        );
+    }
+
+    /// Un `logo_url` vide ou blanc en base — import, saisie à la main — n'est
+    /// pas un logo. `Option::or` ne le voit pas : `Some(\"\")` gagne contre
+    /// `None` et l'on publie une URL vide.
+    #[test]
+    fn un_logo_vide_en_base_ne_compte_pas_pour_un_logo() {
+        assert_eq!(vignette_du_pas_radio(None, Some(""), None), None);
+        assert_eq!(vignette_du_pas_radio(None, Some("   "), None), None);
+        assert_eq!(
+            vignette_du_pas_radio(Some(""), Some("https://x/logo.png"), None),
+            Some("https://x/logo.png".to_string()),
+            "une pochette de titre vide doit laisser la main au logo"
+        );
+    }
+
+    /// Le sens de l'ordre, demandé par Bertrand : « mettre la pochette de
+    /// l'album et non le logo de la radio ». Garde anti-régression sur
+    /// 74677e35 / #2109.
+    #[test]
+    fn la_pochette_du_titre_passe_avant_le_logo() {
+        assert_eq!(
+            vignette_du_pas_radio(
+                Some("https://api.radiofrance/visual.jpg"),
+                Some("https://mozaiklabs.fr/storage/radios/fip.png"),
+                None
+            ),
+            Some("https://api.radiofrance/visual.jpg".to_string())
+        );
+        assert_eq!(
+            vignette_du_pas_radio(
+                None,
+                Some("https://mozaiklabs.fr/storage/radios/fip.png"),
+                None
+            ),
+            Some("https://mozaiklabs.fr/storage/radios/fip.png".to_string())
+        );
     }
 }
