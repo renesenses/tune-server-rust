@@ -31,6 +31,45 @@ async fn get_svc(
     // registry lock drops here
 }
 
+/// Type de favori de streaming demandé sur `/{service}/favorites/{fav_type}`.
+///
+/// Ce type existe pour une seule raison : `service_favorites` dispatche le
+/// `fav_type` à DEUX endroits — l'aller, et la reprise après rafraîchissement
+/// du jeton sur 401. Deux `match` sur une chaîne libre dérivent en silence dès
+/// qu'on ajoute un type à l'un et qu'on oublie l'autre. En passant par une
+/// énumération, le compilateur refuse le second `match` incomplet (#2370).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeFavori {
+    Tracks,
+    Albums,
+    Artists,
+    Playlists,
+}
+
+impl TypeFavori {
+    /// Le client envoie le type au PLURIEL dans l'URL. `None` = type que le
+    /// serveur ne sait pas lire.
+    fn parse(fav_type: &str) -> Option<Self> {
+        match fav_type {
+            "tracks" => Some(Self::Tracks),
+            "albums" => Some(Self::Albums),
+            "artists" => Some(Self::Artists),
+            "playlists" => Some(Self::Playlists),
+            _ => None,
+        }
+    }
+
+    /// Clé du tableau dans la réponse JSON attendue par le client.
+    fn cle(self) -> &'static str {
+        match self {
+            Self::Tracks => "tracks",
+            Self::Albums => "albums",
+            Self::Artists => "artists",
+            Self::Playlists => "playlists",
+        }
+    }
+}
+
 /// Convert a service method result into a JSON response (OK -> 200, Err -> 502).
 fn svc_response<R: serde::Serialize, E: std::fmt::Display>(result: Result<R, E>) -> Response {
     match result {
@@ -769,23 +808,29 @@ async fn service_favorites(
         // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
         // GET /streaming/upnp/favorites/tracks 404).
         Err(_) => {
-            let empty = match fav_type.as_str() {
-                "albums" => json!({ "albums": [] }),
-                "artists" => json!({ "artists": [] }),
-                _ => json!({ "tracks": [] }),
-            };
-            return Json(empty).into_response();
+            let cle = TypeFavori::parse(&fav_type)
+                .map(TypeFavori::cle)
+                .unwrap_or("tracks");
+            return Json(json!({ cle: [] })).into_response();
         }
     };
     let mut svc = svc.write().await;
-    let result = match fav_type.as_str() {
-        "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
-        "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
-        "artists" => svc
+    let result = match TypeFavori::parse(&fav_type) {
+        Some(TypeFavori::Tracks) => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
+        Some(TypeFavori::Albums) => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
+        Some(TypeFavori::Artists) => svc
             .get_user_artists()
             .await
             .map(|a| json!({ "artists": a })),
-        _ => Err(format!("unknown favorite type: {fav_type}").into()),
+        // `get_user_playlists` est une methode REQUISE du trait, deja
+        // implementee par tous les connecteurs (Qobuz lit
+        // `/playlist/getUserPlaylists`). Rien a inventer ici : le type
+        // manquait au dispatch, pas au service.
+        Some(TypeFavori::Playlists) => svc
+            .get_user_playlists()
+            .await
+            .map(|p| json!({ "playlists": p })),
+        None => Err(format!("unknown favorite type: {fav_type}").into()),
     };
     match result {
         Ok(data) => Json(data).into_response(),
@@ -804,14 +849,22 @@ async fn service_favorites(
                     Err(e) => return e.into_response(),
                 };
                 let svc = svc.read().await;
-                let retry = match fav_type.as_str() {
-                    "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
-                    "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
-                    "artists" => svc
+                let retry = match TypeFavori::parse(&fav_type) {
+                    Some(TypeFavori::Tracks) => {
+                        svc.get_user_tracks().await.map(|t| json!({ "tracks": t }))
+                    }
+                    Some(TypeFavori::Albums) => {
+                        svc.get_user_albums().await.map(|a| json!({ "albums": a }))
+                    }
+                    Some(TypeFavori::Artists) => svc
                         .get_user_artists()
                         .await
                         .map(|a| json!({ "artists": a })),
-                    _ => Err("unknown favorite type".into()),
+                    Some(TypeFavori::Playlists) => svc
+                        .get_user_playlists()
+                        .await
+                        .map(|p| json!({ "playlists": p })),
+                    None => Err("unknown favorite type".into()),
                 };
                 match retry {
                     Ok(data) => Json(data).into_response(),
@@ -1078,6 +1131,61 @@ async fn compare_services(
         "services": results,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests_favoris_playlist {
+    use super::*;
+
+    /// #2370 — Gros Bidon (fil 1541) : « on ne peut pas mettre une playlist
+    /// Qobuz en favori ». `GET /streaming/{service}/favorites/playlists`
+    /// retombe aujourd'hui dans le bras par défaut et sort en 400
+    /// « unknown favorite type: playlists ». Même si l'écriture était réglée,
+    /// AUCUN écran ne pourrait relire le favori.
+    #[test]
+    fn le_type_playlists_est_un_type_de_favori_connu_du_serveur() {
+        let t = TypeFavori::parse("playlists");
+        assert!(
+            t.is_some(),
+            "GET /streaming/<service>/favorites/playlists sort en 400 \
+             `unknown favorite type: playlists` : la lecture ne connait pas le type"
+        );
+        assert_eq!(
+            t.unwrap().cle(),
+            "playlists",
+            "le client attend le tableau sous la cle `playlists`"
+        );
+    }
+
+    /// La reponse de repli pour une source non-streaming (upnp/radio/podcast)
+    /// doit porter la MEME cle que la reponse pleine, sans quoi le client lit
+    /// `tracks` la ou il attend `playlists`.
+    #[test]
+    fn la_cle_de_repli_suit_le_type_demande() {
+        for (demande, attendu) in [
+            ("tracks", "tracks"),
+            ("albums", "albums"),
+            ("artists", "artists"),
+            ("playlists", "playlists"),
+        ] {
+            let cle = TypeFavori::parse(demande)
+                .map(TypeFavori::cle)
+                .unwrap_or("tracks");
+            assert_eq!(cle, attendu, "type demande: {demande}");
+        }
+    }
+
+    /// Un type reellement inconnu reste inconnu : le correctif ouvre la
+    /// playlist, il n'ouvre pas la porte a n'importe quelle chaine.
+    #[test]
+    fn un_type_inconnu_reste_refuse() {
+        assert!(TypeFavori::parse("labels").is_none());
+        assert!(
+            TypeFavori::parse("track").is_none(),
+            "le singulier n'est pas le contrat"
+        );
+        assert!(TypeFavori::parse("").is_none());
+    }
 }
 
 #[cfg(test)]
