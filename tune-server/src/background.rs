@@ -790,11 +790,67 @@ fn spawn_telemetry_reporter(state: &AppState) {
     );
 }
 
-/// Lightweight heartbeat — runs ALWAYS regardless of TUNE_TELEMETRY.
-/// Sends a minimal ping every 5 minutes to mozaiklabs.fr so the admin
-/// can see all running instances in real-time.  Also carries license_key
-/// and hardware_fingerprint so the server can validate the license and
-/// return tier / expiry information.
+/// Cadence du battement de coeur vers mozaiklabs.fr.
+///
+/// Une heure, et non les 300 s d'origine (#2416). Le testeur a mesure l'ancienne
+/// cadence sur son propre journal : un `POST /api/v1/heartbeat` — et, compte
+/// mozaiklabs connecte, un `GET /api/v1/user` — toutes les cinq minutes, soit
+/// pres de 300 allers-retours par jour sur une machine qui ne fait qu'ecouter
+/// de la musique.
+///
+/// Rien dans le produit n'exige cette frequence. Les droits (licence a clef
+/// comme compte SSO) sont couverts par une grace hors-ligne de 14 jours
+/// (`tune-core/src/license.rs`, `GRACE_PERIOD_DAYS`) : un rafraichissement
+/// horaire laisse ~336 occasions de revalider avant la moindre degradation.
+/// Les 5 minutes repondaient a un besoin d'outil d'administration temps reel
+/// — voir toutes les instances vivantes dans la console — pas a un besoin de
+/// l'utilisateur, qui en paie le trafic et les journaux.
+///
+/// Les autres boucles de ce fichier partagent le meme 300 s et ne sont PAS
+/// concernees : GC des temporaires DASH, rafraichisseur de jetons, diagnostics
+/// memoire. Elles sont locales et n'appellent personne.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Ce qu'un tour de battement a le droit de faire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeartbeatPlan {
+    /// Envoyer la charge utile a `POST /api/v1/heartbeat`.
+    send_heartbeat: bool,
+    /// Rafraichir les droits premium du compte SSO (`GET /api/v1/user`).
+    refresh_account: bool,
+}
+
+/// Decide ce que fait le tour de battement en fonction de l'opt-out telemetrie.
+///
+/// `TUNE_TELEMETRY=false` coupe l'ENVOI du battement — c'est bien lui qui porte
+/// la charge utile descriptive (version, plateforme, nombre de pistes, nom
+/// d'hote, services authentifies, liste des appareils).
+///
+/// Il ne coupe PAS le rafraichissement des droits premium du compte SSO, et
+/// c'est delibere : ce n'est pas de la telemetrie mais l'entretien du service
+/// que l'utilisateur a achete. Le couper ferait retomber un abonne payant en
+/// gratuit au bout de la grace de 14 jours, pour avoir refuse d'etre compte
+/// dans une statistique. Un opt-out ne doit jamais se payer en fonctionnalites
+/// perdues. L'appel ne part de toute facon que si un `mozaik_access_token`
+/// existe, c'est-a-dire si l'utilisateur a lui-meme lie son compte.
+fn heartbeat_plan(telemetry_enabled: bool) -> HeartbeatPlan {
+    HeartbeatPlan {
+        send_heartbeat: telemetry_enabled,
+        refresh_account: true,
+    }
+}
+
+/// Lightweight heartbeat — honours `TUNE_TELEMETRY` (#2416).
+///
+/// Sends a ping every `HEARTBEAT_INTERVAL` (1 h) to mozaiklabs.fr so the admin
+/// can see running instances.  Also carries license_key and
+/// hardware_fingerprint so the server can validate the license and return
+/// tier / expiry information.
+///
+/// Opting out of telemetry (`TUNE_TELEMETRY=false`) stops the ping — the
+/// comment here used to claim the loop ran "ALWAYS regardless of
+/// TUNE_TELEMETRY", and the code agreed with it: the opt-out cut nothing.
+/// The account premium refresh keeps running either way, see [`heartbeat_plan`].
 fn spawn_heartbeat(state: &AppState) {
     let backend = state.backend.clone();
     let services = state.services.clone();
@@ -853,6 +909,35 @@ fn spawn_heartbeat(state: &AppState) {
         };
 
         loop {
+            let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+
+            // Marqueur de vivacite LOCAL, utilise pour la detection de crash au
+            // demarrage suivant. Il ne quitte jamais la machine : il reste donc
+            // ecrit meme quand la telemetrie est eteinte, sinon l'opt-out
+            // ferait passer chaque arret propre pour un plantage.
+            {
+                let settings =
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                settings
+                    .set("server_last_alive_at", &now_ts.to_string())
+                    .ok();
+            }
+
+            if !plan.send_heartbeat {
+                // Opt-out : rien ne part sur le reseau, et la charge utile n'est
+                // meme pas collectee. Les droits premium, eux, continuent d'etre
+                // rafraichis — voir `heartbeat_plan`.
+                if plan.refresh_account {
+                    refresh_account_premium(&backend, &license, &services).await;
+                }
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                continue;
+            }
+
             let tracks = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
                 .count()
                 .unwrap_or(0);
@@ -1005,19 +1090,6 @@ fn spawn_heartbeat(state: &AppState) {
                 "server_id": server_id,
             });
 
-            // Update server_last_alive_at timestamp for crash detection
-            {
-                let settings =
-                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-                let now_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                settings
-                    .set("server_last_alive_at", &now_ts.to_string())
-                    .ok();
-            }
-
             match client
                 .post("https://mozaiklabs.fr/api/v1/heartbeat")
                 .header("Accept", "application/json")
@@ -1154,9 +1226,11 @@ fn spawn_heartbeat(state: &AppState) {
             // Refresh the account premium (SSO) from /api/v1/user so a lapsed
             // subscription is picked up without waiting for the offline grace or
             // a re-login. No-op when not connected. Never blocks the heartbeat.
-            refresh_account_premium(&backend, &license, &services).await;
+            if plan.refresh_account {
+                refresh_account_premium(&backend, &license, &services).await;
+            }
 
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
         }
     });
 }
@@ -1910,6 +1984,98 @@ fn spawn_social_sharing_listener(state: &AppState) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod heartbeat_cadence_et_optout_tests {
+    use super::{HEARTBEAT_INTERVAL, heartbeat_plan};
+
+    /// Fait constate sur le journal d'un testeur (#2416) : le battement partait
+    /// toutes les 300 s, et il partait meme quand la telemetrie etait eteinte.
+    /// La grace hors-ligne est de 14 jours (`tune-core/src/license.rs`,
+    /// `GRACE_PERIOD_DAYS`) : une cadence horaire est largement suffisante pour
+    /// tenir les droits a jour. 5 minutes etait une cadence d'outil
+    /// d'administration temps reel, pas un besoin du produit.
+    #[test]
+    fn la_cadence_du_battement_est_horaire() {
+        assert_eq!(
+            HEARTBEAT_INTERVAL.as_secs(),
+            3600,
+            "le battement doit battre une fois par heure, pas toutes les 5 minutes"
+        );
+    }
+
+    /// `TUNE_TELEMETRY=false` doit couper l'ENVOI du battement. Le commentaire
+    /// du code affirmait l'inverse (« runs ALWAYS regardless of TUNE_TELEMETRY »)
+    /// et le code lui donnait raison : l'opt-out ne coupait rien.
+    #[test]
+    fn le_battement_ne_part_pas_quand_la_telemetrie_est_eteinte() {
+        assert!(
+            !heartbeat_plan(false).send_heartbeat,
+            "TUNE_TELEMETRY=false doit couper l'envoi du battement"
+        );
+    }
+
+    /// L'opt-out ne doit pas devenir un interrupteur general : telemetrie
+    /// active, le battement part comme avant.
+    #[test]
+    fn le_battement_part_quand_la_telemetrie_est_active() {
+        assert!(
+            heartbeat_plan(true).send_heartbeat,
+            "telemetrie active, le battement doit partir"
+        );
+    }
+
+    /// Decision de perimetre : le rafraichissement des droits premium (SSO,
+    /// `GET /api/v1/user`) SURVIT a l'extinction de la telemetrie. Le couper
+    /// ferait retomber un abonne payant en gratuit au bout de la grace de 14
+    /// jours, pour avoir refuse une statistique — ce n'est pas ce qu'il a
+    /// demande.
+    #[test]
+    fn les_droits_premium_se_rafraichissent_meme_telemetrie_eteinte() {
+        assert!(
+            heartbeat_plan(false).refresh_account,
+            "couper la telemetrie ne doit jamais degrader un compte premium"
+        );
+    }
+
+    /// Seule la boucle du battement change de cadence. Les autres boucles de ce
+    /// fichier partagent le meme 300 s et ne sont pas concernees : elles doivent
+    /// rester exactement au nombre ou elles etaient.
+    #[test]
+    fn les_autres_boucles_gardent_leur_cadence_de_300_s() {
+        let source = include_str!("background.rs");
+        // Aiguille construite a l'execution : ecrite en clair, elle se
+        // compterait elle-meme.
+        let aiguille = format!("from_secs({})", 300);
+        let restants = source.matches(&aiguille).count();
+        assert_eq!(
+            restants, 3,
+            "il doit rester exactement 3 boucles a 300 s (GC des temporaires \
+             DASH, rafraichisseur de jetons, diagnostics memoire) — le \
+             battement, lui, doit passer par HEARTBEAT_INTERVAL"
+        );
+    }
+
+    /// Le battement doit lire l'opt-out par le MEME mecanisme que la telemetrie
+    /// (`TelemetryReporter::is_enabled`), pas par une seconde lecture maison de
+    /// la variable d'environnement.
+    #[test]
+    fn l_optout_reutilise_le_mecanisme_de_la_telemetrie() {
+        // On ne regarde QUE le code de production : les modules de test citent
+        // le nom dans leurs commentaires et leurs messages d'assertion, et le
+        // test se prouverait tout seul.
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        assert!(
+            production.contains(&format!("TelemetryReporter::{}()", "is_enabled")),
+            "l'opt-out du battement doit reutiliser TelemetryReporter::is_enabled, \
+             pas relire TUNE_TELEMETRY pour son compte"
+        );
+    }
 }
 
 #[cfg(test)]

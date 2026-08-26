@@ -10,7 +10,7 @@ use tracing::{error, warn};
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 #[cfg(feature = "oaat")]
-use super::helpers::{detect_and_parse, format_rate_display};
+use super::helpers::{BaseDeTempsOaat, detect_and_parse, duree_audio_envoyee, format_rate_display};
 
 #[cfg(feature = "oaat")]
 const FLAC_CHUNK_SIZE: usize = 4096;
@@ -488,12 +488,17 @@ impl OutputTarget for OaatMultiroomOutput {
                                 Ordering::Relaxed,
                             );
 
-                            let expected = if is_flac {
-                                let audio_bps = cur_sample_rate as f64 * bytes_per_frame as f64;
-                                std::time::Duration::from_nanos((byte_offset as f64 / audio_bps * 1e9) as u64)
-                            } else {
-                                std::time::Duration::from_nanos((sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64)
-                            };
+                            // FLAC reste à débit variable : sa taille
+                            // compressée ne mesure jamais le temps. Le compteur
+                            // d'en-têtes vient de poser `sample_offset`, qui est
+                            // l'unique base de temps correcte ici (#2214).
+                            let expected = duree_audio_envoyee(
+                                BaseDeTempsOaat::Samples,
+                                sample_offset,
+                                byte_offset,
+                                cur_sample_rate,
+                                bytes_per_frame,
+                            );
                             let elapsed = start.elapsed();
                             if expected > elapsed {
                                 tokio::time::sleep(expected - elapsed).await;
@@ -611,5 +616,35 @@ impl OutputTarget for OaatMultiroomOutput {
     #[cfg(feature = "oaat")]
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
         None
+    }
+}
+
+#[cfg(test)]
+mod pacing_regression_tests {
+    /// #2214 : le premier correctif a remplacé les octets compressés pour le
+    /// PTS et la position, mais a laissé le pacing multiroom sur son ancienne
+    /// branche `is_flac`. Le débit FLAC varie : ce chemin doit demander la
+    /// base de temps des samples, exactement comme la sortie OAAT simple.
+    #[test]
+    fn le_pacing_flac_multiroom_ne_retombe_pas_sur_les_octets_compresses() {
+        let source = include_str!("multiroom.rs");
+        let production = source
+            .split("mod pacing_regression_tests")
+            .next()
+            .expect("module de garde introuvable");
+        let debut = production
+            .find("let expected =")
+            .expect("calcul du pacing multiroom introuvable");
+        let fin = (debut + 420).min(production.len());
+        let pacing = &production[debut..fin];
+
+        assert!(
+            pacing.contains("BaseDeTempsOaat::Samples"),
+            "le multiroom ne sélectionne pas explicitement l'horloge samples"
+        );
+        assert!(
+            !pacing.contains("if is_flac") && !pacing.contains("byte_offset as f64"),
+            "le pacing FLAC possède encore sa branche fondée sur byte_offset"
+        );
     }
 }
