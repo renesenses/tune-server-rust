@@ -2582,9 +2582,18 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "podcast_source_id",
         include_str!("../../migrations/postgres/033_podcast_source_id.sql"),
     ),
-    // NB : 034_radio_favorites_saved_at_texte.sql existe sur disque mais n'a
-    // jamais été enregistré ici — constat du 26/08, signalé à part, pas
-    // réparé dans ce commit pour ne pas mélanger deux sujets.
+    // 034 était sur disque sans être enregistrée ici : les installations
+    // PostgreSQL n'ont donc JAMAIS reçu la conversion de
+    // `radio_favorites.saved_at` en TEXTE, alors que SQLite l'a eue
+    // (migration 82). Le test de contiguïté de PG_MIGRATIONS l'a révélé en
+    // refusant le trou entre 33 et 35 — on la répare donc ici, à la même
+    // occasion : elle est idempotente et sans perte (le `DO $$` ne convertit
+    // que si la colonne est encore numérique).
+    (
+        34,
+        "radio_favorites_saved_at_texte",
+        include_str!("../../migrations/postgres/034_radio_favorites_saved_at_texte.sql"),
+    ),
     (
         35,
         "network_mounts_unicite",
@@ -3482,7 +3491,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 33, "latest PG migration must be 33");
+        assert_eq!(pg_latest_version(), 35, "latest PG migration must be 35");
         for wanted in [10, 11, 13] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
