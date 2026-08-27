@@ -5370,6 +5370,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-http-types"
+version = "0.9.113"
+dependencies = [
+ "axum",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "tune-karaoke"
 version = "0.9.113"
 dependencies = [
@@ -5438,6 +5449,7 @@ dependencies = [
  "tune-bandcamp",
  "tune-core",
  "tune-dj",
+ "tune-http-types",
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
  "tune-stream-http",
