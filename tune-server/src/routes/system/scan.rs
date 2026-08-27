@@ -738,7 +738,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
-        let skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_reasons = list_result.skipped_reasons;
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -910,6 +911,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut skipped_unchanged = pre_skipped;
         let mut skipped_duplicate = 0i64;
         let mut skipped_no_metadata = 0i64;
+        let mut skipped_unsupported = 0i64;
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
@@ -975,6 +977,17 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    if let Some(unsupported) = &sf.unsupported {
+                        tracing::info!(
+                            path = %sf.path,
+                            format = %unsupported.report_key,
+                            reason = unsupported.reason,
+                            "scan_track_skipped_unsupported"
+                        );
+                        skipped += 1;
+                        skipped_unsupported += 1;
+                        continue;
+                    }
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         // Counted in the aggregate too, so `processed` can
@@ -1161,6 +1174,15 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 }
             },
         );
+
+        // Les extensions manifestement non prises en charge sont comptées dès
+        // le parcours. Le cas DFF/DST exige une lecture d'en-tête : elle est
+        // faite dans la phase bornée ci-dessus, puis fusionnée dans le même
+        // contrat de rapport.
+        for (format, count) in &scan_stats.unsupported_by_ext {
+            *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
+        }
+        skipped_reasons.extend(scan_stats.unsupported_reasons.clone());
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
@@ -1617,6 +1639,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_unchanged,
             skipped_duplicate,
             skipped_no_metadata,
+            skipped_unsupported,
             db_insert_failed,
             db_update_failed,
             artwork = artwork_extracted,
@@ -1657,6 +1680,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     "skipped_unchanged": skipped_unchanged,
                     "skipped_duplicate": skipped_duplicate,
                     "skipped_no_metadata": skipped_no_metadata,
+                    "skipped_unsupported": skipped_unsupported,
                     "db_insert_failed": db_insert_failed,
                     "db_update_failed": db_update_failed,
                     "artwork_extracted": artwork_extracted,
@@ -1688,6 +1712,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 "skipped_unchanged": skipped_unchanged,
                 "skipped_duplicate": skipped_duplicate,
                 "skipped_no_metadata": skipped_no_metadata,
+                "skipped_unsupported": skipped_unsupported,
                 "db_insert_failed": db_insert_failed,
                 "db_update_failed": db_update_failed,
                 "artwork_extracted": artwork_extracted,
@@ -1720,6 +1745,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "skipped_unchanged": skipped_unchanged,
             "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
+            "skipped_unsupported": skipped_unsupported,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
@@ -1730,6 +1756,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
             // l'utilisateur pourquoi des albums manquent, au lieu de le laisser
             // chercher un bug de scanner (#1763).
             "skipped_unsupported_by_ext": skipped_by_ext,
+            // Motif lisible associé à chaque compteur. Additif pour les clients
+            // existants qui ne connaissent que `skipped_unsupported_by_ext`.
+            "skipped_unsupported_reasons": skipped_reasons,
         });
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())

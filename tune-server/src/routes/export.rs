@@ -182,7 +182,12 @@ async fn export_library_audit_csv(
         avertissements.push(format!("{e}: erreur de lecture en cours de parcours"));
     }
     for (ext, n) in &liste.skipped_by_ext {
-        avertissements.push(format!("{n} fichier(s) .{ext} ignorés (extension non lue)"));
+        let raison = liste
+            .skipped_reasons
+            .get(ext)
+            .map(String::as_str)
+            .unwrap_or("extension non lue");
+        avertissements.push(format!("{n} fichier(s) .{ext} ignorés ({raison})"));
     }
 
     let mut disque: Vec<tune_core::library::audit::FichierDisque> = Vec::new();

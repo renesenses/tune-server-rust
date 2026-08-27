@@ -586,29 +586,23 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
 }
 
 pub fn can_decode_native(file_path: &str) -> bool {
-    let ext = Path::new(file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    matches!(
-        ext.as_str(),
-        "flac"
-            | "mp3"
-            | "wav"
-            | "m4a"
-            | "aac"
-            | "alac"
-            | "ogg"
-            | "oga"
-            | "opus"
-            | "aiff"
-            | "aif"
-            | "dsf"
-            | "dff"
-            | "wv"
-            | "ape"
-    )
+    let path = Path::new(file_path);
+    super::support::native_decoder_supports(path)
+        && !matches!(
+            super::support::library_audio_support(path),
+            super::support::LibraryAudioSupport::Unsupported(_)
+        )
+}
+
+fn reject_unsupported_library_audio(file_path: &str) -> Result<(), String> {
+    match super::support::library_audio_support(Path::new(file_path)) {
+        super::support::LibraryAudioSupport::Unsupported(unsupported) => Err(format!(
+            "format non pris en charge : {} ({})",
+            unsupported.report_key, unsupported.reason
+        )),
+        super::support::LibraryAudioSupport::Supported
+        | super::support::LibraryAudioSupport::NotAudio => Ok(()),
+    }
 }
 
 fn is_wavpack(file_path: &str) -> bool {
@@ -1014,6 +1008,10 @@ pub fn decode_to_pcm(
     if let Some(channels) = target_channels {
         checked_channels(channels, "requested PCM format")?;
     }
+    // Même contrat que le scanner : un fichier exclu du catalogue ne peut pas
+    // redevenir implicitement « transcodable » sur un autre chemin de lecture.
+    // Pour DFF, l'en-tête distingue ici DSD brut de DST compressé.
+    reject_unsupported_library_audio(file_path)?;
     // Stage network/external sources to a fast local temp before decoding so the
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
@@ -1059,11 +1057,6 @@ pub fn decode_to_pcm(
             decode_ape_to_pcm(&fp, seek_s, max_duration_s)
         }))
         .unwrap_or_else(|_| Err("ape: decoder panicked (corrupt file?)".into()))
-    } else if ext == "wma" || ext == "asf" {
-        // WMA/ASF partait vers ffmpeg — un binaire externe retiré du projet.
-        Err(format!(
-            "format non pris en charge : {ext} (WMA/ASF n'a plus de decodeur depuis le retrait de ffmpeg)"
-        ))
     // Ogg-Vorbis / Ogg-FLAC (.ogg / .oga) is decoded NATIVELY by symphonia (the
     // "ogg" demuxer + "vorbis"/"flac" codec features are enabled). Il n'existe
     // plus aucun repli externe : tout ce qui n'est pas décodé ici l'est par
@@ -1407,6 +1400,7 @@ fn decode_to_pcm_streaming_inner(
             "stream target bit depth {bit_depth} is unsupported (expected 16, 24 or 32)"
         ));
     }
+    reject_unsupported_library_audio(file_path)?;
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -1540,7 +1534,7 @@ fn decode_to_pcm_streaming_inner(
 
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
-    if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape" | "wma" | "asf") {
+    if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape") {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
@@ -3296,7 +3290,24 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(can_decode_native("song.dff"));
         assert!(can_decode_native("song.ape"));
         assert!(can_decode_native("song.wv"));
-        assert!(!can_decode_native("song.wma")); // WMA requires external FFmpeg
+        assert!(!can_decode_native("song.wma")); // aucun décodeur WMA livré
+    }
+
+    #[test]
+    fn dff_dst_n_est_jamais_annonce_ni_envoye_comme_decodable() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tune_decode_dff_dst_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("album.dff");
+        std::fs::write(&path, super::super::support::dff_dst_minimal_fixture()).unwrap();
+
+        assert!(!can_decode_native(path.to_str().unwrap()));
+        let error = match decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0) {
+            Ok(_) => panic!("un DFF/DST ne doit jamais atteindre le décodeur DSD brut"),
+            Err(error) => error,
+        };
+        assert!(error.contains("aucun décodeur DST"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
