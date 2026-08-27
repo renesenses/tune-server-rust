@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp"]
+members = ["tune-core", "tune-server", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI

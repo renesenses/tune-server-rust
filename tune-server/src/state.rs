@@ -111,6 +111,16 @@ pub struct AppState {
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
 
+impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpState {
+    fn from_ref(state: &AppState) -> Self {
+        Self::new(
+            state.backend.clone(),
+            state.services.clone(),
+            state.event_bus.clone(),
+        )
+    }
+}
+
 impl AppState {
     /// The SQLite handle, for the few operations with no engine-agnostic
     /// equivalent (FTS rebuild, `VACUUM`, WAL checkpoint, schema version).

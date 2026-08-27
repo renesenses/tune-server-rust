@@ -175,7 +175,7 @@ jobs:
         with:
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
+      - run: cargo test -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server --no-default-features --features oaat
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -457,7 +457,7 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
