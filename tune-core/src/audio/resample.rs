@@ -81,6 +81,39 @@ pub fn rubato_resample_batch_exact(
     rubato_batch_inner(samples, from_sr, to_sr, channels, true)
 }
 
+/// Adaptation de cadence d'une piste dont TOUT le contenu est deja en memoire
+/// (#2246) — flux compresse decode en bloc : FLAC, MP3, AAC, ALAC…
+///
+/// Ce que compense le retrait du delai de groupe
+/// --------------------------------------------
+/// Le delai de groupe n'est pas un alignement voulu entre deux signaux : c'est
+/// la latence propre du filtre sinc. Les `output_delay()` premieres trames de
+/// sortie sont la montee en regime du FIR, pas de la matiere musicale, et le
+/// drainage de fin ajoute une queue de rembourrage symetrique. Les garder
+/// decale l'instant zero de la piste et allonge sa duree de ~2×delay trames.
+///
+/// Pourquoi ici, et surtout POURQUOI PAS sur le chemin en flux
+/// -----------------------------------------------------------
+/// Un rééchantillonneur cree pour UNE piste entiere paie son delai UNE FOIS
+/// PAR PISTE : le decalage se reinstalle a chaque frontiere, et la duree/
+/// position calculees sur cette sortie allongee mentent d'autant.
+///
+/// Le chemin PCM en flux de `outputs/local.rs` est l'inverse exact : le
+/// rééchantillonneur y est cree une fois pour la CHAINE et conserve d'une
+/// piste a l'autre tant que la cadence source ne change pas (vrai gapless).
+/// Il paie donc son delai une seule fois pour tout l'enchainement — une
+/// latence constante, deja absorbee. Y retrancher le delai a chaque piste
+/// **supprimerait de la matiere reelle** a chaque frontiere : ce serait
+/// exactement le mauvais correctif. Cette fonction est reservee aux appelants
+/// qui detiennent la piste complete et jettent leur rééchantillonneur avec.
+///
+/// C'est le meme contrat que `StreamingPcmAdapter` (`audio/decode.rs`) tient
+/// deja pour les decodages progressifs, et que le convertisseur (#1525) tient
+/// pour les fichiers.
+pub fn rubato_resample_track(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> Vec<f32> {
+    rubato_resample_batch_exact(samples, from_sr, to_sr, channels)
+}
+
 fn rubato_batch_inner(
     samples: &[f32],
     from_sr: u32,
@@ -520,5 +553,137 @@ mod tests {
                 assert!(s.is_finite(), "sortie non finie");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod piste_entiere_tests {
+    use super::*;
+
+    const FROM_SR: u32 = 44_100;
+    const TO_SR: u32 = 48_000;
+    const CH: usize = 2;
+
+    /// Piste stereo de `frames` trames, silencieuse sauf une impulsion
+    /// pleine echelle a la trame `pic`.
+    fn impulsion(frames: usize, pic: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; frames * CH];
+        v[pic * CH] = 1.0;
+        v[pic * CH + 1] = 1.0;
+        v
+    }
+
+    fn trame_du_pic(sortie: &[f32]) -> usize {
+        sortie
+            .chunks(CH)
+            .enumerate()
+            .max_by(|a, b| a.1[0].abs().partial_cmp(&b.1[0].abs()).unwrap())
+            .map(|(i, _)| i)
+            .expect("sortie vide")
+    }
+
+    /// #2246 — mesure du temps, pas de l'intention.
+    ///
+    /// Le chemin local des formats compresses decode la piste ENTIERE en
+    /// memoire puis adapte sa cadence. On y envoie une impulsion a une trame
+    /// connue et on lit deux nombres en sortie :
+    ///
+    /// 1. le nombre de trames rendues — il doit valoir exactement
+    ///    `round(trames_entree × ratio)` ;
+    /// 2. la trame du pic — elle doit valoir `round(pic × ratio)`.
+    ///
+    /// Tant que cette fonction conserve le delai de groupe du sinc, les deux
+    /// sont faux du meme nombre de trames : la piste s'allonge et son contenu
+    /// glisse vers la droite. Le message d'echec imprime l'ecart mesure.
+    #[test]
+    fn la_piste_entiere_ne_glisse_ni_ne_s_allonge() {
+        const TRAMES: usize = 44_100; // 1 s
+        const PIC: usize = 4_410; // 100 ms
+
+        let entree = impulsion(TRAMES, PIC);
+        let sortie = rubato_resample_track(&entree, FROM_SR, TO_SR, CH as u16);
+
+        let ratio = TO_SR as f64 / FROM_SR as f64;
+        let trames_attendues = (TRAMES as f64 * ratio).round() as usize;
+        let pic_attendu = (PIC as f64 * ratio).round() as usize;
+
+        let trames_rendues = sortie.len() / CH;
+        let pic_rendu = trame_du_pic(&sortie);
+
+        let derive = pic_rendu as i64 - pic_attendu as i64;
+        assert!(
+            derive.abs() <= 1,
+            "position : le pic est rendu a la trame {pic_rendu} au lieu de \
+             {pic_attendu}, soit une derive de {derive} trames \
+             ({:.3} ms a {TO_SR} Hz). Le delai de groupe du sinc est conserve \
+             et decale toute la piste (#2246).",
+            derive as f64 * 1000.0 / TO_SR as f64
+        );
+
+        assert_eq!(
+            trames_rendues,
+            trames_attendues,
+            "longueur : {trames_rendues} trames rendues pour {trames_attendues} \
+             attendues, soit {} trames en trop. La duree et la position \
+             annoncees par le chemin compresse sont calculees sur cette \
+             sortie : elles mentent d'autant (#2246).",
+            trames_rendues as i64 - trames_attendues as i64
+        );
+    }
+
+    /// #2246 — la contre-partie : le contrat du chemin en FLUX est l'inverse,
+    /// et il ne doit pas etre « corrige ».
+    ///
+    /// `rubato_resample_batch` conserve deliberement delai et queue. Ce test
+    /// fige cette difference : si un jour les deux fonctions rendaient la
+    /// meme chose, c'est que l'une des deux aurait ete alignee sur l'autre
+    /// par megarde.
+    #[test]
+    fn le_contrat_du_flux_reste_distinct_de_celui_de_la_piste() {
+        const TRAMES: usize = 8_820; // 200 ms
+        let entree = impulsion(TRAMES, 441);
+
+        let flux = rubato_resample_batch(&entree, FROM_SR, TO_SR, CH as u16);
+        let piste = rubato_resample_track(&entree, FROM_SR, TO_SR, CH as u16);
+
+        assert!(
+            flux.len() > piste.len(),
+            "le contrat en flux doit rester plus long que le contrat piste : \
+             {} contre {} echantillons",
+            flux.len(),
+            piste.len()
+        );
+    }
+
+    /// #2246 — le chemin compresse de `outputs/local.rs` doit appeler le
+    /// contrat « piste entiere ».
+    ///
+    /// Les deux tests ci-dessus mesurent la fonction ; celui-ci verifie que
+    /// c'est bien elle que la production appelle. Meme controle grossier que
+    /// `chemin_compresse_dsp_tests` (#1725) : il attrape la seule regression
+    /// qui compte, quelqu'un qui rebranche la variante en flux.
+    #[test]
+    fn le_chemin_compresse_appelle_le_contrat_piste_entiere() {
+        let source = include_str!("../outputs/local.rs");
+        let branche = source
+            .split("local_audio_compressed_playing")
+            .nth(1)
+            .expect("branche compressee introuvable");
+        let avant_tampon = branche
+            .split("Pre-fill the ring buffer")
+            .next()
+            .expect("pre-remplissage introuvable");
+
+        assert!(
+            avant_tampon.contains("rubato_resample_track("),
+            "le chemin compresse detient la piste entiere : il doit appeler \
+             rubato_resample_track, qui retire le delai de groupe. La \
+             variante en flux ajoute ~2×delay trames A CHAQUE PISTE (#2246)."
+        );
+        assert!(
+            !avant_tampon.contains("rubato_resample_batch("),
+            "le chemin compresse appelle encore rubato_resample_batch : \
+             delai de groupe et queue conserves a chaque piste (#2246)."
+        );
     }
 }
