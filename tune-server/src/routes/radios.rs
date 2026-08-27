@@ -1,12 +1,17 @@
+use std::sync::Arc;
+
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
+use tune_core::http::streamer::AudioStreamer;
 
 use crate::error::AppError;
 use crate::routes::active_profile::DEFAULT_PROFILE_ID;
@@ -211,12 +216,116 @@ pub fn router() -> Router<AppState> {
             "/{id}",
             get(get_radio).put(update_radio).delete(delete_radio),
         )
+        .route(
+            "/{id}/audio.wav",
+            get(media_server_radio_audio).head(media_server_radio_audio_head),
+        )
         .route("/{id}/favorite", post(toggle_favorite))
         .route("/{id}/play/{zone_id}", post(play_radio))
         .route("/{id}/artwork", post(set_radio_artwork))
         .route("/export.m3u", get(export_radios_m3u))
         .route("/import", post(import_radios))
         .route("/import/m3u", post(import_radios_m3u))
+}
+
+/// Possède la session radio pendant toute la vie du corps HTTP. Axum détruit
+/// le corps aussi bien à EOF que lorsque le renderer coupe sa socket ; le Drop
+/// retire alors la session, ferme son canal et fait sortir le décodeur bloquant
+/// dès son prochain envoi.
+struct MediaServerRadioSessionGuard {
+    streamer: Arc<AudioStreamer>,
+    stream_id: Option<String>,
+}
+
+impl Drop for MediaServerRadioSessionGuard {
+    fn drop(&mut self) {
+        let Some(stream_id) = self.stream_id.take() else {
+            return;
+        };
+        let streamer = self.streamer.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    streamer.remove_session(&stream_id).await;
+                });
+            }
+            Err(error) => tracing::warn!(
+                stream_id,
+                error = %error,
+                "media_server_radio_cleanup_without_runtime"
+            ),
+        }
+    }
+}
+
+fn with_media_server_radio_cleanup(
+    response: Response,
+    streamer: Arc<AudioStreamer>,
+    stream_id: String,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let mut data = body.into_data_stream();
+    let guard = MediaServerRadioSessionGuard {
+        streamer,
+        stream_id: Some(stream_id),
+    };
+    let body = Body::from_stream(async_stream::stream! {
+        let _guard = guard;
+        while let Some(chunk) = data.next().await {
+            yield chunk;
+        }
+    });
+    Response::from_parts(parts, body)
+}
+
+async fn media_server_radio_audio_head(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    req_headers: HeaderMap,
+) -> Response {
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    match repo.get(id) {
+        Ok(Some(_)) => tune_stream_http::live_radio_head_response("audio/wav", &req_headers),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+async fn media_server_radio_audio(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    req_headers: HeaderMap,
+) -> Response {
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let radio = match repo.get(id) {
+        Ok(Some(radio)) => radio,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+
+    // Le Browse et le HEAD sont sans effet. Seul un renderer qui demande
+    // réellement le corps compte comme une tentative d'écoute.
+    if let Err(error) = repo.record_play(id) {
+        tracing::warn!(radio_id = id, error = %error, "media_server_radio_play_not_recorded");
+    }
+    let stream_id = state
+        .orchestrator
+        .create_media_server_radio_session(radio.url.clone())
+        .await;
+    tracing::info!(
+        radio_id = id,
+        radio = %radio.name,
+        stream_id = %stream_id,
+        "media_server_radio_stream_started"
+    );
+
+    let response = tune_stream_http::handle_stream(
+        Path(format!("{stream_id}.wav")),
+        State(state.streamer.sessions_state()),
+        req_headers,
+    )
+    .await;
+    with_media_server_radio_cleanup(response, state.streamer, stream_id)
 }
 
 async fn list_radios(State(state): State<AppState>) -> Json<Value> {
@@ -1629,5 +1738,53 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tune_core::http::streamer::StreamInfo;
+
+    #[tokio::test]
+    async fn abandonner_le_corps_retire_la_session_radio_ephemere() {
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let (stream_id, _tx, _data_ready, _session) = streamer
+            .create_radio_session(
+                StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    ..Default::default()
+                },
+                4,
+            )
+            .await;
+        assert!(
+            streamer
+                .sessions_state()
+                .lock()
+                .await
+                .contains_key(&stream_id)
+        );
+
+        let response = with_media_server_radio_cleanup(
+            Response::new(Body::empty()),
+            streamer.clone(),
+            stream_id.clone(),
+        );
+        drop(response);
+
+        for _ in 0..10 {
+            if !streamer
+                .sessions_state()
+                .lock()
+                .await
+                .contains_key(&stream_id)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("la session {stream_id} survit au corps HTTP abandonné");
     }
 }
