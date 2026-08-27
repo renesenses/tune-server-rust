@@ -127,6 +127,7 @@ jobs:
           bash scripts/verifier-fermeture.sh --autotest
           bash scripts/verifier-refs-issues.sh --autotest
           python3 scripts/preflight-check.py --self-test
+          python3 scripts/measure-compile.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
         run: |
