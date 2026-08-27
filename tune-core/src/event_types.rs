@@ -18,6 +18,12 @@ pub enum EventType {
     ScanStarted,
     ScanProgress,
     ScanComplete,
+    /// Une passe d'enrichissement MusicBrainz vient de se terminer. Le client
+    /// l'ecoute depuis la v0.8 — `MetadataView.svelte` et `SettingsView.svelte`
+    /// y raccrochent leur rafraichissement — mais aucun emetteur ne l'a jamais
+    /// produite cote serveur : l'ecran restait fige jusqu'au rechargement de la
+    /// page (#2259, fil forum 788).
+    EnrichComplete,
     LibraryTrackAdded,
     LibraryTrackRemoved,
     LibraryTrackUpdated,
@@ -61,6 +67,7 @@ impl EventType {
             EventType::ScanStarted => "library.scan.started",
             EventType::ScanProgress => "library.scan.progress",
             EventType::ScanComplete => "library.scan.completed",
+            EventType::EnrichComplete => "library.enrich.completed",
             EventType::LibraryTrackAdded => "library.track.added",
             EventType::LibraryTrackRemoved => "library.track.removed",
             EventType::LibraryTrackUpdated => "library.track.updated",
@@ -285,6 +292,14 @@ mod tests {
         // These strings are consumed by existing clients — they must not drift.
         assert_eq!(EventType::ZoneDeleted.as_str(), "zone.deleted");
         assert_eq!(EventType::ScanComplete.as_str(), "library.scan.completed");
+        // Contrat ENTRE DEUX DEPOTS, dans l'autre sens : c'est le CLIENT qui
+        // ecoutait cette chaine depuis la v0.8 (`MetadataView.svelte`,
+        // `SettingsView.svelte`) et le serveur qui ne la produisait nulle part.
+        // La renommer ici, c'est re-eteindre le rafraichissement (#2259).
+        assert_eq!(
+            EventType::EnrichComplete.as_str(),
+            "library.enrich.completed"
+        );
         // Contrat ENTRE DEUX DEPOTS : `LibraryView.svelte` ecoute cette chaine
         // exacte. La renommer ici sans toucher au client rendrait le
         // surveillant muet a nouveau, et en silence (#1517).

@@ -45,6 +45,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 
     let backend2 = backend.clone();
     let task_id_clone = task_id.clone();
+    let event_bus = state.event_bus.clone();
     let task_guard = state.background_tasks.begin(
         "enrich_all",
         "Enrichissement des métadonnées…",
@@ -252,63 +253,19 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                     _ => details.composer.clone(),
                 };
 
-            // Update tracks DB with COALESCE so we never overwrite existing data
-            let genre_val: Option<String> = details.genre.clone();
-            let year_val: Option<i32> = details.year;
-            let label_val: Option<String> = details.label.clone();
-            let mb_id_val: Option<String> = Some(mb_id.clone());
-            let isrc_val: Option<String> = details.isrc.clone();
-
-            let result = backend2.execute(
-                "UPDATE tracks SET \
-                 genre = COALESCE(genre, ?), \
-                 year = COALESCE(year, ?), \
-                 label = COALESCE(label, ?), \
-                 composer = COALESCE(composer, ?), \
-                 isrc = COALESCE(isrc, ?), \
-                 musicbrainz_recording_id = COALESCE(musicbrainz_recording_id, ?) \
-                 WHERE id = ?",
-                &[
-                    &genre_val as &dyn ToSqlValue,
-                    &year_val as &dyn ToSqlValue,
-                    &label_val as &dyn ToSqlValue,
-                    &composer_val as &dyn ToSqlValue,
-                    &isrc_val as &dyn ToSqlValue,
-                    &mb_id_val as &dyn ToSqlValue,
-                    &track_id as &dyn ToSqlValue,
-                ],
+            // Toute l'ecriture en base tient dans `write_track_enrichment`
+            // (tune-core) : piste, album, et la remontee vers `albums.genre` /
+            // `albums.year` que les cartes de l'ecran Metadonnees comptent.
+            // Elle est sortie d'ici pour etre testable — la boucle qui l'entoure
+            // fait des allers-retours reseau, la partie base non (#2259).
+            let result = tune_core::metadata::enrichment::write_track_enrichment(
+                &backend2,
+                track_id,
+                row.get(10).and_then(|v| v.as_i64()),
+                &mb_id,
+                composer_val,
+                &details,
             );
-
-            // Also update album with release-level metadata
-            if let Some(album_id) = row.get(10).and_then(|v| v.as_i64()) {
-                let release_id = details.release_id.clone();
-                let release_group_id = details.release_group_id.clone();
-                let catalog_number = details.catalog_number.clone();
-                let barcode = details.barcode.clone();
-                let album_label = details.label.clone();
-                let original_year = details.original_year;
-                backend2
-                    .execute(
-                        "UPDATE albums SET \
-                     musicbrainz_release_id = COALESCE(musicbrainz_release_id, ?), \
-                     musicbrainz_release_group_id = COALESCE(musicbrainz_release_group_id, ?), \
-                     catalog_number = COALESCE(catalog_number, ?), \
-                     barcode = COALESCE(barcode, ?), \
-                     label = COALESCE(label, ?), \
-                     original_year = COALESCE(original_year, ?) \
-                     WHERE id = ?",
-                        &[
-                            &release_id as &dyn ToSqlValue,
-                            &release_group_id as &dyn ToSqlValue,
-                            &catalog_number as &dyn ToSqlValue,
-                            &barcode as &dyn ToSqlValue,
-                            &album_label as &dyn ToSqlValue,
-                            &original_year as &dyn ToSqlValue,
-                            &album_id as &dyn ToSqlValue,
-                        ],
-                    )
-                    .ok();
-            }
 
             // Backfill the artist's MusicBrainz ID (unlocks Wikipedia/Wikidata
             // bios). COALESCE so an existing value is never overwritten.
@@ -380,6 +337,23 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 .to_string(),
             )
             .ok();
+
+        // Prevenir le client. `MetadataView.svelte` et `SettingsView.svelte`
+        // ecoutent `library.enrich.completed` depuis la v0.8 pour relire les
+        // compteurs de completude — mais AUCUN emetteur ne l'a jamais produite
+        // cote serveur (`git grep enrich.completed` : zero occurrence jusqu'ici).
+        // La passe dure des minutes en tache de fond : sans cet evenement,
+        // l'ecran restait sur les chiffres d'avant jusqu'a un rechargement de la
+        // page (#2259, fil forum 788).
+        event_bus.emit_typed(
+            tune_core::event_types::EventType::EnrichComplete,
+            json!({
+                "task_id": task_id_clone,
+                "enriched": enriched,
+                "errors": errors,
+                "total": total,
+            }),
+        );
         info!(task_id = %task_id_clone, enriched, errors, total, "enrich_all_library done");
     });
 
