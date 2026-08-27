@@ -2,10 +2,10 @@ name: Preflight
 
 # Phase 1 of release autonomy (docs/RELEASE-AUTONOMY-v0.9.50.md).
 #
-# Runs the pre-release checks before any build kicks off. Triggered
-# on push of tag candidates (v*) and via workflow_dispatch for dry
-# runs. Failure of this workflow blocks the release pipeline by
-# producing a failed status check on the commit.
+# Runs the pre-release checks before any build kicks off. Release appelle ce
+# workflow comme sa premiere dependance ; workflow_dispatch reste disponible
+# pour les essais a blanc. Un echec rend donc les jobs de construction
+# ineligibles, au lieu de seulement poser un check rouge independant.
 #
 # Checks performed (each independently pass/fail):
 # - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
@@ -22,8 +22,18 @@ name: Preflight
 #   workflow_dispatch on a branch that hasn't had CI yet)
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version to check"
+        required: false
+        default: ""
+        type: string
+      skip_ci_check:
+        description: "Skip the CI status check"
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -45,6 +55,7 @@ jobs:
   preflight:
     name: Pre-release checks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

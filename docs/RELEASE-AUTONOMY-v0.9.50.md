@@ -47,7 +47,8 @@
 
 Objectif : avant tout build, valider l'état du repo et bloquer si quelque chose cloche.
 
-- **Workflow `preflight.yml`** déclenché sur push de tag candidat OU PR vers main avec label `release-candidate`
+- **Workflow réutilisable `preflight.yml`** appelé comme première dépendance de
+  `release.yml`, et déclenchable manuellement pour les essais à blanc
 - Checks :
   - CI verte sur le commit
   - `cargo audit` sans CVE haute
@@ -140,14 +141,15 @@ Objectif : si quelque chose pète après la moitié des étapes, on peut annuler
 ```
 git tag v0.9.50
    │
-   ├─► preflight.yml (status check bloquant)
-   │      ├─ CI verte ?
-   │      ├─ aucune P0 ouverte ?
-   │      ├─ cahier de recette présent ?
-   │      └─ cargo audit / deny ?
-   │
-   └─► release.yml (auto-déclenché si preflight OK)
-          ├─ web-client (npm build)
+   └─► release.yml
+          ├─► preflight.yml (dépendance bloquante)
+          │      ├─ CI verte ?
+          │      ├─ aucune P0 ouverte ?
+          │      ├─ cahier de recette présent ?
+          │      └─ cargo audit / deny ?
+          │
+          ├─ web-client (needs: preflight)
+          │     └─ npm build
           ├─ build (DMG, NSIS, Docker, tarballs)
           ├─ release (gh release create)
           ├─ post-release (parallèle) :
