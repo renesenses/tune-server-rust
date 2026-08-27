@@ -9252,12 +9252,7 @@ fn decode_radio_stream_to_pcm(
         // that matches the PCM we actually feed (FIP is 48000 → advertised as
         // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
         // BEFORE first_chunk so the header, emitted after data_ready, is right.
-        session
-            .detected_sample_rate
-            .store(output_sample_rate, std::sync::atomic::Ordering::Relaxed);
-        session
-            .detected_channels
-            .store(source_channels, std::sync::atomic::Ordering::Relaxed);
+        session.publish_detected_output_format(output_sample_rate, source_channels);
 
         // Measure the reconnect gap: how long the session went without fresh
         // PCM. A long gap can starve the renderer's HTTP read.

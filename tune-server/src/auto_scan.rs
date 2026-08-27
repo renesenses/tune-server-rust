@@ -279,6 +279,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
+        let mut skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_reasons = list_result.skipped_reasons;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -385,6 +387,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut skipped_unchanged = pre_skipped as u64;
         let mut skipped_duplicate = 0u64;
         let mut skipped_no_metadata = 0u64;
+        let mut skipped_unsupported = 0u64;
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -420,6 +423,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    if let Some(unsupported) = &sf.unsupported {
+                        tracing::info!(
+                            path = %sf.path,
+                            format = %unsupported.report_key,
+                            reason = unsupported.reason,
+                            "scan_track_skipped_unsupported"
+                        );
+                        skipped += 1;
+                        skipped_unsupported += 1;
+                        continue;
+                    }
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         // Counted in the aggregate too, so `processed` can
@@ -555,6 +569,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 }
             },
         );
+
+        for (format, count) in &stats.unsupported_by_ext {
+            *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
+        }
+        skipped_reasons.extend(stats.unsupported_reasons.clone());
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted();
@@ -753,6 +772,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             skipped_unchanged,
             skipped_duplicate,
             skipped_no_metadata,
+            skipped_unsupported,
             db_insert_failed,
             db_update_failed,
             artwork = artwork_extracted,
@@ -791,10 +811,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "skipped_unchanged": skipped_unchanged,
             "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
+            "skipped_unsupported": skipped_unsupported,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
+            "skipped_unsupported_by_ext": skipped_by_ext,
+            "skipped_unsupported_reasons": skipped_reasons,
         });
 
         let report_path = std::env::var("TUNE_DB_PATH")

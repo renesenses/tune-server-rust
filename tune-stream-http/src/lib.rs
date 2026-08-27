@@ -430,18 +430,14 @@ pub async fn handle_stream(
                 // advertises the TRUE sample rate/channels (FIP is 48000, not
                 // the placeholder 44100). Fall back to the StreamInfo values if
                 // the decoder hasn't populated them within a short window.
-                use std::sync::atomic::Ordering::Relaxed;
-                if session.detected_sample_rate.load(Relaxed) == 0 {
+                if session.detected_output_format().is_none() {
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
                         data_ready.notified(),
                     )
                     .await;
                 }
-                let det_sr = session.detected_sample_rate.load(Relaxed);
-                let det_ch = session.detected_channels.load(Relaxed);
-                let real_sr = if det_sr != 0 { det_sr } else { sr };
-                let real_ch = if det_ch != 0 { det_ch } else { ch };
+                let (real_sr, real_ch) = session.detected_output_format().unwrap_or((sr, ch));
                 if bounded_live {
                     build_wav_header_bounded_live(real_ch, real_sr, bd)
                 } else {
