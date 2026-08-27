@@ -11,6 +11,147 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Version du contrat de capacités compris par ce binaire.
+pub const OUTPUT_CAPABILITIES_VERSION: u16 = 1;
+
+/// Commande optionnelle qu'une sortie peut accepter ou refuser.
+///
+/// Le nom fait partie du contrat HTTP : il est sérialisé en `snake_case` et
+/// permet à un client de distinguer une commande impossible d'une panne du
+/// renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputCommand {
+    Pause,
+    Resume,
+    Seek,
+    SetVolume,
+    SetMute,
+}
+
+impl std::fmt::Display for OutputCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Seek => "seek",
+            Self::SetVolume => "set_volume",
+            Self::SetMute => "set_mute",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// Erreur structurée du chemin de commande d'une sortie.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputCommandError {
+    Unsupported {
+        command: OutputCommand,
+    },
+    Failed {
+        command: OutputCommand,
+        message: String,
+    },
+}
+
+impl OutputCommandError {
+    pub fn unsupported(command: OutputCommand) -> Self {
+        Self::Unsupported { command }
+    }
+
+    pub fn failed(command: OutputCommand, message: impl Into<String>) -> Self {
+        Self::Failed {
+            command,
+            message: message.into(),
+        }
+    }
+
+    pub fn command(&self) -> OutputCommand {
+        match self {
+            Self::Unsupported { command } | Self::Failed { command, .. } => *command,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported { command } => {
+                write!(formatter, "output command {command} is unsupported")
+            }
+            Self::Failed { command, message } => {
+                write!(formatter, "output command {command} failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutputCommandError {}
+
+pub type OutputCommandResult<T> = Result<T, OutputCommandError>;
+
+/// Capacités déclarées par une sortie.
+///
+/// `version == 0` signifie « plugin ancien, contrat inconnu ». Le serveur le
+/// traite de façon conservatrice : aucune commande optionnelle n'est supposée
+/// réussir. Les listes de formats et de dispositions sont vides quand la
+/// sortie ne sait pas encore publier cette partie du contrat ; elles ne
+/// signifient donc pas que la sortie ne sait lire aucun son.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputCapabilities {
+    pub version: u16,
+    pub can_pause: bool,
+    pub can_resume: bool,
+    pub can_seek: bool,
+    pub can_set_volume: bool,
+    pub can_mute: bool,
+    pub can_gapless: bool,
+    #[serde(default)]
+    pub formats: Vec<String>,
+    #[serde(default)]
+    pub channel_layouts: Vec<String>,
+}
+
+impl OutputCapabilities {
+    pub fn v1(
+        can_pause: bool,
+        can_resume: bool,
+        can_seek: bool,
+        can_set_volume: bool,
+        can_mute: bool,
+        can_gapless: bool,
+    ) -> Self {
+        Self {
+            version: OUTPUT_CAPABILITIES_VERSION,
+            can_pause,
+            can_resume,
+            can_seek,
+            can_set_volume,
+            can_mute,
+            can_gapless,
+            formats: Vec::new(),
+            channel_layouts: Vec::new(),
+        }
+    }
+
+    pub fn supports(&self, command: OutputCommand) -> bool {
+        match command {
+            OutputCommand::Pause => self.can_pause,
+            OutputCommand::Resume => self.can_resume,
+            OutputCommand::Seek => self.can_seek,
+            OutputCommand::SetVolume => self.can_set_volume,
+            OutputCommand::SetMute => self.can_mute,
+        }
+    }
+
+    pub fn require(&self, command: OutputCommand) -> OutputCommandResult<()> {
+        self.supports(command)
+            .then_some(())
+            .ok_or_else(|| OutputCommandError::unsupported(command))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportState {
@@ -239,6 +380,14 @@ pub trait OutputTarget: Send + Sync {
     fn device_id(&self) -> &str;
     fn output_type(&self) -> &str;
 
+    /// Contrat explicite des commandes optionnelles de cette sortie.
+    ///
+    /// Le défaut `version == 0`, volontairement conservateur, garde les
+    /// plugins externes source-compatibles sans leur inventer des capacités.
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::default()
+    }
+
     /// Whether this output can seamlessly chain a track staged via
     /// `set_next_media()` from inside its own playback loop (true), or whether
     /// it relies on the poller's natural-end fallback to advance the queue
@@ -251,7 +400,7 @@ pub trait OutputTarget: Send + Sync {
     /// exclusive mode (ASIO / WASAPI exclusive) take a dedicated playback path
     /// that never consumes `next_media`, so they return false.
     fn supports_internal_gapless(&self) -> bool {
-        true
+        self.capabilities().can_gapless
     }
 
     /// Whether the poller should stage the gapless next track as a LOCAL FILE
@@ -301,6 +450,50 @@ pub trait OutputTarget: Send + Sync {
     async fn set_mute(&self, muted: bool) -> Result<(), String>;
     async fn get_status(&self) -> Result<OutputStatus, String>;
     async fn is_available(&self) -> bool;
+
+    /// Entrées contrôlées utilisées par l'hôte. La capacité est vérifiée avant
+    /// tout appel au backend : une implémentation historique qui répondait
+    /// `Ok(())` sans rien faire ne peut donc plus transformer un refus en
+    /// succès.
+    async fn checked_pause(&self) -> OutputCommandResult<()> {
+        let command = OutputCommand::Pause;
+        self.capabilities().require(command)?;
+        self.pause()
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_resume(&self) -> OutputCommandResult<()> {
+        let command = OutputCommand::Resume;
+        self.capabilities().require(command)?;
+        self.resume()
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_seek(&self, position_ms: u64) -> OutputCommandResult<()> {
+        let command = OutputCommand::Seek;
+        self.capabilities().require(command)?;
+        self.seek(position_ms)
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_set_volume(&self, volume: f64) -> OutputCommandResult<()> {
+        let command = OutputCommand::SetVolume;
+        self.capabilities().require(command)?;
+        self.set_volume(volume)
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_set_mute(&self, muted: bool) -> OutputCommandResult<()> {
+        let command = OutputCommand::SetMute;
+        self.capabilities().require(command)?;
+        self.set_mute(muted)
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
 
     /// A fatal error the output hit on its own, outside any call we made.
     ///
@@ -404,5 +597,44 @@ impl ProviderContext {
     /// Whether the account owns the paid module `id` (e.g. "diretta").
     pub fn module_licensed(&self, id: &str) -> bool {
         self.licensed_modules.iter().any(|m| m == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_plugin_capabilities_fail_closed() {
+        let capabilities = OutputCapabilities::default();
+        assert_eq!(capabilities.version, 0);
+        for command in [
+            OutputCommand::Pause,
+            OutputCommand::Resume,
+            OutputCommand::Seek,
+            OutputCommand::SetVolume,
+            OutputCommand::SetMute,
+        ] {
+            assert_eq!(
+                capabilities.require(command),
+                Err(OutputCommandError::Unsupported { command })
+            );
+        }
+    }
+
+    #[test]
+    fn v1_contract_is_stable_and_machine_readable() {
+        let capabilities = OutputCapabilities::v1(true, true, false, true, false, false);
+        let json = serde_json::to_value(&capabilities).unwrap();
+
+        assert_eq!(json["version"], OUTPUT_CAPABILITIES_VERSION);
+        assert_eq!(json["can_pause"], true);
+        assert_eq!(json["can_seek"], false);
+        assert_eq!(
+            capabilities.require(OutputCommand::Seek),
+            Err(OutputCommandError::Unsupported {
+                command: OutputCommand::Seek,
+            })
+        );
     }
 }

@@ -10,9 +10,11 @@ use rubato::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use super::traits::{
+    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+};
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
-use super::traits::{OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState};
 use crate::poller::TRACK_END_NOTIFY;
 
 /// Why a device refused to open, as far as the backend string lets us tell.
@@ -2853,6 +2855,17 @@ impl OutputTarget for LocalOutput {
 
     fn output_type(&self) -> &str {
         "local"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(
+            true,
+            true,
+            true,
+            true,
+            true,
+            self.supports_internal_gapless(),
+        )
     }
 
     /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop

@@ -676,6 +676,19 @@ pub(crate) async fn levels_available(state: &AppState, zone: &Zone) -> bool {
         .await
 }
 
+/// Contrat de commandes de la sortie réellement enregistrée pour une zone.
+///
+/// `None` couvre les zones navigateur et les sorties disparues. Le client ne
+/// doit pas transformer cette absence en une liste de capacités inventée.
+pub(crate) async fn output_capabilities(
+    state: &AppState,
+    output_device_id: Option<&str>,
+) -> Option<tune_core::outputs::OutputCapabilities> {
+    let device_id = output_device_id?;
+    let output = { state.outputs.lock().await.get(device_id) }?;
+    Some(output.lock().await.capabilities())
+}
+
 pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
     // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
     // On ne le demande au streamer que pour une zone navigateur en lecture,
@@ -1610,6 +1623,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "levels_available".into(),
                 json!(levels_available(&state, z).await),
             );
+            obj.insert(
+                "output_capabilities".into(),
+                json!(output_capabilities(&state, z.output_device_id.as_deref()).await),
+            );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -1759,6 +1776,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "levels_available".into(),
                     json!(levels_available(&state, &zone).await),
+                );
+                obj.insert(
+                    "output_capabilities".into(),
+                    json!(output_capabilities(&state, zone.output_device_id.as_deref()).await),
                 );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
@@ -1940,6 +1961,31 @@ async fn patch_zone(
             .into_response();
     }
 
+    // Volume et mute sont des commandes, pas de simples préférences. Le
+    // renderer doit les accepter avant qu'un PATCH puisse annoncer leur
+    // réussite ou laisser une valeur mensongère en base. Si le PATCH change
+    // aussi de sortie, la commande vise explicitement la nouvelle sortie.
+    let command_device_id = body
+        .output_device_id
+        .as_deref()
+        .or(zone_before.output_device_id.as_deref());
+    if let Some(volume) = body.volume
+        && let Err(error) = state
+            .orchestrator
+            .set_volume(id, f64::from(volume) / 100.0, command_device_id)
+            .await
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+    if let Some(muted) = body.muted
+        && let Err(error) = state
+            .orchestrator
+            .set_mute(id, muted, command_device_id)
+            .await
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+
     /// Écrit un champ, ou s'arrête en journalisant la cause.
     ///
     /// Une macro et non une closure : chaque échec doit **sortir** du handler,
@@ -1957,12 +2003,7 @@ async fn patch_zone(
     if let Some(ref name) = body.name {
         ecrire!("name", name, repo.update_name(id, name));
     }
-    if let Some(vol) = body.volume {
-        ecrire!("volume", vol, repo.update_volume(id, vol));
-    }
-    if let Some(muted) = body.muted {
-        ecrire!("muted", muted, repo.update_muted(id, muted));
-    }
+    // volume/muted ont été confirmés et persistés par l'orchestrateur ci-dessus.
     if let Some(ref device_id) = body.output_device_id {
         ecrire!(
             "output_device_id",
@@ -2127,10 +2168,13 @@ async fn patch_zone(
         if let Ok(Some(z)) = repo.get(id) {
             if !z.fixed_volume {
                 if let Some(ref did) = z.output_device_id {
-                    state
+                    if let Err(error) = state
                         .orchestrator
                         .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
-                        .await;
+                        .await
+                    {
+                        warn!(zone_id = id, error = %error, "gain_trim_volume_refresh_failed");
+                    }
                 }
             }
         }
@@ -2629,7 +2673,7 @@ async fn renderer_capabilities(
         };
         if let Some(dev) = disc {
             register_dlna_output_from_device(&dev, &state).await;
-            output = { state.outputs.lock().await.get(device_id) };
+            output = state.outputs.lock().await.get(device_id);
         }
     }
 
@@ -2872,22 +2916,16 @@ async fn update_volume(
     } else {
         body.volume
     };
-    let volume_int = (volume_f * 100.0).round() as i32;
-
-    // Persist to DB
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Err(e) = repo.update_volume(id, volume_int) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_volume(id, volume_f, device_id.as_deref())
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 async fn update_muted(
@@ -2895,20 +2933,16 @@ async fn update_muted(
     Path(id): Path<i64>,
     Json(body): Json<UpdateMuted>,
 ) -> impl IntoResponse {
-    // Persist to DB
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Err(e) = repo.update_muted(id, body.muted) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_mute(id, body.muted, device_id.as_deref())
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 async fn rename_zone(
@@ -3202,7 +3236,6 @@ async fn group_volume(
                 .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
 
-            let repo = ZoneRepo::with_backend(state.backend.clone());
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -3211,9 +3244,20 @@ async fn group_volume(
                     .copied()
                     .unwrap_or(0.0);
                 let effective = (master + offset).clamp(0.0, 1.0);
-                let vol_int = (effective * 100.0) as i32;
-                repo.update_volume(*zid, vol_int).ok();
-                state.orchestrator.set_volume(*zid, effective, None).await;
+                let device_id = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten()
+                    .and_then(|zone| zone.output_device_id);
+                if let Err(error) = state
+                    .orchestrator
+                    .set_volume(*zid, effective, device_id.as_deref())
+                    .await
+                {
+                    return Ok(crate::routes::playback::output_command_error_response(
+                        error,
+                    ));
+                }
             }
             Ok(Json(json!({"group_id": group_id, "master_volume": master})).into_response())
         }

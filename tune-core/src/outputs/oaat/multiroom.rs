@@ -7,7 +7,9 @@ use tracing::info;
 #[cfg(feature = "oaat")]
 use tracing::{error, warn};
 
-use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use crate::outputs::traits::{
+    OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
+};
 
 #[cfg(feature = "oaat")]
 use super::helpers::{BaseDeTempsOaat, detect_and_parse, duree_audio_envoyee, format_rate_display};
@@ -28,6 +30,7 @@ pub struct OaatMultiroomOutput {
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
+    muted: Arc<AtomicBool>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     current_uri: Arc<Mutex<Option<String>>>,
@@ -68,6 +71,7 @@ impl OaatMultiroomOutput {
             // Meme echelle 0–100 que le protocole : 200 rapportait un
             // volume de 200 %, hors bornes (releve en relisant la PR #1379).
             volume: Arc::new(AtomicU32::new(100)),
+            muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             current_uri: Arc::new(Mutex::new(None)),
@@ -207,6 +211,10 @@ impl OutputTarget for OaatMultiroomOutput {
 
     fn output_type(&self) -> &str {
         "oaat-multiroom"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, false, true, true, false)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -554,17 +562,20 @@ impl OutputTarget for OaatMultiroomOutput {
     }
 
     async fn seek(&self, _position_ms: u64) -> Result<(), String> {
-        Ok(())
+        Err("seek not supported on OAAT multiroom".into())
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         let level = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
-        self.volume.store(level as u32, Ordering::SeqCst);
         #[cfg(feature = "oaat")]
         {
             let mut zone = self.zone.lock().await;
-            zone.set_volume_all(level).await.ok();
+            zone.set_volume_all(level)
+                .await
+                .map_err(|e| format!("OAAT multiroom set volume failed: {e}"))?;
         }
+        self.volume.store(level as u32, Ordering::SeqCst);
+        self.muted.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -572,11 +583,11 @@ impl OutputTarget for OaatMultiroomOutput {
         #[cfg(feature = "oaat")]
         {
             let mut zone = self.zone.lock().await;
-            zone.set_mute_all(muted).await.ok();
+            zone.set_mute_all(muted)
+                .await
+                .map_err(|e| format!("OAAT multiroom set mute failed: {e}"))?;
         }
-        if muted {
-            self.volume.store(0, Ordering::SeqCst);
-        }
+        self.muted.store(muted, Ordering::SeqCst);
         Ok(())
     }
 
@@ -596,7 +607,7 @@ impl OutputTarget for OaatMultiroomOutput {
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
             volume: self.volume.load(Ordering::Relaxed) as f64 / 100.0,
-            muted: self.volume.load(Ordering::Relaxed) == 0,
+            muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().await.clone(),
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
