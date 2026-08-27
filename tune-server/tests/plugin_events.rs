@@ -24,7 +24,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use tune_core::plugins_runtime::HOST_ABI_VERSION;
+use tune_plugin_runtime_wasm::HOST_ABI_VERSION;
 use tune_server::state::AppState;
 
 /// A hand-written WAT plugin that EXPORTS `plugin_on_event` (RFC §3.3): it
@@ -134,6 +134,7 @@ async fn last_event(state: &AppState) -> Value {
 /// to make progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_plugin_receives_subscribed_events_only() {
+    let _environment = crate::lock_environment();
     // Plugins dir with one event-subscribing wasm plugin. `main.wasm` holds WAT
     // text; wasmtime's `wat` feature parses it via content sniffing, so no
     // wasm32 toolchain is needed.
