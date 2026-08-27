@@ -1382,18 +1382,50 @@ impl NativePcmRing {
     }
 
     pub(crate) fn pop(&self, out: &mut [i32]) -> usize {
+        self.pop_mapped(out, |sample| sample)
+    }
+
+    /// Drain directly into a backend-owned callback buffer while converting
+    /// each native word in place.  Keeping the mapping inside the ring avoids
+    /// the temporary `Vec` that ASIO used to allocate on every audio period.
+    pub(crate) fn pop_mapped<T>(&self, out: &mut [T], mut map: impl FnMut(i32) -> T) -> usize {
         let w = self.write.load(Ordering::Acquire);
         let r = self.read.load(Ordering::Acquire);
         let n = out.len().min(w.wrapping_sub(r) as usize);
         let cap = self.capacity();
-        for (i, sample) in out[..n].iter_mut().enumerate() {
+        for (i, target) in out[..n].iter_mut().enumerate() {
             let idx = (r as usize + i) % cap;
             // SAFETY: unique consumer, and the producer published this cell
             // before advancing `write` with Release.
-            *sample = unsafe { *self.buf[idx].get() };
+            *target = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
         n
+    }
+
+    /// Drain native left-aligned words straight into a WASAPI byte buffer.
+    /// Returns the number of bytes written; any remaining device buffer is
+    /// silence-filled by the caller. No scratch allocation occurs here.
+    pub(crate) fn pop_pcm_bytes(&self, out: &mut [u8], bit_depth: u16) -> usize {
+        let bytes_per_sample = usize::from(bit_depth / 8);
+        if !matches!(bit_depth, 16 | 24 | 32) {
+            return 0;
+        }
+
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let available = w.wrapping_sub(r) as usize;
+        let count = available.min(out.len() / bytes_per_sample);
+        let cap = self.capacity();
+        for i in 0..count {
+            let idx = (r as usize + i) % cap;
+            // SAFETY: same SPSC publication contract as `pop_mapped`.
+            let native = unsafe { *self.buf[idx].get() }.to_le_bytes();
+            let offset = i * bytes_per_sample;
+            out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
+        }
+        self.read.store(r + count as u64, Ordering::Release);
+        count * bytes_per_sample
     }
 }
 
@@ -1529,6 +1561,13 @@ impl RingBuf {
 
     /// Read samples from the ring buffer into `out`. Returns number actually read.
     pub fn pop(&self, out: &mut [f32]) -> usize {
+        self.pop_mapped(out, |sample| sample)
+    }
+
+    /// Drain and transform directly into the device callback's native slice.
+    /// This is deliberately generic and allocation-free so integer ASIO
+    /// callbacks do not need a floating-point scratch `Vec` per period.
+    pub(crate) fn pop_mapped<T>(&self, out: &mut [T], mut map: impl FnMut(f32) -> T) -> usize {
         let w = self.write.load(Ordering::Acquire);
         let r = self.read.load(Ordering::Acquire);
         let avail = (w.wrapping_sub(r)) as usize;
@@ -1538,7 +1577,7 @@ impl RingBuf {
             let idx = (r as usize + i) % cap;
             // SAFETY: consommateur unique, case publiée par le Release de
             // `push` que le Acquire ci-dessus a observé.
-            out[i] = unsafe { *self.buf[idx].get() };
+            out[i] = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
         n
@@ -1547,8 +1586,70 @@ impl RingBuf {
 
 #[cfg(test)]
 mod ringbuf_tests {
-    use super::RingBuf;
+    use super::{NativePcmRing, RingBuf};
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AllocationTracker;
+
+    thread_local! {
+        static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    }
+    static TRACKED_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for AllocationTracker {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|tracking| {
+                if tracking.get() {
+                    TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|tracking| {
+                if tracking.get() {
+                    TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|tracking| {
+                if tracking.get() {
+                    TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: AllocationTracker = AllocationTracker;
+
+    fn assert_no_allocation<T>(operation: impl FnOnce() -> T) -> T {
+        // Initialise le TLS avant d'armer la mesure : son premier accès peut
+        // appartenir à l'infrastructure de test, pas au chemin temps réel.
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+        TRACKED_ALLOCATIONS.store(0, Ordering::SeqCst);
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
+        let result = operation();
+        TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+        assert_eq!(
+            TRACKED_ALLOCATIONS.load(Ordering::SeqCst),
+            0,
+            "la section simulant le callback audio a alloué"
+        );
+        result
+    }
 
     #[test]
     fn vide_plein_et_bouclage() {
@@ -1586,6 +1687,52 @@ mod ringbuf_tests {
         assert_eq!(rb.available(), 0);
         let mut out = [42.0f32; 3];
         assert_eq!(rb.pop(&mut out), 0, "rien ne doit survivre a un clear");
+    }
+
+    /// #2206 — les six familles de callbacks ASIO/WASAPI reposent sur ces
+    /// trois primitives. Le compteur est local au thread du test afin que les
+    /// allocations des autres tests parallèles ne puissent pas fabriquer un
+    /// faux échec.
+    #[test]
+    fn drains_temps_reel_ne_font_aucune_allocation() {
+        let float_ring = RingBuf::new(8);
+        assert_eq!(float_ring.push(&[0.25, -0.5, 0.75]), 3);
+        let mut i16_out = [0i16; 4];
+        let read = assert_no_allocation(|| {
+            float_ring.pop_mapped(&mut i16_out, |sample| {
+                (f64::from(sample) * 32_768.0)
+                    .round()
+                    .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+            })
+        });
+        assert_eq!(read, 3);
+        assert_eq!(i16_out[..3], [8192, -16384, 24576]);
+
+        let native_ring = NativePcmRing::new(8);
+        assert_eq!(native_ring.push(&[0x1234_0000, -0x1234_0000]), 2);
+        let mut native_i16 = [0i16; 4];
+        let read = assert_no_allocation(|| {
+            native_ring.pop_mapped(&mut native_i16, |sample| (sample >> 16) as i16)
+        });
+        assert_eq!(read, 2);
+        assert_eq!(native_i16[..2], [0x1234, -0x1234]);
+
+        assert_eq!(native_ring.push(&[0x1234_5600, -0x1234_5600]), 2);
+        let zero = cpal::I24::new(0).unwrap();
+        let mut native_i24 = [zero; 4];
+        let read = assert_no_allocation(|| {
+            native_ring.pop_mapped(&mut native_i24, |sample| {
+                cpal::I24::new(sample >> 8).unwrap()
+            })
+        });
+        assert_eq!(read, 2);
+        assert_eq!(native_i24[0].inner(), 0x123456);
+
+        assert_eq!(native_ring.push(&[0x1234_5600, -0x1234_5600]), 2);
+        let mut pcm = [0xAAu8; 12];
+        let written = assert_no_allocation(|| native_ring.pop_pcm_bytes(&mut pcm, 24));
+        assert_eq!(written, 6);
+        assert_eq!(&pcm[..3], &[0x56, 0x34, 0x12]);
     }
 
     /// Le vrai contrat : un producteur, un consommateur, aucune perte, aucun
@@ -7453,13 +7600,8 @@ mod tests {
             let ring = NativePcmRing::new(native.len());
             assert_eq!(ring.push(&native), native.len());
 
-            let mut callback_words = vec![0i32; native.len()];
-            assert_eq!(ring.pop(&mut callback_words), native.len());
             let mut observed = vec![0u8; source.len()];
-            assert_eq!(
-                native_i32_to_pcm_bytes(&callback_words, bit_depth, &mut observed),
-                source.len()
-            );
+            assert_eq!(ring.pop_pcm_bytes(&mut observed, bit_depth), source.len());
             assert_eq!(
                 observed, source,
                 "le dernier callback backend a modifié un mot {bit_depth} bits"
@@ -7473,11 +7615,9 @@ mod tests {
         let native_16 = pcm_bytes_to_native_i32(&source_16, 16);
         let ring_16 = NativePcmRing::new(native_16.len());
         assert_eq!(ring_16.push(&native_16), native_16.len());
-        let mut callback_words_16 = vec![0i32; native_16.len()];
-        assert_eq!(ring_16.pop(&mut callback_words_16), native_16.len());
         let mut asio_16 = vec![0i16; native_16.len()];
         assert_eq!(
-            native_i32_to_asio_i16(&callback_words_16, &mut asio_16),
+            ring_16.pop_mapped(&mut asio_16, |sample| (sample >> 16) as i16),
             native_16.len()
         );
         let observed_16: Vec<u8> = asio_16.iter().flat_map(|word| word.to_le_bytes()).collect();
@@ -7487,12 +7627,12 @@ mod tests {
         let native_24 = pcm_bytes_to_native_i32(&source_24, 24);
         let ring_24 = NativePcmRing::new(native_24.len());
         assert_eq!(ring_24.push(&native_24), native_24.len());
-        let mut callback_words_24 = vec![0i32; native_24.len()];
-        assert_eq!(ring_24.pop(&mut callback_words_24), native_24.len());
         let zero = cpal::I24::new(0).expect("zero tient sur 24 bits");
         let mut asio_24 = vec![zero; native_24.len()];
         assert_eq!(
-            native_i32_to_asio_i24(&callback_words_24, &mut asio_24),
+            ring_24.pop_mapped(&mut asio_24, |sample| {
+                cpal::I24::new(sample >> 8).expect("le mot natif tient sur 24 bits")
+            }),
             native_24.len()
         );
         let observed_24: Vec<u8> = asio_24
@@ -7510,12 +7650,10 @@ mod tests {
         assert_eq!(ring.push(&native), native.len());
         // Deliberately request a callback larger than the remaining stream:
         // this is the final backend callback, including its silence suffix.
-        let mut callback_words = vec![i32::MAX; native.len() + 16];
-        assert_eq!(ring.pop(&mut callback_words), native.len());
-        callback_words[native.len()..].fill(0);
-
-        let mut observed = vec![0u8; callback_words.len() * 3];
-        native_i32_to_pcm_bytes(&callback_words, 24, &mut observed);
+        let mut observed = vec![0xAAu8; (native.len() + 16) * 3];
+        let written = ring.pop_pcm_bytes(&mut observed, 24);
+        assert_eq!(written, source.len());
+        observed[written..].fill(0);
         assert_eq!(&observed[..source.len()], source);
         assert!(observed[source.len()..].iter().all(|octet| *octet == 0));
         for (frame, pair) in observed[..source.len()].chunks_exact(6).enumerate() {
