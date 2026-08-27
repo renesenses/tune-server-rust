@@ -6850,10 +6850,10 @@ impl PlaybackOrchestrator {
     /// `LocalOutput::current_format` mémorise désormais le couple réellement vu
     /// par `apply_local_dsp`, ce qui permet de rebâtir aux bons coefficients.
     ///
-    /// Renvoie `true` si un égaliseur a été poussé vers une sortie vivante.
-    /// `false` couvre tout le reste — zone sans sortie locale, rien en lecture,
-    /// mode PURE (où `load_eq_processor` rend `None`, donc la promesse
-    /// bit-perfect tient sans garde supplémentaire).
+    /// Renvoie `true` si une sortie locale vivante a reçu le nouveau contrat,
+    /// y compris quand ce contrat retire l'égaliseur (`None`) en mode PURE ou
+    /// avec un profil désactivé. `false` est réservé à l'absence de chemin
+    /// local vivant : zone distante, sortie absente ou format encore inconnu.
     pub async fn refresh_zone_eq(&self, zone_id: i64) -> bool {
         #[cfg(not(feature = "local-audio"))]
         {
@@ -6904,7 +6904,7 @@ impl PlaybackOrchestrator {
                 actif,
                 "zone_eq_refreshed_live"
             );
-            actif
+            true
         }
     }
 
@@ -10760,6 +10760,45 @@ mod tests {
                 &format!(r#"{{"enabled":{actif}}}"#),
             )
             .unwrap();
+    }
+
+    /// #2102 : retirer l'EQ d'une sortie locale vivante est une application à
+    /// chaud réussie, pas un échec qui autorise le redémarrage audible réservé
+    /// aux sorties réseau. L'état Playing est indispensable à la
+    /// contre-épreuve : c'est lui qui faisait armer `eq_replay_gen` auparavant.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn removing_local_eq_does_not_schedule_a_stream_replay() {
+        let orch = Arc::new(test_orchestrator());
+        let zone_id = zone_locale_avec_eq(&orch).await;
+
+        avec_sortie_locale(&orch, |local| {
+            local.declare_current_format_for_test(44_100, 2);
+            local.set_eq(orch.load_eq_processor(zone_id, 44_100, 2));
+            assert!(local.has_eq(), "le test doit commencer avec un EQ monté");
+        })
+        .await;
+        orch.playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+
+        regler_pure(&orch, zone_id, true);
+        assert!(
+            orch.apply_eq_change(zone_id).await,
+            "replace_eq_live(None) a bien servi la sortie locale immédiatement"
+        );
+
+        avec_sortie_locale(&orch, |local| {
+            assert!(
+                !local.has_eq(),
+                "la bascule PURE doit retirer l'EqProcessor du flux vivant"
+            );
+        })
+        .await;
+        assert!(
+            !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+            "une sortie locale déjà servie ne doit jamais armer une relecture de flux"
+        );
     }
 
     /// Le signalement de Jean Valjean (#1986), rejoué : Bass Boost audible,
