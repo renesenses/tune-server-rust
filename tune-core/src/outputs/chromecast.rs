@@ -722,9 +722,28 @@ mod deadline_tests {
             }
         })
         .await
-        .expect("les workers doivent rendre leur permis apres la deadline");
+        .expect("le faux pair doit voir toutes ses sockets se fermer");
         assert!(maximum.load(Ordering::SeqCst) <= 2);
-        assert_eq!(slots.available_permits(), 2);
+
+        // `active` compte les sockets vues par le FAUX PAIR : il retombe a zero
+        // des que le client ferme. Le permis, lui, appartient a la tache
+        // BLOQUANTE (`let _permit`) et n'est rendu qu'a la fin de celle-ci —
+        // volontairement, pour qu'un appelant expire ne libere pas de capacite
+        // pendant que son worker vit encore. Les deux evenements sont donc
+        // distincts, et sous charge le second traine : conclure sur le premier
+        // faisait echouer ce test sur une COURSE, jamais sur une fuite (gate du
+        // 27/08, 1 rouge sur 2612 en pleine charge, vert isole 4 fois sur 4).
+        //
+        // On attend donc le permis LUI-MEME, borne. Le test garde toute sa
+        // force : une vraie fuite ne rend jamais le permis, l'attente expire,
+        // et l'echec revient.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("les workers doivent rendre leur permis apres la deadline");
         server.abort();
     }
 
