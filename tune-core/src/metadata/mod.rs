@@ -1400,13 +1400,7 @@ pub(crate) fn album_artiste_du_chemin(
 /// Check if a file has a known audio extension (used to decide whether to
 /// attempt a filesystem-based metadata fallback when lofty fails).
 fn is_known_audio_ext(path: &Path) -> bool {
-    const AUDIO_EXTS: &[&str] = &[
-        "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff",
-        "dst", "alac", "ape",
-    ];
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| AUDIO_EXTS.contains(&ext.to_lowercase().as_str()))
+    crate::audio::support::native_decoder_supports(path)
 }
 
 /// Extract basic metadata from the directory structure when lofty successfully

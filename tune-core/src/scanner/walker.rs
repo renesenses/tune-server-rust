@@ -11,6 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::hasher::compute_audio_hash;
+use crate::audio::support::{LibraryAudioSupport, UnsupportedLibraryAudio};
 use crate::metadata::{TrackMetadata, tagless_fallback_no_props, try_read_metadata};
 
 /// Maximum time allowed for reading metadata + computing hash for a single file.
@@ -174,13 +175,10 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Audio extensions recognised by the scanner. Shared with the file watcher
-/// (which excludes "iso": ISO SACD needs the extraction step that only the
-/// full directory walk performs).
-pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
-    "alac", "ape", "iso",
-];
+/// Audio extensions recognised by the scanner. Shared with the decoder
+/// contract and the file watcher (which excludes `iso`: ISO SACD needs the
+/// extraction step that only the full directory walk performs).
+pub use crate::audio::support::LIBRARY_AUDIO_EXTENSIONS as SUPPORTED_EXTENSIONS;
 
 /// Audio (or audio-describing) extensions Tune does NOT read, listed so the scan
 /// report can say WHY files were left out instead of letting them vanish.
@@ -192,15 +190,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// `cue` earns its place even though it is not audio: a `.cue` next to a single
 /// large file is precisely how an album gets stored as one track, so its
 /// presence explains a missing album better than anything else.
-pub const KNOWN_UNREAD_AUDIO: &[&str] = &[
-    "mpc", "mp+", "mpp", // Musepack (Rhorn, #1763)
-    "cue", // feuille de découpe, jamais interprétée
-    "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
-    "m4b", "m4p", // livres audio, achats protégés
-    "dts", "ac3", "eac3", "mka", // conteneurs plutôt vidéo/multicanal
-    "aac", // AAC brut, hors conteneur m4a
-    "ra", "rm", "amr", "spx",
-];
+pub use crate::audio::support::KNOWN_UNREAD_AUDIO_EXTENSIONS as KNOWN_UNREAD_AUDIO;
 
 const SKIP_DIRS: &[&str] = &[
     "duplicates",
@@ -254,6 +244,10 @@ pub fn normalize_path(path: &str) -> String {
 pub struct ScannedFile {
     pub path: String,
     pub metadata: Option<TrackMetadata>,
+    /// Format audio reconnu mais non décodable par le binaire livré.
+    /// Distinct d'un échec de métadonnées : le rapport doit expliquer le choix
+    /// fail-closed sans présenter le fichier comme corrompu.
+    pub unsupported: Option<UnsupportedLibraryAudio>,
     pub audio_hash: Option<String>,
     pub file_size: u64,
     pub mtime: u64,
@@ -267,11 +261,20 @@ pub struct ScanStats {
     pub metadata_timeout: usize,
     pub hash_ok: usize,
     pub failed_paths: Vec<String>,
+    pub unsupported_by_ext: std::collections::HashMap<String, usize>,
+    pub unsupported_reasons: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug)]
+enum ReadFileError {
+    Timeout,
+    Unsupported(UnsupportedLibraryAudio),
+    Other(String),
 }
 
 /// Read metadata (and optionally compute hash) for a single file, with a
-/// [`FILE_TIMEOUT`] guard.  If the underlying I/O does not complete in time
-/// the file is skipped and `Err("timeout")` is returned.
+/// [`FILE_TIMEOUT`] guard. If the underlying I/O does not complete in time,
+/// [`ReadFileError::Timeout`] is returned.
 ///
 /// We spawn a real OS thread because the metadata/hash reads are blocking I/O
 /// that can hang on NAS mounts — `rayon` tasks must not block indefinitely.
@@ -283,11 +286,9 @@ pub struct ScanStats {
 fn read_file_with_retry(
     path: &PathBuf,
     with_hash: bool,
-) -> Result<(Option<TrackMetadata>, Option<String>), String> {
+) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
-        Err(ref reason) if reason == "timeout" => {
-            read_file_with_timeout(path, with_hash, RETRY_FILE_TIMEOUT)
-        }
+        Err(ReadFileError::Timeout) => read_file_with_timeout(path, with_hash, RETRY_FILE_TIMEOUT),
         other => other,
     }
 }
@@ -330,19 +331,27 @@ fn read_file_with_timeout(
     path: &PathBuf,
     with_hash: bool,
     tag_timeout: Duration,
-) -> Result<(Option<TrackMetadata>, Option<String>), String> {
+) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     // Phase 1 — read the tags. This is fast even on a NAS (only the header /
     // tag blocks are read), so `tag_timeout` is plenty. A timeout here means the
     // tags are genuinely unreadable → caller falls back to filename metadata.
     let meta_path = path.clone();
     let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = mtx.send(try_read_metadata(&meta_path));
+        let result = match crate::audio::support::library_audio_support(&meta_path) {
+            LibraryAudioSupport::Unsupported(unsupported) => {
+                Err(ReadFileError::Unsupported(unsupported))
+            }
+            LibraryAudioSupport::Supported | LibraryAudioSupport::NotAudio => {
+                try_read_metadata(&meta_path).map_err(ReadFileError::Other)
+            }
+        };
+        let _ = mtx.send(result);
     });
     let metadata = match mrx.recv_timeout(tag_timeout) {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("timeout".to_string()),
+        Err(_) => return Err(ReadFileError::Timeout),
     };
 
     if !with_hash {
@@ -386,6 +395,8 @@ pub struct ListAudioResult {
     /// seule chose qui explique à l'utilisateur pourquoi des albums manquent —
     /// sans quoi ils disparaissent en silence (cf `KNOWN_UNREAD_AUDIO`).
     pub skipped_by_ext: std::collections::HashMap<String, usize>,
+    /// Motif stable associé à chaque clé de `skipped_by_ext`.
+    pub skipped_reasons: std::collections::HashMap<String, String>,
 }
 
 impl ListAudioResult {
@@ -407,7 +418,6 @@ pub fn list_audio_files_with_excludes(
     dirs: &[String],
     exclude_patterns: &[String],
 ) -> ListAudioResult {
-    let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
     let excludes: Vec<String> = exclude_patterns
         .iter()
         .map(|p| p.trim().to_lowercase())
@@ -417,6 +427,8 @@ pub fn list_audio_files_with_excludes(
 
     let mut files = Vec::new();
     let mut skipped_by_ext: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut skipped_reasons: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
@@ -523,25 +535,27 @@ pub fn list_audio_files_with_excludes(
                         continue;
                     }
                     let path = entry.path();
-                    // Count the AUDIO files we walk past, by extension. Until now
-                    // a file whose format Tune does not read simply vanished: no
-                    // log, no line in the scan report, nothing. The user sees
-                    // albums missing with no way to learn why — the `.cue` /
-                    // `.mpc` case (Rhorn, #1763), and every future format.
-                    //
-                    // Only KNOWN_UNREAD_AUDIO is counted, never "every unknown
-                    // extension": a music library holds thousands of .jpg, .nfo,
-                    // .m3u and .log, and reporting those would bury the one line
-                    // that matters under noise nobody can act on.
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let lower = ext.to_lowercase();
-                        if KNOWN_UNREAD_AUDIO.contains(&lower.as_str()) {
-                            *skipped_by_ext.entry(lower).or_insert(0) += 1;
+                    // Classer AVANT d'ajouter le chemin : WMA, DST autonome et
+                    // les autres formats audio connus mais non lus restent
+                    // visibles dans le rapport, sans devenir des pistes
+                    // cliquables impossibles à décoder. DFF/DST sera distingué
+                    // plus tard, dans la phase de métadonnées bornée. Les
+                    // fichiers non audio restent silencieux.
+                    match crate::audio::support::library_audio_support_by_extension(path) {
+                        crate::audio::support::LibraryAudioSupport::Unsupported(unsupported) => {
+                            *skipped_by_ext
+                                .entry(unsupported.report_key.clone())
+                                .or_insert(0) += 1;
+                            skipped_reasons
+                                .entry(unsupported.report_key)
+                                .or_insert_with(|| unsupported.reason.to_string());
+                            continue;
                         }
+                        crate::audio::support::LibraryAudioSupport::NotAudio => continue,
+                        crate::audio::support::LibraryAudioSupport::Supported => {}
                     }
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                        && extensions.contains(ext.to_lowercase().as_str())
-                    {
+
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         // ISO SACD: extract DSF tracks instead of adding the ISO directly
                         if ext.eq_ignore_ascii_case("iso")
                             && crate::audio::iso_sacd::is_sacd_iso(path)
@@ -626,7 +640,10 @@ pub fn list_audio_files_with_excludes(
         let total: usize = par_ext.iter().map(|(_, n)| n).sum();
         let detail = par_ext
             .iter()
-            .map(|(e, n)| format!(".{e}={n}"))
+            .map(|(e, n)| {
+                let reason = skipped_reasons.get(e).map(String::as_str).unwrap_or("");
+                format!(".{e}={n} ({reason})")
+            })
             .collect::<Vec<_>>()
             .join(" ");
         warn!(
@@ -642,6 +659,7 @@ pub fn list_audio_files_with_excludes(
         error_dirs,
         missing_dir_reasons,
         skipped_by_ext,
+        skipped_reasons,
     }
 }
 
@@ -692,13 +710,14 @@ pub fn scan_files_parallel(
                 return ScannedFile {
                     path: path_str,
                     metadata: None,
+                    unsupported: None,
                     audio_hash: None,
                     file_size,
                     mtime,
                 };
             }
 
-            let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
+            let (metadata, audio_hash, unsupported) = match read_file_with_retry(path, with_hash) {
                 Ok((meta, hash)) => {
                     if meta.is_none() {
                         warn!(
@@ -706,9 +725,9 @@ pub fn scan_files_parallel(
                             "scan_file_no_metadata — metadata reader returned None"
                         );
                     }
-                    (meta, hash)
+                    (meta, hash, None)
                 }
-                Err(ref reason) if reason == "timeout" => {
+                Err(ReadFileError::Timeout) => {
                     // Don't drop the file — index it with filename-based metadata
                     // so it still appears in the library. audio_hash stays None so
                     // the next scan re-reads full tags once storage is responsive.
@@ -729,9 +748,18 @@ pub fn scan_files_parallel(
                             meta.duration_ms = Some(d);
                         }
                     }
-                    (Some(meta), None)
+                    (Some(meta), None, None)
                 }
-                Err(ref err) => {
+                Err(ReadFileError::Unsupported(unsupported)) => {
+                    info!(
+                        path = %path_str,
+                        format = %unsupported.report_key,
+                        reason = unsupported.reason,
+                        "scan_file_unsupported — format reconnu mais non décodable"
+                    );
+                    (None, None, Some(unsupported))
+                }
+                Err(ReadFileError::Other(err)) => {
                     warn!(
                         path = %path_str,
                         error = %err,
@@ -741,13 +769,14 @@ pub fn scan_files_parallel(
                         .lock()
                         .unwrap()
                         .push((path_str.clone(), err.clone()));
-                    (None, None)
+                    (None, None, None)
                 }
             };
 
             ScannedFile {
                 path: path_str,
                 metadata,
+                unsupported,
                 audio_hash,
                 file_size,
                 mtime,
@@ -761,13 +790,28 @@ pub fn scan_files_parallel(
         .iter()
         .map(|(p, e)| format!("{} ({})", p, e))
         .collect();
+    let mut unsupported_by_ext = std::collections::HashMap::new();
+    let mut unsupported_reasons = std::collections::HashMap::new();
+    for unsupported in results.iter().filter_map(|file| file.unsupported.as_ref()) {
+        *unsupported_by_ext
+            .entry(unsupported.report_key.clone())
+            .or_insert(0) += 1;
+        unsupported_reasons
+            .entry(unsupported.report_key.clone())
+            .or_insert_with(|| unsupported.reason.to_string());
+    }
     let stats = ScanStats {
         total_files: results.len(),
         metadata_ok: results.iter().filter(|f| f.metadata.is_some()).count(),
-        metadata_failed: results.iter().filter(|f| f.metadata.is_none()).count(),
+        metadata_failed: results
+            .iter()
+            .filter(|f| f.metadata.is_none() && f.unsupported.is_none())
+            .count(),
         metadata_timeout: timed_out,
         hash_ok: results.iter().filter(|f| f.audio_hash.is_some()).count(),
         failed_paths,
+        unsupported_by_ext,
+        unsupported_reasons,
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -870,15 +914,17 @@ pub fn scan_files_batched(
                         return ScannedFile {
                             path: path_str,
                             metadata: None,
+                            unsupported: None,
                             audio_hash: None,
                             file_size,
                             mtime,
                         };
                     }
 
-                    let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
-                        Ok((meta, hash)) => (meta, hash),
-                        Err(ref reason) if reason == "timeout" => {
+                    let (metadata, audio_hash, unsupported) =
+                        match read_file_with_retry(path, with_hash) {
+                        Ok((meta, hash)) => (meta, hash, None),
+                        Err(ReadFileError::Timeout) => {
                             // Don't drop the file — same fallback as
                             // scan_files_parallel: index it with filename-based
                             // metadata so it still appears in the library.
@@ -890,22 +936,32 @@ pub fn scan_files_batched(
                                 "scan_file_timeout — tag read timed out, indexing with filename metadata"
                             );
                             batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                            (Some(tagless_fallback_no_props(path)), None)
+                            (Some(tagless_fallback_no_props(path)), None, None)
                         }
-                        Err(err) => {
+                        Err(ReadFileError::Unsupported(unsupported)) => {
+                            info!(
+                                path = %path_str,
+                                format = %unsupported.report_key,
+                                reason = unsupported.reason,
+                                "scan_file_unsupported — format reconnu mais non décodable"
+                            );
+                            (None, None, Some(unsupported))
+                        }
+                        Err(ReadFileError::Other(err)) => {
                             warn!(
                                 path = %path_str,
                                 error = %err,
                                 "scan_file_failed"
                             );
                             failed_files.lock().unwrap().push((path_str.clone(), err));
-                            (None, None)
+                            (None, None, None)
                         }
                     };
 
                     ScannedFile {
                         path: path_str,
                         metadata,
+                        unsupported,
                         audio_hash,
                         file_size,
                         mtime,
@@ -925,9 +981,22 @@ pub fn scan_files_batched(
 
         // Update aggregate stats
         aggregate.metadata_ok += batch.iter().filter(|f| f.metadata.is_some()).count();
-        aggregate.metadata_failed += batch.iter().filter(|f| f.metadata.is_none()).count();
+        aggregate.metadata_failed += batch
+            .iter()
+            .filter(|f| f.metadata.is_none() && f.unsupported.is_none())
+            .count();
         aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
+        for unsupported in batch.iter().filter_map(|file| file.unsupported.as_ref()) {
+            *aggregate
+                .unsupported_by_ext
+                .entry(unsupported.report_key.clone())
+                .or_insert(0) += 1;
+            aggregate
+                .unsupported_reasons
+                .entry(unsupported.report_key.clone())
+                .or_insert_with(|| unsupported.reason.to_string());
+        }
 
         let failed = failed_files.lock().unwrap();
         if !failed.is_empty() {
@@ -1071,6 +1140,8 @@ mod tests {
         assert!(SUPPORTED_EXTENSIONS.contains(&"mp3"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"dsf"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"ape"));
+        assert!(!SUPPORTED_EXTENSIONS.contains(&"wma"));
+        assert!(!SUPPORTED_EXTENSIONS.contains(&"dst"));
         assert!(!SUPPORTED_EXTENSIONS.contains(&"txt"));
     }
 
@@ -1096,6 +1167,9 @@ mod tests {
         // Les formats réclamés sur le forum (Rhorn, #1763).
         assert!(KNOWN_UNREAD_AUDIO.contains(&"mpc"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"cue"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"wma"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"asf"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"dst"));
         // Le bruit d'une bibliothèque musicale ne doit JAMAIS y figurer :
         // compter les pochettes et les fichiers de log noierait le seul
         // renseignement exploitable.
@@ -1105,6 +1179,93 @@ mod tests {
                 "{noise} n'est pas de l'audio et polluerait le rapport"
             );
         }
+    }
+
+    #[test]
+    fn wma_asf_et_dst_sont_expliques_sans_etre_catalogues() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_formats_non_lus_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in [
+            "album.wma",
+            "archive.asf",
+            "sacd.dst",
+            "temoin.flac",
+            "cover.jpg",
+        ] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files[0].ends_with("temoin.flac"));
+        assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+        assert_eq!(result.skipped_by_ext.get("asf"), Some(&1));
+        assert_eq!(result.skipped_by_ext.get("dst"), Some(&1));
+        assert!(
+            result
+                .skipped_reasons
+                .get("wma")
+                .is_some_and(|reason| reason.contains("aucun décodeur"))
+        );
+        assert!(
+            result
+                .skipped_reasons
+                .get("dst")
+                .is_some_and(|reason| reason.contains("aucun décodeur"))
+        );
+        assert!(!result.skipped_by_ext.contains_key("jpg"));
+    }
+
+    #[test]
+    fn dff_dst_est_inventorie_sans_io_puis_refuse_dans_la_phase_bornee() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_dff_dst_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("album.dff");
+        std::fs::write(&path, crate::audio::support::dff_dst_minimal_fixture()).unwrap();
+
+        // L'inventaire ne lit pas l'en-tête : il conserve le DFF pour que la
+        // phase de métadonnées, protégée par FILE_TIMEOUT, le classe.
+        let listed = list_audio_files(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(listed.files, vec![path]);
+        assert!(listed.skipped_by_ext.is_empty());
+
+        let (files, stats) = scan_files_parallel(&listed.files, false, None);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].metadata.is_none());
+        assert_eq!(
+            files[0]
+                .unsupported
+                .as_ref()
+                .map(|unsupported| unsupported.report_key.as_str()),
+            Some("dff-dst")
+        );
+        assert_eq!(stats.metadata_failed, 0);
+        assert!(stats.failed_paths.is_empty());
+        assert_eq!(stats.unsupported_by_ext.get("dff-dst"), Some(&1));
+        assert!(
+            stats
+                .unsupported_reasons
+                .get("dff-dst")
+                .is_some_and(|reason| reason.contains("aucun décodeur DST"))
+        );
+
+        // Le serveur emploie le chemin par lots : il doit porter exactement le
+        // même verdict et les mêmes compteurs que le chemin parallèle direct.
+        let mut batch_files = Vec::new();
+        let batch_stats = scan_files_batched(&listed.files, false, 1, |batch, _, _| {
+            batch_files.extend(batch);
+        });
+        assert_eq!(batch_files.len(), 1);
+        assert!(batch_files[0].unsupported.is_some());
+        assert_eq!(batch_stats.metadata_failed, 0);
+        assert_eq!(batch_stats.unsupported_by_ext.get("dff-dst"), Some(&1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
