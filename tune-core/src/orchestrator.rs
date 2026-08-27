@@ -2649,9 +2649,9 @@ impl PlaybackOrchestrator {
         // Une zone navigateur n'a volontairement aucun `output_device_id` :
         // l'onglet est la sortie et tire lui-même `stream_url`. On doit donc
         // lire son type en base plutôt que déduire « aucune sortie » de
-        // l'absence de périphérique (#2076, #2158).
-        let is_browser_output = is_bandcamp
-            && req.output_device_id.is_none()
+        // l'absence de périphérique (#2076, #2158). Cette propriété vaut pour
+        // Bandcamp comme pour la radio dont l'EQ force désormais le proxy WAV.
+        let is_browser_output = req.output_device_id.is_none()
             && ZoneRepo::with_backend(self.db.clone())
                 .get(req.zone_id)
                 .ok()
@@ -2659,6 +2659,22 @@ impl PlaybackOrchestrator {
                 .and_then(|zone| zone.output_type)
                 .as_deref()
                 == Some("browser");
+
+        // La sortie locale applique déjà l'EQ dans son callback : le refaire
+        // ici colorerait le signal deux fois. OAAT, DLNA et navigateur
+        // consomment en revanche le WAV construit par ce décodeur ; le profil
+        // doit voyager jusqu'au moment où son format réel sera connu (#2063).
+        // Un profil neutre ne force aucun transcodage inutile.
+        let radio_eq_profile = if is_radio
+            && !is_local_output
+            && (is_oaat_output || req.output_device_id.is_some() || is_browser_output)
+        {
+            self.load_eq_profile(req.zone_id).filter(|profile| {
+                crate::audio::eq::EqProcessor::new(profile, 44_100, 2).is_enabled()
+            })
+        } else {
+            None
+        };
 
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = if is_radio
             && (is_local_output || is_oaat_output)
@@ -2716,7 +2732,18 @@ impl PlaybackOrchestrator {
                 // Download + decode in a blocking thread since symphonia and
                 // reqwest::blocking are both synchronous.
                 let result = tokio::task::spawn_blocking(move || {
-                    decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, radio_levels_tx)
+                    decode_radio_stream_to_pcm(
+                        radio_url,
+                        tx,
+                        data_ready,
+                        session,
+                        if is_local_output {
+                            None
+                        } else {
+                            radio_eq_profile.clone()
+                        },
+                        radio_levels_tx,
+                    )
                 })
                 .await;
 
@@ -2799,7 +2826,7 @@ impl PlaybackOrchestrator {
             let session_for_done = session.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    decode_radio_stream_to_pcm(bc_url, tx, data_ready, session, bc_levels_tx)
+                    decode_radio_stream_to_pcm(bc_url, tx, data_ready, session, None, bc_levels_tx)
                 })
                 .await;
                 session_for_done
@@ -2892,11 +2919,12 @@ impl PlaybackOrchestrator {
             // WAV is universally supported, so proxying guarantees sound at
             // low CPU/LAN cost. Only device-less network resolves (no HEAD to
             // gamble on) keep the extension-based passthrough.
-            let needs_proxy = if req.output_device_id.is_some() {
-                true
-            } else {
-                !reliable_ext
-            };
+            // Un EQ actif interdit le passthrough, même pour un MP3 explicite :
+            // les octets compressés contourneraient entièrement le DSP. C'est
+            // notamment le cas d'une zone navigateur, qui n'a aucun device_id
+            // mais doit recevoir le WAV déjà égalisé par Tune (#2063).
+            let needs_proxy =
+                req.output_device_id.is_some() || !reliable_ext || radio_eq_profile.is_some();
 
             if needs_proxy {
                 let wav_info = StreamInfo {
@@ -2942,6 +2970,7 @@ impl PlaybackOrchestrator {
                             tx,
                             data_ready,
                             session,
+                            radio_eq_profile.clone(),
                             radio_levels_tx,
                         )
                     })
@@ -7332,8 +7361,18 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::eq::EqProcessor> {
-        // PURE mode: never build an EqProcessor (no EQ, no room-correction
-        // gains) so the PCM reaches the output untouched.
+        let profile = self.load_eq_profile(zone_id)?;
+        let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
+        if eq.is_enabled() { Some(eq) } else { None }
+    }
+
+    /// Profil EQ réellement actif pour une zone, sans encore le lier à un
+    /// format PCM. Le décodeur radio ne connaît le taux et le nombre de canaux
+    /// qu'après sa sonde ; lui transmettre le profil permet de construire les
+    /// coefficients exacts à cet instant au lieu de supposer 44,1 kHz (#2063).
+    fn load_eq_profile(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
+        // PURE mode: never build an EqProcessor so the PCM reaches the output
+        // untouched.
         if self.zone_audiophile(zone_id) {
             return None;
         }
@@ -7347,8 +7386,7 @@ impl PlaybackOrchestrator {
         if !profile.enabled {
             return None;
         }
-        let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
-        if eq.is_enabled() { Some(eq) } else { None }
+        Some(profile)
     }
 
     /// True when the zone has an uploaded room-correction IR and is not in PURE
@@ -9084,11 +9122,24 @@ pub(crate) fn non_audio_content_type(content_type: &str) -> Option<String> {
         .then_some(ct)
 }
 
+/// Applique l'EQ au PCM radio déjà décodé, avant sa quantification en i16.
+/// `None` est une identité stricte : les chemins sans EQ conservent exactement
+/// les mêmes échantillons et ne paient aucun traitement supplémentaire.
+fn apply_radio_eq(eq: &mut Option<crate::audio::eq::EqProcessor>, interleaved: &mut [f32]) {
+    if let Some(eq) = eq.as_mut() {
+        eq.process_interleaved(interleaved);
+    }
+}
+
 fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     session: std::sync::Arc<crate::http::streamer::StreamSession>,
+    // Le profil voyage sans coefficients : le taux/canaux réels ne sont connus
+    // qu'après la sonde Symphonia. `None` garde le PCM historique à l'identique
+    // (notamment la sortie locale, qui applique déjà son propre EQ).
+    eq_profile: Option<crate::audio::eq::EqProfile>,
     // Pur observateur : les VU-mètres. Un flux radio est décodé live (pas de
     // fichier), donc le décodage-pour-niveaux des pistes locales ne s'applique
     // pas — on tappe ici le PCM déjà décodé. `None` = pas de bus (tests).
@@ -9126,6 +9177,10 @@ fn decode_radio_stream_to_pcm(
     // different rate/channel layout would feed PCM that doesn't match the WAV
     // header already sent to the renderer, so we bail to a fresh session instead.
     let mut expected_format: Option<(u16, u32)> = None;
+    // Construit une seule fois au format réellement détecté, puis conservé à
+    // travers les reconnexions compatibles : réinitialiser les biquads à chaque
+    // coupure amont créerait un transitoire audible (#2063).
+    let mut radio_eq: Option<crate::audio::eq::EqProcessor> = None;
 
     'reconnect: loop {
         // ---- Connect + probe + build decoder ----
@@ -9275,6 +9330,16 @@ fn decode_radio_stream_to_pcm(
         // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
         let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
         let needs_resample = output_sample_rate != source_sample_rate;
+        if radio_eq.is_none() {
+            radio_eq = eq_profile.as_ref().and_then(|profile| {
+                let eq = crate::audio::eq::EqProcessor::new(
+                    profile,
+                    output_sample_rate,
+                    source_channels,
+                );
+                if eq.is_enabled() { Some(eq) } else { None }
+            });
+        }
 
         // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
         // that matches the PCM we actually feed (FIP is 48000 → advertised as
@@ -9365,6 +9430,11 @@ fn decode_radio_stream_to_pcm(
                     channels as u16,
                 );
             }
+
+            // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
+            // le profil de zone. Le traitement se fait en f32 avant i16, comme
+            // les autres chemins DSP, et les VU observent ainsi le signal final.
+            apply_radio_eq(&mut radio_eq, &mut interleaved);
 
             let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
             for sample in &interleaved {
@@ -11954,6 +12024,96 @@ mod tests {
         let queue_repo = PlayQueueRepo::with_backend(orch.db.clone());
         let queue = queue_repo.get_queue(zone_id).unwrap();
         assert_eq!(queue.len(), 3);
+    }
+
+    fn radio_test_eq_profile() -> crate::audio::eq::EqProfile {
+        crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 80.0,
+                gain: 8.0,
+                q: 0.71,
+                band_type: "low_shelf".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn f32_bytes(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    /// #2063 — contre-épreuve négative : ajouter le crochet DSP au décodeur
+    /// radio ne doit modifier AUCUN octet quand la zone n'a pas d'EQ actif.
+    #[test]
+    fn radio_without_eq_keeps_pcm_byte_for_byte() {
+        let mut samples = vec![0.0, -0.0, 0.125, -0.25, 0.75, -0.875];
+        let expected = f32_bytes(&samples);
+        let mut eq = None;
+        super::apply_radio_eq(&mut eq, &mut samples);
+        assert_eq!(f32_bytes(&samples), expected);
+    }
+
+    /// Le témoin positif complète le précédent : un profil réellement actif
+    /// doit atteindre le PCM que Tune servira dans le WAV, pas seulement
+    /// forcer une route de transcodage qui oublierait ensuite le processeur.
+    #[test]
+    fn radio_with_eq_changes_the_pcm_served_to_the_renderer() {
+        let profile = radio_test_eq_profile();
+        let mut eq = Some(crate::audio::eq::EqProcessor::new(&profile, 44_100, 2));
+        let mut samples = vec![0.10f32; 2 * 1024];
+        let untouched = f32_bytes(&samples);
+        super::apply_radio_eq(&mut eq, &mut samples);
+        assert_ne!(f32_bytes(&samples), untouched);
+    }
+
+    /// Une URL MP3 explicite passait directement au navigateur. Avec un EQ,
+    /// ce passthrough contournerait tous les filtres : la zone doit recevoir
+    /// une session WAV Tune même sans `output_device_id`.
+    #[tokio::test]
+    async fn browser_radio_with_eq_is_forced_through_the_wav_session() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+            )
+            .unwrap();
+        let source = "http://127.0.0.1:9/station.mp3";
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some(source.into()),
+            title: Some("Radio avec EQ".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "l'EQ actif doit interdire le passthrough MP3"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+        assert_eq!(resolved.origin_url.as_deref(), Some(source));
     }
 
     #[tokio::test]
