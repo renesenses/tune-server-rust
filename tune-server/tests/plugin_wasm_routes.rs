@@ -93,8 +93,9 @@ const MANIFEST: &str = r#"{
 /// threads to make progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_plugin_route_dispatches_and_exercises_real_host() {
+    let _environment = crate::lock_environment();
     // A plugins dir with one wasm plugin. `main.wasm` holds WAT text; wasmtime's
-    // `wat` feature (enabled in tune-core) parses it via content sniffing, so a
+    // `wat` feature parses it via content sniffing, so a
     // real wasm32 toolchain is not needed for the test.
     let dir = tempfile::tempdir().expect("tempdir");
     let plugin_dir = dir.path().join("wasmtest");
