@@ -238,6 +238,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        // #2154 — une base incomplète ne doit plus pouvoir ignorer des
+        // réglages pendant des mois sans laisser de trace dans le rapport.
+        "zone_settings_ignored": tune_core::db::zone_repo::zone_settings_ignored(),
         "discovered_devices": devices_by_type,
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
@@ -955,6 +958,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Zones
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_count = zone_repo.count().unwrap_or(0);
+    let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
@@ -1061,6 +1065,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
+    md.push_str(&format!(
+        "- Zone settings not persisted: {zone_settings_ignored}\n"
+    ));
     md.push('\n');
 
     md.push_str("## Streaming Services\n");
@@ -1163,6 +1170,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "count": zone_count,
             "items": zones,
         },
+        "zone_settings_ignored": zone_settings_ignored,
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
