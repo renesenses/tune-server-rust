@@ -4,6 +4,8 @@ pub mod airplay2;
 pub mod asio_exclusive;
 pub mod bluos;
 pub mod bridge;
+#[cfg(test)]
+mod capabilities_test;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
@@ -29,4 +31,7 @@ pub mod traits;
 pub mod wasapi_exclusive;
 
 pub use registry::OutputRegistry;
-pub use traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+pub use traits::{
+    OutputCapabilities, OutputCommand, OutputCommandError, OutputCommandResult, OutputStatus,
+    OutputTarget, PlayMedia, TransportState,
+};

@@ -91,7 +91,7 @@ impl CrossfadeHandler {
         *self.fading.lock().await = false;
         let orig = self.original_volume.lock().await.take();
         if let (Some(vol), Some(out)) = (orig, output) {
-            let _ = out.set_volume(vol).await;
+            let _ = out.checked_set_volume(vol).await;
         }
     }
 
@@ -102,7 +102,7 @@ impl CrossfadeHandler {
 
 async fn fade_volume(output: &dyn OutputTarget, from: f64, to: f64, duration_s: f64) {
     if duration_s <= 0.0 {
-        let _ = output.set_volume(to).await;
+        let _ = output.checked_set_volume(to).await;
         return;
     }
     let steps = ((duration_s * 10.0) as u64).max(1);
@@ -110,7 +110,7 @@ async fn fade_volume(output: &dyn OutputTarget, from: f64, to: f64, duration_s: 
     for i in 0..=steps {
         let t = i as f64 / steps as f64;
         let vol = from + (to - from) * t;
-        if output.set_volume(vol).await.is_err() {
+        if output.checked_set_volume(vol).await.is_err() {
             break;
         }
         tokio::time::sleep(step_delay).await;

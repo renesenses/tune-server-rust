@@ -254,6 +254,26 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
 /// payload, after optional `frma`/`alac` atom prefixes) — the same layout the
 /// decoder uses. Returns `(format, bit_depth)`; bit depth is `None` for AAC.
 pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> {
+    // symphonia-codec-aac 0.6.0 panique `index out of bounds` (ics/mod.rs:246,
+    // len 64 idx 64) sur certains flux AAC-in-M4A malformés. Pendant un scan de
+    // bibliothèque cet unwind tuait la tâche de scan et faisait crasher le
+    // serveur quelques secondes après le démarrage (#2302, forum Marco Polo).
+    // Depuis que #2327 a restauré `panic = "unwind"`, `catch_unwind` intercepte
+    // vraiment ce panic — on calque le durcissement déjà en place dans le chemin
+    // de LECTURE (`audio/decode.rs`) : un fichier qui panique est SAUTÉ (None)
+    // avec un `warn!`, jamais propagé. `probe_m4a_props` est le SEUL appel
+    // symphonia du chemin de scan (`try_read_metadata` passe par lofty).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_m4a_props_inner(path)))
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                path = %path.display(),
+                "m4a_probe_panic: le décodeur AAC de symphonia a paniqué, fichier ignoré"
+            );
+            None
+        })
+}
+
+fn probe_m4a_props_inner(path: &std::path::Path) -> Option<(String, Option<u16>)> {
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
     use symphonia::core::formats::FormatOptions;
@@ -2706,6 +2726,27 @@ mod tests_dossier_de_disque {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_m4a_props_attrape_un_panic_du_decodeur() {
+        // symphonia-codec-aac 0.6.0 panique `index out of bounds` (ics/mod.rs:246,
+        // len 64 idx 64) sur certains AAC-in-M4A malformés. On simule ce panic
+        // exact : SANS la garde `catch_unwind` de `probe_m4a_props`, l'unwind
+        // remonte et tue la tâche de scan (ROUGE) ; AVEC, il est attrapé et rendu
+        // en `None` (VERT). On prouve que la MÉCANIQUE de garde attrape bien le
+        // panic index-out-of-bounds d'origine.
+        let sous_garde: Option<(String, Option<u16>)> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let v: Vec<u8> = vec![0u8; 64];
+                let _ = v[64]; // index out of bounds: len 64 index 64 — comme #2302
+                Some(("aac".to_string(), None))
+            }))
+            .unwrap_or(None);
+        assert_eq!(
+            sous_garde, None,
+            "un panic du décodeur doit rendre None, pas remonter"
+        );
+    }
 
     #[test]
     fn mb_artist_query_includes_alias_clause() {

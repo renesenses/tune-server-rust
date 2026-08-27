@@ -3,6 +3,7 @@ name = "tune-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 tune-output-api = { path = "../tune-output-api" }
@@ -67,11 +68,6 @@ webpki-roots = "0.26"
 # env-only derivation collided every instance on "tune-server" (#1112, #1127).
 # Already in the lockfile transitively, so this is a near-free direct dep.
 hostname = "0.4"
-# Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
-# behind the `plugins-wasm` feature so the default server build is unchanged.
-# default-features trimmed to compiler + runtime + WAT parsing; no async,
-# component-model, gc, threads, profiling, pooling, coredump, debug.
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
 # ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
 # keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
 # compile time — and the shared lib is loaded at runtime next to the model
@@ -110,6 +106,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -118,21 +115,21 @@ axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+[[test]]
+name = "integration_contracts"
+path = "tests/integration_contracts.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
 
 [features]
 default = ["local-audio"]
-local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
+local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.
 plugin-http = ["dep:axum"]
-# P0 of the plugin ABI: embed wasmtime to load/instantiate/call wasm plugins
-# with JSON-over-linear-memory marshalling under resource limits. NOT in
-# default — the default server build must not pull in wasmtime.
-plugins-wasm = ["dep:wasmtime"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]

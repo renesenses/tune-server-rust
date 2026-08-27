@@ -8,11 +8,12 @@
 //! status is read back from the shared player registry (updated by STAT).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 use crate::slimproto::{
     CommandChannels, PlayerRegistry, ServerMessage, build_strm_start, strm_control,
 };
@@ -34,6 +35,9 @@ pub struct SlimProtoOutput {
     command_channels: CommandChannels,
     /// Locally-tracked transport state (set by the playback commands).
     state: Arc<AtomicU8>,
+    /// Last volume command accepted by the player's command channel.
+    volume: Arc<Mutex<f64>>,
+    muted: Arc<AtomicBool>,
 }
 
 impl SlimProtoOutput {
@@ -51,6 +55,8 @@ impl SlimProtoOutput {
             players,
             command_channels,
             state: Arc::new(AtomicU8::new(ST_STOPPED)),
+            volume: Arc::new(Mutex::new(1.0)),
+            muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -106,6 +112,10 @@ impl OutputTarget for SlimProtoOutput {
         "slimproto"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, false, true, true, false)
+    }
+
     /// Native SlimProto has no internal next-track staging yet (phase 3 wires
     /// `set_next_url` → `strm s` autostart). Rely on the poller's natural-end
     /// advance for now so a single-track Repeat queue still loops.
@@ -141,30 +151,39 @@ impl OutputTarget for SlimProtoOutput {
     }
 
     async fn seek(&self, _position_ms: u64) -> Result<(), String> {
-        // Precise seek on the sequential stream needs a re-issued positioned
-        // stream (phase 3). No-op for now so a seek request doesn't error.
-        Ok(())
+        Err("seek not supported on SlimProto".into())
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         // SlimProto digital gain is fixed-point with 65536 = unity.
-        let g = (volume.clamp(0.0, 1.0) * 65536.0).round() as u32;
+        let volume = volume.clamp(0.0, 1.0);
+        let g = (volume * 65536.0).round() as u32;
         self.send(ServerMessage::Audg {
             left_gain: g,
             right_gain: g,
             digital_volume: 1,
         })
-        .await
+        .await?;
+        *self.volume.lock().await = volume;
+        self.muted.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let g = if muted { 0 } else { 65536 };
+        let volume = *self.volume.lock().await;
+        let g = if muted {
+            0
+        } else {
+            (volume * 65536.0).round() as u32
+        };
         self.send(ServerMessage::Audg {
             left_gain: g,
             right_gain: g,
             digital_volume: 1,
         })
-        .await
+        .await?;
+        self.muted.store(muted, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -176,8 +195,8 @@ impl OutputTarget for SlimProtoOutput {
             state: self.transport(),
             position_ms: position_ms.unwrap_or(0),
             duration_ms: 0,
-            volume: 1.0,
-            muted: false,
+            volume: *self.volume.lock().await,
+            muted: self.muted.load(Ordering::Relaxed),
             current_uri: None,
             track_title: None,
             track_artist: None,

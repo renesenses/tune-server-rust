@@ -142,11 +142,17 @@ impl SyncEngine {
                         target_ms = target,
                         "sync_coarse_correction"
                     );
-                    let _ = output.lock().await.seek(target as u64).await;
-                    self.last_correction
-                        .lock()
-                        .await
-                        .insert(follower_id, Instant::now());
+                    match output.lock().await.checked_seek(target as u64).await {
+                        Ok(()) => {
+                            self.last_correction
+                                .lock()
+                                .await
+                                .insert(follower_id, Instant::now());
+                        }
+                        Err(error) => {
+                            warn!(follower = follower_id, error = %error, "sync_coarse_correction_failed")
+                        }
+                    }
                 }
             } else if drift > DRIFT_FINE_MS {
                 let should_correct = {
@@ -166,11 +172,17 @@ impl SyncEngine {
                         target_ms = target,
                         "sync_fine_correction"
                     );
-                    let _ = output.lock().await.seek(target as u64).await;
-                    self.last_correction
-                        .lock()
-                        .await
-                        .insert(follower_id, Instant::now());
+                    match output.lock().await.checked_seek(target as u64).await {
+                        Ok(()) => {
+                            self.last_correction
+                                .lock()
+                                .await
+                                .insert(follower_id, Instant::now());
+                        }
+                        Err(error) => {
+                            warn!(follower = follower_id, error = %error, "sync_fine_correction_failed")
+                        }
+                    }
                 }
             }
         }
