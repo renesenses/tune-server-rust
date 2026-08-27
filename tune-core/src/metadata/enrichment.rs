@@ -680,9 +680,219 @@ fn string_similarity(a: &str, b: &str) -> f64 {
     common as f64 / max_len as f64
 }
 
+/// Ecrit en base ce qu'un enrichissement MusicBrainz vient de trouver pour UNE
+/// piste, puis remonte le resultat au niveau de son album.
+///
+/// Extrait de `tune-server/src/routes/library/enrich.rs` (`enrich_all_library`)
+/// pour etre testable : la boucle appelante fait des allers-retours reseau, la
+/// partie base de donnees non.
+///
+/// **La remontee vers l'album n'est pas cosmetique.** Les cartes de l'ecran
+/// Metadonnees comptent `albums.genre` et `albums.year`
+/// (`tune-server/src/routes/library/stats.rs`, requete `completeness_stats`),
+/// jamais `tracks.*` : le compte par piste ne collait pas a la liste d'albums
+/// affichee (#1091, Reivax66). Or l'enrichissement n'ecrivait que `tracks.genre`
+/// et `tracks.year`. Les deux seuls ecrivains de `albums.genre` / `albums.year`
+/// a partir des pistes — `AlbumRepo::update_quality_from_tracks` et
+/// `AlbumRepo::update_dates` — ne sont appeles que par le scan
+/// (`auto_scan.rs`, `scan_import.rs`). Rien ne faisait donc le pont hors d'un
+/// scan, et le compteur « Genre manquant » restait fige sur sa valeur d'avant,
+/// quel que soit le nombre de rafraichissements (#2259, fil forum 788).
+///
+/// Renvoie le resultat de l'ecriture sur la piste — c'est lui qui decide si la
+/// piste compte comme enrichie ou en erreur.
+pub fn write_track_enrichment(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    track_id: i64,
+    album_id: Option<i64>,
+    mb_id: &str,
+    composer: Option<String>,
+    details: &RecordingDetails,
+) -> Result<usize, String> {
+    use crate::db::backend::ToSqlValue;
+
+    // COALESCE partout : on comble un trou, on n'ecrase jamais une valeur en place.
+    let genre_val: Option<String> = details.genre.clone();
+    let year_val: Option<i32> = details.year;
+    let label_val: Option<String> = details.label.clone();
+    let composer_val: Option<String> = composer;
+    let isrc_val: Option<String> = details.isrc.clone();
+    let mb_id_val: Option<String> = Some(mb_id.to_string());
+
+    let result = backend.execute(
+        "UPDATE tracks SET \
+         genre = COALESCE(genre, ?), \
+         year = COALESCE(year, ?), \
+         label = COALESCE(label, ?), \
+         composer = COALESCE(composer, ?), \
+         isrc = COALESCE(isrc, ?), \
+         musicbrainz_recording_id = COALESCE(musicbrainz_recording_id, ?) \
+         WHERE id = ?",
+        &[
+            &genre_val as &dyn ToSqlValue,
+            &year_val as &dyn ToSqlValue,
+            &label_val as &dyn ToSqlValue,
+            &composer_val as &dyn ToSqlValue,
+            &isrc_val as &dyn ToSqlValue,
+            &mb_id_val as &dyn ToSqlValue,
+            &track_id as &dyn ToSqlValue,
+        ],
+    );
+
+    // Les metadonnees de niveau release remontent sur l'album.
+    if let Some(album_id) = album_id {
+        let release_id = details.release_id.clone();
+        let release_group_id = details.release_group_id.clone();
+        let catalog_number = details.catalog_number.clone();
+        let barcode = details.barcode.clone();
+        let album_label = details.label.clone();
+        let original_year = details.original_year;
+        backend
+            .execute(
+                "UPDATE albums SET \
+                 musicbrainz_release_id = COALESCE(musicbrainz_release_id, ?), \
+                 musicbrainz_release_group_id = COALESCE(musicbrainz_release_group_id, ?), \
+                 catalog_number = COALESCE(catalog_number, ?), \
+                 barcode = COALESCE(barcode, ?), \
+                 label = COALESCE(label, ?), \
+                 original_year = COALESCE(original_year, ?) \
+                 WHERE id = ?",
+                &[
+                    &release_id as &dyn ToSqlValue,
+                    &release_group_id as &dyn ToSqlValue,
+                    &catalog_number as &dyn ToSqlValue,
+                    &barcode as &dyn ToSqlValue,
+                    &album_label as &dyn ToSqlValue,
+                    &original_year as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                ],
+            )
+            .ok();
+
+        // Et enfin la remontee vers les colonnes que lisent les cartes de
+        // l'ecran Metadonnees. Ce sont exactement les deux appels que le scan
+        // fait deja (`auto_scan.rs:201` et `auto_scan.rs:705`) — d'ou le
+        // contraste que decrivait le fil 788 : un scan rafraichissait les
+        // compteurs, un enrichissement jamais. On ne duplique aucune requete :
+        // les deux methodes sont fill-only (COALESCE / NULLIF) et n'ecrasent
+        // aucune valeur en place.
+        let album_repo = crate::db::album_repo::AlbumRepo::with_backend(backend.clone());
+        // albums.genre / albums.genres, repris des pistes de l'album.
+        album_repo.update_quality_from_tracks(album_id).ok();
+        // albums.year, repris de l'annee que MusicBrainz vient de donner.
+        album_repo
+            .update_dates(album_id, year_val, None, None, None)
+            .ok();
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contre-epreuve #2259 — le compteur de l'ecran Metadonnees doit bouger
+    /// apres un enrichissement.
+    ///
+    /// On ne teste pas le rafraichissement de l'ecran : on teste la seule chose
+    /// dont il depend, la valeur que sa requete lit. Les deux comptes ci-dessous
+    /// sont copies mot pour mot de `completeness_stats`
+    /// (`tune-server/src/routes/library/stats.rs`) — ce sont les cartes « Genre »
+    /// et « Annee » que Philippe voyait rester a 24.
+    ///
+    /// Avant le correctif, `write_track_enrichment` ne remplissait que
+    /// `tracks.genre` / `tracks.year` : les deux comptes restaient a 0, et aucun
+    /// rafraichissement, manuel ou par WebSocket, ne pouvait y changer quoi que
+    /// ce soit.
+    #[test]
+    fn enrichment_moves_the_album_completeness_counters() {
+        use crate::db::album_repo::AlbumRepo;
+        use crate::db::artist_repo::ArtistRepo;
+        use crate::db::backend::DbBackend;
+        use crate::db::models::Track;
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::track_repo::TrackRepo;
+        use std::sync::Arc;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Un album sans genre ni annee, avec une piste elle aussi nue : le cas
+        // exact des 24 albums du fil 788.
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&crate::db::models::Artist::new("Miles Davis".into()))
+            .unwrap();
+        let album_repo = AlbumRepo::new(db.clone());
+        let album = album_repo
+            .get_or_create("Kind of Blue", artist_id, None)
+            .unwrap();
+        let album_id = album.id.unwrap();
+
+        let mut track = Track::new("So What".to_string());
+        track.album_id = Some(album_id);
+        track.artist_id = Some(artist_id);
+        track.file_path = Some("/music/so_what.flac".into());
+        track.genre = None;
+        track.year = None;
+        let track_id = TrackRepo::new(db.clone()).create(&track).unwrap();
+
+        // L'album part bien sans genre ni annee — sinon le test ne prouverait rien.
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let count = |sql: &str| -> i64 {
+            backend
+                .query_one(sql, &[])
+                .unwrap()
+                .and_then(|r| r.first().and_then(|v| v.as_i64()))
+                .unwrap()
+        };
+        const ALBUMS_WITH_GENRE: &str =
+            "SELECT COUNT(*) FROM albums WHERE genre IS NOT NULL AND genre != ''";
+        const ALBUMS_WITH_YEAR: &str =
+            "SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0";
+        assert_eq!(count(ALBUMS_WITH_GENRE), 0, "pre-condition: pas de genre");
+        assert_eq!(count(ALBUMS_WITH_YEAR), 0, "pre-condition: pas d'annee");
+
+        // MusicBrainz repond : Jazz, 1959.
+        let details = RecordingDetails {
+            genre: Some("Jazz".into()),
+            year: Some(1959),
+            ..Default::default()
+        };
+        write_track_enrichment(
+            &backend,
+            track_id,
+            Some(album_id),
+            "mb-recording-id",
+            None,
+            &details,
+        )
+        .unwrap();
+
+        // La piste est bien enrichie : ce n'est pas la question.
+        let track_genre: Option<String> = backend
+            .query_one(
+                "SELECT genre FROM tracks WHERE id = ?",
+                &[&track_id as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()));
+        assert_eq!(track_genre.as_deref(), Some("Jazz"));
+
+        // La question est celle-ci : le compteur bouge-t-il ?
+        assert_eq!(
+            count(ALBUMS_WITH_GENRE),
+            1,
+            "#2259 : l'enrichissement a rempli tracks.genre mais pas albums.genre — \
+             la carte « Genre » de l'ecran Metadonnees ne bougera jamais"
+        );
+        assert_eq!(
+            count(ALBUMS_WITH_YEAR),
+            1,
+            "#2259 : l'enrichissement a rempli tracks.year mais pas albums.year — \
+             la carte « Annee » de l'ecran Metadonnees ne bougera jamais"
+        );
+    }
 
     #[test]
     fn enrichment_result_serialize() {
