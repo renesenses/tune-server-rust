@@ -61,6 +61,42 @@ pub fn native_decoder_supports(path: &Path) -> bool {
     extension(path).is_some_and(|ext| NATIVE_DECODE_EXTENSIONS.contains(&ext.as_str()))
 }
 
+/// Retourne le motif précis qui interdit un chemin au décodeur livré.
+///
+/// Cette frontière est volontairement distincte du catalogue : AAC brut est
+/// décodable mais n'est pas indexé aujourd'hui, tandis que WMA/DST ne sont ni
+/// catalogables ni décodables. DFF exige une inspection de contenu.
+pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
+    let ext = extension(path)?;
+    match ext.as_str() {
+        "wma" | "asf" => Some(UnsupportedLibraryAudio {
+            report_key: ext,
+            reason: "WMA/ASF : aucun décodeur n'est livré",
+        }),
+        "dst" => Some(UnsupportedLibraryAudio {
+            report_key: ext,
+            reason: "DST compressé : aucun décodeur n'est livré",
+        }),
+        "dff"
+            if path
+                .to_str()
+                .and_then(|path| super::dff::parse_dff(path).ok())
+                .is_some_and(|info| info.is_dst()) =>
+        {
+            Some(UnsupportedLibraryAudio {
+                report_key: "dff-dst".into(),
+                reason: "DSDIFF compressé en DST : aucun décodeur DST n'est livré",
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Capacité réelle du décodeur pour ce fichier, y compris le contenu DFF.
+pub fn native_decoder_supports_file(path: &Path) -> bool {
+    native_decoder_supports(path) && decoder_rejection(path).is_none()
+}
+
 /// Classe un chemin par sa seule extension, sans ouvrir le fichier.
 ///
 /// Le parcours initial de la bibliothèque appelle cette variante : sur un NAS,
@@ -106,16 +142,8 @@ pub fn library_audio_support(path: &Path) -> LibraryAudioSupport {
         return by_extension;
     }
 
-    if extension(path).as_deref() == Some("dff")
-        && path
-            .to_str()
-            .and_then(|path| super::dff::parse_dff(path).ok())
-            .is_some_and(|info| info.is_dst())
-    {
-        return LibraryAudioSupport::Unsupported(UnsupportedLibraryAudio {
-            report_key: "dff-dst".into(),
-            reason: "DSDIFF compressé en DST : aucun décodeur DST n'est livré",
-        });
+    if let Some(unsupported) = decoder_rejection(path) {
+        return LibraryAudioSupport::Unsupported(unsupported);
     }
 
     by_extension
@@ -182,6 +210,16 @@ mod tests {
                 ".{ext} est catalogué sans décodeur natif"
             );
         }
+    }
+
+    #[test]
+    fn decodeur_et_catalogue_restent_deux_frontieres_distinctes() {
+        assert!(native_decoder_supports_file(Path::new("radio.aac")));
+        assert!(matches!(
+            library_audio_support_by_extension(Path::new("radio.aac")),
+            LibraryAudioSupport::Unsupported(_)
+        ));
+        assert!(!native_decoder_supports_file(Path::new("album.wma")));
     }
 
     #[test]

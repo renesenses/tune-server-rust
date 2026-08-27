@@ -586,22 +586,16 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
 }
 
 pub fn can_decode_native(file_path: &str) -> bool {
-    let path = Path::new(file_path);
-    super::support::native_decoder_supports(path)
-        && !matches!(
-            super::support::library_audio_support(path),
-            super::support::LibraryAudioSupport::Unsupported(_)
-        )
+    super::support::native_decoder_supports_file(Path::new(file_path))
 }
 
 fn reject_unsupported_library_audio(file_path: &str) -> Result<(), String> {
-    match super::support::library_audio_support(Path::new(file_path)) {
-        super::support::LibraryAudioSupport::Unsupported(unsupported) => Err(format!(
+    match super::support::decoder_rejection(Path::new(file_path)) {
+        Some(unsupported) => Err(format!(
             "format non pris en charge : {} ({})",
             unsupported.report_key, unsupported.reason
         )),
-        super::support::LibraryAudioSupport::Supported
-        | super::support::LibraryAudioSupport::NotAudio => Ok(()),
+        None => Ok(()),
     }
 }
 
