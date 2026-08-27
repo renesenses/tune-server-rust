@@ -17,6 +17,8 @@ mod karaoke_plugin;
 mod output_provider_seam;
 #[path = "rbac.rs"]
 mod rbac;
+#[path = "rustsec_allowlists.rs"]
+mod rustsec_allowlists;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
 #[path = "workflows_bornes.rs"]
