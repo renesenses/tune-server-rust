@@ -5441,6 +5441,7 @@ dependencies = [
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
  "tune-stream-http",
+ "tune-streaming-http",
  "unicode-normalization",
  "urlencoding",
  "uuid",
@@ -5456,6 +5457,22 @@ dependencies = [
  "bytes",
  "futures-util",
  "reqwest",
+ "tokio",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
+name = "tune-streaming-http"
+version = "0.9.113"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tune-core",

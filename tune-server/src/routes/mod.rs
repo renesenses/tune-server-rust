@@ -13,7 +13,7 @@ pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
-pub mod deezer_proxy_handler;
+pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
 pub mod digest;
@@ -76,7 +76,10 @@ pub mod squeezebox;
 // dans une branche soeur du graphe de compilation, tout en gardant le chemin
 // historique `routes::stream_handler` pour les appelants internes et externes.
 pub use tune_stream_http as stream_handler;
-pub mod streaming;
+// L'API des services de streaming dépend d'un sous-ensemble explicite de
+// l'état serveur. Elle compile dans une crate sœur, tout en conservant le
+// chemin historique `routes::streaming` pour les appelants.
+pub use tune_streaming_http as streaming;
 pub mod support;
 pub mod system;
 pub mod tagger;
