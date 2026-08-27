@@ -1436,6 +1436,42 @@ pub(crate) struct WasapiEndpoint {
     pub(crate) name: String,
 }
 
+/// Convert the frame count returned after
+/// `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` to a 100 ns WASAPI duration, with the
+/// rounding formula prescribed by Microsoft. Kept outside the COM layer so
+/// the arithmetic contract remains testable on every CI platform (#2208).
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn wasapi_aligned_duration_100ns(frames: u32, sample_rate: u32) -> Result<i64, String> {
+    if frames == 0 || sample_rate == 0 {
+        return Err(format!(
+            "Taille WASAPI alignée invalide : {frames} frames à {sample_rate} Hz"
+        ));
+    }
+    let numerator = u64::from(frames) * 10_000_000 + u64::from(sample_rate) / 2;
+    i64::try_from(numerator / u64::from(sample_rate))
+        .map_err(|_| "Durée WASAPI alignée hors domaine i64".to_string())
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HRESULT: i32 = 0x88890019u32 as i32;
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WasapiInitDecision {
+    Ready,
+    RetryWithAlignedBuffer,
+    Fail(i32),
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn wasapi_init_decision(hr: i32) -> WasapiInitDecision {
+    match hr {
+        0 => WasapiInitDecision::Ready,
+        AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HRESULT => WasapiInitDecision::RetryWithAlignedBuffer,
+        other => WasapiInitDecision::Fail(other),
+    }
+}
+
 /// Resolve the exact endpoint requested by a zone. Display names are
 /// disambiguated with the same `(2)`, `(3)` convention as discovery, while a
 /// stable endpoint ID bypasses name matching entirely.
@@ -1586,7 +1622,10 @@ impl RingBuf {
 
 #[cfg(test)]
 mod ringbuf_tests {
-    use super::{NativePcmRing, RingBuf};
+    use super::{
+        AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HRESULT, NativePcmRing, RingBuf, WasapiInitDecision,
+        wasapi_aligned_duration_100ns, wasapi_init_decision,
+    };
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::Arc;
@@ -1733,6 +1772,28 @@ mod ringbuf_tests {
         let written = assert_no_allocation(|| native_ring.pop_pcm_bytes(&mut pcm, 24));
         assert_eq!(written, 6);
         assert_eq!(&pcm[..3], &[0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn duree_wasapi_alignee_suit_le_nombre_de_frames_du_pilote() {
+        assert_eq!(wasapi_aligned_duration_100ns(480, 48_000).unwrap(), 100_000);
+        assert_eq!(wasapi_aligned_duration_100ns(441, 44_100).unwrap(), 100_000);
+        assert_eq!(wasapi_aligned_duration_100ns(1, 44_100).unwrap(), 227);
+        assert!(wasapi_aligned_duration_100ns(0, 48_000).is_err());
+        assert!(wasapi_aligned_duration_100ns(480, 0).is_err());
+    }
+
+    #[test]
+    fn seul_le_hresult_d_alignement_autorise_une_seconde_initialisation() {
+        assert_eq!(wasapi_init_decision(0), WasapiInitDecision::Ready);
+        assert_eq!(
+            wasapi_init_decision(AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HRESULT),
+            WasapiInitDecision::RetryWithAlignedBuffer
+        );
+        assert_eq!(
+            wasapi_init_decision(0x8000_4005u32 as i32),
+            WasapiInitDecision::Fail(0x8000_4005u32 as i32)
+        );
     }
 
     /// Le vrai contrat : un producteur, un consommateur, aucune perte, aucun
