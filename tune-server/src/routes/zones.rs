@@ -897,6 +897,19 @@ fn build_signal_path(
     // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
     let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
     let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
+    // A decoded live radio has no library row and its NowPlaying resolution is
+    // only the bootstrap value chosen before the decoder opens the upstream.
+    // Once the session publishes its detected PCM format, that observation is
+    // authoritative for the source line too (France Musique: 48 kHz, not the
+    // 44.1 kHz bootstrap value from session creation — #2427).
+    let radio_wire_sample_rate = (np.source == "radio")
+        .then_some(wire_sample_rate)
+        .flatten()
+        .map(|v| v as i32);
+    let radio_wire_bit_depth = (np.source == "radio")
+        .then_some(wire_bit_depth)
+        .flatten()
+        .map(|v| v as i32);
 
     // Look up track details for format/sample_rate/bit_depth
     let track = np.track_id.and_then(|tid| {
@@ -925,8 +938,8 @@ fn build_signal_path(
             .or_else(|| np.sample_rate.map(|v| v as i32))
             .unwrap_or(2_822_400)
     } else {
-        np.sample_rate
-            .map(|v| v as i32)
+        radio_wire_sample_rate
+            .or_else(|| np.sample_rate.map(|v| v as i32))
             .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
             // Dernier recours quand ni la lecture en cours ni la base ne
             // savent : le fil, qui décrit ce qui part vraiment. Sans lui on
@@ -943,8 +956,8 @@ fn build_signal_path(
             .or_else(|| np.bit_depth.map(|v| v as i32))
             .unwrap_or(1)
     } else {
-        np.bit_depth
-            .map(|v| v as i32)
+        radio_wire_bit_depth
+            .or_else(|| np.bit_depth.map(|v| v as i32))
             .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
             .or_else(|| wire_bit_depth.map(|v| v as i32))
             .unwrap_or(16)
@@ -3877,6 +3890,41 @@ mod signal_path_tests {
             Some("FLAC 96kHz/24bit"),
             "sans metadonnees, la resolution doit venir du fil et non du repli 44100/16"
         );
+    }
+
+    // #2427: radio resolution is unknown when NowPlaying is created. Its
+    // 44.1 kHz value is only a bootstrap for the WAV session; after probing,
+    // the wire reports the PCM rate actually served and must win.
+    #[test]
+    fn decoded_radio_source_uses_the_detected_wire_rate() {
+        let (backend, zone) = dlna_zone();
+        let np = NowPlaying {
+            title: "France Musique".into(),
+            source: "radio".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            stream_id: Some("sid-radio".into()),
+            ..Default::default()
+        };
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(np),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Renderer"),
+            "none",
+            Some(&wire("wav", 48_000, 16)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "Source").as_deref(), Some("WAV 48kHz/16bit"));
     }
 
     // Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
