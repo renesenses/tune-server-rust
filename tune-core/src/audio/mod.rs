@@ -34,6 +34,7 @@ pub mod resample;
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
 pub mod staged_growth;
+pub mod support;
 pub mod tap;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]

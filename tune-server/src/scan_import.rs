@@ -644,6 +644,7 @@ mod tests {
         ScannedFile {
             path: path.to_string(),
             metadata: None,
+            unsupported: None,
             audio_hash: Some("hash-1".into()),
             file_size: 4096,
             mtime: 1_700_000_000,

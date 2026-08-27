@@ -2646,6 +2646,19 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+        // Une zone navigateur n'a volontairement aucun `output_device_id` :
+        // l'onglet est la sortie et tire lui-même `stream_url`. On doit donc
+        // lire son type en base plutôt que déduire « aucune sortie » de
+        // l'absence de périphérique (#2076, #2158).
+        let is_browser_output = is_bandcamp
+            && req.output_device_id.is_none()
+            && ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|zone| zone.output_type)
+                .as_deref()
+                == Some("browser");
 
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = if is_radio
             && (is_local_output || is_oaat_output)
@@ -2808,12 +2821,14 @@ impl PlaybackOrchestrator {
                 Some(16u32),
                 Some(2u32),
             )
-        } else if is_bandcamp && !is_local_output && req.output_device_id.is_some() {
-            // Sortie RÉSEAU (DLNA/OpenHome). Bandcamp ne publie ses flux qu'en
-            // HTTPS, et un renderer DLNA ne sait pas ouvrir TLS : lui passer
-            // l'URL telle quelle donne un « PLAYING » suivi de silence — le
-            // même faux positif que la radio TSF Jazz envoyée en direct au
-            // Yamaha R-N2000A.
+        } else if is_bandcamp
+            && !is_local_output
+            && (req.output_device_id.is_some() || is_browser_output)
+        {
+            // Sortie RÉSEAU (DLNA/OpenHome) ou navigateur. Bandcamp ne publie
+            // ses flux qu'en HTTPS : un renderer DLNA ne sait pas ouvrir TLS,
+            // tandis que le client web réécrit une URL tierce en chemin local
+            // et reçoit alors du text/html au lieu du MP3 (#2076, #2158).
             //
             // On la sert donc par une session proxy locale, en clair, comme
             // les pistes Tidal/Qobuz (`create_proxy_session`). Les octets
@@ -2835,7 +2850,11 @@ impl PlaybackOrchestrator {
                 .await;
             let server_ip = self.server_ip();
             let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "mp3");
-            info!(url = %audio_url, "bandcamp_proxy_for_network_output");
+            info!(
+                url = %audio_url,
+                browser = is_browser_output,
+                "bandcamp_proxy_for_network_or_browser_output"
+            );
             (
                 stream_url,
                 Some(session_id),
@@ -9252,12 +9271,7 @@ fn decode_radio_stream_to_pcm(
         // that matches the PCM we actually feed (FIP is 48000 → advertised as
         // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
         // BEFORE first_chunk so the header, emitted after data_ready, is right.
-        session
-            .detected_sample_rate
-            .store(output_sample_rate, std::sync::atomic::Ordering::Relaxed);
-        session
-            .detected_channels
-            .store(source_channels, std::sync::atomic::Ordering::Relaxed);
+        session.publish_detected_output_format(output_sample_rate, source_channels);
 
         // Measure the reconnect gap: how long the session went without fresh
         // PCM. A long gap can starve the renderer's HTTP read.
@@ -12078,6 +12092,54 @@ mod tests {
         );
         // Les octets passent verbatim : c'est toujours du MP3, rien n'est
         // transcodé. Le renderer doit donc lire « audio/mpeg ».
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn bandcamp_is_proxied_for_a_browser_zone_without_an_output_device() {
+        // Contre-épreuve #2076/#2158 : une zone navigateur n'a jamais de
+        // `output_device_id`. Ce n'est pas une zone orpheline — l'onglet est la
+        // sortie — et il doit tirer une URL Tune locale, pas l'URL tierce que le
+        // client réécrirait en chemin relatif avant de recevoir du text/html.
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        let stream_id = resolved
+            .stream_id
+            .as_deref()
+            .expect("une zone navigateur doit recevoir une session proxy");
+        assert!(
+            resolved.url.ends_with(&format!("/stream/{stream_id}.mp3")),
+            "le navigateur doit tirer le MP3 depuis Tune : {}",
+            resolved.url
+        );
+        assert!(
+            !resolved.url.contains("bcbits.com"),
+            "l'URL Bandcamp ne doit jamais être rendue au navigateur"
+        );
+        assert_eq!(resolved.origin_url.as_deref(), Some(BC_STREAM));
         assert_eq!(resolved.mime_type, "audio/mpeg");
     }
 
