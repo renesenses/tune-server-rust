@@ -243,6 +243,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "audio_outputs_available": audio_outputs,
         "audio_backend": audio_backend_name,
         "asio_available": asio_avail,
+        // #2392 : pourquoi un fournisseur de sortie hors-arbre est inerte.
+        // Absent de la liste = non compilé ; présent avec un `refusal` = droit
+        // manquant, et le refus dit lequel et quoi faire ; présent sans refus
+        // et `devices: 0` = il cherche et ne trouve rien. Ces trois cas
+        // donnaient jusqu'ici le même écran vide.
+        "output_providers": crate::discovery_setup::provider_status_snapshot(),
         "scan_status": {
             "status": scan_status,
             "tracks": tracks,
@@ -303,6 +309,51 @@ fn get_rss_mb() -> Option<u64> {
     {
         None::<u64>
     }
+}
+
+/// La section « fournisseurs de sortie » d'un rapport de bogue.
+///
+/// Vide quand le binaire n'embarque aucun fournisseur hors-arbre : il n'y a
+/// alors rien à dire, et une section vide dans chaque rapport serait du bruit.
+fn section_fournisseurs_de_sortie(instantane: &Value) -> String {
+    let Some(fournisseurs) = instantane["providers"].as_array().filter(|l| !l.is_empty()) else {
+        return String::new();
+    };
+
+    let mut md = String::from("## Output Providers\n");
+    if !instantane["account_linked"].as_bool().unwrap_or(true) {
+        md.push_str(
+            "- ⚠ **No linked Mozaiklabs account** — paid module entitlements travel with the \
+             account, never with the license key, so no paid output module can be active.\n",
+        );
+    }
+    let modules = instantane["licensed_modules"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    md.push_str(&format!(
+        "- Licensed modules: {}\n",
+        if modules.is_empty() { "none" } else { &modules }
+    ));
+
+    for f in fournisseurs {
+        let nom = f["provider"].as_str().unwrap_or("?");
+        let appareils = f["devices"].as_u64().unwrap_or(0);
+        match f["refusal"]["code"].as_str() {
+            Some(code) => md.push_str(&format!(
+                "- {nom}: **idle — {code}** ({})\n",
+                f["refusal"]["message"].as_str().unwrap_or("")
+            )),
+            None => md.push_str(&format!("- {nom}: active, {appareils} device(s)\n")),
+        }
+    }
+    md.push('\n');
+    md
 }
 
 pub(super) async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Value> {
@@ -1037,6 +1088,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     md.push('\n');
+
+    // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
+    // Diretta une réinstallation complète de Fedora. Un rapport de bogue qui
+    // dit « fournisseur diretta, 0 appareil, aucun compte lié » se lit en dix
+    // secondes ; un rapport muet oblige à tout redemander.
+    md.push_str(&section_fournisseurs_de_sortie(
+        &crate::discovery_setup::provider_status_snapshot(),
+    ));
 
     if !oaat_endpoints.is_empty() {
         md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
@@ -2000,5 +2059,69 @@ mod selection_de_lignes {
         let rapport = lignes_utiles_pour_un_rapport(journal, 200);
         assert!(rapport.contains("add_rejected"));
         assert!(!rapport.contains("sonde a=1"));
+    }
+}
+
+/// #2392 — la section « fournisseurs de sortie » du rapport de bogue.
+#[cfg(test)]
+mod fournisseurs_de_sortie {
+    use super::*;
+
+    /// #2392 : le rapport de bogue doit dire pourquoi un fournisseur payant est
+    /// inerte. C'est le canal qui aurait épargné au bêta-testeur du module
+    /// Diretta une réinstallation complète de son système d'exploitation.
+    #[test]
+    fn le_rapport_dit_quand_un_module_paye_est_inerte_faute_de_compte_lie() {
+        let instantane = serde_json::json!({
+            "account_linked": false,
+            "licensed_modules": [],
+            "providers": [{
+                "provider": "diretta",
+                "required_module": "diretta",
+                "devices": 0,
+                "refusal": {
+                    "code": "module_account_not_linked",
+                    "message": "link your Mozaiklabs account",
+                },
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(md.contains("No linked Mozaiklabs account"), "{md}");
+        assert!(md.contains("Licensed modules: none"), "{md}");
+        assert!(
+            md.contains("diretta: **idle — module_account_not_linked**"),
+            "{md}"
+        );
+    }
+
+    /// Droit présent mais rien sur le réseau : l'autre cas, et il doit se lire
+    /// différemment — sinon on n'a fait que déplacer l'ambiguïté.
+    #[test]
+    fn le_rapport_distingue_un_module_actif_qui_ne_trouve_rien() {
+        let instantane = serde_json::json!({
+            "account_linked": true,
+            "licensed_modules": ["diretta"],
+            "providers": [{
+                "provider": "diretta",
+                "required_module": "diretta",
+                "devices": 0,
+                "refusal": null,
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(!md.contains("No linked Mozaiklabs account"), "{md}");
+        assert!(md.contains("Licensed modules: diretta"), "{md}");
+        assert!(md.contains("diretta: active, 0 device(s)"), "{md}");
+    }
+
+    /// Aucun fournisseur hors-arbre (le cas du binaire public, et l'état avant
+    /// la première passe) : pas de section du tout, pas de bruit.
+    #[test]
+    fn aucun_fournisseur_hors_arbre_najoute_aucune_section() {
+        assert_eq!(section_fournisseurs_de_sortie(&Value::Null), "");
+        assert_eq!(
+            section_fournisseurs_de_sortie(&serde_json::json!({ "providers": [] })),
+            ""
+        );
     }
 }
