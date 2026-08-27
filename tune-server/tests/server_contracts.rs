@@ -15,12 +15,16 @@ mod http_client_seam;
 mod integration;
 #[path = "karaoke_plugin.rs"]
 mod karaoke_plugin;
+#[path = "notarisation_bornes.rs"]
+mod notarisation_bornes;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "rbac.rs"]
 mod rbac;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "tests_orphelins.rs"]
+mod tests_orphelins;
 #[path = "workflows_bornes.rs"]
 mod workflows_bornes;
 #[path = "ws_auth.rs"]
