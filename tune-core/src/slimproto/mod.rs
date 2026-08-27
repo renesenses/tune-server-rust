@@ -46,7 +46,8 @@ pub enum ClientMessage {
         device_type: u8,
         firmware_version: u8,
         mac: [u8; 6],
-        /// Remaining bytes may contain device name (UTF-8, variable length).
+        /// Display label derived from the modern HELO capabilities, or from
+        /// the legacy trailing UTF-8 field for old short payloads.
         name: String,
     },
     /// `STAT` — status report.
@@ -146,6 +147,41 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<ClientMessage, Strin
     parse_client_message(tag, payload)
 }
 
+const MODERN_HELO_BASE_LEN: usize = 36;
+const LEGACY_HELO_NAME_OFFSET: usize = 10;
+
+fn helo_display_name(payload: &[u8], device_type: u8) -> String {
+    if payload.len() >= MODERN_HELO_BASE_LEN {
+        // Modern HELO layout (payload offsets): device/revision/MAC [0..8],
+        // UUID [8..24], WLAN channels [24..26], bytes received [26..34],
+        // language [34..36], then comma-separated ASCII capabilities.
+        let capabilities = String::from_utf8_lossy(&payload[MODERN_HELO_BASE_LEN..]);
+        let capabilities = capabilities.trim_matches('\0').trim();
+        let capability = |key: &str| {
+            capabilities
+                .split(',')
+                .find_map(|item| item.trim().strip_prefix(key))
+                .filter(|value| !value.is_empty())
+        };
+        return capability("ModelName=")
+            .or_else(|| capability("Model="))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Squeezebox {device_type}"));
+    }
+
+    // Preserve the old parser for short legacy frames whose optional trailing
+    // field starts after device/revision/MAC/WLAN. Their layout predates the
+    // 36-byte UUID/counters/language contract above.
+    payload
+        .get(LEGACY_HELO_NAME_OFFSET..)
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .trim_end_matches('\0')
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse raw tag + payload into a typed `ClientMessage`.
 fn parse_client_message(tag: [u8; 4], payload: Vec<u8>) -> Result<ClientMessage, String> {
     match &tag {
@@ -156,15 +192,7 @@ fn parse_client_message(tag: [u8; 4], payload: Vec<u8>) -> Result<ClientMessage,
             if payload.len() >= 8 {
                 mac.copy_from_slice(&payload[2..8]);
             }
-            // Bytes 8..9 are typically the number of wlan channels, bytes 10+
-            // may contain the device name as UTF-8.
-            let name = if payload.len() > 10 {
-                String::from_utf8_lossy(&payload[10..])
-                    .trim_end_matches('\0')
-                    .to_string()
-            } else {
-                String::new()
-            };
+            let name = helo_display_name(&payload, device_type);
 
             Ok(ClientMessage::Helo {
                 device_type,
@@ -1068,6 +1096,59 @@ mod tests {
             }
             _ => panic!("expected Helo"),
         }
+    }
+
+    #[test]
+    fn parse_modern_helo_reads_model_name_after_binary_fields() {
+        let mut payload = vec![
+            12, // device_type
+            0,  // firmware_version
+            0x00, 0x04, 0x20, 0x2a, 0xe4, 0xfe, // MAC
+        ];
+        // UUID, WLAN channel bitmap, byte counter and language are deliberately
+        // non-UTF-8/binary: none of them may leak into the display name.
+        payload.extend_from_slice(&[
+            0xff, 0x81, 0x00, 0x7f, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0,
+            0xb0, 0xc0,
+        ]);
+        payload.extend_from_slice(&0x07ff_u16.to_be_bytes());
+        payload.extend_from_slice(&21_700_000_u64.to_be_bytes());
+        payload.extend_from_slice(b"FR");
+        payload.extend_from_slice(
+            b"Model=baby,ModelName=Squeezebox Radio,Firmware=8.0.1-r16924,alc,aac,ogg,flc",
+        );
+
+        let msg = parse_client_message(*b"HELO", payload).unwrap();
+        match msg {
+            ClientMessage::Helo { name, mac, .. } => {
+                assert_eq!(name, "Squeezebox Radio");
+                assert_eq!(mac, [0x00, 0x04, 0x20, 0x2a, 0xe4, 0xfe]);
+                assert!(!name.contains('\u{fffd}'));
+            }
+            _ => panic!("expected Helo"),
+        }
+    }
+
+    #[test]
+    fn parse_modern_helo_falls_back_to_model_then_device_type() {
+        let mut with_model = vec![0_u8; MODERN_HELO_BASE_LEN];
+        with_model[0] = 12;
+        with_model.extend_from_slice(b"Model=squeezelite,flc,pcm");
+        let ClientMessage::Helo { name, .. } = parse_client_message(*b"HELO", with_model).unwrap()
+        else {
+            panic!("expected Helo");
+        };
+        assert_eq!(name, "squeezelite");
+
+        let mut without_model = vec![0_u8; MODERN_HELO_BASE_LEN];
+        without_model[0] = 10;
+        without_model.extend_from_slice(b"flc,pcm");
+        let ClientMessage::Helo { name, .. } =
+            parse_client_message(*b"HELO", without_model).unwrap()
+        else {
+            panic!("expected Helo");
+        };
+        assert_eq!(name, "Squeezebox 10");
     }
 
     #[test]
