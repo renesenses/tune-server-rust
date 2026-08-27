@@ -892,9 +892,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/creer-alias-actifs-release.sh
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      # Les actifs construits gardent leur nom versionne pour l'auto-update.
+      # Ces copies donnent en plus un nom stable a /releases/latest/download :
+      # une URL qui contient la version ne peut structurellement pas servir de
+      # lien « latest » (#2121, commande d'installation Linux en 404).
+      - name: Créer les alias de téléchargement Linux stables
+        run: bash scripts/creer-alias-actifs-release.sh artifacts "$GITHUB_REF_NAME"
 
       # Les sommes sont calculées sur les artefacts DU RUN COURANT. Sur un
       # re-run partiel, ce run n'a rejoué qu'une partie des jobs : les fichiers
