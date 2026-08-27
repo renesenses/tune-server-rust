@@ -9,14 +9,12 @@
 //! third-party ASIO driver.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use tracing::{debug, info};
+use tracing::info;
 
-use super::local::{
-    NativePcmRing, WasapiEndpoint, native_i32_to_pcm_bytes, select_wasapi_endpoint,
-};
+use super::local::{NativePcmRing, WasapiEndpoint, select_wasapi_endpoint};
 
 #[cfg(target_os = "windows")]
 fn resolve_wasapi_endpoint(requested: &str) -> Result<WasapiEndpoint, String> {
@@ -218,6 +216,9 @@ pub struct WasapiExclusiveOutput {
     #[cfg(target_os = "windows")]
     buffer_frame_count: u32,
     running: Arc<AtomicBool>,
+    underruns: Arc<AtomicU64>,
+    deadline_misses: Arc<AtomicU64>,
+    callback_errors: Arc<AtomicU64>,
     render_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -483,6 +484,9 @@ impl WasapiExclusiveOutput {
                 event_handle: event,
                 buffer_frame_count,
                 running: Arc::new(AtomicBool::new(false)),
+                underruns: Arc::new(AtomicU64::new(0)),
+                deadline_misses: Arc::new(AtomicU64::new(0)),
+                callback_errors: Arc::new(AtomicU64::new(0)),
                 render_thread: None,
             })
         }
@@ -515,7 +519,11 @@ impl WasapiExclusiveOutput {
         let buffer_frame_count = self.buffer_frame_count;
         let channels = self.channels;
         let bytes_per_sample = self.bit_depth / 8;
+        let bit_depth = self.bit_depth as u16;
         let frame_bytes = channels * bytes_per_sample;
+        let underruns = self.underruns.clone();
+        let deadline_misses = self.deadline_misses.clone();
+        let callback_errors = self.callback_errors.clone();
 
         let handle = std::thread::spawn(move || {
             const S_OK_LOCAL: i32 = 0;
@@ -534,7 +542,7 @@ impl WasapiExclusiveOutput {
                 let wait_result = unsafe { WaitForSingleObject(event_handle, 2000) };
                 if wait_result != WAIT_OBJECT_0_LOCAL {
                     if running.load(Ordering::SeqCst) {
-                        debug!("wasapi_exclusive_wait_timeout");
+                        deadline_misses.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -565,7 +573,6 @@ impl WasapiExclusiveOutput {
                     continue;
                 }
 
-                let needed_samples = (buffer_frame_count * channels) as usize;
                 unsafe {
                     let mut buf: *mut u8 = std::ptr::null_mut();
                     type GetBufferFn =
@@ -574,10 +581,7 @@ impl WasapiExclusiveOutput {
                     let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
                     let hr = get_buf(render_client, buffer_frame_count, &mut buf);
                     if hr != S_OK_LOCAL {
-                        debug!(
-                            hr = format!("0x{hr:08X}"),
-                            "wasapi_exclusive_getbuffer_failed"
-                        );
+                        callback_errors.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
 
@@ -585,16 +589,14 @@ impl WasapiExclusiveOutput {
                     // have already been resolved by the producer. The
                     // callback performs serialization only: no float, scale,
                     // rounding or truncation can alter a bit-perfect word.
-                    let mut samples = vec![0i32; needed_samples];
-                    let read = ring.pop(&mut samples);
-                    samples[read..].fill(0);
-
                     let out_slice = std::slice::from_raw_parts_mut(
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    let written =
-                        native_i32_to_pcm_bytes(&samples, (bytes_per_sample * 8) as u16, out_slice);
+                    let written = ring.pop_pcm_bytes(out_slice, bit_depth);
+                    if written < out_slice.len() {
+                        underruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     out_slice[written..].fill(0);
 
                     type RelBufFn =
@@ -640,7 +642,13 @@ impl WasapiExclusiveOutput {
             ffi::CloseHandle(self.event_handle);
         }
 
-        info!(device = %self.device_name, "wasapi_exclusive_stopped");
+        info!(
+            device = %self.device_name,
+            underruns = self.underrun_count(),
+            deadline_misses = self.deadline_miss_count(),
+            callback_errors = self.callback_error_count(),
+            "wasapi_exclusive_stopped"
+        );
     }
 
     pub fn format_info(&self) -> String {
@@ -661,6 +669,18 @@ impl WasapiExclusiveOutput {
 
     pub fn opened_device_id(&self) -> &str {
         &self.device_id
+    }
+
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn deadline_miss_count(&self) -> u64 {
+        self.deadline_misses.load(Ordering::Relaxed)
+    }
+
+    pub fn callback_error_count(&self) -> u64 {
+        self.callback_errors.load(Ordering::Relaxed)
     }
 }
 
