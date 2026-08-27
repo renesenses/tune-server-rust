@@ -33,6 +33,11 @@ use crate::state::AppState;
 /// license_key, discogs_token, auth_tokens_*, mots de passe…).
 const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
     ("community_sync_enabled", || json!(false)),
+    // Consentement de contribution (bios + images d'artistes). Non sensible,
+    // et utile en support : « est-ce que cette instance envoie quelque chose ? »
+    (tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY, || {
+        json!(tune_core::cloud::consent::CONTRIBUTION_DEFAULT)
+    }),
     ("enrich_on_scan", || json!(true)),
     ("scan_import_playlists", || json!(true)),
     ("resample_policy", || json!("none")),
