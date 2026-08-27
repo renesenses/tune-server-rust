@@ -1275,10 +1275,26 @@ jobs:
             echo "::warning::Pose du tag refusée (HTTP $STATUS) : $(cat /tmp/resp)"
           fi
 
+  # ETEINT VOLONTAIREMENT depuis le 03/06/2026 (496fc446, « manual posts have
+  # better formatting »). NE PAS rallumer sans lire #2328 : en l'etat, ce job
+  # ferait du mal.
+  #
+  #   1. Il posterait le changelog brut de git-cliff, qui emet un lien vers le
+  #      depot — PRIVE — par commit (`cliff.toml`), publiquement sur le forum.
+  #   2. Un fil cree par l'API nait `moderation_status = 'pending'` : le POST
+  #      repond 200, le job passe au vert, et PERSONNE ne voit le fil.
+  #   3. Le corps est du Markdown ; l'API attend du HTML.
+  #   4. `category: releases` n'existe pas : le champ est `type`, parmi
+  #      release|discussion|bug|feature.
+  #   5. Le jeton poste sous `user_id = 1`, affiche « Admin » — les notes sont
+  #      signees Bertrand (18).
+  #
+  # Le filet, en attendant, est `notes-de-version-watch.yml` : il ne poste rien
+  # et echoue bruyamment quand une version publiee reste sans fil de notes.
   forum:
     name: Announce on mozaiklabs forum
     needs: release
-    if: false  # Disabled — forum posts are written manually with better formatting
+    if: false  # Disabled — voir le pave ci-dessus et #2328
     runs-on: ubuntu-latest
     timeout-minutes: 15  # Announce on forum — desactive
     steps:
