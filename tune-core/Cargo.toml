@@ -119,6 +119,13 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 name = "integration_contracts"
 path = "tests/integration_contracts.rs"
 
+# `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
+# tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
+# que tune_core, déjà construit (#2213).
+[[test]]
+name = "terminologie_eq"
+path = "tests/terminologie_eq.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
