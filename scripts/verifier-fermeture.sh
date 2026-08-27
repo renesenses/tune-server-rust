@@ -86,6 +86,36 @@ commits_candidats() {
   done | sort -u
 }
 
+# Rend uniquement les refus qui peuvent viser l'issue en cours.
+#
+# Un commit de garde-fou ou de documentation peut citer textuellement le refus
+# porte par un AUTRE correctif. C'est le cas du commit qui corrige #2086 : son
+# paragraphe historique cite #1654 et #1657 puis reproduit « Ne ferme aucune des
+# deux issues ». Lire ce texte comme un veto sur #2086 rendrait le controle
+# impossible a satisfaire par son propre correctif.
+#
+# Regle conservative :
+# - un paragraphe sans numero d'issue reste un refus (cas du SHA explicitement
+#   cite dans une justification) ;
+# - un paragraphe qui cite l'issue courante reste un refus ;
+# - un paragraphe qui ne cite QUE d'autres issues est un recit, pas un veto sur
+#   l'issue courante.
+refus_pertinents() {
+  local message="$1" numero="${2:-}" paragraphe references
+
+  while IFS= read -r -d $'\034' paragraphe; do
+    printf '%s\n' "$paragraphe" | grep -qiE "$REFUS" || continue
+    references=$(printf '%s\n' "$paragraphe" | grep -oE '#[0-9]+' | sort -u || true)
+    if printf '%s\n' "$numero" | grep -qE '^[0-9]+$' \
+      && [ -n "$references" ] \
+      && ! printf '%s\n' "$references" | grep -qxF "#$numero"
+    then
+      continue
+    fi
+    printf '%s\n' "$paragraphe" | grep -iE "$REFUS" | head -2
+  done < <(printf '%s\n' "$message" | awk 'BEGIN { RS=""; ORS=sprintf("%c", 28) } { print }')
+}
+
 # Analyse un commentaire de fermeture. Ecrit son rapport sur STDOUT.
 #
 # `depot` permet aux cas de preuve de travailler sur un faux depot ; en usage
@@ -155,11 +185,11 @@ analyser() {
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     message=$(git -C "$depot" log -1 --format='%B' "$sha" 2>/dev/null)
-    if printf '%s\n' "$message" | grep -qiE "$REFUS"; then
+    extraits=$(refus_pertinents "$message" "${NUMERO_ISSUE:-}")
+    if [ -n "$extraits" ]; then
       # Une PR peut laisser dans l'historique le commit original et sa copie
       # rejouee avec un sujet suffixe par le numero de PR. Les lignes de refus
       # sont identiques : c'est un seul signal, pas deux.
-      extraits=$(printf '%s\n' "$message" | grep -iE "$REFUS" | head -2)
       empreinte=$(printf '%s' "$extraits" | git -C "$depot" hash-object --stdin)
       if printf '%s\n' "$empreintes_vues" | grep -qxF "$empreinte"; then
         continue
@@ -266,6 +296,34 @@ autotest() {
     printf '  ok    commit complet lie a l issue\n'
   else
     printf '  ECHEC commit complet lie a l issue (attendu 0, obtenu %d)\n' "$code"
+    echecs=$((echecs + 1))
+  fi
+
+  # Le correctif de #2086 cite les refus historiques de #1654/#1657 dans son
+  # propre message. Ce recit ne doit pas se transformer en veto sur #2086.
+  git -C "$depot_test" commit -q --allow-empty \
+    -m 'fix: garde des fermetures (#9993)' \
+    -m 'Incident : #1111 et #2222 citaient « Ne ferme aucune des deux issues ».'
+  NUMERO_ISSUE=9993 analyser 'Corrigé et vérifié.' "$depot_test" >/dev/null 2>&1
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    printf '  ok    refus historique visant d autres issues ignore\n'
+  else
+    printf '  ECHEC refus historique visant d autres issues ignore (attendu 0, obtenu %d)\n' "$code"
+    echecs=$((echecs + 1))
+  fi
+
+  # Si l'issue courante figure dans le paragraphe, les autres numeros ne
+  # diluent pas le refus : le veto reste applicable.
+  git -C "$depot_test" commit -q --allow-empty \
+    -m 'fix: traitement groupe (#9994)' \
+    -m 'Ne ferme pas #9994 ; #1111 est corrige mais ce chantier reste ouvert.'
+  NUMERO_ISSUE=9994 analyser 'Corrigé et vérifié.' "$depot_test" >/dev/null 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then
+    printf '  ok    refus visant l issue courante parmi plusieurs numeros\n'
+  else
+    printf '  ECHEC refus visant l issue courante parmi plusieurs numeros (attendu 1, obtenu %d)\n' "$code"
     echecs=$((echecs + 1))
   fi
 
