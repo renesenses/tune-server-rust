@@ -1,25 +1,85 @@
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
+
+use tokio::sync::Semaphore;
 use tracing::info;
 
-use super::traits::{OutputStatus, OutputTarget, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, TransportState};
 
-/// rust_cast opens a plain blocking `TcpStream` with no connect/read timeout:
-/// a Chromecast that vanished from the network (sleep, Wi-Fi drop — some flap
-/// every few minutes) turns that connect into a minutes-long hang that
-/// strands a blocking-pool thread. Probe with a bounded connect first so a
-/// dead host fails fast.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// One Cast operation gets one global budget: DNS, every address attempt,
+/// TLS and all protocol exchanges included.
+const CAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CAST_COMMAND_WORKERS: usize = 4;
+static CAST_COMMAND_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)));
 
-/// `true` when `host:port` accepts a TCP connection within `timeout`. Returns
-/// `true` on resolution failure so rust_cast surfaces the real error itself.
-fn probe_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool {
-    use std::net::{TcpStream, ToSocketAddrs};
-    match (host, port).to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => TcpStream::connect_timeout(&addr, timeout).is_ok(),
-            None => true,
-        },
-        Err(_) => true,
+fn remaining_budget(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "chromecast command deadline elapsed".to_string())
+}
+
+async fn resolve_cast_addresses(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
+
+    let mut addresses: Vec<_> = tokio::time::timeout(
+        remaining_budget(deadline)?,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| format!("chromecast resolution deadline elapsed for {host}"))?
+    .map_err(|error| format!("chromecast resolve {host}: {error}"))?
+    .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(format!("chromecast resolve {host}: no address"));
+    }
+    Ok(addresses)
+}
+
+async fn run_cast_command<T, F>(
+    host: String,
+    port: u16,
+    timeout: Duration,
+    slots: Arc<Semaphore>,
+    operation: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(rust_cast::CastDevice<'static>) -> Result<T, String> + Send + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    let permit = tokio::time::timeout(remaining_budget(deadline)?, slots.acquire_owned())
+        .await
+        .map_err(|_| "chromecast worker deadline elapsed".to_string())?
+        .map_err(|_| "chromecast worker pool closed".to_string())?;
+    let addresses = resolve_cast_addresses(&host, port, deadline).await?;
+    let worker = tokio::task::spawn_blocking(move || {
+        // A timed-out caller must not release capacity while its blocking
+        // worker is still alive. The deadline socket makes this finite.
+        let _permit = permit;
+        let device = rust_cast::CastDevice::connect_without_host_verification_with_deadline(
+            host, &addresses, deadline,
+        )
+        .map_err(|error| format!("chromecast connect: {error}"))?;
+        operation(device)
+    });
+
+    tokio::time::timeout(remaining_budget(deadline)?, worker)
+        .await
+        .map_err(|_| "chromecast command deadline elapsed".to_string())?
+        .map_err(|error| format!("chromecast worker: {error}"))?
 }
 
 /// Session déjà ouverte sur l'appareil pour l'application `app_id`, s'il y en
@@ -49,6 +109,8 @@ pub struct ChromecastOutput {
     device_id: String,
     host: String,
     port: u16,
+    command_timeout: Duration,
+    command_slots: Arc<Semaphore>,
 }
 
 impl ChromecastOutput {
@@ -58,7 +120,16 @@ impl ChromecastOutput {
             device_id,
             host,
             port,
+            command_timeout: CAST_COMMAND_TIMEOUT,
+            command_slots: Arc::clone(&CAST_COMMAND_SLOTS),
         }
+    }
+
+    #[cfg(test)]
+    fn with_command_limits(mut self, timeout: Duration, slots: Arc<Semaphore>) -> Self {
+        self.command_timeout = timeout;
+        self.command_slots = slots;
+        self
     }
 }
 
@@ -74,6 +145,10 @@ impl OutputTarget for ChromecastOutput {
 
     fn output_type(&self) -> &str {
         "chromecast"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, false)
     }
 
     /// Chromecast does not consume `set_next_media` (no cast-queue / autoplay
@@ -109,11 +184,10 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         let name = self.name.clone();
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
 
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("chromecast connect: {e}"))?;
-
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -183,16 +257,14 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))??;
-        Ok(())
     }
 
     async fn pause(&self) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("connect: {e}"))?;
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -221,15 +293,14 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn resume(&self) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("connect: {e}"))?;
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -258,15 +329,14 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn stop(&self) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("connect: {e}"))?;
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -284,16 +354,15 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
         let position_secs = position_ms as f32 / 1000.0;
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("connect: {e}"))?;
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -326,16 +395,15 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
         let level = volume as f32;
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("connect: {e}"))?;
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -350,15 +418,14 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
-        tokio::task::spawn_blocking(move || {
-            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                .map_err(|e| format!("connect: {e}"))?;
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
                 .connect("receiver-0")
@@ -373,24 +440,18 @@ impl OutputTarget for ChromecastOutput {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
         let host = self.host.clone();
         let port = self.port;
-        tokio::task::spawn_blocking(move || {
-            if !probe_reachable(&host, port, PROBE_TIMEOUT) {
-                return Ok(OutputStatus::default());
-            }
-            let device = match rust_cast::CastDevice::connect_without_host_verification(&host, port)
-            {
-                Ok(d) => d,
-                Err(_) => return Ok(OutputStatus::default()),
-            };
-            if device.connection.connect("receiver-0").is_err() {
-                return Ok(OutputStatus::default());
-            }
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
+            device
+                .connection
+                .connect("receiver-0")
+                .map_err(|e| format!("connect receiver: {e}"))?;
 
             let recv_status = device
                 .receiver
@@ -409,26 +470,15 @@ impl OutputTarget for ChromecastOutput {
                 });
             };
 
-            if device.connection.connect(&app.transport_id).is_err() {
-                return Ok(OutputStatus {
-                    ended_naturally: false,
-                    volume,
-                    muted,
-                    ..Default::default()
-                });
-            }
+            device
+                .connection
+                .connect(&app.transport_id)
+                .map_err(|e| format!("connect transport: {e}"))?;
 
-            let media_status = match device.media.get_status(&app.transport_id, None) {
-                Ok(s) => s,
-                Err(_) => {
-                    return Ok(OutputStatus {
-                        ended_naturally: false,
-                        volume,
-                        muted,
-                        ..Default::default()
-                    });
-                }
-            };
+            let media_status = device
+                .media
+                .get_status(&app.transport_id, None)
+                .map_err(|e| format!("media status: {e}"))?;
 
             let Some(entry) = media_status.entries.first() else {
                 return Ok(OutputStatus {
@@ -488,60 +538,178 @@ impl OutputTarget for ChromecastOutput {
             })
         })
         .await
-        .map_err(|e| format!("spawn: {e}"))?
     }
 
     async fn is_available(&self) -> bool {
         let host = self.host.clone();
         let port = self.port;
-        tokio::task::spawn_blocking(move || {
-            probe_reachable(&host, port, PROBE_TIMEOUT)
-                && rust_cast::CastDevice::connect_without_host_verification(&host, port).is_ok()
+        let timeout = self.command_timeout;
+        let slots = Arc::clone(&self.command_slots);
+        run_cast_command(host, port, timeout, slots, move |device| {
+            device
+                .connection
+                .connect("receiver-0")
+                .map_err(|e| format!("connect receiver: {e}"))?;
+            device
+                .receiver
+                .get_status()
+                .map_err(|e| format!("status: {e}"))?;
+            Ok(())
         })
         .await
-        .unwrap_or(false)
+        .is_ok()
     }
 }
 
 #[cfg(test)]
-mod probe_tests {
+mod deadline_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
 
-    #[test]
-    fn reachable_host_probes_true() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn silent_tcp_peer() -> (
+        u16,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(probe_reachable(
-            "127.0.0.1",
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let active_for_task = Arc::clone(&active);
+        let maximum_for_task = Arc::clone(&maximum);
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let active = Arc::clone(&active_for_task);
+                let maximum = Arc::clone(&maximum_for_task);
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut bytes = [0u8; 1024];
+                    while socket.read(&mut bytes).await.unwrap_or(0) != 0 {}
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (port, active, maximum, task)
+    }
+
+    fn test_output(port: u16, timeout: Duration, slots: Arc<Semaphore>) -> ChromecastOutput {
+        ChromecastOutput::new(
+            "Cast silencieux".into(),
+            "cast-silencieux".into(),
+            "127.0.0.1".into(),
             port,
-            std::time::Duration::from_millis(500)
-        ));
+        )
+        .with_command_limits(timeout, slots)
     }
 
     #[test]
-    fn dead_host_probes_false_fast() {
-        // Bind then drop: the port is closed, connect is refused immediately.
-        let port = {
+    fn la_connexion_essaie_toutes_les_adresses_dans_le_budget() {
+        let closed_port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let start = std::time::Instant::now();
-        assert!(!probe_reachable(
-            "127.0.0.1",
-            port,
-            std::time::Duration::from_millis(500)
-        ));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], closed_port)),
+            listener.local_addr().unwrap(),
+        ];
+
+        let device = rust_cast::CastDevice::connect_without_host_verification_with_deadline(
+            "127.0.0.1".into(),
+            &addresses,
+            Instant::now() + Duration::from_millis(500),
+        );
+        assert!(device.is_ok(), "la seconde adresse doit etre essayee");
     }
 
-    #[test]
-    fn unresolvable_host_falls_through_true() {
-        // rust_cast must surface the real error itself.
-        assert!(probe_reachable(
-            "definitely-not-a-real-host.invalid",
+    #[tokio::test]
+    async fn toutes_les_commandes_expirent_sur_un_pair_tcp_silencieux() {
+        let (port, _active, _maximum, server) = silent_tcp_peer().await;
+        let output = test_output(
+            port,
+            Duration::from_millis(80),
+            Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
+        );
+        let start = Instant::now();
+
+        assert!(
+            output
+                .play_url(
+                    "http://127.0.0.1/audio.flac",
+                    "audio/flac",
+                    Some("Temoin"),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(output.pause().await.is_err());
+        assert!(output.resume().await.is_err());
+        assert!(output.stop().await.is_err());
+        assert!(output.seek(1_000).await.is_err());
+        assert!(output.set_volume(0.5).await.is_err());
+        assert!(output.set_mute(true).await.is_err());
+        assert!(output.get_status().await.is_err());
+        assert!(!output.is_available().await);
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "neuf commandes bornees ne doivent jamais immobiliser le serveur"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn les_workers_cast_restent_bornes_quand_les_pairs_ne_repondent_pas() {
+        let (port, active, maximum, server) = silent_tcp_peer().await;
+        let slots = Arc::new(Semaphore::new(2));
+        let outputs: Vec<_> = (0..8)
+            .map(|_| test_output(port, Duration::from_millis(200), Arc::clone(&slots)))
+            .collect();
+
+        let results = futures_util::future::join_all(outputs.iter().map(|o| o.get_status())).await;
+        assert!(results.iter().all(Result::is_err));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("les workers doivent rendre leur permis apres la deadline");
+        assert!(maximum.load(Ordering::SeqCst) <= 2);
+        assert_eq!(slots.available_permits(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resolution_impossible_ne_retombe_pas_sur_un_connect_non_borne() {
+        let output = ChromecastOutput::new(
+            "Cast introuvable".into(),
+            "cast-introuvable".into(),
+            "definitely-not-a-real-host.invalid".into(),
             8009,
-            std::time::Duration::from_millis(500)
-        ));
+        )
+        .with_command_limits(Duration::from_millis(200), Arc::new(Semaphore::new(1)));
+        let start = Instant::now();
+        assert!(output.get_status().await.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn adresse_non_routable_echoue_dans_le_budget_global() {
+        let output = ChromecastOutput::new(
+            "Cast blackhole".into(),
+            "cast-blackhole".into(),
+            "192.0.2.1".into(),
+            8009,
+        )
+        .with_command_limits(Duration::from_millis(150), Arc::new(Semaphore::new(1)));
+        let start = Instant::now();
+        assert!(output.pause().await.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
 

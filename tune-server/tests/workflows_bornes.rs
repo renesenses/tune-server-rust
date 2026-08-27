@@ -222,6 +222,14 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
             "job du noyau {nom} differe a tort jusqu'a l'integration du lot"
         );
     }
+
+    for nom in ["test", "clippy"] {
+        assert!(
+            corps(nom)
+                .contains("-p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server"),
+            "job {nom} : les crates HTTP extraites ne sont plus testees explicitement"
+        );
+    }
     for nom in [
         "test-shipped-features",
         "audio-embedding",

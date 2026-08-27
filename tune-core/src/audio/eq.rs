@@ -1,12 +1,24 @@
 //! Parametric equalizer for the Tune Master Profiler.
 //!
 //! 3-band EQ using biquad filters (Robert Bristow-Johnson Audio EQ Cookbook):
-//! - Low shelf (60-80 Hz) — bass resonance correction
+//! - Low shelf (60-80 Hz) — bass weight
 //! - Mid peak (1-3 kHz) — voice presence/clarity
 //! - High shelf (10-12 kHz) — treble air/brightness
 //!
-//! Processing is done in f64 for bit-perfect quality. The EQ profile is
-//! stored per-zone and applied in the PCM pipeline before output.
+//! Coefficients and filter state are computed in f64. That is a claim about
+//! ARITHMETIC precision and nothing else: the biquad accumulators stay far
+//! below the noise floor of 16- and 24-bit material, so the filter adds no
+//! audible rounding of its own. It is NOT a claim of bit-perfection — an
+//! active equalizer modifies every sample, by design, whatever the width of
+//! its accumulators. The two properties are independent and Tune must not
+//! trade the wording of one for the other (#2213): the signal-path panel
+//! already flips `bit_perfect` to false as soon as the EQ alters the signal
+//! (`tune-server/src/routes/zones.rs`, `zone_eq_alters_signal`). Disabled — or
+//! in PURE mode, where the processor is never built — this stage is a strict
+//! identity and the samples pass through untouched.
+//!
+//! The EQ profile is stored per-zone and applied in the PCM pipeline before
+//! output.
 
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -153,10 +165,10 @@ pub enum SpeakerPlacement {
 }
 
 impl EqProfile {
-    /// Compute the effective gain for each band, combining the room correction
-    /// preset with the user's perceptual adjustments.
+    /// Compute the effective gain for each band, combining the environment
+    /// tone preset with the user's perceptual adjustments.
     pub fn effective_gains(&self) -> (f64, f64, f64) {
-        let (base_bass, base_mid, base_treble) = self.room_correction_preset();
+        let (base_bass, base_mid, base_treble) = self.environment_tone_preset();
         (
             base_bass + self.bass_gain_db,
             base_mid + self.mid_gain_db,
@@ -164,9 +176,27 @@ impl EqProfile {
         )
     }
 
-    /// Room correction preset based on macro environment settings.
+    /// Tone preset for the DECLARED listening environment.
     /// Returns (bass_db, mid_db, treble_db) offsets.
-    fn room_correction_preset(&self) -> (f64, f64, f64) {
+    ///
+    /// Six hard-coded tilts, chosen from two enums the listener picks in a
+    /// three-question wizard — room size and speaker placement — plus a
+    /// headphone case. **Nothing is measured here.** No microphone, no sweep,
+    /// no impulse response, no frequency response of the room or of the
+    /// speakers ever reaches this function; two rooms answering the same three
+    /// questions get the same three numbers.
+    ///
+    /// The name this function carried until #2213 promised something the code
+    /// does not do. In audiophile usage, "room correction" means a filter
+    /// DERIVED FROM AN ACOUSTIC MEASUREMENT — which Tune does offer,
+    /// elsewhere: `crate::room_correction` stores a `RoomProfile` with its
+    /// `measurement_data`, and `crate::audio::convolver` convolves a WAV
+    /// impulse response exported from REW, Acourate or Audiolense. Those
+    /// deserve the term; this table does not.
+    ///
+    /// What it is worth is stated plainly: a sane starting tilt for a stated
+    /// environment, to be finished by ear with the three sliders.
+    fn environment_tone_preset(&self) -> (f64, f64, f64) {
         if self.listening == ListeningMode::Headphones {
             // Headphones: slight bass boost for missing physical impact,
             // slight treble rolloff for reduced fatigue
@@ -674,17 +704,17 @@ mod tests {
     }
 
     #[test]
-    fn room_correction_presets() {
+    fn environment_tone_presets() {
         let mut p = EqProfile::default();
 
         p.room_size = RoomSize::Small;
         p.speaker_placement = SpeakerPlacement::NearWall;
-        let (bass, _, _) = p.room_correction_preset();
+        let (bass, _, _) = p.environment_tone_preset();
         assert!(bass < 0.0, "small room near wall should cut bass");
 
         p.room_size = RoomSize::Large;
         p.speaker_placement = SpeakerPlacement::FreeStanding;
-        let (bass, _, treble) = p.room_correction_preset();
+        let (bass, _, treble) = p.environment_tone_preset();
         assert!(bass > 0.0, "large room freestanding should boost bass");
         assert!(treble > 0.0, "large room should boost treble");
     }

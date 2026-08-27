@@ -463,6 +463,79 @@ pub(crate) fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// Base de temps du cadencement OAAT.
+///
+/// PCM et FLAC avancent avec un nombre de samples. Seul un flux dont le débit
+/// en octets est réellement constant — le porteur DSD — peut être cadencé
+/// depuis les octets envoyés. Le type rend ce choix visible à chaque appel et
+/// empêche de remettre FLAC dans la branche octets par commodité (#2214).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BaseDeTempsOaat {
+    Samples,
+    OctetsADebitConstant,
+}
+
+pub(super) fn duree_audio_envoyee(
+    base: BaseDeTempsOaat,
+    sample_offset: u64,
+    byte_offset: u64,
+    sample_rate: u32,
+    bytes_per_frame: usize,
+) -> std::time::Duration {
+    let (unites, unites_par_seconde) = match base {
+        BaseDeTempsOaat::Samples => (sample_offset as u128, sample_rate as u128),
+        BaseDeTempsOaat::OctetsADebitConstant => (
+            byte_offset as u128,
+            sample_rate as u128 * bytes_per_frame as u128,
+        ),
+    };
+    if unites_par_seconde == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let nanos = unites
+        .saturating_mul(1_000_000_000)
+        .checked_div(unites_par_seconde)
+        .unwrap_or(0)
+        .min(u64::MAX as u128) as u64;
+    std::time::Duration::from_nanos(nanos)
+}
+
+#[cfg(test)]
+mod tests_cadencement_oaat {
+    use super::{BaseDeTempsOaat, duree_audio_envoyee};
+
+    #[test]
+    fn la_duree_flac_depend_des_samples_pas_de_la_taille_compressee() {
+        let depuis_petit_corps =
+            duree_audio_envoyee(BaseDeTempsOaat::Samples, 44_100, 4_096, 44_100, 4);
+        let depuis_gros_corps =
+            duree_audio_envoyee(BaseDeTempsOaat::Samples, 44_100, 4_000_000, 44_100, 4);
+
+        assert_eq!(depuis_petit_corps, std::time::Duration::from_secs(1));
+        assert_eq!(depuis_gros_corps, depuis_petit_corps);
+    }
+
+    #[test]
+    fn le_porteur_dsd_conserve_son_horloge_a_debit_octets_constant() {
+        let duree = duree_audio_envoyee(
+            BaseDeTempsOaat::OctetsADebitConstant,
+            99,
+            1_152_000,
+            192_000,
+            6,
+        );
+        assert_eq!(duree, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn une_cadence_inconnue_ne_divise_jamais_par_zero() {
+        assert_eq!(
+            duree_audio_envoyee(BaseDeTempsOaat::Samples, 1, 0, 0, 0),
+            std::time::Duration::ZERO
+        );
+    }
+}
+
 /// Process-wide OAAT clock sync responder port (one clock master identity
 /// for the whole server). Bound once on first use; answers endpoint-initiated
 /// exchanges (OAAT RFC §6.2) so endpoints can PTS-schedule playback against

@@ -1472,6 +1472,73 @@ fn may_reanchor(
     legacy_id != new_id && !new_id_taken && zone_name == dev_name
 }
 
+/// Pourquoi chaque fournisseur de sortie hors-arbre est actif ou inerte.
+///
+/// #2392 : un module payant sans droit se retirait sans un mot. Vu de
+/// l'extérieur, « non licencié », « non compilé » et « aucun appareil trouvé »
+/// donnaient le même écran vide, et un bêta-testeur du module Diretta a
+/// réinstallé Fedora, changé de système de fichiers et recompilé trente
+/// minutes durant avant d'écrire « Je ne sais que faire ! ».
+///
+/// Cet instantané est lu par `/system/diagnostics`. Il tranche les trois cas :
+/// un fournisseur **absent de la liste** n'est pas compilé ; un fournisseur
+/// présent avec un `refusal` manque d'un droit, et le refus dit lequel et quoi
+/// faire ; un fournisseur présent sans refus et à `devices: 0` cherche
+/// vraiment et ne trouve rien.
+///
+/// Même motif que [`crate::boot_status`] : un état global minuscule, écrit par
+/// la boucle qui le connaît, lu par la route qui l'affiche.
+static STATUT_FOURNISSEURS: std::sync::LazyLock<std::sync::Mutex<serde_json::Value>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(serde_json::Value::Null));
+
+/// L'instantané courant, pour `/system/diagnostics`. `null` tant qu'aucune
+/// passe n'a eu lieu — y compris quand le binaire n'embarque aucun
+/// fournisseur hors-arbre, ce qui est déjà une réponse.
+pub fn provider_status_snapshot() -> serde_json::Value {
+    STATUT_FOURNISSEURS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// L'état d'UN fournisseur après une passe de découverte.
+///
+/// Isolé du monde (pas de base, pas de réseau) pour être testable : c'est ici
+/// que le silence de #2392 devient une raison nommée.
+fn statut_du_fournisseur(
+    nom: &str,
+    module_requis: Option<&str>,
+    appareils: usize,
+    modules_licencies: &[String],
+    compte_lie: bool,
+) -> serde_json::Value {
+    // Un fournisseur libre n'exige aucun droit : il ne peut donc pas être
+    // refusé, et le nombre d'appareils reste le seul fait à lire.
+    let refus = module_requis.and_then(|module| {
+        let possede = modules_licencies.iter().any(|m| m == module);
+        crate::premium_guard::ModuleRefusal::evaluate(possede, compte_lie)
+            .map(|raison| raison.to_json(module))
+    });
+
+    serde_json::json!({
+        "provider": nom,
+        "required_module": module_requis,
+        "devices": appareils,
+        "refusal": refus,
+    })
+}
+
+/// Un jeton de compte est-il stocké ? C'est la condition exacte sous laquelle
+/// `refresh_account_premium` (`background.rs:1177`) sort sans rien faire et
+/// sans rien dire, laissant `licensed_modules` vide à jamais.
+fn compte_mozaik_lie(db: &Arc<dyn DbBackend>) -> bool {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("mozaik_access_token")
+        .ok()
+        .flatten()
+        .is_some_and(|t| !t.is_empty())
+}
+
 pub fn spawn_output_providers(
     state: &AppState,
     providers: Vec<Arc<dyn tune_core::outputs::traits::OutputProvider>>,
@@ -1492,8 +1559,18 @@ pub fn spawn_output_providers(
             let ctx = tune_core::outputs::traits::ProviderContext {
                 licensed_modules: license.modules().await,
             };
+            let compte_lie = compte_mozaik_lie(&db);
+            let mut statuts = Vec::with_capacity(providers.len());
             for provider in &providers {
-                for output in provider.discover(&ctx).await {
+                let trouves = provider.discover(&ctx).await;
+                statuts.push(statut_du_fournisseur(
+                    provider.provider_name(),
+                    provider.required_module(),
+                    trouves.len(),
+                    &ctx.licensed_modules,
+                    compte_lie,
+                ));
+                for output in trouves {
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
                     let otype = output.output_type().to_string();
@@ -1583,14 +1660,115 @@ pub fn spawn_output_providers(
                     }
                 }
             }
+            publier_statut_fournisseurs(statuts, &ctx.licensed_modules, compte_lie);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 }
 
+/// Publie l'instantané et **journalise ce qui a changé**, au-dessus de
+/// `debug`.
+///
+/// « Une fois » compte autant que « au-dessus de `debug` » : la boucle repasse
+/// toutes les soixante secondes, et un avertissement répété mille fois par
+/// nuit se fait filtrer comme du bruit — donc redevient invisible, ce qui est
+/// le défaut qu'on corrige. On ne réémet donc que sur changement réel
+/// (démarrage, compte lié, module acheté, remboursement).
+fn publier_statut_fournisseurs(
+    statuts: Vec<serde_json::Value>,
+    modules_licencies: &[String],
+    compte_lie: bool,
+) {
+    let instantane = serde_json::json!({
+        "account_linked": compte_lie,
+        "licensed_modules": modules_licencies,
+        "providers": statuts,
+    });
+
+    let change = {
+        let mut courant = STATUT_FOURNISSEURS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `null` = première passe : on parle toujours au démarrage.
+        let change = courant.is_null()
+            || refus_nommes(&courant) != refus_nommes(&instantane)
+            || courant["account_linked"] != instantane["account_linked"];
+        *courant = instantane;
+        change
+    };
+
+    if !change {
+        return;
+    }
+
+    // Le résumé de démarrage. Il vaut même quand AUCUN fournisseur ne déclare
+    // encore `required_module()` : un binaire qui embarque un fournisseur
+    // hors-arbre — donc, en pratique, un module payant — et qui tourne sans
+    // compte lié ne recevra jamais le moindre droit. C'est très exactement la
+    // configuration du bêta-testeur de #2392, et rien ne la disait.
+    let instantane = provider_status_snapshot();
+    let noms: Vec<&str> = instantane["providers"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|p| p["provider"].as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if compte_lie {
+        info!(
+            providers = ?noms,
+            licensed_modules = ?modules_licencies,
+            "output_providers_status"
+        );
+    } else {
+        warn!(
+            providers = ?noms,
+            "output_providers_no_linked_account: no Mozaiklabs account is linked, so no paid module entitlement can reach this server — a module you own stays idle until the account is connected (a license key alone never carries it)"
+        );
+    }
+
+    for (fournisseur, code, message) in refus_nommes(&instantane) {
+        warn!(
+            provider = %fournisseur,
+            code = %code,
+            account_linked = compte_lie,
+            "output_provider_module_refused: {message}"
+        );
+    }
+}
+
+/// Les refus nommés d'un instantané : `(fournisseur, code, message)`.
+fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)> {
+    instantane["providers"]
+        .as_array()
+        .map(|liste| {
+            liste
+                .iter()
+                .filter_map(|p| {
+                    let refus = p.get("refusal")?.as_object()?;
+                    Some((
+                        p["provider"].as_str().unwrap_or_default().to_string(),
+                        refus.get("code")?.as_str().unwrap_or_default().to_string(),
+                        refus
+                            .get("message")?
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{find_cross_protocol_zone_conflict, may_reanchor, resolve_control_url};
+    use super::{
+        find_cross_protocol_zone_conflict, may_reanchor, refus_nommes, resolve_control_url,
+        statut_du_fournisseur,
+    };
     use tune_core::db::zone_repo::Zone;
 
     fn zone(name: &str, output_type: &str, device_id: &str) -> Zone {
@@ -2154,5 +2332,97 @@ mod tests {
                 assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()), "{loc}");
             }
         }
+    }
+
+    /// #2392, le cas du bêta-testeur Diretta : le fournisseur EST compilé et
+    /// enregistré, son droit est acheté, mais aucun compte n'est lié — donc
+    /// `licensed_modules` est vide et le fournisseur se retire sans un mot.
+    ///
+    /// Le diagnostic doit nommer la raison ET le geste qui la lève. Sans ça,
+    /// « pas de droit » est indiscernable de « rien sur le réseau », et c'est
+    /// une réinstallation complète de système d'exploitation qui se déclenche.
+    #[test]
+    fn un_fournisseur_paye_sans_compte_lie_dit_pourquoi_il_est_inerte() {
+        let statut = statut_du_fournisseur("diretta", Some("diretta"), 0, &[], false);
+
+        assert_eq!(statut["provider"], "diretta");
+        assert_eq!(statut["required_module"], "diretta");
+        assert_eq!(
+            statut["refusal"]["code"], "module_account_not_linked",
+            "le diagnostic doit nommer la raison, pas la taire : {statut}"
+        );
+        assert_eq!(statut["refusal"]["action"], "link_account");
+        assert_eq!(statut["refusal"]["module"], "diretta");
+    }
+
+    /// Compte bien lié, module non acheté : même écran vide, autre geste. Les
+    /// deux causes doivent rester distinctes côté client.
+    #[test]
+    fn un_fournisseur_paye_avec_compte_lie_mais_non_achete_dit_autre_chose() {
+        let statut = statut_du_fournisseur("diretta", Some("diretta"), 0, &[], true);
+        assert_eq!(statut["refusal"]["code"], "module_not_owned");
+        assert_eq!(statut["refusal"]["action"], "purchase_module");
+    }
+
+    /// Droit présent : aucun refus, et le compte d'appareils devient le seul
+    /// fait à lire — c'est ce qui sépare « pas de droit » de « rien trouvé ».
+    #[test]
+    fn un_fournisseur_licencie_ne_refuse_rien_et_rend_compte_de_sa_recherche() {
+        let licencies = vec!["diretta".to_string()];
+        let vide = statut_du_fournisseur("diretta", Some("diretta"), 0, &licencies, true);
+        assert!(
+            vide["refusal"].is_null(),
+            "un module possede ne doit pas etre presente comme refuse : {vide}"
+        );
+        assert_eq!(vide["devices"], 0);
+
+        let trouve = statut_du_fournisseur("diretta", Some("diretta"), 2, &licencies, true);
+        assert!(trouve["refusal"].is_null());
+        assert_eq!(trouve["devices"], 2);
+    }
+
+    /// Un fournisseur libre (le défaut du contrat : `required_module() == None`)
+    /// n'est jamais refusé, même sans compte lié — sinon le correctif
+    /// inventerait un refus là où il n'y en a pas.
+    #[test]
+    fn un_fournisseur_libre_nest_jamais_refuse() {
+        let statut = statut_du_fournisseur("snapcast", None, 0, &[], false);
+        assert!(statut["required_module"].is_null());
+        assert!(
+            statut["refusal"].is_null(),
+            "aucun droit exige, donc aucun refus : {statut}"
+        );
+    }
+
+    /// Le journal n'est réémis que lorsque l'ensemble des refus CHANGE — la
+    /// boucle repasse toutes les soixante secondes, et un avertissement répété
+    /// mille fois par nuit se fait filtrer comme du bruit, c'est-à-dire
+    /// redevient le silence qu'on corrige. C'est `refus_nommes` qui tranche.
+    #[test]
+    fn les_refus_se_comparent_pour_ne_pas_rejournaliser_a_chaque_passe() {
+        let passe = |compte_lie| {
+            serde_json::json!({
+                "providers": [
+                    statut_du_fournisseur("diretta", Some("diretta"), 0, &[], compte_lie),
+                    statut_du_fournisseur("snapcast", None, 1, &[], compte_lie),
+                ]
+            })
+        };
+
+        let refus = refus_nommes(&passe(false));
+        assert_eq!(
+            refus.len(),
+            1,
+            "seul le fournisseur paye est refuse : {refus:?}"
+        );
+        assert_eq!(refus[0].0, "diretta");
+        assert_eq!(refus[0].1, "module_account_not_linked");
+
+        // Deux passes identiques : rien de neuf à dire.
+        assert_eq!(refus_nommes(&passe(false)), refus);
+        // Le compte se lie : la raison change, donc on reparle.
+        assert_ne!(refus_nommes(&passe(true)), refus);
+        // Et un instantané vide (aucune passe encore) ne refuse rien.
+        assert!(refus_nommes(&serde_json::Value::Null).is_empty());
     }
 }

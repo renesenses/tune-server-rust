@@ -10,7 +10,11 @@ use rubato::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::traits::{OutputStatus, OutputTarget, TransportState};
+use super::traits::{
+    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+};
+#[cfg(any(target_os = "windows", test))]
+use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
 use crate::poller::TRACK_END_NOTIFY;
 
 /// Why a device refused to open, as far as the backend string lets us tell.
@@ -112,9 +116,20 @@ impl OpenFailure {
 
 /// Select the cpal host based on the requested backend.
 ///
-/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only)
+/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only).
+///   Falls back to WASAPI, with a warning, if the host cannot be opened or
+///   exposes no output device.
 /// - `"wasapi"`: use the default host (WASAPI on Windows)
-/// - `"auto"` (default): try ASIO first if available, fall back to default
+/// - `"auto"` (default): use WASAPI directly. **`auto` never probes ASIO.**
+/// - anything else: treated like `"wasapi"`.
+///
+/// `auto` used to try ASIO first; it no longer does, since #199. Probing an
+/// ASIO driver can make it call `abort()` and take the whole process down
+/// without a trace, so the only way to reach ASIO is to ask for it by name.
+/// Getting ASIO therefore takes a deliberate setting — see
+/// [`crate::config::LOCAL_AUDIO_BACKEND_ENV`]. A machine whose ASIO drivers
+/// are detected and listed by `/audio/asio-devices` is still playing through
+/// WASAPI as long as the backend is left on `auto`: detecting is not playing.
 ///
 /// On non-Windows platforms, always returns `cpal::default_host()`.
 pub fn select_host(backend: &str) -> cpal::Host {
@@ -156,7 +171,9 @@ pub fn select_host(backend: &str) -> cpal::Host {
             "auto" => {
                 // Auto mode uses WASAPI directly — ASIO drivers can call
                 // abort() when probed, crashing the process silently.
-                // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
+                // Users who want ASIO must set TUNE_LOCAL_AUDIO_BACKEND=asio
+                // (the canonical name; the older TUNE_AUDIO_BACKEND is still
+                // honoured as a fallback, but should not be recommended).
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
                 note_observed_backend("WASAPI");
                 return cpal::default_host();
@@ -500,7 +517,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 let endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
 
                 // Skip ALSA null/dummy sinks that produce no audio
-                if raw_name.contains("Discard all samples") || raw_name.contains("Dummy") {
+                if is_null_sink(&raw_name) {
                     debug!(device = %raw_name, "local_audio_device_skipped_null_sink");
                     continue;
                 }
@@ -594,19 +611,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
                 // Disambiguate duplicate device names (common on Windows WASAPI
                 // where multiple USB DACs all show as "Haut-Parleurs").
-                let name = if seen_names.contains(&raw_name) {
-                    let mut n = 2;
-                    loop {
-                        let candidate = format!("{raw_name} ({n})");
-                        if !seen_names.contains(&candidate) {
-                            break candidate;
-                        }
-                        n += 1;
-                    }
-                } else {
-                    raw_name.clone()
-                };
-                seen_names.insert(name.clone());
+                let name = disambiguate_display_name(&raw_name, &mut seen_names);
 
                 info!(
                     device = %name,
@@ -755,7 +760,10 @@ pub struct LocalOutput {
     /// Stable backend endpoint captured at discovery. The public registry ID
     /// remains compatible (`local:<display name>`), while exclusive WASAPI
     /// opens this exact IMMDevice instead of resolving the name again.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    ///
+    /// Toutes plateformes désormais : `find_device_with_fallback` le consulte
+    /// **avant** le nom, seule façon de survivre à un renommage (#2269) et de
+    /// ne pas confondre deux périphériques homonymes (#2272).
     endpoint_id: Option<String>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -904,6 +912,13 @@ pub struct LocalOutput {
     /// and it changes what the volume slider does on a DSD track — it is
     /// tracked separately rather than smuggled in here.
     dop_active: Arc<AtomicBool>,
+    /// Dernier contrat réellement observé avant le callback du backend.
+    ///
+    /// Les boucles Windows savent déjà si elles publient des mots entiers
+    /// natifs ou repassent par f32, et si volume/DSP ont modifié le buffer.
+    /// Cette case rend ce verdict lisible hors du fil de rendu au lieu de le
+    /// perdre après le journal `windows_exclusive_signal_contract`.
+    signal_path_status: Arc<std::sync::Mutex<Option<OutputSignalPathStatus>>>,
     /// Set by the playback thread when the audio device refuses to open, so
     /// the poller can stop the zone and tell the user on the very next tick
     /// instead of waiting out the stall heuristics. Cleared on every
@@ -1052,6 +1067,7 @@ impl LocalOutput {
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
+            signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -2653,6 +2669,121 @@ fn local_dsp_is_identity(
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn local_dsp_runtime_state(
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    dop: bool,
+) -> OutputDspState {
+    if dop {
+        return OutputDspState::BypassedDop;
+    }
+    if pure_bypass.load(Ordering::Relaxed) {
+        return OutputDspState::BypassedPure;
+    }
+    let (Ok(eq), Ok(convolver), Ok(crossfeed)) = (eq.lock(), convolver.lock(), crossfeed.lock())
+    else {
+        return OutputDspState::Unknown;
+    };
+    if eq.is_some() || convolver.is_some() || crossfeed.is_some() {
+        OutputDspState::Applied
+    } else {
+        OutputDspState::Inactive
+    }
+}
+
+/// Compose le verdict exact que le producteur remet au callback Windows.
+///
+/// Le callback entier ne fait que sérialiser les mots ; le callback flottant
+/// ne peut jamais garantir leurs bits. Sur le chemin entier, volume et DSP
+/// décident si le producteur peut conserver les octets source ou doit faire un
+/// aller-retour en espace flottant. DoP force les deux contournements à
+/// l'unité : toucher son marqueur rendrait le flux illisible par le DAC.
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn windows_signal_path_status(
+    native_transport: bool,
+    dop: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> OutputSignalPathStatus {
+    let sample_transport = if native_transport {
+        OutputSampleTransport::NativeInteger
+    } else {
+        OutputSampleTransport::Float
+    };
+    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, dop);
+    let volume = if dop {
+        OutputVolumeState::BypassedDop
+    } else if volume_units == 1000 {
+        OutputVolumeState::Unity
+    } else {
+        OutputVolumeState::Applied
+    };
+
+    let mut reasons = Vec::new();
+    if !native_transport {
+        reasons.push(OutputSignalReason::FloatTransport);
+    }
+    match dsp {
+        OutputDspState::Applied => reasons.push(OutputSignalReason::DspApplied),
+        OutputDspState::Unknown => reasons.push(OutputSignalReason::DspStateUnknown),
+        OutputDspState::Inactive | OutputDspState::BypassedPure | OutputDspState::BypassedDop => {}
+    }
+    if volume == OutputVolumeState::Applied {
+        reasons.push(OutputSignalReason::SoftwareVolume);
+    }
+
+    OutputSignalPathStatus {
+        bit_perfect: reasons.is_empty(),
+        sample_transport,
+        dsp,
+        volume,
+        reasons,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn publish_windows_signal_path_status(
+    slot: &std::sync::Mutex<Option<OutputSignalPathStatus>>,
+    observed_bit_perfect: bool,
+    native_transport: bool,
+    dop: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> OutputSignalPathStatus {
+    let mut status = windows_signal_path_status(
+        native_transport,
+        dop,
+        volume_units,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+    );
+    // Le verdict du producteur est autoritaire : il a choisi la branche raw
+    // ou flottante pour CE buffer. La lecture des verrous ci-dessus décrit
+    // l'état courant et peut croiser une mise à jour à chaud juste après ce
+    // choix ; elle ne doit jamais transformer un verdict négatif en promesse.
+    status.bit_perfect = observed_bit_perfect;
+    if !observed_bit_perfect && status.reasons.is_empty() {
+        status.reasons.push(OutputSignalReason::DspStateUnknown);
+    }
+    if let Ok(mut current) = slot.lock() {
+        *current = Some(status.clone());
+    }
+    status
+}
+
+#[cfg(any(target_os = "windows", test))]
 struct PreparedNativePcm {
     samples: Vec<i32>,
     dop: bool,
@@ -2728,6 +2859,17 @@ impl OutputTarget for LocalOutput {
 
     fn output_type(&self) -> &str {
         "local"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(
+            true,
+            true,
+            true,
+            true,
+            true,
+            self.supports_internal_gapless(),
+        )
     }
 
     /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop
@@ -2882,13 +3024,20 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.open_failure.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.signal_path_status.lock() {
+            *slot = None;
+        }
         let open_failure = self.open_failure.clone();
+        #[cfg(target_os = "windows")]
+        let signal_path_status = self.signal_path_status.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
         let track_ended_generation = self.track_ended_generation.clone();
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
-        #[cfg(target_os = "windows")]
+        // Plus seulement pour WASAPI exclusif (#2207) : le chemin CPAL partagé
+        // s'en sert désormais pour retrouver un périphérique renommé (#2269) et
+        // pour ne pas confondre deux homonymes (#2272).
         let endpoint_id = self.endpoint_id.clone();
         let url = url.to_string();
         let playing = self.playing.clone();
@@ -3056,7 +3205,8 @@ impl OutputTarget for LocalOutput {
                 let decoded_len = decoded_samples.len();
 
                 let host = select_host(&audio_backend);
-                let Some((device, fell_back)) = find_device_with_fallback(&host, &device_name)
+                let Some((device, fell_back)) =
+                    find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
                 else {
                     warn!(name = %device_name, "audio_device_not_found_compressed");
                     playing.store(false, Ordering::SeqCst);
@@ -3680,12 +3830,25 @@ impl OutputTarget for LocalOutput {
                                 outcome.dop,
                             );
                         }
-                        bit_perfect_state = Some(outcome.bit_perfect);
+                        let volume_units = volume.load(Ordering::SeqCst);
+                        let runtime = publish_windows_signal_path_status(
+                            &signal_path_status,
+                            outcome.bit_perfect,
+                            matches!(selected_ring, WindowsExclusiveRingRef::Native(_)),
+                            outcome.dop,
+                            volume_units,
+                            &eq,
+                            &convolver,
+                            &crossfeed,
+                            &pure_bypass,
+                        );
+                        bit_perfect_state = Some(runtime.bit_perfect);
                         info!(
                             backend = "ASIO",
-                            bit_perfect = outcome.bit_perfect,
+                            bit_perfect = runtime.bit_perfect,
                             dop = outcome.dop,
-                            volume_units = volume.load(Ordering::SeqCst),
+                            volume_units,
+                            reasons = ?runtime.reasons,
                             "windows_exclusive_signal_contract"
                         );
                     }
@@ -3906,13 +4069,26 @@ impl OutputTarget for LocalOutput {
                                     outcome.dop,
                                 );
                             }
-                            if bit_perfect_state != Some(outcome.bit_perfect) {
-                                bit_perfect_state = Some(outcome.bit_perfect);
+                            let volume_units = volume.load(Ordering::SeqCst);
+                            let runtime = publish_windows_signal_path_status(
+                                &signal_path_status,
+                                outcome.bit_perfect,
+                                matches!(selected_ring, WindowsExclusiveRingRef::Native(_)),
+                                outcome.dop,
+                                volume_units,
+                                &eq,
+                                &convolver,
+                                &crossfeed,
+                                &pure_bypass,
+                            );
+                            if bit_perfect_state != Some(runtime.bit_perfect) {
+                                bit_perfect_state = Some(runtime.bit_perfect);
                                 info!(
                                     backend = "ASIO",
-                                    bit_perfect = outcome.bit_perfect,
+                                    bit_perfect = runtime.bit_perfect,
                                     dop = outcome.dop,
-                                    volume_units = volume.load(Ordering::SeqCst),
+                                    volume_units,
+                                    reasons = ?runtime.reasons,
                                     "windows_exclusive_signal_contract"
                                 );
                             }
@@ -4176,13 +4352,26 @@ impl OutputTarget for LocalOutput {
                                         outcome.dop,
                                     );
                                 }
-                                if bit_perfect_state != Some(outcome.bit_perfect) {
-                                    bit_perfect_state = Some(outcome.bit_perfect);
+                                let volume_units = volume.load(Ordering::SeqCst);
+                                let runtime = publish_windows_signal_path_status(
+                                    &signal_path_status,
+                                    outcome.bit_perfect,
+                                    true,
+                                    outcome.dop,
+                                    volume_units,
+                                    &eq,
+                                    &convolver,
+                                    &crossfeed,
+                                    &pure_bypass,
+                                );
+                                if bit_perfect_state != Some(runtime.bit_perfect) {
+                                    bit_perfect_state = Some(runtime.bit_perfect);
                                     info!(
                                         backend = "WASAPI",
-                                        bit_perfect = outcome.bit_perfect,
+                                        bit_perfect = runtime.bit_perfect,
                                         dop = outcome.dop,
-                                        volume_units = volume.load(Ordering::SeqCst),
+                                        volume_units,
+                                        reasons = ?runtime.reasons,
                                         "windows_exclusive_signal_contract"
                                     );
                                 }
@@ -4248,13 +4437,26 @@ impl OutputTarget for LocalOutput {
                                                     outcome.dop,
                                                 );
                                             }
-                                            if bit_perfect_state != Some(outcome.bit_perfect) {
-                                                bit_perfect_state = Some(outcome.bit_perfect);
+                                            let volume_units = volume.load(Ordering::SeqCst);
+                                            let runtime = publish_windows_signal_path_status(
+                                                &signal_path_status,
+                                                outcome.bit_perfect,
+                                                true,
+                                                outcome.dop,
+                                                volume_units,
+                                                &eq,
+                                                &convolver,
+                                                &crossfeed,
+                                                &pure_bypass,
+                                            );
+                                            if bit_perfect_state != Some(runtime.bit_perfect) {
+                                                bit_perfect_state = Some(runtime.bit_perfect);
                                                 info!(
                                                     backend = "WASAPI",
-                                                    bit_perfect = outcome.bit_perfect,
+                                                    bit_perfect = runtime.bit_perfect,
                                                     dop = outcome.dop,
-                                                    volume_units = volume.load(Ordering::SeqCst),
+                                                    volume_units,
+                                                    reasons = ?runtime.reasons,
                                                     "windows_exclusive_signal_contract"
                                                 );
                                             }
@@ -4379,7 +4581,9 @@ impl OutputTarget for LocalOutput {
 
             // ------- Open cpal device (shared mode) -------
             let host = select_host(&audio_backend);
-            let Some((device, fell_back)) = find_device_with_fallback(&host, &device_name) else {
+            let Some((device, fell_back)) =
+                find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
+            else {
                 warn!(
                     requested = %device_name,
                     "audio_device_not_found_no_fallback"
@@ -5795,6 +5999,9 @@ impl OutputTarget for LocalOutput {
         // the previous track do not affect the next track's end-detection cycle.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        if let Ok(mut slot) = self.signal_path_status.lock() {
+            *slot = None;
+        }
         *self.next_media.lock().unwrap() = None;
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
@@ -5915,6 +6122,13 @@ impl OutputTarget for LocalOutput {
 
     fn take_output_failure(&self) -> Option<String> {
         self.open_failure.lock().ok().and_then(|mut s| s.take())
+    }
+
+    fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
+        self.signal_path_status
+            .lock()
+            .ok()
+            .and_then(|status| status.clone())
     }
 
     async fn is_available(&self) -> bool {
@@ -6084,6 +6298,152 @@ fn feed_native_ring_abortable(
     true
 }
 
+/// Ce qu'une zone connaît d'un périphérique de sortie, tel que la découverte
+/// CPAL l'a vu : l'identifiant d'endpoint stable du backend (vide sur les
+/// hôtes qui n'en exposent aucun) et le nom **brut** rendu par le pilote,
+/// avant toute désambiguïsation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceIdentity {
+    pub(crate) endpoint_id: String,
+    pub(crate) raw_name: String,
+}
+
+/// Par quoi une zone a été rattachée à son périphérique. Le rang porté par
+/// chaque variante est l'indice dans la liste énumérée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceMatch {
+    /// Retrouvé par identifiant d'endpoint stable. C'est le seul appariement
+    /// qui survive à un renommage.
+    ByEndpointId(usize),
+    /// Retrouvé par nom d'affichage, avec la convention `(n)` de la
+    /// découverte — donc en distinguant les homonymes.
+    ByDisplayName(usize),
+    /// Retrouvé par sous-chaîne, et par une seule candidate.
+    BySubstring(usize),
+}
+
+impl DeviceMatch {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::ByEndpointId(i) | Self::ByDisplayName(i) | Self::BySubstring(i) => i,
+        }
+    }
+}
+
+/// Résoudre le périphérique qu'une zone désigne.
+///
+/// Le nom d'affichage n'est **pas** une identité : il n'est ni unique (deux
+/// DAC USB s'annoncent tous deux « Haut-Parleurs », #2272) ni stable (Windows
+/// renomme l'endpoint au changement de taux d'échantillonnage, #2269).
+/// L'ordre ci-dessous met donc l'identifiant d'endpoint stable capturé à la
+/// découverte (#2207) devant le nom :
+///
+/// 1. **identifiant d'endpoint** — insensible au renommage comme à l'ordre
+///    d'énumération ;
+/// 2. **nom d'affichage** reconstruit avec la convention `(n)` **exacte** de
+///    la découverte, si bien que « Haut-Parleurs (2) » atteint le second
+///    homonyme et non le premier ;
+/// 3. **sous-chaîne**, tolérance héritée pour les hôtes aux noms verbeux
+///    (CoreAudio, PipeWire) — mais seulement si elle désigne **une seule**
+///    candidate, et jamais pour un nom que Tune a lui-même suffixé d'un
+///    `(n)` : ce suffixe vient de nous, pas du pilote, et le laisser glisser
+///    par sous-chaîne est précisément ce qui envoyait le son sur le mauvais
+///    DAC en silence.
+///
+/// `None` veut dire « je ne sais pas », et non « prends le premier venu » :
+/// l'appelant retombe alors sur la sortie par défaut, mais en le **disant**.
+pub(crate) fn resolve_device(
+    requested: &str,
+    requested_endpoint_id: Option<&str>,
+    candidates: &[DeviceIdentity],
+) -> Option<DeviceMatch> {
+    // 1. L'identifiant d'endpoint stable, quand la zone en connaît un. C'est
+    //    le seul appariement qui traverse un renommage ou un réordonnancement.
+    if let Some(endpoint_id) = requested_endpoint_id.filter(|id| !id.is_empty())
+        && let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate.endpoint_id == endpoint_id)
+    {
+        return Some(DeviceMatch::ByEndpointId(index));
+    }
+
+    let search = requested.to_lowercase();
+
+    // 2. Le nom d'affichage, reconstruit avec la convention de la découverte —
+    //    c'est ce nom-là, suffixe compris, qui a été stocké dans la zone.
+    let mut seen_names = std::collections::HashSet::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let display_name = disambiguate_display_name(&candidate.raw_name, &mut seen_names);
+        if display_name.to_lowercase() == search {
+            return Some(DeviceMatch::ByDisplayName(index));
+        }
+    }
+
+    // 3. Sous-chaîne. Un `(n)` qui n'a trouvé personne à l'étape 2 ne se
+    //    rattrape pas ici : ce suffixe vient de nous, pas du pilote, et le
+    //    laisser glisser renvoyait « Haut-Parleurs (2) » sur le premier
+    //    « Haut-Parleurs » — le mauvais DAC, en silence (#2272).
+    if looks_disambiguated(requested) {
+        return None;
+    }
+    let mut ambigus = candidates.iter().enumerate().filter(|(_, candidate)| {
+        let lower = candidate.raw_name.to_lowercase();
+        lower.contains(&search) || search.contains(&lower)
+    });
+    match (ambigus.next(), ambigus.next()) {
+        (Some((index, _)), None) => Some(DeviceMatch::BySubstring(index)),
+        // Deux candidates : choisir la première, c'est rejouer le même défaut
+        // sous un autre nom. On préfère l'aveu d'ignorance.
+        _ => None,
+    }
+}
+
+/// La convention de désambiguïsation des noms d'affichage, en **un seul**
+/// endroit.
+///
+/// Plusieurs DAC USB s'annoncent souvent sous le même nom (« Haut-Parleurs »)
+/// sous WASAPI. La découverte suffixe le second « (2) », le troisième « (3) »,
+/// en sautant les rangs qu'un pilote occupe déjà de lui-même. La résolution
+/// doit rejouer **exactement** ce calcul, puisque c'est son résultat qui a été
+/// stocké dans la zone : un simple compteur d'occurrences, plus court à
+/// écrire, diverge dès `["A", "A (2)", "A"]` — il donnerait « A (2) » au
+/// troisième, qui volerait alors la zone du deuxième.
+fn disambiguate_display_name(
+    raw_name: &str,
+    seen_names: &mut std::collections::HashSet<String>,
+) -> String {
+    let name = if seen_names.contains(raw_name) {
+        let mut n = 2;
+        loop {
+            let candidate = format!("{raw_name} ({n})");
+            if !seen_names.contains(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        }
+    } else {
+        raw_name.to_string()
+    };
+    seen_names.insert(name.clone());
+    name
+}
+
+/// Puits nuls d'ALSA, qui ne produisent aucun son. Écartés à la découverte
+/// **et** à la résolution : les deux doivent voir exactement la même liste,
+/// faute de quoi les rangs `(n)` qu'elles calculent peuvent diverger.
+fn is_null_sink(raw_name: &str) -> bool {
+    raw_name.contains("Discard all samples") || raw_name.contains("Dummy")
+}
+
+/// Le nom demandé porte-t-il un suffixe de rang `(n)` posé par la découverte ?
+fn looks_disambiguated(requested: &str) -> bool {
+    requested
+        .rsplit_once(" (")
+        .and_then(|(_, tail)| tail.strip_suffix(')'))
+        .and_then(|rank| rank.parse::<u32>().ok())
+        .is_some_and(|rank| rank >= 2)
+}
+
 /// Find an audio output device by name, falling back to the default device if
 /// the requested device is not found.
 ///
@@ -6095,37 +6455,55 @@ fn feed_native_ring_abortable(
 ///
 /// Returns `(device, fell_back)` where `fell_back` is `true` if the default
 /// device was used instead of the requested one.
-fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cpal::Device, bool)> {
+fn find_device_with_fallback(
+    host: &cpal::Host,
+    device_name: &str,
+    endpoint_id: Option<&str>,
+) -> Option<(cpal::Device, bool)> {
     if device_name == "default" {
         return host.default_output_device().map(|d| (d, false));
     }
 
-    // Try exact or substring match first (case-insensitive, bidirectional)
-    let search = device_name.to_lowercase();
-    let found = host.output_devices().ok().and_then(|mut devs| {
-        devs.find(|d| {
-            d.description()
-                .map(|desc| {
-                    let n = desc.name().to_string();
-                    let lower = n.to_lowercase();
-                    lower == search || lower.contains(&search) || search.contains(&lower)
-                })
-                .unwrap_or(false)
+    // La même liste que la découverte, puits nuls écartés compris : c'est la
+    // condition pour que les rangs `(n)` reconstruits ici soient ceux qui ont
+    // été stockés dans la zone.
+    let (devices, identities): (Vec<cpal::Device>, Vec<DeviceIdentity>) = host
+        .output_devices()
+        .map(|devs| devs.collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|device| {
+            let identity = DeviceIdentity {
+                endpoint_id: device.id().map(|id| id.to_string()).unwrap_or_default(),
+                raw_name: device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".into()),
+            };
+            (device, identity)
         })
-    });
+        .filter(|(_, identity)| !is_null_sink(&identity.raw_name))
+        .unzip();
 
-    if let Some(device) = found {
-        return Some((device, false));
+    if let Some(matched) = resolve_device(device_name, endpoint_id, &identities) {
+        let index = matched.index();
+        debug!(
+            requested = %device_name,
+            resolved = %identities[index].raw_name,
+            endpoint_id = %identities[index].endpoint_id,
+            matched_by = ?matched,
+            "audio_device_resolved"
+        );
+        // `nth` plutôt qu'un clone : `cpal::Device` n'est pas clonable sur tous
+        // les hôtes, et on n'a plus besoin des autres.
+        return devices.into_iter().nth(index).map(|device| (device, false));
     }
 
     // Device not found — log available devices and fall back to default
-    let available: Vec<String> = host
-        .output_devices()
-        .map(|devs| {
-            devs.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let available: Vec<String> = identities
+        .iter()
+        .map(|identity| format!("{} [{}]", identity.raw_name, identity.endpoint_id))
+        .collect();
 
     if let Some(default_device) = host.default_output_device() {
         let default_name = default_device
@@ -6134,6 +6512,7 @@ fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cp
             .unwrap_or_else(|_| "unknown".into());
         warn!(
             requested = %device_name,
+            requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
             fallback = %default_name,
             available = ?available,
             "audio_device_not_found_falling_back_to_default — \
@@ -6145,6 +6524,7 @@ fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cp
     } else {
         warn!(
             requested = %device_name,
+            requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
             available = ?available,
             "audio_device_not_found_no_default_available"
         );
@@ -6702,6 +7082,89 @@ mod tests {
         assert_eq!(fixture, real_dop_bytes(64, 2));
     }
 
+    fn runtime_contract(
+        native: bool,
+        dop: bool,
+        volume_units: u32,
+        eq: Option<crate::audio::eq::EqProcessor>,
+        pure: bool,
+    ) -> OutputSignalPathStatus {
+        windows_signal_path_status(
+            native,
+            dop,
+            volume_units,
+            &std::sync::Mutex::new(eq),
+            &std::sync::Mutex::new(None),
+            &std::sync::Mutex::new(None),
+            &AtomicBool::new(pure),
+        )
+    }
+
+    #[test]
+    fn native_unity_without_dsp_is_reported_bit_perfect() {
+        let status = runtime_contract(true, false, 1000, None, false);
+        assert!(status.bit_perfect);
+        assert_eq!(
+            status.sample_transport,
+            OutputSampleTransport::NativeInteger
+        );
+        assert_eq!(status.dsp, OutputDspState::Inactive);
+        assert_eq!(status.volume, OutputVolumeState::Unity);
+        assert!(status.reasons.is_empty());
+    }
+
+    #[test]
+    fn float_transport_names_why_it_is_not_bit_perfect() {
+        let status = runtime_contract(false, false, 1000, None, false);
+        assert!(!status.bit_perfect);
+        assert_eq!(status.sample_transport, OutputSampleTransport::Float);
+        assert_eq!(status.reasons, vec![OutputSignalReason::FloatTransport]);
+    }
+
+    #[test]
+    fn native_transport_names_volume_and_dsp_when_they_modify_pcm() {
+        let status = runtime_contract(true, false, 420, Some(test_eq()), false);
+        assert!(!status.bit_perfect);
+        assert_eq!(status.dsp, OutputDspState::Applied);
+        assert_eq!(status.volume, OutputVolumeState::Applied);
+        assert_eq!(
+            status.reasons,
+            vec![
+                OutputSignalReason::DspApplied,
+                OutputSignalReason::SoftwareVolume,
+            ]
+        );
+    }
+
+    #[test]
+    fn dop_reports_both_safety_bypasses_and_keeps_native_bits() {
+        let status = runtime_contract(true, true, 42, Some(test_eq()), false);
+        assert!(status.bit_perfect);
+        assert_eq!(status.dsp, OutputDspState::BypassedDop);
+        assert_eq!(status.volume, OutputVolumeState::BypassedDop);
+        assert!(status.reasons.is_empty());
+    }
+
+    #[test]
+    fn producer_verdict_cannot_be_upgraded_by_a_later_state_snapshot() {
+        let slot = std::sync::Mutex::new(None);
+        let status = publish_windows_signal_path_status(
+            &slot,
+            false,
+            true,
+            false,
+            1000,
+            &std::sync::Mutex::new(None),
+            &std::sync::Mutex::new(None),
+            &std::sync::Mutex::new(None),
+            &AtomicBool::new(false),
+        );
+
+        assert!(!status.bit_perfect);
+        assert_eq!(status.reasons, vec![OutputSignalReason::DspStateUnknown]);
+        assert_eq!(slot.lock().unwrap().as_ref(), Some(&status));
+    }
+
     fn integer_pcm_fixture(bit_depth: u16) -> Vec<u8> {
         let bytes_per_sample = usize::from(bit_depth / 8);
         let fixture_line = match bit_depth {
@@ -6737,6 +7200,163 @@ mod tests {
             bytes.extend_from_slice(&word.to_le_bytes()[..bytes_per_sample]);
         }
         bytes
+    }
+
+    /// Deux DAC USB qui s'annoncent tous deux « Haut-Parleurs », plus une
+    /// sortie HDMI. C'est la configuration d'Alain (#1084) et celle de Marco
+    /// Polo (#2272).
+    fn homonymes_fixture() -> Vec<DeviceIdentity> {
+        vec![
+            DeviceIdentity {
+                endpoint_id: "{ugreen}".into(),
+                raw_name: "Haut-Parleurs".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{topping}".into(),
+                raw_name: "Haut-Parleurs".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{hdmi}".into(),
+                raw_name: "Téléviseur".into(),
+            },
+        ]
+    }
+
+    /// Le nom d'affichage n'est pas une identité. Ce test tient les deux bouts
+    /// du même défaut : deux homonymes doivent rester **distincts** (#2272), et
+    /// une zone doit continuer de désigner **le bon** après un redémarrage ou
+    /// un rebranchement qui renomme le périphérique (#2269).
+    #[test]
+    fn deux_homonymes_restent_distincts_et_la_zone_survit_au_renommage() {
+        let enumeres = homonymes_fixture();
+
+        // 1. Les homonymes ne se confondent pas. Le suffixe « (2) » que la
+        //    découverte a posé désigne le SECOND, jamais le premier.
+        assert_eq!(
+            resolve_device("Haut-Parleurs", None, &enumeres),
+            Some(DeviceMatch::ByDisplayName(0)),
+            "« Haut-Parleurs » doit désigner le premier homonyme"
+        );
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", None, &enumeres),
+            Some(DeviceMatch::ByDisplayName(1)),
+            "« Haut-Parleurs (2) » doit désigner le SECOND homonyme, \
+             pas retomber sur le premier par sous-chaîne"
+        );
+
+        // 2. Redémarrage : Windows n'énumère pas dans le même ordre. Le rang
+        //    « (2) » ment désormais ; l'identifiant stable, lui, dit vrai.
+        let apres_redemarrage = vec![
+            enumeres[1].clone(),
+            enumeres[0].clone(),
+            enumeres[2].clone(),
+        ];
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_redemarrage),
+            Some(DeviceMatch::ByEndpointId(0)),
+            "après réordonnancement, l'identifiant stable doit primer sur le rang"
+        );
+
+        // 3. Rebranchement : le pilote renomme l'endpoint au changement de
+        //    taux d'échantillonnage (DEvir, #2269). Plus aucun nom ne
+        //    correspond — l'identifiant le retrouve quand même.
+        let apres_rebranchement = vec![
+            DeviceIdentity {
+                endpoint_id: "{ugreen}".into(),
+                raw_name: "Haut-Parleurs".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{topping}".into(),
+                raw_name: "Topping D10s (96 kHz)".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_rebranchement),
+            Some(DeviceMatch::ByEndpointId(1)),
+            "un renommage ne doit pas casser une zone qui connaît son endpoint"
+        );
+
+        // 4. Même scène, mais sans identifiant stable (hôte qui n'en expose
+        //    pas, ou zone créée avant #2207). On préfère l'aveu d'ignorance —
+        //    donc un repli SIGNALÉ — au premier « Haut-Parleurs » venu choisi
+        //    en silence.
+        assert_eq!(
+            resolve_device("Haut-Parleurs (2)", None, &apres_rebranchement),
+            None,
+            "sans identifiant, un « (2) » orphelin ne doit PAS glisser sur le (1)"
+        );
+
+        // 5. La tolérance par sous-chaîne reste acquise aux hôtes verbeux,
+        //    tant qu'elle ne désigne qu'une seule candidate.
+        let coreaudio = vec![
+            DeviceIdentity {
+                endpoint_id: "{builtin}".into(),
+                raw_name: "MacBook Pro Speakers".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{hdmi}".into(),
+                raw_name: "Téléviseur".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_device("MacBook Pro Speakers (2)", None, &coreaudio),
+            None,
+            "un suffixe posé par Tune ne se rattrape pas par sous-chaîne"
+        );
+        assert_eq!(
+            resolve_device("MacBook Pro", None, &coreaudio),
+            Some(DeviceMatch::BySubstring(0)),
+            "un nom tronqué sans ambiguïté reste résolu"
+        );
+    }
+
+    /// Une sous-chaîne qui désigne deux candidates ne désigne rien : choisir
+    /// la première, c'est rejouer le bug de #2272 sous un autre nom.
+    #[test]
+    fn une_sous_chaine_ambigue_ne_choisit_pas_a_notre_place() {
+        let ambigus = vec![
+            DeviceIdentity {
+                endpoint_id: "{a}".into(),
+                raw_name: "Realtek Digital Output".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{b}".into(),
+                raw_name: "Realtek Digital Output (Optical)".into(),
+            },
+        ];
+        assert_eq!(resolve_device("Realtek", None, &ambigus), None);
+    }
+
+    /// L'appariement par nom doit employer la convention `(n)` **exacte** de
+    /// la découverte, pas un compteur d'occurrences : sur `["A", "A (2)", "A"]`
+    /// les deux algorithmes divergent, et un troisième périphérique volerait
+    /// la zone du deuxième.
+    #[test]
+    fn la_convention_de_suffixe_est_celle_de_la_decouverte() {
+        let colision = vec![
+            DeviceIdentity {
+                endpoint_id: "{a1}".into(),
+                raw_name: "A".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{a2}".into(),
+                raw_name: "A (2)".into(),
+            },
+            DeviceIdentity {
+                endpoint_id: "{a3}".into(),
+                raw_name: "A".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_device("A (2)", None, &colision),
+            Some(DeviceMatch::ByDisplayName(1)),
+            "« A (2) » est le nom BRUT du deuxième, il lui appartient"
+        );
+        assert_eq!(
+            resolve_device("A (3)", None, &colision),
+            Some(DeviceMatch::ByDisplayName(2)),
+            "le troisième reçoit « A (3) », comme à la découverte"
+        );
     }
 
     fn wasapi_endpoint_fixture() -> Vec<WasapiEndpoint> {

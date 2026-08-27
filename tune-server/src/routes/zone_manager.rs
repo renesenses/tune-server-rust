@@ -280,23 +280,19 @@ async fn mute_zone(
 ) -> impl IntoResponse {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
 
-    // Persist to DB
-    if let Err(e) = zone_repo.update_muted(id, body.muted) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = zone_repo
         .get(id)
         .ok()
         .flatten()
         .and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_mute(id, body.muted, device_id.as_deref())
-        .await;
-
-    Json(json!({ "zone_id": id, "muted": body.muted })).into_response()
+        .await
+    {
+        Ok(()) => Json(json!({ "zone_id": id, "muted": body.muted })).into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +410,7 @@ async fn group_volume(
                 .unwrap_or_default();
             save_json_setting(&settings, "zone_groups", &groups);
 
-            // Apply volume to each zone
-            let repo = ZoneRepo::with_backend(state.backend.clone());
+            // Apply volume to each zone only after its renderer accepts it.
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -424,9 +419,18 @@ async fn group_volume(
                     .copied()
                     .unwrap_or(0.0);
                 let effective = (master + offset).clamp(0.0, 1.0);
-                let vol_int = (effective * 100.0) as i32;
-                repo.update_volume(*zid, vol_int).ok();
-                state.orchestrator.set_volume(*zid, effective, None).await;
+                let device_id = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten()
+                    .and_then(|zone| zone.output_device_id);
+                if let Err(error) = state
+                    .orchestrator
+                    .set_volume(*zid, effective, device_id.as_deref())
+                    .await
+                {
+                    return crate::routes::playback::output_command_error_response(error);
+                }
             }
 
             Json(json!({"group_id": id, "master_volume": master})).into_response()
@@ -759,15 +763,28 @@ async fn activate_zone_profile(
         if let Some(ot) = zc.get("output_type").and_then(|v| v.as_str()) {
             zone_repo.update_output_type(zone_id, ot).ok();
         }
+        let device_id = zone_repo
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.output_device_id);
         if let Some(vol) = zc.get("volume").and_then(|v| v.as_i64()) {
-            zone_repo.update_volume(zone_id, vol as i32).ok();
-            state
+            if let Err(error) = state
                 .orchestrator
-                .set_volume(zone_id, vol as f64 / 100.0, None)
-                .await;
+                .set_volume(zone_id, vol as f64 / 100.0, device_id.as_deref())
+                .await
+            {
+                return crate::routes::playback::output_command_error_response(error);
+            }
         }
         if let Some(muted) = zc.get("muted").and_then(|v| v.as_bool()) {
-            zone_repo.update_muted(zone_id, muted).ok();
+            if let Err(error) = state
+                .orchestrator
+                .set_mute(zone_id, muted, device_id.as_deref())
+                .await
+            {
+                return crate::routes::playback::output_command_error_response(error);
+            }
         }
         applied += 1;
     }

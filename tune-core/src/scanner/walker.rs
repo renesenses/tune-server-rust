@@ -394,6 +394,41 @@ impl ListAudioResult {
     }
 }
 
+/// Ce que le parcours des dossiers sait de lui-même **pendant** qu'il tourne.
+///
+/// Le parcours est la phase la plus longue d'un scan complet sur un partage
+/// réseau, et c'était la seule qui ne disait rien : `scan_dir_complete` ne
+/// tombe qu'à la fin d'une racine, `audio_files_listed` qu'à la fin de toutes.
+/// Sur une bibliothèque tenue par un NAS, cela fait plusieurs minutes pendant
+/// lesquelles ni le journal ni l'écran ne distinguent « ça travaille » de
+/// « c'est planté » (#2203, JP Borderies : 3 min 40 sans une ligne, scan
+/// annulé, redémarrage, abandon).
+///
+/// Rien ici n'est calculé pour l'occasion : ces trois valeurs sont déjà tenues
+/// par la boucle de parcours. Elles n'étaient simplement jamais rendues.
+pub struct ProgressionParcours<'a> {
+    /// Fichiers audio retenus depuis le début du parcours, **toutes racines
+    /// confondues**. C'est un compte qui monte, jamais un pourcentage : à cet
+    /// instant le total est inconnu — on ne peut pas savoir combien de
+    /// fichiers restent avant de les avoir parcourus.
+    pub fichiers_vus: usize,
+    /// Racine configurée en cours de parcours.
+    pub racine: &'a str,
+    /// Dossier réellement visité à cet instant. C'est ce qui prouve à
+    /// l'utilisateur que la machine avance, et c'est ce qui nous dit, sur un
+    /// journal de testeur, OÙ un parcours s'est enlisé.
+    pub dossier_courant: &'a str,
+}
+
+/// Cadence des annonces de progression du parcours.
+///
+/// À cadence fixe, jamais par fichier : une bibliothèque de 58 000 fichiers
+/// produirait 58 000 lignes, ce qui noierait le journal et coûterait plus cher
+/// que le parcours lui-même. Deux secondes, c'est la même cadence que
+/// l'émission par lots de la phase d'import (`scan.rs`), pour que l'écran
+/// reçoive un flux régulier d'un bout à l'autre du scan.
+pub const CADENCE_PROGRESSION_PARCOURS: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     list_audio_files_with_excludes(dirs, &[])
 }
@@ -403,9 +438,34 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
 /// substring — deliberately simple, no glob engine). Patterns come from the
 /// `scan_exclude_paths` setting: staging/incoming folders, backup trees, a
 /// sibling's library on a shared NAS…
+///
+/// Ne rend pas compte de son avancement. Les appelants qui ont un écran à
+/// nourrir passent par [`list_audio_files_avec_progression`].
 pub fn list_audio_files_with_excludes(
     dirs: &[String],
     exclude_patterns: &[String],
+) -> ListAudioResult {
+    list_audio_files_avec_progression(
+        dirs,
+        exclude_patterns,
+        CADENCE_PROGRESSION_PARCOURS,
+        &mut |_| {},
+    )
+}
+
+/// Comme [`list_audio_files_with_excludes`], mais rend compte de son
+/// avancement au fil du parcours, au plus une fois par `cadence`.
+///
+/// `on_progress` ne peut RIEN changer au parcours : il ne rend rien, ne reçoit
+/// que des emprunts, et n'est appelé qu'entre deux entrées. L'ordre des
+/// fichiers, les exclusions, les lots et la liste rendue sont identiques à
+/// ceux de `list_audio_files_with_excludes` — cette fonction ajoute de la
+/// visibilité, pas de la logique.
+pub fn list_audio_files_avec_progression(
+    dirs: &[String],
+    exclude_patterns: &[String],
+    cadence: std::time::Duration,
+    on_progress: &mut dyn FnMut(ProgressionParcours<'_>),
 ) -> ListAudioResult {
     let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
     let excludes: Vec<String> = exclude_patterns
@@ -425,6 +485,15 @@ pub fn list_audio_files_with_excludes(
     // trouble (NAS died mid-walk) — protect the entire root instead of
     // accumulating an unbounded list.
     const MAX_ERROR_SCOPES: usize = 50;
+    // Horloge des annonces de progression, partagée par TOUTES les racines :
+    // la cadence doit valoir pour le parcours entier, pas se réarmer à chaque
+    // racine. Initialisée dans le passé pour qu'une première annonce parte
+    // aussitôt — c'est celle qui dit à l'écran que le parcours a commencé,
+    // et sans elle une racine lente resterait muette pendant sa première
+    // tranche de cadence.
+    let mut derniere_annonce = std::time::Instant::now()
+        .checked_sub(cadence)
+        .unwrap_or_else(std::time::Instant::now);
     for dir in dirs {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
@@ -432,27 +501,52 @@ pub fn list_audio_files_with_excludes(
         // Probe with read_dir instead of a bare exists(): on Windows a NAS path
         // fails for several distinct reasons that exists() collapses to `false`
         // (silent skip → "scan finds nothing", Alain Bonnel). read_dir surfaces
-        // the actual io::Error kind so the user learns WHY: NotFound = bad UNC /
-        // NAS unmounted, PermissionDenied = no SMB credentials for this session,
-        // and — the common Windows case — a mapped drive (Z:\) is invisible to
-        // an elevated / service token even though it works in Explorer.
+        // the actual error so the user learns WHY: bad UNC / NAS unmounted, no
+        // SMB credentials for this session, and — the common Windows case — a
+        // mapped drive (Z:\) invisible to an elevated / service token even
+        // though it works in Explorer. La traduction de cette erreur en cause
+        // lisible est le seul travail de `scanner::obstacle`.
         if let Err(e) = std::fs::read_dir(dir_path) {
+            // La raison est NOMMÉE ici et pas ailleurs : `missing_dir_reasons`
+            // est rendu VERBATIM par le client web (SettingsView.svelte). Le
+            // `format!("{}: {:?} — {}", …, e.kind(), e)` d'avant y déposait le
+            // `Debug` d'un `ErrorKind` — donc `Uncategorized` pour tout errno
+            // que Rust ne mappe pas, dont ENODEV. C'est le message que JeromeQ
+            // a recopié du fil 1539 sans pouvoir en rien faire (#2357).
+            let (motif, message) = crate::scanner::obstacle::obstacle_de_lecture(&normalized, &e);
             warn!(
                 dir = %normalized,
                 original = %dir,
                 error = %e,
                 kind = ?e.kind(),
+                // L'errno numérique n'était journalisé nulle part : sans lui,
+                // un `Uncategorized` dans les journaux reste indéchiffrable
+                // même pour nous.
+                errno = ?e.raw_os_error(),
+                motif = %motif,
                 "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
-            missing_dir_reasons.push(format!("{}: {:?} — {}", normalized, e.kind(), e));
+            missing_dir_reasons.push(message);
             missing_dirs.push(normalized);
             continue;
         }
         if !dir_path.is_dir() {
+            // Ce chemin n'est atteignable qu'en course (la racine a été
+            // remplacée entre la sonde `read_dir` et ce test) : `read_dir`
+            // rend déjà ENOTDIR sur un fichier. Il n'en poussait pas moins la
+            // racine dans le néant — un `warn!` et un `continue`, rien dans
+            // `missing_dirs`. Or `missing_dirs` n'est pas qu'un rapport :
+            // c'est ce qui déclenche `VerdictPurge::ProtegeIllisible`. Une
+            // racine écartée hors de cette liste voyait donc ses pistes
+            // supprimées comme si les fichiers avaient disparu (#2356).
+            let (motif, message) = crate::scanner::obstacle::pas_un_dossier(&normalized);
             warn!(
                 dir = %normalized,
+                motif = %motif,
                 "scan_dir_not_a_directory — path is not a directory, skipping"
             );
+            missing_dir_reasons.push(message);
+            missing_dirs.push(normalized);
             continue;
         }
 
@@ -481,6 +575,38 @@ pub fn list_audio_files_with_excludes(
         for entry in walker {
             match entry {
                 Ok(entry) => {
+                    // Signe de vie du parcours (#2203).
+                    //
+                    // Placé AVANT le filtre `is_file` à dessein : sur un
+                    // partage réseau, le temps ne se passe pas sur les
+                    // fichiers retenus, il se passe à traverser des dossiers
+                    // qui n'en contiennent aucun. Un battement qui ne tomberait
+                    // que sur les fichiers audio se tairait précisément là où
+                    // le parcours s'enlise.
+                    //
+                    // Le test de cadence est un unique `Instant::now()` par
+                    // entrée — quelques dizaines de nanosecondes, à comparer
+                    // au `stat` réseau que le parcours vient de payer.
+                    if derniere_annonce.elapsed() >= cadence {
+                        derniere_annonce = std::time::Instant::now();
+                        let dossier = if entry.file_type().is_dir() {
+                            entry.path()
+                        } else {
+                            entry.path().parent().unwrap_or_else(|| entry.path())
+                        };
+                        let dossier = dossier.to_string_lossy();
+                        info!(
+                            racine = %normalized,
+                            dossier = %dossier,
+                            fichiers = files.len(),
+                            "scan_indexing_progress — parcours en cours"
+                        );
+                        on_progress(ProgressionParcours {
+                            fichiers_vus: files.len(),
+                            racine: &normalized,
+                            dossier_courant: &dossier,
+                        });
+                    }
                     if !entry.file_type().is_file() {
                         continue;
                     }
@@ -1096,12 +1222,68 @@ mod tests {
         assert!(result.files.is_empty());
         assert_eq!(result.missing_dirs.len(), 1);
         assert_eq!(result.missing_dir_reasons.len(), 1);
-        assert!(
-            result.missing_dir_reasons[0].contains("NotFound"),
-            "reason = {:?}",
-            result.missing_dir_reasons[0]
-        );
         assert!(result.error_dirs.is_empty());
+    }
+
+    /// La ligne que voit l'utilisateur — celle que `SettingsView.svelte` rend
+    /// verbatim — ne doit contenir aucun nom de variante de `std::io::ErrorKind`
+    /// ni de `os error N`. C'est tout le sujet de #2357 : JeromeQ a recopié
+    /// `Uncategorized — No such device (os error 19)` sans pouvoir en rien
+    /// faire. Ici, sur une racine simplement absente, le rendu partait déjà en
+    /// `NotFound`.
+    #[test]
+    fn la_raison_rendue_a_l_ecran_est_une_phrase_pas_un_errno() {
+        let result = list_audio_files(&["/tmp/nonexistent_tune_test_dir".into()]);
+        let raison = &result.missing_dir_reasons[0];
+        for mot in ["NotFound", "Uncategorized", "os error"] {
+            assert!(
+                !raison.contains(mot),
+                "jargon « {mot} » rendu à l'écran : {raison:?}"
+            );
+        }
+        assert!(
+            raison.contains("/tmp/nonexistent_tune_test_dir"),
+            "le chemin fautif doit être nommé : {raison:?}"
+        );
+        let bas = raison.to_lowercase();
+        assert!(
+            bas.contains("n'existe pas") || bas.contains("introuvable") || bas.contains("absent"),
+            "la cause doit être dite en français : {raison:?}"
+        );
+    }
+
+    /// #2356, seconde face : une racine écartée ne doit JAMAIS l'être en
+    /// silence. Un chemin configuré qui n'est pas un dossier était sauté avec
+    /// un simple `warn!` : absent de `missing_dirs`, il n'apparaissait ni dans
+    /// le rapport de scan, ni dans le garde-fou de purge — ses pistes étaient
+    /// donc supprimées comme si les fichiers avaient disparu.
+    #[test]
+    fn une_racine_qui_n_est_pas_un_dossier_est_signalee_et_non_sautee() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_racine_fichier_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fichier = base.join("ceci_est_un_fichier.txt");
+        std::fs::write(&fichier, b"x").unwrap();
+
+        let result = list_audio_files(&[fichier.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.missing_dirs.len(),
+            1,
+            "racine sautée en silence : missing_dirs = {:?}",
+            result.missing_dirs
+        );
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+        let raison = &result.missing_dir_reasons[0];
+        for mot in ["NotFound", "Uncategorized", "NotADirectory", "os error"] {
+            assert!(!raison.contains(mot), "jargon rendu à l'écran : {raison:?}");
+        }
+        assert!(
+            raison.to_lowercase().contains("dossier"),
+            "la cause doit être dite : {raison:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1163,6 +1345,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(filtered.files.len(), 1, "files = {:?}", filtered.files);
         assert!(filtered.files[0].to_string_lossy().contains("keep"));
+    }
+
+    /// #2203 — le parcours doit rendre compte de lui-même PENDANT qu'il
+    /// tourne, pas seulement à la fin.
+    ///
+    /// La contre-épreuve porte sur le point exact du défaut : il ne suffit pas
+    /// qu'une progression soit rendue, il faut qu'elle le soit **avant la
+    /// fin**. Un rapport unique déposé une fois le parcours terminé laisserait
+    /// l'utilisateur devant le même écran muet — c'est précisément ce que
+    /// faisaient déjà `scan_dir_complete` et `audio_files_listed`.
+    #[test]
+    fn le_parcours_rend_compte_avant_la_fin_et_nomme_le_dossier_courant() {
+        // Pas sous temp_dir() : is_tune_temp_file() y écarte tout.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_progression_2203");
+        let _ = std::fs::remove_dir_all(&base);
+        // Plusieurs dossiers, plusieurs fichiers : sans quoi « avant la fin »
+        // n'aurait aucun sens.
+        for sous_dossier in ["disque1", "disque2", "disque3"] {
+            std::fs::create_dir_all(base.join(sous_dossier)).unwrap();
+            for n in 0..4 {
+                std::fs::write(base.join(sous_dossier).join(format!("p{n}.flac")), b"x").unwrap();
+            }
+        }
+        let racine = base.to_string_lossy().to_string();
+
+        let mut annonces: Vec<(usize, String, String)> = Vec::new();
+        // Cadence nulle : on veut observer le mécanisme, pas attendre 2 s.
+        let result = list_audio_files_avec_progression(
+            std::slice::from_ref(&racine),
+            &[],
+            std::time::Duration::ZERO,
+            &mut |p| {
+                annonces.push((
+                    p.fichiers_vus,
+                    p.racine.to_string(),
+                    p.dossier_courant.to_string(),
+                ));
+            },
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Le parcours rend toujours exactement ce qu'il rendait.
+        assert_eq!(result.files.len(), 12, "files = {:?}", result.files);
+
+        assert!(
+            !annonces.is_empty(),
+            "le parcours n'a rendu AUCUNE progression : c'est le silence de #2203 \
+             (3 min 40 sans une ligne chez JP Borderies)"
+        );
+        // « Avant la fin » : au moins une annonce porte un compte
+        // STRICTEMENT inférieur au total. Un unique rapport final en porterait
+        // 12 et ne prouverait rien.
+        assert!(
+            annonces.iter().any(|(vus, _, _)| *vus < 12),
+            "aucune annonce ne précède la fin du parcours — un rapport rendu \
+             une fois tout terminé laisse l'écran muet exactement comme avant. \
+             annonces = {annonces:?}"
+        );
+        // Le compte ne recule jamais : il agrège toutes les racines.
+        for paire in annonces.windows(2) {
+            assert!(
+                paire[1].0 >= paire[0].0,
+                "le compte a reculé : {:?} puis {:?}",
+                paire[0],
+                paire[1]
+            );
+        }
+        // La racine est nommée, et le dossier courant descend réellement dans
+        // l'arborescence — c'est ce qui dit OÙ un parcours s'enlise.
+        assert!(
+            annonces.iter().all(|(_, r, _)| r == &racine),
+            "racine mal rendue : {annonces:?}"
+        );
+        assert!(
+            annonces.iter().any(|(_, _, d)| d.contains("disque1")
+                || d.contains("disque2")
+                || d.contains("disque3")),
+            "le dossier courant ne descend jamais dans l'arborescence : {annonces:?}"
+        );
+    }
+
+    /// La cadence est ce qui empêche une bibliothèque de 58 000 fichiers de
+    /// produire 58 000 lignes de journal. Une cadence longue ⇒ au plus une
+    /// annonce sur un parcours qui dure quelques millisecondes.
+    #[test]
+    fn la_cadence_borne_le_nombre_d_annonces() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_cadence_2203");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for n in 0..50 {
+            std::fs::write(base.join(format!("p{n}.flac")), b"x").unwrap();
+        }
+        let racine = base.to_string_lossy().to_string();
+
+        let mut annonces = 0usize;
+        let result = list_audio_files_avec_progression(
+            std::slice::from_ref(&racine),
+            &[],
+            std::time::Duration::from_secs(3600),
+            &mut |_| annonces += 1,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 50);
+        assert!(
+            annonces <= 1,
+            "la cadence n'est pas respectée : {annonces} annonces pour un \
+             parcours de quelques millisecondes"
+        );
     }
 
     #[test]

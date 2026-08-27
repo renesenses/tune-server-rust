@@ -18,7 +18,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
-use tune_core::plugins_runtime::HOST_ABI_VERSION;
+use tune_plugin_runtime_wasm::HOST_ABI_VERSION;
 use tune_server::state::AppState;
 
 /// A hand-written WAT plugin that **imports** `host_queue_add` and, in
@@ -93,8 +93,9 @@ const MANIFEST: &str = r#"{
 /// threads to make progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_plugin_route_dispatches_and_exercises_real_host() {
+    let _environment = crate::lock_environment();
     // A plugins dir with one wasm plugin. `main.wasm` holds WAT text; wasmtime's
-    // `wat` feature (enabled in tune-core) parses it via content sniffing, so a
+    // `wat` feature parses it via content sniffing, so a
     // real wasm32 toolchain is not needed for the test.
     let dir = tempfile::tempdir().expect("tempdir");
     let plugin_dir = dir.path().join("wasmtest");
