@@ -3,6 +3,7 @@ name = "tune-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [features]
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp"]
@@ -89,3 +90,20 @@ tower = "0.5"
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+
+[[test]]
+name = "server_contracts"
+path = "tests/server_contracts.rs"
+
+[[test]]
+name = "appliance_contracts"
+path = "tests/appliance_contracts.rs"
+
+[[test]]
+name = "plugin_contracts"
+path = "tests/plugin_contracts.rs"
+
+[[test]]
+name = "plugin_wasm_contracts"
+path = "tests/plugin_wasm_contracts.rs"
+required-features = ["plugins-wasm"]

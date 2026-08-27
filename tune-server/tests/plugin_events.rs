@@ -134,6 +134,7 @@ async fn last_event(state: &AppState) -> Value {
 /// to make progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_plugin_receives_subscribed_events_only() {
+    let _environment = crate::lock_environment();
     // Plugins dir with one event-subscribing wasm plugin. `main.wasm` holds WAT
     // text; wasmtime's `wat` feature parses it via content sniffing, so no
     // wasm32 toolchain is needed.

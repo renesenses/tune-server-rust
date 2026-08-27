@@ -13,25 +13,12 @@ use axum::routing::get;
 use serde_json::Value;
 use tower::ServiceExt;
 
+use crate::use_scratch_plugin_data_dir;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 use tune_server::state::AppState;
 
 const SECRET: &str = "test-jwt-secret";
-
-/// Point plugin data dirs at a scratch directory instead of `plugins/data`
-/// under the repo. Shared across tests and set to the *same* value every time,
-/// so the tests that call `plugins::init` concurrently cannot race each other
-/// through the environment. Kept alive for the whole process.
-static PLUGIN_DATA_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-
-fn use_scratch_plugin_data_dir() {
-    let dir = PLUGIN_DATA_DIR.get_or_init(|| tempfile::tempdir().unwrap());
-    // Safety: always the same value, so a concurrent write is a no-op.
-    unsafe {
-        std::env::set_var("TUNE_PLUGINS_DATA_DIR", dir.path());
-    }
-}
 
 fn new_state() -> AppState {
     AppState::new(":memory:", 0, Default::default()).unwrap()
