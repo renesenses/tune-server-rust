@@ -146,11 +146,30 @@ pub mod sql {
         "SELECT id, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    /// ⚠ L'ordre DÉCLARÉ doit suivre l'ordre LIÉ.
+    ///
+    /// `SqliteDialect::placeholder` **ignore l'indice** et rend `?`
+    /// (`db/engine.rs`) : sur SQLite seule la position compte. Cette requête
+    /// déclarait `SET musicbrainz_id = {2} WHERE id = {1}` alors que
+    /// `ArtistRepo::update_mbid` liait `[id, mbid]` — ce qui donnait, une fois
+    /// les `?` numérotés par leur ordre d'apparition,
+    /// `SET musicbrainz_id = <id> WHERE id = <mbid>`. Un identifiant
+    /// MusicBrainz n'étant jamais un entier, la clause `WHERE` ne trouvait
+    /// **jamais** de ligne : l'écriture était un no-op silencieux, et l'est
+    /// restée sur toute la ligne 0.9. Postgres, qui numérote ses `$n`,
+    /// n'était pas touché — le défaut ne se voyait donc que sur le moteur par
+    /// défaut, celui de la quasi-totalité des installations.
+    ///
+    /// Conséquence directe sur #2184 : la « phase 1 » de l'enrichissement des
+    /// images d'artistes (`batch_match_artist_mbids`) résolvait des MBID et
+    /// n'en gardait aucun. D'une passe à l'autre, `artists_without_mbid` ne
+    /// bougeait pas et les artistes n'atteignaient jamais les sources d'images
+    /// indexées par MBID (Fanart, TheAudioDB, MusicBrainz/Wikidata).
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
-            d.placeholder(2),
-            d.placeholder(1)
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -616,7 +635,8 @@ impl ArtistRepo {
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         let mbid = usable_musicbrainz_id(Some(mbid));
-        self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
+        // Ordre lié = ordre déclaré : la valeur d'abord, l'identifiant ensuite.
+        self.db.execute(&sql, &[&mbid as &dyn ToSqlValue, &id])?;
         Ok(())
     }
 
@@ -955,6 +975,51 @@ mod tests {
 
         let results = repo.search("Jazz", 10).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// `update_mbid` doit ÉCRIRE — sur SQLite aussi.
+    ///
+    /// `SqliteDialect::placeholder` rend `?` quel que soit l'indice, donc
+    /// l'ordre déclaré dans le `format!` ne vaut rien : seul l'ordre des
+    /// paramètres liés compte. La requête déclarait la valeur en `{2}` et
+    /// l'identifiant en `{1}` tout en liant `[id, mbid]`, ce qui produisait
+    /// `SET musicbrainz_id = <id> WHERE id = <mbid>` : zéro ligne touchée.
+    ///
+    /// Sans cette écriture, la phase 1 de l'enrichissement des images
+    /// d'artistes résout des MBID et n'en garde aucun (#2184).
+    #[test]
+    fn update_mbid_ecrit_reellement_le_mbid() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let id = repo.create(&Artist::new("Magma".into())).unwrap();
+        assert_eq!(repo.list_without_mbid().unwrap().len(), 1);
+
+        const MBID: &str = "0e1a0b0f-1111-2222-3333-444444444444";
+        repo.update_mbid(id, MBID).unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().musicbrainz_id.as_deref(),
+            Some(MBID),
+            "le MBID doit être persisté, sinon chaque passe repart de zéro"
+        );
+        assert!(
+            repo.list_without_mbid().unwrap().is_empty(),
+            "l'artiste doit sortir de la liste « sans MBID »"
+        );
+    }
+
+    /// Contre-épreuve du témoin : un identifiant vide reste une absence, il ne
+    /// doit pas se transformer en chaîne vide qui passerait les filtres
+    /// `musicbrainz_id != ''`.
+    #[test]
+    fn update_mbid_vide_laisse_l_artiste_sans_mbid() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let id = repo.create(&Artist::new("Gong".into())).unwrap();
+
+        repo.update_mbid(id, "   ").unwrap();
+
+        assert_eq!(repo.list_without_mbid().unwrap().len(), 1);
     }
 
     #[test]
