@@ -832,6 +832,34 @@ fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
         return None; // stockage local : le décodeur lit sur place
     }
 
+    // Staging PIPELINÉ (phase 2, flag TUNE_STAGE_STREAM_DECODE) : au lieu de
+    // copier tout le fichier avant de décoder, on lance la copie en tâche de
+    // fond et on rend la main tout de suite ; `decode_symphonia` décode via une
+    // source seekable qui suit la frontière d'écriture. Pour un faststart, la
+    // première note arrive en 2-3 s au lieu des 41 s d'un gros ALAC. Le temp
+    // n'entre PAS dans le cache d'octets (il n'est pas complet à cet instant).
+    if crate::audio::staged_growth::stream_decode_enabled()
+        && let Ok(m) = std::fs::metadata(src_path)
+    {
+        let ext = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin");
+        let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
+        let growth = crate::audio::staged_growth::StageGrowth::new(m.len());
+        crate::audio::staged_growth::register(&dst.to_string_lossy(), growth.clone());
+        let src_owned = src.to_string();
+        let dst_owned = dst.clone();
+        std::thread::spawn(move || {
+            copier_en_fond(&src_owned, &dst_owned, &growth);
+        });
+        tracing::info!(src = %src, staged = %dst.display(), "decode_source_staging_pipelined");
+        return Some(Arc::new(StagedFile {
+            path: dst,
+            bytes: 0,
+        }));
+    }
+
     // Identité du fichier : chemin + date + taille. Une source dont on n'a pas
     // les métadonnées ne peut pas être mise en cache sûrement — on la copie
     // sans cache (comportement historique) plutôt que de risquer une copie
@@ -907,6 +935,47 @@ fn stage_locally_for_decode(src: &str) -> Option<Arc<StagedFile>> {
         STAGE_CACHE.lock().unwrap().inflight.remove(&k);
     }
     resultat
+}
+
+/// Copie `src` → `dst` par blocs en publiant la progression sur `growth`, pour
+/// que le décodeur lise au fur et à mesure. `finish()` à la fin, `fail()` sur
+/// erreur (le lecteur remonte alors une erreur au lieu d'un EOF muet). Le temp
+/// est supprimé par le `Drop` du `StagedFile` que tient le décodeur ; sur Unix
+/// l'inode survit tant que ce copieur écrit, même si le chemin est délié.
+#[cfg(unix)]
+fn copier_en_fond(
+    src: &str,
+    dst: &std::path::Path,
+    growth: &Arc<crate::audio::staged_growth::StageGrowth>,
+) {
+    use std::io::{Read, Write};
+    let (mut r, mut w) = match (std::fs::File::open(src), std::fs::File::create(dst)) {
+        (Ok(r), Ok(w)) => (r, w),
+        _ => {
+            growth.fail();
+            return;
+        }
+    };
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB
+    let mut total: u64 = 0;
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if w.write_all(&buf[..n]).is_err() || w.flush().is_err() {
+                    growth.fail();
+                    return;
+                }
+                total += n as u64;
+                growth.advance(total);
+            }
+            Err(_) => {
+                growth.fail();
+                return;
+            }
+        }
+    }
+    growth.finish();
 }
 
 /// Date de modification en secondes epoch, 0 si indisponible — juste une
@@ -2227,7 +2296,15 @@ fn decode_symphonia(
     // instead of a plain File (which would EOF-truncate at the write frontier).
     // Registry is empty unless TUNE_DASH_STREAM_DECODE armed a download — then
     // this is byte-identical to the File path.
-    let mss = if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+    let mss = if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
+        // Staging pipeliné (lenteurs Yves, phase 2) : le fichier réseau est
+        // copié en fond ; on décode au fur et à mesure via une source SEEKABLE
+        // (l'ALAC moov-at-end peut chercher la fin). Registre vide sauf
+        // TUNE_STAGE_STREAM_DECODE — sinon octet pour octet identique au File.
+        let src = crate::audio::staged_growth::SeekableGrowingSource::open(file_path, growth)
+            .map_err(|e| format!("open (staged growing): {e}"))?;
+        MediaSourceStream::new(Box::new(src), Default::default())
+    } else if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
         let src = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
             .map_err(|e| format!("open (growing): {e}"))?;
         MediaSourceStream::new(Box::new(src), Default::default())

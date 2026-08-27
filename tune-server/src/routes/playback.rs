@@ -11,6 +11,7 @@ use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
+use tune_core::outputs::OutputCommandError;
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
@@ -138,6 +139,32 @@ fn play_error_response(e: String) -> axum::response::Response {
         .into_response()
 }
 
+/// Réponse stable des commandes de sortie. Une capacité absente est une
+/// requête impossible (422), pas une panne ; un backend qui refuse une
+/// capacité déclarée est une erreur de passerelle (502), jamais un faux 200.
+pub(crate) fn output_command_error_response(error: OutputCommandError) -> axum::response::Response {
+    match error {
+        OutputCommandError::Unsupported { command } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "unsupported_output_command",
+                "command": command,
+                "message": format!("Output does not support {command}"),
+            })),
+        )
+            .into_response(),
+        OutputCommandError::Failed { command, message } => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "output_command_failed",
+                "command": command,
+                "message": message,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Persist the queue state for a zone to disk (non-blocking).
 fn persist_queue_async(state: &AppState, zone_id: i64) {
     let db = state.backend.clone();
@@ -213,6 +240,13 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         v.as_object_mut().unwrap().insert(
             "levels_available".into(),
             json!(crate::routes::zones::levels_available(state, zone).await),
+        );
+        v.as_object_mut().unwrap().insert(
+            "output_capabilities".into(),
+            json!(
+                crate::routes::zones::output_capabilities(state, zone.output_device_id.as_deref())
+                    .await
+            ),
         );
     }
     if is_browser_zone {
@@ -1187,13 +1221,16 @@ async fn play(
     }
 }
 
-async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let device_id = get_zone_device_id(&state, zone_id);
-    state
+    match state
         .orchestrator
         .pause(zone_id, device_id.as_deref())
-        .await;
-    Json(build_zone_json(&state, zone_id).await)
+        .await
+    {
+        Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Err(error) => output_command_error_response(error),
+    }
 }
 
 async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
@@ -1360,11 +1397,14 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
     }
 
     let device_id = get_zone_device_id(&state, zone_id);
-    state
+    match state
         .orchestrator
         .resume(zone_id, device_id.as_deref())
-        .await;
-    Json(build_zone_json(&state, zone_id).await).into_response()
+        .await
+    {
+        Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Err(error) => output_command_error_response(error),
+    }
 }
 
 async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
@@ -1485,10 +1525,13 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
 
     if precedent_doit_relancer(current.position_ms, vient_de_redemarrer) {
         let device_id = get_zone_device_id(&state, zone_id);
-        state
+        if let Err(error) = state
             .orchestrator
             .seek(zone_id, 0, device_id.as_deref())
-            .await;
+            .await
+        {
+            return output_command_error_response(error);
+        }
         DERNIER_REDEMARRAGE
             .lock()
             .unwrap()
@@ -1512,20 +1555,23 @@ async fn seek(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<SeekRequest>,
-) -> Json<Value> {
+) -> impl IntoResponse {
     let device_id = get_zone_device_id(&state, zone_id);
-    state
+    match state
         .orchestrator
         .seek(zone_id, body.position_ms as u64, device_id.as_deref())
-        .await;
-    Json(json!({ "position_ms": body.position_ms }))
+        .await
+    {
+        Ok(()) => Json(json!({ "position_ms": body.position_ms })).into_response(),
+        Err(error) => output_command_error_response(error),
+    }
 }
 
 async fn set_volume(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<VolumeRequest>,
-) -> Json<Value> {
+) -> impl IntoResponse {
     // Le verrou du mode PURE mord ICI, pas seulement dans l'interface : le
     // volume est un multiplicateur appliqué à chaque échantillon, et une zone
     // annoncée « bit-perfect » qui atténue ne l'est pas. Un curseur grisé côté
@@ -1544,15 +1590,14 @@ async fn set_volume(
         );
     }
     let device_id = get_zone_device_id(&state, zone_id);
-    state
+    match state
         .orchestrator
         .set_volume(zone_id, volume, device_id.as_deref())
-        .await;
-    let vol_int = (volume * 100.0).round() as i32;
-    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .update_volume(zone_id, vol_int)
-        .ok();
-    Json(json!({ "volume": volume }))
+        .await
+    {
+        Ok(()) => Json(json!({ "volume": volume })).into_response(),
+        Err(error) => output_command_error_response(error),
+    }
 }
 
 async fn toggle_shuffle(
@@ -2536,15 +2581,20 @@ async fn do_transfer(
                 // début (même seuil que la route seek) — inutile de chercher
                 // dans un flux qui vient de démarrer.
                 if source_position_ms > 3000 {
-                    state
+                    if let Err(error) = state
                         .orchestrator
                         .seek(target_zone, source_position_ms, Some(did))
-                        .await;
+                        .await
+                    {
+                        return output_command_error_response(error);
+                    }
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
                 if source_paused {
-                    state.orchestrator.pause(target_zone, Some(did)).await;
+                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
+                        return output_command_error_response(error);
+                    }
                 }
             }
             Err(e) => {
@@ -2838,33 +2888,60 @@ async fn get_audiophile(State(state): State<AppState>, Path(zone_id): Path<i64>)
     Json(val)
 }
 
+#[derive(Debug, Deserialize)]
+struct AudiophileChange {
+    enabled: bool,
+    #[serde(default)]
+    confirm_full_volume: bool,
+}
+
+/// L'activation de PURE avec le verrou armé est une commande de volume à
+/// 100 %, pas un simple changement d'affichage. Le serveur impose donc la
+/// confirmation à tous les clients, y compris une télécommande ou un appel
+/// direct qui contournerait le client web (#2445).
+fn full_volume_confirmation_required(lock_enabled: bool, body: &AudiophileChange) -> bool {
+    lock_enabled && body.enabled && !body.confirm_full_volume
+}
+
 async fn set_audiophile(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("zone_{zone_id}_audiophile");
-    settings.set(&key, &body.to_string()).ok();
+    Json(body): Json<AudiophileChange>,
+) -> axum::response::Response {
+    let lock_enabled = tune_core::audio::audiophile::volume_lock_enabled(&state.backend);
+    if full_volume_confirmation_required(lock_enabled, &body) {
+        warn!(zone_id, "audiophile_full_volume_confirmation_required");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "full_volume_confirmation_required",
+                "message": "Activating PURE with the volume lock enabled sets the device volume to 100%. Explicit confirmation is required.",
+            })),
+        )
+            .into_response();
+    }
 
     // Verrou armé : passer en PURE remonte le volume tout de suite. Sans ça,
     // la zone resterait à 20 % avec un curseur gelé sur 20 % — le pire des
     // deux mondes, ni bit-perfect ni réglable.
-    if tune_core::audio::audiophile::volume_lock_enabled(&state.backend)
-        && body
-            .get("enabled")
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false)
-    {
+    if lock_enabled && body.enabled {
         let device_id = get_zone_device_id(&state, zone_id);
-        state
+        if let Err(error) = state
             .orchestrator
             .set_volume(zone_id, 1.0, device_id.as_deref())
-            .await;
-        tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-            .update_volume(zone_id, 100)
-            .ok();
+            .await
+        {
+            return output_command_error_response(error);
+        }
     }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let key = format!("zone_{zone_id}_audiophile");
+    // Le témoin de confirmation autorise cette seule requête : il ne devient
+    // jamais un réglage persistant qui pourrait autoriser un saut ultérieur.
+    settings
+        .set(&key, &json!({ "enabled": body.enabled }).to_string())
+        .ok();
 
     // Repousser l'état vers la sortie qui joue. Sans cet appel, la clé était
     // écrite, la route répondait un succès, et la bascule n'atteignait le son
@@ -2875,21 +2952,19 @@ async fn set_audiophile(
     let applique_a_chaud = state.orchestrator.apply_audiophile_change(zone_id).await;
     info!(
         zone_id,
-        enabled = body
-            .get("enabled")
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false),
+        enabled = body.enabled,
         applique_a_chaud,
         "audiophile_mode_set"
     );
 
-    let mut reponse = body;
     // `applied_live` dit la vérité que la réponse taisait : la bascule est-elle
-    // audible MAINTENANT, ou seulement au prochain flux ?
-    if let Some(obj) = reponse.as_object_mut() {
-        obj.insert("applied_live".into(), json!(applique_a_chaud));
-    }
-    Json(reponse)
+    // audible MAINTENANT, ou seulement au prochain flux ? Le témoin de
+    // confirmation n'est volontairement jamais renvoyé ni persisté.
+    Json(json!({
+        "enabled": body.enabled,
+        "applied_live": applique_a_chaud,
+    }))
+    .into_response()
 }
 
 async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
@@ -3196,12 +3271,49 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
 
 #[cfg(test)]
 mod tests {
+    use super::AudiophileChange;
     use super::client_title_is_usable;
     use super::eq_bands_json;
+    use super::full_volume_confirmation_required;
+    use super::output_command_error_response;
     use super::play_error_response;
     use super::precedent_doit_relancer;
     use super::{PlayRequest, QueueAddRequest};
     use axum::http::StatusCode;
+    use tune_core::outputs::{OutputCommand, OutputCommandError};
+
+    #[test]
+    fn pure_avec_verrou_refuse_toute_activation_non_confirmee() {
+        let activation = AudiophileChange {
+            enabled: true,
+            confirm_full_volume: false,
+        };
+        assert!(full_volume_confirmation_required(true, &activation));
+
+        let confirmation = AudiophileChange {
+            enabled: true,
+            confirm_full_volume: true,
+        };
+        assert!(!full_volume_confirmation_required(true, &confirmation));
+    }
+
+    #[test]
+    fn aucune_confirmation_n_est_demandee_sans_montee_de_volume() {
+        let activation_sans_verrou = AudiophileChange {
+            enabled: true,
+            confirm_full_volume: false,
+        };
+        assert!(!full_volume_confirmation_required(
+            false,
+            &activation_sans_verrou
+        ));
+
+        let desactivation = AudiophileChange {
+            enabled: false,
+            confirm_full_volume: false,
+        };
+        assert!(!full_volume_confirmation_required(true, &desactivation));
+    }
 
     #[test]
     fn le_json_eq_preserve_le_canal_cible() {
@@ -3316,12 +3428,41 @@ mod tests {
     }
 
     async fn parts(e: &str) -> (StatusCode, serde_json::Value) {
-        let resp = play_error_response(e.to_string());
+        response_parts(play_error_response(e.to_string())).await
+    }
+
+    async fn response_parts(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unsupported_output_command_is_explicit_json_422() {
+        let (status, body) = response_parts(output_command_error_response(
+            OutputCommandError::unsupported(OutputCommand::Seek),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "unsupported_output_command");
+        assert_eq!(body["command"], "seek");
+        assert!(body["message"].as_str().unwrap().contains("seek"));
+    }
+
+    #[tokio::test]
+    async fn failed_output_command_is_explicit_json_502() {
+        let (status, body) = response_parts(output_command_error_response(
+            OutputCommandError::failed(OutputCommand::SetVolume, "renderer refused volume"),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "output_command_failed");
+        assert_eq!(body["command"], "set_volume");
+        assert_eq!(body["message"], "renderer refused volume");
     }
 
     /// Forum #1183: a device-side rejection (e.g. the legacy AirPlay path

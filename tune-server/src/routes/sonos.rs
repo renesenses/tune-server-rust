@@ -95,7 +95,7 @@ async fn play_room(State(state): State<AppState>, Path(id): Path<String>) -> imp
             .into_response();
     };
     let output = output.lock().await;
-    match output.resume().await {
+    match output.checked_resume().await {
         Ok(()) => Json(json!({"status": "playing"})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -112,7 +112,7 @@ async fn pause_room(State(state): State<AppState>, Path(id): Path<String>) -> im
             .into_response();
     };
     let output = output.lock().await;
-    match output.pause().await {
+    match output.checked_pause().await {
         Ok(()) => Json(json!({"status": "paused"})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -139,7 +139,7 @@ async fn set_room_volume(
             .into_response();
     };
     let output = output.lock().await;
-    match output.set_volume(body.volume).await {
+    match output.checked_set_volume(body.volume).await {
         Ok(()) => Json(json!({"volume": body.volume})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }

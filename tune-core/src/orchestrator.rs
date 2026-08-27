@@ -173,6 +173,7 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::event_bus::EventBus;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
+use crate::outputs::{OutputCommand, OutputCommandError, OutputCommandResult};
 use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
@@ -1927,7 +1928,7 @@ impl PlaybackOrchestrator {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         let arc = { outputs.lock().await.get(&did) };
                         if let Some(output) = arc {
-                            if let Err(e) = output.lock().await.set_volume(1.0).await {
+                            if let Err(e) = output.lock().await.checked_set_volume(1.0).await {
                                 warn!(zone_id, volume = 1.0, error = %e, "play_initial_volume_failed");
                             } else {
                                 info!(zone_id, volume = 1.0, "play_initial_volume_sent");
@@ -7635,26 +7636,27 @@ impl PlaybackOrchestrator {
         });
     }
 
-    pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) {
+    pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        if let Some(did) = device_id {
+            // Le backend confirme la commande AVANT que la copie mémoire et
+            // la base annoncent Paused.
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::Pause,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            output.lock().await.checked_pause().await?;
+        }
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "paused")
             .ok();
         self.playback.pause(zone_id).await;
-        if let Some(did) = device_id {
-            // Snapshot the output Arc under a short lock, then release the
-            // registry lock BEFORE the SOAP call: holding it across per-device
-            // network I/O lets one slow/offline renderer freeze all playback.
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                if let Err(e) = output.lock().await.pause().await {
-                    warn!(zone_id, error = %e, "device_pause_failed");
-                }
-            }
-        }
+        Ok(())
     }
 
-    pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) {
+    pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
@@ -7716,7 +7718,7 @@ impl PlaybackOrchestrator {
                         // Même station, même écoute logique : pas de nouvelle
                         // ligne d'historique (même règle que radio_auto_retry).
                         match self.play_without_history(req).await {
-                            Ok(_) => return,
+                            Ok(_) => return Ok(()),
                             Err(e) => warn!(
                                 zone_id,
                                 error = %e,
@@ -7728,37 +7730,43 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.playback.resume(zone_id).await;
-
-        let Some(did) = device_id else { return };
-        let output_type = {
-            let arc = { self.outputs.lock().await.get(did) };
-            let Some(output) = arc else {
-                return;
-            };
+        let output_type = if let Some(did) = device_id {
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::Resume,
+                    format!("output {did} is not registered"),
+                )
+            })?;
             let out = output.lock().await;
             let t = out.output_type().to_string();
-            if let Err(e) = out.resume().await {
-                warn!(zone_id, error = %e, "device_resume_failed");
-            }
-            t
+            out.checked_resume().await?;
+            Some(t)
+        } else {
+            None
         };
+
+        self.playback.resume(zone_id).await;
+        crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .save_play_state(zone_id, "playing")
+            .ok();
 
         // Legacy DLNA/OpenHome renderers (e.g. Cyrus Stream X) restart the stream
         // on Play-after-Pause instead of resuming. Seek back to the paused
         // position once the renderer has had a moment to (re)start, so playback
         // continues instead of replaying from the top. Locks are released during
         // the wait so other zones aren't blocked.
-        if (output_type == "dlna" || output_type == "openhome") && position_ms > 3000 {
+        if matches!(output_type.as_deref(), Some("dlna" | "openhome")) && position_ms > 3000 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                match output.lock().await.seek(position_ms).await {
+            let did = device_id.expect("output type only exists with a device id");
+            let output = { self.outputs.lock().await.get(did) };
+            if let Some(output) = output {
+                match output.lock().await.checked_seek(position_ms).await {
                     Ok(()) => info!(zone_id, position_ms, "dlna_resume_seek"),
                     Err(e) => warn!(zone_id, position_ms, error = %e, "dlna_resume_seek_failed"),
                 }
             }
         }
+        Ok(())
     }
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
@@ -7818,11 +7826,30 @@ impl PlaybackOrchestrator {
         }
     }
 
-    pub async fn seek(&self, zone_id: i64, mut position_ms: u64, device_id: Option<&str>) {
+    pub async fn seek(
+        &self,
+        zone_id: i64,
+        mut position_ms: u64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
         let seek_start = std::time::Instant::now();
+        if let Some(did) = device_id {
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::Seek,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            output
+                .lock()
+                .await
+                .capabilities()
+                .require(OutputCommand::Seek)?;
+        }
         // Clamp seek to track duration to prevent out-of-bounds seek on files
         // with incorrect metadata duration (e.g. VBR MP3 with wrong header).
         let state = self.playback.get_state(zone_id).await;
+        let original_position_ms = state.position_ms;
         if let Some(ref np) = state.now_playing {
             if np.duration_ms > 0 && position_ms > np.duration_ms as u64 {
                 info!(
@@ -7834,20 +7861,6 @@ impl PlaybackOrchestrator {
                 position_ms = (np.duration_ms as u64).saturating_sub(1000);
             }
         }
-        self.playback.seek(zone_id, position_ms as i64).await;
-        let state = self.playback.get_state(zone_id).await;
-        if let Some(ref np) = state.now_playing {
-            if let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
-                zone_id,
-                position_ms as i64,
-                np.track_id,
-                Some(np.source.as_str()),
-                np.source_id.as_deref(),
-            ) {
-                warn!(zone_id, error = %e, "persist_seek_position_failed");
-            }
-        }
-
         if let Some(did) = device_id {
             // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
             // the seek strategy depends on whether the stream session supports
@@ -7915,13 +7928,13 @@ impl PlaybackOrchestrator {
                         "seek_streaming_direct_on_seekable_session"
                     );
 
-                    let arc = { self.outputs.lock().await.get(did) };
-                    if let Some(output) = arc {
-                        if let Err(e) = output.lock().await.seek(position_ms).await {
-                            warn!(zone_id, error = %e, "device_seek_on_seekable_session_failed");
-                        }
-                    }
-                    self.playback.seek(zone_id, position_ms as i64).await;
+                    let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                        OutputCommandError::failed(
+                            OutputCommand::Seek,
+                            format!("output {did} disappeared during seek"),
+                        )
+                    })?;
+                    output.lock().await.checked_seek(position_ms).await?;
                     info!(
                         zone_id,
                         position_ms,
@@ -7983,11 +7996,17 @@ impl PlaybackOrchestrator {
                             // Stream is now fresh — issue the seek on the output.
                             // Small delay to let the renderer start buffering.
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            let arc = { self.outputs.lock().await.get(did) };
-                            if let Some(output) = arc {
-                                if let Err(e) = output.lock().await.seek(position_ms).await {
-                                    warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
-                                }
+                            let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(OutputCommandError::failed(
+                                    OutputCommand::Seek,
+                                    format!("output {did} disappeared during seek"),
+                                ));
+                            };
+                            if let Err(error) = output.lock().await.checked_seek(position_ms).await
+                            {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(error);
                             }
                             // Re-set the seek timestamp so the poller grace period
                             // starts from after the Seek SOAP command, not from
@@ -8006,11 +8025,17 @@ impl PlaybackOrchestrator {
                             // misinterpret the Stopped state as a playback failure.
                             self.playback.seek(zone_id, position_ms as i64).await;
                             // Fall back to direct seek (best effort)
-                            let arc = { self.outputs.lock().await.get(did) };
-                            if let Some(output) = arc {
-                                if let Err(e) = output.lock().await.seek(position_ms).await {
-                                    warn!(zone_id, error = %e, "device_seek_fallback_failed");
-                                }
+                            let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(OutputCommandError::failed(
+                                    OutputCommand::Seek,
+                                    format!("output {did} disappeared during seek"),
+                                ));
+                            };
+                            if let Err(error) = output.lock().await.checked_seek(position_ms).await
+                            {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(error);
                             }
                         }
                     }
@@ -8040,21 +8065,49 @@ impl PlaybackOrchestrator {
                             seek_ms = seek_start.elapsed().as_millis() as u64,
                             "seek_local_output_complete"
                         ),
-                        Err(e) => warn!(zone_id, error = %e, "seek_local_output_play_failed"),
-                    }
-                } else {
-                    let arc = { self.outputs.lock().await.get(did) };
-                    if let Some(output) = arc {
-                        if let Err(e) = output.lock().await.seek(position_ms).await {
-                            warn!(zone_id, error = %e, "device_seek_failed");
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "seek_local_output_play_failed");
+                            self.playback.seek(zone_id, original_position_ms).await;
+                            return Err(OutputCommandError::failed(OutputCommand::Seek, e));
                         }
                     }
+                } else {
+                    let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                        OutputCommandError::failed(
+                            OutputCommand::Seek,
+                            format!("output {did} disappeared during seek"),
+                        )
+                    })?;
+                    output.lock().await.checked_seek(position_ms).await?;
                 }
             }
         }
+
+        // La position publique et persistée ne change qu'après confirmation du
+        // backend. Les `seek()` temporaires ci-dessus servent uniquement de
+        // garde au poller pendant une recréation de flux.
+        self.playback.seek(zone_id, position_ms as i64).await;
+        let confirmed_state = self.playback.get_state(zone_id).await;
+        if let Some(ref np) = confirmed_state.now_playing {
+            if let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
+                zone_id,
+                position_ms as i64,
+                np.track_id,
+                Some(np.source.as_str()),
+                np.source_id.as_deref(),
+            ) {
+                warn!(zone_id, error = %e, "persist_seek_position_failed");
+            }
+        }
+        Ok(())
     }
 
-    pub async fn set_volume(&self, zone_id: i64, volume: f64, device_id: Option<&str>) {
+    pub async fn set_volume(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
         let zone = ZoneRepo::with_backend(self.db.clone())
@@ -8063,20 +8116,12 @@ impl PlaybackOrchestrator {
             .flatten();
         if zone.as_ref().is_some_and(|z| z.fixed_volume) {
             self.playback.set_volume(zone_id, 1.0).await;
-            return;
+            ZoneRepo::with_backend(self.db.clone())
+                .update_volume(zone_id, 100)
+                .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+            return Ok(());
         }
 
-        self.playback.set_volume(zone_id, volume).await;
-        self.playback.mark_volume_changed(zone_id).await;
-        // Persister AUSSI : les routes HTTP écrivent la base elles-mêmes, mais
-        // les appels internes (alarmes, minuterie de sommeil, IA) passaient
-        // uniquement par ici et laissaient `zone.volume` sur l'ancienne valeur.
-        // La page et le chemin du signal lisent la base : sans cette ligne, ils
-        // divergeaient de la copie mémoire jusqu'au prochain coup de curseur
-        // (#1504). Écriture idempotente quand la route a déjà écrit.
-        ZoneRepo::with_backend(self.db.clone())
-            .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
-            .ok();
         // Trim de gain par renderer (setting `zone_{id}_gain_trim_db`, ±12 dB) :
         // composé UNIQUEMENT dans la valeur envoyée au device. Le volume
         // affiché/persisté reste celui de l'utilisateur, le cache de
@@ -8094,53 +8139,66 @@ impl PlaybackOrchestrator {
             (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
         };
         if let Some(did) = device_id {
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                info!(
-                    zone_id,
-                    volume,
-                    device_volume,
-                    device_id = did,
-                    "device_set_volume_sending"
-                );
-                if let Err(e) = output.lock().await.set_volume(device_volume).await {
-                    warn!(zone_id, error = %e, "device_set_volume_failed");
-                    // A refused volume used to stop at this log line: the DB kept
-                    // the new value, the slider stayed where the user left it,
-                    // and the sound never changed. Tell the UI, using the same
-                    // channel an unavailable output already uses.
-                    if let Some(ref bus) = self.event_bus {
-                        bus.emit(
-                            "zone.playback_error",
-                            serde_json::json!({
-                                "zone_id": zone_id,
-                                "error": e,
-                            }),
-                        );
-                    }
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::SetVolume,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            info!(
+                zone_id,
+                volume,
+                device_volume,
+                device_id = did,
+                "device_set_volume_sending"
+            );
+            if let Err(error) = output.lock().await.checked_set_volume(device_volume).await {
+                warn!(zone_id, error = %error, "device_set_volume_failed");
+                if let Some(ref bus) = self.event_bus {
+                    bus.emit(
+                        "zone.playback_error",
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "error": error.to_string(),
+                        }),
+                    );
                 }
-            } else {
-                warn!(
-                    zone_id,
-                    device_id = did,
-                    "device_set_volume_output_not_found"
-                );
+                return Err(error);
             }
         } else {
             info!(zone_id, volume, "set_volume_no_device_id");
         }
+
+        // Le backend a accepté la commande : seulement maintenant les deux
+        // copies internes et la base peuvent annoncer la nouvelle valeur.
+        self.playback.set_volume(zone_id, volume).await;
+        self.playback.mark_volume_changed(zone_id).await;
+        ZoneRepo::with_backend(self.db.clone())
+            .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
+            .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+        Ok(())
     }
 
-    pub async fn set_mute(&self, zone_id: i64, muted: bool, device_id: Option<&str>) {
-        self.playback.set_mute(zone_id, muted).await;
+    pub async fn set_mute(
+        &self,
+        zone_id: i64,
+        muted: bool,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
         if let Some(did) = device_id {
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                if let Err(e) = output.lock().await.set_mute(muted).await {
-                    warn!(zone_id, error = %e, "device_set_mute_failed");
-                }
-            }
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::SetMute,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            output.lock().await.checked_set_mute(muted).await?;
         }
+        self.playback.set_mute(zone_id, muted).await;
+        ZoneRepo::with_backend(self.db.clone())
+            .update_muted(zone_id, muted)
+            .map_err(|message| OutputCommandError::failed(OutputCommand::SetMute, message))?;
+        Ok(())
     }
 
     /// Clear the prefetch buffer. Should be called when the queue changes
@@ -9995,6 +10053,7 @@ mod tests {
     use crate::db::zone_repo::ZoneRepo;
     use crate::http::streamer::AudioStreamer;
     use crate::outputs::registry::OutputRegistry;
+    use crate::outputs::{OutputCapabilities, OutputCommand, OutputCommandError};
     use crate::playback::{NowPlaying, PlayState, PlaybackManager};
     use crate::streaming::registry::ServiceRegistry;
 
@@ -10644,7 +10703,7 @@ mod tests {
             .await;
         orch.playback.pause(zone_id).await;
 
-        orch.resume(zone_id, Some("mock-radio")).await;
+        orch.resume(zone_id, Some("mock-radio")).await.unwrap();
 
         let outputs = orch.outputs.lock().await;
         let out = outputs.get("mock-radio").unwrap();
@@ -10709,7 +10768,7 @@ mod tests {
             .await;
         orch.playback.pause(zone_id).await;
 
-        orch.resume(zone_id, Some("mock-radio")).await;
+        orch.resume(zone_id, Some("mock-radio")).await.unwrap();
 
         let outputs = orch.outputs.lock().await;
         let out = outputs.get("mock-radio").unwrap();
@@ -10966,6 +11025,56 @@ mod tests {
         id: String,
     }
 
+    struct FailingCommandOutput {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outputs::traits::OutputTarget for FailingCommandOutput {
+        fn name(&self) -> &str {
+            "FailingCommand"
+        }
+        fn device_id(&self) -> &str {
+            &self.id
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        fn capabilities(&self) -> OutputCapabilities {
+            OutputCapabilities::v1(true, true, true, true, true, false)
+        }
+        async fn play_media(
+            &self,
+            _media: &crate::outputs::traits::PlayMedia<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Err("pause refused".into())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Err("resume refused".into())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Err("seek refused".into())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Err("volume refused".into())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Err("mute refused".into())
+        }
+        async fn get_status(&self) -> Result<crate::outputs::traits::OutputStatus, String> {
+            Ok(Default::default())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::outputs::traits::OutputTarget for TimingOutOutput {
         fn name(&self) -> &str {
@@ -11011,6 +11120,143 @@ mod tests {
         async fn is_available(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn une_capacite_absente_ne_modifie_ni_memoire_ni_base() {
+        let orch = test_orchestrator();
+        let device_id = "legacy-noop";
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Legacy", Some("test"), Some(device_id))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(TimingOutOutput {
+                id: device_id.into(),
+            }));
+
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id: Some(42),
+                    title: "Contrat fail-closed".into(),
+                    duration_ms: 120_000,
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.update_position(zone_id, 12_000).await;
+        orch.playback.set_volume(zone_id, 0.5).await;
+        orch.playback.set_mute(zone_id, false).await;
+
+        for (result, command) in [
+            (
+                orch.pause(zone_id, Some(device_id)).await,
+                OutputCommand::Pause,
+            ),
+            (
+                orch.seek(zone_id, 42_000, Some(device_id)).await,
+                OutputCommand::Seek,
+            ),
+            (
+                orch.set_volume(zone_id, 0.8, Some(device_id)).await,
+                OutputCommand::SetVolume,
+            ),
+            (
+                orch.set_mute(zone_id, true, Some(device_id)).await,
+                OutputCommand::SetMute,
+            ),
+        ] {
+            assert_eq!(
+                result,
+                Err(OutputCommandError::Unsupported { command }),
+                "{command} doit être refusée avant toute mutation"
+            );
+        }
+
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Playing);
+        assert_eq!(state.position_ms, 12_000);
+        assert!((state.volume - 0.5).abs() < f64::EPSILON);
+        assert!(!state.muted);
+
+        let persisted = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(persisted.last_position_ms, 0);
+        assert_eq!(persisted.volume, 50);
+        assert!(!persisted.muted);
+    }
+
+    #[tokio::test]
+    async fn un_backend_qui_refuse_ne_modifie_ni_memoire_ni_base() {
+        let orch = test_orchestrator();
+        let device_id = "failing-command";
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Failing", Some("test"), Some(device_id))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(FailingCommandOutput {
+                id: device_id.into(),
+            }));
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id: Some(43),
+                    title: "Refus backend".into(),
+                    duration_ms: 120_000,
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.update_position(zone_id, 13_000).await;
+        orch.playback.set_volume(zone_id, 0.5).await;
+
+        assert!(matches!(
+            orch.pause(zone_id, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::Pause,
+                ..
+            })
+        ));
+        assert!(matches!(
+            orch.seek(zone_id, 42_000, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::Seek,
+                ..
+            })
+        ));
+        assert!(matches!(
+            orch.set_volume(zone_id, 0.8, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::SetVolume,
+                ..
+            })
+        ));
+        assert!(matches!(
+            orch.set_mute(zone_id, true, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::SetMute,
+                ..
+            })
+        ));
+
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Playing);
+        assert_eq!(state.position_ms, 13_000);
+        assert_eq!(state.volume, 0.5);
+        assert!(!state.muted);
+        let persisted = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(persisted.last_position_ms, 0);
+        assert_eq!(persisted.volume, 50);
+        assert!(!persisted.muted);
     }
 
     /// Un timeout de transport ne doit PAS détruire la session de flux : la
@@ -11162,12 +11408,12 @@ mod tests {
         orch.playback.play(zone_id, np).await;
 
         // Pause
-        orch.pause(zone_id, None).await;
+        orch.pause(zone_id, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert_eq!(state.state, PlayState::Paused);
 
         // Resume
-        orch.resume(zone_id, None).await;
+        orch.resume(zone_id, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert_eq!(state.state, PlayState::Playing);
 
@@ -11201,7 +11447,7 @@ mod tests {
         orch.playback.play(zone_id, np).await;
 
         // Seek to 42 seconds
-        orch.seek(zone_id, 42_000, None).await;
+        orch.seek(zone_id, 42_000, None).await.unwrap();
 
         // Verify in-memory state updated
         let state = orch.playback.get_state(zone_id).await;
@@ -11235,17 +11481,17 @@ mod tests {
         orch.playback.play(zone_id, np).await;
 
         // Set volume to 80%
-        orch.set_volume(zone_id, 0.8, None).await;
+        orch.set_volume(zone_id, 0.8, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.8).abs() < f64::EPSILON);
 
         // Set volume to 0 (mute level)
-        orch.set_volume(zone_id, 0.0, None).await;
+        orch.set_volume(zone_id, 0.0, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.0).abs() < f64::EPSILON);
 
         // Set volume to 1.0 (max)
-        orch.set_volume(zone_id, 1.0, None).await;
+        orch.set_volume(zone_id, 1.0, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 1.0).abs() < f64::EPSILON);
     }
@@ -11274,7 +11520,7 @@ mod tests {
             .set(&format!("zone_{zone_id}_gain_trim_db"), "-6")
             .unwrap();
 
-        orch.set_volume(zone_id, 0.8, None).await;
+        orch.set_volume(zone_id, 0.8, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.8).abs() < f64::EPSILON);
         let zone = zone_repo.get(zone_id).unwrap().unwrap();
@@ -11306,7 +11552,7 @@ mod tests {
         orch.playback.update_position(zone_id, 55_000).await;
 
         // Pause triggers persist_position
-        orch.pause(zone_id, None).await;
+        orch.pause(zone_id, None).await.unwrap();
 
         let zone = zone_repo.get(zone_id).unwrap().unwrap();
         assert_eq!(zone.last_position_ms, 55_000);

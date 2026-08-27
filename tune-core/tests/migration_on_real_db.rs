@@ -1,7 +1,7 @@
 //! Validation de la migration 73 sur une COPIE d'une base réelle.
 //!
 //! Ignoré par défaut : ne tourne que si `TUNE_REAL_DB` désigne une copie.
-//!   TUNE_REAL_DB=/chemin/copie.db cargo test -p tune-core --test migration_on_real_db -- --nocapture
+//!   TUNE_REAL_DB=/chemin/copie.db cargo test -p tune-core --test integration_contracts migration_on_real_db:: -- --nocapture
 
 use tune_core::db::sqlite::SqliteDb;
 

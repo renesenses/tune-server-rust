@@ -48,6 +48,7 @@ fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> std::path::Pat
 
 #[tokio::test]
 async fn relocation_full_flow() {
+    let _environment = crate::lock_environment();
     let tmp = std::env::temp_dir().join(format!("tune-reloc-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
