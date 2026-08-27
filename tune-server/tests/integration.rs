@@ -230,6 +230,30 @@ async fn library_empty() {
 }
 
 #[tokio::test]
+async fn smart_routes_remain_mounted_after_extraction() {
+    let app = make_app();
+
+    for path in [
+        "/api/v1/library/smart-playlists",
+        "/api/v1/library/smart-collections",
+    ] {
+        let (status, body) = get(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(body.is_array(), "{path}: {body}");
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/smart-ai/generate",
+        json!({"prompt": "jazz", "limit": 3}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tracks"], json!([]));
+    assert_eq!(body["total"], 0);
+}
+
+#[tokio::test]
 async fn search_empty() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/search?q=miles").await;
