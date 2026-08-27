@@ -18,7 +18,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
-use tune_core::plugins_runtime::HOST_ABI_VERSION;
+use tune_plugin_runtime_wasm::HOST_ABI_VERSION;
 use tune_server::state::AppState;
 
 /// A hand-written WAT plugin that **imports** `host_queue_add` and, in

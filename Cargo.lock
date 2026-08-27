@@ -5338,7 +5338,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
- "wasmtime",
  "webpki-roots 0.26.11",
  "windows",
  "x25519-dalek",
@@ -5393,6 +5392,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-runtime-wasm"
+version = "0.9.113"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "wasmtime",
+]
+
+[[package]]
 name = "tune-server"
 version = "0.9.113"
 dependencies = [
@@ -5431,6 +5439,7 @@ dependencies = [
  "tune-core",
  "tune-dj",
  "tune-karaoke",
+ "tune-plugin-runtime-wasm",
  "unicode-normalization",
  "urlencoding",
  "uuid",

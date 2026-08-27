@@ -24,7 +24,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use tune_core::plugins_runtime::HOST_ABI_VERSION;
+use tune_plugin_runtime_wasm::HOST_ABI_VERSION;
 use tune_server::state::AppState;
 
 /// A hand-written WAT plugin that EXPORTS `plugin_on_event` (RFC §3.3): it

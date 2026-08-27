@@ -67,11 +67,6 @@ webpki-roots = "0.26"
 # env-only derivation collided every instance on "tune-server" (#1112, #1127).
 # Already in the lockfile transitively, so this is a near-free direct dep.
 hostname = "0.4"
-# Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
-# behind the `plugins-wasm` feature so the default server build is unchanged.
-# default-features trimmed to compiler + runtime + WAT parsing; no async,
-# component-model, gc, threads, profiling, pooling, coredump, debug.
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
 # ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
 # keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
 # compile time — and the shared lib is loaded at runtime next to the model
@@ -130,10 +125,6 @@ local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-typ
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.
 plugin-http = ["dep:axum"]
-# P0 of the plugin ABI: embed wasmtime to load/instantiate/call wasm plugins
-# with JSON-over-linear-memory marshalling under resource limits. NOT in
-# default — the default server build must not pull in wasmtime.
-plugins-wasm = ["dep:wasmtime"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]
