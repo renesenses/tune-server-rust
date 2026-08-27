@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::traits::*;
 use crate::TuneError;
@@ -10,6 +10,24 @@ const API_BASE: &str = "https://api.deezer.com";
 const OAUTH_TOKEN_URL: &str = "https://connect.deezer.com/oauth/access_token.php";
 const DEEZER_GW: &str = "https://www.deezer.com/ajax/gw-light.php";
 const DEEZER_MEDIA_URL: &str = "https://media.deezer.com/v1";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArlAuthenticationError {
+    /// Deezer (or the local shape check) established that the credential cannot
+    /// authenticate. Only this variant is allowed to discard a persisted ARL.
+    Rejected(String),
+    /// The probe did not establish anything about the credential: network,
+    /// HTTP challenge, rate limit, malformed gateway response, etc.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for ArlAuthenticationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::Unavailable(message) => f.write_str(message),
+        }
+    }
+}
 
 pub struct DeezerService {
     client: Client,
@@ -22,6 +40,7 @@ pub struct DeezerService {
     api_token: Option<String>,
     quality: String,
     proxy_base_url: Option<String>,
+    arl_rejected: bool,
 }
 
 impl Default for DeezerService {
@@ -47,6 +66,7 @@ impl DeezerService {
             api_token: None,
             quality: "FLAC".into(),
             proxy_base_url: None,
+            arl_rejected: false,
         }
     }
 
@@ -97,20 +117,33 @@ impl DeezerService {
         Ok(data.get("results").cloned().unwrap_or_default())
     }
 
-    pub async fn authenticate_arl(&mut self, arl: &str) -> Result<bool, String> {
+    async fn authenticate_arl_checked(
+        &mut self,
+        arl: &str,
+    ) -> Result<bool, ArlAuthenticationError> {
         if arl.len() < 100 {
-            return Err("ARL trop court — doit faire ~192 caractères".into());
+            return Err(ArlAuthenticationError::Rejected(
+                "ARL trop court — doit faire ~192 caractères".into(),
+            ));
         }
         self.arl = Some(arl.into());
-        let result = self.gw_api_call("deezer.getUserData", None).await?;
+        self.license_token = None;
+        self.api_token = None;
+        self.arl_rejected = false;
+        let result = self
+            .gw_api_call("deezer.getUserData", None)
+            .await
+            .map_err(ArlAuthenticationError::Unavailable)?;
         let user = &result["USER"];
         let user_id_num = user["USER_ID"]
             .as_u64()
             .or_else(|| user["USER_ID"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0);
         if user_id_num == 0 {
-            self.arl = None;
-            return Err("ARL invalide ou expiré".into());
+            self.reject_arl();
+            return Err(ArlAuthenticationError::Rejected(
+                "ARL invalide ou expiré".into(),
+            ));
         }
         self.user_id = Some(user_id_num);
         self.username = user["BLOG_NAME"].as_str().map(Into::into);
@@ -128,6 +161,34 @@ impl DeezerService {
             "deezer_arl_authenticated"
         );
         Ok(true)
+    }
+
+    pub async fn authenticate_arl(&mut self, arl: &str) -> Result<bool, String> {
+        self.authenticate_arl_checked(arl)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn reject_arl(&mut self) {
+        self.arl = None;
+        self.license_token = None;
+        self.api_token = None;
+        self.arl_rejected = true;
+    }
+
+    fn handle_restored_arl_failure(&mut self, error: &ArlAuthenticationError) {
+        match error {
+            ArlAuthenticationError::Rejected(message) => {
+                self.reject_arl();
+                info!(error = %message, "deezer_arl_rejected_after_restore");
+            }
+            ArlAuthenticationError::Unavailable(message) => {
+                // The credential remains the user's credential. A later token
+                // refresh will retry the probe instead of turning a provider or
+                // network outage into a fake logout.
+                warn!(error = %message, "deezer_arl_probe_unavailable_kept");
+            }
+        }
     }
 
     pub async fn get_full_stream_url(
@@ -843,6 +904,7 @@ impl StreamingService for DeezerService {
         }
         if let Some(arl) = tokens["arl"].as_str() {
             self.arl = Some(arl.into());
+            self.arl_rejected = false;
             restored = true;
         }
         if let Some(q) = tokens["quality"].as_str() {
@@ -853,16 +915,16 @@ impl StreamingService for DeezerService {
         restored
     }
 
+    fn session_expired(&self) -> bool {
+        self.arl_rejected && self.access_token.is_none()
+    }
+
     async fn post_restore(&mut self) {
         // Re-authenticate ARL to get license_token
         if let Some(arl) = self.arl.clone() {
-            match self.authenticate_arl(&arl).await {
+            match self.authenticate_arl_checked(&arl).await {
                 Ok(_) => info!(username = ?self.username, "deezer_arl_restored"),
-                Err(e) => {
-                    info!(error = %e, "deezer_arl_invalid_after_restore");
-                    self.arl = None;
-                    self.license_token = None;
-                }
+                Err(error) => self.handle_restored_arl_failure(&error),
             }
         }
         // Validate OAuth token if present
@@ -879,6 +941,28 @@ impl StreamingService for DeezerService {
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
+        // A failed restore probe keeps the ARL but deliberately leaves the
+        // derived license token empty. The five-minute refresher retries it;
+        // only an explicit rejection turns that credential into an expired
+        // session and lets the registry delete the persisted row.
+        if self.arl.is_some() && self.license_token.is_none() {
+            let arl = self.arl.clone().expect("ARL checked above");
+            return match self.authenticate_arl_checked(&arl).await {
+                Ok(_) => {
+                    info!(username = ?self.username, "deezer_arl_retry_succeeded");
+                    Ok(true)
+                }
+                Err(error @ ArlAuthenticationError::Rejected(_)) => {
+                    self.handle_restored_arl_failure(&error);
+                    Ok(true)
+                }
+                Err(error @ ArlAuthenticationError::Unavailable(_)) => {
+                    self.handle_restored_arl_failure(&error);
+                    Err(error.to_string().into())
+                }
+            };
+        }
+
         // Deezer tokens don't expire unless revoked, but validate if present
         if self.access_token.is_none() {
             return Ok(false);
@@ -1113,6 +1197,51 @@ mod tests {
         let mut svc = DeezerService::new();
         let tokens = json!({"nothing": "here"});
         assert!(!svc.restore_tokens(&tokens));
+    }
+
+    #[test]
+    fn transient_arl_probe_failure_keeps_the_credential_for_retry() {
+        let mut svc = DeezerService::new();
+        svc.arl = Some("a".repeat(192));
+
+        svc.handle_restored_arl_failure(&ArlAuthenticationError::Unavailable(
+            "deezer gw: connection reset".into(),
+        ));
+
+        assert_eq!(svc.arl.as_deref(), Some("a".repeat(192).as_str()));
+        assert!(!svc.arl_rejected);
+        assert!(!svc.session_expired());
+        assert!(svc.save_tokens().is_some());
+    }
+
+    #[test]
+    fn rejected_arl_is_the_only_probe_failure_that_expires_the_session() {
+        let mut svc = DeezerService::new();
+        svc.arl = Some("a".repeat(192));
+        svc.license_token = Some("old-license".into());
+        svc.api_token = Some("old-api-token".into());
+
+        svc.handle_restored_arl_failure(&ArlAuthenticationError::Rejected(
+            "ARL invalide ou expiré".into(),
+        ));
+
+        assert!(svc.arl.is_none());
+        assert!(svc.license_token.is_none());
+        assert!(svc.api_token.is_none());
+        assert!(svc.arl_rejected);
+        assert!(svc.session_expired());
+        assert!(svc.save_tokens().is_none());
+    }
+
+    #[test]
+    fn restoring_an_arl_clears_an_earlier_rejection_marker() {
+        let mut svc = DeezerService::new();
+        svc.arl_rejected = true;
+
+        assert!(svc.restore_tokens(&json!({"arl": "a".repeat(192)})));
+
+        assert!(!svc.arl_rejected);
+        assert!(!svc.session_expired());
     }
 
     #[test]
