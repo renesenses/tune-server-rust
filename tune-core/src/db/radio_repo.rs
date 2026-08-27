@@ -24,6 +24,18 @@ pub mod sql {
         )
     }
 
+    /// Retrouver une station par l'URL exacte de son flux.
+    ///
+    /// `(name, url)` porte la contrainte d'unicité, pas `url` seule : deux
+    /// lignes peuvent partager un flux sous deux noms. `ORDER BY id` rend donc
+    /// le résultat déterministe plutôt que dépendant du plan de requête.
+    pub fn get_by_url<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM radio_stations WHERE url = {} ORDER BY id LIMIT 1",
+            d.placeholder(1)
+        )
+    }
+
     pub fn list_all() -> String {
         format!("SELECT {COLS} FROM radio_stations ORDER BY is_favorite DESC, LOWER(name)")
     }
@@ -156,6 +168,14 @@ impl RadioRepo {
     pub fn get(&self, id: i64) -> Result<Option<RadioStation>, String> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
+    }
+
+    /// Retrouver une station par l'URL exacte de son flux — c'est ce que le
+    /// now-playing d'une radio porte dans `source_id` (#2421).
+    pub fn get_by_url(&self, url: &str) -> Result<Option<RadioStation>, String> {
+        let sql = self.dialect_sql(sql::get_by_url, sql::get_by_url);
+        let params: [&dyn ToSqlValue; 1] = [&url];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
     }
 

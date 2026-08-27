@@ -14,6 +14,9 @@ use tune_core::db::zone_repo::{AutoplayMode, Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
+use tune_core::outputs::traits::{
+    OutputDspState, OutputSignalPathStatus, OutputSignalReason, OutputVolumeState,
+};
 use tune_core::playback::{PlayState, ZoneState};
 
 use crate::error::AppError;
@@ -75,6 +78,11 @@ struct PatchZone {
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
+    /// Accord ponctuel de l'utilisateur pour une activation qui peut envoyer
+    /// immédiatement 100 % à une sortie réseau. Ce jeton appartient à la
+    /// requête et n'est jamais persisté avec la zone (#2395).
+    #[serde(default)]
+    confirm_full_volume: bool,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
     ///
     /// #2271 — conserve pour les clients existants. `true` vaut
@@ -136,6 +144,24 @@ struct PatchZone {
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
+}
+
+/// Une transition vers le volume fixe est une commande de volume à 100 %, pas
+/// un simple réglage. Le serveur l'impose à tous les clients réseau, y compris
+/// aux anciennes interfaces et aux appels directs qui contournent le Web.
+///
+/// Le type envoyé dans le PATCH prime sur celui qui est déjà stocké : changer
+/// une zone locale en DLNA et armer le volume fixe dans la même requête doit
+/// rester protégé. Un type absent ou inconnu est traité comme distant jusqu'à
+/// preuve du contraire (fail-closed).
+fn fixed_volume_confirmation_required(zone: &Zone, body: &PatchZone) -> bool {
+    let effective_output_type = body.output_type.as_deref().or(zone.output_type.as_deref());
+    let local_or_browser = matches!(effective_output_type, Some("local" | "browser"));
+
+    body.fixed_volume == Some(true)
+        && !zone.fixed_volume
+        && !local_or_browser
+        && !body.confirm_full_volume
 }
 
 /// Injecte l'identité appareil d'une zone dans son JSON de sortie :
@@ -660,6 +686,19 @@ pub(crate) async fn levels_available(state: &AppState, zone: &Zone) -> bool {
         .await
 }
 
+/// Contrat de commandes de la sortie réellement enregistrée pour une zone.
+///
+/// `None` couvre les zones navigateur et les sorties disparues. Le client ne
+/// doit pas transformer cette absence en une liste de capacités inventée.
+pub(crate) async fn output_capabilities(
+    state: &AppState,
+    output_device_id: Option<&str>,
+) -> Option<tune_core::outputs::OutputCapabilities> {
+    let device_id = output_device_id?;
+    let output = { state.outputs.lock().await.get(device_id) }?;
+    Some(output.lock().await.capabilities())
+}
+
 pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
     // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
     // On ne le demande au streamer que pour une zone navigateur en lecture,
@@ -833,6 +872,20 @@ fn wav_wire_bit_perfect(
     is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
 }
 
+fn runtime_signal_reason_detail(status: &OutputSignalPathStatus) -> Option<String> {
+    let details: Vec<&str> = status
+        .reasons
+        .iter()
+        .map(|reason| match reason {
+            OutputSignalReason::FloatTransport => "Transport flottant imposé par le callback",
+            OutputSignalReason::DspApplied => "DSP appliqué",
+            OutputSignalReason::DspStateUnknown => "État DSP indéterminé",
+            OutputSignalReason::SoftwareVolume => "Volume logiciel appliqué",
+        })
+        .collect();
+    (!details.is_empty()).then(|| details.join(" ; "))
+}
+
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
@@ -953,6 +1006,13 @@ fn build_signal_path(
         .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
+    // Pour une sortie locale qui sait observer son dernier callback, le réel
+    // prime sur toute déduction depuis les réglages. Les autres sorties
+    // conservent le calcul historique jusqu'à ce qu'elles publient leur propre
+    // sonde via le contrat additif d'OutputTarget.
+    let runtime_signal_path = (output_type == "local")
+        .then(|| ps.output_signal_path.as_ref())
+        .flatten();
 
     // Determine if DSP is active.
     //
@@ -967,11 +1027,14 @@ fn build_signal_path(
     // l'argument central, promettre une pureté qu'on ne tient pas est le pire
     // des deux sens possibles de l'erreur (signalement Bilou).
     let zid = zone.id.unwrap_or(0);
-    let dsp_enabled = ZoneRepo::with_backend(backend.clone())
+    let configured_dsp_enabled = ZoneRepo::with_backend(backend.clone())
         .get_dsp_config(zid)
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
         .unwrap_or(false)
         || zone_eq_alters_signal(&backend, zid);
+    let dsp_enabled = runtime_signal_path
+        .map(|status| status.dsp == OutputDspState::Applied)
+        .unwrap_or(configured_dsp_enabled);
 
     // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
     // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
@@ -1156,7 +1219,13 @@ fn build_signal_path(
                 "ALSA" => "ALSA",
                 other => other,
             };
-            (true, transport, format_name)
+            (
+                runtime_signal_path
+                    .map(|status| status.bit_perfect)
+                    .unwrap_or(true),
+                transport,
+                format_name,
+            )
         }
         other => (false, other, format_name),
     };
@@ -1296,8 +1365,24 @@ fn build_signal_path(
         }));
     }
 
-    // Volume step (informational — does not affect bit-perfect status)
-    if !volume_full {
+    // La sonde locale tranche si le gain a réellement été appliqué. Pour les
+    // sorties sans sonde, conserver l'affichage historique fondé sur le
+    // réglage de zone.
+    if let Some(runtime) = runtime_signal_path {
+        match runtime.volume {
+            OutputVolumeState::Applied => steps.push(json!({
+                "name": "Volume",
+                "description": format!("Volume logiciel {}%", (ui_volume * 100.0).round() as i32),
+                "bit_perfect": false,
+            })),
+            OutputVolumeState::BypassedDop => steps.push(json!({
+                "name": "Volume",
+                "description": "Volume contourné pour DoP",
+                "bit_perfect": true,
+            })),
+            OutputVolumeState::Unity => {}
+        }
+    } else if !volume_full {
         steps.push(json!({
             "name": "Volume",
             "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
@@ -1305,8 +1390,25 @@ fn build_signal_path(
         }));
     }
 
-    // DSP step
-    if dsp_enabled {
+    // L'état d'exécution distingue traitement et contournement. C'est le
+    // reliquat commun de #2205/#2233 : un réglage enregistré ne disait pas ce
+    // qui avait effectivement atteint le ring Windows.
+    if let Some(runtime) = runtime_signal_path {
+        let dsp_step = match runtime.dsp {
+            OutputDspState::Applied => Some(("DSP appliqué", false)),
+            OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
+            OutputDspState::BypassedDop => Some(("DSP contourné pour DoP", true)),
+            OutputDspState::Unknown => Some(("État DSP indéterminé", false)),
+            OutputDspState::Inactive => None,
+        };
+        if let Some((description, intact)) = dsp_step {
+            steps.push(json!({
+                "name": "DSP",
+                "description": description,
+                "bit_perfect": intact,
+            }));
+        }
+    } else if dsp_enabled {
         steps.push(json!({
             "name": "DSP",
             "description": "EQ/DSP active",
@@ -1319,6 +1421,7 @@ fn build_signal_path(
         "name": "Transport",
         "description": transport_desc,
         "bit_perfect": transport_bit_perfect,
+        "detail": runtime_signal_path.and_then(runtime_signal_reason_detail),
     }));
 
     let renderer_name = renderer_label
@@ -1349,6 +1452,8 @@ fn build_signal_path(
         "lossless": is_lossless,
         "summary": summary,
         "steps": steps,
+        "runtime_observed": runtime_signal_path.is_some(),
+        "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
     }))
 }
 
@@ -1533,6 +1638,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "levels_available".into(),
                 json!(levels_available(&state, z).await),
             );
+            obj.insert(
+                "output_capabilities".into(),
+                json!(output_capabilities(&state, z.output_device_id.as_deref()).await),
+            );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -1686,6 +1795,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "levels_available".into(),
                     json!(levels_available(&state, &zone).await),
                 );
+                obj.insert(
+                    "output_capabilities".into(),
+                    json!(output_capabilities(&state, zone.output_device_id.as_deref()).await),
+                );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
                 if let Some(ref np) = ps.now_playing {
@@ -1794,14 +1907,14 @@ async fn patch_zone(
     // réussissent — avant que `get_zone` ne rende 404 tout à la fin. Le 404
     // était juste, mais il arrivait après trente écritures inutiles et ne
     // disait pas laquelle avait échoué en cas de vrai problème.
-    match repo.get(id) {
-        Ok(Some(_)) => {}
+    let zone_before = match repo.get(id) {
+        Ok(Some(zone)) => zone,
         Ok(None) => {
             warn!(zone_id = id, "zone_patch_unknown_zone");
             return (StatusCode::NOT_FOUND, format!("zone {id} inconnue")).into_response();
         }
         Err(e) => return echec_ecriture(id, "zone", &id.to_string(), e),
-    }
+    };
 
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
     // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
@@ -1869,6 +1982,45 @@ async fn patch_zone(
         return refus_de_valeur(id, "name", name, "vide");
     }
 
+    // Ce refus précède strictement la première écriture : un PATCH qui porte
+    // d'autres champs ne doit rien modifier si l'accord manque.
+    if fixed_volume_confirmation_required(&zone_before, &body) {
+        warn!(zone_id = id, "fixed_volume_confirmation_required");
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "full_volume_confirmation_required",
+                "message": "Enabling fixed volume on a network output sets the device volume to 100%. Explicit confirmation is required.",
+            })),
+        )
+            .into_response();
+    }
+
+    // Volume et mute sont des commandes, pas de simples préférences. Le
+    // renderer doit les accepter avant qu'un PATCH puisse annoncer leur
+    // réussite ou laisser une valeur mensongère en base. Si le PATCH change
+    // aussi de sortie, la commande vise explicitement la nouvelle sortie.
+    let command_device_id = body
+        .output_device_id
+        .as_deref()
+        .or(zone_before.output_device_id.as_deref());
+    if let Some(volume) = body.volume
+        && let Err(error) = state
+            .orchestrator
+            .set_volume(id, f64::from(volume) / 100.0, command_device_id)
+            .await
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+    if let Some(muted) = body.muted
+        && let Err(error) = state
+            .orchestrator
+            .set_mute(id, muted, command_device_id)
+            .await
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+
     /// Écrit un champ, ou s'arrête en journalisant la cause.
     ///
     /// Une macro et non une closure : chaque échec doit **sortir** du handler,
@@ -1886,12 +2038,7 @@ async fn patch_zone(
     if let Some(ref name) = body.name {
         ecrire!("name", name, repo.update_name(id, name));
     }
-    if let Some(vol) = body.volume {
-        ecrire!("volume", vol, repo.update_volume(id, vol));
-    }
-    if let Some(muted) = body.muted {
-        ecrire!("muted", muted, repo.update_muted(id, muted));
-    }
+    // volume/muted ont été confirmés et persistés par l'orchestrateur ci-dessus.
     if let Some(ref device_id) = body.output_device_id {
         ecrire!(
             "output_device_id",
@@ -2067,10 +2214,13 @@ async fn patch_zone(
         if let Ok(Some(z)) = repo.get(id) {
             if !z.fixed_volume {
                 if let Some(ref did) = z.output_device_id {
-                    state
+                    if let Err(error) = state
                         .orchestrator
                         .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
-                        .await;
+                        .await
+                    {
+                        warn!(zone_id = id, error = %error, "gain_trim_volume_refresh_failed");
+                    }
                 }
             }
         }
@@ -2569,7 +2719,7 @@ async fn renderer_capabilities(
         };
         if let Some(dev) = disc {
             register_dlna_output_from_device(&dev, &state).await;
-            output = { state.outputs.lock().await.get(device_id) };
+            output = state.outputs.lock().await.get(device_id);
         }
     }
 
@@ -2812,22 +2962,16 @@ async fn update_volume(
     } else {
         body.volume
     };
-    let volume_int = (volume_f * 100.0).round() as i32;
-
-    // Persist to DB
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Err(e) = repo.update_volume(id, volume_int) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_volume(id, volume_f, device_id.as_deref())
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 async fn update_muted(
@@ -2835,20 +2979,16 @@ async fn update_muted(
     Path(id): Path<i64>,
     Json(body): Json<UpdateMuted>,
 ) -> impl IntoResponse {
-    // Persist to DB
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Err(e) = repo.update_muted(id, body.muted) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_mute(id, body.muted, device_id.as_deref())
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 async fn rename_zone(
@@ -3142,7 +3282,6 @@ async fn group_volume(
                 .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
 
-            let repo = ZoneRepo::with_backend(state.backend.clone());
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -3151,9 +3290,20 @@ async fn group_volume(
                     .copied()
                     .unwrap_or(0.0);
                 let effective = (master + offset).clamp(0.0, 1.0);
-                let vol_int = (effective * 100.0) as i32;
-                repo.update_volume(*zid, vol_int).ok();
-                state.orchestrator.set_volume(*zid, effective, None).await;
+                let device_id = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten()
+                    .and_then(|zone| zone.output_device_id);
+                if let Err(error) = state
+                    .orchestrator
+                    .set_volume(*zid, effective, device_id.as_deref())
+                    .await
+                {
+                    return Ok(crate::routes::playback::output_command_error_response(
+                        error,
+                    ));
+                }
             }
             Ok(Json(json!({"group_id": group_id, "master_volume": master})).into_response())
         }
@@ -3442,6 +3592,63 @@ mod signal_path_tests {
             .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
             .and_then(|s| s.get("description").and_then(|d| d.as_str()))
             .map(String::from)
+    }
+
+    fn step_detail(v: &Value, name: &str) -> Option<String> {
+        v.get("steps")?
+            .as_array()?
+            .iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|s| s.get("detail").and_then(|d| d.as_str()))
+            .map(String::from)
+    }
+
+    /// #2205/#2233 : le backend Windows connaît déjà le verdict exact à la
+    /// frontière du callback. Le chemin public doit le croire plutôt que de
+    /// continuer à déclarer statiquement toute sortie locale bit-perfect.
+    #[test]
+    fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
+        use tune_core::outputs::traits::{
+            OutputDspState, OutputSampleTransport, OutputSignalPathStatus, OutputSignalReason,
+            OutputVolumeState,
+        };
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo
+            .create("DAC", Some("local"), Some("local:dac"))
+            .unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        let mut ps = wav24_playing();
+        ps.output_signal_path = Some(OutputSignalPathStatus {
+            bit_perfect: false,
+            sample_transport: OutputSampleTransport::Float,
+            dsp: OutputDspState::Applied,
+            volume: OutputVolumeState::Unity,
+            reasons: vec![
+                OutputSignalReason::FloatTransport,
+                OutputSignalReason::DspApplied,
+            ],
+        });
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "ASIO", None).unwrap();
+
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            sp.get("runtime_observed").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sp.get("runtime_reasons"),
+            Some(&json!(["float_transport", "dsp_applied"]))
+        );
+        assert_eq!(
+            step_detail(&sp, "Transport").as_deref(),
+            Some("Transport flottant imposé par le callback ; DSP appliqué")
+        );
+        assert_eq!(step_desc(&sp, "DSP").as_deref(), Some("DSP appliqué"));
     }
 
     // ------------------------------------------------------------------
@@ -4105,7 +4312,30 @@ mod output_reach_tests {
 
 #[cfg(test)]
 mod patch_zone_deserialize_tests {
-    use super::PatchZone;
+    use super::{PatchZone, fixed_volume_confirmation_required};
+    use tune_core::db::zone_repo::Zone;
+
+    fn zone(output_type: Option<&str>, fixed_volume: bool) -> Zone {
+        Zone {
+            id: Some(7),
+            name: "Salon".into(),
+            output_type: output_type.map(str::to_string),
+            output_device_id: Some("renderer-1".into()),
+            volume: 37,
+            muted: false,
+            online: true,
+            gapless_enabled: false,
+            group_id: None,
+            sync_delay_ms: 0,
+            last_position_ms: 0,
+            last_track_id: None,
+            last_track_source: None,
+            last_track_source_id: None,
+            max_sample_rate: None,
+            fixed_volume,
+            autoplay_enabled: false,
+        }
+    }
 
     /// #2271 — le nouveau champ de mode se deserialise, et l'ancien booleen
     /// continue de se deserialiser seul. Les deux ensemble sont acceptes au
@@ -4154,6 +4384,51 @@ mod patch_zone_deserialize_tests {
     fn value_means_set_the_cap() {
         let p: PatchZone = serde_json::from_str(r#"{"max_sample_rate": 705600}"#).unwrap();
         assert_eq!(p.max_sample_rate, Some(Some(705_600)));
+    }
+
+    #[test]
+    fn sortie_reseau_refuse_l_armement_sans_accord() {
+        let p: PatchZone = serde_json::from_str(r#"{"fixed_volume": true}"#).unwrap();
+        assert!(
+            fixed_volume_confirmation_required(&zone(Some("dlna"), false), &p),
+            "avant le correctif, ce chemin envoyait immédiatement 100 % sans accord"
+        );
+    }
+
+    #[test]
+    fn accord_explicite_autorise_l_armement_reseau() {
+        let p: PatchZone =
+            serde_json::from_str(r#"{"fixed_volume": true, "confirm_full_volume": true}"#).unwrap();
+        assert!(!fixed_volume_confirmation_required(
+            &zone(Some("dlna"), false),
+            &p
+        ));
+    }
+
+    #[test]
+    fn passage_local_vers_reseau_dans_le_meme_patch_reste_protege() {
+        let p: PatchZone =
+            serde_json::from_str(r#"{"output_type": "airplay", "fixed_volume": true}"#).unwrap();
+        assert!(fixed_volume_confirmation_required(
+            &zone(Some("local"), false),
+            &p
+        ));
+    }
+
+    #[test]
+    fn chemins_sans_montee_de_volume_restent_immediats() {
+        for (stored_type, stored_fixed, payload) in [
+            (Some("local"), false, r#"{"fixed_volume": true}"#),
+            (Some("browser"), false, r#"{"fixed_volume": true}"#),
+            (Some("dlna"), true, r#"{"fixed_volume": true}"#),
+            (Some("dlna"), true, r#"{"fixed_volume": false}"#),
+        ] {
+            let p: PatchZone = serde_json::from_str(payload).unwrap();
+            assert!(
+                !fixed_volume_confirmation_required(&zone(stored_type, stored_fixed), &p),
+                "le chemin {stored_type:?}/{stored_fixed}/{payload} ne monte pas une sortie réseau nouvellement armée à 100 %"
+            );
+        }
     }
 }
 
@@ -4431,6 +4706,22 @@ mod patch_zone_error_guard {
             premier_refus < premiere_ecriture,
             "une validation arrive APRÈS une écriture : un PATCH refusé aurait \
              déjà modifié la zone"
+        );
+    }
+
+    #[test]
+    fn full_volume_refusal_comes_before_any_write() {
+        let corps = corps_du_handler();
+        let refus = corps
+            .find("fixed_volume_confirmation_required(&zone_before, &body)")
+            .expect("le PATCH ne protège plus l'armement du volume fixe");
+        let premiere_ecriture = corps
+            .find("ecrire!(")
+            .expect("aucune écriture dans `patch_zone`");
+        assert!(
+            refus < premiere_ecriture,
+            "la confirmation du volume fixe est vérifiée APRÈS une écriture : \
+             un PATCH refusé aurait déjà modifié la zone"
         );
     }
 }

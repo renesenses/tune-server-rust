@@ -10,7 +10,11 @@ use rubato::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::traits::{OutputStatus, OutputTarget, TransportState};
+use super::traits::{
+    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+};
+#[cfg(any(target_os = "windows", test))]
+use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
 use crate::poller::TRACK_END_NOTIFY;
 
 /// Why a device refused to open, as far as the backend string lets us tell.
@@ -112,9 +116,20 @@ impl OpenFailure {
 
 /// Select the cpal host based on the requested backend.
 ///
-/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only)
+/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only).
+///   Falls back to WASAPI, with a warning, if the host cannot be opened or
+///   exposes no output device.
 /// - `"wasapi"`: use the default host (WASAPI on Windows)
-/// - `"auto"` (default): try ASIO first if available, fall back to default
+/// - `"auto"` (default): use WASAPI directly. **`auto` never probes ASIO.**
+/// - anything else: treated like `"wasapi"`.
+///
+/// `auto` used to try ASIO first; it no longer does, since #199. Probing an
+/// ASIO driver can make it call `abort()` and take the whole process down
+/// without a trace, so the only way to reach ASIO is to ask for it by name.
+/// Getting ASIO therefore takes a deliberate setting — see
+/// [`crate::config::LOCAL_AUDIO_BACKEND_ENV`]. A machine whose ASIO drivers
+/// are detected and listed by `/audio/asio-devices` is still playing through
+/// WASAPI as long as the backend is left on `auto`: detecting is not playing.
 ///
 /// On non-Windows platforms, always returns `cpal::default_host()`.
 pub fn select_host(backend: &str) -> cpal::Host {
@@ -156,7 +171,9 @@ pub fn select_host(backend: &str) -> cpal::Host {
             "auto" => {
                 // Auto mode uses WASAPI directly — ASIO drivers can call
                 // abort() when probed, crashing the process silently.
-                // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
+                // Users who want ASIO must set TUNE_LOCAL_AUDIO_BACKEND=asio
+                // (the canonical name; the older TUNE_AUDIO_BACKEND is still
+                // honoured as a fallback, but should not be recommended).
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
                 note_observed_backend("WASAPI");
                 return cpal::default_host();
@@ -904,6 +921,13 @@ pub struct LocalOutput {
     /// and it changes what the volume slider does on a DSD track — it is
     /// tracked separately rather than smuggled in here.
     dop_active: Arc<AtomicBool>,
+    /// Dernier contrat réellement observé avant le callback du backend.
+    ///
+    /// Les boucles Windows savent déjà si elles publient des mots entiers
+    /// natifs ou repassent par f32, et si volume/DSP ont modifié le buffer.
+    /// Cette case rend ce verdict lisible hors du fil de rendu au lieu de le
+    /// perdre après le journal `windows_exclusive_signal_contract`.
+    signal_path_status: Arc<std::sync::Mutex<Option<OutputSignalPathStatus>>>,
     /// Set by the playback thread when the audio device refuses to open, so
     /// the poller can stop the zone and tell the user on the very next tick
     /// instead of waiting out the stall heuristics. Cleared on every
@@ -1052,6 +1076,7 @@ impl LocalOutput {
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
+            signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -2653,6 +2678,121 @@ fn local_dsp_is_identity(
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn local_dsp_runtime_state(
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    dop: bool,
+) -> OutputDspState {
+    if dop {
+        return OutputDspState::BypassedDop;
+    }
+    if pure_bypass.load(Ordering::Relaxed) {
+        return OutputDspState::BypassedPure;
+    }
+    let (Ok(eq), Ok(convolver), Ok(crossfeed)) = (eq.lock(), convolver.lock(), crossfeed.lock())
+    else {
+        return OutputDspState::Unknown;
+    };
+    if eq.is_some() || convolver.is_some() || crossfeed.is_some() {
+        OutputDspState::Applied
+    } else {
+        OutputDspState::Inactive
+    }
+}
+
+/// Compose le verdict exact que le producteur remet au callback Windows.
+///
+/// Le callback entier ne fait que sérialiser les mots ; le callback flottant
+/// ne peut jamais garantir leurs bits. Sur le chemin entier, volume et DSP
+/// décident si le producteur peut conserver les octets source ou doit faire un
+/// aller-retour en espace flottant. DoP force les deux contournements à
+/// l'unité : toucher son marqueur rendrait le flux illisible par le DAC.
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn windows_signal_path_status(
+    native_transport: bool,
+    dop: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> OutputSignalPathStatus {
+    let sample_transport = if native_transport {
+        OutputSampleTransport::NativeInteger
+    } else {
+        OutputSampleTransport::Float
+    };
+    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, dop);
+    let volume = if dop {
+        OutputVolumeState::BypassedDop
+    } else if volume_units == 1000 {
+        OutputVolumeState::Unity
+    } else {
+        OutputVolumeState::Applied
+    };
+
+    let mut reasons = Vec::new();
+    if !native_transport {
+        reasons.push(OutputSignalReason::FloatTransport);
+    }
+    match dsp {
+        OutputDspState::Applied => reasons.push(OutputSignalReason::DspApplied),
+        OutputDspState::Unknown => reasons.push(OutputSignalReason::DspStateUnknown),
+        OutputDspState::Inactive | OutputDspState::BypassedPure | OutputDspState::BypassedDop => {}
+    }
+    if volume == OutputVolumeState::Applied {
+        reasons.push(OutputSignalReason::SoftwareVolume);
+    }
+
+    OutputSignalPathStatus {
+        bit_perfect: reasons.is_empty(),
+        sample_transport,
+        dsp,
+        volume,
+        reasons,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn publish_windows_signal_path_status(
+    slot: &std::sync::Mutex<Option<OutputSignalPathStatus>>,
+    observed_bit_perfect: bool,
+    native_transport: bool,
+    dop: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+) -> OutputSignalPathStatus {
+    let mut status = windows_signal_path_status(
+        native_transport,
+        dop,
+        volume_units,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+    );
+    // Le verdict du producteur est autoritaire : il a choisi la branche raw
+    // ou flottante pour CE buffer. La lecture des verrous ci-dessus décrit
+    // l'état courant et peut croiser une mise à jour à chaud juste après ce
+    // choix ; elle ne doit jamais transformer un verdict négatif en promesse.
+    status.bit_perfect = observed_bit_perfect;
+    if !observed_bit_perfect && status.reasons.is_empty() {
+        status.reasons.push(OutputSignalReason::DspStateUnknown);
+    }
+    if let Ok(mut current) = slot.lock() {
+        *current = Some(status.clone());
+    }
+    status
+}
+
+#[cfg(any(target_os = "windows", test))]
 struct PreparedNativePcm {
     samples: Vec<i32>,
     dop: bool,
@@ -2728,6 +2868,17 @@ impl OutputTarget for LocalOutput {
 
     fn output_type(&self) -> &str {
         "local"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(
+            true,
+            true,
+            true,
+            true,
+            true,
+            self.supports_internal_gapless(),
+        )
     }
 
     /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop
@@ -2882,7 +3033,12 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.open_failure.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.signal_path_status.lock() {
+            *slot = None;
+        }
         let open_failure = self.open_failure.clone();
+        #[cfg(target_os = "windows")]
+        let signal_path_status = self.signal_path_status.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
         let track_ended_generation = self.track_ended_generation.clone();
 
@@ -3680,12 +3836,25 @@ impl OutputTarget for LocalOutput {
                                 outcome.dop,
                             );
                         }
-                        bit_perfect_state = Some(outcome.bit_perfect);
+                        let volume_units = volume.load(Ordering::SeqCst);
+                        let runtime = publish_windows_signal_path_status(
+                            &signal_path_status,
+                            outcome.bit_perfect,
+                            matches!(selected_ring, WindowsExclusiveRingRef::Native(_)),
+                            outcome.dop,
+                            volume_units,
+                            &eq,
+                            &convolver,
+                            &crossfeed,
+                            &pure_bypass,
+                        );
+                        bit_perfect_state = Some(runtime.bit_perfect);
                         info!(
                             backend = "ASIO",
-                            bit_perfect = outcome.bit_perfect,
+                            bit_perfect = runtime.bit_perfect,
                             dop = outcome.dop,
-                            volume_units = volume.load(Ordering::SeqCst),
+                            volume_units,
+                            reasons = ?runtime.reasons,
                             "windows_exclusive_signal_contract"
                         );
                     }
@@ -3906,13 +4075,26 @@ impl OutputTarget for LocalOutput {
                                     outcome.dop,
                                 );
                             }
-                            if bit_perfect_state != Some(outcome.bit_perfect) {
-                                bit_perfect_state = Some(outcome.bit_perfect);
+                            let volume_units = volume.load(Ordering::SeqCst);
+                            let runtime = publish_windows_signal_path_status(
+                                &signal_path_status,
+                                outcome.bit_perfect,
+                                matches!(selected_ring, WindowsExclusiveRingRef::Native(_)),
+                                outcome.dop,
+                                volume_units,
+                                &eq,
+                                &convolver,
+                                &crossfeed,
+                                &pure_bypass,
+                            );
+                            if bit_perfect_state != Some(runtime.bit_perfect) {
+                                bit_perfect_state = Some(runtime.bit_perfect);
                                 info!(
                                     backend = "ASIO",
-                                    bit_perfect = outcome.bit_perfect,
+                                    bit_perfect = runtime.bit_perfect,
                                     dop = outcome.dop,
-                                    volume_units = volume.load(Ordering::SeqCst),
+                                    volume_units,
+                                    reasons = ?runtime.reasons,
                                     "windows_exclusive_signal_contract"
                                 );
                             }
@@ -4176,13 +4358,26 @@ impl OutputTarget for LocalOutput {
                                         outcome.dop,
                                     );
                                 }
-                                if bit_perfect_state != Some(outcome.bit_perfect) {
-                                    bit_perfect_state = Some(outcome.bit_perfect);
+                                let volume_units = volume.load(Ordering::SeqCst);
+                                let runtime = publish_windows_signal_path_status(
+                                    &signal_path_status,
+                                    outcome.bit_perfect,
+                                    true,
+                                    outcome.dop,
+                                    volume_units,
+                                    &eq,
+                                    &convolver,
+                                    &crossfeed,
+                                    &pure_bypass,
+                                );
+                                if bit_perfect_state != Some(runtime.bit_perfect) {
+                                    bit_perfect_state = Some(runtime.bit_perfect);
                                     info!(
                                         backend = "WASAPI",
-                                        bit_perfect = outcome.bit_perfect,
+                                        bit_perfect = runtime.bit_perfect,
                                         dop = outcome.dop,
-                                        volume_units = volume.load(Ordering::SeqCst),
+                                        volume_units,
+                                        reasons = ?runtime.reasons,
                                         "windows_exclusive_signal_contract"
                                     );
                                 }
@@ -4248,13 +4443,26 @@ impl OutputTarget for LocalOutput {
                                                     outcome.dop,
                                                 );
                                             }
-                                            if bit_perfect_state != Some(outcome.bit_perfect) {
-                                                bit_perfect_state = Some(outcome.bit_perfect);
+                                            let volume_units = volume.load(Ordering::SeqCst);
+                                            let runtime = publish_windows_signal_path_status(
+                                                &signal_path_status,
+                                                outcome.bit_perfect,
+                                                true,
+                                                outcome.dop,
+                                                volume_units,
+                                                &eq,
+                                                &convolver,
+                                                &crossfeed,
+                                                &pure_bypass,
+                                            );
+                                            if bit_perfect_state != Some(runtime.bit_perfect) {
+                                                bit_perfect_state = Some(runtime.bit_perfect);
                                                 info!(
                                                     backend = "WASAPI",
-                                                    bit_perfect = outcome.bit_perfect,
+                                                    bit_perfect = runtime.bit_perfect,
                                                     dop = outcome.dop,
-                                                    volume_units = volume.load(Ordering::SeqCst),
+                                                    volume_units,
+                                                    reasons = ?runtime.reasons,
                                                     "windows_exclusive_signal_contract"
                                                 );
                                             }
@@ -5795,6 +6003,9 @@ impl OutputTarget for LocalOutput {
         // the previous track do not affect the next track's end-detection cycle.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        if let Ok(mut slot) = self.signal_path_status.lock() {
+            *slot = None;
+        }
         *self.next_media.lock().unwrap() = None;
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
@@ -5915,6 +6126,13 @@ impl OutputTarget for LocalOutput {
 
     fn take_output_failure(&self) -> Option<String> {
         self.open_failure.lock().ok().and_then(|mut s| s.take())
+    }
+
+    fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
+        self.signal_path_status
+            .lock()
+            .ok()
+            .and_then(|status| status.clone())
     }
 
     async fn is_available(&self) -> bool {
@@ -6700,6 +6918,89 @@ mod tests {
         let fixture = versioned_dop_fixture();
         assert_eq!(fixture.len(), 64 * 2 * 3);
         assert_eq!(fixture, real_dop_bytes(64, 2));
+    }
+
+    fn runtime_contract(
+        native: bool,
+        dop: bool,
+        volume_units: u32,
+        eq: Option<crate::audio::eq::EqProcessor>,
+        pure: bool,
+    ) -> OutputSignalPathStatus {
+        windows_signal_path_status(
+            native,
+            dop,
+            volume_units,
+            &std::sync::Mutex::new(eq),
+            &std::sync::Mutex::new(None),
+            &std::sync::Mutex::new(None),
+            &AtomicBool::new(pure),
+        )
+    }
+
+    #[test]
+    fn native_unity_without_dsp_is_reported_bit_perfect() {
+        let status = runtime_contract(true, false, 1000, None, false);
+        assert!(status.bit_perfect);
+        assert_eq!(
+            status.sample_transport,
+            OutputSampleTransport::NativeInteger
+        );
+        assert_eq!(status.dsp, OutputDspState::Inactive);
+        assert_eq!(status.volume, OutputVolumeState::Unity);
+        assert!(status.reasons.is_empty());
+    }
+
+    #[test]
+    fn float_transport_names_why_it_is_not_bit_perfect() {
+        let status = runtime_contract(false, false, 1000, None, false);
+        assert!(!status.bit_perfect);
+        assert_eq!(status.sample_transport, OutputSampleTransport::Float);
+        assert_eq!(status.reasons, vec![OutputSignalReason::FloatTransport]);
+    }
+
+    #[test]
+    fn native_transport_names_volume_and_dsp_when_they_modify_pcm() {
+        let status = runtime_contract(true, false, 420, Some(test_eq()), false);
+        assert!(!status.bit_perfect);
+        assert_eq!(status.dsp, OutputDspState::Applied);
+        assert_eq!(status.volume, OutputVolumeState::Applied);
+        assert_eq!(
+            status.reasons,
+            vec![
+                OutputSignalReason::DspApplied,
+                OutputSignalReason::SoftwareVolume,
+            ]
+        );
+    }
+
+    #[test]
+    fn dop_reports_both_safety_bypasses_and_keeps_native_bits() {
+        let status = runtime_contract(true, true, 42, Some(test_eq()), false);
+        assert!(status.bit_perfect);
+        assert_eq!(status.dsp, OutputDspState::BypassedDop);
+        assert_eq!(status.volume, OutputVolumeState::BypassedDop);
+        assert!(status.reasons.is_empty());
+    }
+
+    #[test]
+    fn producer_verdict_cannot_be_upgraded_by_a_later_state_snapshot() {
+        let slot = std::sync::Mutex::new(None);
+        let status = publish_windows_signal_path_status(
+            &slot,
+            false,
+            true,
+            false,
+            1000,
+            &std::sync::Mutex::new(None),
+            &std::sync::Mutex::new(None),
+            &std::sync::Mutex::new(None),
+            &AtomicBool::new(false),
+        );
+
+        assert!(!status.bit_perfect);
+        assert_eq!(status.reasons, vec![OutputSignalReason::DspStateUnknown]);
+        assert_eq!(slot.lock().unwrap().as_ref(), Some(&status));
     }
 
     fn integer_pcm_fixture(bit_depth: u16) -> Vec<u8> {

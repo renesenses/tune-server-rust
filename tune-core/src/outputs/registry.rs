@@ -136,6 +136,7 @@ impl OutputRegistry {
                 "name": output.name(),
                 "type": output.output_type(),
                 "available": available,
+                "output_capabilities": output.capabilities(),
             });
             if let Some(host) = output.host() {
                 entry
@@ -158,6 +159,7 @@ impl OutputRegistry {
                 "device_id": id,
                 "name": output.name(),
                 "type": output.output_type(),
+                "output_capabilities": output.capabilities(),
             });
             if let Some(host) = output.host() {
                 entry

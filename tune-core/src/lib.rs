@@ -42,11 +42,6 @@ pub mod playlist_sync;
 pub mod playlist_transfer;
 pub mod plugin_sdk;
 pub mod plugins;
-/// P0 of the plugin ABI (RFC §3): embedded wasmtime runtime that loads,
-/// instantiates and calls wasm plugins with JSON-over-linear-memory
-/// marshalling under resource limits. Gated behind `plugins-wasm`.
-#[cfg(feature = "plugins-wasm")]
-pub mod plugins_runtime;
 pub mod poller;
 pub mod prefetch;
 pub mod queue_persistence;

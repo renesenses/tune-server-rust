@@ -47,6 +47,36 @@ struct CreateRadio {
     bitrate: Option<i32>,
 }
 
+/// Ce qu'a donné une passe de rattrapage des logos de station.
+///
+/// La fonction rendait un `usize`, et ce compteur mentait par omission : `0`
+/// disait à la fois « tout le monde avait déjà son logo », « l'annuaire ne
+/// connaît pas ces stations » et « je n'ai pas pu joindre l'annuaire ». Trois
+/// situations, trois suites à donner — et dans le troisième cas, aucune trace
+/// n'était écrite du tout (`if n > 0` côté démarrage). Un serveur sans
+/// vignette ne disait donc pas s'il n'avait rien trouvé ou s'il n'avait pas pu
+/// chercher. C'est l'information qui manque pour instruire le fil 1508.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RattrapageLogos {
+    /// Stations dont le logo vient d'être posé.
+    pub updated: usize,
+    /// Stations toujours sans logo APRÈS la passe : l'annuaire a répondu et ne
+    /// les connaît ni par URL de flux ni par nom.
+    pub sans_logo: usize,
+    /// L'annuaire n'a pas répondu, ou sa réponse était vide/illisible. Alors
+    /// `updated` et `sans_logo` valent tous deux `0` et ne prouvent RIEN.
+    pub annuaire_injoignable: bool,
+}
+
+impl RattrapageLogos {
+    fn injoignable() -> Self {
+        Self {
+            annuaire_injoignable: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Backfill missing station logos from the mozaiklabs.fr radio directory.
 ///
 /// The seeded default stations (migration `seed_default_radios`) and any station
@@ -59,7 +89,11 @@ struct CreateRadio {
 ///
 /// Best-effort and cloud-graceful: any network/parse failure is a no-op (Tune
 /// works fully without mozaiklabs.fr). Never overwrites a logo already set.
-pub async fn refresh_radio_logos(state: &AppState) -> usize {
+///
+/// Rend un [`RattrapageLogos`] et non un simple compteur : voir la note de ce
+/// type — `0` seul est indéchiffrable, et c'est précisément l'information qui
+/// manquait pour instruire le fil 1508 (#2421).
+pub async fn refresh_radio_logos(state: &AppState) -> RattrapageLogos {
     const DIRECTORY_URL: &str = "https://mozaiklabs.fr/api/v1/radios";
     const BASE: &str = "https://mozaiklabs.fr";
 
@@ -70,7 +104,7 @@ pub async fn refresh_radio_logos(state: &AppState) -> usize {
         .await
     {
         Ok(r) => r.json().await.unwrap_or_default(),
-        Err(_) => return 0,
+        Err(_) => return RattrapageLogos::injoignable(),
     };
 
     // Normalize a stream URL for matching: scheme-insensitive, no trailing slash.
@@ -109,11 +143,14 @@ pub async fn refresh_radio_logos(state: &AppState) -> usize {
         }
     }
     if by_url.is_empty() && by_name.is_empty() {
-        return 0;
+        // 200 avec un corps vide ou illisible (`unwrap_or_default` ci-dessus
+        // avale l'erreur de parsage) : on n'a rien appris, donc on ne conclut
+        // rien. C'est un « injoignable », pas un « rien à faire ».
+        return RattrapageLogos::injoignable();
     }
 
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let mut updated = 0usize;
+    let mut bilan = RattrapageLogos::default();
     for mut st in repo.list().unwrap_or_default() {
         if st.logo_url.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             continue; // keep an existing / user-set logo
@@ -122,26 +159,45 @@ pub async fn refresh_radio_logos(state: &AppState) -> usize {
             .get(&norm(&st.url))
             .or_else(|| by_name.get(&st.name.trim().to_ascii_lowercase()))
             .cloned();
-        if let Some(logo) = logo {
-            st.logo_url = Some(logo);
-            if repo.update(&st).is_ok() {
-                updated += 1;
+        match logo {
+            Some(logo) => {
+                st.logo_url = Some(logo);
+                if repo.update(&st).is_ok() {
+                    bilan.updated += 1;
+                } else {
+                    bilan.sans_logo += 1;
+                }
             }
+            // L'annuaire a répondu et ne connaît pas cette station, ni par URL
+            // de flux ni par nom : son logo restera vide tant que l'entrée n'y
+            // sera pas ajoutée. Quatre stations livrées sont dans ce cas —
+            // FIP Pop, FIP Monde, FIP Reggae, FIP Nouveautés (#2421).
+            None => bilan.sans_logo += 1,
         }
     }
-    if updated > 0 {
+    if bilan.updated > 0 {
         state.event_bus.emit(
             "library.radios_changed",
-            json!({"action": "logos_refreshed", "updated": updated}),
+            json!({"action": "logos_refreshed", "updated": bilan.updated}),
         );
-        tracing::info!(updated, "radio_logos_refreshed_from_directory");
     }
-    updated
+    tracing::info!(
+        updated = bilan.updated,
+        sans_logo = bilan.sans_logo,
+        "radio_logos_refreshed_from_directory"
+    );
+    bilan
 }
 
 async fn refresh_logos_handler(State(state): State<AppState>) -> Json<Value> {
-    let updated = refresh_radio_logos(&state).await;
-    Json(json!({ "updated": updated }))
+    let bilan = refresh_radio_logos(&state).await;
+    // `updated` reste en tête et garde son nom : c'est le champ que la réponse
+    // portait déjà.
+    Json(json!({
+        "updated": bilan.updated,
+        "sans_logo": bilan.sans_logo,
+        "annuaire_injoignable": bilan.annuaire_injoignable,
+    }))
 }
 
 pub fn router() -> Router<AppState> {

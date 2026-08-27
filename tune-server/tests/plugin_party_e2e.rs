@@ -72,6 +72,7 @@ async fn call(app: &axum::Router, method: &str, path: &str, body: Value) -> (Sta
 /// threads to make progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_party_plugin_round_trips_through_p2_wiring() {
+    let _environment = crate::lock_environment();
     // Point the loader at the COMMITTED fixture dir (contains `party/`). Each
     // `cargo test` binary is its own process, so this env var cannot leak into
     // the default integration test run.
