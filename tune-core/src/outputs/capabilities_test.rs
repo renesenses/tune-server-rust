@@ -14,6 +14,7 @@ use super::hqplayer::HqplayerOutput;
 #[cfg(feature = "local-audio")]
 use super::local::LocalOutput;
 use super::mock::MockOutput;
+#[cfg(feature = "oaat")]
 use super::oaat::{OaatMultiroomOutput, OaatOutput};
 use super::openhome::OpenHomeOutput;
 use super::slimproto::SlimProtoOutput;
@@ -87,7 +88,7 @@ async fn toutes_les_sorties_integrees_declarent_le_contrat_v1() {
     let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(1);
     let players = Arc::new(Mutex::new(HashMap::new()));
     let channels = Arc::new(Mutex::new(HashMap::new()));
-    #[allow(unused_mut)] // `push(LocalOutput)` n'existe que sous local-audio.
+    #[allow(unused_mut)] // Les ajouts OAAT et local dépendent des features actives.
     let mut outputs: Vec<Box<dyn OutputTarget>> = vec![
         Box::new(AirplayOutput::new(
             "AirPlay".into(),
@@ -137,17 +138,6 @@ async fn toutes_les_sorties_integrees_declarent_le_contrat_v1() {
             9,
         )),
         Box::new(MockOutput::new("mock-1", "Mock")),
-        Box::new(OaatOutput::new(
-            "OAAT".into(),
-            "127.0.0.1".into(),
-            9,
-            "oaat-1".into(),
-        )),
-        Box::new(OaatMultiroomOutput::new(
-            "OAAT group".into(),
-            "group-1".into(),
-            Vec::new(),
-        )),
         Box::new(OpenHomeOutput::new(
             "OpenHome".into(),
             "openhome-1".into(),
@@ -171,6 +161,20 @@ async fn toutes_les_sorties_integrees_declarent_le_contrat_v1() {
             9,
         )),
     ];
+    #[cfg(feature = "oaat")]
+    {
+        outputs.push(Box::new(OaatOutput::new(
+            "OAAT".into(),
+            "127.0.0.1".into(),
+            9,
+            "oaat-1".into(),
+        )));
+        outputs.push(Box::new(OaatMultiroomOutput::new(
+            "OAAT group".into(),
+            "group-1".into(),
+            Vec::new(),
+        )));
+    }
     #[cfg(feature = "local-audio")]
     outputs.push(Box::new(LocalOutput::new("Test local".into())));
 
