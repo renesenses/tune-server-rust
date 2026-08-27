@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::info;
 
-use super::traits::{OutputStatus, OutputTarget, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, TransportState};
 
 /// One Cast operation gets one global budget: DNS, every address attempt,
 /// TLS and all protocol exchanges included.
@@ -145,6 +145,10 @@ impl OutputTarget for ChromecastOutput {
 
     fn output_type(&self) -> &str {
         "chromecast"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, false)
     }
 
     /// Chromecast does not consume `set_next_media` (no cast-queue / autoplay
