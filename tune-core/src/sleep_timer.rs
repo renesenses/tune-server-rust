@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::orchestrator::PlaybackOrchestrator;
 
@@ -130,9 +130,12 @@ impl SleepTimer {
                     .await;
 
                 if let Some(vol) = timer.original_volume {
-                    orchestrator
+                    if let Err(error) = orchestrator
                         .set_volume(timer.zone_id, vol, timer.device_id.as_deref())
-                        .await;
+                        .await
+                    {
+                        warn!(zone_id = timer.zone_id, error = %error, "sleep_timer_restore_volume_failed");
+                    }
                 }
 
                 *self.active.lock().await = None;
@@ -166,9 +169,12 @@ impl SleepTimer {
             let progress = remaining_s as f64 / timer.fade_duration_s as f64;
             let target_vol = orig_vol * progress;
             drop(guard);
-            orchestrator
+            if let Err(error) = orchestrator
                 .set_volume(timer.zone_id, target_vol, timer.device_id.as_deref())
-                .await;
+                .await
+            {
+                warn!(zone_id = timer.zone_id, error = %error, "sleep_timer_fade_volume_failed");
+            }
         }
     }
 }

@@ -382,6 +382,67 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
         .expect("WHERE year = $int must not raise `text = bigint` after the heal");
 }
 
+/// #2468 — contre le chemin reel d'une base deja installee : 005 a cree
+/// `bookmarks.position_ms` en INTEGER et 013 a enregistre son passage sans la
+/// toucher. La migration suivante doit etre jouee par le runner du binaire,
+/// convertir sans perte, puis permettre une position superieure a i32::MAX.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2468_runner_heals_bookmarks_position_integer_to_bigint() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    sqlx::raw_sql(
+        "DELETE FROM bookmarks;
+         ALTER TABLE bookmarks
+             ALTER COLUMN position_ms TYPE INTEGER
+             USING position_ms::integer;
+         DELETE FROM schema_version WHERE version = 36;",
+    )
+    .execute(&pool)
+    .await
+    .expect("le drift INTEGER de #2468 doit pouvoir etre reproduit");
+
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("le runner doit appliquer la migration 036");
+
+    let data_type: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'bookmarks'
+            AND column_name = 'position_ms'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(data_type, "bigint");
+
+    let large_position = i64::from(i32::MAX) + 1;
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO bookmarks (position_ms, label)
+         VALUES ($1, 'pg-2468-i64')
+         RETURNING id",
+    )
+    .bind(large_position)
+    .fetch_one(&pool)
+    .await
+    .expect("bookmarks.position_ms doit accepter toute valeur i64");
+    let stored: i64 = sqlx::query_scalar("SELECT position_ms FROM bookmarks WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, large_position);
+    sqlx::query("DELETE FROM bookmarks WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// #1706 — reproduces the exact .15 production drift and proves `ensure_schema`
 /// heals it instead of dying on the first bad statement.
 ///

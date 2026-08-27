@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 use crate::http::error as http_error;
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -411,6 +411,10 @@ impl OutputTarget for DlnaOutput {
 
     fn output_type(&self) -> &str {
         "dlna"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, true)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

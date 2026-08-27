@@ -2627,14 +2627,24 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "network_mounts_unicite",
         include_str!("../../migrations/postgres/035_network_mounts_unicite.sql"),
     ),
+    // #2468 : 005 cree cette colonne en INTEGER sur une base neuve et 013 ne
+    // convertit que TEXT/VARCHAR. Une migration nouvelle est indispensable :
+    // les installations ayant deja enregistre la version 13 ne la rejouent pas.
+    (
+        36,
+        "bookmarks_position_bigint",
+        include_str!("../../migrations/postgres/036_bookmarks_position_bigint.sql"),
+    ),
     // Jumelle de la migration SQLite 84. `listen_history` n'a jamais su d'ou
     // venait une ecoute : sans ces deux colonnes, la meme piste jouee seule,
     // depuis une playlist ou dans un album donnent trois lignes identiques,
     // et aucune rubrique ne peut refleter l'intention de l'auditeur (#2441).
+    // Numerotee 37 : la 36 est revenue au lot PostgreSQL fusionne entre-temps,
+    // et la contiguite interdit de reserver un numero d'avance.
     (
-        36,
+        37,
         "listen_history_contexte_de_lecture",
-        include_str!("../../migrations/postgres/036_listen_history_contexte_de_lecture.sql"),
+        include_str!("../../migrations/postgres/037_listen_history_contexte_de_lecture.sql"),
     ),
 ];
 
@@ -3508,7 +3518,7 @@ mod tests {
 
     // The PG numeric-type heal chain (#1220): the migration list must stay
     // contiguous and 1-based so run_pg_migrations applies every step, and the
-    // numeric-column-type heal migrations (010/011/013) must all be present — a
+    // numeric-column-type heal migrations (010/011/013/036) must all be present — a
     // gap or a missing heal would leave a data-migrated DB with TEXT numeric
     // columns and re-break force-scan album resolution (`operator does not
     // exist: text = bigint`). (012 heals integer id columns, a sibling fix.)
@@ -3528,13 +3538,19 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 36, "latest PG migration must be 36");
-        for wanted in [10, 11, 13] {
+        assert_eq!(pg_latest_version(), 37, "latest PG migration must be 37");
+        for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
                 "numeric-type heal migration {wanted} must be registered"
             );
         }
+        assert!(
+            PG_MIGRATIONS
+                .iter()
+                .any(|&(v, name, _)| v == 36 && name == "bookmarks_position_bigint"),
+            "#2468 repair must stay registered as migration 036"
+        );
     }
 
     /// #1440 — cas RÉEL : l'anthologie « OUF », douze lignes issues de douze

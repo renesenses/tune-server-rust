@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use tune_core::audio::formats::AudioFormat;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::db::zone_repo::{Zone, ZoneRepo};
+use tune_core::db::zone_repo::{AutoplayMode, Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
@@ -84,7 +84,17 @@ struct PatchZone {
     #[serde(default)]
     confirm_full_volume: bool,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
+    ///
+    /// #2271 — conserve pour les clients existants. `true` vaut
+    /// `autoplay_mode: "similar"`, `false` vaut `"off"`. Si les deux champs
+    /// arrivent ensemble, `autoplay_mode` l'emporte : il est le plus precis.
     autoplay_enabled: Option<bool>,
+    /// Ce qui s'enchaine quand la file se vide : `"off"` ou `"similar"` (#2271).
+    ///
+    /// Remplace `autoplay_enabled`, qui ne pouvait pas porter un choix de
+    /// source. Le catalogue est volontairement limite aux deux comportements
+    /// qui existent reellement aujourd'hui — voir `AutoplayMode`.
+    autoplay_mode: Option<String>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
     dsd_mode: Option<String>,
     /// Décalage des paroles synchronisées, en ms (positif = paroles retardées).
@@ -674,6 +684,19 @@ pub(crate) async fn levels_available(state: &AppState, zone: &Zone) -> bool {
         .orchestrator
         .output_produces_levels(zone.output_device_id.as_deref())
         .await
+}
+
+/// Contrat de commandes de la sortie réellement enregistrée pour une zone.
+///
+/// `None` couvre les zones navigateur et les sorties disparues. Le client ne
+/// doit pas transformer cette absence en une liste de capacités inventée.
+pub(crate) async fn output_capabilities(
+    state: &AppState,
+    output_device_id: Option<&str>,
+) -> Option<tune_core::outputs::OutputCapabilities> {
+    let device_id = output_device_id?;
+    let output = { state.outputs.lock().await.get(device_id) }?;
+    Some(output.lock().await.capabilities())
 }
 
 pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
@@ -1574,10 +1597,15 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // correctement lu par le poller (Sandro, 0.9.70). On lit la vraie
             // valeur par l'accesseur prevu pour ca, comme les autres reglages
             // de zone ci-dessus.
+            // #2271 — les deux champs sortent ensemble et decrivent la meme
+            // colonne. `autoplay_enabled` reste emis tel quel : le client web
+            // actuel ne lit que lui, et le retirer casserait le bouton.
+            let autoplay_mode = zone_repo.get_autoplay_mode(zone_id);
             obj.insert(
                 "autoplay_enabled".into(),
-                json!(zone_repo.get_autoplay_enabled(zone_id)),
+                json!(autoplay_mode != AutoplayMode::Off),
             );
+            obj.insert("autoplay_mode".into(), json!(autoplay_mode.as_str()));
             let detected_dev = z
                 .output_device_id
                 .as_deref()
@@ -1609,6 +1637,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             obj.insert(
                 "levels_available".into(),
                 json!(levels_available(&state, z).await),
+            );
+            obj.insert(
+                "output_capabilities".into(),
+                json!(output_capabilities(&state, z.output_device_id.as_deref()).await),
             );
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
@@ -1727,10 +1759,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 );
                 // Meme correction que dans la liste : la valeur serialisee
                 // depuis la struct vaut toujours `false`.
+                // #2271 — meme paire que dans la liste.
+                let autoplay_mode = repo.get_autoplay_mode(id);
                 obj.insert(
                     "autoplay_enabled".into(),
-                    json!(repo.get_autoplay_enabled(id)),
+                    json!(autoplay_mode != AutoplayMode::Off),
                 );
+                obj.insert("autoplay_mode".into(), json!(autoplay_mode.as_str()));
                 let detected_dev = zone
                     .output_device_id
                     .as_deref()
@@ -1759,6 +1794,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "levels_available".into(),
                     json!(levels_available(&state, &zone).await),
+                );
+                obj.insert(
+                    "output_capabilities".into(),
+                    json!(output_capabilities(&state, zone.output_device_id.as_deref()).await),
                 );
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
@@ -1903,6 +1942,23 @@ async fn patch_zone(
             &format!("mode DSD inconnu (attendu : {})", MODES_DSD.join(", ")),
         );
     }
+    // #2271 — un mode inconnu est REFUSE, jamais range en base. Sans ce
+    // garde-fou une faute de frappe s'ecrirait telle quelle et la lecture
+    // tolerante de `get_autoplay_mode` la rattraperait en `similar` : la zone
+    // se mettrait a enchainer alors que l'auditeur croyait l'eteindre.
+    if let Some(ref mode) = body.autoplay_mode
+        && AutoplayMode::from_str_stocke(mode).is_none()
+    {
+        return refus_de_valeur(
+            id,
+            "autoplay_mode",
+            mode,
+            &format!(
+                "mode de continuation inconnu (attendu : {})",
+                AutoplayMode::NOMS.join(", ")
+            ),
+        );
+    }
     if let Some(vol) = body.volume
         && !(0..=100).contains(&vol)
     {
@@ -1940,6 +1996,31 @@ async fn patch_zone(
             .into_response();
     }
 
+    // Volume et mute sont des commandes, pas de simples préférences. Le
+    // renderer doit les accepter avant qu'un PATCH puisse annoncer leur
+    // réussite ou laisser une valeur mensongère en base. Si le PATCH change
+    // aussi de sortie, la commande vise explicitement la nouvelle sortie.
+    let command_device_id = body
+        .output_device_id
+        .as_deref()
+        .or(zone_before.output_device_id.as_deref());
+    if let Some(volume) = body.volume
+        && let Err(error) = state
+            .orchestrator
+            .set_volume(id, f64::from(volume) / 100.0, command_device_id)
+            .await
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+    if let Some(muted) = body.muted
+        && let Err(error) = state
+            .orchestrator
+            .set_mute(id, muted, command_device_id)
+            .await
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+
     /// Écrit un champ, ou s'arrête en journalisant la cause.
     ///
     /// Une macro et non une closure : chaque échec doit **sortir** du handler,
@@ -1957,12 +2038,7 @@ async fn patch_zone(
     if let Some(ref name) = body.name {
         ecrire!("name", name, repo.update_name(id, name));
     }
-    if let Some(vol) = body.volume {
-        ecrire!("volume", vol, repo.update_volume(id, vol));
-    }
-    if let Some(muted) = body.muted {
-        ecrire!("muted", muted, repo.update_muted(id, muted));
-    }
+    // volume/muted ont été confirmés et persistés par l'orchestrateur ci-dessus.
     if let Some(ref device_id) = body.output_device_id {
         ecrire!(
             "output_device_id",
@@ -1998,7 +2074,18 @@ async fn patch_zone(
             state.playback.set_volume(id, 1.0).await;
         }
     }
-    if let Some(autoplay) = body.autoplay_enabled {
+    // #2271 — les deux champs visent la MEME colonne. `autoplay_mode` est le
+    // plus precis, il gagne ; `autoplay_enabled` n'est applique que seul, pour
+    // que les clients qui ne connaissent que lui continuent de fonctionner.
+    if let Some(ref mode) = body.autoplay_mode {
+        // Deja valide plus haut : le `unwrap_or` n'est pas atteignable.
+        let mode = AutoplayMode::from_str_stocke(mode).unwrap_or_default();
+        ecrire!(
+            "autoplay_mode",
+            mode.as_str(),
+            repo.update_autoplay_mode(id, mode)
+        );
+    } else if let Some(autoplay) = body.autoplay_enabled {
         ecrire!(
             "autoplay_enabled",
             autoplay,
@@ -2127,10 +2214,13 @@ async fn patch_zone(
         if let Ok(Some(z)) = repo.get(id) {
             if !z.fixed_volume {
                 if let Some(ref did) = z.output_device_id {
-                    state
+                    if let Err(error) = state
                         .orchestrator
                         .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
-                        .await;
+                        .await
+                    {
+                        warn!(zone_id = id, error = %error, "gain_trim_volume_refresh_failed");
+                    }
                 }
             }
         }
@@ -2629,7 +2719,7 @@ async fn renderer_capabilities(
         };
         if let Some(dev) = disc {
             register_dlna_output_from_device(&dev, &state).await;
-            output = { state.outputs.lock().await.get(device_id) };
+            output = state.outputs.lock().await.get(device_id);
         }
     }
 
@@ -2872,22 +2962,16 @@ async fn update_volume(
     } else {
         body.volume
     };
-    let volume_int = (volume_f * 100.0).round() as i32;
-
-    // Persist to DB
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Err(e) = repo.update_volume(id, volume_int) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_volume(id, volume_f, device_id.as_deref())
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 async fn update_muted(
@@ -2895,20 +2979,16 @@ async fn update_muted(
     Path(id): Path<i64>,
     Json(body): Json<UpdateMuted>,
 ) -> impl IntoResponse {
-    // Persist to DB
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    if let Err(e) = repo.update_muted(id, body.muted) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_mute(id, body.muted, device_id.as_deref())
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 async fn rename_zone(
@@ -3202,7 +3282,6 @@ async fn group_volume(
                 .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
 
-            let repo = ZoneRepo::with_backend(state.backend.clone());
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -3211,9 +3290,20 @@ async fn group_volume(
                     .copied()
                     .unwrap_or(0.0);
                 let effective = (master + offset).clamp(0.0, 1.0);
-                let vol_int = (effective * 100.0) as i32;
-                repo.update_volume(*zid, vol_int).ok();
-                state.orchestrator.set_volume(*zid, effective, None).await;
+                let device_id = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten()
+                    .and_then(|zone| zone.output_device_id);
+                if let Err(error) = state
+                    .orchestrator
+                    .set_volume(*zid, effective, device_id.as_deref())
+                    .await
+                {
+                    return Ok(crate::routes::playback::output_command_error_response(
+                        error,
+                    ));
+                }
             }
             Ok(Json(json!({"group_id": group_id, "master_volume": master})).into_response())
         }
@@ -4245,6 +4335,27 @@ mod patch_zone_deserialize_tests {
             fixed_volume,
             autoplay_enabled: false,
         }
+    }
+
+    /// #2271 — le nouveau champ de mode se deserialise, et l'ancien booleen
+    /// continue de se deserialiser seul. Les deux ensemble sont acceptes au
+    /// niveau serde ; c'est le handler qui tranche la precedence.
+    #[test]
+    fn autoplay_mode_se_deserialise() {
+        let b: PatchZone = serde_json::from_str(r#"{"autoplay_mode":"similar"}"#).unwrap();
+        assert_eq!(b.autoplay_mode.as_deref(), Some("similar"));
+        assert_eq!(b.autoplay_enabled, None, "champ absent, pas `false`");
+
+        let b: PatchZone = serde_json::from_str(r#"{"autoplay_enabled":true}"#).unwrap();
+        assert_eq!(b.autoplay_enabled, Some(true));
+        assert_eq!(
+            b.autoplay_mode, None,
+            "un client qui ne connait que le booleen n'envoie pas de mode"
+        );
+
+        let b: PatchZone = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(b.autoplay_mode, None);
+        assert_eq!(b.autoplay_enabled, None);
     }
 
     // #1320 (Cyrille) — « Aucune » ne persistait jamais : un `null` explicite

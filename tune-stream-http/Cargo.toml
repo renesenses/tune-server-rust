@@ -1,0 +1,15 @@
+[package]
+name = "tune-stream-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tune-core = { path = "../tune-core", default-features = false }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }

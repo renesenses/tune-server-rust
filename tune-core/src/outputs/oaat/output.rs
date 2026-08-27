@@ -5,7 +5,9 @@ use tokio::sync::Mutex;
 #[cfg(feature = "oaat")]
 use tracing::{debug, error, info, warn};
 
-use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use crate::outputs::traits::{
+    OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
+};
 
 #[cfg(feature = "oaat")]
 use super::helpers::{
@@ -415,6 +417,17 @@ impl OutputTarget for OaatOutput {
 
     fn output_type(&self) -> &str {
         "oaat"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(
+            true,
+            true,
+            true,
+            true,
+            true,
+            self.supports_internal_gapless(),
+        )
     }
 
     /// OAAT genuinely chains tracks internally in BOTH modes, so it always

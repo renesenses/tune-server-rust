@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BridgeCommand {
@@ -132,6 +132,10 @@ impl OutputTarget for BridgeOutput {
 
     fn output_type(&self) -> &str {
         &self.output_type_str
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, true)
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
