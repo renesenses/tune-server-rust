@@ -90,13 +90,11 @@ pub struct StreamSession {
     pub cover_url: Option<String>,
     pub bit_perfect: bool,
     pub is_radio: bool,
-    /// True audio format detected by the radio decoder once the upstream is
-    /// probed. The WAV header advertised to the renderer is built from the
-    /// hard-coded `info` (44100/16/2) at request time — but a station may
-    /// decode at a different rate (FIP is 48000). The decoder publishes the
-    /// real rate/channels here so the header can reflect them instead of
-    /// declaring 44100 for a 48000 stream (which plays ~8.8% too slow and
-    /// skews the renderer's byte accounting). `0` means "not yet detected".
+    /// True output format detected by the radio decoder once the upstream is
+    /// probed. `info` contains only the bootstrap format used while the session
+    /// is being created; every runtime consumer must use
+    /// [`StreamSession::detected_output_format`] so a 48 kHz station is never
+    /// reported as the 44.1 kHz bootstrap value. `0` means "not yet detected".
     pub detected_sample_rate: std::sync::atomic::AtomicU32,
     pub detected_channels: std::sync::atomic::AtomicU16,
     pub wav_header_included: std::sync::atomic::AtomicBool,
@@ -152,6 +150,46 @@ impl StreamSession {
         !self.is_radio
             && self.file_path.lock().await.is_none()
             && self.proxy_url.lock().await.is_none()
+    }
+
+    /// Publish the PCM format actually produced by the radio decoder.
+    ///
+    /// Channels are stored first and the sample rate is the release marker.
+    /// Readers that acquire a non-zero sample rate therefore never observe a
+    /// new rate paired with the old channel count.
+    pub fn publish_detected_output_format(&self, sample_rate: u32, channels: u16) {
+        if sample_rate == 0 || channels == 0 {
+            return;
+        }
+        self.detected_channels
+            .store(channels, std::sync::atomic::Ordering::Relaxed);
+        self.detected_sample_rate
+            .store(sample_rate, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PCM format actually produced by the radio decoder, once known.
+    pub fn detected_output_format(&self) -> Option<(u32, u16)> {
+        let sample_rate = self
+            .detected_sample_rate
+            .load(std::sync::atomic::Ordering::Acquire);
+        if sample_rate == 0 {
+            return None;
+        }
+        let channels = self
+            .detected_channels
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (channels != 0).then_some((sample_rate, channels))
+    }
+
+    fn effective_output_info(&self) -> StreamInfo {
+        let mut info = self.info.clone();
+        if self.is_radio {
+            if let Some((sample_rate, channels)) = self.detected_output_format() {
+                info.sample_rate = sample_rate;
+                info.channels = channels;
+            }
+        }
+        info
     }
 
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
@@ -631,7 +669,7 @@ impl AudioStreamer {
             .lock()
             .await
             .get(stream_id)
-            .map(|s| s.info.clone())
+            .map(|s| s.effective_output_info())
     }
 
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
@@ -837,6 +875,30 @@ mod tests {
         let (id, _tx, _data_ready) = streamer.create_session(info, false, 128).await;
         assert!(!id.is_empty());
         streamer.remove_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn radio_wire_uses_the_detected_output_format() {
+        let streamer = AudioStreamer::new(8080);
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        };
+        let (id, _tx, _data_ready, session) = streamer.create_radio_session(info, 256).await;
+
+        assert_eq!(
+            streamer.stream_output_wire(&id).await.unwrap().sample_rate,
+            44_100
+        );
+
+        session.publish_detected_output_format(48_000, 1);
+        let wire = streamer.stream_output_wire(&id).await.unwrap();
+        assert_eq!(wire.sample_rate, 48_000);
+        assert_eq!(wire.channels, 1);
     }
 
     #[tokio::test]
