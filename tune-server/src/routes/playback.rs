@@ -3063,6 +3063,67 @@ pub struct ShuffleAllQuery {
 /// hundred randomly-shuffled tracks is a "shuffle all" for all practical use.
 const SHUFFLE_MAX_TRACKS: i64 = 500;
 
+/// Une sélection que la base a déjà bornée à `SHUFFLE_MAX_TRACKS`.
+///
+/// `search()` s'arrête à la limite qu'on lui donne : une liste PLEINE veut
+/// dire « il y en avait peut-être davantage », et on ne sait pas combien. On
+/// rend donc `None` plutôt qu'un total qui serait faux — la même règle que
+/// #2250 : la valeur mesurée, ou rien.
+fn selection_bornee(pistes: Option<Vec<tune_core::db::models::Track>>) -> (Vec<i64>, Option<i64>) {
+    let ids: Vec<i64> = pistes
+        .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+        .unwrap_or_default();
+    let total = ((ids.len() as i64) < SHUFFLE_MAX_TRACKS).then_some(ids.len() as i64);
+    (ids, total)
+}
+
+/// Ce que la lecture aléatoire peut honnêtement dire de sa sélection :
+/// `(a-t-on plafonné, sur combien)`.
+///
+/// Le plafond RESTE — le retirer rouvre le gel d'interface qu'il a été posé
+/// pour fermer (Jean Valjean, 30 000 pistes, #2228). Ce qui doit cesser,
+/// c'est le silence : la réponse annonçait `track_count: 500` sans rien qui
+/// distingue « votre bibliothèque contient 500 pistes » de « elle en contient
+/// 30 412 et j'en ai pris 500 », pendant que le bouton, lui, promet TOUT.
+///
+/// Un total n'est jamais deviné. Sélection de taille inconnue : elle est
+/// arrivée bornée, donc on a bien plafonné — on le dit, sans prétendre savoir
+/// sur combien.
+fn compte_rendu_selection(disponibles: Option<i64>, enfilees: usize) -> (bool, Option<i64>) {
+    match disponibles {
+        Some(n) => (n > enfilees as i64, Some(n)),
+        None => (true, None),
+    }
+}
+
+/// Charge utile de `shuffle_all`.
+///
+/// `track_count` est déjà lu par le client (`LibraryView.svelte`,
+/// `library.shufflePlaying` → « Lecture aléatoire : N pistes »).
+fn reponse_shuffle(
+    zone_id: i64,
+    enfilees: usize,
+    disponibles: Option<i64>,
+    output_sent: bool,
+) -> Value {
+    let (plafonne, total) = compte_rendu_selection(disponibles, enfilees);
+    let mut payload = json!({
+        "zone_id": zone_id,
+        "track_count": enfilees,
+        "tracks_queued": enfilees,
+        "output_sent": output_sent,
+        "capped": plafonne,
+    });
+    // Absent, pas `null` : un total qu'on n'a pas mesuré ne s'annonce pas.
+    if let Some(n) = total {
+        payload
+            .as_object_mut()
+            .expect("json! object")
+            .insert("available_track_count".into(), json!(n));
+    }
+    payload
+}
+
 pub async fn shuffle_all(
     State(state): State<AppState>,
     Query(q): Query<ShuffleAllQuery>,
@@ -3073,31 +3134,34 @@ pub async fn shuffle_all(
     // Honor the current library filter context so the shuffle applies to the
     // visible results, not the whole library, and target the caller's zone
     // (Sergio: shuffle from a search result did nothing / played nowhere).
-    let mut all_ids: Vec<i64> = if let Some(aid) = q.album_id {
-        track_repo
+    //
+    // `disponibles` porte la taille RÉELLE de la sélection — mais seulement
+    // là où elle est MESURÉE. `None` veut dire « on ne le sait pas », et dans
+    // ce cas on ne l'invente pas : c'est la même règle que #2250 sur la
+    // résolution annoncée, la valeur qu'on a ou rien.
+    let (mut all_ids, disponibles): (Vec<i64>, Option<i64>) = if let Some(aid) = q.album_id {
+        let ids: Vec<i64> = track_repo
             .list_by_album(aid)
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let n = ids.len() as i64;
+        (ids, Some(n))
     } else if let Some(arid) = q.artist_id {
-        track_repo
+        let ids: Vec<i64> = track_repo
             .list_by_artist(arid)
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let n = ids.len() as i64;
+        (ids, Some(n))
     } else if let Some(sq) = q
         .search_query
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        track_repo
-            .search(sq, 500)
-            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+        selection_bornee(track_repo.search(sq, SHUFFLE_MAX_TRACKS).ok())
     } else if let Some(g) = q.genre.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        track_repo
-            .search(g, 500)
-            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+        selection_bornee(track_repo.search(g, SHUFFLE_MAX_TRACKS).ok())
     } else {
         // Whole-library shuffle: take a random SHUFFLE_MAX_TRACKS sample straight
         // from the DB rather than every row. Enqueuing an entire 50k-track library
@@ -3105,9 +3169,15 @@ pub async fn shuffle_all(
         // few-hundred is a "shuffle all" in every practical sense (Yves, 50k
         // library). random_ids already returns a random subset, so we don't load
         // the whole table just to discard most of it.
-        track_repo
-            .random_ids(SHUFFLE_MAX_TRACKS)
-            .unwrap_or_default()
+        //
+        // C'est la seule branche où le total est connu sans coût : la
+        // bibliothèque entière se compte.
+        (
+            track_repo
+                .random_ids(SHUFFLE_MAX_TRACKS)
+                .unwrap_or_default(),
+            track_repo.count().ok(),
+        )
     };
     if all_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();
@@ -3180,7 +3250,7 @@ pub async fn shuffle_all(
                 .playback
                 .update_queue_info(zone_id, 0, all_ids.len() as i64)
                 .await;
-            let mut resp = json!({ "zone_id": zone_id, "track_count": all_ids.len(), "tracks_queued": all_ids.len(), "output_sent": result.output_sent });
+            let mut resp = reponse_shuffle(zone_id, all_ids.len(), disponibles, result.output_sent);
             if let Some(ref err) = result.error {
                 resp.as_object_mut()
                     .unwrap()
@@ -3267,6 +3337,108 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
         })),
     )
         .into_response()
+}
+
+/// Le plafond de la lecture aléatoire doit être DIT, pas seulement appliqué.
+///
+/// Rappel du fil 1096 (Jean Valjean, #2228) : une file de 30 000 pistes gelait
+/// l'interface, d'où `SHUFFLE_MAX_TRACKS`. Le plafond reste — le retirer
+/// rouvrirait ce gel. Mais la réponse n'en disait rien, et le bouton, lui,
+/// promet « tout ».
+#[cfg(test)]
+mod plafond_aleatoire_tests {
+    use super::{SHUFFLE_MAX_TRACKS, compte_rendu_selection, reponse_shuffle, selection_bornee};
+
+    /// Le cas de Jean Valjean : 30 412 pistes en bibliothèque, 500 enfilées.
+    /// La réponse doit porter les deux nombres, pas seulement le second.
+    #[test]
+    fn une_bibliotheque_plus_grande_que_le_plafond_dit_les_deux_nombres() {
+        let (plafonne, disponibles) = compte_rendu_selection(Some(30_412), 500);
+        assert!(plafonne);
+        assert_eq!(disponibles, Some(30_412));
+
+        let payload = reponse_shuffle(1, 500, Some(30_412), true);
+        assert_eq!(payload["track_count"], 500);
+        assert_eq!(
+            payload["capped"], true,
+            "la réponse doit DIRE qu'elle a plafonné : sans ce champ, rien ne \
+             distingue « la bibliothèque fait 500 pistes » de « elle en fait \
+             30 412 et j'en ai pris 500 » (#2228)"
+        );
+        assert_eq!(
+            payload["available_track_count"], 30_412,
+            "le total mesuré doit être annoncé, sinon le client ne peut pas \
+             cesser de promettre « toute la bibliothèque »"
+        );
+    }
+
+    /// Une bibliothèque plus petite que le plafond n'a rien été plafonné du
+    /// tout : le dire serait une seconde forme de mensonge.
+    #[test]
+    fn une_bibliotheque_plus_petite_que_le_plafond_n_annonce_aucun_plafond() {
+        let (plafonne, disponibles) = compte_rendu_selection(Some(312), 312);
+        assert!(!plafonne);
+        assert_eq!(disponibles, Some(312));
+
+        let payload = reponse_shuffle(1, 312, Some(312), true);
+        assert_eq!(payload["capped"], false);
+        assert_eq!(payload["available_track_count"], 312);
+    }
+
+    /// Sélection de taille INCONNUE — une recherche revenue pleine.
+    ///
+    /// On a bien plafonné, et on l'annonce ; mais on ne sait pas sur combien,
+    /// et on n'invente donc AUCUN total. C'est la règle de #2250 appliquée à
+    /// un compte au lieu d'une résolution : la valeur mesurée, ou rien.
+    #[test]
+    fn une_selection_de_taille_inconnue_n_invente_pas_son_total() {
+        let (plafonne, disponibles) = compte_rendu_selection(None, 500);
+        assert!(plafonne);
+        assert_eq!(disponibles, None);
+
+        let payload = reponse_shuffle(1, 500, None, true);
+        assert_eq!(payload["capped"], true);
+        assert!(
+            payload.get("available_track_count").is_none()
+                || payload["available_track_count"].is_null(),
+            "un total qu'on n'a pas mesuré ne doit pas être annoncé, \
+             fût-ce à 500 : ce serait un chiffre inventé"
+        );
+    }
+
+    /// `search()` s'arrête à la limite qu'on lui donne : une liste pleine ne
+    /// prouve pas que la sélection faisait exactement cette taille.
+    #[test]
+    fn une_recherche_revenue_pleine_ne_connait_pas_sa_taille() {
+        let pleine: Vec<tune_core::db::models::Track> = (0..SHUFFLE_MAX_TRACKS)
+            .map(|i| {
+                let mut t = tune_core::db::models::Track::new(format!("piste {i}"));
+                t.id = Some(i + 1);
+                t
+            })
+            .collect();
+        let (ids, total) = selection_bornee(Some(pleine));
+        assert_eq!(ids.len(), SHUFFLE_MAX_TRACKS as usize);
+        assert_eq!(total, None, "liste pleine ⇒ taille réelle inconnue");
+
+        let mut courte = tune_core::db::models::Track::new("unique".into());
+        courte.id = Some(7);
+        let (ids, total) = selection_bornee(Some(vec![courte]));
+        assert_eq!(ids, vec![7]);
+        assert_eq!(total, Some(1), "liste incomplète ⇒ taille réelle connue");
+    }
+
+    /// Garde-fou de non-régression : le client lit `track_count` pour son
+    /// message « Lecture aléatoire : N pistes ». Les nouveaux champs ne
+    /// doivent rien déplacer.
+    #[test]
+    fn les_champs_deja_lus_par_le_client_ne_bougent_pas() {
+        let payload = reponse_shuffle(4, 500, Some(30_412), false);
+        assert_eq!(payload["zone_id"], 4);
+        assert_eq!(payload["track_count"], 500);
+        assert_eq!(payload["tracks_queued"], 500);
+        assert_eq!(payload["output_sent"], false);
+    }
 }
 
 #[cfg(test)]
