@@ -3360,8 +3360,14 @@ impl OutputTarget for LocalOutput {
                 if dec_ch != output_ch {
                     samples = adapt_channels(&samples, dec_ch, output_ch);
                 }
+                //
+                // Piste entiere en memoire : `rubato_resample_track` retire le
+                // delai de groupe du sinc et rend exactement
+                // `round(trames × ratio)`. La variante en flux le conservait,
+                // et la duree/position calculees juste en dessous heritaient du
+                // surplus a CHAQUE piste (#2246).
                 if dec_sr != output_sr {
-                    samples = rubato_resample_batch(&samples, dec_sr, output_sr, output_ch);
+                    samples = rubato_resample_track(&samples, dec_sr, output_sr, output_ch);
                 }
 
                 // Pre-fill the ring buffer before starting the cpal stream.
@@ -6708,7 +6714,7 @@ use crate::audio::simple_resample;
 /// `crate::audio::resample` (#1525) so the file converter can share it
 /// without the `local-audio` feature; re-exported for this pipeline's
 /// existing call sites and tests.
-pub(crate) use crate::audio::resample::{rubato_resample_batch, rubato_resample_chunk};
+pub(crate) use crate::audio::resample::{rubato_resample_chunk, rubato_resample_track};
 
 #[cfg(test)]
 mod tests {
@@ -8708,7 +8714,9 @@ mod chemin_compresse_dsp_tests {
         let pos_dsp = avant_tampon
             .find("apply_local_dsp(")
             .expect("le chemin compresse n'applique AUCUN DSP (#1725)");
-        let pos_resample = avant_tampon.find("rubato_resample_batch");
+        // Le chemin compresse appelle `rubato_resample_track` depuis #2246 ;
+        // le prefixe couvre les deux noms si la variante venait a changer.
+        let pos_resample = avant_tampon.find("rubato_resample_");
 
         if let Some(pos_resample) = pos_resample {
             assert!(
