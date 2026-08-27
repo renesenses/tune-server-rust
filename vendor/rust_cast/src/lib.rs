@@ -188,7 +188,8 @@ impl<'a> CastDevice<'a> {
             log::debug!("Successfully parsed {valid} root certificates.");
         }
 
-        let mut config = ClientConfig::builder()
+        let mut config = ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()?
             .with_root_certificates(root_store)
             .with_no_client_auth();
         config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -240,7 +241,8 @@ impl<'a> CastDevice<'a> {
 
         log::debug!("Establishing non-verified connection with cast device at {host}:{port}…");
 
-        let mut config = ClientConfig::builder()
+        let mut config = ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
             .with_no_client_auth();
@@ -312,7 +314,8 @@ impl<'a> CastDevice<'a> {
             }
         };
 
-        let mut config = ClientConfig::builder()
+        let mut config = ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
             .with_no_client_auth();
