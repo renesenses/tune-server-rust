@@ -4124,9 +4124,13 @@ impl PositionPoller {
                     // les Stop sans les exécuter, seul Pause→Stop le libère
                     // (constaté par SOAP direct sur le DMP-A8). Best-effort :
                     // un appareil sain n'en souffre pas.
-                    self.orchestrator
+                    if let Err(error) = self
+                        .orchestrator
                         .pause(zone_id, device_id_ref.as_deref())
-                        .await;
+                        .await
+                    {
+                        warn!(zone_id, error = %error, "demarrage_mort_pause_echouee");
+                    }
                     self.orchestrator
                         .stop(zone_id, device_id_ref.as_deref())
                         .await;

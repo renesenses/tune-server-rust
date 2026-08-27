@@ -215,7 +215,8 @@ impl HostContext for AppStateHost {
 
     fn pause(&self, zone: i64) -> Result<Value, String> {
         let device_id = self.zone_device_id(zone);
-        block_on(self.orchestrator.pause(zone, device_id.as_deref()));
+        block_on(self.orchestrator.pause(zone, device_id.as_deref()))
+            .map_err(|error| error.to_string())?;
         Ok(json!({ "ok": true }))
     }
 
