@@ -3,6 +3,8 @@
 //! Ces modules utilisent des bases et routeurs isolés ; ils peuvent donc
 //! partager un binaire de tests sans partager leurs données.
 
+#[path = "annonce_forum_bornes.rs"]
+mod annonce_forum_bornes;
 #[path = "auth_security.rs"]
 mod auth_security;
 #[path = "bump_natifs_android.rs"]
