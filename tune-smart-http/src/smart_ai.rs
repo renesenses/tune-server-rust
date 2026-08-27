@@ -7,10 +7,14 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
-use crate::error::AppError;
-use crate::state::AppState;
+use crate::SmartHttpState;
+use tune_http_types::AppError;
 
-pub fn router() -> Router<AppState> {
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SmartHttpState: axum::extract::FromRef<S>,
+{
     Router::new()
         .route("/generate", post(generate_smart_playlist))
         .route("/mood", post(mood_playlist))
@@ -60,7 +64,7 @@ struct GenerateRequest {
 }
 
 async fn generate_smart_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<GenerateRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(30);
@@ -243,7 +247,7 @@ struct MoodRequest {
 }
 
 async fn mood_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<MoodRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(20);
@@ -404,7 +408,7 @@ struct SimilarToRequest {
 }
 
 async fn similar_to_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<SimilarToRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(20);
@@ -569,7 +573,7 @@ struct HistoryBasedRequest {
 }
 
 async fn history_based_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<HistoryBasedRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(30);
@@ -759,7 +763,7 @@ struct TempoMatchRequest {
 }
 
 async fn tempo_match_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<TempoMatchRequest>,
 ) -> Result<Json<Value>, AppError> {
     let tolerance = body.tolerance.unwrap_or(10.0);
@@ -838,7 +842,7 @@ struct DiscoveryRequest {
 }
 
 async fn discovery_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<DiscoveryRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(30);

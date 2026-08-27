@@ -121,6 +121,12 @@ impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpStat
     }
 }
 
+impl axum::extract::FromRef<AppState> for tune_smart_http::SmartHttpState {
+    fn from_ref(state: &AppState) -> Self {
+        Self::new(state.backend.clone())
+    }
+}
+
 impl AppState {
     /// The SQLite handle, for the few operations with no engine-agnostic
     /// equivalent (FTS rebuild, `VACUUM`, WAL checkpoint, schema version).

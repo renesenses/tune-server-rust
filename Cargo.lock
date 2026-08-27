@@ -5452,12 +5452,25 @@ dependencies = [
  "tune-http-types",
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
+ "tune-smart-http",
  "tune-stream-http",
  "tune-streaming-http",
  "unicode-normalization",
  "urlencoding",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "tune-smart-http"
+version = "0.9.113"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tune-core",
+ "tune-http-types",
 ]
 
 [[package]]
