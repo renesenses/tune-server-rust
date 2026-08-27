@@ -731,9 +731,41 @@ pub(crate) async fn spawn_library_scan_confirmee(
         if !exclude_patterns.is_empty() {
             tracing::info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
-        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+        // Le parcours des dossiers est la phase la plus longue d'un scan sur
+        // un partage réseau, et c'était la seule totalement muette : dans la
+        // boucle de `walker.rs` aucune trace n'est émise hors chemin d'erreur,
+        // et le premier `info!` — `scan_dir_complete` — n'arrive qu'une fois
+        // la racine ENTIÈREMENT parcourue. Sur le journal de JP Borderies
+        // (3 226 pistes sur un Synology en SMB) cela donne 3 min 40 sans une
+        // ligne : indiscernable d'un blocage, pour lui comme pour nous
+        // (#2203). Il a annulé, redémarré, puis renoncé — alors que le scan
+        // travaillait.
+        //
+        // On ne change RIEN au parcours : même ordre, mêmes exclusions, même
+        // liste rendue. On lit seulement, à cadence fixe, le compte que la
+        // boucle tenait déjà sans le dire.
+        //
+        // `total: 0` marque la barre comme indéterminée : pendant le parcours
+        // le total est INCONNU par construction — on ne sait combien de
+        // fichiers il y a qu'une fois qu'on les a tous vus. Le client rend
+        // alors « n fichiers » et une barre indéterminée, ce qu'il sait déjà
+        // faire (SettingsView.svelte) : aucun changement web n'est requis.
+        let list_result = tune_core::scanner::walker::list_audio_files_avec_progression(
             &scan_dirs,
             &exclude_patterns,
+            tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
+            &mut |p| {
+                event_bus.emit(
+                    "library.scan.progress",
+                    json!({
+                        "phase": "indexing",
+                        "scanned": p.fichiers_vus as i64,
+                        "added": 0i64,
+                        "total": 0i64,
+                        "current_dir": p.dossier_courant,
+                    }),
+                );
+            },
         );
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
