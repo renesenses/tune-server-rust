@@ -401,10 +401,10 @@ def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
             False,
             f"{len(failures)} failed: {', '.join(failures[:5])}",
         )
-    # Jobs that haven't finished yet are NOT a failure: preflight runs
-    # concurrently with the multi-platform Build jobs, so those are always
-    # "in progress" at tag time. Only actually-failed runs (handled above)
-    # block. Each build still gates itself via its own job status.
+    # Jobs that haven't finished yet are NOT a failure: the current preflight
+    # check and other workflows triggered by the tag can still be running.
+    # Only actually-failed runs (handled above) block. Release itself cannot
+    # start building before this reusable workflow has succeeded.
     pending = [r["name"] for r in runs if r.get("status") != "completed"]
     if pending:
         return CheckResult(
