@@ -58,6 +58,36 @@ fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
     }
 }
 
+/// Réponse HEAD d'un flux radio live, sans créer de session ni contacter la
+/// station. Le MediaServer publie une URL stable avant que le renderer fasse
+/// son GET ; ce point d'entrée partage donc exactement le contrat du HEAD
+/// d'une session radio déjà créée.
+pub fn live_radio_head_response(mime_type: &str, req_headers: &HeaderMap) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(mime_type).expect("valid radio MIME type"),
+    );
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static("Streaming"),
+    );
+
+    let ua = req_headers.get("User-Agent").and_then(|v| v.to_str().ok());
+    if accepts_chunked_live_stream(ua) {
+        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+    } else {
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        headers.insert(
+            "Content-Length",
+            HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
+        );
+    }
+
+    (StatusCode::OK, headers).into_response()
+}
+
 impl RadioConsumerGuard {
     fn new(session: std::sync::Arc<StreamSession>) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
@@ -148,6 +178,13 @@ pub async fn handle_head(
         "stream_head_request"
     );
 
+    if is_radio {
+        // Le HEAD doit annoncer le même contrat que le GET qui suit, sans quoi
+        // un lecteur qui sonde d'abord conclut « pas de longueur » et n'essaie
+        // même pas (#1689).
+        return live_radio_head_response(&session.info.mime_type, &req_headers);
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
@@ -155,25 +192,7 @@ pub async fn handle_head(
     );
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
 
-    if is_radio {
-        headers.insert(
-            "transferMode.dlna.org",
-            HeaderValue::from_static("Streaming"),
-        );
-        // Le HEAD doit annoncer le même contrat que le GET qui suit, sans quoi
-        // un lecteur qui sonde d'abord conclut « pas de longueur » et n'essaie
-        // même pas (#1689).
-        let ua = req_headers.get("User-Agent").and_then(|v| v.to_str().ok());
-        if accepts_chunked_live_stream(ua) {
-            headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
-        } else {
-            headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-            headers.insert(
-                "Content-Length",
-                HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
-            );
-        }
-    } else if session.is_channel().await {
+    if session.is_channel().await {
         // Conversion à la volée : le canal ne rejoue aucun octet passé. Le HEAD
         // doit dire la même vérité que la DIDL (DLNA.ORG_OP=00) — annoncer
         // Accept-Ranges ici invite le renderer à seeker un tuyau (DMP-A8,
@@ -1647,6 +1666,30 @@ mod tests {
         // something other than Lavf sees a different response.
         assert!(accepts_chunked_live_stream(None));
         assert!(accepts_chunked_live_stream(Some("")));
+    }
+
+    #[test]
+    fn le_head_radio_stable_reutilise_le_contrat_live_du_renderer() {
+        let mut req = axum::http::HeaderMap::new();
+        req.insert("User-Agent", "Marantz ND8006".parse().unwrap());
+        let rep = super::live_radio_head_response("audio/wav", &req);
+        let expected_length = LIVE_BOUNDED_TOTAL_LEN.to_string();
+
+        assert_eq!(rep.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            rep.headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("audio/wav")
+        );
+        assert_eq!(
+            rep.headers()
+                .get("Content-Length")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_length.as_str())
+        );
+        assert!(rep.headers().get("Accept-Ranges").is_some());
+        assert!(rep.headers().get("Transfer-Encoding").is_none());
     }
 
     #[test]
